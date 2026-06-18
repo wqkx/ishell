@@ -46,8 +46,31 @@ pub enum UiCommand {
     ReadFile { path: String, force: bool },
     /// 写回文本文件内容（保存）
     WriteFile { path: String, content: String },
+    /// 新增端口转发
+    AddForward(ForwardSpec),
+    /// 移除端口转发
+    RemoveForward(u64),
     /// 主动断开
     Disconnect,
+}
+
+/// 端口转发类型。
+#[derive(Clone, Debug)]
+pub enum ForwardKind {
+    /// 本地转发：本地端口 -> 远端 host:port
+    Local { remote_host: String, remote_port: u16 },
+    /// 动态转发：本地 SOCKS5 代理
+    Dynamic,
+}
+
+/// 一条端口转发配置。
+#[derive(Clone, Debug)]
+pub struct ForwardSpec {
+    pub id: u64,
+    /// 本地监听地址（默认 127.0.0.1）
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub kind: ForwardKind,
 }
 
 /// Worker -> UI 事件。
@@ -77,6 +100,8 @@ pub enum WorkerEvent {
     TransferProgress { id: u64, done: u64 },
     /// 传输结束
     TransferDone { id: u64, ok: bool, message: String, refresh_dir: Option<String> },
+    /// 端口转发状态更新（监听中 / 失败原因）
+    ForwardStatus { id: u64, ok: bool, message: String },
     /// 错误提示
     Error(String),
 }

@@ -1,0 +1,138 @@
+//! SSH 端口转发：本地转发与动态（SOCKS5）转发。
+//!
+//! 每条转发在本地监听一个 TCP 端口，每来一个连接就通过 SSH 开一条 `direct-tcpip`
+//! 通道连到目标，并在本地 socket 与通道之间双向拷贝字节。
+
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+
+use russh::client::Handle;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+use super::ClientHandler;
+use super::UiSink;
+use crate::proto::{ForwardKind, ForwardSpec, WorkerEvent};
+
+/// 运行一条转发监听，直到任务被 abort。
+pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, sink: UiSink) {
+    let bind = format!("{}:{}", spec.bind_host, spec.bind_port);
+    let listener = match TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            sink.send(WorkerEvent::ForwardStatus {
+                id: spec.id,
+                ok: false,
+                message: format!("绑定 {bind} 失败：{e}"),
+            });
+            return;
+        }
+    };
+    let label = match &spec.kind {
+        ForwardKind::Local { remote_host, remote_port } => format!("{bind} → {remote_host}:{remote_port}"),
+        ForwardKind::Dynamic => format!("SOCKS5 {bind}"),
+    };
+    sink.send(WorkerEvent::ForwardStatus { id: spec.id, ok: true, message: format!("监听中  {label}") });
+
+    loop {
+        let (sock, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        let handle = handle.clone();
+        let kind = spec.kind.clone();
+        tokio::spawn(async move {
+            let _ = handle_conn(handle, kind, sock, peer).await;
+        });
+    }
+}
+
+async fn handle_conn(
+    handle: Arc<Handle<ClientHandler>>,
+    kind: ForwardKind,
+    mut sock: TcpStream,
+    peer: SocketAddr,
+) -> anyhow::Result<()> {
+    let origin = peer.ip().to_string();
+    let oport = peer.port() as u32;
+
+    match kind {
+        ForwardKind::Local { remote_host, remote_port } => {
+            let ch = handle
+                .channel_open_direct_tcpip(remote_host, remote_port as u32, origin, oport)
+                .await?;
+            let mut stream = ch.into_stream();
+            tokio::io::copy_bidirectional(&mut sock, &mut stream).await?;
+        }
+        ForwardKind::Dynamic => {
+            let (host, port) = socks5_negotiate(&mut sock).await?;
+            match handle.channel_open_direct_tcpip(host, port as u32, origin, oport).await {
+                Ok(ch) => {
+                    socks5_reply(&mut sock, 0x00).await?; // succeeded
+                    let mut stream = ch.into_stream();
+                    tokio::io::copy_bidirectional(&mut sock, &mut stream).await?;
+                }
+                Err(e) => {
+                    let _ = socks5_reply(&mut sock, 0x05).await; // connection refused
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 完成 SOCKS5 方法协商并解析 CONNECT 请求，返回目标 (host, port)。
+/// 不发送最终响应（由调用方在通道建立后回复）。
+async fn socks5_negotiate(sock: &mut TcpStream) -> anyhow::Result<(String, u16)> {
+    // 问候：VER, NMETHODS, METHODS...
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head).await?;
+    if head[0] != 0x05 {
+        anyhow::bail!("非 SOCKS5");
+    }
+    let mut methods = vec![0u8; head[1] as usize];
+    sock.read_exact(&mut methods).await?;
+    sock.write_all(&[0x05, 0x00]).await?; // 选择「无认证」
+
+    // 请求：VER, CMD, RSV, ATYP, ADDR, PORT
+    let mut req = [0u8; 4];
+    sock.read_exact(&mut req).await?;
+    if req[0] != 0x05 || req[1] != 0x01 {
+        // 仅支持 CONNECT
+        socks5_reply(sock, 0x07).await?;
+        anyhow::bail!("仅支持 CONNECT");
+    }
+    let host = match req[3] {
+        0x01 => {
+            let mut a = [0u8; 4];
+            sock.read_exact(&mut a).await?;
+            Ipv4Addr::from(a).to_string()
+        }
+        0x03 => {
+            let mut l = [0u8; 1];
+            sock.read_exact(&mut l).await?;
+            let mut d = vec![0u8; l[0] as usize];
+            sock.read_exact(&mut d).await?;
+            String::from_utf8_lossy(&d).to_string()
+        }
+        0x04 => {
+            let mut a = [0u8; 16];
+            sock.read_exact(&mut a).await?;
+            Ipv6Addr::from(a).to_string()
+        }
+        _ => {
+            socks5_reply(sock, 0x08).await?; // address type not supported
+            anyhow::bail!("不支持的地址类型");
+        }
+    };
+    let mut pb = [0u8; 2];
+    sock.read_exact(&mut pb).await?;
+    Ok((host, u16::from_be_bytes(pb)))
+}
+
+/// 发送 SOCKS5 响应（rep=0x00 成功）。BND.ADDR 固定 0.0.0.0:0。
+async fn socks5_reply(sock: &mut TcpStream, rep: u8) -> anyhow::Result<()> {
+    sock.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    Ok(())
+}

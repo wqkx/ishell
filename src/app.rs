@@ -38,6 +38,9 @@ struct Session {
     hostkey_tx: UnboundedSender<bool>,
     /// 待确认的未知主机（host, 指纹）
     pending_hostkey: Option<(String, String)>,
+    /// 端口转发列表
+    forwards: Vec<ForwardEntry>,
+    next_forward: u64,
 }
 
 /// UI 侧的一条传输记录。
@@ -84,6 +87,12 @@ impl Session {
                 }
                 WorkerEvent::DirListing { path, entries } => {
                     self.files.on_listing(path, entries);
+                }
+                WorkerEvent::ForwardStatus { id, ok, message } => {
+                    if let Some(f) = self.forwards.iter_mut().find(|f| f.id == id) {
+                        f.ok = ok;
+                        f.status = message;
+                    }
                 }
                 WorkerEvent::HostKeyPrompt { host, fingerprint } => {
                     self.pending_hostkey = Some((host, fingerprint));
@@ -162,6 +171,10 @@ pub struct App {
     /// 编辑器标签页
     editors: Vec<EditorTab>,
     active_editor: usize,
+    /// 端口转发管理窗口是否显示
+    show_forwards: bool,
+    /// 新增转发表单
+    fwd_form: ForwardForm,
     /// 自检截图模式（由环境变量触发，正常使用时为 None）
     shot: Option<Shot>,
 }
@@ -169,6 +182,36 @@ pub struct App {
 /// 拖拽会话标签时携带的源索引。
 #[derive(Clone)]
 struct TabDrag(usize);
+
+/// UI 侧的一条端口转发记录。
+struct ForwardEntry {
+    id: u64,
+    label: String,
+    status: String,
+    ok: bool,
+}
+
+/// "新增转发"表单状态。
+struct ForwardForm {
+    /// 0 = 本地转发，1 = 动态 SOCKS5
+    kind: usize,
+    bind: String,
+    local_port: String,
+    target_host: String,
+    target_port: String,
+}
+
+impl Default for ForwardForm {
+    fn default() -> Self {
+        Self {
+            kind: 0,
+            bind: "127.0.0.1".into(),
+            local_port: String::new(),
+            target_host: String::new(),
+            target_port: String::new(),
+        }
+    }
+}
 
 /// 一个编辑器标签（含来源服务器，用于回写）。
 struct EditorTab {
@@ -218,6 +261,8 @@ impl App {
             allow_close: false,
             editors: Vec::new(),
             active_editor: 0,
+            show_forwards: false,
+            fwd_form: ForwardForm::default(),
             shot,
         };
 
@@ -256,6 +301,28 @@ impl App {
                     cmd_tx: tx,
                 });
             }
+        }
+
+        // 自检：自动建立一条本地转发（127.0.0.1:18022 → 127.0.0.1:22）
+        if std::env::var("ISHELL_DEMO_FORWARD").is_ok() {
+            use crate::proto::{ForwardKind, ForwardSpec};
+            if let Some(s) = app.sessions.first_mut() {
+                let id = s.next_forward;
+                s.next_forward += 1;
+                s.forwards.push(ForwardEntry {
+                    id,
+                    label: "127.0.0.1:18022 → 127.0.0.1:22".into(),
+                    status: "启动中 …".into(),
+                    ok: true,
+                });
+                let _ = s.cmd_tx.send(UiCommand::AddForward(ForwardSpec {
+                    id,
+                    bind_host: "127.0.0.1".into(),
+                    bind_port: 18022,
+                    kind: ForwardKind::Local { remote_host: "127.0.0.1".into(), remote_port: 22 },
+                }));
+            }
+            app.show_forwards = true;
         }
 
         // 自检：显示退出确认框
@@ -305,6 +372,8 @@ impl App {
             pending_open: Vec::new(),
             hostkey_tx,
             pending_hostkey: None,
+            forwards: Vec::new(),
+            next_forward: 1,
         });
         self.active = Some(self.sessions.len() - 1);
     }
@@ -480,6 +549,9 @@ impl eframe::App for App {
 
         // 传输进度浮窗
         self.transfer_window(&ctx);
+
+        // 端口转发管理浮窗
+        self.forward_window(&ctx);
 
         // 文本编辑器浮窗
         self.editor_window(&ctx);
@@ -694,6 +766,19 @@ impl App {
                                 self.xfer_just_opened = true;
                             }
                         }
+                        let nfwd = self
+                            .active
+                            .and_then(|i| self.sessions.get(i))
+                            .map(|s| s.forwards.len())
+                            .unwrap_or(0);
+                        let flabel = if nfwd > 0 {
+                            format!("{} 转发 {}", icon::ARROWS_LEFT_RIGHT, nfwd)
+                        } else {
+                            format!("{} 转发", icon::ARROWS_LEFT_RIGHT)
+                        };
+                        if flat_button(ui, &RichText::new(flabel), "端口转发管理") {
+                            self.show_forwards = !self.show_forwards;
+                        }
                         if let Some(idx) = self.active {
                             if let Some(s) = self.sessions.get(idx) {
                                 let c = if s.connected { Palette::OK } else { Palette::WARN };
@@ -783,6 +868,118 @@ impl App {
             }
             // 关闭大文件后把空闲内存归还 OS
             trim_memory();
+        }
+    }
+
+    /// 端口转发管理浮窗（针对当前会话）。
+    fn forward_window(&mut self, ctx: &egui::Context) {
+        use crate::proto::{ForwardKind, ForwardSpec};
+        if !self.show_forwards {
+            return;
+        }
+        let mut open = true;
+        let Some(idx) = self.active.filter(|&i| i < self.sessions.len()) else {
+            egui::Window::new("端口转发").open(&mut open).resizable(false).show(ctx, |ui| {
+                ui.label("请先连接一个会话");
+            });
+            self.show_forwards = open;
+            return;
+        };
+
+        let mut add_spec: Option<ForwardSpec> = None;
+        let mut remove_id: Option<u64> = None;
+
+        egui::Window::new("端口转发")
+            .open(&mut open)
+            .default_width(440.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                // 新增表单
+                let f = &mut self.fwd_form;
+                egui::ComboBox::from_id_salt("fwd_kind")
+                    .selected_text(if f.kind == 0 { "本地转发" } else { "动态 SOCKS5" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut f.kind, 0, "本地转发");
+                        ui.selectable_value(&mut f.kind, 1, "动态 SOCKS5");
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("本地");
+                    ui.add(egui::TextEdit::singleline(&mut f.bind).desired_width(90.0).hint_text("127.0.0.1"));
+                    ui.label(":");
+                    ui.add(egui::TextEdit::singleline(&mut f.local_port).desired_width(54.0).hint_text("端口"));
+                    if f.kind == 0 {
+                        ui.label(RichText::new("→").color(Palette::TEXT_DIM));
+                        ui.label("目标");
+                        ui.add(egui::TextEdit::singleline(&mut f.target_host).desired_width(120.0).hint_text("主机/IP"));
+                        ui.label(":");
+                        ui.add(egui::TextEdit::singleline(&mut f.target_port).desired_width(54.0).hint_text("端口"));
+                    }
+                });
+                ui.add_space(4.0);
+                if ui.add(egui::Button::new(RichText::new("添加转发").color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                    if let Ok(lp) = f.local_port.trim().parse::<u16>() {
+                        let kind = if f.kind == 0 {
+                            match f.target_port.trim().parse::<u16>() {
+                                Ok(tp) if !f.target_host.trim().is_empty() => {
+                                    Some(ForwardKind::Local { remote_host: f.target_host.trim().to_string(), remote_port: tp })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            Some(ForwardKind::Dynamic)
+                        };
+                        if let Some(kind) = kind {
+                            let bind = if f.bind.trim().is_empty() { "127.0.0.1".into() } else { f.bind.trim().to_string() };
+                            add_spec = Some(ForwardSpec { id: 0, bind_host: bind, bind_port: lp, kind });
+                        }
+                    }
+                }
+
+                ui.separator();
+                if let Some(s) = self.sessions.get(idx) {
+                    if s.forwards.is_empty() {
+                        ui.label(RichText::new("（暂无转发）").color(Palette::TEXT_DIM).size(12.0));
+                    }
+                    for fwd in &s.forwards {
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 4.0, if fwd.ok { Palette::OK } else { Palette::DANGER });
+                            ui.label(RichText::new(&fwd.label).strong());
+                            ui.label(RichText::new(&fwd.status).color(if fwd.ok { Palette::TEXT_DIM } else { Palette::DANGER }).size(11.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("删除").clicked() {
+                                    remove_id = Some(fwd.id);
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+        self.show_forwards = open;
+
+        if let Some(mut spec) = add_spec {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                let id = s.next_forward;
+                s.next_forward += 1;
+                spec.id = id;
+                let label = match &spec.kind {
+                    ForwardKind::Local { remote_host, remote_port } => {
+                        format!("{}:{} → {}:{}", spec.bind_host, spec.bind_port, remote_host, remote_port)
+                    }
+                    ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
+                };
+                s.forwards.push(ForwardEntry { id, label, status: "启动中 …".into(), ok: true });
+                let _ = s.cmd_tx.send(UiCommand::AddForward(spec));
+            }
+            self.fwd_form.local_port.clear();
+            self.fwd_form.target_host.clear();
+            self.fwd_form.target_port.clear();
+        }
+        if let Some(id) = remove_id {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                s.forwards.retain(|f| f.id != id);
+                let _ = s.cmd_tx.send(UiCommand::RemoveForward(id));
+            }
         }
     }
 

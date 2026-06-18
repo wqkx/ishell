@@ -1,8 +1,10 @@
 //! SSH 后台 worker：运行在 tokio 运行时上，负责建立连接、维护交互式 shell
 //! 通道、SFTP 通道，并周期性采集系统信息。通过 channel 与 UI 线程通信。
 
+mod forward;
 pub mod sysinfo;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +137,9 @@ pub async fn run(
 
     sink.send(WorkerEvent::Connected);
 
+    // 端口转发监听任务：id -> JoinHandle
+    let mut forwards: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+
     // 4) 主循环：转发终端数据、处理 UI 指令
     loop {
         tokio::select! {
@@ -236,6 +241,17 @@ pub async fn run(
                             sink.send(WorkerEvent::Error("SFTP 不可用".into()));
                         }
                     }
+                    Some(UiCommand::AddForward(spec)) => {
+                        let id = spec.id;
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        forwards.insert(id, tokio::spawn(forward::run_forward(h, spec, s)));
+                    }
+                    Some(UiCommand::RemoveForward(id)) => {
+                        if let Some(task) = forwards.remove(&id) {
+                            task.abort();
+                        }
+                    }
                     Some(UiCommand::Disconnect) | None => {
                         let _ = shell.eof().await;
                         sink.send(WorkerEvent::Disconnected("已断开".into()));
@@ -246,6 +262,9 @@ pub async fn run(
         }
     }
 
+    for (_, task) in forwards {
+        task.abort();
+    }
     probe_task.abort();
 }
 
