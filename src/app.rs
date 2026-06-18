@@ -712,10 +712,10 @@ impl App {
                     let bw = 96.0;
                     let total = bw * 2.0 + ui.spacing().item_spacing.x;
                     ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                    if ui.add(egui::Button::new(RichText::new("信任并连接").color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 28.0))).clicked() {
+                    if dialog_button(ui, "信任并连接", Some(Palette::ACCENT), bw) {
                         decision = Some(true);
                     }
-                    if ui.add(egui::Button::new("拒绝").min_size(egui::vec2(bw, 28.0))).clicked() {
+                    if dialog_button(ui, "拒绝", None, bw) {
                         decision = Some(false);
                     }
                 });
@@ -753,15 +753,12 @@ impl App {
                         let total = bw * 2.0 + ui.spacing().item_spacing.x;
                         let space = ((ui.available_width() - total) / 2.0).max(0.0);
                         ui.add_space(space);
-                        if ui
-                            .add(egui::Button::new(RichText::new("退出").color(egui::Color32::WHITE)).fill(Palette::DANGER).min_size(egui::vec2(bw, 28.0)))
-                            .clicked()
-                        {
+                        if dialog_button(ui, "退出", Some(Palette::DANGER), bw) {
                             self.allow_close = true;
                             self.show_close_confirm = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        if ui.add(egui::Button::new("取消").min_size(egui::vec2(bw, 28.0))).clicked() {
+                        if dialog_button(ui, "取消", None, bw) {
                             self.show_close_confirm = false;
                         }
                     });
@@ -1468,6 +1465,33 @@ impl App {
 }
 
 /// 扁平按钮（无边框、悬停高亮），用于标签栏等处，贴近 FinalShell 风格。
+/// 对话框按钮：自绘以保证文字在按钮内垂直居中（补偿 CJK 字体行盒下沉）。
+fn dialog_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>, width: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::click());
+    let bg = match fill {
+        Some(f) => {
+            if resp.hovered() {
+                f.gamma_multiply(0.9)
+            } else {
+                f
+            }
+        }
+        None => {
+            if resp.hovered() {
+                Palette::TRACK
+            } else {
+                Palette::PANEL_2
+            }
+        }
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, bg);
+    let col = if fill.is_some() { egui::Color32::WHITE } else { Palette::TEXT };
+    // 文字中心略下移 1px，抵消字体行盒上偏，达到视觉居中
+    p.text(rect.center() + egui::vec2(0.0, 1.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(14.0), col);
+    resp.clicked()
+}
+
 fn flat_button(ui: &mut egui::Ui, text: &RichText, tip: &str) -> bool {
     let mut clicked = false;
     ui.scope(|ui| {

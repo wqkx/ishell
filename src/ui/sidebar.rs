@@ -14,7 +14,7 @@ pub struct NetHistory {
 }
 
 impl NetHistory {
-    const CAP: usize = 60;
+    const CAP: usize = 120;
     pub fn push(&mut self, down: f64, up: f64) {
         self.down.push_back(down);
         self.up.push_back(up);
