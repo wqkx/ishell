@@ -10,6 +10,8 @@ pub struct ConnectConfig {
     pub port: u16,
     pub username: String,
     pub auth: AuthMethod,
+    /// 标签显示名（来自连接名称，空则回退为用户名）；不含 IP
+    pub label: String,
     /// 可选跳板机：先连它，再经 direct-tcpip 连到目标主机
     pub jump: Option<JumpHost>,
 }

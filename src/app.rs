@@ -16,6 +16,8 @@ use crate::ui::sidebar::{self, NetHistory};
 /// 单个 SSH 会话的前台状态。
 struct Session {
     title: String,
+    /// 悬停提示（user@host，用于标签去掉 IP 后的消歧）
+    tip: String,
     cmd_tx: UnboundedSender<UiCommand>,
     evt_rx: std::sync::mpsc::Receiver<WorkerEvent>,
     connected: bool,
@@ -280,6 +282,7 @@ impl App {
                         port,
                         username: parts[2].into(),
                         auth: AuthMethod::KeyFile { path: parts[3].into(), passphrase: None },
+                        label: String::new(),
                         // 自检：ISHELL_JUMP="host|port|user|key" 时经跳板机连接
                         jump: std::env::var("ISHELL_JUMP").ok().and_then(|s| {
                             let p: Vec<&str> = s.split('|').collect();
@@ -367,7 +370,8 @@ impl App {
         self.runtime.spawn(ssh::run(cfg.clone(), cmd_rx, sink, hostkey_rx));
 
         self.sessions.push(Session {
-            title: format!("{}@{}", cfg.username, cfg.host),
+            title: if cfg.label.trim().is_empty() { cfg.username.clone() } else { cfg.label.trim().to_string() },
+            tip: format!("{}@{}:{}", cfg.username, cfg.host, cfg.port),
             cmd_tx,
             evt_rx,
             connected: false,
@@ -749,6 +753,7 @@ impl App {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         for (i, s) in self.sessions.iter().enumerate() {
@@ -768,7 +773,7 @@ impl App {
                                                                 ui.painter().circle_filled(dot.center(), 4.0, color);
                                                                 let title = RichText::new(&s.title)
                                                                     .color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
-                                                                ui.add(egui::Label::new(title).selectable(false));
+                                                                ui.add(egui::Label::new(title).selectable(false)).on_hover_text(s.tip.as_str());
                                                                 if ui
                                                                     .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
                                                                     .on_hover_text("关闭会话")

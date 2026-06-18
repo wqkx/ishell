@@ -219,10 +219,14 @@ impl ConnectForm {
                             if ui.add(egui::Button::new(RichText::new(icon::PENCIL_SIMPLE).color(Palette::TEXT_DIM)).frame(false)).on_hover_text("编辑").clicked() {
                                 edit_idx = Some(i);
                             }
-                            ui.add_space(12.0);
-                            ui.label(RichText::new(&c.username).color(Palette::TEXT_DIM).size(12.0));
-                            ui.add_space(20.0);
-                            ui.label(RichText::new(format!("{}:{}", c.host, c.port)).color(Palette::TEXT_DIM).size(12.0));
+                            ui.add_space(10.0);
+                            // 固定宽列：用户名 + IP，跨行对齐
+                            ui.allocate_ui_with_layout(egui::vec2(80.0, row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(&c.username).color(Palette::TEXT_DIM).size(12.0));
+                            });
+                            ui.allocate_ui_with_layout(egui::vec2(150.0, row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(format!("{}:{}", c.host, c.port)).color(Palette::TEXT_DIM).size(12.0));
+                            });
                         });
                     },
                 );
@@ -526,6 +530,7 @@ impl ConnectForm {
             port,
             username: self.username.trim().to_string(),
             auth,
+            label: self.name.trim().to_string(),
             jump,
         })
     }
