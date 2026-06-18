@@ -1,0 +1,53 @@
+[package]
+name = "ishell"
+version = "0.1.0"
+edition = "2021"
+description = "现代化 Rust SSH 客户端，仿 FinalShell 布局（系统信息 + 终端 + SFTP 文件管理）"
+
+[dependencies]
+# GUI（GPU 渲染的即时模式框架）
+eframe = { version = "0.34", default-features = true }
+egui = "0.34"
+egui_extras = "0.34"  # 表格 + 轻量代码高亮（不启用 syntect，避免常驻大内存）
+egui-phosphor = "0.12" # 图标字体（对应 egui 0.34）
+
+# 原生文件选择器：按平台选择后端（见文件底部 target 段）
+
+# 异步运行时（SSH 后台线程）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+
+# SSH 协议栈 + SFTP
+# 用 ring 加密后端替代默认的 aws-lc-rs，去掉 aws-lc-sys 的 C/cmake 依赖，跨平台编译更省事；
+# 保留 flate2（压缩）与 rsa（RSA 私钥支持）。
+russh = { version = "0.61", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "2.3"
+
+# 终端模拟（VT100 屏幕模型）
+vt100 = "0.16"
+
+# 连接配置持久化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# PNG 编码（仅用于 --screenshot 自检模式）
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# 工具
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# Linux：xdg-portal 纯 Rust 文件选择器（免 GTK）；libc 用于 malloc_trim 归还内存
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
+
+# 非 Linux（macOS / Windows）：使用 rfd 原生后端
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

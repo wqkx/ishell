@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target
+
+# 本机归档的可执行文件与截图
+/dist
+
+# 敏感信息：测试服务器私钥/地址，绝不入库
+/server_info
+
+# Claude Code 本地设置
+/.claude
+
+# 根目录参考截图（非源码）
+/*.png
+
+# 其它
+.DS_Store
+**/*.rs.bk
+*.log
