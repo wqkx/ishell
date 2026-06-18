@@ -31,18 +31,51 @@ impl UiSink {
     }
 }
 
-/// russh 客户端回调处理器。这里采用「信任所有主机密钥」策略（仅用于演示）。
-/// 生产环境应校验 `known_hosts`。
-struct ClientHandler;
+/// russh 客户端回调处理器：校验主机密钥（known_hosts + 首次信任 TOFU）。
+struct ClientHandler {
+    host: String,
+    port: u16,
+    sink: UiSink,
+    /// UI 对"是否信任新主机"的回复
+    decision_rx: UnboundedReceiver<bool>,
+}
 
 impl Handler for ClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let fp = server_public_key
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
+            // 已记录且匹配
+            Ok(true) => Ok(true),
+            // 未知主机 -> 请 UI 确认（TOFU），同意则写入 known_hosts
+            Ok(false) => {
+                self.sink.send(WorkerEvent::HostKeyPrompt {
+                    host: format!("{}:{}", self.host, self.port),
+                    fingerprint: fp,
+                });
+                match self.decision_rx.recv().await {
+                    Some(true) => {
+                        let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
+            // 已记录但密钥不一致 -> 可能中间人攻击，拒绝并提示手动处理
+            Err(_) => {
+                self.sink.send(WorkerEvent::Error(format!(
+                    "主机密钥已改变（{}），可能存在中间人攻击！如确属服务器更换密钥，请手动编辑 ~/.ssh/known_hosts 删除旧行后重试。",
+                    fp
+                )));
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -51,10 +84,11 @@ pub async fn run(
     cfg: ConnectConfig,
     mut cmd_rx: UnboundedReceiver<UiCommand>,
     sink: UiSink,
+    hostkey_rx: UnboundedReceiver<bool>,
 ) {
     sink.send(WorkerEvent::Status(format!("正在连接 {}:{} …", cfg.host, cfg.port)));
 
-    let handle = match connect(&cfg, &sink).await {
+    let handle = match connect(&cfg, &sink, hostkey_rx).await {
         Ok(h) => h,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(format!("连接失败：{e}")));
@@ -216,14 +250,24 @@ pub async fn run(
 }
 
 /// 建立 TCP + SSH 握手并完成认证。
-async fn connect(cfg: &ConnectConfig, sink: &UiSink) -> anyhow::Result<Handle<ClientHandler>> {
+async fn connect(
+    cfg: &ConnectConfig,
+    sink: &UiSink,
+    hostkey_rx: UnboundedReceiver<bool>,
+) -> anyhow::Result<Handle<ClientHandler>> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         keepalive_interval: Some(Duration::from_secs(30)),
         ..Default::default()
     });
 
-    let mut handle = client::connect(config, (cfg.host.as_str(), cfg.port), ClientHandler).await?;
+    let handler = ClientHandler {
+        host: cfg.host.clone(),
+        port: cfg.port,
+        sink: sink.clone(),
+        decision_rx: hostkey_rx,
+    };
+    let mut handle = client::connect(config, (cfg.host.as_str(), cfg.port), handler).await?;
     sink.send(WorkerEvent::Status("正在认证 …".into()));
 
     let ok = match &cfg.auth {

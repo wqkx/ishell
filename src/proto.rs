@@ -65,6 +65,8 @@ pub enum WorkerEvent {
     SysInfo(Box<SysInfo>),
     /// 目录列表结果
     DirListing { path: String, entries: Vec<FileEntry> },
+    /// 首次连接的未知主机，请 UI 确认是否信任其指纹（TOFU）
+    HostKeyPrompt { host: String, fingerprint: String },
     /// 文本文件已读取，打开编辑器
     FileOpened { path: String, content: String },
     /// 一次文件操作成功完成（携带提示文本与需要刷新的目录）

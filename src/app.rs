@@ -34,6 +34,10 @@ struct Session {
     proc_sort_mem: bool,
     /// 已读取待打开到编辑器的文件（path, content）
     pending_open: Vec<(String, String)>,
+    /// 向 worker 回复"是否信任未知主机"
+    hostkey_tx: UnboundedSender<bool>,
+    /// 待确认的未知主机（host, 指纹）
+    pending_hostkey: Option<(String, String)>,
 }
 
 /// UI 侧的一条传输记录。
@@ -80,6 +84,10 @@ impl Session {
                 }
                 WorkerEvent::DirListing { path, entries } => {
                     self.files.on_listing(path, entries);
+                }
+                WorkerEvent::HostKeyPrompt { host, fingerprint } => {
+                    self.pending_hostkey = Some((host, fingerprint));
+                    self.status = "等待确认主机指纹 …".into();
                 }
                 WorkerEvent::FileOpened { path, content } => {
                     self.pending_open.push((path, content));
@@ -273,9 +281,10 @@ impl App {
         self.show_close_confirm = false; // 新建会话则取消退出提示
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let (hostkey_tx, hostkey_rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = UiSink::new(evt_tx, self.ctx.clone());
 
-        self.runtime.spawn(ssh::run(cfg.clone(), cmd_rx, sink));
+        self.runtime.spawn(ssh::run(cfg.clone(), cmd_rx, sink, hostkey_rx));
 
         self.sessions.push(Session {
             title: format!("{}@{}", cfg.username, cfg.host),
@@ -294,6 +303,8 @@ impl App {
             selected_nic: String::new(),
             proc_sort_mem: false,
             pending_open: Vec::new(),
+            hostkey_tx,
+            pending_hostkey: None,
         });
         self.active = Some(self.sessions.len() - 1);
     }
@@ -473,6 +484,9 @@ impl eframe::App for App {
         // 文本编辑器浮窗
         self.editor_window(&ctx);
 
+        // 未知主机指纹确认（TOFU）
+        self.host_key_dialog(&ctx);
+
         // 关闭确认：仍有会话连接时，先弹确认
         self.handle_close(&ctx);
 
@@ -482,6 +496,45 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// 未知主机首次连接：确认指纹（TOFU），同意则 worker 写入 known_hosts。
+    fn host_key_dialog(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.sessions.iter().position(|s| s.pending_hostkey.is_some()) else {
+            return;
+        };
+        let (host, fp) = self.sessions[idx].pending_hostkey.clone().unwrap();
+        let mut decision: Option<bool> = None;
+        egui::Window::new("未知主机")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.label(format!("首次连接主机：{host}"));
+                ui.add_space(4.0);
+                ui.label(RichText::new("指纹 (SHA256)：").color(Palette::TEXT_DIM).size(12.0));
+                ui.label(RichText::new(&fp).monospace());
+                ui.add_space(6.0);
+                ui.label(RichText::new("请确认该指纹与目标服务器一致；信任后将写入 ~/.ssh/known_hosts。").color(Palette::TEXT_DIM).size(11.0));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let bw = 96.0;
+                    let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                    ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                    if ui.add(egui::Button::new(RichText::new("信任并连接").color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 28.0))).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.add(egui::Button::new("拒绝").min_size(egui::vec2(bw, 28.0))).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if let Some(d) = decision {
+            let s = &mut self.sessions[idx];
+            let _ = s.hostkey_tx.send(d);
+            s.pending_hostkey = None;
+        }
+    }
+
     /// 关闭窗口前确认（仍有会话时）。
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested())

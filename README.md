@@ -87,7 +87,8 @@ cargo run --release
 
 ## 安全说明
 
-当前 `check_server_key` 信任所有主机密钥（仅便于演示）。生产环境应实现 `known_hosts` 校验。
+- **主机密钥校验**：连接时按 `~/.ssh/known_hosts` 校验服务器指纹——已记录且匹配则直接连接；未知主机首次连接弹窗确认指纹（TOFU），同意后写入 known_hosts；若已记录但密钥改变则拒绝并告警（防中间人）。
+- 保存的连接密码目前为明文存于 `~/.config/ishell/connections.json`（个人工具取舍），如需可改为加密/系统钥匙串。
 
 ## 后续可扩展
 
