@@ -171,7 +171,8 @@ fn meter_row(ui: &mut egui::Ui, label: &str, percent: f32, detail: &str) {
     let percent = percent.clamp(0.0, 100.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 19.0), egui::Sense::hover());
     let p = ui.painter_at(rect);
-    let label_w = 56.0;
+    // 标签很短（CPU / 内存 / 交换），进度条紧贴文字右侧
+    let label_w = 34.0;
 
     p.text(
         rect.left_center() + Vec2::new(1.0, 0.0),

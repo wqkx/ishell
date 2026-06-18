@@ -49,26 +49,25 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Palette::TRACK);
 
-    // 左侧预留刻度标签区
-    let label_w = 46.0;
+    // 绘图区贴近左边界（不再预留左侧刻度栏），刻度文字浮动在曲线之上
     let plot = Rect::from_min_max(
-        egui::pos2(rect.left() + label_w, rect.top() + 9.0),
-        egui::pos2(rect.right() - 6.0, rect.bottom() - 6.0),
+        egui::pos2(rect.left() + 2.0, rect.top() + 9.0),
+        egui::pos2(rect.right() - 4.0, rect.bottom() - 6.0),
     );
 
     let raw_max = down.iter().chain(up.iter()).cloned().fold(0.0_f64, f64::max);
     let max = nice_ceiling(raw_max.max(1024.0)); // 至少 1KB，向上取整到“整”刻度
 
-    // 水平虚线网格 + 左侧刻度值（顶/中/底，仿 FinalShell）
+    // 水平虚线网格 + 浮动刻度值（顶/中/底）
     let grid_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0xb6, 0xb0, 0xa0));
     for frac in [1.0_f32, 0.5, 0.0] {
         let y = plot.bottom() - plot.height() * frac;
         dashed_hline(&painter, plot.left(), plot.right(), y, grid_stroke);
         let val = max * frac as f64;
-        // 刻度文字：紧凑、右对齐，离绘图区左边界留 8px（整体远离窗口边界）
+        // 刻度文字浮动在该网格线“上方”，左对齐贴近左边界
         painter.text(
-            egui::pos2(plot.left() - 8.0, y),
-            egui::Align2::RIGHT_CENTER,
+            egui::pos2(plot.left() + 2.0, y - 1.0),
+            egui::Align2::LEFT_BOTTOM,
             fmt_rate_compact(val),
             egui::FontId::proportional(9.0),
             Palette::TEXT_DIM,
