@@ -120,10 +120,10 @@ pub fn show(
         // 上下行速率（图标 + 文字，对齐）
         ui.horizontal(|ui| {
             ui.label(RichText::new(icon::ARROW_DOWN).color(Palette::OK).size(13.0));
-            ui.label(RichText::new(fmt_rate(rx)).color(Palette::TEXT).size(12.0));
+            ui.label(RichText::new(fmt_rate(rx)).color(Palette::TEXT).size(12.0).monospace());
             ui.add_space(12.0);
             ui.label(RichText::new(icon::ARROW_UP).color(Palette::ACCENT).size(13.0));
-            ui.label(RichText::new(fmt_rate(tx)).color(Palette::TEXT).size(12.0));
+            ui.label(RichText::new(fmt_rate(tx)).color(Palette::TEXT).size(12.0).monospace());
         });
         net_sparkline(ui, &hist.down_slice(), &hist.up_slice(), 76.0);
         ui.add_space(6.0);
@@ -194,7 +194,7 @@ fn meter_row(ui: &mut egui::Ui, label: &str, percent: f32, detail: &str) {
         bar.right_center() - Vec2::new(5.0, 0.0),
         egui::Align2::RIGHT_CENTER,
         detail,
-        egui::FontId::proportional(11.0),
+        egui::FontId::monospace(11.0),
         Palette::TEXT,
     );
 }
@@ -223,7 +223,7 @@ fn disk_row(ui: &mut egui::Ui, mount: &str, percent: f32, detail: &str) {
         rect.right_center() - Vec2::new(6.0, 0.0),
         egui::Align2::RIGHT_CENTER,
         detail,
-        egui::FontId::proportional(11.0),
+        egui::FontId::monospace(11.0),
         Palette::TEXT_DIM,
     );
 }
@@ -267,15 +267,15 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool) {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), egui::Sense::hover());
         let p = ui.painter_at(rect);
         p.text(rect.left_center(), egui::Align2::LEFT_CENTER, proc.pid.to_string(),
-            egui::FontId::proportional(11.0), Palette::TEXT_DIM);
+            egui::FontId::monospace(11.0), Palette::TEXT_DIM);
         // 内存%（最右）
         let mem_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w, 0.0), rect.right_bottom());
         p.text(mem_rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.mem),
-            egui::FontId::proportional(11.0), usage_color(proc.mem));
+            egui::FontId::monospace(11.0), usage_color(proc.mem));
         // CPU%（中右）
         let cpu_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w + cpu_w, 0.0), egui::pos2(rect.right() - mem_w, rect.bottom()));
         p.text(cpu_rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.cpu),
-            egui::FontId::proportional(11.0), usage_color(proc.cpu));
+            egui::FontId::monospace(11.0), usage_color(proc.cpu));
         // 名称（中间，截断）
         let name_rect = Rect::from_min_max(
             rect.left_top() + Vec2::new(pid_w, 0.0),

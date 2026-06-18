@@ -69,7 +69,7 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32) {
             egui::pos2(plot.left() + 2.0, y - 1.0),
             egui::Align2::LEFT_BOTTOM,
             fmt_rate_compact(val),
-            egui::FontId::proportional(9.0),
+            egui::FontId::monospace(9.0),
             Palette::TEXT_DIM,
         );
     }

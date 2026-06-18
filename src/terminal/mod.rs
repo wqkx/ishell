@@ -70,7 +70,7 @@ impl Terminal {
             sel_anchor: None,
             sel_cursor: None,
             clipboard: None,
-            dark: true,
+            dark: false,
         }
     }
 
