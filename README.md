@@ -90,7 +90,7 @@ cargo run --release
 ## 安全说明
 
 - **主机密钥校验**：连接时按 `~/.ssh/known_hosts` 校验服务器指纹——已记录且匹配则直接连接；未知主机首次连接弹窗确认指纹（TOFU），同意后写入 known_hosts；若已记录但密钥改变则拒绝并告警（防中间人）。
-- 保存的连接密码目前为明文存于 `~/.config/ishell/connections.json`（个人工具取舍），如需可改为加密/系统钥匙串。
+- **保存密码加密**：连接密码/口令以 ChaCha20-Poly1305 加密存于 `connections.json`（前缀 `enc:v1:`），密钥随机生成于 `~/.config/ishell/key`（0600）；旧明文文件首次启动自动迁移为密文。属 at-rest 加密（密钥同机），可挡直接读文件偷密码，换机需一并带上 `key`。
 
 ## 后续可扩展
 

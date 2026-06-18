@@ -1,14 +1,22 @@
 //! 已保存连接的持久化（`~/.config/ishell/connections.json`）。
 //!
-//! 注意：为便于使用，密码以**明文**保存在用户配置目录。这是个人本地工具的取舍，
-//! 若用于多人环境请改为系统密钥环或加密存储。
+//! 密码/口令在磁盘上以 **ChaCha20-Poly1305** 加密存储（前缀 `enc:v1:`），密钥随机生成
+//! 保存在 `~/.config/ishell/key`（0600）。**内存中始终为明文**，其余代码无需感知加密。
 //!
-//! 兼容性：所有字段都带 `#[serde(default)]`，新增字段不会导致旧文件解析失败；
-//! 升级后仍能读出旧的账号/密码。解析失败时会把原文件备份为 `.bak`，避免被覆盖丢失。
+//! 说明：这是「at-rest」加密——能挡住直接读文件偷密码；但密钥就在同机，无法防御
+//! 拿到本机完整权限的攻击者（个人工具取舍）。换机时需同时带上 `key` 才能解密。
+//!
+//! 兼容性：所有字段带 `#[serde(default)]`，新增字段不致旧文件解析失败；读到旧明文密码
+//! 会自动改写为密文（迁移）。解析失败时把原文件备份为 `.bak`，避免被覆盖丢失。
 
 use std::path::PathBuf;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
+
+const ENC_PREFIX: &str = "enc:v1:";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SavedConnection {
@@ -38,33 +46,133 @@ fn default_port() -> u16 {
     22
 }
 
-fn config_path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(home.join(".config").join("ishell").join("connections.json"))
+    Some(home.join(".config").join("ishell"))
+}
+fn config_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("connections.json"))
 }
 
-/// 读取已保存连接列表。
+// ---------- 密钥与加解密 ----------
+
+/// 读取本地密钥；不存在则随机生成并以 0600 写入。
+fn load_or_create_key() -> Option<[u8; 32]> {
+    let path = config_dir()?.join("key");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes);
+            return Some(k);
+        }
+    }
+    let mut k = [0u8; 32];
+    getrandom::getrandom(&mut k).ok()?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(&path, k).is_err() {
+        return None;
+    }
+    restrict_perms(&path);
+    Some(k)
+}
+
+#[cfg(unix)]
+fn restrict_perms(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn restrict_perms(_path: &std::path::Path) {}
+
+fn cipher() -> Option<ChaCha20Poly1305> {
+    let k = load_or_create_key()?;
+    Some(ChaCha20Poly1305::new(Key::from_slice(&k)))
+}
+
+/// 加密一个秘密字段为 `enc:v1:<base64(nonce||ciphertext)>`；
+/// 空串原样返回；任何失败则退化为明文（不阻断保存）。
+pub fn encrypt_secret(plain: &str) -> String {
+    if plain.is_empty() {
+        return String::new();
+    }
+    if plain.starts_with(ENC_PREFIX) {
+        return plain.to_string(); // 已是密文
+    }
+    let Some(c) = cipher() else { return plain.to_string() };
+    let mut nonce = [0u8; 12];
+    if getrandom::getrandom(&mut nonce).is_err() {
+        return plain.to_string();
+    }
+    match c.encrypt(Nonce::from_slice(&nonce), plain.as_bytes()) {
+        Ok(ct) => {
+            let mut blob = nonce.to_vec();
+            blob.extend_from_slice(&ct);
+            format!("{ENC_PREFIX}{}", STANDARD.encode(blob))
+        }
+        Err(_) => plain.to_string(),
+    }
+}
+
+/// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回；解密失败返回空串。
+pub fn decrypt_secret(s: &str) -> String {
+    let Some(rest) = s.strip_prefix(ENC_PREFIX) else {
+        return s.to_string();
+    };
+    let Some(c) = cipher() else { return String::new() };
+    let Ok(blob) = STANDARD.decode(rest) else {
+        return String::new();
+    };
+    if blob.len() < 12 {
+        return String::new();
+    }
+    let (nonce, ct) = blob.split_at(12);
+    c.decrypt(Nonce::from_slice(nonce), ct)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default()
+}
+
+// ---------- 读写 ----------
+
+/// 读取已保存连接列表（内存中为明文密码）。
 ///
 /// - 文件不存在 → 空列表
-/// - 解析失败 → **先把原文件备份为 `connections.json.bak`**，再返回空（避免后续 `save` 覆盖丢数据）
+/// - 解析失败 → 先把原文件备份为 `connections.json.bak`，再返回空（避免被覆盖丢失）
+/// - 读到旧明文密码 → 自动改写为密文（迁移），无需用户操作
 pub fn load() -> Vec<SavedConnection> {
     let Some(path) = config_path() else {
         return Vec::new();
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new(); // 文件不存在
+        return Vec::new();
     };
-    match serde_json::from_str::<Vec<SavedConnection>>(&text) {
-        Ok(list) => list,
+    let mut list: Vec<SavedConnection> = match serde_json::from_str(&text) {
+        Ok(l) => l,
         Err(e) => {
             log::warn!("connections.json 解析失败：{e}，已备份为 .bak");
             let _ = std::fs::write(path.with_extension("json.bak"), &text);
-            Vec::new()
+            return Vec::new();
         }
+    };
+    // 检测是否存在旧明文（需要迁移）
+    let needs_migrate = list.iter().any(|c| {
+        (!c.password.is_empty() && !c.password.starts_with(ENC_PREFIX))
+            || (!c.passphrase.is_empty() && !c.passphrase.starts_with(ENC_PREFIX))
+    });
+    // 解密到内存明文
+    for c in &mut list {
+        c.password = decrypt_secret(&c.password);
+        c.passphrase = decrypt_secret(&c.passphrase);
     }
+    if needs_migrate {
+        save(&list); // 以密文重写，完成迁移
+    }
+    list
 }
 
-/// 写回连接列表。
+/// 写回连接列表（密码/口令加密后落盘）。
 pub fn save(list: &[SavedConnection]) {
     let Some(path) = config_path() else {
         return;
@@ -72,7 +180,18 @@ pub fn save(list: &[SavedConnection]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(json) = serde_json::to_string_pretty(list) {
-        let _ = std::fs::write(&path, json);
+    let encrypted: Vec<SavedConnection> = list
+        .iter()
+        .map(|c| {
+            let mut e = c.clone();
+            e.password = encrypt_secret(&c.password);
+            e.passphrase = encrypt_secret(&c.passphrase);
+            e
+        })
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&encrypted) {
+        if std::fs::write(&path, json).is_ok() {
+            restrict_perms(&path);
+        }
     }
 }
