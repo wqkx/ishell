@@ -169,6 +169,8 @@ pub struct App {
     /// 正在拖拽排序的标签源索引
     dragging_tab: Option<usize>,
     connect_form: ConnectForm,
+    /// 默认下载目录（可在传输窗中修改，持久化）
+    download_dir: std::path::PathBuf,
     /// 传输进度浮窗是否显示
     show_transfers: bool,
     /// 传输浮窗刚打开（本帧跳过"点击外部关闭"判定）
@@ -283,6 +285,7 @@ impl App {
             active: None,
             dragging_tab: None,
             connect_form: form,
+            download_dir: crate::store::load_download_dir().map(std::path::PathBuf::from).unwrap_or_else(downloads_dir),
             show_transfers: false,
             xfer_just_opened: false,
             show_close_confirm: false,
@@ -489,7 +492,7 @@ impl App {
             }
             FileAction::Download(remote) => {
                 let name = remote.rsplit('/').next().unwrap_or("download").to_string();
-                let local = downloads_dir().join(&name).to_string_lossy().into_owned();
+                let local = self.download_dir.join(&name).to_string_lossy().into_owned();
                 let id = s.next_xfer;
                 s.next_xfer += 1;
                 s.transfers.push(Transfer {
@@ -1290,6 +1293,8 @@ impl App {
         let Some(idx) = self.active else { return };
         let mut close_win = false;
         let mut clear = false;
+        let mut pick_dir = false;
+        let dl_dir = self.download_dir.to_string_lossy().into_owned();
         let win = egui::Window::new("transfer_win")
             .title_bar(false) // 隐藏过大的默认标题，使用自定义紧凑标题
             .anchor(egui::Align2::RIGHT_TOP, [-10.0, 44.0])
@@ -1307,6 +1312,13 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                             close_win = true;
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new(icon::FOLDER_OPEN).size(13.0).color(Palette::TEXT_DIM)).frame(false))
+                            .on_hover_text(format!("选择默认下载文件夹\n当前：{}", dl_dir))
+                            .clicked()
+                        {
+                            pick_dir = true;
                         }
                     });
                 });
@@ -1371,6 +1383,14 @@ impl App {
             if let Some(s) = self.sessions.get_mut(idx) {
                 s.transfers.retain(|t| t.ok.is_none());
             }
+        }
+        // 选择默认下载目录（原生文件夹选择器）
+        if pick_dir {
+            if let Some(dir) = rfd::FileDialog::new().set_title("选择默认下载文件夹").pick_folder() {
+                self.download_dir = dir.clone();
+                crate::store::save_download_dir(&dir.to_string_lossy());
+            }
+            self.xfer_just_opened = true; // 选择期间点击不算"外部点击"，避免关窗
         }
         // 点击窗口外部任意位置自动隐藏（打开当帧除外，避免被开启动作立即关闭）
         let clicked_outside = win

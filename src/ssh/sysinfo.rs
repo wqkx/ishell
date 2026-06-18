@@ -19,7 +19,9 @@ echo '===MEM==='; grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/memin
 echo '===NET==='; cat /proc/net/dev 2>/dev/null
 echo '===DISK==='; df -kP 2>/dev/null
 echo '===PROC==='; ps -eo pid,%cpu,%mem,comm --sort=-%cpu 2>/dev/null | head -n 41
-echo '===GPU==='; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null
+echo '===GPU==='
+nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null
+for d in /sys/class/drm/card[0-9]*/device; do [ -r "$d/gpu_busy_percent" ] || continue; v=$(cat "$d/vendor" 2>/dev/null); case "$v" in 0x1002) vn="AMD GPU";; 0x8086) vn="Intel GPU";; *) vn="GPU";; esac; busy=$(cat "$d/gpu_busy_percent" 2>/dev/null || echo 0); used=$(cat "$d/mem_info_vram_used" 2>/dev/null || echo 0); total=$(cat "$d/mem_info_vram_total" 2>/dev/null || echo 0); idx=$(basename "$(dirname "$d")" | tr -dc 0-9); echo "$idx, $vn, ${busy:-0}, $((${used:-0}/1048576)), $((${total:-0}/1048576))"; done 2>/dev/null
 echo '===END==='
 "#;
 

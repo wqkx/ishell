@@ -151,6 +151,34 @@ pub fn decrypt_secret(s: &str) -> String {
         .unwrap_or_default()
 }
 
+// ---------- 默认下载目录设置 ----------
+
+fn download_dir_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("download_dir"))
+}
+
+/// 读取用户设置的默认下载目录（未设置则 None）。
+pub fn load_download_dir() -> Option<String> {
+    let p = download_dir_path()?;
+    let s = std::fs::read_to_string(p).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 保存默认下载目录。
+pub fn save_download_dir(dir: &str) {
+    if let Some(p) = download_dir_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, dir);
+    }
+}
+
 // ---------- 读写 ----------
 
 /// 读取已保存连接列表（内存中为明文密码）。
