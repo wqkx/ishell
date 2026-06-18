@@ -4,7 +4,7 @@
 use egui::{Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, TextFormat, Vec2};
 use egui::text::LayoutJob;
 
-/// 单字符的渲染字号（pt）。
+/// 默认字号（pt）。
 const FONT_SIZE: f32 = 14.0;
 
 pub struct Terminal {
@@ -12,6 +12,13 @@ pub struct Terminal {
     cols: u16,
     rows: u16,
     scrollback: usize,
+    /// 可调字号（Ctrl+滚轮）
+    font_size: f32,
+    /// 选区两端（屏幕字符坐标 row,col）；None 表示无选区
+    sel_anchor: Option<(u16, u16)>,
+    sel_cursor: Option<(u16, u16)>,
+    /// 系统剪贴板（懒初始化，用于右键粘贴）
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl Terminal {
@@ -21,7 +28,63 @@ impl Terminal {
             cols: 80,
             rows: 24,
             scrollback: 0,
+            font_size: FONT_SIZE,
+            sel_anchor: None,
+            sel_cursor: None,
+            clipboard: None,
         }
+    }
+
+    /// 选区按阅读顺序的 (起, 止)（含两端）。
+    fn ordered_selection(&self) -> Option<((u16, u16), (u16, u16))> {
+        let (a, b) = (self.sel_anchor?, self.sel_cursor?);
+        if (a.0, a.1) <= (b.0, b.1) {
+            Some((a, b))
+        } else {
+            Some((b, a))
+        }
+    }
+
+    /// 提取选中文本（按行拼接，行尾去除多余空格）。
+    fn selected_text(&self) -> Option<String> {
+        let ((sr, sc), (er, ec)) = self.ordered_selection()?;
+        let screen = self.parser.screen();
+        let mut out = String::new();
+        for row in sr..=er {
+            let c0 = if row == sr { sc } else { 0 };
+            let c1 = if row == er { ec } else { self.cols.saturating_sub(1) };
+            let mut line = String::new();
+            for col in c0..=c1 {
+                let ch = screen.cell(row, col).map(|c| c.contents()).unwrap_or_default();
+                line.push_str(if ch.is_empty() { " " } else { ch });
+            }
+            out.push_str(line.trim_end());
+            if row != er {
+                out.push('\n');
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        matches!((self.sel_anchor, self.sel_cursor), (Some(a), Some(b)) if a != b)
+    }
+
+    fn clear_selection(&mut self) {
+        self.sel_anchor = None;
+        self.sel_cursor = None;
+    }
+
+    /// 读系统剪贴板（懒初始化）。
+    fn read_clipboard(&mut self) -> Option<String> {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        self.clipboard.as_mut()?.get_text().ok()
     }
 
     /// 喂入来自远程的原始字节。
@@ -50,7 +113,7 @@ impl Terminal {
     ///
     /// `focused` 表示终端区域是否持有焦点，决定是否采集键盘事件。
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Vec<u8> {
-        let font = FontId::monospace(FONT_SIZE);
+        let font = FontId::monospace(self.font_size);
         // 以字符 'M' 的宽高度量单元格尺寸
         let (char_w, char_h) = ui.ctx().fonts_mut(|f| {
             let w = f.glyph_width(&font, 'M');
@@ -88,20 +151,46 @@ impl Terminal {
         let new_rows = (avail.y / char_h).floor().max(1.0) as u16;
         self.resize(new_cols, new_rows);
 
-        // 鼠标滚轮 -> scrollback
+        // 滚轮：Ctrl+滚轮调字号，否则回滚 scrollback
         if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            let (scroll, ctrl) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl || i.modifiers.command));
             if scroll != 0.0 {
-                let lines = (scroll / char_h).round() as i64;
-                let nb = (self.scrollback as i64 + lines).clamp(0, 5000) as usize;
-                self.scrollback = nb;
-                self.parser.screen_mut().set_scrollback(nb);
+                if ctrl {
+                    self.font_size = (self.font_size + scroll.signum() * 1.0).clamp(8.0, 32.0);
+                } else {
+                    let lines = (scroll / char_h).round() as i64;
+                    let nb = (self.scrollback as i64 + lines).clamp(0, 5000) as usize;
+                    self.scrollback = nb;
+                    self.parser.screen_mut().set_scrollback(nb);
+                }
             }
+        }
+
+        // 鼠标拖拽选择文本（屏幕字符坐标）
+        let cell_at = |pos: egui::Pos2| -> (u16, u16) {
+            let c = (((pos.x - rect.left()) / char_w).floor() as i32).clamp(0, self.cols as i32 - 1) as u16;
+            let r = (((pos.y - rect.top()) / char_h).floor() as i32).clamp(0, self.rows as i32 - 1) as u16;
+            (r, c)
+        };
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let c = cell_at(p);
+                self.sel_anchor = Some(c);
+                self.sel_cursor = Some(c);
+            }
+        } else if resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.sel_cursor = Some(cell_at(p));
+            }
+        }
+        if resp.clicked() {
+            self.clear_selection();
         }
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, crate::theme::Palette::TERM_BG);
 
+        let sel = self.ordered_selection();
         let screen = self.parser.screen();
         let origin = rect.min;
         for row in 0..self.rows {
@@ -142,6 +231,22 @@ impl Terminal {
             let pos = origin + Vec2::new(0.0, row as f32 * char_h);
             // 先绘制该行的背景块（处理非默认底色）
             paint_row_backgrounds(&painter, screen, row, self.cols, origin, cell);
+            // 选区高亮（半透明，文字仍可见）
+            if let Some(((sr, sc), (er, ec))) = sel {
+                if row >= sr && row <= er {
+                    let c0 = if row == sr { sc } else { 0 };
+                    let c1 = if row == er { ec } else { self.cols.saturating_sub(1) };
+                    let x0 = origin.x + c0 as f32 * char_w;
+                    let x1 = origin.x + (c1 as f32 + 1.0) * char_w;
+                    let y = origin.y + row as f32 * char_h;
+                    let a = crate::theme::Palette::ACCENT;
+                    painter.rect_filled(
+                        Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)),
+                        0.0,
+                        Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 80),
+                    );
+                }
+            }
             let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
             painter.galley(pos, galley, Color32::WHITE);
         }
@@ -163,11 +268,41 @@ impl Terminal {
             }
         }
 
-        if focused {
-            self.collect_input(ui)
-        } else {
-            Vec::new()
+        // 键盘输入
+        let mut out = if focused { self.collect_input(ui) } else { Vec::new() };
+
+        // 复制/粘贴：Ctrl+Shift+C / Ctrl+Shift+V，以及右键菜单
+        let (copy_sc, paste_sc) = ui.input(|i| {
+            let m = i.modifiers.command || i.modifiers.ctrl;
+            (
+                m && i.modifiers.shift && i.key_pressed(Key::C),
+                m && i.modifiers.shift && i.key_pressed(Key::V),
+            )
+        });
+        let mut do_copy = copy_sc;
+        let mut do_paste = paste_sc;
+        resp.context_menu(|ui| {
+            let sel = self.has_selection();
+            if ui.add_enabled(sel, egui::Button::new("复制")).clicked() {
+                do_copy = true;
+                ui.close();
+            }
+            if ui.button("粘贴").clicked() {
+                do_paste = true;
+                ui.close();
+            }
+        });
+        if do_copy {
+            if let Some(t) = self.selected_text() {
+                ui.ctx().copy_text(t);
+            }
         }
+        if do_paste {
+            if let Some(t) = self.read_clipboard() {
+                out.extend_from_slice(t.as_bytes());
+            }
+        }
+        out
     }
 
     /// 把本帧键盘事件编码为终端字节。
@@ -197,6 +332,10 @@ impl Default for Terminal {
 
 /// 把特殊按键编码为 ANSI 转义序列；Ctrl 组合键编码为控制字符。
 fn encode_key(key: Key, mods: Modifiers, out: &mut Vec<u8>) {
+    // Ctrl+Shift+C/V 保留给复制/粘贴，不作为终端输入
+    if (mods.ctrl || mods.command) && mods.shift && matches!(key, Key::C | Key::V) {
+        return;
+    }
     // Ctrl + 字母 -> 0x01..0x1a
     if mods.ctrl {
         if let Some(c) = key_to_ascii_letter(key) {
