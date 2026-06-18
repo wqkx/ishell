@@ -156,6 +156,19 @@ pub struct SysInfo {
     pub nets: Vec<NetIface>,
     pub disks: Vec<DiskInfo>,
     pub procs: Vec<ProcInfo>,
+    /// GPU 列表（无 NVIDIA GPU 或无 nvidia-smi 时为空）
+    pub gpus: Vec<GpuInfo>,
+}
+
+/// 单块 GPU 信息（来自 nvidia-smi）。
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    pub index: u32,
+    pub name: String,
+    /// 使用率 0..100
+    pub util: f32,
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
 }
 
 #[derive(Clone, Debug)]

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::proto::{DiskInfo, ProcInfo, SysInfo};
+use crate::proto::{DiskInfo, GpuInfo, ProcInfo, SysInfo};
 
 /// 采集命令：一次 SSH exec 取回所有原始数据，用 `===MARK===` 分段，便于解析。
 pub const PROBE_CMD: &str = r#"
@@ -19,6 +19,7 @@ echo '===MEM==='; grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/memin
 echo '===NET==='; cat /proc/net/dev 2>/dev/null
 echo '===DISK==='; df -kP 2>/dev/null
 echo '===PROC==='; ps -eo pid,%cpu,%mem,comm --sort=-%cpu 2>/dev/null | head -n 41
+echo '===GPU==='; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null
 echo '===END==='
 "#;
 
@@ -83,6 +84,9 @@ impl SysSampler {
         }
         if let Some(s) = sections.get("PROC") {
             info.procs = parse_proc(s);
+        }
+        if let Some(s) = sections.get("GPU") {
+            info.gpus = parse_gpu(s);
         }
 
         self.prev_instant = Some(std::time::Instant::now());
@@ -265,6 +269,30 @@ fn parse_proc(raw: &str) -> Vec<ProcInfo> {
     out
 }
 
+/// 解析 nvidia-smi CSV：index, name, util.gpu, mem.used, mem.total（均无单位）。
+fn parse_gpu(raw: &str) -> Vec<GpuInfo> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        let Ok(index) = cols[0].parse::<u32>() else { continue };
+        out.push(GpuInfo {
+            index,
+            name: cols[1].to_string(),
+            util: cols[2].parse().unwrap_or(0.0),
+            mem_used_mb: cols[3].parse().unwrap_or(0),
+            mem_total_mb: cols[4].parse().unwrap_or(0),
+        });
+    }
+    out
+}
+
 fn fmt_uptime(secs: u64) -> String {
     let d = secs / 86400;
     let h = (secs % 86400) / 3600;
@@ -275,5 +303,28 @@ fn fmt_uptime(secs: u64) -> String {
         format!("{h}时 {m}分")
     } else {
         format!("{m}分")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_gpu_csv() {
+        let raw = "0, NVIDIA GeForce RTX 4090, 73, 18000, 24564\n1, NVIDIA GeForce RTX 4090, 12, 2000, 24564\n";
+        let g = parse_gpu(raw);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].index, 0);
+        assert_eq!(g[0].util as i32, 73);
+        assert_eq!(g[0].mem_used_mb, 18000);
+        assert_eq!(g[1].index, 1);
+        assert_eq!(g[1].mem_total_mb, 24564);
+    }
+
+    #[test]
+    fn parse_gpu_empty() {
+        assert!(parse_gpu("").is_empty());
+        assert!(parse_gpu("\n\n").is_empty());
     }
 }

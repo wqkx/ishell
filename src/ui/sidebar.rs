@@ -40,6 +40,7 @@ pub fn show(
     selected_nic: &mut String,
     sort_mem: &mut bool,
     proc_click: &mut Option<(u32, egui::Pos2)>,
+    gpu_click: &mut Option<egui::Pos2>,
 ) {
     use egui_phosphor::regular as icon;
     egui::ScrollArea::vertical()
@@ -85,6 +86,14 @@ pub fn show(
                 format!("{}/{}", fmt_kb(info.swap_used_kb), fmt_kb(info.swap_total_kb))
             },
         );
+        // GPU（如有）：总（平均）使用率，单击查看每块详情
+        if !info.gpus.is_empty() {
+            let avg = info.gpus.iter().map(|g| g.util).sum::<f32>() / info.gpus.len() as f32;
+            let resp = gpu_meter(ui, avg, info.gpus.len());
+            if resp.clicked() {
+                *gpu_click = resp.interact_pointer_pos().or(Some(resp.rect.left_bottom()));
+            }
+        }
         ui.add_space(6.0);
 
         // —— 进程（≤5，可按 CPU/内存 排序） ——
@@ -200,6 +209,28 @@ fn meter_row(ui: &mut egui::Ui, label: &str, percent: f32, detail: &str) {
         egui::FontId::monospace(11.0),
         Palette::TEXT,
     );
+}
+
+/// GPU 单行：与 meter_row 同款，但可单击（查看每块详情）。
+fn gpu_meter(ui: &mut egui::Ui, percent: f32, count: usize) -> egui::Response {
+    let percent = percent.clamp(0.0, 100.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 19.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect.expand2(Vec2::new(2.0, 0.0)), 3.0, Palette::PANEL_2);
+    }
+    let p = ui.painter_at(rect);
+    let label_w = 34.0;
+    p.text(rect.left_center() + Vec2::new(1.0, 0.0), egui::Align2::LEFT_CENTER, "GPU",
+        egui::FontId::proportional(12.0), Palette::TEXT);
+    let bar = Rect::from_min_max(rect.left_top() + Vec2::new(label_w, 2.0), rect.right_bottom() - Vec2::new(0.0, 2.0));
+    p.rect_filled(bar, 0.0, Palette::TRACK);
+    let mut fill = bar;
+    fill.set_width((bar.width() * percent / 100.0).max(2.0));
+    p.rect_filled(fill, 0.0, usage_color(percent));
+    let detail = if count > 1 { format!("{count} 卡  {percent:.0}%") } else { format!("{percent:.0}%") };
+    p.text(bar.right_center() - Vec2::new(5.0, 0.0), egui::Align2::RIGHT_CENTER, detail,
+        egui::FontId::monospace(11.0), Palette::TEXT);
+    resp
 }
 
 /// 磁盘单行：浅色底，使用量从右侧填充；左挂载点、右「可用/总量」。

@@ -189,6 +189,11 @@ pub struct App {
     /// 进程详情小窗
     proc_popup: Option<ProcPopup>,
     proc_popup_just_opened: bool,
+    /// GPU 详情小窗（仅记录弹出位置，数据每帧从活动会话取）
+    gpu_popup: Option<egui::Pos2>,
+    gpu_popup_just_opened: bool,
+    /// 自检：每帧注入假 GPU 数据并保持详情窗打开（仅截图核对用）
+    demo_gpu: bool,
     /// 自检截图模式（由环境变量触发，正常使用时为 None）
     shot: Option<Shot>,
 }
@@ -289,6 +294,9 @@ impl App {
             fwd_form: ForwardForm::default(),
             proc_popup: None,
             proc_popup_just_opened: false,
+            gpu_popup: None,
+            gpu_popup_just_opened: false,
+            demo_gpu: std::env::var("ISHELL_DEMO_GPU").is_ok(),
             shot,
         };
 
@@ -565,6 +573,20 @@ impl eframe::App for App {
             }
         }
 
+        // 自检：注入假 GPU 数据并保持详情窗打开
+        if self.demo_gpu {
+            if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
+                if let Some(si) = s.sysinfo.as_mut() {
+                    si.gpus = vec![
+                        crate::proto::GpuInfo { index: 0, name: "RTX 4090".into(), util: 73.0, mem_used_mb: 18000, mem_total_mb: 24564 },
+                        crate::proto::GpuInfo { index: 1, name: "RTX 4090".into(), util: 12.0, mem_used_mb: 2000, mem_total_mb: 24564 },
+                    ];
+                }
+            }
+            self.gpu_popup = Some(egui::pos2(130.0, 130.0));
+            self.gpu_popup_just_opened = true;
+        }
+
         // 进程详情返回 -> 填充小窗
         if let Some(idx) = self.active {
             let detail = self.sessions.get_mut(idx).and_then(|s| s.proc_detail.take());
@@ -587,6 +609,7 @@ impl eframe::App for App {
 
         // 3) 左侧操作栏：独立全高区域
         let mut proc_click: Option<(u32, egui::Pos2)> = None;
+        let mut gpu_click: Option<egui::Pos2> = None;
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(300.0)
@@ -595,7 +618,7 @@ impl eframe::App for App {
             .show_inside(ui, |ui| match self.active {
                 Some(idx) if idx < self.sessions.len() => {
                     let s = &mut self.sessions[idx];
-                    sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click);
+                    sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click, &mut gpu_click);
                 }
                 _ => {
                     ui.add_space(16.0);
@@ -622,6 +645,10 @@ impl eframe::App for App {
                 self.proc_popup_just_opened = true;
             }
         }
+        if let Some(pos) = gpu_click {
+            self.gpu_popup = Some(pos);
+            self.gpu_popup_just_opened = true;
+        }
 
         // 4) 顶部选项卡（仅位于右侧区域之上）
         self.top_tabs(ui);
@@ -640,6 +667,9 @@ impl eframe::App for App {
 
         // 进程详情小窗
         self.proc_popup_window(&ctx);
+
+        // GPU 详情小窗
+        self.gpu_popup_window(&ctx);
 
         // 文本编辑器浮窗
         self.editor_window(&ctx);
@@ -986,6 +1016,69 @@ impl App {
             // 关闭大文件后把空闲内存归还 OS
             trim_memory();
         }
+    }
+
+    /// GPU 详情小窗：每块 GPU 使用率 + 显存；鼠标移开或点击外部关闭。
+    fn gpu_popup_window(&mut self, ctx: &egui::Context) {
+        use egui_phosphor::regular as icon;
+        let Some(pos) = self.gpu_popup else { return };
+        // 取活动会话的 GPU 列表（克隆，避免借用冲突）
+        let gpus = self
+            .active
+            .and_then(|i| self.sessions.get(i))
+            .and_then(|s| s.sysinfo.as_ref())
+            .map(|si| si.gpus.clone())
+            .unwrap_or_default();
+        if gpus.is_empty() {
+            self.gpu_popup = None;
+            return;
+        }
+        let mut close = false;
+        let win = egui::Window::new("gpu_popup")
+            .title_bar(false)
+            // 窗口套在光标上（光标落在窗口内），这样「鼠标移开即关闭」不会一打开就触发
+            .fixed_pos(pos - egui::vec2(10.0, 10.0))
+            .resizable(false)
+            .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
+            .show(ctx, |ui| {
+                ui.set_max_width(300.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}  GPU 详情", icon::CPU)).strong().size(13.0).color(Palette::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                for g in &gpus {
+                    ui.label(RichText::new(format!("GPU{} {}", g.index, g.name)).size(12.0).color(Palette::TEXT));
+                    let mem_pct = if g.mem_total_mb > 0 { g.mem_used_mb as f32 / g.mem_total_mb as f32 * 100.0 } else { 0.0 };
+                    ui.add(
+                        egui::ProgressBar::new((g.util / 100.0).clamp(0.0, 1.0))
+                            .fill(crate::ui::usage_color(g.util))
+                            .text(RichText::new(format!("使用率 {:.0}%", g.util)).size(10.0))
+                            .desired_height(12.0)
+                            .corner_radius(2.0),
+                    );
+                    ui.add(
+                        egui::ProgressBar::new((mem_pct / 100.0).clamp(0.0, 1.0))
+                            .fill(Palette::ACCENT)
+                            .text(RichText::new(format!("显存 {}/{} MB", g.mem_used_mb, g.mem_total_mb)).size(10.0))
+                            .desired_height(12.0)
+                            .corner_radius(2.0),
+                    );
+                    ui.add_space(5.0);
+                }
+            });
+
+        // 鼠标移开（不在窗口上）或点击外部 -> 关闭
+        let hovered = win.as_ref().map(|r| r.response.hovered()).unwrap_or(false);
+        let outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
+        if close || ((outside || !hovered) && !self.gpu_popup_just_opened) {
+            self.gpu_popup = None;
+        }
+        self.gpu_popup_just_opened = false;
     }
 
     /// 进程详情小窗：显示资源/目录/命令 + 强制结束；点击外部关闭。
