@@ -274,6 +274,31 @@ pub async fn run(
                             sink.send(WorkerEvent::Error("SFTP 不可用".into()));
                         }
                     }
+                    Some(UiCommand::ProcDetail(pid)) => {
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        tokio::spawn(async move {
+                            // cmdline（NUL 转空格）/ cwd / exe，三行返回
+                            let cmd = format!(
+                                "cat /proc/{pid}/cmdline 2>/dev/null | tr '\\0' ' '; echo; readlink /proc/{pid}/cwd 2>/dev/null; readlink /proc/{pid}/exe 2>/dev/null"
+                            );
+                            if let Ok(out) = exec_capture(&h, &cmd).await {
+                                let mut it = out.split('\n');
+                                let cmdline = it.next().unwrap_or("").trim().to_string();
+                                let cwd = it.next().unwrap_or("").trim().to_string();
+                                let exe = it.next().unwrap_or("").trim().to_string();
+                                s.send(WorkerEvent::ProcDetail { pid, cmd: cmdline, cwd, exe });
+                            }
+                        });
+                    }
+                    Some(UiCommand::KillProc(pid)) => {
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        tokio::spawn(async move {
+                            let _ = exec_capture(&h, &format!("kill -9 {pid}")).await;
+                            s.send(WorkerEvent::Status(format!("已发送 kill -9 {pid}")));
+                        });
+                    }
                     Some(UiCommand::AddForward(spec)) => {
                         let id = spec.id;
                         let h = handle.clone();

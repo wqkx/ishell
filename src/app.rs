@@ -43,6 +43,8 @@ struct Session {
     /// 端口转发列表
     forwards: Vec<ForwardEntry>,
     next_forward: u64,
+    /// 进程详情返回（pid, cmd, cwd, exe），由 App 取用后清空
+    proc_detail: Option<(u32, String, String, String)>,
 }
 
 /// UI 侧的一条传输记录。
@@ -89,6 +91,9 @@ impl Session {
                 }
                 WorkerEvent::DirListing { path, entries } => {
                     self.files.on_listing(path, entries);
+                }
+                WorkerEvent::ProcDetail { pid, cmd, cwd, exe } => {
+                    self.proc_detail = Some((pid, cmd, cwd, exe));
                 }
                 WorkerEvent::ForwardStatus { id, ok, message } => {
                     if let Some(f) = self.forwards.iter_mut().find(|f| f.id == id) {
@@ -161,6 +166,8 @@ pub struct App {
     ctx: egui::Context,
     sessions: Vec<Session>,
     active: Option<usize>,
+    /// 正在拖拽排序的标签源索引
+    dragging_tab: Option<usize>,
     connect_form: ConnectForm,
     /// 传输进度浮窗是否显示
     show_transfers: bool,
@@ -179,13 +186,24 @@ pub struct App {
     fwd_just_opened: bool,
     /// 新增转发表单
     fwd_form: ForwardForm,
+    /// 进程详情小窗
+    proc_popup: Option<ProcPopup>,
+    proc_popup_just_opened: bool,
     /// 自检截图模式（由环境变量触发，正常使用时为 None）
     shot: Option<Shot>,
 }
 
-/// 拖拽会话标签时携带的源索引。
-#[derive(Clone)]
-struct TabDrag(usize);
+/// 进程详情小窗状态。
+struct ProcPopup {
+    pid: u32,
+    name: String,
+    cpu: f32,
+    mem: f32,
+    pos: egui::Pos2,
+    cmd: String,
+    cwd: String,
+    exe: String,
+}
 
 /// UI 侧的一条端口转发记录。
 struct ForwardEntry {
@@ -258,6 +276,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             sessions: Vec::new(),
             active: None,
+            dragging_tab: None,
             connect_form: form,
             show_transfers: false,
             xfer_just_opened: false,
@@ -268,6 +287,8 @@ impl App {
             show_forwards: false,
             fwd_just_opened: false,
             fwd_form: ForwardForm::default(),
+            proc_popup: None,
+            proc_popup_just_opened: false,
             shot,
         };
 
@@ -341,6 +362,20 @@ impl App {
             app.show_forwards = true;
         }
 
+        // 自检：进程详情小窗
+        if std::env::var("ISHELL_DEMO_PROC").is_ok() {
+            app.proc_popup = Some(ProcPopup {
+                pid: 1234,
+                name: "gromacs_mpi".into(),
+                cpu: 98.5,
+                mem: 12.3,
+                pos: egui::pos2(150.0, 300.0),
+                cmd: "/opt/gromacs/bin/gmx mdrun -deffnm md -nb gpu".into(),
+                cwd: "/home/e5-1/sim/run1".into(),
+                exe: "/opt/gromacs/bin/gmx".into(),
+            });
+        }
+
         // 自检：显示退出确认框
         if std::env::var("ISHELL_DEMO_CLOSE").is_ok() {
             app.show_close_confirm = true;
@@ -391,6 +426,7 @@ impl App {
             pending_hostkey: None,
             forwards: Vec::new(),
             next_forward: 1,
+            proc_detail: None,
         });
         self.active = Some(self.sessions.len() - 1);
     }
@@ -402,8 +438,8 @@ impl App {
             return;
         }
         let moved = self.sessions.remove(from);
-        let dest = if from < to { to - 1 } else { to };
-        let dest = dest.min(self.sessions.len());
+        // 让被拖动标签落在放置目标的原始位置 `to`（双向一致，避免相邻正向拖动变成空操作）
+        let dest = to.min(self.sessions.len());
         self.sessions.insert(dest, moved);
         // 重算当前激活索引
         self.active = self.active.map(|a| {
@@ -529,6 +565,20 @@ impl eframe::App for App {
             }
         }
 
+        // 进程详情返回 -> 填充小窗
+        if let Some(idx) = self.active {
+            let detail = self.sessions.get_mut(idx).and_then(|s| s.proc_detail.take());
+            if let Some((pid, cmd, cwd, exe)) = detail {
+                if let Some(pp) = &mut self.proc_popup {
+                    if pp.pid == pid {
+                        pp.cmd = cmd;
+                        pp.cwd = cwd;
+                        pp.exe = exe;
+                    }
+                }
+            }
+        }
+
         // 2) 连接对话框（浮动窗口）
         let ctx = ui.ctx().clone();
         if let Some(cfg) = self.connect_form.show(&ctx) {
@@ -536,6 +586,7 @@ impl eframe::App for App {
         }
 
         // 3) 左侧操作栏：独立全高区域
+        let mut proc_click: Option<(u32, egui::Pos2)> = None;
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(300.0)
@@ -544,7 +595,7 @@ impl eframe::App for App {
             .show_inside(ui, |ui| match self.active {
                 Some(idx) if idx < self.sessions.len() => {
                     let s = &mut self.sessions[idx];
-                    sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem);
+                    sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click);
                 }
                 _ => {
                     ui.add_space(16.0);
@@ -554,6 +605,23 @@ impl eframe::App for App {
                     });
                 }
             });
+        // 进程行被点击：打开详情小窗并请求详情
+        if let Some((pid, pos)) = proc_click {
+            let mut popup = None;
+            if let Some(s) = self.active.and_then(|i| self.sessions.get(i)) {
+                if let Some(p) = s.sysinfo.as_ref().and_then(|si| si.procs.iter().find(|p| p.pid == pid)) {
+                    popup = Some(ProcPopup {
+                        pid, name: p.name.clone(), cpu: p.cpu, mem: p.mem, pos,
+                        cmd: String::new(), cwd: String::new(), exe: String::new(),
+                    });
+                }
+                let _ = s.cmd_tx.send(UiCommand::ProcDetail(pid));
+            }
+            if let Some(pp) = popup {
+                self.proc_popup = Some(pp);
+                self.proc_popup_just_opened = true;
+            }
+        }
 
         // 4) 顶部选项卡（仅位于右侧区域之上）
         self.top_tabs(ui);
@@ -569,6 +637,9 @@ impl eframe::App for App {
 
         // 端口转发管理浮窗
         self.forward_window(&ctx);
+
+        // 进程详情小窗
+        self.proc_popup_window(&ctx);
 
         // 文本编辑器浮窗
         self.editor_window(&ctx);
@@ -753,51 +824,52 @@ impl App {
 
                         // 剩余空间：标签条横向可滚动（标签多时不再与右侧按钮重叠）
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let mut drag_start: Option<usize> = None;
+                            let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
                             egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
                                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                                // 仅滚轮滚动，关闭拖拽滚动，让标签拖拽排序直接生效
                                 .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         for (i, s) in self.sessions.iter().enumerate() {
                                             let selected = self.active == Some(i);
                                             let fill = if selected { Palette::PANEL } else { egui::Color32::TRANSPARENT };
-                                            let id = egui::Id::new(("shtab", i));
-                                            let resp = ui
-                                                .dnd_drag_source(id, TabDrag(i), |ui| {
-                                                    egui::Frame::new()
-                                                        .fill(fill)
-                                                        .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
-                                                        .inner_margin(egui::Margin::symmetric(9, 4))
-                                                        .show(ui, |ui| {
-                                                            ui.horizontal(|ui| {
-                                                                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
-                                                                let color = if s.connected { Palette::OK } else { Palette::WARN };
-                                                                ui.painter().circle_filled(dot.center(), 4.0, color);
-                                                                let title = RichText::new(&s.title)
-                                                                    .color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
-                                                                ui.add(egui::Label::new(title).selectable(false)).on_hover_text(s.tip.as_str());
-                                                                if ui
-                                                                    .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
-                                                                    .on_hover_text("关闭会话")
-                                                                    .clicked()
-                                                                {
-                                                                    to_close = Some(i);
-                                                                }
-                                                            });
-                                                        });
-                                                })
-                                                .response;
-                                            if resp.clicked() {
-                                                to_activate = Some(i);
-                                            }
-                                            if resp.middle_clicked() {
-                                                to_close = Some(i);
-                                            }
-                                            if let Some(p) = resp.dnd_release_payload::<TabDrag>() {
-                                                reorder = Some((p.0, i));
-                                            }
+                                            let inner = egui::Frame::new()
+                                                .fill(fill)
+                                                .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
+                                                .inner_margin(egui::Margin::symmetric(9, 4))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
+                                                        let color = if s.connected { Palette::OK } else { Palette::WARN };
+                                                        ui.painter().circle_filled(dot.center(), 4.0, color);
+                                                        let title = RichText::new(&s.title)
+                                                            .color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
+                                                        // 标签标题：可点击（激活）+ 可拖拽（排序）
+                                                        let tr = ui
+                                                            .add(egui::Label::new(title).selectable(false).sense(Sense::click_and_drag()))
+                                                            .on_hover_text(s.tip.as_str());
+                                                        if tr.clicked() {
+                                                            to_activate = Some(i);
+                                                        }
+                                                        if tr.middle_clicked() {
+                                                            to_close = Some(i);
+                                                        }
+                                                        if tr.drag_started() {
+                                                            drag_start = Some(i);
+                                                        }
+                                                        // 关闭按钮：独立响应，确保可点
+                                                        if ui
+                                                            .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
+                                                            .on_hover_text("关闭会话")
+                                                            .clicked()
+                                                        {
+                                                            to_close = Some(i);
+                                                        }
+                                                    });
+                                                });
+                                            tab_rects.push((i, inner.response.rect));
                                         }
                                         if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), "新建连接") {
                                             self.connect_form.open_dialog();
@@ -805,6 +877,21 @@ impl App {
                                         }
                                     });
                                 });
+                            // 拖拽排序：记录起点，松开时按指针所在标签确定目标位置
+                            if let Some(f) = drag_start {
+                                self.dragging_tab = Some(f);
+                            }
+                            if ui.input(|i| i.pointer.any_released()) {
+                                if let Some(from) = self.dragging_tab.take() {
+                                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                        if let Some(&(to, _)) = tab_rects.iter().find(|(_, r)| r.contains(pos)) {
+                                            if to != from {
+                                                reorder = Some((from, to));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         });
                     });
                     if let Some((from, to)) = reorder {
@@ -899,6 +986,71 @@ impl App {
             // 关闭大文件后把空闲内存归还 OS
             trim_memory();
         }
+    }
+
+    /// 进程详情小窗：显示资源/目录/命令 + 强制结束；点击外部关闭。
+    fn proc_popup_window(&mut self, ctx: &egui::Context) {
+        use egui_phosphor::regular as icon;
+        let (pid, name, cpu, mem, pos, cmd, cwd, exe) = match &self.proc_popup {
+            Some(p) => (p.pid, p.name.clone(), p.cpu, p.mem, p.pos, p.cmd.clone(), p.cwd.clone(), p.exe.clone()),
+            None => return,
+        };
+        let mut close = false;
+        let mut kill = false;
+        let win = egui::Window::new("proc_popup")
+            .title_bar(false)
+            .fixed_pos(pos + egui::vec2(8.0, 8.0))
+            .resizable(false)
+            .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
+            .show(ctx, |ui| {
+                ui.set_max_width(320.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}  {}", icon::CPU, name)).strong().size(13.0).color(Palette::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                let kv = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(k).color(Palette::TEXT_DIM).size(12.0));
+                        ui.label(RichText::new(v).color(Palette::TEXT).size(12.0).monospace());
+                    });
+                };
+                kv(ui, "PID", pid.to_string());
+                kv(ui, "CPU", format!("{cpu:.1}%"));
+                kv(ui, "内存", format!("{mem:.1}%"));
+                if !exe.is_empty() {
+                    kv(ui, "程序", exe.clone());
+                }
+                if !cwd.is_empty() {
+                    kv(ui, "目录", cwd.clone());
+                }
+                if cmd.is_empty() {
+                    ui.label(RichText::new("（正在获取命令…）").color(Palette::TEXT_DIM).size(11.0));
+                } else {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new("命令").color(Palette::TEXT_DIM).size(12.0));
+                    ui.label(RichText::new(&cmd).size(11.5).monospace().color(Palette::TEXT));
+                }
+                ui.separator();
+                if ui.add(egui::Button::new(RichText::new(format!("{}  强制结束 (kill -9)", icon::SKULL)).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
+                    kill = true;
+                }
+            });
+
+        let outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
+        if kill {
+            if let Some(s) = self.active.and_then(|i| self.sessions.get(i)) {
+                let _ = s.cmd_tx.send(UiCommand::KillProc(pid));
+            }
+            self.proc_popup = None;
+        } else if close || (outside && !self.proc_popup_just_opened) {
+            self.proc_popup = None;
+        }
+        self.proc_popup_just_opened = false;
     }
 
     /// 端口转发管理浮窗（右上角弹出，样式与传输浮窗一致）。

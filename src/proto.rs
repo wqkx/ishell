@@ -59,6 +59,10 @@ pub enum UiCommand {
     ReadFile { path: String, force: bool },
     /// 写回文本文件内容（保存）
     WriteFile { path: String, content: String },
+    /// 查询进程详情（cmdline / cwd / exe）
+    ProcDetail(u32),
+    /// 强制结束进程（kill -9）
+    KillProc(u32),
     /// 新增端口转发
     AddForward(ForwardSpec),
     /// 移除端口转发
@@ -113,6 +117,8 @@ pub enum WorkerEvent {
     TransferProgress { id: u64, done: u64 },
     /// 传输结束
     TransferDone { id: u64, ok: bool, message: String, refresh_dir: Option<String> },
+    /// 进程详情返回
+    ProcDetail { pid: u32, cmd: String, cwd: String, exe: String },
     /// 端口转发状态更新（监听中 / 失败原因）
     ForwardStatus { id: u64, ok: bool, message: String },
     /// 错误提示

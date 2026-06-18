@@ -39,9 +39,12 @@ pub fn show(
     hist: &NetHistory,
     selected_nic: &mut String,
     sort_mem: &mut bool,
+    proc_click: &mut Option<(u32, egui::Pos2)>,
 ) {
     use egui_phosphor::regular as icon;
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    egui::ScrollArea::vertical()
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(ui, |ui| {
         // 适度行距（与快速连接列表一致的舒展感）
         ui.spacing_mut().item_spacing.y = 3.5;
         let Some(info) = info else {
@@ -86,7 +89,7 @@ pub fn show(
 
         // —— 进程（≤5，可按 CPU/内存 排序） ——
         section(ui, icon::LIST_BULLETS, "进程 Top");
-        proc_table(ui, info, sort_mem);
+        proc_table(ui, info, sort_mem, proc_click);
         ui.add_space(6.0);
 
         // —— 网络（可选网卡，显示实时上下行） ——
@@ -228,18 +231,20 @@ fn disk_row(ui: &mut egui::Ui, mount: &str, percent: f32, detail: &str) {
     );
 }
 
-/// 进程表：最多 5 行；可点击 CPU%/内存% 表头切换排序。
-fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool) {
+/// 进程表：最多 5 行；可点击 CPU%/内存% 表头切换排序；单击行查看详情。
+fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click: &mut Option<(u32, egui::Pos2)>) {
     let pid_w = 46.0;
     let cpu_w = 44.0;
     let mem_w = 44.0;
 
-    // 表头（CPU%/内存% 可点击排序，高亮当前排序列）
+    // 表头：PID | 名称 | CPU% | 内存%（CPU%/内存% 可点击排序）
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 15.0), egui::Sense::hover());
         let p = ui.painter_at(rect);
-        p.text(rect.left_center(), egui::Align2::LEFT_CENTER, "PID/名称",
+        p.text(rect.left_center(), egui::Align2::LEFT_CENTER, "PID",
+            egui::FontId::proportional(10.5), Palette::TEXT_DIM);
+        p.text(rect.left_center() + Vec2::new(pid_w, 0.0), egui::Align2::LEFT_CENTER, "名称",
             egui::FontId::proportional(10.5), Palette::TEXT_DIM);
         let mem_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w, 0.0), rect.right_bottom());
         let cpu_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w + cpu_w, 0.0), egui::pos2(rect.right() - mem_w, rect.bottom()));
@@ -264,7 +269,13 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool) {
     }
 
     for proc in procs.into_iter().take(5) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), egui::Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), egui::Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(rect.expand2(Vec2::new(2.0, 0.0)), 3.0, Palette::PANEL_2);
+        }
+        if resp.clicked() {
+            *proc_click = Some((proc.pid, resp.interact_pointer_pos().unwrap_or(rect.right_center())));
+        }
         let p = ui.painter_at(rect);
         p.text(rect.left_center(), egui::Align2::LEFT_CENTER, proc.pid.to_string(),
             egui::FontId::monospace(11.0), Palette::TEXT_DIM);
