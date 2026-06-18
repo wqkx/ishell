@@ -756,7 +756,8 @@ impl App {
                             egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
                                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                                .drag_to_scroll(false) // 让标签的拖拽排序直接生效，无需先点一下
+                                // 仅滚轮滚动，关闭拖拽滚动，让标签拖拽排序直接生效
+                                .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         for (i, s) in self.sessions.iter().enumerate() {
