@@ -19,6 +19,44 @@ pub struct Terminal {
     sel_cursor: Option<(u16, u16)>,
     /// 系统剪贴板（懒初始化，用于右键粘贴）
     clipboard: Option<arboard::Clipboard>,
+    /// 终端配色：true=深色（默认），false=浅色（随主题暖色）
+    dark: bool,
+}
+
+/// 终端配色（背景/默认前景/ANSI 16 色），可在深/浅之间切换。
+struct TermColors {
+    bg: Color32,
+    fg: Color32,
+    ansi: [(u8, u8, u8); 16],
+}
+
+impl TermColors {
+    /// 深色（经典控制台，暖调近黑底 + 高对比 ANSI）。
+    fn dark() -> Self {
+        Self {
+            bg: Color32::from_rgb(0x1e, 0x1c, 0x19),
+            fg: Color32::from_rgb(0xe6, 0xe1, 0xd6),
+            ansi: [
+                (0x33, 0x30, 0x2b), (0xe0, 0x6c, 0x60), (0x8c, 0xb8, 0x5f), (0xe0, 0xb0, 0x55),
+                (0x6f, 0xa8, 0xdc), (0xc2, 0x8c, 0xd8), (0x5f, 0xbf, 0xc4), (0xd8, 0xd2, 0xc4),
+                (0x6f, 0x6b, 0x61), (0xee, 0x82, 0x76), (0xa6, 0xcf, 0x73), (0xf0, 0xc6, 0x6b),
+                (0x86, 0xbd, 0xea), (0xd2, 0xa0, 0xe6), (0x76, 0xd2, 0xd6), (0xf2, 0xed, 0xe2),
+            ],
+        }
+    }
+    /// 浅色（暖米底，ANSI 已为浅底调校）。
+    fn light() -> Self {
+        Self {
+            bg: crate::theme::Palette::TERM_BG,
+            fg: crate::theme::Palette::TERM_FG,
+            ansi: [
+                (0x3a, 0x38, 0x33), (0xc0, 0x4b, 0x3f), (0x4f, 0x86, 0x4a), (0xb5, 0x82, 0x2e),
+                (0x2f, 0x6f, 0xb0), (0xa6, 0x55, 0x9d), (0x2b, 0x8a, 0x8f), (0xb8, 0xb2, 0xa3),
+                (0x6f, 0x6b, 0x61), (0xc0, 0x56, 0x4b), (0x5b, 0x8a, 0x56), (0xc2, 0x8e, 0x3c),
+                (0x35, 0x78, 0xbb), (0xb0, 0x60, 0xa6), (0x30, 0x95, 0x9a), (0x55, 0x52, 0x4a),
+            ],
+        }
+    }
 }
 
 impl Terminal {
@@ -32,6 +70,7 @@ impl Terminal {
             sel_anchor: None,
             sel_cursor: None,
             clipboard: None,
+            dark: true,
         }
     }
 
@@ -187,8 +226,9 @@ impl Terminal {
             self.clear_selection();
         }
 
+        let tc = if self.dark { TermColors::dark() } else { TermColors::light() };
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, crate::theme::Palette::TERM_BG);
+        painter.rect_filled(rect, 0.0, tc.bg);
 
         let sel = self.ordered_selection();
         let screen = self.parser.screen();
@@ -213,9 +253,9 @@ impl Terminal {
                 let (ch, fmt): (&str, TextFormat) = match screen.cell(row, col) {
                     Some(c) => {
                         let s = c.contents();
-                        (if s.is_empty() { " " } else { s }, cell_format(c, &font))
+                        (if s.is_empty() { " " } else { s }, cell_format(c, &font, &tc))
                     }
-                    None => (" ", default_format(&font)),
+                    None => (" ", default_format(&font, &tc)),
                 };
                 match &run_fmt {
                     Some(prev) if same_format(prev, &fmt) => run.push_str(ch),
@@ -230,7 +270,7 @@ impl Terminal {
 
             let pos = origin + Vec2::new(0.0, row as f32 * char_h);
             // 先绘制该行的背景块（处理非默认底色）
-            paint_row_backgrounds(&painter, screen, row, self.cols, origin, cell);
+            paint_row_backgrounds(&painter, screen, row, self.cols, origin, cell, &tc);
             // 选区高亮（半透明，文字仍可见）
             if let Some(((sr, sc), (er, ec))) = sel {
                 if row >= sr && row <= er {
@@ -289,6 +329,12 @@ impl Terminal {
             }
             if ui.button("粘贴").clicked() {
                 do_paste = true;
+                ui.close();
+            }
+            ui.separator();
+            let theme_label = if self.dark { "切换为浅色终端" } else { "切换为深色终端" };
+            if ui.button(theme_label).clicked() {
+                self.dark = !self.dark;
                 ui.close();
             }
         });
@@ -375,20 +421,19 @@ fn key_to_ascii_letter(key: Key) -> Option<char> {
 }
 
 /// 把 vt100 颜色映射到 egui 颜色（含 256 色板）。
-fn vt_color(c: vt100::Color, default: Color32) -> Color32 {
+fn vt_color(c: vt100::Color, default: Color32, tc: &TermColors) -> Color32 {
     match c {
         vt100::Color::Default => default,
-        vt100::Color::Idx(i) => xterm256(i),
+        vt100::Color::Idx(i) => xterm256(i, tc),
         vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
     }
 }
 
-fn cell_format(c: &vt100::Cell, font: &FontId) -> TextFormat {
-    let fg_default = crate::theme::Palette::TERM_FG;
-    let mut fg = vt_color(c.fgcolor(), fg_default);
+fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> TextFormat {
+    let mut fg = vt_color(c.fgcolor(), tc.fg, tc);
     // 反显：文字改用背景色（实际背景块在 paint_row_backgrounds 中绘制）
     if c.inverse() {
-        fg = vt_color(c.bgcolor(), crate::theme::Palette::TERM_BG);
+        fg = vt_color(c.bgcolor(), tc.bg, tc);
     }
     let mut f = TextFormat {
         font_id: font.clone(),
@@ -401,10 +446,10 @@ fn cell_format(c: &vt100::Cell, font: &FontId) -> TextFormat {
     f
 }
 
-fn default_format(font: &FontId) -> TextFormat {
+fn default_format(font: &FontId, tc: &TermColors) -> TextFormat {
     TextFormat {
         font_id: font.clone(),
-        color: crate::theme::Palette::TERM_FG,
+        color: tc.fg,
         ..Default::default()
     }
 }
@@ -421,12 +466,13 @@ fn paint_row_backgrounds(
     cols: u16,
     origin: egui::Pos2,
     cell: Vec2,
+    tc: &TermColors,
 ) {
     for col in 0..cols {
         if let Some(c) = screen.cell(row, col) {
-            let mut bg = vt_color(c.bgcolor(), Color32::TRANSPARENT);
+            let mut bg = vt_color(c.bgcolor(), Color32::TRANSPARENT, tc);
             if c.inverse() {
-                bg = vt_color(c.fgcolor(), crate::theme::Palette::TERM_FG);
+                bg = vt_color(c.fgcolor(), tc.fg, tc);
             }
             if bg != Color32::TRANSPARENT {
                 let pos = origin + Vec2::new(col as f32 * cell.x, row as f32 * cell.y);
@@ -436,18 +482,11 @@ fn paint_row_backgrounds(
     }
 }
 
-/// xterm 256 色板。
-fn xterm256(i: u8) -> Color32 {
-    // 适配暖色浅背景的 ANSI 16 色（灰阶偏暖，彩色保持清晰）
-    const BASE: [(u8, u8, u8); 16] = [
-        (0x3a, 0x38, 0x33), (0xc0, 0x4b, 0x3f), (0x4f, 0x86, 0x4a), (0xb5, 0x82, 0x2e),
-        (0x2f, 0x6f, 0xb0), (0xa6, 0x55, 0x9d), (0x2b, 0x8a, 0x8f), (0xb8, 0xb2, 0xa3),
-        (0x6f, 0x6b, 0x61), (0xc0, 0x56, 0x4b), (0x5b, 0x8a, 0x56), (0xc2, 0x8e, 0x3c),
-        (0x35, 0x78, 0xbb), (0xb0, 0x60, 0xa6), (0x30, 0x95, 0x9a), (0x55, 0x52, 0x4a),
-    ];
+/// xterm 256 色板（0..15 取当前终端配色的 ANSI 表）。
+fn xterm256(i: u8, tc: &TermColors) -> Color32 {
     match i {
         0..=15 => {
-            let (r, g, b) = BASE[i as usize];
+            let (r, g, b) = tc.ansi[i as usize];
             Color32::from_rgb(r, g, b)
         }
         16..=231 => {

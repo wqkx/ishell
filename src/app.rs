@@ -575,12 +575,11 @@ impl App {
         };
         let (host, fp) = self.sessions[idx].pending_hostkey.clone().unwrap();
         let mut decision: Option<bool> = None;
-        egui::Window::new("未知主机")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        egui::Modal::new(egui::Id::new("hostkey_modal"))
             .show(ctx, |ui| {
-                ui.set_min_width(380.0);
+                ui.set_width(380.0);
+                ui.label(RichText::new("未知主机").size(16.0).strong());
+                ui.add_space(8.0);
                 ui.label(format!("首次连接主机：{host}"));
                 ui.add_space(4.0);
                 ui.label(RichText::new("指纹 (SHA256)：").color(Palette::TEXT_DIM).size(12.0));
@@ -617,14 +616,12 @@ impl App {
             self.show_close_confirm = true;
         }
         if self.show_close_confirm {
-            egui::Window::new("确认退出")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            egui::Modal::new(egui::Id::new("close_modal"))
                 .show(ctx, |ui| {
-                    ui.set_min_width(300.0);
+                    ui.set_width(320.0);
                     ui.vertical_centered(|ui| {
-                        ui.add_space(4.0);
+                        ui.label(RichText::new("确认退出").size(16.0).strong());
+                        ui.add_space(6.0);
                         ui.label(format!("还有 {} 个会话处于连接中", self.sessions.len()));
                         ui.label("确定退出 iShell 吗？");
                     });

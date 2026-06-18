@@ -13,14 +13,15 @@ impl Palette {
     pub const PANEL_2: Color32 = Color32::from_rgb(0xf0, 0xee, 0xe6);
     /// 进度条轨道（暖灰）
     pub const TRACK: Color32 = Color32::from_rgb(0xe3, 0xdf, 0xd3);
-    /// 分隔线 / 边框
-    pub const BORDER: Color32 = Color32::from_rgb(0xdd, 0xd8, 0xca);
+    /// 分隔线 / 边框（加深一档，让面板/分区边界更清晰）
+    pub const BORDER: Color32 = Color32::from_rgb(0xcd, 0xc7, 0xb5);
     /// 主强调色（Claude 珊瑚橙）
     pub const ACCENT: Color32 = Color32::from_rgb(0xd9, 0x77, 0x57);
     pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0xf5, 0xe4, 0xda);
     /// 文本（暖近黑 / 暖灰）
     pub const TEXT: Color32 = Color32::from_rgb(0x2a, 0x28, 0x24);
-    pub const TEXT_DIM: Color32 = Color32::from_rgb(0x6f, 0x6b, 0x61);
+    /// 次要文字（加深以满足 WCAG AA 小字对比）
+    pub const TEXT_DIM: Color32 = Color32::from_rgb(0x54, 0x51, 0x4a);
     /// 语义色（柔和暖调）
     pub const OK: Color32 = Color32::from_rgb(0x5b, 0x8a, 0x56);
     pub const WARN: Color32 = Color32::from_rgb(0xc2, 0x8e, 0x3c);
@@ -49,12 +50,17 @@ pub fn apply(ctx: &egui::Context) {
     v.selection.bg_fill = Palette::ACCENT_SOFT;
     v.selection.stroke = Stroke::new(1.0, Palette::ACCENT);
     v.window_shadow = egui::epaint::Shadow {
-        offset: [0, 4],
-        blur: 16,
+        offset: [0, 6],
+        blur: 20,
         spread: 0,
-        color: Color32::from_black_alpha(28),
+        color: Color32::from_black_alpha(50),
     };
-    v.popup_shadow = v.window_shadow;
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 3],
+        blur: 12,
+        spread: 0,
+        color: Color32::from_black_alpha(40),
+    };
     v.window_corner_radius = CornerRadius::same(10);
 
     // 统一小圆角（FinalShell 风格的小圆角矩形）
