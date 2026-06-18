@@ -155,7 +155,8 @@ pub async fn run(
     let probe_sink = sink.clone();
     let probe_task = tokio::spawn(async move {
         let mut sampler = SysSampler::new();
-        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        // 1s 采样：网络曲线点更密（约 2 倍），监控也更实时
+        let mut ticker = tokio::time::interval(Duration::from_millis(1000));
         loop {
             ticker.tick().await;
             match exec_capture(&probe_handle, PROBE_CMD).await {

@@ -1467,7 +1467,7 @@ impl App {
 /// 扁平按钮（无边框、悬停高亮），用于标签栏等处，贴近 FinalShell 风格。
 /// 对话框按钮：自绘以保证文字在按钮内垂直居中（补偿 CJK 字体行盒下沉）。
 fn dialog_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>, width: f32) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     let bg = match fill {
         Some(f) => {
             if resp.hovered() {
@@ -1487,8 +1487,8 @@ fn dialog_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>, wi
     let p = ui.painter();
     p.rect_filled(rect, 4.0, bg);
     let col = if fill.is_some() { egui::Color32::WHITE } else { Palette::TEXT };
-    // 文字中心略下移 1px，抵消字体行盒上偏，达到视觉居中
-    p.text(rect.center() + egui::vec2(0.0, 1.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(14.0), col);
+    // 文字中心下移补偿 CJK 字体行盒上偏（≈ 字号 * 0.16），达到视觉居中
+    p.text(rect.center() + egui::vec2(0.0, 2.5), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(13.5), col);
     resp.clicked()
 }
 
