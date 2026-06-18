@@ -2,7 +2,7 @@
 
 use egui::RichText;
 
-use crate::proto::{AuthMethod, ConnectConfig};
+use crate::proto::{AuthMethod, ConnectConfig, JumpHost};
 use crate::store::{self, SavedConnection};
 use crate::theme::Palette;
 
@@ -32,6 +32,15 @@ pub struct ConnectForm {
     key_path: String,
     passphrase: String,
     auth: AuthKind,
+    // —— 跳板机 ——
+    use_jump: bool,
+    j_host: String,
+    j_port: String,
+    j_username: String,
+    j_password: String,
+    j_key_path: String,
+    j_passphrase: String,
+    j_auth: AuthKind,
     error: Option<String>,
     saved: Vec<SavedConnection>,
     /// 列表中选中的连接（高亮）
@@ -53,6 +62,14 @@ impl Default for ConnectForm {
             key_path: String::new(),
             passphrase: String::new(),
             auth: AuthKind::Password,
+            use_jump: false,
+            j_host: String::new(),
+            j_port: "22".into(),
+            j_username: "root".into(),
+            j_password: String::new(),
+            j_key_path: String::new(),
+            j_passphrase: String::new(),
+            j_auth: AuthKind::Password,
             error: None,
             saved: store::load(),
             sel: None,
@@ -240,6 +257,14 @@ impl ConnectForm {
         self.key_path.clear();
         self.passphrase.clear();
         self.auth = AuthKind::Password;
+        self.use_jump = false;
+        self.j_host.clear();
+        self.j_port = "22".into();
+        self.j_username = "root".into();
+        self.j_password.clear();
+        self.j_key_path.clear();
+        self.j_passphrase.clear();
+        self.j_auth = AuthKind::Password;
         self.error = None;
     }
 
@@ -303,6 +328,54 @@ impl ConnectForm {
                 }
             });
 
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.use_jump, "通过跳板机连接（ProxyJump）");
+        if self.use_jump {
+            egui::Grid::new("jump_form")
+                .num_columns(2)
+                .spacing([12.0, 10.0])
+                .min_col_width(64.0)
+                .show(ui, |ui| {
+                    ui.label("跳板主机");
+                    ui.add(egui::TextEdit::singleline(&mut self.j_host).desired_width(w));
+                    ui.end_row();
+                    ui.label("跳板端口");
+                    ui.add(egui::TextEdit::singleline(&mut self.j_port).desired_width(w));
+                    ui.end_row();
+                    ui.label("跳板用户");
+                    ui.add(egui::TextEdit::singleline(&mut self.j_username).desired_width(w));
+                    ui.end_row();
+                    ui.label("跳板认证");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.j_auth, AuthKind::Password, "密码");
+                        ui.selectable_value(&mut self.j_auth, AuthKind::Key, "私钥");
+                    });
+                    ui.end_row();
+                    match self.j_auth {
+                        AuthKind::Password => {
+                            ui.label("跳板密码");
+                            ui.add(egui::TextEdit::singleline(&mut self.j_password).desired_width(w).password(true));
+                            ui.end_row();
+                        }
+                        AuthKind::Key => {
+                            ui.label("跳板私钥");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.j_key_path).desired_width(w - 36.0));
+                                if ui.button(egui_phosphor::regular::FOLDER_OPEN).on_hover_text("浏览选择私钥文件").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().set_title("选择跳板机私钥").pick_file() {
+                                        self.j_key_path = path.to_string_lossy().into_owned();
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("私钥口令");
+                            ui.add(egui::TextEdit::singleline(&mut self.j_passphrase).desired_width(w).password(true));
+                            ui.end_row();
+                        }
+                    }
+                });
+        }
+
         if let Some(err) = &self.error {
             ui.add_space(4.0);
             ui.label(RichText::new(err).color(Palette::DANGER));
@@ -342,6 +415,14 @@ impl ConnectForm {
         self.key_path = c.key_path;
         self.passphrase = c.passphrase;
         self.auth = if c.auth_kind == "key" { AuthKind::Key } else { AuthKind::Password };
+        self.use_jump = c.use_jump;
+        self.j_host = c.jump_host;
+        self.j_port = c.jump_port.to_string();
+        self.j_username = c.jump_username;
+        self.j_password = c.jump_password;
+        self.j_key_path = c.jump_key_path;
+        self.j_passphrase = c.jump_passphrase;
+        self.j_auth = if c.jump_auth_kind == "key" { AuthKind::Key } else { AuthKind::Password };
         self.error = None;
     }
 
@@ -361,6 +442,14 @@ impl ConnectForm {
             password: self.password.clone(),
             key_path: self.key_path.trim().to_string(),
             passphrase: self.passphrase.clone(),
+            use_jump: self.use_jump,
+            jump_host: self.j_host.trim().to_string(),
+            jump_port: self.j_port.trim().parse().unwrap_or(22),
+            jump_username: self.j_username.trim().to_string(),
+            jump_auth_kind: if self.j_auth == AuthKind::Key { "key".into() } else { "password".into() },
+            jump_password: self.j_password.clone(),
+            jump_key_path: self.j_key_path.trim().to_string(),
+            jump_passphrase: self.j_passphrase.clone(),
         };
         if let Some(slot) = self.saved.iter_mut().find(|c| c.name == name && c.host == entry.host) {
             *slot = entry;
@@ -395,11 +484,41 @@ impl ConnectForm {
                 }
             }
         };
+        let jump = if self.use_jump {
+            if self.j_host.trim().is_empty() {
+                return Err("请填写跳板主机地址".into());
+            }
+            let jport: u16 = self.j_port.trim().parse().map_err(|_| "跳板端口非法".to_string())?;
+            if self.j_username.trim().is_empty() {
+                return Err("请填写跳板用户名".into());
+            }
+            let jauth = match self.j_auth {
+                AuthKind::Password => AuthMethod::Password(self.j_password.clone()),
+                AuthKind::Key => {
+                    if self.j_key_path.trim().is_empty() {
+                        return Err("请填写跳板私钥路径".into());
+                    }
+                    AuthMethod::KeyFile {
+                        path: self.j_key_path.trim().to_string(),
+                        passphrase: if self.j_passphrase.is_empty() { None } else { Some(self.j_passphrase.clone()) },
+                    }
+                }
+            };
+            Some(JumpHost {
+                host: self.j_host.trim().to_string(),
+                port: jport,
+                username: self.j_username.trim().to_string(),
+                auth: jauth,
+            })
+        } else {
+            None
+        };
         Ok(ConnectConfig {
             host: self.host.trim().to_string(),
             port,
             username: self.username.trim().to_string(),
             auth,
+            jump,
         })
     }
 }

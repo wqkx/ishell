@@ -81,6 +81,38 @@ impl Handler for ClientHandler {
     }
 }
 
+/// 跳板机回调处理器：校验其 known_hosts，未知则自动信任并记录（首次连接）。
+struct JumpHandler {
+    host: String,
+    port: u16,
+    sink: UiSink,
+}
+
+impl Handler for JumpHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
+                self.sink.send(WorkerEvent::Status(format!("已信任跳板机 {} 的主机指纹", self.host)));
+                Ok(true)
+            }
+            Err(_) => {
+                self.sink.send(WorkerEvent::Error(format!(
+                    "跳板机 {} 主机密钥已改变，可能存在中间人攻击，已拒绝。",
+                    self.host
+                )));
+                Ok(false)
+            }
+        }
+    }
+}
+
 /// worker 入口：在 tokio 任务中运行，直到断开。所有错误都转成 UI 事件上报。
 pub async fn run(
     cfg: ConnectConfig,
@@ -90,7 +122,8 @@ pub async fn run(
 ) {
     sink.send(WorkerEvent::Status(format!("正在连接 {}:{} …", cfg.host, cfg.port)));
 
-    let handle = match connect(&cfg, &sink, hostkey_rx).await {
+    // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
+    let (handle, _jump_handle) = match connect(&cfg, &sink, hostkey_rx).await {
         Ok(h) => h,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(format!("连接失败：{e}")));
@@ -268,53 +301,78 @@ pub async fn run(
     probe_task.abort();
 }
 
-/// 建立 TCP + SSH 握手并完成认证。
+/// 用指定认证方式完成一次 SSH 认证。
+async fn authenticate<H>(
+    handle: &mut Handle<H>,
+    username: &str,
+    auth: &AuthMethod,
+) -> anyhow::Result<bool>
+where
+    H: Handler,
+    H::Error: std::error::Error + Send + Sync + 'static,
+{
+    let ok = match auth {
+        AuthMethod::Password(pw) => handle.authenticate_password(username, pw).await?.success(),
+        AuthMethod::KeyFile { path, passphrase } => {
+            let key = russh::keys::load_secret_key(path, passphrase.as_deref())?;
+            // RSA 密钥须用 rsa-sha2-512 签名（None 会退化为 SHA-1 的 ssh-rsa，被现代 OpenSSH 拒绝）。
+            handle
+                .authenticate_publickey(
+                    username,
+                    russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), Some(russh::keys::HashAlg::Sha512)),
+                )
+                .await?
+                .success()
+        }
+    };
+    Ok(ok)
+}
+
+/// 建立 TCP + SSH 握手并完成认证。可选经跳板机（ProxyJump）连接。
+/// 返回目标主机句柄，以及需保持存活的跳板机句柄（None 表示直连）。
 async fn connect(
     cfg: &ConnectConfig,
     sink: &UiSink,
     hostkey_rx: UnboundedReceiver<bool>,
-) -> anyhow::Result<Handle<ClientHandler>> {
+) -> anyhow::Result<(Handle<ClientHandler>, Option<Handle<JumpHandler>>)> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         keepalive_interval: Some(Duration::from_secs(30)),
         ..Default::default()
     });
 
-    let handler = ClientHandler {
+    let target_handler = ClientHandler {
         host: cfg.host.clone(),
         port: cfg.port,
         sink: sink.clone(),
         decision_rx: hostkey_rx,
     };
-    let mut handle = client::connect(config, (cfg.host.as_str(), cfg.port), handler).await?;
-    sink.send(WorkerEvent::Status("正在认证 …".into()));
 
-    let ok = match &cfg.auth {
-        AuthMethod::Password(pw) => {
-            let res = handle.authenticate_password(&cfg.username, pw).await?;
-            res.success()
+    let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {
+        // 1) 先连跳板机并认证
+        sink.send(WorkerEvent::Status(format!("正在连接跳板机 {}:{} …", jump.host, jump.port)));
+        let jhandler = JumpHandler { host: jump.host.clone(), port: jump.port, sink: sink.clone() };
+        let mut jhandle = client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?;
+        if !authenticate(&mut jhandle, &jump.username, &jump.auth).await? {
+            anyhow::bail!("跳板机认证被拒绝");
         }
-        AuthMethod::KeyFile { path, passphrase } => {
-            let key = russh::keys::load_secret_key(path, passphrase.as_deref())?;
-            // RSA 密钥须用 rsa-sha2-512 签名（None 会退化为 SHA-1 的 ssh-rsa，
-            // 被现代 OpenSSH 拒绝）；对 ed25519/ecdsa 该参数被忽略。
-            let res = handle
-                .authenticate_publickey(
-                    &cfg.username,
-                    russh::keys::PrivateKeyWithHashAlg::new(
-                        Arc::new(key),
-                        Some(russh::keys::HashAlg::Sha512),
-                    ),
-                )
-                .await?;
-            res.success()
-        }
+        // 2) 经跳板机打开到目标主机的 direct-tcpip 通道，并在该流上完成目标 SSH 握手
+        sink.send(WorkerEvent::Status(format!("经跳板机连接 {}:{} …", cfg.host, cfg.port)));
+        let ch = jhandle
+            .channel_open_direct_tcpip(cfg.host.clone(), cfg.port as u32, "127.0.0.1", 0)
+            .await?;
+        let handle = client::connect_stream(config, ch.into_stream(), target_handler).await?;
+        (handle, Some(jhandle))
+    } else {
+        let handle = client::connect(config, (cfg.host.as_str(), cfg.port), target_handler).await?;
+        (handle, None)
     };
 
-    if !ok {
+    sink.send(WorkerEvent::Status("正在认证 …".into()));
+    if !authenticate(&mut handle, &cfg.username, &cfg.auth).await? {
         anyhow::bail!("认证被拒绝（用户名/密码或密钥错误）");
     }
-    Ok(handle)
+    Ok((handle, jump_keep))
 }
 
 /// 打开带 PTY 的交互式 shell 通道。

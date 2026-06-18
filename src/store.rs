@@ -37,6 +37,23 @@ pub struct SavedConnection {
     pub key_path: String,
     #[serde(default)]
     pub passphrase: String,
+    // —— 可选跳板机 ——
+    #[serde(default)]
+    pub use_jump: bool,
+    #[serde(default)]
+    pub jump_host: String,
+    #[serde(default = "default_port")]
+    pub jump_port: u16,
+    #[serde(default)]
+    pub jump_username: String,
+    #[serde(default = "default_auth")]
+    pub jump_auth_kind: String,
+    #[serde(default)]
+    pub jump_password: String,
+    #[serde(default)]
+    pub jump_key_path: String,
+    #[serde(default)]
+    pub jump_passphrase: String,
 }
 
 fn default_auth() -> String {
@@ -157,14 +174,16 @@ pub fn load() -> Vec<SavedConnection> {
         }
     };
     // 检测是否存在旧明文（需要迁移）
+    let is_plain = |s: &str| !s.is_empty() && !s.starts_with(ENC_PREFIX);
     let needs_migrate = list.iter().any(|c| {
-        (!c.password.is_empty() && !c.password.starts_with(ENC_PREFIX))
-            || (!c.passphrase.is_empty() && !c.passphrase.starts_with(ENC_PREFIX))
+        is_plain(&c.password) || is_plain(&c.passphrase) || is_plain(&c.jump_password) || is_plain(&c.jump_passphrase)
     });
     // 解密到内存明文
     for c in &mut list {
         c.password = decrypt_secret(&c.password);
         c.passphrase = decrypt_secret(&c.passphrase);
+        c.jump_password = decrypt_secret(&c.jump_password);
+        c.jump_passphrase = decrypt_secret(&c.jump_passphrase);
     }
     if needs_migrate {
         save(&list); // 以密文重写，完成迁移
@@ -186,6 +205,8 @@ pub fn save(list: &[SavedConnection]) {
             let mut e = c.clone();
             e.password = encrypt_secret(&c.password);
             e.passphrase = encrypt_secret(&c.passphrase);
+            e.jump_password = encrypt_secret(&c.jump_password);
+            e.jump_passphrase = encrypt_secret(&c.jump_passphrase);
             e
         })
         .collect();

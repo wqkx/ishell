@@ -10,6 +10,17 @@ pub struct ConnectConfig {
     pub port: u16,
     pub username: String,
     pub auth: AuthMethod,
+    /// 可选跳板机：先连它，再经 direct-tcpip 连到目标主机
+    pub jump: Option<JumpHost>,
+}
+
+/// 跳板机（堡垒机）连接信息。
+#[derive(Clone, Debug)]
+pub struct JumpHost {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: AuthMethod,
 }
 
 #[derive(Clone, Debug)]

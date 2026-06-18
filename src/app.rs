@@ -277,6 +277,16 @@ impl App {
                         port,
                         username: parts[2].into(),
                         auth: AuthMethod::KeyFile { path: parts[3].into(), passphrase: None },
+                        // 自检：ISHELL_JUMP="host|port|user|key" 时经跳板机连接
+                        jump: std::env::var("ISHELL_JUMP").ok().and_then(|s| {
+                            let p: Vec<&str> = s.split('|').collect();
+                            (p.len() == 4).then(|| crate::proto::JumpHost {
+                                host: p[0].into(),
+                                port: p[1].parse().unwrap_or(22),
+                                username: p[2].into(),
+                                auth: AuthMethod::KeyFile { path: p[3].into(), passphrase: None },
+                            })
+                        }),
                     });
                 }
             }
