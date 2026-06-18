@@ -705,6 +705,8 @@ impl App {
             .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::symmetric(6, 4)))
             .show_inside(root, |ui| {
                 ui.horizontal(|ui| {
+                    // 固定行高，使右侧按钮与标签在同一水平线居中对齐
+                    ui.set_min_height(28.0);
                     let mut to_close = None;
                     let mut to_activate = None;
                     let mut reorder: Option<(usize, usize)> = None;
@@ -754,6 +756,7 @@ impl App {
                             egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
                                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                .drag_to_scroll(false) // 让标签的拖拽排序直接生效，无需先点一下
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         for (i, s) in self.sessions.iter().enumerate() {

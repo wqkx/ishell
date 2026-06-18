@@ -49,25 +49,24 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Palette::TRACK);
 
-    // 绘图区贴近左边界（不再预留左侧刻度栏），刻度文字浮动在曲线之上
+    // 绘图区贴近左/上边界；顶线贴住上边界，另两条线把区域三等分
     let plot = Rect::from_min_max(
-        egui::pos2(rect.left() + 2.0, rect.top() + 9.0),
+        egui::pos2(rect.left() + 2.0, rect.top() + 2.0),
         egui::pos2(rect.right() - 4.0, rect.bottom() - 6.0),
     );
 
     let raw_max = down.iter().chain(up.iter()).cloned().fold(0.0_f64, f64::max);
     let max = nice_ceiling(raw_max.max(1024.0)); // 至少 1KB，向上取整到“整”刻度
 
-    // 水平虚线网格 + 浮动刻度值（顶/中/底）
+    // 三条水平虚线（frac = 1, 2/3, 1/3，把绘图区分三块），刻度值贴在各自线下方
     let grid_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0xb6, 0xb0, 0xa0));
-    for frac in [1.0_f32, 0.5, 0.0] {
+    for frac in [1.0_f32, 2.0 / 3.0, 1.0 / 3.0] {
         let y = plot.bottom() - plot.height() * frac;
         dashed_hline(&painter, plot.left(), plot.right(), y, grid_stroke);
         let val = max * frac as f64;
-        // 刻度文字浮动在该网格线“上方”，左对齐贴近左边界
         painter.text(
-            egui::pos2(plot.left() + 2.0, y - 1.0),
-            egui::Align2::LEFT_BOTTOM,
+            egui::pos2(plot.left() + 2.0, y + 1.0),
+            egui::Align2::LEFT_TOP,
             fmt_rate_compact(val),
             egui::FontId::monospace(9.0),
             Palette::TEXT_DIM,
