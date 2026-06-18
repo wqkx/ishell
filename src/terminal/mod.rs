@@ -21,6 +21,18 @@ pub struct Terminal {
     clipboard: Option<arboard::Clipboard>,
     /// 终端配色：true=深色（默认），false=浅色（随主题暖色）
     dark: bool,
+    /// 当前输入行的影子缓冲（用于前缀历史搜索）
+    input_line: String,
+    /// 本会话命令历史
+    history: Vec<String>,
+    /// 历史前缀搜索状态
+    hist: Option<HistState>,
+}
+
+/// 前缀历史搜索状态：记住起始前缀与当前命中位置。
+struct HistState {
+    prefix: String,
+    idx: usize,
 }
 
 /// 终端配色（背景/默认前景/ANSI 16 色），可在深/浅之间切换。
@@ -71,6 +83,9 @@ impl Terminal {
             sel_cursor: None,
             clipboard: None,
             dark: false,
+            input_line: String::new(),
+            history: Vec::new(),
+            hist: None,
         }
     }
 
@@ -351,22 +366,125 @@ impl Terminal {
         out
     }
 
-    /// 把本帧键盘事件编码为终端字节。
-    fn collect_input(&self, ui: &egui::Ui) -> Vec<u8> {
+    /// 把本帧键盘事件编码为终端字节，并维护输入行影子缓冲 / 前缀历史搜索。
+    fn collect_input(&mut self, ui: &egui::Ui) -> Vec<u8> {
         let mut out = Vec::new();
-        ui.input(|i| {
-            for ev in &i.events {
-                match ev {
-                    egui::Event::Text(t) => out.extend_from_slice(t.as_bytes()),
-                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                        encode_key(*key, *modifiers, &mut out);
+        let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
+        // 全屏程序（vim/less/htop 等用备用屏幕）下不拦截方向键，避免破坏其交互
+        let alt = self.parser.screen().alternate_screen();
+        if alt {
+            self.input_line.clear();
+            self.hist = None;
+        }
+        for ev in events {
+            match ev {
+                egui::Event::Text(t) => {
+                    if !alt {
+                        self.input_line.push_str(&t);
+                        self.hist = None;
                     }
-                    egui::Event::Paste(t) => out.extend_from_slice(t.as_bytes()),
-                    _ => {}
+                    out.extend_from_slice(t.as_bytes());
                 }
+                egui::Event::Paste(t) => {
+                    if !alt {
+                        self.input_line.push_str(&t);
+                        self.hist = None;
+                    }
+                    out.extend_from_slice(t.as_bytes());
+                }
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    // 有前缀时，上下键做「本会话历史前缀搜索」（仅普通修饰、非全屏）
+                    let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.shift;
+                    if !alt && plain && matches!(key, Key::ArrowUp | Key::ArrowDown) {
+                        out.extend_from_slice(&self.history_nav(key == Key::ArrowUp));
+                        continue;
+                    }
+                    if !alt {
+                        match key {
+                            Key::Enter => self.commit_line(),
+                            Key::Backspace => {
+                                self.input_line.pop();
+                                self.hist = None;
+                            }
+                            Key::C | Key::U if modifiers.ctrl => {
+                                self.input_line.clear();
+                                self.hist = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                    encode_key(key, modifiers, &mut out);
+                }
+                _ => {}
             }
-        });
+        }
         out
+    }
+
+    /// 上/下键的历史前缀搜索；返回应发送给远端的字节。
+    fn history_nav(&mut self, up: bool) -> Vec<u8> {
+        // 空行：交给远端 shell 自身的历史
+        if self.input_line.is_empty() {
+            self.hist = None;
+            return if up { b"\x1b[A".to_vec() } else { b"\x1b[B".to_vec() };
+        }
+        let prefix = match &self.hist {
+            Some(h) => h.prefix.clone(),
+            None => self.input_line.clone(),
+        };
+        let start = self.hist.as_ref().map(|h| h.idx as isize).unwrap_or(self.history.len() as isize);
+        if up {
+            let mut i = start - 1;
+            while i >= 0 {
+                let cand = &self.history[i as usize];
+                if cand.starts_with(&prefix) && cand != &self.input_line {
+                    let m = cand.clone();
+                    self.hist = Some(HistState { prefix, idx: i as usize });
+                    return self.rewrite_line(&m);
+                }
+                i -= 1;
+            }
+            Vec::new() // 没有更早的匹配，保持不变
+        } else {
+            if self.hist.is_none() {
+                return Vec::new(); // 不在搜索中，下键无意义
+            }
+            let mut i = start + 1;
+            while (i as usize) < self.history.len() {
+                let cand = &self.history[i as usize];
+                if cand.starts_with(&prefix) {
+                    let m = cand.clone();
+                    self.hist = Some(HistState { prefix, idx: i as usize });
+                    return self.rewrite_line(&m);
+                }
+                i += 1;
+            }
+            // 越过最新匹配：恢复到最初输入的前缀
+            self.hist = None;
+            self.rewrite_line(&prefix.clone())
+        }
+    }
+
+    /// 清空远端当前行并键入 `text`（Ctrl+E 到行尾 + Ctrl+U 清行 + 文本）。
+    fn rewrite_line(&mut self, text: &str) -> Vec<u8> {
+        let mut out = vec![0x05, 0x15]; // Ctrl+E, Ctrl+U
+        out.extend_from_slice(text.as_bytes());
+        self.input_line = text.to_string();
+        out
+    }
+
+    /// 回车提交：把当前行加入历史（去重相邻、去空）。
+    fn commit_line(&mut self) {
+        if !self.input_line.trim().is_empty()
+            && self.history.last().map(|s| s != &self.input_line).unwrap_or(true)
+        {
+            self.history.push(self.input_line.clone());
+            if self.history.len() > 500 {
+                self.history.remove(0);
+            }
+        }
+        self.input_line.clear();
+        self.hist = None;
     }
 }
 
@@ -501,5 +619,35 @@ fn xterm256(i: u8, tc: &TermColors) -> Color32 {
             let v = 8 + (i - 232) * 10;
             Color32::from_rgb(v, v, v)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_history_search() {
+        let mut t = Terminal::new();
+        for cmd in ["cd /tmp", "ls -la", "cd /var/log", "cat x"] {
+            t.input_line = cmd.into();
+            t.commit_line();
+        }
+        // 前缀 "cd " 上键 -> 最近的 "cd /var/log"，并带清行前缀 Ctrl+E/Ctrl+U
+        t.input_line = "cd ".into();
+        let b = t.history_nav(true);
+        assert_eq!(&b[..2], &[0x05, 0x15]);
+        assert_eq!(&b[2..], b"cd /var/log");
+        assert_eq!(t.input_line, "cd /var/log");
+        // 再上 -> "cd /tmp"
+        assert_eq!(&t.history_nav(true)[2..], b"cd /tmp");
+        // 下 -> 回到 "cd /var/log"
+        assert_eq!(&t.history_nav(false)[2..], b"cd /var/log");
+        // 下越过最新匹配 -> 恢复前缀
+        assert_eq!(&t.history_nav(false)[2..], b"cd ");
+        // 空行上键 -> 透传方向键
+        t.input_line.clear();
+        t.hist = None;
+        assert_eq!(t.history_nav(true), b"\x1b[A");
     }
 }
