@@ -164,7 +164,11 @@ impl ConnectForm {
             ui.heading(RichText::new("快速连接").size(18.0).color(Palette::TEXT));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add(egui::Button::new(RichText::new(format!("{}  新建", icon::PLUS)).color(egui::Color32::WHITE)).fill(Palette::ACCENT))
+                    .add(
+                        egui::Button::new(RichText::new(format!("{}  新建", icon::PLUS)).color(egui::Color32::WHITE))
+                            .fill(Palette::ACCENT)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    )
                     .clicked()
                 {
                     self.reset_form();
@@ -383,7 +387,11 @@ impl ConnectForm {
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new(RichText::new(format!("{}  连接", egui_phosphor::regular::PLUGS_CONNECTED)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+            if ui.add(
+                egui::Button::new(RichText::new(format!("{}  连接", egui_phosphor::regular::PLUGS_CONNECTED)).color(egui::Color32::WHITE))
+                    .fill(Palette::ACCENT)
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            ).clicked() {
                 match self.build() {
                     Ok(cfg) => *result = Some(cfg),
                     Err(e) => self.error = Some(e),

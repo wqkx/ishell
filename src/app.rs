@@ -173,6 +173,8 @@ pub struct App {
     active_editor: usize,
     /// 端口转发管理窗口是否显示
     show_forwards: bool,
+    /// 转发浮窗刚打开（本帧跳过"点击外部关闭"判定）
+    fwd_just_opened: bool,
     /// 新增转发表单
     fwd_form: ForwardForm,
     /// 自检截图模式（由环境变量触发，正常使用时为 None）
@@ -262,6 +264,7 @@ impl App {
             editors: Vec::new(),
             active_editor: 0,
             show_forwards: false,
+            fwd_just_opened: false,
             fwd_form: ForwardForm::default(),
             shot,
         };
@@ -701,61 +704,7 @@ impl App {
                     let mut to_close = None;
                     let mut to_activate = None;
                     let mut reorder: Option<(usize, usize)> = None;
-                    for (i, s) in self.sessions.iter().enumerate() {
-                        let selected = self.active == Some(i);
-                        // FinalShell 风格扁平标签：选中用面板色填充；可拖动排序，关闭按钮在标签内部
-                        let fill = if selected { Palette::PANEL } else { egui::Color32::TRANSPARENT };
-                        let id = egui::Id::new(("shtab", i));
-                        let resp = ui
-                            .dnd_drag_source(id, TabDrag(i), |ui| {
-                                egui::Frame::new()
-                                    .fill(fill)
-                                    .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
-                                    .inner_margin(egui::Margin::symmetric(9, 4))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
-                                            let color = if s.connected { Palette::OK } else { Palette::WARN };
-                                            ui.painter().circle_filled(dot.center(), 4.0, color);
-                                            let title = RichText::new(&s.title)
-                                                .color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
-                                            ui.add(egui::Label::new(title).selectable(false));
-                                            if ui
-                                                .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
-                                                .on_hover_text("关闭会话")
-                                                .clicked()
-                                            {
-                                                to_close = Some(i);
-                                            }
-                                        });
-                                    });
-                            })
-                            .response;
-                        if resp.clicked() {
-                            to_activate = Some(i);
-                        }
-                        if resp.middle_clicked() {
-                            to_close = Some(i);
-                        }
-                        if let Some(p) = resp.dnd_release_payload::<TabDrag>() {
-                            reorder = Some((p.0, i));
-                        }
-                    }
-                    if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), "新建连接") {
-                        self.connect_form.open_dialog();
-                        self.show_close_confirm = false;
-                    }
-                    if let Some((from, to)) = reorder {
-                        self.reorder_session(from, to);
-                    }
-                    if let Some(i) = to_activate {
-                        self.active = Some(i);
-                    }
-                    if let Some(i) = to_close {
-                        self.close_session(i);
-                    }
-
-                    // 右侧：传输按钮 + 状态文本
+                    // 右侧按钮先占位（传输 / 转发 / 状态），剩余空间留给可滚动的标签条
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let active_xfers = self
                             .active
@@ -785,6 +734,9 @@ impl App {
                         };
                         if flat_button(ui, &RichText::new(flabel), "端口转发管理") {
                             self.show_forwards = !self.show_forwards;
+                            if self.show_forwards {
+                                self.fwd_just_opened = true;
+                            }
                         }
                         if let Some(idx) = self.active {
                             if let Some(s) = self.sessions.get(idx) {
@@ -792,7 +744,69 @@ impl App {
                                 ui.label(RichText::new(&s.status).color(c).size(12.0));
                             }
                         }
+
+                        // 剩余空间：标签条横向可滚动（标签多时不再与右侧按钮重叠）
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            egui::ScrollArea::horizontal()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        for (i, s) in self.sessions.iter().enumerate() {
+                                            let selected = self.active == Some(i);
+                                            let fill = if selected { Palette::PANEL } else { egui::Color32::TRANSPARENT };
+                                            let id = egui::Id::new(("shtab", i));
+                                            let resp = ui
+                                                .dnd_drag_source(id, TabDrag(i), |ui| {
+                                                    egui::Frame::new()
+                                                        .fill(fill)
+                                                        .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
+                                                        .inner_margin(egui::Margin::symmetric(9, 4))
+                                                        .show(ui, |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
+                                                                let color = if s.connected { Palette::OK } else { Palette::WARN };
+                                                                ui.painter().circle_filled(dot.center(), 4.0, color);
+                                                                let title = RichText::new(&s.title)
+                                                                    .color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
+                                                                ui.add(egui::Label::new(title).selectable(false));
+                                                                if ui
+                                                                    .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
+                                                                    .on_hover_text("关闭会话")
+                                                                    .clicked()
+                                                                {
+                                                                    to_close = Some(i);
+                                                                }
+                                                            });
+                                                        });
+                                                })
+                                                .response;
+                                            if resp.clicked() {
+                                                to_activate = Some(i);
+                                            }
+                                            if resp.middle_clicked() {
+                                                to_close = Some(i);
+                                            }
+                                            if let Some(p) = resp.dnd_release_payload::<TabDrag>() {
+                                                reorder = Some((p.0, i));
+                                            }
+                                        }
+                                        if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), "新建连接") {
+                                            self.connect_form.open_dialog();
+                                            self.show_close_confirm = false;
+                                        }
+                                    });
+                                });
+                        });
                     });
+                    if let Some((from, to)) = reorder {
+                        self.reorder_session(from, to);
+                    }
+                    if let Some(i) = to_activate {
+                        self.active = Some(i);
+                    }
+                    if let Some(i) = to_close {
+                        self.close_session(i);
+                    }
                 });
             });
     }
@@ -878,52 +892,64 @@ impl App {
         }
     }
 
-    /// 端口转发管理浮窗（针对当前会话）。
+    /// 端口转发管理浮窗（右上角弹出，样式与传输浮窗一致）。
     fn forward_window(&mut self, ctx: &egui::Context) {
         use crate::proto::{ForwardKind, ForwardSpec};
+        use egui_phosphor::regular as icon;
         if !self.show_forwards {
             return;
         }
-        let mut open = true;
-        let Some(idx) = self.active.filter(|&i| i < self.sessions.len()) else {
-            egui::Window::new("端口转发").open(&mut open).resizable(false).show(ctx, |ui| {
-                ui.label("请先连接一个会话");
-            });
-            self.show_forwards = open;
-            return;
-        };
-
+        let idx = self.active.filter(|&i| i < self.sessions.len());
         let mut add_spec: Option<ForwardSpec> = None;
         let mut remove_id: Option<u64> = None;
+        let mut close_win = false;
 
-        egui::Window::new("端口转发")
-            .open(&mut open)
-            .default_width(440.0)
+        let win = egui::Window::new("forward_win")
+            .title_bar(false)
+            .anchor(egui::Align2::RIGHT_TOP, [-10.0, 44.0])
+            .default_width(340.0)
             .resizable(false)
+            .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
             .show(ctx, |ui| {
-                // 新增表单
-                let f = &mut self.fwd_form;
-                egui::ComboBox::from_id_salt("fwd_kind")
-                    .selected_text(if f.kind == 0 { "本地转发" } else { "动态 SOCKS5" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut f.kind, 0, "本地转发");
-                        ui.selectable_value(&mut f.kind, 1, "动态 SOCKS5");
+                // 自定义紧凑标题栏
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}  端口转发", icon::ARROWS_LEFT_RIGHT)).strong().size(13.0).color(Palette::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                            close_win = true;
+                        }
                     });
+                });
+                ui.separator();
+
+                let Some(idx) = idx else {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("请先连接一个会话").color(Palette::TEXT_DIM).size(12.0));
+                    return;
+                };
+
+                // 新增表单（分段按钮代替下拉，避免点击下拉被判为窗口外而自动关闭）
+                let f = &mut self.fwd_form;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut f.kind, 0usize, "本地转发");
+                    ui.selectable_value(&mut f.kind, 1usize, "动态 SOCKS5");
+                });
                 ui.horizontal(|ui| {
                     ui.label("本地");
-                    ui.add(egui::TextEdit::singleline(&mut f.bind).desired_width(90.0).hint_text("127.0.0.1"));
+                    ui.add(egui::TextEdit::singleline(&mut f.bind).desired_width(84.0).hint_text("127.0.0.1"));
                     ui.label(":");
-                    ui.add(egui::TextEdit::singleline(&mut f.local_port).desired_width(54.0).hint_text("端口"));
-                    if f.kind == 0 {
-                        ui.label(RichText::new("→").color(Palette::TEXT_DIM));
+                    ui.add(egui::TextEdit::singleline(&mut f.local_port).desired_width(48.0).hint_text("端口"));
+                });
+                if f.kind == 0 {
+                    ui.horizontal(|ui| {
                         ui.label("目标");
                         ui.add(egui::TextEdit::singleline(&mut f.target_host).desired_width(120.0).hint_text("主机/IP"));
                         ui.label(":");
-                        ui.add(egui::TextEdit::singleline(&mut f.target_port).desired_width(54.0).hint_text("端口"));
-                    }
-                });
+                        ui.add(egui::TextEdit::singleline(&mut f.target_port).desired_width(48.0).hint_text("端口"));
+                    });
+                }
                 ui.add_space(4.0);
-                if ui.add(egui::Button::new(RichText::new("添加转发").color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                if ui.add(egui::Button::new(RichText::new(format!("{}  添加转发", icon::PLUS)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                     if let Ok(lp) = f.local_port.trim().parse::<u16>() {
                         let kind = if f.kind == 0 {
                             match f.target_port.trim().parse::<u16>() {
@@ -945,25 +971,36 @@ impl App {
                 ui.separator();
                 if let Some(s) = self.sessions.get(idx) {
                     if s.forwards.is_empty() {
-                        ui.label(RichText::new("（暂无转发）").color(Palette::TEXT_DIM).size(12.0));
+                        ui.label(RichText::new("暂无转发任务").color(Palette::TEXT_DIM).size(12.0));
                     }
                     for fwd in &s.forwards {
                         ui.horizontal(|ui| {
                             let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), Sense::hover());
                             ui.painter().circle_filled(dot.center(), 4.0, if fwd.ok { Palette::OK } else { Palette::DANGER });
-                            ui.label(RichText::new(&fwd.label).strong());
-                            ui.label(RichText::new(&fwd.status).color(if fwd.ok { Palette::TEXT_DIM } else { Palette::DANGER }).size(11.0));
+                            ui.label(RichText::new(&fwd.label).size(12.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("删除").clicked() {
+                                if ui.add(egui::Button::new(RichText::new(icon::TRASH).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text("删除").clicked() {
                                     remove_id = Some(fwd.id);
                                 }
                             });
                         });
+                        ui.label(RichText::new(&fwd.status).color(if fwd.ok { Palette::TEXT_DIM } else { Palette::DANGER }).size(10.5));
+                        ui.add_space(3.0);
                     }
                 }
             });
-        self.show_forwards = open;
 
+        // 点击窗口外部自动隐藏（打开当帧除外）
+        let clicked_outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
+        if close_win || (clicked_outside && !self.fwd_just_opened) {
+            self.show_forwards = false;
+        }
+        self.fwd_just_opened = false;
+
+        let idx = match idx {
+            Some(i) => i,
+            None => return,
+        };
         if let Some(mut spec) = add_spec {
             if let Some(s) = self.sessions.get_mut(idx) {
                 let id = s.next_forward;
