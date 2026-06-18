@@ -143,6 +143,19 @@ impl Terminal {
 
     /// 喂入来自远程的原始字节。
     pub fn feed(&mut self, bytes: &[u8]) {
+        // `clear` 会发 ESC[2J（清屏）+ ESC[3J（清回滚缓冲）。vt100 不处理 [3J，
+        // 导致旧内容仍留在 scrollback（可上滚看到）。这里在 [3J 处重建解析器，
+        // 真正清空回滚缓冲；[3J 之后的字节（新提示符等）喂入全新解析器。
+        if find_sub(bytes, b"\x1b[2J").is_some() {
+            if let Some(pos) = find_sub(bytes, b"\x1b[3J") {
+                let (before, after) = bytes.split_at(pos + 4);
+                self.parser.process(before);
+                self.parser = vt100::Parser::new(self.rows, self.cols, 5000);
+                self.scrollback = 0;
+                self.parser.process(after);
+                return;
+            }
+        }
         self.parser.process(bytes);
     }
 
@@ -494,6 +507,14 @@ impl Default for Terminal {
     }
 }
 
+/// 在字节流中查找子序列，返回起始下标。
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 /// 把特殊按键编码为 ANSI 转义序列；Ctrl 组合键编码为控制字符。
 fn encode_key(key: Key, mods: Modifiers, out: &mut Vec<u8>) {
     // Ctrl+Shift+C/V 保留给复制/粘贴，不作为终端输入
@@ -649,5 +670,27 @@ mod tests {
         t.input_line.clear();
         t.hist = None;
         assert_eq!(t.history_nav(true), b"\x1b[A");
+    }
+
+    #[test]
+    fn clear_wipes_scrollback() {
+        let mut t = Terminal::new();
+        for i in 0..50 {
+            t.feed(format!("L{i}\r\n").as_bytes());
+        }
+        // clear：ESC[H ESC[2J ESC[3J
+        t.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        t.feed(b"prompt$ ");
+        // 即便上滚也看不到旧内容（scrollback 已清空）
+        t.parser.screen_mut().set_scrollback(100);
+        let s = t.parser.screen();
+        let mut all = String::new();
+        for r in 0..t.rows {
+            for c in 0..t.cols {
+                all.push_str(s.cell(r, c).map(|x| x.contents()).unwrap_or(""));
+            }
+        }
+        assert!(!all.contains("L49"), "旧内容应已被清除");
+        assert!(all.contains("prompt$"), "新提示符应保留");
     }
 }
