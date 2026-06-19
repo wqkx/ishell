@@ -40,9 +40,9 @@ leans toward:
 |---|---|
 | Binary | single file, **~22 MB** (no runtime deps, no background daemon) |
 | Idle CPU | **≈ 0%** (one idle session; system info polled every 2 s) |
-| Memory | native app — **no Electron / JVM / Python** runtime, so far lighter than Electron-based clients that idle at hundreds of MB |
+| Memory | **~80 MB** (idle, measured) — native app, **no Electron / JVM / Python** runtime; far below Electron-based clients that idle at hundreds of MB |
 
-> Measured on Linux, release build, one idle session. Exact memory varies with GPU driver / resolution.
+> Measured on Linux, release build, one idle session; varies slightly with GPU driver / resolution.
 
 ## 🚀 Features
 
