@@ -45,6 +45,14 @@ struct Session {
     next_forward: u64,
     /// 进程详情返回（pid, cmd, cwd, exe），由 App 取用后清空
     proc_detail: Option<(u32, String, String, String)>,
+    /// 连接配置（用于断线重连）
+    cfg: ConnectConfig,
+    /// 是否曾成功连接（仅对掉线的会话自动重连，避免错误配置死循环）
+    was_connected: bool,
+    /// 计划在此刻自动重连
+    reconnect_at: Option<std::time::Instant>,
+    /// 已自动重连次数
+    reconnect_tries: u32,
 }
 
 /// UI 侧的一条传输记录。
@@ -68,11 +76,21 @@ impl Session {
                 WorkerEvent::Status(s) => self.status = s,
                 WorkerEvent::Connected => {
                     self.connected = true;
+                    self.was_connected = true;
+                    self.reconnect_tries = 0;
+                    self.reconnect_at = None;
                     self.status = "已连接".into();
                 }
                 WorkerEvent::Disconnected(reason) => {
                     self.connected = false;
                     self.status = reason;
+                    // 仅对"曾连上又掉线"的会话自动重连，最多 5 次，指数退避
+                    const MAX_TRIES: u32 = 5;
+                    if self.was_connected && self.reconnect_tries < MAX_TRIES {
+                        let secs = (2u64 << self.reconnect_tries.min(4)).min(30); // 2,4,8,16,30
+                        self.reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+                        self.status = format!("{} · {}s 后重连", self.status, secs);
+                    }
                 }
                 WorkerEvent::TerminalData(bytes) => self.terminal.feed(&bytes),
                 WorkerEvent::SysInfo(info) => {
@@ -409,14 +427,22 @@ impl App {
     }
 
     /// 根据配置建立一个新会话（spawn worker）。
-    fn spawn_session(&mut self, cfg: ConnectConfig) {
-        self.show_close_confirm = false; // 新建会话则取消退出提示
+    /// 创建通道并在运行时启动一个 worker，返回 (cmd_tx, evt_rx, hostkey_tx)。
+    fn spawn_worker(
+        &self,
+        cfg: ConnectConfig,
+    ) -> (UnboundedSender<UiCommand>, std::sync::mpsc::Receiver<WorkerEvent>, UnboundedSender<bool>) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
         let (hostkey_tx, hostkey_rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = UiSink::new(evt_tx, self.ctx.clone());
+        self.runtime.spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx));
+        (cmd_tx, evt_rx, hostkey_tx)
+    }
 
-        self.runtime.spawn(ssh::run(cfg.clone(), cmd_rx, sink, hostkey_rx));
+    fn spawn_session(&mut self, cfg: ConnectConfig) {
+        self.show_close_confirm = false; // 新建会话则取消退出提示
+        let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg.clone());
 
         self.sessions.push(Session {
             title: if cfg.label.trim().is_empty() { cfg.username.clone() } else { cfg.label.trim().to_string() },
@@ -441,8 +467,31 @@ impl App {
             forwards: Vec::new(),
             next_forward: 1,
             proc_detail: None,
+            cfg,
+            was_connected: false,
+            reconnect_at: None,
+            reconnect_tries: 0,
         });
         self.active = Some(self.sessions.len() - 1);
+    }
+
+    /// 重连指定会话：用原配置重启 worker，重置连接相关状态，保留标签/目录等。
+    fn reconnect_session(&mut self, idx: usize) {
+        let Some(s) = self.sessions.get(idx) else { return };
+        let cfg = s.cfg.clone();
+        let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg);
+        let Some(s) = self.sessions.get_mut(idx) else { return };
+        s.cmd_tx = cmd_tx;
+        s.evt_rx = evt_rx;
+        s.hostkey_tx = hostkey_tx;
+        s.connected = false;
+        s.initialized = false;
+        s.terminal = Terminal::new();
+        s.sysinfo = None;
+        s.forwards.clear();
+        s.pending_hostkey = None;
+        s.reconnect_at = None;
+        s.status = "重连中 …".into();
     }
 
     /// 拖动排序：把会话从 `from` 移动到放置目标 `to` 处。
@@ -577,6 +626,30 @@ impl eframe::App for App {
                 });
                 self.active_editor = self.editors.len() - 1;
             }
+        }
+
+        // 断线自动重连：到点的执行重连，并安排下次唤醒（即使无交互也能触发）
+        let now = std::time::Instant::now();
+        let mut due: Vec<usize> = Vec::new();
+        let mut next_wake: Option<std::time::Duration> = None;
+        for (i, s) in self.sessions.iter().enumerate() {
+            if let Some(at) = s.reconnect_at {
+                if now >= at {
+                    due.push(i);
+                } else {
+                    let d = at - now;
+                    next_wake = Some(next_wake.map_or(d, |w: std::time::Duration| w.min(d)));
+                }
+            }
+        }
+        for i in due {
+            if let Some(s) = self.sessions.get_mut(i) {
+                s.reconnect_tries += 1;
+            }
+            self.reconnect_session(i);
+        }
+        if let Some(d) = next_wake {
+            ui.ctx().request_repaint_after(d);
         }
 
         // 自检：注入网络曲线波形以核对点密度
@@ -1459,6 +1532,7 @@ impl App {
         }
 
         // 中间终端区（四周留空隙，与其他区域分开）
+        let mut reconnect_click = false;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1468,6 +1542,24 @@ impl App {
             )
             .show_inside(root, |ui| {
                 let s = &mut self.sessions[idx];
+                // 断线提示条 + 手动重连（初次"连接中"不显示）
+                if !s.connected && !s.status.contains("连接中") {
+                    egui::Frame::new()
+                        .fill(Palette::ACCENT_SOFT)
+                        .corner_radius(4)
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{}  {}", egui_phosphor::regular::WARNING, s.status)).color(Palette::DANGER).size(12.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.add(egui::Button::new(RichText::new(format!("{}  重连", egui_phosphor::regular::ARROW_CLOCKWISE)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                                        reconnect_click = true;
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
                 let input = s.terminal.ui(ui);
                 if !input.is_empty() {
                     let _ = s.cmd_tx.send(UiCommand::TerminalInput(input));
@@ -1478,6 +1570,12 @@ impl App {
                     let _ = s.cmd_tx.send(UiCommand::Resize { cols: size.0, rows: size.1 });
                 }
             });
+        if reconnect_click {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                s.reconnect_tries = 0;
+            }
+            self.reconnect_session(idx);
+        }
     }
 }
 
