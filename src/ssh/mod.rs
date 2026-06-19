@@ -5,7 +5,7 @@ mod forward;
 pub mod sysinfo;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,10 +50,13 @@ fn start_xfer(
     let dtx = done_tx.clone();
     tokio::spawn(async move {
         match open_sftp(&h).await {
-            Ok(sftp) => match p {
-                PendingXfer::Download { id, remote, local } => download(&sftp, id, remote, local, &s, cancel).await,
-                PendingXfer::Upload { id, local, remote_dir } => upload(&sftp, id, local, remote_dir, &s, cancel).await,
-            },
+            Ok(sftp) => {
+                let sftp = Arc::new(sftp);
+                match p {
+                    PendingXfer::Download { id, remote, local } => download(sftp, id, remote, local, &s, cancel).await,
+                    PendingXfer::Upload { id, local, remote_dir } => upload(sftp.as_ref(), id, local, remote_dir, &s, cancel).await,
+                }
+            }
             Err(e) => s.send(WorkerEvent::TransferDone {
                 id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
             }),
@@ -472,6 +475,10 @@ async fn open_shell(handle: &Handle<ClientHandler>) -> anyhow::Result<russh::Cha
     channel
         .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
         .await?;
+    // 请求 UTF-8 locale：否则远端 ls 等会把中文文件名转义成 $'\345\277...'。
+    // 多数 sshd 默认 AcceptEnv LANG LC_*；不被接受时忽略即可。
+    let _ = channel.set_env(false, "LANG", "en_US.UTF-8").await;
+    let _ = channel.set_env(false, "LC_ALL", "en_US.UTF-8").await;
     channel.request_shell(false).await?;
     Ok(channel)
 }
@@ -534,16 +541,16 @@ async fn list_dir(
     Ok((canon, entries))
 }
 
-/// 分块下载并上报进度。
+/// 下载（单文件或整个目录）并上报进度。大文件用多个并发分段读取流水线化，
+/// 抵消 SFTP「单请求等一个往返」的吞吐瓶颈（高延迟链路上提速明显）。
 async fn download(
-    sftp: &russh_sftp::client::SftpSession,
+    sftp: Arc<russh_sftp::client::SftpSession>,
     id: u64,
     remote: String,
     local: String,
     sink: &UiSink,
     cancel: Arc<AtomicBool>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let name = basename(&remote);
     let is_dir = sftp.metadata(&remote).await.map(|m| m.is_dir()).unwrap_or(false);
 
@@ -580,33 +587,39 @@ async fn download(
             id, name: name.clone(), total, dir: crate::proto::TransferDir::Download,
         });
 
-        let (mut done, mut last) = (0u64, 0u64);
-        let mut buf = vec![0u8; 128 * 1024];
-        for (rpath, lpath, _sz) in files {
-            if let Some(parent) = lpath.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+        // 累计已下载字节（多任务共享）+ 周期性上报进度
+        let done = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let prog = {
+            let (d, s, st) = (done.clone(), sink.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut last = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let v = d.load(Ordering::Relaxed);
+                    if v != last {
+                        last = v;
+                        s.send(WorkerEvent::TransferProgress { id, done: v });
+                    }
+                    if st.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let result = async {
+            for (rpath, lpath, size) in files {
+                download_file(&sftp, &rpath, &lpath, size, &cancel, &done).await?;
             }
-            let mut rf = sftp.open(&rpath).await?;
-            let mut lf = tokio::fs::File::create(&lpath).await?;
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    anyhow::bail!("canceled");
-                }
-                let n = rf.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                lf.write_all(&buf[..n]).await?;
-                done += n as u64;
-                if done - last >= 256 * 1024 {
-                    last = done;
-                    sink.send(WorkerEvent::TransferProgress { id, done });
-                }
-            }
-            lf.flush().await?;
+            Ok::<(), anyhow::Error>(())
         }
-        sink.send(WorkerEvent::TransferProgress { id, done });
-        Ok(())
+        .await;
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = prog.await;
+        sink.send(WorkerEvent::TransferProgress { id, done: done.load(Ordering::Relaxed) });
+        result
     }
     .await;
 
@@ -622,6 +635,115 @@ async fn download(
             };
             sink.send(WorkerEvent::TransferDone { id, ok: false, message, refresh_dir: None });
         }
+    }
+}
+
+/// 同一文件内的并发分段数（流水线深度）。8 路足以在常见高延迟链路上跑满带宽。
+const DL_PARALLEL: u64 = 8;
+/// 每个分段一次抢占的字节数。
+const DL_CHUNK: u64 = 1024 * 1024;
+
+/// 下载单个文件：大文件按偏移并发分段读取，定位写入本地，显著提升高延迟链路吞吐。
+async fn download_file(
+    sftp: &Arc<russh_sftp::client::SftpSession>,
+    rpath: &str,
+    lpath: &std::path::Path,
+    size: u64,
+    cancel: &Arc<AtomicBool>,
+    done: &Arc<AtomicU64>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    if let Some(parent) = lpath.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    // 小文件（或大小未知）：单流顺序读取，免去并发开销
+    if size <= DL_CHUNK {
+        let mut rf = sftp.open(rpath).await?;
+        let mut lf = tokio::fs::File::create(lpath).await?;
+        let mut buf = vec![0u8; 128 * 1024];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("canceled");
+            }
+            let n = rf.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            lf.write_all(&buf[..n]).await?;
+            done.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        lf.flush().await?;
+        return Ok(());
+    }
+
+    // 大文件：预分配，按偏移并发分段；各分段定位写入（pwrite）
+    let out = std::fs::File::create(lpath)?;
+    out.set_len(size)?;
+    let out = Arc::new(out);
+    let cursor = Arc::new(AtomicU64::new(0));
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..DL_PARALLEL {
+        let sftp = sftp.clone();
+        let out = out.clone();
+        let cursor = cursor.clone();
+        let done = done.clone();
+        let cancel = cancel.clone();
+        let rpath = rpath.to_string();
+        set.spawn(async move {
+            let mut rf = sftp.open(&rpath).await?;
+            let mut buf = vec![0u8; DL_CHUNK as usize];
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    anyhow::bail!("canceled");
+                }
+                let off = cursor.fetch_add(DL_CHUNK, Ordering::Relaxed);
+                if off >= size {
+                    break;
+                }
+                let want = std::cmp::min(DL_CHUNK, size - off) as usize;
+                rf.seek(std::io::SeekFrom::Start(off)).await?; // 仅本地置位，无往返
+                let mut got = 0usize;
+                while got < want {
+                    let n = rf.read(&mut buf[got..want]).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                }
+                pwrite(&out, &buf[..got], off)?;
+                done.fetch_add(got as u64, Ordering::Relaxed);
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+    }
+    // 任一分段失败（含取消）则整体失败；JoinSet 析构会中止其余分段
+    while let Some(r) = set.join_next().await {
+        r??;
+    }
+    Ok(())
+}
+
+/// 在指定偏移定位写入（跨平台）。
+fn pwrite(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut off = offset;
+        let mut b = buf;
+        while !b.is_empty() {
+            let n = file.seek_write(b, off)?;
+            b = &b[n..];
+            off += n as u64;
+        }
+        Ok(())
     }
 }
 
