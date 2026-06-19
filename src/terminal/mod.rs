@@ -2,7 +2,6 @@
 //! 同时把键盘事件编码为终端字节流。
 
 use egui::{Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, TextFormat, Vec2};
-use egui::text::LayoutJob;
 
 /// 默认字号（pt）。
 const FONT_SIZE: f32 = 14.0;
@@ -442,46 +441,11 @@ impl Terminal {
         let screen = self.parser.screen();
         let origin = rect.min;
         for row in 0..self.rows {
-            let mut job = LayoutJob::default();
-            let mut run = String::new();
-            let mut run_fmt: Option<TextFormat> = None;
-
-            let flush =
-                |job: &mut LayoutJob, run: &mut String, fmt: &mut Option<TextFormat>| {
-                    if let Some(f) = fmt.take() {
-                        if !run.is_empty() {
-                            job.append(run, 0.0, f);
-                        }
-                    }
-                    run.clear();
-                };
-
-            for col in 0..self.cols {
-                // vt100::Cell::contents() 返回 &str（可能为空，代表空格）
-                let (ch, fmt): (&str, TextFormat) = match screen.cell(row, col) {
-                    Some(c) => {
-                        let s = c.contents();
-                        (if s.is_empty() { " " } else { s }, cell_format(c, &font, &tc))
-                    }
-                    None => (" ", default_format(&font, &tc)),
-                };
-                match &run_fmt {
-                    Some(prev) if same_format(prev, &fmt) => run.push_str(ch),
-                    _ => {
-                        flush(&mut job, &mut run, &mut run_fmt);
-                        run.push_str(ch);
-                        run_fmt = Some(fmt);
-                    }
-                }
-            }
-            flush(&mut job, &mut run, &mut run_fmt);
-
-            let pos = origin + Vec2::new(0.0, row as f32 * char_h);
+            let y = origin.y + row as f32 * char_h;
             // 先绘制该行的背景块（处理非默认底色）
             paint_row_backgrounds(&painter, screen, row, self.cols, origin, cell, &tc);
             // 搜索命中行高亮（整行淡黄底）
             if self.search_hl == Some(row) {
-                let y = origin.y + row as f32 * char_h;
                 painter.rect_filled(
                     Rect::from_min_max(egui::pos2(origin.x, y), egui::pos2(rect.right(), y + char_h)),
                     0.0,
@@ -495,7 +459,6 @@ impl Terminal {
                     let c1 = if row == er { ec } else { self.cols.saturating_sub(1) };
                     let x0 = origin.x + c0 as f32 * char_w;
                     let x1 = origin.x + (c1 as f32 + 1.0) * char_w;
-                    let y = origin.y + row as f32 * char_h;
                     let a = crate::theme::Palette::ACCENT;
                     painter.rect_filled(
                         Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)),
@@ -504,8 +467,22 @@ impl Terminal {
                     );
                 }
             }
-            let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-            painter.galley(pos, galley, Color32::WHITE);
+            // 逐格绘制字形：固定网格定位，避免 CJK / 宽字符的字形步进破坏对齐。
+            // 空内容（含宽字符的续格）跳过；宽字符自身在本格绘制，自然跨两格。
+            for col in 0..self.cols {
+                let Some(c) = screen.cell(row, col) else { continue };
+                let s = c.contents();
+                if s.is_empty() {
+                    continue;
+                }
+                let fmt = cell_format(c, &font, &tc);
+                let x = origin.x + col as f32 * char_w;
+                painter.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, s, font.clone(), fmt.color);
+                if fmt.underline.width > 0.0 {
+                    let uy = y + char_h - 1.0;
+                    painter.hline(x..=(x + char_w), uy, fmt.underline);
+                }
+            }
         }
 
         // 光标
@@ -523,6 +500,17 @@ impl Terminal {
             } else {
                 painter.rect_stroke(crect, 1.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
             }
+        }
+
+        // 启用 IME（中文 / fcitx 等输入法）：聚焦时上报输入区，并把候选框定位到光标处。
+        // 否则平台不会在终端上激活输入法，导致无法输入中文。
+        if focused {
+            let (cr, cc) = screen.cursor_position();
+            let ipos = origin + Vec2::new(cc as f32 * char_w, cr as f32 * char_h);
+            let irect = Rect::from_min_size(ipos, cell);
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput { rect: irect, cursor_rect: irect });
+            });
         }
 
         // 键盘输入
@@ -587,6 +575,14 @@ impl Terminal {
         for ev in events {
             match ev {
                 egui::Event::Text(t) => {
+                    if !alt {
+                        self.input_line.push_str(&t);
+                        self.hist = None;
+                    }
+                    out.extend_from_slice(t.as_bytes());
+                }
+                // 输入法提交（中文等）：提交串以 UTF-8 发往远端
+                egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
                     if !alt {
                         self.input_line.push_str(&t);
                         self.hist = None;
@@ -778,18 +774,6 @@ fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> TextFormat {
         f.underline = Stroke::new(1.0, fg);
     }
     f
-}
-
-fn default_format(font: &FontId, tc: &TermColors) -> TextFormat {
-    TextFormat {
-        font_id: font.clone(),
-        color: tc.fg,
-        ..Default::default()
-    }
-}
-
-fn same_format(a: &TextFormat, b: &TextFormat) -> bool {
-    a.color == b.color && a.underline == b.underline
 }
 
 /// 逐格绘制非默认背景色（egui 文本布局不便携带逐段背景，单独画矩形）。
