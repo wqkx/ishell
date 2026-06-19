@@ -140,16 +140,74 @@ fn install_fonts(ctx: &egui::Context) {
         .find_map(|p| std::fs::read(p).ok().map(|d| (*p, d)))
     {
         log::info!("加载中文字体：{path}");
-        // 不改 CJK 基线（保持中英文同基线对齐）
-        fonts
-            .font_data
-            .insert("cjk".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(data)));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("cjk".to_owned());
+        // 比例族：用普通（Sans）CJK 面作为后备
+        let prop_idx = cjk_face_index(&data, false);
+        let mut prop_fd = egui::FontData::from_owned(data.clone());
+        prop_fd.index = prop_idx;
+        fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(prop_fd));
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().push("cjk".to_owned());
+
+        // 等宽族：若字体集合内含等宽（Mono）CJK 面，则**前置**为主字体——
+        // 其 Latin 为半角、CJK 为全角，恰好 1:2，终端按 2 格绘制 CJK 不再有多余间距。
+        // 找不到等宽面时退回用普通 CJK 作后备（仅消除方块，间距略宽，可接受）。
+        match cjk_mono_face_index(&data) {
+            Some(mono_idx) => {
+                log::info!("终端使用等宽 CJK 字面 index={mono_idx}");
+                let mut mono_fd = egui::FontData::from_owned(data);
+                mono_fd.index = mono_idx;
+                fonts.font_data.insert("cjk-mono".to_owned(), std::sync::Arc::new(mono_fd));
+                fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "cjk-mono".to_owned());
+            }
+            None => {
+                fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".to_owned());
+            }
         }
     } else {
         log::warn!("未找到系统中文字体，中文可能显示为方块");
     }
 
     ctx.set_fonts(fonts);
+}
+
+/// 取字体集合中某个字面的 Family 名（name_id=1）。
+fn face_family(data: &[u8], index: u32) -> Option<String> {
+    let face = ttf_parser::Face::parse(data, index).ok()?;
+    face.names()
+        .into_iter()
+        .filter(|n| n.name_id == ttf_parser::name_id::FAMILY)
+        .find_map(|n| n.to_string())
+}
+
+/// 选择普通（非 Mono）CJK 字面索引；优先简体（SC），否则第一个非 Mono 面，再不行用 0。
+fn cjk_face_index(data: &[u8], _prop: bool) -> u32 {
+    let n = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+    let mut first_non_mono = None;
+    for i in 0..n {
+        let Some(fam) = face_family(data, i) else { continue };
+        if fam.contains("Mono") {
+            continue;
+        }
+        if fam.contains("SC") {
+            return i;
+        }
+        first_non_mono.get_or_insert(i);
+    }
+    first_non_mono.unwrap_or(0)
+}
+
+/// 选择等宽（Mono）CJK 字面索引；优先简体（SC）。无 Mono 面则返回 None。
+fn cjk_mono_face_index(data: &[u8]) -> Option<u32> {
+    let n = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+    let mut first_mono = None;
+    for i in 0..n {
+        let Some(fam) = face_family(data, i) else { continue };
+        if !fam.contains("Mono") {
+            continue;
+        }
+        if fam.contains("SC") {
+            return Some(i);
+        }
+        first_mono.get_or_insert(i);
+    }
+    first_mono
 }

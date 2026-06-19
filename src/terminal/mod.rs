@@ -30,6 +30,8 @@ pub struct Terminal {
     find: Option<Find>,
     /// 当前命中所在的屏幕行（高亮用）
     search_hl: Option<u16>,
+    /// 鼠标上报模式下当前按住的按钮基码（0=左 1=中 2=右），用于编码拖动事件
+    held_btn: Option<u8>,
 }
 
 /// 终端搜索状态。
@@ -107,6 +109,7 @@ impl Terminal {
             hist: None,
             find: None,
             search_hl: None,
+            held_btn: None,
         }
     }
 
@@ -396,12 +399,36 @@ impl Terminal {
         let new_rows = (avail.y / char_h).floor().max(1.0) as u16;
         self.resize(new_cols, new_rows);
 
-        // 滚轮：Ctrl+滚轮调字号，否则回滚 scrollback
+        // 单元格定位（屏幕字符坐标）。捕获 cols/rows 副本以免与后续 &mut self 冲突。
+        let (cols, rows) = (self.cols, self.rows);
+        let cell_at = |pos: egui::Pos2| -> (u16, u16) {
+            let c = (((pos.x - rect.left()) / char_w).floor() as i32).clamp(0, cols as i32 - 1) as u16;
+            let r = (((pos.y - rect.top()) / char_h).floor() as i32).clamp(0, rows as i32 - 1) as u16;
+            (r, c)
+        };
+
+        // 远端是否开启了鼠标上报（vim/htop/tmux 等）。按住 Shift 时临时强制本地选择（xterm 习惯）。
+        let mmode = self.parser.screen().mouse_protocol_mode();
+        let menc = self.parser.screen().mouse_protocol_encoding();
+        let shift = ui.input(|i| i.modifiers.shift);
+        let report_mouse = mmode != vt100::MouseProtocolMode::None && !shift;
+        let mut mouse_out: Vec<u8> = Vec::new();
+
+        // 滚轮：Ctrl 调字号；鼠标上报时发滚轮键（64/65）；否则本地回滚
         if resp.hovered() {
             let (scroll, ctrl) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl || i.modifiers.command));
             if scroll != 0.0 {
                 if ctrl {
                     self.font_size = (self.font_size + scroll.signum() * 1.0).clamp(8.0, 32.0);
+                } else if report_mouse {
+                    if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+                        let (r, c) = cell_at(p);
+                        let cb = if scroll > 0.0 { 64 } else { 65 };
+                        let steps = ((scroll.abs() / char_h).round() as i32).clamp(1, 5);
+                        for _ in 0..steps {
+                            encode_mouse(menc, cb, c, r, true, &mut mouse_out);
+                        }
+                    }
                 } else {
                     let lines = (scroll / char_h).round() as i64;
                     let nb = (self.scrollback as i64 + lines).clamp(0, 5000) as usize;
@@ -412,25 +439,62 @@ impl Terminal {
             }
         }
 
-        // 鼠标拖拽选择文本（屏幕字符坐标）
-        let cell_at = |pos: egui::Pos2| -> (u16, u16) {
-            let c = (((pos.x - rect.left()) / char_w).floor() as i32).clamp(0, self.cols as i32 - 1) as u16;
-            let r = (((pos.y - rect.top()) / char_h).floor() as i32).clamp(0, self.rows as i32 - 1) as u16;
-            (r, c)
-        };
-        if resp.drag_started() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                let c = cell_at(p);
-                self.sel_anchor = Some(c);
-                self.sel_cursor = Some(c);
+        if report_mouse {
+            // 转发鼠标按键/移动给远端
+            let events = ui.input(|i| i.events.clone());
+            for ev in &events {
+                match ev {
+                    egui::Event::PointerButton { pos, button, pressed, modifiers } if rect.contains(*pos) => {
+                        let (r, c) = cell_at(*pos);
+                        let base = match button {
+                            egui::PointerButton::Primary => 0u8,
+                            egui::PointerButton::Middle => 1,
+                            egui::PointerButton::Secondary => 2,
+                            _ => 0,
+                        };
+                        let mut cb = base;
+                        if modifiers.alt { cb += 8; }
+                        if modifiers.ctrl || modifiers.command { cb += 16; }
+                        if *pressed {
+                            self.held_btn = Some(base);
+                            encode_mouse(menc, cb, c, r, true, &mut mouse_out);
+                        } else {
+                            self.held_btn = None;
+                            // X10(Press) 模式不上报释放；SGR 用原按钮码，传统编码用 3
+                            if mmode != vt100::MouseProtocolMode::Press {
+                                let rel = if menc == vt100::MouseProtocolEncoding::Sgr { cb } else { 3 };
+                                encode_mouse(menc, rel, c, r, false, &mut mouse_out);
+                            }
+                        }
+                    }
+                    egui::Event::PointerMoved(pos) if rect.contains(*pos) => {
+                        let motion = mmode == vt100::MouseProtocolMode::AnyMotion
+                            || (mmode == vt100::MouseProtocolMode::ButtonMotion && self.held_btn.is_some());
+                        if motion {
+                            let (r, c) = cell_at(*pos);
+                            let cb = 32 + self.held_btn.unwrap_or(3); // 32=移动标志位
+                            encode_mouse(menc, cb, c, r, true, &mut mouse_out);
+                        }
+                    }
+                    _ => {}
+                }
             }
-        } else if resp.dragged() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                self.sel_cursor = Some(cell_at(p));
+        } else {
+            // 本地拖拽选择文本
+            if resp.drag_started() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let c = cell_at(p);
+                    self.sel_anchor = Some(c);
+                    self.sel_cursor = Some(c);
+                }
+            } else if resp.dragged() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    self.sel_cursor = Some(cell_at(p));
+                }
             }
-        }
-        if resp.clicked() {
-            self.clear_selection();
+            if resp.clicked() {
+                self.clear_selection();
+            }
         }
 
         let tc = if self.dark { TermColors::dark() } else { TermColors::light() };
@@ -559,6 +623,8 @@ impl Terminal {
                 out.extend_from_slice(t.as_bytes());
             }
         }
+        // 鼠标上报字节（若有）
+        out.extend_from_slice(&mouse_out);
         out
     }
 
@@ -756,6 +822,26 @@ fn vt_color(c: vt100::Color, default: Color32, tc: &TermColors) -> Color32 {
         vt100::Color::Default => default,
         vt100::Color::Idx(i) => xterm256(i, tc),
         vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+    }
+}
+
+/// 编码一个鼠标事件为终端字节流。`cb` 为按钮码（含修饰位/移动位/滚轮位）。
+/// `col`/`row` 为 0 基屏幕坐标，内部转 1 基。`press` 仅影响 SGR 的 M/m。
+fn encode_mouse(enc: vt100::MouseProtocolEncoding, cb: u8, col: u16, row: u16, press: bool, out: &mut Vec<u8>) {
+    let cx = col as u32 + 1;
+    let cy = row as u32 + 1;
+    match enc {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let m = if press { 'M' } else { 'm' };
+            out.extend_from_slice(format!("\x1b[<{cb};{cx};{cy}{m}").as_bytes());
+        }
+        // 传统 X10/normal 编码：ESC [ M (cb+32) (x+32) (y+32)，坐标上限 223
+        _ => {
+            let b = 32u32.saturating_add(cb as u32);
+            let x = 32 + cx.min(223);
+            let y = 32 + cy.min(223);
+            out.extend_from_slice(&[0x1b, b'[', b'M', b as u8, x as u8, y as u8]);
+        }
     }
 }
 

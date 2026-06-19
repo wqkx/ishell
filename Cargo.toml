@@ -10,6 +10,7 @@ eframe = { version = "0.34", default-features = true }
 egui = "0.34"
 egui_extras = "0.34"  # 表格 + 轻量代码高亮（不启用 syntect，避免常驻大内存）
 egui-phosphor = "0.12" # 图标字体（对应 egui 0.34）
+ttf-parser = "0.25"    # 解析 CJK 字体集合，挑出等宽（Mono）字面用于终端
 
 # 原生文件选择器：按平台选择后端（见文件底部 target 段）
 
