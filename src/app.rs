@@ -370,7 +370,7 @@ impl App {
             demo_gpu: std::env::var("ISHELL_DEMO_GPU").is_ok(),
             demo_net: std::env::var("ISHELL_DEMO_NET").is_ok(),
             shot,
-            logo: std::env::var("ISHELL_LOGO").is_ok(),
+            logo: std::env::var("ISHELL_LOGO").is_ok() || std::env::var("ISHELL_ICON").is_ok(),
         };
 
         // 自检：自动连接（格式 host|port|user|keypath），免去手动登录

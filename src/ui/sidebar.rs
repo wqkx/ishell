@@ -272,7 +272,7 @@ fn disk_row(ui: &mut egui::Ui, mount: &str, percent: f32, detail: &str) {
 
 /// 进程表：最多 5 行；可点击 CPU%/内存% 表头切换排序；单击行查看详情。
 fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click: &mut Option<(u32, egui::Pos2)>) {
-    let pid_w = 46.0;
+    let pid_w = 60.0; // 容纳较长 PID（约 +2 个字符）
     let cpu_w = 44.0;
     let mem_w = 44.0;
 
@@ -317,15 +317,15 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
         }
         let p = ui.painter_at(rect);
         p.text(rect.left_center(), egui::Align2::LEFT_CENTER, proc.pid.to_string(),
-            egui::FontId::monospace(11.0), Palette::TEXT_DIM);
+            egui::FontId::proportional(11.0), Palette::TEXT_DIM);
         // 内存%（最右）
         let mem_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w, 0.0), rect.right_bottom());
         p.text(mem_rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.mem),
-            egui::FontId::monospace(11.0), usage_color(proc.mem));
+            egui::FontId::proportional(11.0), usage_color(proc.mem));
         // CPU%（中右）
         let cpu_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w + cpu_w, 0.0), egui::pos2(rect.right() - mem_w, rect.bottom()));
         p.text(cpu_rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.cpu),
-            egui::FontId::monospace(11.0), usage_color(proc.cpu));
+            egui::FontId::proportional(11.0), usage_color(proc.cpu));
         // 名称（中间，截断）
         let name_rect = Rect::from_min_max(
             rect.left_top() + Vec2::new(pid_w, 0.0),

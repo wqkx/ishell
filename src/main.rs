@@ -15,18 +15,35 @@ mod terminal;
 mod theme;
 mod ui;
 
+/// 应用图标（任务栏/窗口/Alt-Tab）。编译期内嵌 PNG，运行时解码为 RGBA。
+fn load_icon() -> egui::IconData {
+    let bytes = include_bytes!("../assets/icon.png");
+    match image::load_from_memory(bytes) {
+        Ok(img) => {
+            let img = img.into_rgba8();
+            let (width, height) = img.dimensions();
+            egui::IconData { rgba: img.into_raw(), width, height }
+        }
+        Err(_) => egui::IconData::default(),
+    }
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Logo 生成模式：窄长画布 + 透明背景 + 无边框，用于截出圆角矩形 logo
+    // Logo / 图标生成模式：窄长（logo）或方形（icon）画布，用于截图生成素材
     let logo = std::env::var("ISHELL_LOGO").is_ok();
-    let viewport = if logo {
+    let icon_gen = std::env::var("ISHELL_ICON").is_ok();
+    let viewport = if icon_gen {
+        egui::ViewportBuilder::default().with_inner_size([256.0, 256.0])
+    } else if logo {
         egui::ViewportBuilder::default().with_inner_size([440.0, 156.0])
     } else {
         egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 560.0])
             .with_title("iShell — Rust SSH 客户端")
+            .with_icon(load_icon())
     };
     let native_options = eframe::NativeOptions { viewport, ..Default::default() };
 

@@ -1,6 +1,6 @@
 <div align="center">
 
-# iShell
+<img src="docs/logo.png" alt="iShell" width="300">
 
 **A modern, cross-platform SSH client written in Rust**
 

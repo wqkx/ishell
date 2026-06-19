@@ -1,6 +1,6 @@
 <div align="center">
 
-# iShell
+<img src="docs/logo.png" alt="iShell" width="300">
 
 **一个用 Rust 编写的现代化跨平台 SSH 客户端**
 
