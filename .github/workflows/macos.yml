@@ -4,8 +4,6 @@ name: macOS Build
 # 触发：手动运行（Actions 页面 Run workflow），或推送 v* 标签。
 on:
   workflow_dispatch:
-  push:
-    tags: ['v*']
 
 jobs:
   build:
