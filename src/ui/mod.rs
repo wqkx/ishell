@@ -42,8 +42,9 @@ pub fn usage_color(percent: f32) -> Color32 {
     }
 }
 
-/// 绘制网络速率折线图（含左侧刻度值与水平虚线网格，仿 FinalShell）。
-pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32) {
+/// 绘制网络速率折线图（含刻度值与水平虚线网格，仿 FinalShell）。
+/// `slots` 为横轴总点位数（决定点间距/密度）；数据从右侧（最新）向左排布。
+pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, slots: usize) {
     let desired = Vec2::new(ui.available_width(), height);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -78,11 +79,14 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32) {
             return;
         }
         let n = series.len();
+        // 固定点间距（按总点位数），数据右对齐：最新点在最右，旧点向左延伸。
+        // 这样点的密度始终正确，不会在数据未填满时被拉伸成稀疏。
+        let step = plot.width() / (slots.saturating_sub(1).max(1) as f32);
         let pts: Vec<egui::Pos2> = series
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let x = plot.left() + plot.width() * (i as f32 / (n - 1) as f32);
+                let x = plot.right() - (n - 1 - i) as f32 * step;
                 let y = plot.bottom() - plot.height() * (*v / max).min(1.0) as f32;
                 egui::pos2(x, y)
             })

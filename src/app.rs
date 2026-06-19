@@ -196,6 +196,8 @@ pub struct App {
     gpu_popup_just_opened: bool,
     /// 自检：每帧注入假 GPU 数据并保持详情窗打开（仅截图核对用）
     demo_gpu: bool,
+    /// 自检：注入网络曲线波形（仅截图核对密度用）
+    demo_net: bool,
     /// 自检截图模式（由环境变量触发，正常使用时为 None）
     shot: Option<Shot>,
 }
@@ -300,6 +302,7 @@ impl App {
             gpu_popup: None,
             gpu_popup_just_opened: false,
             demo_gpu: std::env::var("ISHELL_DEMO_GPU").is_ok(),
+            demo_net: std::env::var("ISHELL_DEMO_NET").is_ok(),
             shot,
         };
 
@@ -573,6 +576,20 @@ impl eframe::App for App {
                     cmd_tx: tx,
                 });
                 self.active_editor = self.editors.len() - 1;
+            }
+        }
+
+        // 自检：注入网络曲线波形以核对点密度
+        if self.demo_net {
+            if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
+                s.net_hist.down.clear();
+                s.net_hist.up.clear();
+                // 仅 30 个点，便于核对「从右侧起、向左生长」与点密度
+                for i in 0..30 {
+                    let t = i as f64;
+                    s.net_hist.down.push_back(((t * 0.4).sin() * 0.5 + 0.5) * 5.0e6);
+                    s.net_hist.up.push_back(((t * 0.3).cos() * 0.5 + 0.5) * 2.0e6);
+                }
             }
         }
 
@@ -1465,31 +1482,18 @@ impl App {
 }
 
 /// 扁平按钮（无边框、悬停高亮），用于标签栏等处，贴近 FinalShell 风格。
-/// 对话框按钮：自绘以保证文字在按钮内垂直居中（补偿 CJK 字体行盒下沉）。
+/// 对话框按钮：用 egui 原生按钮（自然高度，仅约束最小宽度），由 egui 居中文字，
+/// 与全局其它按钮一致，避免硬编码像素偏移在不同字体下错位。
 fn dialog_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>, width: f32) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
-    let bg = match fill {
-        Some(f) => {
-            if resp.hovered() {
-                f.gamma_multiply(0.9)
-            } else {
-                f
-            }
-        }
-        None => {
-            if resp.hovered() {
-                Palette::TRACK
-            } else {
-                Palette::PANEL_2
-            }
-        }
+    let text = match fill {
+        Some(_) => RichText::new(label).color(egui::Color32::WHITE),
+        None => RichText::new(label),
     };
-    let p = ui.painter();
-    p.rect_filled(rect, 4.0, bg);
-    let col = if fill.is_some() { egui::Color32::WHITE } else { Palette::TEXT };
-    // 文字中心下移补偿 CJK 字体行盒上偏（≈ 字号 * 0.16），达到视觉居中
-    p.text(rect.center() + egui::vec2(0.0, 2.5), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(13.5), col);
-    resp.clicked()
+    let mut btn = egui::Button::new(text).min_size(egui::vec2(width, 0.0));
+    if let Some(f) = fill {
+        btn = btn.fill(f);
+    }
+    ui.add(btn).clicked()
 }
 
 fn flat_button(ui: &mut egui::Ui, text: &RichText, tip: &str) -> bool {

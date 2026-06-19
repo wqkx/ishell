@@ -14,7 +14,7 @@ pub struct NetHistory {
 }
 
 impl NetHistory {
-    const CAP: usize = 120;
+    pub const CAP: usize = 120;
     pub fn push(&mut self, down: f64, up: f64) {
         self.down.push_back(down);
         self.up.push_back(up);
@@ -137,7 +137,7 @@ pub fn show(
             ui.label(RichText::new(icon::ARROW_UP).color(Palette::ACCENT).size(13.0));
             ui.label(RichText::new(fmt_rate(tx)).color(Palette::TEXT).size(12.0).monospace());
         });
-        net_sparkline(ui, &hist.down_slice(), &hist.up_slice(), 76.0);
+        net_sparkline(ui, &hist.down_slice(), &hist.up_slice(), 76.0, NetHistory::CAP);
         ui.add_space(6.0);
 
         // —— 磁盘：每行一个，右起进度条 + 文字同行 ——
