@@ -254,6 +254,8 @@ pub struct App {
     demo_net: bool,
     /// 自检截图模式（由环境变量触发，正常使用时为 None）
     shot: Option<Shot>,
+    /// Logo 生成模式（ISHELL_LOGO）：只画 logo 圆角矩形
+    logo: bool,
 }
 
 /// 进程详情小窗状态。
@@ -368,6 +370,7 @@ impl App {
             demo_gpu: std::env::var("ISHELL_DEMO_GPU").is_ok(),
             demo_net: std::env::var("ISHELL_DEMO_NET").is_ok(),
             shot,
+            logo: std::env::var("ISHELL_LOGO").is_ok(),
         };
 
         // 自检：自动连接（格式 host|port|user|keypath），免去手动登录
@@ -684,11 +687,33 @@ impl App {
 impl eframe::App for App {
     // 窗口清屏色用主题背景，避免各区域间隙露出黑色
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.logo {
+            return [1.0, 1.0, 1.0, 1.0]; // logo 模式白底，圆角矩形（米色）落在白底上便于裁切/置于浅色页
+        }
         Palette::BG.to_normalized_gamma_f32()
     }
 
     // eframe 0.34 的现代入口：所有面板通过 `show_inside` 嵌入根 `ui`。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Logo 生成模式：透明画布上画一个圆角矩形（初始界面背景色）+ iShell（accent 色、同字体）
+        if self.logo {
+            {
+                let painter = ui.painter();
+                let rect = ui.max_rect().shrink(8.0);
+                painter.rect_filled(rect, 30.0, Palette::BG);
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "iShell",
+                    egui::FontId::proportional(76.0),
+                    Palette::ACCENT,
+                );
+            }
+            let ctx = ui.ctx().clone();
+            self.drive_screenshot(&ctx);
+            return;
+        }
+
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
         let mut new_tabs: Vec<(String, String, String, UnboundedSender<UiCommand>)> = Vec::new();
         for s in &mut self.sessions {
@@ -1085,6 +1110,12 @@ impl App {
                         }
                         if flat_button(ui, &RichText::new(format!("{} {}", icon::MEGAPHONE, crate::i18n::tr("群发", "Bcast"))), crate::i18n::tr("向所有已连接会话广播命令", "Broadcast to all connected sessions")) {
                             self.show_broadcast = !self.show_broadcast;
+                        }
+                        // 分隔竖线：把标签区（标签 + 新建）与右侧功能区分开（短、低调，和谐配色）
+                        {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(11.0, ui.available_height()), egui::Sense::hover());
+                            let cy = rect.center().y;
+                            ui.painter().vline(rect.center().x.round(), (cy - 8.0)..=(cy + 8.0), egui::Stroke::new(1.0, Palette::BORDER));
                         }
                         // 新建：固定在标签条右侧，标签溢出也不会被滚走
                         if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), crate::i18n::tr("新建连接", "New connection")) {

@@ -18,13 +18,17 @@ mod ui;
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    // Logo 生成模式：窄长画布 + 透明背景 + 无边框，用于截出圆角矩形 logo
+    let logo = std::env::var("ISHELL_LOGO").is_ok();
+    let viewport = if logo {
+        egui::ViewportBuilder::default().with_inner_size([440.0, 156.0])
+    } else {
+        egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title("iShell — Rust SSH 客户端"),
-        ..Default::default()
+            .with_title("iShell — Rust SSH 客户端")
     };
+    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
         "iShell",
