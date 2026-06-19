@@ -70,6 +70,11 @@ struct Transfer {
     message: String,
     /// 是否展开显示失败原因
     show_err: bool,
+    /// 实时速度（字节/秒，指数平滑）
+    speed: f64,
+    /// 上次采样的已传字节数与时刻（用于计算速度）
+    last_done: u64,
+    last_t: Option<std::time::Instant>,
 }
 
 impl Session {
@@ -142,11 +147,28 @@ impl Session {
                         t.total = total;
                         t.dir = dir;
                     } else {
-                        self.transfers.push(Transfer { id, name, dir, done: 0, total, ok: None, local: None, message: String::new(), show_err: false });
+                        self.transfers.push(Transfer { id, name, dir, done: 0, total, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
                     }
                 }
                 WorkerEvent::TransferProgress { id, done } => {
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
+                        let now = std::time::Instant::now();
+                        match t.last_t {
+                            Some(prev) => {
+                                let dt = now.duration_since(prev).as_secs_f64();
+                                if dt >= 0.25 {
+                                    let inst = done.saturating_sub(t.last_done) as f64 / dt;
+                                    // 指数平滑，读数更稳
+                                    t.speed = if t.speed <= 0.0 { inst } else { t.speed * 0.6 + inst * 0.4 };
+                                    t.last_done = done;
+                                    t.last_t = Some(now);
+                                }
+                            }
+                            None => {
+                                t.last_done = done;
+                                t.last_t = Some(now);
+                            }
+                        }
                         t.done = done;
                     }
                 }
@@ -157,6 +179,7 @@ impl Session {
                             t.total = t.done;
                         }
                         t.message = message.clone();
+                        t.speed = 0.0;
                     }
                     self.status = message;
                     self.refresh_dir(refresh_dir);
@@ -474,9 +497,9 @@ impl App {
         if std::env::var("ISHELL_DEMO_XFER").is_ok() {
             if let Some(s) = app.sessions.first_mut() {
                 use crate::proto::TransferDir::*;
-                s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, done: 73_400_320, total: 104_857_600, ok: None, local: None, message: String::new(), show_err: false });
-                s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, done: 2048, total: 2048, ok: Some(true), local: None, message: String::new(), show_err: false });
-                s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()), message: String::new(), show_err: false });
+                s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, done: 73_400_320, total: 104_857_600, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, done: 2048, total: 2048, ok: Some(true), local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
             }
             app.show_transfers = true;
         }
@@ -613,7 +636,7 @@ impl App {
                 s.next_xfer += 1;
                 s.transfers.push(Transfer {
                     id, name, dir: crate::proto::TransferDir::Download, done: 0, total: 0, ok: None,
-                    local: Some(local.clone()), message: String::new(), show_err: false,
+                    local: Some(local.clone()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
                 });
                 let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local });
                 self.show_transfers = true;
@@ -625,7 +648,7 @@ impl App {
                 s.next_xfer += 1;
                 s.transfers.push(Transfer {
                     id, name, dir: crate::proto::TransferDir::Upload, done: 0, total: 0, ok: None,
-                    local: None, message: String::new(), show_err: false,
+                    local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
                 });
                 let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir });
                 self.show_transfers = true;
@@ -1603,14 +1626,21 @@ impl App {
                         });
                     });
                     let frac = if t.total > 0 { t.done as f32 / t.total as f32 } else if t.ok == Some(true) { 1.0 } else { 0.0 };
-                    let text = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
+                    // 进度条上显示百分比
+                    let pct = (frac.clamp(0.0, 1.0) * 100.0).round() as i32;
                     ui.add(
                         egui::ProgressBar::new(frac.clamp(0.0, 1.0))
                             .fill(dir_col)
-                            .text(RichText::new(text).size(10.0))
+                            .text(RichText::new(format!("{pct}%")).size(10.0))
                             .desired_height(10.0)
                             .corner_radius(2.0),
                     );
+                    // 详情行：已传/总量；进行中再附实时速度
+                    let mut detail = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
+                    if t.ok.is_none() && t.speed > 0.0 {
+                        detail.push_str(&format!("  ·  {}", crate::ui::fmt_rate(t.speed)));
+                    }
+                    ui.label(RichText::new(detail).size(10.0).color(Palette::TEXT_DIM));
                     // 失败且已展开：显示失败原因
                     if t.ok == Some(false) && t.show_err && !t.message.is_empty() {
                         ui.label(RichText::new(&t.message).color(Palette::DANGER).size(11.0));
