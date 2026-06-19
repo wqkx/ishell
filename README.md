@@ -56,20 +56,13 @@ src/
 
 ## 构建与运行
 
-### Linux 依赖
+**跨平台**：Linux / macOS / Windows 均支持。详见 [BUILD.md](BUILD.md)（含各平台说明与 GitHub Actions 自动出包）。
 
 ```bash
-sudo apt install -y libxcb1-dev libxkbcommon-dev libgl1-mesa-dev libssl-dev pkg-config
-# 中文显示（可选）：安装 Noto CJK 或文泉驿字体
-sudo apt install -y fonts-noto-cjk
+cargo run --release        # 在目标平台上直接编译运行
 ```
 
-### 编译
-
-```bash
-cargo run --release
-```
-
+Linux 可选依赖：`sudo apt install -y libxkbcommon-dev libgl1-mesa-dev fonts-noto-cjk`。
 启动后在弹出的对话框中填入主机、端口、用户名，选择密码或私钥认证即可连接。
 
 ## 已实现

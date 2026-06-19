@@ -64,8 +64,15 @@ fn default_port() -> u16 {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(home.join(".config").join("ishell"))
+    // Windows: %APPDATA%\ishell；类 Unix：$HOME/.config/ishell
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("ishell"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("ishell"))
+    }
 }
 fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("connections.json"))

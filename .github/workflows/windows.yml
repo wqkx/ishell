@@ -1,0 +1,33 @@
+name: Windows Build
+
+# 在 GitHub 的 Windows runner 上编译出 ishell.exe。
+# 触发：手动运行（Actions 页 Run workflow），或推送 v* 标签。
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # 项目内的 .cargo/config.toml 指向国内 rsproxy 镜像，CI 上用官方源即可
+      - name: Use crates.io (drop China mirror)
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ishell-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/ishell.exe

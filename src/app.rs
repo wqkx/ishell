@@ -1777,9 +1777,13 @@ fn open_containing_folder(file: &str) {
     let _ = std::process::Command::new(cmd).arg(dir).spawn();
 }
 
-/// 本地下载目录：优先 `$HOME/Downloads`，否则当前目录。
+/// 本地下载目录：优先用户主目录下的 Downloads，否则当前目录。
 fn downloads_dir() -> std::path::PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    if let Some(home) = home {
         let d = std::path::Path::new(&home).join("Downloads");
         let _ = std::fs::create_dir_all(&d);
         return d;
