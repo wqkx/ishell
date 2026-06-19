@@ -4,17 +4,63 @@
 mod forward;
 pub mod sysinfo;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client::{self, Handle, Handler};
 use russh::keys::ssh_key;
 use russh::ChannelMsg;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::proto::{AuthMethod, ConnectConfig, FileEntry, UiCommand, WorkerEvent};
 use sysinfo::{SysSampler, PROBE_CMD};
+
+/// 同一会话同时进行的最大传输数（不同会话各自独立）。
+const MAX_CONCURRENT_XFER: usize = 6;
+
+/// 待执行/进行中的传输任务描述。
+enum PendingXfer {
+    Download { id: u64, remote: String, local: String },
+    Upload { id: u64, local: String, remote_dir: String },
+}
+
+impl PendingXfer {
+    fn id(&self) -> u64 {
+        match self {
+            PendingXfer::Download { id, .. } | PendingXfer::Upload { id, .. } => *id,
+        }
+    }
+}
+
+/// 启动一个传输任务：登记取消标志，spawn 后台任务，完成时通过 `done_tx` 通知主循环。
+fn start_xfer(
+    handle: &Arc<Handle<ClientHandler>>,
+    sink: &UiSink,
+    done_tx: &UnboundedSender<u64>,
+    cancels: &mut HashMap<u64, Arc<AtomicBool>>,
+    p: PendingXfer,
+) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let id = p.id();
+    cancels.insert(id, cancel.clone());
+    let h = handle.clone();
+    let s = sink.clone();
+    let dtx = done_tx.clone();
+    tokio::spawn(async move {
+        match open_sftp(&h).await {
+            Ok(sftp) => match p {
+                PendingXfer::Download { id, remote, local } => download(&sftp, id, remote, local, &s, cancel).await,
+                PendingXfer::Upload { id, local, remote_dir } => upload(&sftp, id, local, remote_dir, &s, cancel).await,
+            },
+            Err(e) => s.send(WorkerEvent::TransferDone {
+                id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
+            }),
+        }
+        let _ = dtx.send(id);
+    });
+}
 
 /// 发往 UI 的事件通道（std mpsc），附带 egui 上下文用于主动请求重绘。
 #[derive(Clone)]
@@ -167,9 +213,28 @@ pub async fn run(
     // 端口转发监听任务：id -> JoinHandle
     let mut forwards: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
 
+    // 传输并发控制：进行中计数 + 排队 + 取消标志；完成时由任务经 xfer_done 通知主循环
+    let mut active_xfer = 0usize;
+    let mut pending_xfer: VecDeque<PendingXfer> = VecDeque::new();
+    let mut xfer_cancels: HashMap<u64, Arc<AtomicBool>> = HashMap::new();
+    let (xfer_done_tx, mut xfer_done_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+
     // 4) 主循环：转发终端数据、处理 UI 指令
     loop {
         tokio::select! {
+            // 某个传输结束：腾出名额并尝试启动排队中的任务
+            Some(_done_id) = xfer_done_rx.recv() => {
+                xfer_cancels.remove(&_done_id);
+                active_xfer = active_xfer.saturating_sub(1);
+                while active_xfer < MAX_CONCURRENT_XFER {
+                    if let Some(p) = pending_xfer.pop_front() {
+                        start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
+                        active_xfer += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
             msg = shell.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
@@ -217,28 +282,34 @@ pub async fn run(
                     }
                     // 传输：独立任务（独立 SFTP 通道），不阻塞交互 shell
                     Some(UiCommand::Download { id, remote, local }) => {
-                        let h = handle.clone();
-                        let s = sink.clone();
-                        tokio::spawn(async move {
-                            match open_sftp(&h).await {
-                                Ok(sftp) => download(&sftp, id, remote, local, &s).await,
-                                Err(e) => s.send(WorkerEvent::TransferDone {
-                                    id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
-                                }),
-                            }
-                        });
+                        let p = PendingXfer::Download { id, remote, local };
+                        if active_xfer < MAX_CONCURRENT_XFER {
+                            start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
+                            active_xfer += 1;
+                        } else {
+                            pending_xfer.push_back(p);
+                        }
                     }
                     Some(UiCommand::Upload { id, local, remote_dir }) => {
-                        let h = handle.clone();
-                        let s = sink.clone();
-                        tokio::spawn(async move {
-                            match open_sftp(&h).await {
-                                Ok(sftp) => upload(&sftp, id, local, remote_dir, &s).await,
-                                Err(e) => s.send(WorkerEvent::TransferDone {
-                                    id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
-                                }),
-                            }
-                        });
+                        let p = PendingXfer::Upload { id, local, remote_dir };
+                        if active_xfer < MAX_CONCURRENT_XFER {
+                            start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
+                            active_xfer += 1;
+                        } else {
+                            pending_xfer.push_back(p);
+                        }
+                    }
+                    Some(UiCommand::CancelTransfer(id)) => {
+                        if let Some(c) = xfer_cancels.get(&id) {
+                            // 进行中：置标志，任务会尽快中止并上报「已取消」
+                            c.store(true, Ordering::Relaxed);
+                        } else if let Some(pos) = pending_xfer.iter().position(|p| p.id() == id) {
+                            // 仍在排队：直接移除并上报已取消
+                            pending_xfer.remove(pos);
+                            sink.send(WorkerEvent::TransferDone {
+                                id, ok: false, message: crate::i18n::tr("已取消", "Canceled").into(), refresh_dir: None,
+                            });
+                        }
                     }
                     Some(UiCommand::ReadFile { path, force }) => {
                         if let Some(sftp) = &sftp {
@@ -470,6 +541,7 @@ async fn download(
     remote: String,
     local: String,
     sink: &UiSink,
+    cancel: Arc<AtomicBool>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let name = basename(&remote);
@@ -517,6 +589,9 @@ async fn download(
             let mut rf = sftp.open(&rpath).await?;
             let mut lf = tokio::fs::File::create(&lpath).await?;
             loop {
+                if cancel.load(Ordering::Relaxed) {
+                    anyhow::bail!("canceled");
+                }
                 let n = rf.read(&mut buf).await?;
                 if n == 0 {
                     break;
@@ -539,9 +614,14 @@ async fn download(
         Ok(_) => sink.send(WorkerEvent::TransferDone {
             id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已下载 {name}"), crate::i18n::Lang::En => format!("Downloaded {name}") }, refresh_dir: None,
         }),
-        Err(e) => sink.send(WorkerEvent::TransferDone {
-            id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("下载失败：{e}"), crate::i18n::Lang::En => format!("Download failed: {e}") }, refresh_dir: None,
-        }),
+        Err(e) => {
+            let message = if cancel.load(Ordering::Relaxed) {
+                crate::i18n::tr("已取消", "Canceled").to_string()
+            } else {
+                match crate::i18n::current() { crate::i18n::Lang::Zh => format!("下载失败：{e}"), crate::i18n::Lang::En => format!("Download failed: {e}") }
+            };
+            sink.send(WorkerEvent::TransferDone { id, ok: false, message, refresh_dir: None });
+        }
     }
 }
 
@@ -552,6 +632,7 @@ async fn upload(
     local: String,
     remote_dir: String,
     sink: &UiSink,
+    cancel: Arc<AtomicBool>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let name = basename(&local);
@@ -566,6 +647,9 @@ async fn upload(
         let mut buf = vec![0u8; 128 * 1024];
         let (mut done, mut last) = (0u64, 0u64);
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("canceled");
+            }
             let n = lf.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -587,9 +671,14 @@ async fn upload(
         Ok(_) => sink.send(WorkerEvent::TransferDone {
             id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已上传 {name}"), crate::i18n::Lang::En => format!("Uploaded {name}") }, refresh_dir: Some(remote_dir),
         }),
-        Err(e) => sink.send(WorkerEvent::TransferDone {
-            id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("上传失败：{e}"), crate::i18n::Lang::En => format!("Upload failed: {e}") }, refresh_dir: None,
-        }),
+        Err(e) => {
+            let message = if cancel.load(Ordering::Relaxed) {
+                crate::i18n::tr("已取消", "Canceled").to_string()
+            } else {
+                match crate::i18n::current() { crate::i18n::Lang::Zh => format!("上传失败：{e}"), crate::i18n::Lang::En => format!("Upload failed: {e}") }
+            };
+            sink.send(WorkerEvent::TransferDone { id, ok: false, message, refresh_dir: None });
+        }
     }
 }
 

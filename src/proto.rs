@@ -45,6 +45,8 @@ pub enum UiCommand {
     Download { id: u64, remote: String, local: String },
     /// 上传本地文件到远程目录
     Upload { id: u64, local: String, remote_dir: String },
+    /// 取消某个传输任务（进行中或排队中）
+    CancelTransfer(u64),
     /// 新建目录
     Mkdir(String),
     /// 新建空文件

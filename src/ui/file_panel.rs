@@ -39,6 +39,18 @@ pub struct FilePanelState {
     pub synced_cwd: String,
     /// 当前弹出的对话框
     pub dialog: Option<Dialog>,
+    /// 列表排序键 + 是否降序
+    pub sort_key: SortKey,
+    pub sort_desc: bool,
+}
+
+/// 文件列表排序键。
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    #[default]
+    Name,
+    Size,
+    Mtime,
 }
 
 /// 原地重命名状态。
@@ -357,12 +369,28 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     }
 
     let cwd = state.cwd.clone();
-    let entries = match state.listings.get(&cwd) {
+    let mut entries = match state.listings.get(&cwd) {
         Some(e) => e.clone(),
         None => return,
     };
+    // 排序：目录始终在前，组内按所选键升/降序
+    {
+        let key = state.sort_key;
+        let desc = state.sort_desc;
+        entries.sort_by(|a, b| {
+            (!a.is_dir).cmp(&!b.is_dir).then_with(|| {
+                let ord = match key {
+                    SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortKey::Size => a.size.cmp(&b.size),
+                    SortKey::Mtime => a.mtime.cmp(&b.mtime),
+                };
+                if desc { ord.reverse() } else { ord }
+            })
+        });
+    }
 
     let mut navigate: Option<String> = None;
+    let mut sort_click: Option<SortKey> = None;
     let mut menu: Vec<Menu> = Vec::new();
     let mut clicks: Vec<usize> = Vec::new(); // 本帧被点击的行
     let mut rclick: Option<usize> = None; // 本帧被右键的行
@@ -402,7 +430,30 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
         .column(Column::auto().at_least(96.0))
         .column(Column::remainder())
         .header(22.0, |mut h| {
-            for t in [crate::i18n::tr("名称","Name"), crate::i18n::tr("大小","Size"), crate::i18n::tr("修改时间","Modified"), crate::i18n::tr("权限","Perm"), crate::i18n::tr("所有者","Owner")] {
+            let (cur, desc) = (state.sort_key, state.sort_desc);
+            // 可排序表头：点击切换排序键/方向，激活列显示升降箭头
+            for (k, label) in [
+                (SortKey::Name, crate::i18n::tr("名称", "Name")),
+                (SortKey::Size, crate::i18n::tr("大小", "Size")),
+                (SortKey::Mtime, crate::i18n::tr("修改时间", "Modified")),
+            ] {
+                h.col(|ui| {
+                    let arrow = if cur == k {
+                        if desc { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_UP }
+                    } else {
+                        ""
+                    };
+                    let color = if cur == k { Palette::ACCENT } else { Palette::TEXT_DIM };
+                    if ui
+                        .add(egui::Label::new(RichText::new(format!("{label} {arrow}")).strong().color(color)).sense(Sense::click()))
+                        .clicked()
+                    {
+                        sort_click = Some(k);
+                    }
+                });
+            }
+            // 不可排序：权限 / 所有者
+            for t in [crate::i18n::tr("权限", "Perm"), crate::i18n::tr("所有者", "Owner")] {
                 h.col(|ui| {
                     ui.label(RichText::new(t).strong().color(Palette::TEXT_DIM));
                 });
@@ -503,6 +554,18 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
             }
         });
     });
+
+    // 表头点击排序：同列切升/降，换列则置升序
+    if let Some(k) = sort_click {
+        if state.sort_key == k {
+            state.sort_desc = !state.sort_desc;
+        } else {
+            state.sort_key = k;
+            state.sort_desc = false;
+        }
+        state.selected.clear();
+        state.anchor = None;
+    }
 
     // 背景右键新建
     if bg_new_dir {

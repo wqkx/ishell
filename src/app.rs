@@ -66,6 +66,10 @@ struct Transfer {
     ok: Option<bool>,
     /// 下载到的本地路径（用于「打开所在文件夹」）
     local: Option<String>,
+    /// 完成/失败原因（点击状态可展开查看）
+    message: String,
+    /// 是否展开显示失败原因
+    show_err: bool,
 }
 
 impl Session {
@@ -138,7 +142,7 @@ impl Session {
                         t.total = total;
                         t.dir = dir;
                     } else {
-                        self.transfers.push(Transfer { id, name, dir, done: 0, total, ok: None, local: None });
+                        self.transfers.push(Transfer { id, name, dir, done: 0, total, ok: None, local: None, message: String::new(), show_err: false });
                     }
                 }
                 WorkerEvent::TransferProgress { id, done } => {
@@ -152,6 +156,7 @@ impl Session {
                         if ok && t.total == 0 {
                             t.total = t.done;
                         }
+                        t.message = message.clone();
                     }
                     self.status = message;
                     self.refresh_dir(refresh_dir);
@@ -469,9 +474,9 @@ impl App {
         if std::env::var("ISHELL_DEMO_XFER").is_ok() {
             if let Some(s) = app.sessions.first_mut() {
                 use crate::proto::TransferDir::*;
-                s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, done: 73_400_320, total: 104_857_600, ok: None, local: None });
-                s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, done: 2048, total: 2048, ok: Some(true), local: None });
-                s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()) });
+                s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, done: 73_400_320, total: 104_857_600, ok: None, local: None, message: String::new(), show_err: false });
+                s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, done: 2048, total: 2048, ok: Some(true), local: None, message: String::new(), show_err: false });
+                s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()), message: String::new(), show_err: false });
             }
             app.show_transfers = true;
         }
@@ -608,7 +613,7 @@ impl App {
                 s.next_xfer += 1;
                 s.transfers.push(Transfer {
                     id, name, dir: crate::proto::TransferDir::Download, done: 0, total: 0, ok: None,
-                    local: Some(local.clone()),
+                    local: Some(local.clone()), message: String::new(), show_err: false,
                 });
                 let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local });
                 self.show_transfers = true;
@@ -620,7 +625,7 @@ impl App {
                 s.next_xfer += 1;
                 s.transfers.push(Transfer {
                     id, name, dir: crate::proto::TransferDir::Upload, done: 0, total: 0, ok: None,
-                    local: None,
+                    local: None, message: String::new(), show_err: false,
                 });
                 let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir });
                 self.show_transfers = true;
@@ -1514,6 +1519,8 @@ impl App {
         let mut close_win = false;
         let mut clear = false;
         let mut pick_dir = false;
+        let mut cancel_id: Option<u64> = None;
+        let mut toggle_err: Option<u64> = None;
         let dl_dir = self.download_dir.to_string_lossy().into_owned();
         let win = egui::Window::new("transfer_win")
             .title_bar(false) // 隐藏过大的默认标题，使用自定义紧凑标题
@@ -1562,8 +1569,25 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             match t.ok {
                                 Some(true) => { ui.label(RichText::new(icon::CHECK_CIRCLE).color(Palette::OK).size(13.0)); }
-                                Some(false) => { ui.label(RichText::new(icon::WARNING_CIRCLE).color(Palette::DANGER).size(13.0)); }
-                                None => { ui.spinner(); }
+                                Some(false) => {
+                                    // 失败：状态按钮可点击展开失败原因
+                                    if ui.add(egui::Button::new(RichText::new(icon::WARNING_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
+                                        .on_hover_text(crate::i18n::tr("点击查看失败原因", "Click for reason"))
+                                        .clicked()
+                                    {
+                                        toggle_err = Some(t.id);
+                                    }
+                                }
+                                None => {
+                                    // 进行中：取消按钮 + 转圈
+                                    if ui.add(egui::Button::new(RichText::new(icon::X_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
+                                        .on_hover_text(crate::i18n::tr("取消", "Cancel"))
+                                        .clicked()
+                                    {
+                                        cancel_id = Some(t.id);
+                                    }
+                                    ui.spinner();
+                                }
                             }
                             // 下载完成：打开所在文件夹
                             if t.ok == Some(true) {
@@ -1587,6 +1611,10 @@ impl App {
                             .desired_height(10.0)
                             .corner_radius(2.0),
                     );
+                    // 失败且已展开：显示失败原因
+                    if t.ok == Some(false) && t.show_err && !t.message.is_empty() {
+                        ui.label(RichText::new(&t.message).color(Palette::DANGER).size(11.0));
+                    }
                     ui.add_space(4.0);
                 }
                 if let Some(p) = open_dir {
@@ -1603,6 +1631,22 @@ impl App {
             if let Some(s) = self.sessions.get_mut(idx) {
                 s.transfers.retain(|t| t.ok.is_none());
             }
+        }
+        // 取消传输：向 worker 发送取消指令
+        if let Some(id) = cancel_id {
+            if let Some(s) = self.sessions.get(idx) {
+                let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
+            }
+            self.xfer_just_opened = true; // 避免点击被当作窗外点击而关窗
+        }
+        // 切换失败原因展开
+        if let Some(id) = toggle_err {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+                    t.show_err = !t.show_err;
+                }
+            }
+            self.xfer_just_opened = true;
         }
         // 选择默认下载目录（原生文件夹选择器）
         if pick_dir {
