@@ -200,6 +200,10 @@ pub struct App {
     /// 编辑器标签页
     editors: Vec<EditorTab>,
     active_editor: usize,
+    /// 下一个编辑器 TextEdit Id 序号
+    next_editor_id: u64,
+    /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
+    trim_after: Option<u32>,
     /// 端口转发管理窗口是否显示
     show_forwards: bool,
     /// 转发浮窗刚打开（本帧跳过"点击外部关闭"判定）
@@ -270,6 +274,8 @@ struct EditorTab {
     editor: crate::ui::editor::Editor,
     server: String,
     cmd_tx: UnboundedSender<UiCommand>,
+    /// 该编辑器固定的 TextEdit Id（关闭时据此清理 egui 状态/撤销历史）
+    text_id: egui::Id,
 }
 
 /// 自检截图状态。
@@ -315,6 +321,8 @@ impl App {
             allow_close: false,
             editors: Vec::new(),
             active_editor: 0,
+            next_editor_id: 0,
+            trim_after: None,
             show_forwards: false,
             fwd_just_opened: false,
             fwd_form: ForwardForm::default(),
@@ -364,22 +372,28 @@ impl App {
         if std::env::var("ISHELL_DEMO_EDIT").is_ok() {
             if let Some((server, tx)) = app.sessions.first().map(|s| (s.title.clone(), s.cmd_tx.clone())) {
                 let code = "use std::io;\n\n// 示例：读取并打印\nfn main() {\n    let mut s = String::new();\n    io::stdin().read_line(&mut s).unwrap();\n    let n: i32 = s.trim().parse().unwrap_or(0);\n    for i in 0..n {\n        println!(\"line {}\", i);\n    }\n}\n".to_string();
+                let t1 = app.alloc_editor_id();
                 app.editors.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/home/e5-1/demo.rs".into(), code),
                     server: server.clone(),
                     cmd_tx: tx.clone(),
+                    text_id: t1,
                 });
                 // 大文件（>1MB）→ 只读模式，核对「改为可编辑」按钮
                 let big: String = (0..40000).map(|i| format!("{i}: the quick brown fox jumps over the lazy dog\n")).collect();
+                let t2 = app.alloc_editor_id();
                 app.editors.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
                     server: server.clone(),
                     cmd_tx: tx.clone(),
+                    text_id: t2,
                 });
+                let t3 = app.alloc_editor_id();
                 app.editors.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
                     server,
                     cmd_tx: tx,
+                    text_id: t3,
                 });
                 app.active_editor = 1; // 默认显示大文件标签
             }
@@ -460,6 +474,13 @@ impl App {
     }
 
     /// 根据配置建立一个新会话（spawn worker）。
+    /// 分配一个唯一的编辑器 TextEdit Id。
+    fn alloc_editor_id(&mut self) -> egui::Id {
+        let id = egui::Id::new(("ed_txt", self.next_editor_id));
+        self.next_editor_id += 1;
+        id
+    }
+
     /// 创建通道并在运行时启动一个 worker，返回 (cmd_tx, evt_rx, hostkey_tx)。
     fn spawn_worker(
         &self,
@@ -652,10 +673,12 @@ impl eframe::App for App {
             if let Some(i) = self.editors.iter().position(|t| t.server == server && t.editor.path == path) {
                 self.active_editor = i;
             } else {
+                let tid = self.alloc_editor_id();
                 self.editors.push(EditorTab {
                     editor: crate::ui::editor::Editor::new(path, content),
                     server,
                     cmd_tx: tx,
+                    text_id: tid,
                 });
                 self.active_editor = self.editors.len() - 1;
             }
@@ -683,6 +706,17 @@ impl eframe::App for App {
         }
         if let Some(d) = next_wake {
             ui.ctx().request_repaint_after(d);
+        }
+
+        // 关闭编辑器后延迟归还内存（等 galley 缓存淘汰）
+        if let Some(n) = self.trim_after {
+            if n == 0 {
+                trim_memory();
+                self.trim_after = None;
+            } else {
+                self.trim_after = Some(n - 1);
+                ui.ctx().request_repaint();
+            }
         }
 
         // 自检：注入网络曲线波形以核对点密度
@@ -1160,7 +1194,8 @@ impl App {
 
                 // 当前标签内容
                 if let Some(tab) = self.editors.get_mut(self.active_editor) {
-                    if crate::ui::editor::content(ui, &mut tab.editor) {
+                    let tid = tab.text_id;
+                    if crate::ui::editor::content(ui, &mut tab.editor, tid) {
                         do_save = true;
                     }
                 }
@@ -1182,13 +1217,17 @@ impl App {
         }
         if let Some(i) = close_tab {
             if i < self.editors.len() {
-                self.editors.remove(i);
+                let closed = self.editors.remove(i);
+                // 清除该编辑器在 egui 内存中的 TextEdit 状态（含撤销历史的文本快照），
+                // 否则大文件编辑后即使关闭也会残留占用
+                ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
             }
             if self.active_editor >= self.editors.len() && !self.editors.is_empty() {
                 self.active_editor = self.editors.len() - 1;
             }
-            // 关闭大文件后把空闲内存归还 OS
-            trim_memory();
+            // 延迟几帧再 malloc_trim：等 galley 缓存被淘汰后再归还 OS，效果更明显
+            self.trim_after = Some(4);
+            ctx.request_repaint();
         }
     }
 

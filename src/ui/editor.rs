@@ -63,7 +63,8 @@ impl Editor {
 }
 
 /// 渲染编辑器内容（工具栏 + 查找栏 + 代码区）。返回 true 表示请求保存。
-pub fn content(ui: &mut egui::Ui, ed: &mut Editor) -> bool {
+/// `text_id` 为该编辑器固定的 TextEdit Id（用于关闭时清理其状态/撤销历史）。
+pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     use egui_phosphor::regular as icon;
     let mut save = false;
 
@@ -193,7 +194,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor) -> bool {
             .code_editor()
             .desired_width(f32::INFINITY)
             .desired_rows(24)
-            .id_salt("editor_text")
+            .id(text_id)
             .layouter(&mut layouter)
             .show(ui);
         if let Some((c0, c1)) = pending_select {
