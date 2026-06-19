@@ -369,11 +369,19 @@ impl App {
                     server: server.clone(),
                     cmd_tx: tx.clone(),
                 });
+                // 大文件（>1MB）→ 只读模式，核对「改为可编辑」按钮
+                let big: String = (0..40000).map(|i| format!("{i}: the quick brown fox jumps over the lazy dog\n")).collect();
+                app.editors.push(EditorTab {
+                    editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
+                    server: server.clone(),
+                    cmd_tx: tx.clone(),
+                });
                 app.editors.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
                     server,
                     cmd_tx: tx,
                 });
+                app.active_editor = 1; // 默认显示大文件标签
             }
         }
 

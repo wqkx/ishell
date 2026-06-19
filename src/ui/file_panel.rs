@@ -823,14 +823,21 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
             }
             Dialog::ConfirmOpenLarge { path, size } => {
                 modal(&ctx, "打开大文件", |ui| {
-                    ui.label(format!("文件较大（{}），仍要打开编辑吗？", fmt_bytes(*size as f64)));
-                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(format!("文件较大（{}），仍要打开吗？", fmt_bytes(*size as f64)));
+                        ui.label(RichText::new("将以只读方式打开，可在编辑器内切换为可编辑").color(Palette::TEXT_DIM).size(11.0));
+                    });
+                    ui.add_space(10.0);
+                    // 按钮水平居中
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new("打开").color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                        let bw = 80.0;
+                        let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                        if ui.add(egui::Button::new(RichText::new("打开").color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
                             actions.push(FileAction::OpenFile { path: path.clone(), force: true });
                             close = true;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.add(egui::Button::new("取消").min_size(egui::vec2(bw, 0.0))).clicked() {
                             close = true;
                         }
                     });

@@ -71,7 +71,19 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor) -> bool {
     if ed.read_only {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&ed.path).color(Palette::TEXT_DIM).size(11.0));
-            ui.label(RichText::new("（大文件·只读）").color(Palette::WARN).size(11.0));
+            let mb = ed.content.len() as f64 / 1_048_576.0;
+            ui.label(RichText::new(format!("（大文件 {mb:.1} MB · 只读）")).color(Palette::WARN).size(11.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(RichText::new(format!("{}  改为可编辑", icon::PENCIL_SIMPLE)))
+                    .on_hover_text("大文件编辑会占用较多内存（约文件大小的数倍），关闭后自动释放")
+                    .clicked()
+                {
+                    ed.read_only = false;
+                    // 释放只读行索引（编辑模式不再需要）
+                    ed.line_ranges = Vec::new();
+                }
+            });
         });
         ui.separator();
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
