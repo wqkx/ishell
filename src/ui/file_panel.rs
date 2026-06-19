@@ -342,7 +342,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
         });
     ui.add_space(2.0);
     if let Some(p) = bc_nav {
-        state.cwd = p;
+        // 规范化：去掉末尾多余的 "/"（否则与 worker 返回的规范路径不匹配，无法进入）
+        state.cwd = normalize_path(&p);
         state.selected.clear();
     }
     ui.separator();
@@ -899,6 +900,20 @@ fn join_path(base: &str, name: &str) -> String {
     }
 }
 
+/// 规范化目录路径：去掉末尾多余 "/"；空或全为 "/" 视为根。
+fn normalize_path(p: &str) -> String {
+    let t = p.trim();
+    if t == "/" || t.is_empty() {
+        return "/".into();
+    }
+    let trimmed = t.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// 把权限位转为 `drwxr-xr-x` 形式。
 fn perm_string(perm: u32, is_dir: bool, is_link: bool) -> String {
     let t = if is_link { 'l' } else if is_dir { 'd' } else { '-' };
@@ -935,4 +950,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_path;
+
+    #[test]
+    fn normalize_trailing_slash() {
+        assert_eq!(normalize_path("/home/e5-1/"), "/home/e5-1");
+        assert_eq!(normalize_path("/home/e5-1"), "/home/e5-1");
+        assert_eq!(normalize_path("/home/e5-1///"), "/home/e5-1");
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("///"), "/");
+        assert_eq!(normalize_path("  /tmp/  "), "/tmp");
+        assert_eq!(normalize_path(""), "/");
+    }
 }

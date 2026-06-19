@@ -413,6 +413,20 @@ impl App {
             });
         }
 
+        // 自检：生成多个标签，核对溢出渐隐 + 固定的「新建」按钮
+        if std::env::var("ISHELL_DEMO_TABS").is_ok() {
+            for n in 1..=12 {
+                app.spawn_session(ConnectConfig {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                    username: format!("srv-{n:02}"),
+                    auth: AuthMethod::Password(String::new()),
+                    label: String::new(),
+                    jump: None,
+                });
+            }
+        }
+
         // 自检：命令广播栏
         if std::env::var("ISHELL_DEMO_BCAST").is_ok() {
             app.show_broadcast = true;
@@ -955,7 +969,7 @@ impl App {
                     let mut to_close = None;
                     let mut to_activate = None;
                     let mut reorder: Option<(usize, usize)> = None;
-                    // 右侧按钮先占位（传输 / 转发 / 状态），剩余空间留给可滚动的标签条
+                    // 右侧按钮固定占位（传输 / 转发 / 群发 / 新建），剩余空间给可滚动标签条
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let active_xfers = self
                             .active
@@ -992,18 +1006,17 @@ impl App {
                         if flat_button(ui, &RichText::new(format!("{} 群发", icon::MEGAPHONE)), "向所有已连接会话广播命令") {
                             self.show_broadcast = !self.show_broadcast;
                         }
-                        if let Some(idx) = self.active {
-                            if let Some(s) = self.sessions.get(idx) {
-                                let c = if s.connected { Palette::OK } else { Palette::WARN };
-                                ui.label(RichText::new(&s.status).color(c).size(12.0));
-                            }
+                        // 新建：固定在标签条右侧，标签溢出也不会被滚走
+                        if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), "新建连接") {
+                            self.connect_form.open_dialog();
+                            self.show_close_confirm = false;
                         }
 
                         // 剩余空间：标签条横向可滚动（标签多时不再与右侧按钮重叠）
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let mut drag_start: Option<usize> = None;
                             let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
-                            egui::ScrollArea::horizontal()
+                            let out = egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
                                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
@@ -1048,12 +1061,18 @@ impl App {
                                                 });
                                             tab_rects.push((i, inner.response.rect));
                                         }
-                                        if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), "新建连接") {
-                                            self.connect_form.open_dialog();
-                                            self.show_close_confirm = false;
-                                        }
                                     });
                                 });
+                            // 溢出渐隐：提示左右还有被隐藏的标签
+                            let off = out.state.offset.x;
+                            let vw = out.inner_rect.width();
+                            let cw = out.content_size.x;
+                            if off > 0.5 {
+                                edge_fade(ui.painter(), out.inner_rect, true, Palette::PANEL_2);
+                            }
+                            if off + vw < cw - 0.5 {
+                                edge_fade(ui.painter(), out.inner_rect, false, Palette::PANEL_2);
+                            }
                             // 拖拽排序：记录起点，松开时按指针所在标签确定目标位置
                             if let Some(f) = drag_start {
                                 self.dragging_tab = Some(f);
@@ -1676,6 +1695,27 @@ fn trim_memory() {
 }
 
 /// 用系统文件管理器打开文件所在目录。
+/// 在标签条某一侧绘制渐隐遮罩，提示该方向还有被滚动隐藏的标签。
+/// `left=true` 左侧（实色在左、向右透明）；否则右侧（向右渐变为实色）。
+fn edge_fade(painter: &egui::Painter, rect: egui::Rect, left: bool, bg: egui::Color32) {
+    let w = 18.0_f32.min(rect.width());
+    let transp = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 0);
+    let (x0, x1, c0, c1) = if left {
+        (rect.left(), rect.left() + w, bg, transp)
+    } else {
+        (rect.right() - w, rect.right(), transp, bg)
+    };
+    let (t, b) = (rect.top(), rect.bottom());
+    let mut mesh = egui::Mesh::default();
+    let uv = egui::epaint::WHITE_UV;
+    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, t), uv, color: c0 });
+    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, t), uv, color: c1 });
+    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, b), uv, color: c1 });
+    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, b), uv, color: c0 });
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn open_containing_folder(file: &str) {
     let dir = std::path::Path::new(file)
         .parent()
