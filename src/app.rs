@@ -206,6 +206,9 @@ pub struct App {
     fwd_just_opened: bool,
     /// 新增转发表单
     fwd_form: ForwardForm,
+    /// 命令广播栏是否显示 + 输入内容
+    show_broadcast: bool,
+    broadcast_input: String,
     /// 进程详情小窗
     proc_popup: Option<ProcPopup>,
     proc_popup_just_opened: bool,
@@ -315,6 +318,8 @@ impl App {
             show_forwards: false,
             fwd_just_opened: false,
             fwd_form: ForwardForm::default(),
+            show_broadcast: false,
+            broadcast_input: String::new(),
             proc_popup: None,
             proc_popup_just_opened: false,
             gpu_popup: None,
@@ -406,6 +411,12 @@ impl App {
                 cwd: "/home/e5-1/sim/run1".into(),
                 exe: "/opt/gromacs/bin/gmx".into(),
             });
+        }
+
+        // 自检：命令广播栏
+        if std::env::var("ISHELL_DEMO_BCAST").is_ok() {
+            app.show_broadcast = true;
+            app.broadcast_input = "systemctl status nginx".into();
         }
 
         // 自检：显示退出确认框
@@ -746,6 +757,9 @@ impl eframe::App for App {
         // 4) 顶部选项卡（仅位于右侧区域之上）
         self.top_tabs(ui);
 
+        // 4.5) 命令广播栏
+        self.broadcast_bar(ui);
+
         // 5) 右侧主体
         match self.active {
             Some(idx) if idx < self.sessions.len() => self.right_body(ui, idx),
@@ -890,6 +904,46 @@ impl App {
 }
 
 impl App {
+    /// 命令广播栏：输入命令回车，发送到所有已连接会话。
+    fn broadcast_bar(&mut self, root: &mut egui::Ui) {
+        use egui_phosphor::regular as icon;
+        if !self.show_broadcast {
+            return;
+        }
+        let targets = self.sessions.iter().filter(|s| s.connected).count();
+        let mut send = false;
+        egui::Panel::top("broadcast")
+            .frame(egui::Frame::new().fill(Palette::ACCENT_SOFT).inner_margin(egui::Margin::symmetric(8, 5)))
+            .show_inside(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{} 群发到 {} 个会话", icon::MEGAPHONE, targets)).color(Palette::TEXT).size(12.0));
+                    if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                        self.show_broadcast = false;
+                    }
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.broadcast_input)
+                            .desired_width(ui.available_width() - 70.0)
+                            .hint_text("输入命令，回车发送到所有已连接会话"),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        send = true;
+                        resp.request_focus();
+                    }
+                    if ui.add(egui::Button::new(RichText::new(format!("{} 发送", icon::PAPER_PLANE_RIGHT)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                        send = true;
+                    }
+                });
+            });
+        if send && !self.broadcast_input.trim().is_empty() {
+            let mut bytes = self.broadcast_input.clone().into_bytes();
+            bytes.push(b'\n');
+            for s in self.sessions.iter().filter(|s| s.connected) {
+                let _ = s.cmd_tx.send(UiCommand::TerminalInput(bytes.clone()));
+            }
+            self.broadcast_input.clear();
+        }
+    }
+
     fn top_tabs(&mut self, root: &mut egui::Ui) {
         use egui_phosphor::regular as icon;
         egui::Panel::top("tabs")
@@ -934,6 +988,9 @@ impl App {
                             if self.show_forwards {
                                 self.fwd_just_opened = true;
                             }
+                        }
+                        if flat_button(ui, &RichText::new(format!("{} 群发", icon::MEGAPHONE)), "向所有已连接会话广播命令") {
+                            self.show_broadcast = !self.show_broadcast;
                         }
                         if let Some(idx) = self.active {
                             if let Some(s) = self.sessions.get(idx) {
