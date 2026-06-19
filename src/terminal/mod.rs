@@ -32,6 +32,8 @@ pub struct Terminal {
     search_hl: Option<u16>,
     /// 鼠标上报模式下当前按住的按钮基码（0=左 1=中 2=右），用于编码拖动事件
     held_btn: Option<u8>,
+    /// 跨数据块暂存的不完整 UTF-8 尾字节（避免多字节中文被拆分后乱码）
+    utf8_pending: Vec<u8>,
 }
 
 /// 终端搜索状态。
@@ -110,6 +112,7 @@ impl Terminal {
             find: None,
             search_hl: None,
             held_btn: None,
+            utf8_pending: Vec::new(),
         }
     }
 
@@ -255,6 +258,19 @@ impl Terminal {
 
     /// 喂入来自远程的原始字节。
     pub fn feed(&mut self, bytes: &[u8]) {
+        // 合并上次暂存的不完整 UTF-8 前缀，并把本次结尾不完整的多字节序列暂存到下次，
+        // 避免一个中文字符被拆在两个数据块里导致乱码。
+        let mut data = std::mem::take(&mut self.utf8_pending);
+        data.extend_from_slice(bytes);
+        let hold = incomplete_utf8_tail(&data);
+        let split = data.len() - hold;
+        self.utf8_pending = data[split..].to_vec();
+        data.truncate(split);
+        let bytes = &data[..];
+        if bytes.is_empty() {
+            return;
+        }
+
         // `clear` 会发 ESC[2J（清屏）+ ESC[3J（清回滚缓冲）。vt100 不处理 [3J，
         // 导致旧内容仍留在 scrollback（可上滚看到）。这里在 [3J 处重建解析器，
         // 真正清空回滚缓冲；[3J 之后的字节（新提示符等）喂入全新解析器。
@@ -623,6 +639,10 @@ impl Terminal {
                 out.extend_from_slice(t.as_bytes());
             }
         }
+        // 复制/粘贴（尤其右键菜单）后焦点会丢失，重新聚焦终端，免得还要再点一下
+        if do_copy || do_paste {
+            resp.request_focus();
+        }
         // 鼠标上报字节（若有）
         out.extend_from_slice(&mouse_out);
         out
@@ -770,6 +790,50 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 若字节流结尾是一个**不完整**的多字节 UTF-8 序列，返回需要暂存的尾字节数；否则 0。
+/// 用于避免一个 UTF-8 字符被拆分在两次 `feed` 之间导致乱码。
+fn incomplete_utf8_tail(b: &[u8]) -> usize {
+    let mut cont = 0usize; // 已统计的连续字节（0b10xxxxxx）数量
+    let mut i = b.len();
+    while i > 0 && cont < 3 {
+        i -= 1;
+        let byte = b[i];
+        if byte & 0b1100_0000 == 0b1000_0000 {
+            cont += 1; // 连续字节，继续往前找首字节
+            continue;
+        }
+        // 找到序列首字节（或单字节）：按首字节判断该序列需要的总长度
+        let need = if byte & 0b1000_0000 == 0 {
+            0 // ASCII，单字节，完整
+        } else if byte & 0b1110_0000 == 0b1100_0000 {
+            1 // 2 字节
+        } else if byte & 0b1111_0000 == 0b1110_0000 {
+            2 // 3 字节（绝大多数中文）
+        } else if byte & 0b1111_1000 == 0b1111_0000 {
+            3 // 4 字节
+        } else {
+            0 // 非法首字节，按完整处理，交给解析器
+        };
+        // 还差连续字节 -> 把「首字节 + 已有连续字节」整体暂存
+        return if need > cont { cont + 1 } else { 0 };
+    }
+    0
+}
+
+#[cfg(test)]
+mod utf8_tail_tests {
+    use super::incomplete_utf8_tail;
+    #[test]
+    fn detects_split_multibyte() {
+        // "你"=E4 BD A0：完整应为 0；缺尾则需暂存
+        assert_eq!(incomplete_utf8_tail(&[0xE4, 0xBD, 0xA0]), 0);
+        assert_eq!(incomplete_utf8_tail(&[0xE4, 0xBD]), 2); // 缺 1 个连续字节
+        assert_eq!(incomplete_utf8_tail(&[0xE4]), 1); // 只有首字节
+        assert_eq!(incomplete_utf8_tail(b"abc"), 0); // 纯 ASCII
+        assert_eq!(incomplete_utf8_tail(&[0x41, 0xE4, 0xBD, 0xA0]), 0); // A + 完整"你"
+    }
 }
 
 /// 把特殊按键编码为 ANSI 转义序列；Ctrl 组合键编码为控制字符。

@@ -1705,7 +1705,7 @@ impl App {
                             if t.ok == Some(true) {
                                 if let Some(local) = &t.local {
                                     if ui.add(egui::Button::new(RichText::new(icon::FOLDER_OPEN).size(12.0).color(Palette::TEXT_DIM)).frame(false))
-                                        .on_hover_text(crate::i18n::tr("打开所在文件夹", "Open folder"))
+                                        .on_hover_text(crate::i18n::tr("在文件管理器中显示", "Show in file manager"))
                                         .clicked()
                                     {
                                         open_dir = Some(local.clone());
@@ -1936,18 +1936,54 @@ fn edge_fade(painter: &egui::Painter, rect: egui::Rect, left: bool, bg: egui::Co
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// 在文件管理器中打开并**选中**该文件（而不仅是打开目录）。
 fn open_containing_folder(file: &str) {
-    let dir = std::path::Path::new(file)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
     #[cfg(target_os = "windows")]
-    let cmd = "explorer";
-    let _ = std::process::Command::new(cmd).arg(dir).spawn();
+    {
+        // explorer /select, 选中文件
+        let _ = std::process::Command::new("explorer").arg(format!("/select,{file}")).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Finder 中显示并选中
+        let _ = std::process::Command::new("open").arg("-R").arg(file).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 优先 freedesktop D-Bus ShowItems（nautilus/dolphin/nemo 等都支持），可选中文件；
+        // 不可用时退回 xdg-open 仅打开所在目录。
+        let uri = file_uri(file);
+        let dbus = std::process::Command::new("dbus-send")
+            .args([
+                "--type=method_call",
+                "--dest=org.freedesktop.FileManager1",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("array:string:{uri}"),
+                "string:",
+            ])
+            .spawn();
+        if dbus.is_err() {
+            let dir = std::path::Path::new(file)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        }
+    }
+}
+
+/// 把本地绝对路径转成百分号编码的 file:// URI。
+#[cfg(target_os = "linux")]
+fn file_uri(p: &str) -> String {
+    let mut s = String::from("file://");
+    for b in p.bytes() {
+        match b {
+            b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => s.push(b as char),
+            _ => s.push_str(&format!("%{b:02X}")),
+        }
+    }
+    s
 }
 
 /// 本地下载目录：优先用户主目录下的 Downloads，否则当前目录。
