@@ -6,6 +6,8 @@
 
 System monitor · interactive terminal · SFTP file manager · port forwarding · jump hosts — all in one window
 
+**⚡ High performance · low resource usage** — native Rust + GPU rendering: a single binary, fast startup, low memory/CPU footprint
+
 **English** · [中文](README.zh-CN.md)
 
 [![Release](https://img.shields.io/github/v/release/wqkx/ishell?display_name=tag)](https://github.com/wqkx/ishell/releases)
@@ -24,7 +26,7 @@ in the center, and an SFTP file manager at the bottom-right — aiming to keep e
 daily SSH work in a single window. Compared to FinalShell / Xshell / MobaXterm / Termius, iShell
 leans toward:
 
-- **Pure Rust + a GPU immediate-mode UI (egui)** — a single binary, fast startup, low footprint, no runtime deps.
+- **High performance, low resource usage (the core)** — pure Rust + a GPU immediate-mode UI (egui): a single binary, fast startup, low memory/CPU footprint, no runtime deps or background services.
 - **A pure-Rust SSH stack (russh + ring)** — no dependency on the system OpenSSH / PuTTY; consistent behavior across platforms.
 - **One codebase, three platforms** — Linux / macOS / Windows share the same code and UI.
 - **Multilingual** — English / 中文, switchable from the right-click menu.
