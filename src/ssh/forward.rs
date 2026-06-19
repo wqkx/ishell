@@ -23,7 +23,7 @@ pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, 
             sink.send(WorkerEvent::ForwardStatus {
                 id: spec.id,
                 ok: false,
-                message: format!("绑定 {bind} 失败：{e}"),
+                message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("绑定 {bind} 失败：{e}"), crate::i18n::Lang::En => format!("Bind {bind} failed: {e}") },
             });
             return;
         }
@@ -32,7 +32,7 @@ pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, 
         ForwardKind::Local { remote_host, remote_port } => format!("{bind} → {remote_host}:{remote_port}"),
         ForwardKind::Dynamic => format!("SOCKS5 {bind}"),
     };
-    sink.send(WorkerEvent::ForwardStatus { id: spec.id, ok: true, message: format!("监听中  {label}") });
+    sink.send(WorkerEvent::ForwardStatus { id: spec.id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("监听中  {label}"), crate::i18n::Lang::En => format!("Listening  {label}") } });
 
     loop {
         let (sock, peer) = match listener.accept().await {
@@ -89,7 +89,7 @@ async fn socks5_negotiate(sock: &mut TcpStream) -> anyhow::Result<(String, u16)>
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
     if head[0] != 0x05 {
-        anyhow::bail!("非 SOCKS5");
+        anyhow::bail!("{}", crate::i18n::tr("非 SOCKS5", "Not SOCKS5"));
     }
     let mut methods = vec![0u8; head[1] as usize];
     sock.read_exact(&mut methods).await?;
@@ -101,7 +101,7 @@ async fn socks5_negotiate(sock: &mut TcpStream) -> anyhow::Result<(String, u16)>
     if req[0] != 0x05 || req[1] != 0x01 {
         // 仅支持 CONNECT
         socks5_reply(sock, 0x07).await?;
-        anyhow::bail!("仅支持 CONNECT");
+        anyhow::bail!("{}", crate::i18n::tr("仅支持 CONNECT", "Only CONNECT"));
     }
     let host = match req[3] {
         0x01 => {
@@ -123,7 +123,7 @@ async fn socks5_negotiate(sock: &mut TcpStream) -> anyhow::Result<(String, u16)>
         }
         _ => {
             socks5_reply(sock, 0x08).await?; // address type not supported
-            anyhow::bail!("不支持的地址类型");
+            anyhow::bail!("{}", crate::i18n::tr("不支持的地址类型", "Unsupported address type"));
         }
     };
     let mut pb = [0u8; 2];

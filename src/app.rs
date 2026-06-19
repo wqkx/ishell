@@ -79,7 +79,7 @@ impl Session {
                     self.was_connected = true;
                     self.reconnect_tries = 0;
                     self.reconnect_at = None;
-                    self.status = "已连接".into();
+                    self.status = crate::i18n::tr("已连接", "Connected").into();
                 }
                 WorkerEvent::Disconnected(reason) => {
                     self.connected = false;
@@ -89,7 +89,8 @@ impl Session {
                     if self.was_connected && self.reconnect_tries < MAX_TRIES {
                         let secs = (2u64 << self.reconnect_tries.min(4)).min(30); // 2,4,8,16,30
                         self.reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
-                        self.status = format!("{} · {}s 后重连", self.status, secs);
+                        let tail = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("{secs}s 后重连"), crate::i18n::Lang::En => format!("reconnect in {secs}s") };
+                        self.status = format!("{} · {}", self.status, tail);
                     }
                 }
                 WorkerEvent::TerminalData(bytes) => self.terminal.feed(&bytes),
@@ -121,11 +122,11 @@ impl Session {
                 }
                 WorkerEvent::HostKeyPrompt { host, fingerprint } => {
                     self.pending_hostkey = Some((host, fingerprint));
-                    self.status = "等待确认主机指纹 …".into();
+                    self.status = crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
                 }
                 WorkerEvent::FileOpened { path, content } => {
                     self.pending_open.push((path, content));
-                    self.status = "已打开文件".into();
+                    self.status = crate::i18n::tr("已打开文件", "File opened").into();
                 }
                 WorkerEvent::OpDone { message, refresh_dir } => {
                     self.status = message;
@@ -288,6 +289,10 @@ struct Shot {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::apply(&cc.egui_ctx);
+        // 载入已保存语言（默认中文）
+        if let Some(code) = crate::store::load_lang() {
+            crate::i18n::set(crate::i18n::Lang::from_code(&code));
+        }
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -408,7 +413,7 @@ impl App {
                 s.forwards.push(ForwardEntry {
                     id,
                     label: "127.0.0.1:18022 → 127.0.0.1:22".into(),
-                    status: "启动中 …".into(),
+                    status: crate::i18n::tr("启动中 …", "Starting …").into(),
                     ok: true,
                 });
                 let _ = s.cmd_tx.send(UiCommand::AddForward(ForwardSpec {
@@ -504,7 +509,7 @@ impl App {
             cmd_tx,
             evt_rx,
             connected: false,
-            status: "连接中 …".into(),
+            status: crate::i18n::tr("连接中 …", "Connecting …").into(),
             terminal: Terminal::new(),
             sysinfo: None,
             net_hist: NetHistory::default(),
@@ -545,7 +550,7 @@ impl App {
         s.forwards.clear();
         s.pending_hostkey = None;
         s.reconnect_at = None;
-        s.status = "重连中 …".into();
+        s.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
     }
 
     /// 拖动排序：把会话从 `from` 移动到放置目标 `to` 处。
@@ -638,10 +643,10 @@ impl App {
             }
             FileAction::CopyPath(p) => {
                 self.ctx.copy_text(p.clone());
-                s.status = format!("已复制路径：{p}");
+                s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已复制路径：{p}"), crate::i18n::Lang::En => format!("Copied: {p}") };
             }
             FileAction::OpenFile { path, force } => {
-                s.status = format!("打开中：{path} …");
+                s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
                 let _ = s.cmd_tx.send(UiCommand::ReadFile { path, force });
             }
         }
@@ -770,7 +775,7 @@ impl eframe::App for App {
         // 3) 左侧操作栏：独立全高区域
         let mut proc_click: Option<(u32, egui::Pos2)> = None;
         let mut gpu_click: Option<egui::Pos2> = None;
-        egui::Panel::left("sidebar")
+        let side = egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(300.0)
             .size_range(220.0..=460.0)
@@ -784,10 +789,15 @@ impl eframe::App for App {
                     ui.add_space(16.0);
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new(egui_phosphor::regular::PLUGS).size(28.0).color(Palette::TEXT_DIM));
-                        ui.label(RichText::new("未连接").color(Palette::TEXT_DIM));
+                        ui.label(RichText::new(crate::i18n::tr("未连接", "Not connected")).color(Palette::TEXT_DIM));
                     });
                 }
             });
+        // 右键左侧栏：语言设置
+        side.response.context_menu(|ui| {
+            ui.label(RichText::new(crate::i18n::tr("语言", "Language")).color(Palette::TEXT_DIM).size(11.0));
+            crate::i18n::language_menu(ui);
+        });
         // 进程行被点击：打开详情小窗并请求详情
         if let Some((pid, pos)) = proc_click {
             let mut popup = None;
@@ -859,23 +869,23 @@ impl App {
         egui::Modal::new(egui::Id::new("hostkey_modal"))
             .show(ctx, |ui| {
                 ui.set_width(380.0);
-                ui.label(RichText::new("未知主机").size(16.0).strong());
+                ui.label(RichText::new(crate::i18n::tr("未知主机", "Unknown host")).size(16.0).strong());
                 ui.add_space(8.0);
-                ui.label(format!("首次连接主机：{host}"));
+                ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("首次连接主机：{host}"), crate::i18n::Lang::En => format!("First connect: {host}") });
                 ui.add_space(4.0);
-                ui.label(RichText::new("指纹 (SHA256)：").color(Palette::TEXT_DIM).size(12.0));
+                ui.label(RichText::new(crate::i18n::tr("指纹 (SHA256)：", "Fingerprint (SHA256):")).color(Palette::TEXT_DIM).size(12.0));
                 ui.label(RichText::new(&fp).monospace());
                 ui.add_space(6.0);
-                ui.label(RichText::new("请确认该指纹与目标服务器一致；信任后将写入 ~/.ssh/known_hosts。").color(Palette::TEXT_DIM).size(11.0));
+                ui.label(RichText::new(crate::i18n::tr("请确认该指纹与目标服务器一致；信任后将写入 ~/.ssh/known_hosts。", "Verify the fingerprint matches the server; trusting writes to ~/.ssh/known_hosts.")).color(Palette::TEXT_DIM).size(11.0));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let bw = 96.0;
                     let total = bw * 2.0 + ui.spacing().item_spacing.x;
                     ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                    if dialog_button(ui, "信任并连接", Some(Palette::ACCENT), bw) {
+                    if dialog_button(ui, crate::i18n::tr("信任并连接", "Trust & connect"), Some(Palette::ACCENT), bw) {
                         decision = Some(true);
                     }
-                    if dialog_button(ui, "拒绝", None, bw) {
+                    if dialog_button(ui, crate::i18n::tr("拒绝", "Reject"), None, bw) {
                         decision = Some(false);
                     }
                 });
@@ -901,10 +911,10 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_width(320.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("确认退出").size(16.0).strong());
+                        ui.label(RichText::new(crate::i18n::tr("确认退出", "Quit?")).size(16.0).strong());
                         ui.add_space(6.0);
-                        ui.label(format!("还有 {} 个会话处于连接中", self.sessions.len()));
-                        ui.label("确定退出 iShell 吗？");
+                        ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("还有 {} 个会话处于连接中", self.sessions.len()), crate::i18n::Lang::En => format!("{} session(s) still connected", self.sessions.len()) });
+                        ui.label(crate::i18n::tr("确定退出 iShell 吗？", "Quit iShell?"));
                     });
                     ui.add_space(12.0);
                     // 按钮行水平居中（固定按钮宽度 + 居中留白）
@@ -913,12 +923,12 @@ impl App {
                         let total = bw * 2.0 + ui.spacing().item_spacing.x;
                         let space = ((ui.available_width() - total) / 2.0).max(0.0);
                         ui.add_space(space);
-                        if dialog_button(ui, "退出", Some(Palette::DANGER), bw) {
+                        if dialog_button(ui, crate::i18n::tr("退出", "Quit"), Some(Palette::DANGER), bw) {
                             self.allow_close = true;
                             self.show_close_confirm = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        if dialog_button(ui, "取消", None, bw) {
+                        if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
                             self.show_close_confirm = false;
                         }
                     });
@@ -972,20 +982,20 @@ impl App {
             .frame(egui::Frame::new().fill(Palette::ACCENT_SOFT).inner_margin(egui::Margin::symmetric(8, 5)))
             .show_inside(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} 群发到 {} 个会话", icon::MEGAPHONE, targets)).color(Palette::TEXT).size(12.0));
+                    ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("{} 群发到 {} 个会话", icon::MEGAPHONE, targets), crate::i18n::Lang::En => format!("{} Broadcast to {} session(s)", icon::MEGAPHONE, targets) }).color(Palette::TEXT).size(12.0));
                     if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                         self.show_broadcast = false;
                     }
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.broadcast_input)
                             .desired_width(ui.available_width() - 70.0)
-                            .hint_text("输入命令，回车发送到所有已连接会话"),
+                            .hint_text(crate::i18n::tr("输入命令，回车发送到所有已连接会话", "Type a command; Enter sends to all connected sessions")),
                     );
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         send = true;
                         resp.request_focus();
                     }
-                    if ui.add(egui::Button::new(RichText::new(format!("{} 发送", icon::PAPER_PLANE_RIGHT)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                    if ui.add(egui::Button::new(RichText::new(format!("{} {}", icon::PAPER_PLANE_RIGHT, crate::i18n::tr("发送", "Send"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                         send = true;
                     }
                 });
@@ -1019,11 +1029,11 @@ impl App {
                             .map(|s| s.transfers.iter().filter(|t| t.ok.is_none()).count())
                             .unwrap_or(0);
                         let label = if active_xfers > 0 {
-                            format!("{} 传输 {}", icon::ARROWS_DOWN_UP, active_xfers)
+                            format!("{} {} {}", icon::ARROWS_DOWN_UP, crate::i18n::tr("传输", "Xfer"), active_xfers)
                         } else {
-                            format!("{} 传输", icon::ARROWS_DOWN_UP)
+                            format!("{} {}", icon::ARROWS_DOWN_UP, crate::i18n::tr("传输", "Xfer"))
                         };
-                        if flat_button(ui, &RichText::new(label), "显示/隐藏传输进度") {
+                        if flat_button(ui, &RichText::new(label), crate::i18n::tr("显示/隐藏传输进度", "Show/hide transfers")) {
                             self.show_transfers = !self.show_transfers;
                             if self.show_transfers {
                                 self.xfer_just_opened = true;
@@ -1035,21 +1045,21 @@ impl App {
                             .map(|s| s.forwards.len())
                             .unwrap_or(0);
                         let flabel = if nfwd > 0 {
-                            format!("{} 转发 {}", icon::ARROWS_LEFT_RIGHT, nfwd)
+                            format!("{} {} {}", icon::ARROWS_LEFT_RIGHT, crate::i18n::tr("转发", "Fwd"), nfwd)
                         } else {
-                            format!("{} 转发", icon::ARROWS_LEFT_RIGHT)
+                            format!("{} {}", icon::ARROWS_LEFT_RIGHT, crate::i18n::tr("转发", "Fwd"))
                         };
-                        if flat_button(ui, &RichText::new(flabel), "端口转发管理") {
+                        if flat_button(ui, &RichText::new(flabel), crate::i18n::tr("端口转发管理", "Port forwarding")) {
                             self.show_forwards = !self.show_forwards;
                             if self.show_forwards {
                                 self.fwd_just_opened = true;
                             }
                         }
-                        if flat_button(ui, &RichText::new(format!("{} 群发", icon::MEGAPHONE)), "向所有已连接会话广播命令") {
+                        if flat_button(ui, &RichText::new(format!("{} {}", icon::MEGAPHONE, crate::i18n::tr("群发", "Bcast"))), crate::i18n::tr("向所有已连接会话广播命令", "Broadcast to all connected sessions")) {
                             self.show_broadcast = !self.show_broadcast;
                         }
                         // 新建：固定在标签条右侧，标签溢出也不会被滚走
-                        if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), "新建连接") {
+                        if flat_button(ui, &RichText::new(icon::PLUS).size(15.0), crate::i18n::tr("新建连接", "New connection")) {
                             self.connect_form.open_dialog();
                             self.show_close_confirm = false;
                         }
@@ -1094,7 +1104,7 @@ impl App {
                                                         // 关闭按钮：独立响应，确保可点
                                                         if ui
                                                             .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
-                                                            .on_hover_text("关闭会话")
+                                                            .on_hover_text(crate::i18n::tr("关闭会话", "Close session"))
                                                             .clicked()
                                                         {
                                                             to_close = Some(i);
@@ -1256,7 +1266,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_max_width(300.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}  GPU 详情", icon::CPU)).strong().size(13.0).color(Palette::TEXT));
+                    ui.label(RichText::new(format!("{}  {}", icon::CPU, crate::i18n::tr("GPU 详情", "GPU"))).strong().size(13.0).color(Palette::TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                             close = true;
@@ -1270,14 +1280,14 @@ impl App {
                     ui.add(
                         egui::ProgressBar::new((g.util / 100.0).clamp(0.0, 1.0))
                             .fill(crate::ui::usage_color(g.util))
-                            .text(RichText::new(format!("使用率 {:.0}%", g.util)).size(10.0))
+                            .text(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("使用率 {:.0}%", g.util), crate::i18n::Lang::En => format!("Util {:.0}%", g.util) }).size(10.0))
                             .desired_height(12.0)
                             .corner_radius(2.0),
                     );
                     ui.add(
                         egui::ProgressBar::new((mem_pct / 100.0).clamp(0.0, 1.0))
                             .fill(Palette::ACCENT)
-                            .text(RichText::new(format!("显存 {}/{} MB", g.mem_used_mb, g.mem_total_mb)).size(10.0))
+                            .text(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("显存 {}/{} MB", g.mem_used_mb, g.mem_total_mb), crate::i18n::Lang::En => format!("VRAM {}/{} MB", g.mem_used_mb, g.mem_total_mb) }).size(10.0))
                             .desired_height(12.0)
                             .corner_radius(2.0),
                     );
@@ -1327,22 +1337,22 @@ impl App {
                 };
                 kv(ui, "PID", pid.to_string());
                 kv(ui, "CPU", format!("{cpu:.1}%"));
-                kv(ui, "内存", format!("{mem:.1}%"));
+                kv(ui, crate::i18n::tr("内存", "Mem"), format!("{mem:.1}%"));
                 if !exe.is_empty() {
-                    kv(ui, "程序", exe.clone());
+                    kv(ui, crate::i18n::tr("程序", "Exe"), exe.clone());
                 }
                 if !cwd.is_empty() {
-                    kv(ui, "目录", cwd.clone());
+                    kv(ui, crate::i18n::tr("目录", "Dir"), cwd.clone());
                 }
                 if cmd.is_empty() {
-                    ui.label(RichText::new("（正在获取命令…）").color(Palette::TEXT_DIM).size(11.0));
+                    ui.label(RichText::new(crate::i18n::tr("（正在获取命令…）", "(loading command…)")).color(Palette::TEXT_DIM).size(11.0));
                 } else {
                     ui.add_space(2.0);
-                    ui.label(RichText::new("命令").color(Palette::TEXT_DIM).size(12.0));
+                    ui.label(RichText::new(crate::i18n::tr("命令", "Command")).color(Palette::TEXT_DIM).size(12.0));
                     ui.label(RichText::new(&cmd).size(11.5).monospace().color(Palette::TEXT));
                 }
                 ui.separator();
-                if ui.add(egui::Button::new(RichText::new(format!("{}  强制结束 (kill -9)", icon::SKULL)).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
+                if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::SKULL, crate::i18n::tr("强制结束 (kill -9)", "Kill (-9)"))).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
                     kill = true;
                 }
             });
@@ -1380,7 +1390,7 @@ impl App {
             .show(ctx, |ui| {
                 // 自定义紧凑标题栏
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}  端口转发", icon::ARROWS_LEFT_RIGHT)).strong().size(13.0).color(Palette::TEXT));
+                    ui.label(RichText::new(format!("{}  {}", icon::ARROWS_LEFT_RIGHT, crate::i18n::tr("端口转发", "Port forward"))).strong().size(13.0).color(Palette::TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                             close_win = true;
@@ -1391,32 +1401,32 @@ impl App {
 
                 let Some(idx) = idx else {
                     ui.add_space(4.0);
-                    ui.label(RichText::new("请先连接一个会话").color(Palette::TEXT_DIM).size(12.0));
+                    ui.label(RichText::new(crate::i18n::tr("请先连接一个会话", "Connect a session first")).color(Palette::TEXT_DIM).size(12.0));
                     return;
                 };
 
                 // 新增表单（分段按钮代替下拉，避免点击下拉被判为窗口外而自动关闭）
                 let f = &mut self.fwd_form;
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut f.kind, 0usize, "本地转发");
-                    ui.selectable_value(&mut f.kind, 1usize, "动态 SOCKS5");
+                    ui.selectable_value(&mut f.kind, 0usize, crate::i18n::tr("本地转发", "Local"));
+                    ui.selectable_value(&mut f.kind, 1usize, crate::i18n::tr("动态 SOCKS5", "Dynamic SOCKS5"));
                 });
                 ui.horizontal(|ui| {
-                    ui.label("本地");
+                    ui.label(crate::i18n::tr("本地", "Local"));
                     ui.add(egui::TextEdit::singleline(&mut f.bind).desired_width(84.0).hint_text("127.0.0.1"));
                     ui.label(":");
-                    ui.add(egui::TextEdit::singleline(&mut f.local_port).desired_width(48.0).hint_text("端口"));
+                    ui.add(egui::TextEdit::singleline(&mut f.local_port).desired_width(48.0).hint_text(crate::i18n::tr("端口", "Port")));
                 });
                 if f.kind == 0 {
                     ui.horizontal(|ui| {
-                        ui.label("目标");
-                        ui.add(egui::TextEdit::singleline(&mut f.target_host).desired_width(120.0).hint_text("主机/IP"));
+                        ui.label(crate::i18n::tr("目标", "Target"));
+                        ui.add(egui::TextEdit::singleline(&mut f.target_host).desired_width(120.0).hint_text(crate::i18n::tr("主机/IP", "Host/IP")));
                         ui.label(":");
-                        ui.add(egui::TextEdit::singleline(&mut f.target_port).desired_width(48.0).hint_text("端口"));
+                        ui.add(egui::TextEdit::singleline(&mut f.target_port).desired_width(48.0).hint_text(crate::i18n::tr("端口", "Port")));
                     });
                 }
                 ui.add_space(4.0);
-                if ui.add(egui::Button::new(RichText::new(format!("{}  添加转发", icon::PLUS)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::PLUS, crate::i18n::tr("添加转发", "Add forward"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                     if let Ok(lp) = f.local_port.trim().parse::<u16>() {
                         let kind = if f.kind == 0 {
                             match f.target_port.trim().parse::<u16>() {
@@ -1438,7 +1448,7 @@ impl App {
                 ui.separator();
                 if let Some(s) = self.sessions.get(idx) {
                     if s.forwards.is_empty() {
-                        ui.label(RichText::new("暂无转发任务").color(Palette::TEXT_DIM).size(12.0));
+                        ui.label(RichText::new(crate::i18n::tr("暂无转发任务", "No forwards")).color(Palette::TEXT_DIM).size(12.0));
                     }
                     for fwd in &s.forwards {
                         ui.horizontal(|ui| {
@@ -1446,7 +1456,7 @@ impl App {
                             ui.painter().circle_filled(dot.center(), 4.0, if fwd.ok { Palette::OK } else { Palette::DANGER });
                             ui.label(RichText::new(&fwd.label).size(12.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add(egui::Button::new(RichText::new(icon::TRASH).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text("删除").clicked() {
+                                if ui.add(egui::Button::new(RichText::new(icon::TRASH).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("删除", "Delete")).clicked() {
                                     remove_id = Some(fwd.id);
                                 }
                             });
@@ -1479,7 +1489,7 @@ impl App {
                     }
                     ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
                 };
-                s.forwards.push(ForwardEntry { id, label, status: "启动中 …".into(), ok: true });
+                s.forwards.push(ForwardEntry { id, label, status: crate::i18n::tr("启动中 …", "Starting …").into(), ok: true });
                 let _ = s.cmd_tx.send(UiCommand::AddForward(spec));
             }
             self.fwd_form.local_port.clear();
@@ -1518,14 +1528,14 @@ impl App {
             .show(ctx, |ui| {
                 // 自定义紧凑标题栏
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}  文件传输", icon::ARROWS_DOWN_UP)).strong().size(13.0).color(Palette::TEXT));
+                    ui.label(RichText::new(format!("{}  {}", icon::ARROWS_DOWN_UP, crate::i18n::tr("文件传输", "Transfers"))).strong().size(13.0).color(Palette::TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                             close_win = true;
                         }
                         if ui
                             .add(egui::Button::new(RichText::new(icon::FOLDER_OPEN).size(13.0).color(Palette::TEXT_DIM)).frame(false))
-                            .on_hover_text(format!("选择默认下载文件夹\n当前：{}", dl_dir))
+                            .on_hover_text(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("选择默认下载文件夹\n当前：{}", dl_dir), crate::i18n::Lang::En => format!("Set default download folder\nCurrent: {}", dl_dir) })
                             .clicked()
                         {
                             pick_dir = true;
@@ -1537,7 +1547,7 @@ impl App {
                 let Some(s) = self.sessions.get(idx) else { return };
                 if s.transfers.is_empty() {
                     ui.add_space(6.0);
-                    ui.label(RichText::new("暂无传输任务").color(Palette::TEXT_DIM).size(12.0));
+                    ui.label(RichText::new(crate::i18n::tr("暂无传输任务", "No transfers")).color(Palette::TEXT_DIM).size(12.0));
                 }
                 let mut open_dir: Option<String> = None;
                 for t in s.transfers.iter().rev().take(20) {
@@ -1559,7 +1569,7 @@ impl App {
                             if t.ok == Some(true) {
                                 if let Some(local) = &t.local {
                                     if ui.add(egui::Button::new(RichText::new(icon::FOLDER_OPEN).size(12.0).color(Palette::TEXT_DIM)).frame(false))
-                                        .on_hover_text("打开所在文件夹")
+                                        .on_hover_text(crate::i18n::tr("打开所在文件夹", "Open folder"))
                                         .clicked()
                                     {
                                         open_dir = Some(local.clone());
@@ -1584,7 +1594,7 @@ impl App {
                 }
                 if !s.transfers.is_empty() {
                     ui.separator();
-                    if ui.button("清除已完成").clicked() {
+                    if ui.button(crate::i18n::tr("清除已完成", "Clear done")).clicked() {
                         clear = true;
                     }
                 }
@@ -1596,7 +1606,7 @@ impl App {
         }
         // 选择默认下载目录（原生文件夹选择器）
         if pick_dir {
-            if let Some(dir) = rfd::FileDialog::new().set_title("选择默认下载文件夹").pick_folder() {
+            if let Some(dir) = rfd::FileDialog::new().set_title(crate::i18n::tr("选择默认下载文件夹", "Select default download folder")).pick_folder() {
                 self.download_dir = dir.clone();
                 crate::store::save_download_dir(&dir.to_string_lossy());
             }
@@ -1619,13 +1629,13 @@ impl App {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("iShell").size(40.0).strong().color(Palette::ACCENT));
                 ui.label(
-                    RichText::new("现代化 Rust SSH 客户端")
+                    RichText::new(crate::i18n::tr("现代化 Rust SSH 客户端", "A modern Rust SSH client"))
                         .size(16.0)
                         .color(Palette::TEXT_DIM),
                 );
                 ui.add_space(20.0);
                 if ui
-                    .add(egui::Button::new(RichText::new(format!("{}  新建连接", egui_phosphor::regular::PLUS)).size(16.0).color(egui::Color32::WHITE)).fill(Palette::ACCENT))
+                    .add(egui::Button::new(RichText::new(format!("{}  {}", egui_phosphor::regular::PLUS, crate::i18n::tr("新建连接", "New connection"))).size(16.0).color(egui::Color32::WHITE)).fill(Palette::ACCENT))
                     .clicked()
                 {
                     self.connect_form.open_dialog();
@@ -1666,7 +1676,7 @@ impl App {
             .show_inside(root, |ui| {
                 let s = &mut self.sessions[idx];
                 // 断线提示条 + 手动重连（初次"连接中"不显示）
-                if !s.connected && !s.status.contains("连接中") {
+                if !s.connected {
                     egui::Frame::new()
                         .fill(Palette::ACCENT_SOFT)
                         .corner_radius(4)
@@ -1675,7 +1685,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("{}  {}", egui_phosphor::regular::WARNING, s.status)).color(Palette::DANGER).size(12.0));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.add(egui::Button::new(RichText::new(format!("{}  重连", egui_phosphor::regular::ARROW_CLOCKWISE)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                                    if ui.add(egui::Button::new(RichText::new(format!("{}  {}", egui_phosphor::regular::ARROW_CLOCKWISE, crate::i18n::tr("重连", "Reconnect"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                                         reconnect_click = true;
                                     }
                                 });

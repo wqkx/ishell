@@ -186,6 +186,33 @@ pub fn save_download_dir(dir: &str) {
     }
 }
 
+// ---------- 语言设置 ----------
+
+fn lang_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("lang"))
+}
+
+/// 读取语言代码（"zh"/"en"），未设置则 None。
+pub fn load_lang() -> Option<String> {
+    let p = lang_path()?;
+    let s = std::fs::read_to_string(p).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 保存语言代码。
+pub fn save_lang(code: &str) {
+    if let Some(p) = lang_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, code);
+    }
+}
+
 // ---------- 读写 ----------
 
 /// 读取已保存连接列表（内存中为明文密码）。

@@ -102,7 +102,7 @@ impl ConnectForm {
         let mut result = None;
         let mut open = self.open;
 
-        let title = if self.mode == Mode::List { "快速连接" } else { "新建连接" };
+        let title = if self.mode == Mode::List { crate::i18n::tr("快速连接", "Quick Connect") } else { crate::i18n::tr("新建连接", "New Connection") };
         egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
@@ -118,17 +118,17 @@ impl ConnectForm {
         if let Some(i) = self.confirm_delete {
             let name = self.saved.get(i).map(|c| c.name.clone()).unwrap_or_default();
             let mut close = false;
-            egui::Window::new("确认删除")
+            egui::Window::new(crate::i18n::tr("确认删除", "Confirm delete"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.set_min_width(260.0);
-                    ui.label(format!("确定删除连接「{name}」吗？"));
+                    ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("确定删除连接「{name}」吗？"), crate::i18n::Lang::En => format!("Delete \"{name}\"?") });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("删除").color(egui::Color32::WHITE)).fill(Palette::DANGER))
+                            .add(egui::Button::new(RichText::new(crate::i18n::tr("删除", "Delete")).color(egui::Color32::WHITE)).fill(Palette::DANGER))
                             .clicked()
                         {
                             if i < self.saved.len() {
@@ -138,7 +138,7 @@ impl ConnectForm {
                             self.sel = None;
                             close = true;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(crate::i18n::tr("取消", "Cancel")).clicked() {
                             close = true;
                         }
                     });
@@ -161,11 +161,11 @@ impl ConnectForm {
     fn list_view(&mut self, ui: &mut egui::Ui, result: &mut Option<ConnectConfig>) {
         use egui_phosphor::regular as icon;
         ui.horizontal(|ui| {
-            ui.heading(RichText::new("快速连接").size(18.0).color(Palette::TEXT));
+            ui.heading(RichText::new(crate::i18n::tr("快速连接", "Quick Connect")).size(18.0).color(Palette::TEXT));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(format!("{}  新建", icon::PLUS)).color(egui::Color32::WHITE))
+                        egui::Button::new(RichText::new(format!("{}  {}", icon::PLUS, crate::i18n::tr("新建", "New"))).color(egui::Color32::WHITE))
                             .fill(Palette::ACCENT)
                             .wrap_mode(egui::TextWrapMode::Extend),
                     )
@@ -176,7 +176,7 @@ impl ConnectForm {
                 }
             });
         });
-        ui.label(RichText::new("单击选择，双击连接").color(Palette::TEXT_DIM).size(11.0));
+        ui.label(RichText::new(crate::i18n::tr("单击选择，双击连接", "Click to select, double-click to connect")).color(Palette::TEXT_DIM).size(11.0));
         ui.separator();
         ui.set_min_width(500.0);
 
@@ -184,7 +184,7 @@ impl ConnectForm {
             if self.saved.is_empty() {
                 ui.add_space(20.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("还没有保存的连接，点击右上角「新建」").color(Palette::TEXT_DIM));
+                    ui.label(RichText::new(crate::i18n::tr("还没有保存的连接，点击右上角「新建」", "No saved connections. Click \"New\" top-right.")).color(Palette::TEXT_DIM));
                 });
                 return;
             }
@@ -213,10 +213,10 @@ impl ConnectForm {
                         ui.add_space(2.0);
                         ui.label(RichText::new(&c.name).color(Palette::TEXT));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Button::new(RichText::new(icon::TRASH).color(Palette::TEXT_DIM)).frame(false)).on_hover_text("删除").clicked() {
+                            if ui.add(egui::Button::new(RichText::new(icon::TRASH).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("删除", "Delete")).clicked() {
                                 del_idx = Some(i);
                             }
-                            if ui.add(egui::Button::new(RichText::new(icon::PENCIL_SIMPLE).color(Palette::TEXT_DIM)).frame(false)).on_hover_text("编辑").clicked() {
+                            if ui.add(egui::Button::new(RichText::new(icon::PENCIL_SIMPLE).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("编辑", "Edit")).clicked() {
                                 edit_idx = Some(i);
                             }
                             ui.add_space(10.0);
@@ -285,51 +285,51 @@ impl ConnectForm {
             .spacing([12.0, 12.0])
             .min_col_width(64.0)
             .show(ui, |ui| {
-                ui.label("名称");
-                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(w).hint_text("便于识别，可留空"));
+                ui.label(crate::i18n::tr("名称", "Name"));
+                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(w).hint_text(crate::i18n::tr("便于识别，可留空", "For display, optional")));
                 ui.end_row();
 
-                ui.label("主机");
+                ui.label(crate::i18n::tr("主机", "Host"));
                 ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(w));
                 ui.end_row();
 
-                ui.label("端口");
+                ui.label(crate::i18n::tr("端口", "Port"));
                 ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(w));
                 ui.end_row();
 
-                ui.label("用户名");
+                ui.label(crate::i18n::tr("用户名", "User"));
                 ui.add(egui::TextEdit::singleline(&mut self.username).desired_width(w));
                 ui.end_row();
 
-                ui.label("认证方式");
+                ui.label(crate::i18n::tr("认证方式", "Auth"));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.auth, AuthKind::Password, "密码");
-                    ui.selectable_value(&mut self.auth, AuthKind::Key, "私钥");
+                    ui.selectable_value(&mut self.auth, AuthKind::Password, crate::i18n::tr("密码", "Password"));
+                    ui.selectable_value(&mut self.auth, AuthKind::Key, crate::i18n::tr("私钥", "Key"));
                 });
                 ui.end_row();
 
                 match self.auth {
                     AuthKind::Password => {
-                        ui.label("密码");
+                        ui.label(crate::i18n::tr("密码", "Password"));
                         ui.add(egui::TextEdit::singleline(&mut self.password).desired_width(w).password(true));
                         ui.end_row();
                     }
                     AuthKind::Key => {
-                        ui.label("私钥路径");
+                        ui.label(crate::i18n::tr("私钥路径", "Key file"));
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut self.key_path).desired_width(w - 36.0));
                             if ui
                                 .button(egui_phosphor::regular::FOLDER_OPEN)
-                                .on_hover_text("浏览选择私钥文件")
+                                .on_hover_text(crate::i18n::tr("浏览选择私钥文件", "Browse for key file"))
                                 .clicked()
                             {
-                                if let Some(path) = rfd::FileDialog::new().set_title("选择私钥文件").pick_file() {
+                                if let Some(path) = rfd::FileDialog::new().set_title(crate::i18n::tr("选择私钥文件", "Select key file")).pick_file() {
                                     self.key_path = path.to_string_lossy().into_owned();
                                 }
                             }
                         });
                         ui.end_row();
-                        ui.label("私钥口令");
+                        ui.label(crate::i18n::tr("私钥口令", "Passphrase"));
                         ui.add(egui::TextEdit::singleline(&mut self.passphrase).desired_width(w).password(true));
                         ui.end_row();
                     }
@@ -337,46 +337,46 @@ impl ConnectForm {
             });
 
         ui.add_space(8.0);
-        ui.checkbox(&mut self.use_jump, "通过跳板机连接（ProxyJump）");
+        ui.checkbox(&mut self.use_jump, crate::i18n::tr("通过跳板机连接（ProxyJump）", "Via jump host (ProxyJump)"));
         if self.use_jump {
             egui::Grid::new("jump_form")
                 .num_columns(2)
                 .spacing([12.0, 10.0])
                 .min_col_width(64.0)
                 .show(ui, |ui| {
-                    ui.label("跳板主机");
+                    ui.label(crate::i18n::tr("跳板主机", "Jump host"));
                     ui.add(egui::TextEdit::singleline(&mut self.j_host).desired_width(w));
                     ui.end_row();
-                    ui.label("跳板端口");
+                    ui.label(crate::i18n::tr("跳板端口", "Jump port"));
                     ui.add(egui::TextEdit::singleline(&mut self.j_port).desired_width(w));
                     ui.end_row();
-                    ui.label("跳板用户");
+                    ui.label(crate::i18n::tr("跳板用户", "Jump user"));
                     ui.add(egui::TextEdit::singleline(&mut self.j_username).desired_width(w));
                     ui.end_row();
-                    ui.label("跳板认证");
+                    ui.label(crate::i18n::tr("跳板认证", "Jump auth"));
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.j_auth, AuthKind::Password, "密码");
-                        ui.selectable_value(&mut self.j_auth, AuthKind::Key, "私钥");
+                        ui.selectable_value(&mut self.j_auth, AuthKind::Password, crate::i18n::tr("密码", "Password"));
+                        ui.selectable_value(&mut self.j_auth, AuthKind::Key, crate::i18n::tr("私钥", "Key"));
                     });
                     ui.end_row();
                     match self.j_auth {
                         AuthKind::Password => {
-                            ui.label("跳板密码");
+                            ui.label(crate::i18n::tr("跳板密码", "Jump pwd"));
                             ui.add(egui::TextEdit::singleline(&mut self.j_password).desired_width(w).password(true));
                             ui.end_row();
                         }
                         AuthKind::Key => {
-                            ui.label("跳板私钥");
+                            ui.label(crate::i18n::tr("跳板私钥", "Jump key"));
                             ui.horizontal(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut self.j_key_path).desired_width(w - 36.0));
-                                if ui.button(egui_phosphor::regular::FOLDER_OPEN).on_hover_text("浏览选择私钥文件").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new().set_title("选择跳板机私钥").pick_file() {
+                                if ui.button(egui_phosphor::regular::FOLDER_OPEN).on_hover_text(crate::i18n::tr("浏览选择私钥文件", "Browse for key file")).clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().set_title(crate::i18n::tr("选择跳板机私钥", "Select jump key file")).pick_file() {
                                         self.j_key_path = path.to_string_lossy().into_owned();
                                     }
                                 }
                             });
                             ui.end_row();
-                            ui.label("私钥口令");
+                            ui.label(crate::i18n::tr("私钥口令", "Passphrase"));
                             ui.add(egui::TextEdit::singleline(&mut self.j_passphrase).desired_width(w).password(true));
                             ui.end_row();
                         }
@@ -392,7 +392,7 @@ impl ConnectForm {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui.add(
-                egui::Button::new(RichText::new(format!("{}  连接", egui_phosphor::regular::PLUGS_CONNECTED)).color(egui::Color32::WHITE))
+                egui::Button::new(RichText::new(format!("{}  {}", egui_phosphor::regular::PLUGS_CONNECTED, crate::i18n::tr("连接", "Connect"))).color(egui::Color32::WHITE))
                     .fill(Palette::ACCENT)
                     .wrap_mode(egui::TextWrapMode::Extend),
             ).clicked() {
@@ -401,7 +401,7 @@ impl ConnectForm {
                     Err(e) => self.error = Some(e),
                 }
             }
-            if ui.button("保存").on_hover_text("保存到快速连接").clicked() {
+            if ui.button(crate::i18n::tr("保存", "Save")).on_hover_text(crate::i18n::tr("保存到快速连接", "Save to quick connect")).clicked() {
                 match self.build() {
                     Ok(_) => {
                         self.save_current();
@@ -410,7 +410,7 @@ impl ConnectForm {
                     Err(e) => self.error = Some(e),
                 }
             }
-            if ui.button("返回").clicked() {
+            if ui.button(crate::i18n::tr("返回", "Back")).clicked() {
                 self.error = None;
                 self.mode = Mode::List;
             }
@@ -474,17 +474,17 @@ impl ConnectForm {
 
     fn build(&self) -> Result<ConnectConfig, String> {
         if self.host.trim().is_empty() {
-            return Err("请填写主机地址".into());
+            return Err(crate::i18n::tr("请填写主机地址", "Enter host").into());
         }
-        let port: u16 = self.port.trim().parse().map_err(|_| "端口非法".to_string())?;
+        let port: u16 = self.port.trim().parse().map_err(|_| crate::i18n::tr("端口非法", "Invalid port").to_string())?;
         if self.username.trim().is_empty() {
-            return Err("请填写用户名".into());
+            return Err(crate::i18n::tr("请填写用户名", "Enter user").into());
         }
         let auth = match self.auth {
             AuthKind::Password => AuthMethod::Password(self.password.clone()),
             AuthKind::Key => {
                 if self.key_path.trim().is_empty() {
-                    return Err("请填写私钥路径".into());
+                    return Err(crate::i18n::tr("请填写私钥路径", "Enter key file").into());
                 }
                 AuthMethod::KeyFile {
                     path: self.key_path.trim().to_string(),
@@ -498,17 +498,17 @@ impl ConnectForm {
         };
         let jump = if self.use_jump {
             if self.j_host.trim().is_empty() {
-                return Err("请填写跳板主机地址".into());
+                return Err(crate::i18n::tr("请填写跳板主机地址", "Enter jump host").into());
             }
-            let jport: u16 = self.j_port.trim().parse().map_err(|_| "跳板端口非法".to_string())?;
+            let jport: u16 = self.j_port.trim().parse().map_err(|_| crate::i18n::tr("跳板端口非法", "Invalid jump port").to_string())?;
             if self.j_username.trim().is_empty() {
-                return Err("请填写跳板用户名".into());
+                return Err(crate::i18n::tr("请填写跳板用户名", "Enter jump user").into());
             }
             let jauth = match self.j_auth {
                 AuthKind::Password => AuthMethod::Password(self.j_password.clone()),
                 AuthKind::Key => {
                     if self.j_key_path.trim().is_empty() {
-                        return Err("请填写跳板私钥路径".into());
+                        return Err(crate::i18n::tr("请填写跳板私钥路径", "Enter jump key file").into());
                     }
                     AuthMethod::KeyFile {
                         path: self.j_key_path.trim().to_string(),

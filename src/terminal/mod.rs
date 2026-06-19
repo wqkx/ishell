@@ -300,7 +300,7 @@ impl Terminal {
                 ui.horizontal(|ui| {
                     let f = self.find.as_mut().unwrap();
                     ui.label(egui::RichText::new(icon::MAGNIFYING_GLASS).color(crate::theme::Palette::TEXT_DIM));
-                    let resp = ui.add(egui::TextEdit::singleline(&mut f.query).desired_width(180.0).hint_text("查找终端内容"));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut f.query).desired_width(180.0).hint_text(crate::i18n::tr("查找终端内容", "Find in terminal")));
                     if f.focus {
                         resp.request_focus();
                         f.focus = false;
@@ -318,10 +318,10 @@ impl Terminal {
                         format!("{}/{}", f.cur + 1, f.hits.len())
                     };
                     ui.label(egui::RichText::new(cnt).color(crate::theme::Palette::TEXT_DIM).size(11.0));
-                    if ui.button(icon::CARET_UP).on_hover_text("上一个").clicked() {
+                    if ui.button(icon::CARET_UP).on_hover_text(crate::i18n::tr("上一个", "Prev")).clicked() {
                         action = FindAction::Step(-1);
                     }
-                    if ui.button(icon::CARET_DOWN).on_hover_text("下一个").clicked() {
+                    if ui.button(icon::CARET_DOWN).on_hover_text(crate::i18n::tr("下一个", "Next")).clicked() {
                         action = FindAction::Step(1);
                     }
                     if ui.button(icon::X).clicked() {
@@ -540,20 +540,26 @@ impl Terminal {
         let mut do_paste = paste_sc;
         resp.context_menu(|ui| {
             let sel = self.has_selection();
-            if ui.add_enabled(sel, egui::Button::new("复制")).clicked() {
+            if ui.add_enabled(sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
                 do_copy = true;
                 ui.close();
             }
-            if ui.button("粘贴").clicked() {
+            if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
                 do_paste = true;
                 ui.close();
             }
             ui.separator();
-            let theme_label = if self.dark { "切换为浅色终端" } else { "切换为深色终端" };
+            let theme_label = if self.dark {
+                crate::i18n::tr("切换为浅色终端", "Light terminal")
+            } else {
+                crate::i18n::tr("切换为深色终端", "Dark terminal")
+            };
             if ui.button(theme_label).clicked() {
                 self.dark = !self.dark;
                 ui.close();
             }
+            ui.separator();
+            ui.menu_button(crate::i18n::tr("语言", "Language"), crate::i18n::language_menu);
         });
         if do_copy {
             if let Some(t) = self.selected_text() {

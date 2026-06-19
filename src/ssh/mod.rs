@@ -71,10 +71,7 @@ impl Handler for ClientHandler {
             }
             // 已记录但密钥不一致 -> 可能中间人攻击，拒绝并提示手动处理
             Err(_) => {
-                self.sink.send(WorkerEvent::Error(format!(
-                    "主机密钥已改变（{}），可能存在中间人攻击！如确属服务器更换密钥，请手动编辑 ~/.ssh/known_hosts 删除旧行后重试。",
-                    fp
-                )));
+                self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("主机密钥已改变（{}），可能存在中间人攻击！请手动编辑 ~/.ssh/known_hosts 删除旧行后重试。", fp), crate::i18n::Lang::En => format!("Host key changed ({})! Possible MITM. Remove the old line in ~/.ssh/known_hosts and retry.", fp) }));
                 Ok(false)
             }
         }
@@ -99,14 +96,11 @@ impl Handler for JumpHandler {
             Ok(true) => Ok(true),
             Ok(false) => {
                 let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
-                self.sink.send(WorkerEvent::Status(format!("已信任跳板机 {} 的主机指纹", self.host)));
+                self.sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已信任跳板机 {} 的主机指纹", self.host), crate::i18n::Lang::En => format!("Trusted jump host key: {}", self.host) }));
                 Ok(true)
             }
             Err(_) => {
-                self.sink.send(WorkerEvent::Error(format!(
-                    "跳板机 {} 主机密钥已改变，可能存在中间人攻击，已拒绝。",
-                    self.host
-                )));
+                self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("跳板机 {} 主机密钥已改变，可能存在中间人攻击，已拒绝。", self.host), crate::i18n::Lang::En => format!("Jump host {} key changed; possible MITM. Rejected.", self.host) }));
                 Ok(false)
             }
         }
@@ -120,13 +114,13 @@ pub async fn run(
     sink: UiSink,
     hostkey_rx: UnboundedReceiver<bool>,
 ) {
-    sink.send(WorkerEvent::Status(format!("正在连接 {}:{} …", cfg.host, cfg.port)));
+    sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("正在连接 {}:{} …", cfg.host, cfg.port), crate::i18n::Lang::En => format!("Connecting {}:{} …", cfg.host, cfg.port) }));
 
     // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
     let (handle, _jump_handle) = match connect(&cfg, &sink, hostkey_rx).await {
         Ok(h) => h,
         Err(e) => {
-            sink.send(WorkerEvent::Disconnected(format!("连接失败：{e}")));
+            sink.send(WorkerEvent::Disconnected(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("连接失败：{e}"), crate::i18n::Lang::En => format!("Connect failed: {e}") }));
             return;
         }
     };
@@ -136,7 +130,7 @@ pub async fn run(
     let mut shell = match open_shell(&handle).await {
         Ok(c) => c,
         Err(e) => {
-            sink.send(WorkerEvent::Disconnected(format!("打开 shell 失败：{e}")));
+            sink.send(WorkerEvent::Disconnected(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开 shell 失败：{e}"), crate::i18n::Lang::En => format!("Open shell failed: {e}") }));
             return;
         }
     };
@@ -145,7 +139,7 @@ pub async fn run(
     let sftp = match open_sftp(&handle).await {
         Ok(s) => Some(Arc::new(s)),
         Err(e) => {
-            sink.send(WorkerEvent::Error(format!("SFTP 不可用：{e}")));
+            sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }));
             None
         }
     };
@@ -185,7 +179,7 @@ pub async fn run(
                         sink.send(WorkerEvent::TerminalData(data.to_vec()));
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                        sink.send(WorkerEvent::Disconnected("远程关闭了会话".into()));
+                        sink.send(WorkerEvent::Disconnected(crate::i18n::tr("远程关闭了会话", "Remote closed the session").into()));
                         break;
                     }
                     _ => {}
@@ -195,7 +189,7 @@ pub async fn run(
                 match cmd {
                     Some(UiCommand::TerminalInput(bytes)) => {
                         if shell.data(&bytes[..]).await.is_err() {
-                            sink.send(WorkerEvent::Disconnected("写入通道失败".into()));
+                            sink.send(WorkerEvent::Disconnected(crate::i18n::tr("写入通道失败", "Channel write failed").into()));
                             break;
                         }
                     }
@@ -213,7 +207,7 @@ pub async fn run(
                                         s.send(WorkerEvent::DirListing { path: canon, entries });
                                     }
                                     Err(e) => {
-                                        s.send(WorkerEvent::Error(format!("读取目录失败：{e}")));
+                                        s.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("读取目录失败：{e}"), crate::i18n::Lang::En => format!("List dir failed: {e}") }));
                                         // 回送空列表以清除该目录的 loading 状态，避免卡在“加载中”
                                         s.send(WorkerEvent::DirListing { path, entries: Vec::new() });
                                     }
@@ -229,7 +223,7 @@ pub async fn run(
                             match open_sftp(&h).await {
                                 Ok(sftp) => download(&sftp, id, remote, local, &s).await,
                                 Err(e) => s.send(WorkerEvent::TransferDone {
-                                    id, ok: false, message: format!("SFTP 不可用：{e}"), refresh_dir: None,
+                                    id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
                                 }),
                             }
                         });
@@ -241,7 +235,7 @@ pub async fn run(
                             match open_sftp(&h).await {
                                 Ok(sftp) => upload(&sftp, id, local, remote_dir, &s).await,
                                 Err(e) => s.send(WorkerEvent::TransferDone {
-                                    id, ok: false, message: format!("SFTP 不可用：{e}"), refresh_dir: None,
+                                    id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
                                 }),
                             }
                         });
@@ -253,7 +247,7 @@ pub async fn run(
                             tokio::spawn(async move {
                                 match read_text_file(&sftp, &path, force).await {
                                     Ok(content) => s.send(WorkerEvent::FileOpened { path, content }),
-                                    Err(e) => s.send(WorkerEvent::Error(format!("打开失败：{e}"))),
+                                    Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{e}"), crate::i18n::Lang::En => format!("Open failed: {e}") })),
                                 }
                             });
                         }
@@ -271,7 +265,7 @@ pub async fn run(
                                 handle_fs_op(&sftp, cmd, &s).await;
                             });
                         } else {
-                            sink.send(WorkerEvent::Error("SFTP 不可用".into()));
+                            sink.send(WorkerEvent::Error(crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into()));
                         }
                     }
                     Some(UiCommand::ProcDetail(pid)) => {
@@ -296,7 +290,7 @@ pub async fn run(
                         let s = sink.clone();
                         tokio::spawn(async move {
                             let _ = exec_capture(&h, &format!("kill -9 {pid}")).await;
-                            s.send(WorkerEvent::Status(format!("已发送 kill -9 {pid}")));
+                            s.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已发送 kill -9 {pid}"), crate::i18n::Lang::En => format!("Sent kill -9 {pid}") }));
                         });
                     }
                     Some(UiCommand::AddForward(spec)) => {
@@ -312,7 +306,7 @@ pub async fn run(
                     }
                     Some(UiCommand::Disconnect) | None => {
                         let _ = shell.eof().await;
-                        sink.send(WorkerEvent::Disconnected("已断开".into()));
+                        sink.send(WorkerEvent::Disconnected(crate::i18n::tr("已断开", "Disconnected").into()));
                         break;
                     }
                 }
@@ -375,14 +369,14 @@ async fn connect(
 
     let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {
         // 1) 先连跳板机并认证
-        sink.send(WorkerEvent::Status(format!("正在连接跳板机 {}:{} …", jump.host, jump.port)));
+        sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("正在连接跳板机 {}:{} …", jump.host, jump.port), crate::i18n::Lang::En => format!("Connecting jump {}:{} …", jump.host, jump.port) }));
         let jhandler = JumpHandler { host: jump.host.clone(), port: jump.port, sink: sink.clone() };
         let mut jhandle = client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?;
         if !authenticate(&mut jhandle, &jump.username, &jump.auth).await? {
-            anyhow::bail!("跳板机认证被拒绝");
+            anyhow::bail!("{}", crate::i18n::tr("跳板机认证被拒绝", "Jump host auth rejected"));
         }
         // 2) 经跳板机打开到目标主机的 direct-tcpip 通道，并在该流上完成目标 SSH 握手
-        sink.send(WorkerEvent::Status(format!("经跳板机连接 {}:{} …", cfg.host, cfg.port)));
+        sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("经跳板机连接 {}:{} …", cfg.host, cfg.port), crate::i18n::Lang::En => format!("Via jump to {}:{} …", cfg.host, cfg.port) }));
         let ch = jhandle
             .channel_open_direct_tcpip(cfg.host.clone(), cfg.port as u32, "127.0.0.1", 0)
             .await?;
@@ -393,9 +387,9 @@ async fn connect(
         (handle, None)
     };
 
-    sink.send(WorkerEvent::Status("正在认证 …".into()));
+    sink.send(WorkerEvent::Status(crate::i18n::tr("正在认证 …", "Authenticating …").into()));
     if !authenticate(&mut handle, &cfg.username, &cfg.auth).await? {
-        anyhow::bail!("认证被拒绝（用户名/密码或密钥错误）");
+        anyhow::bail!("{}", crate::i18n::tr("认证被拒绝（用户名/密码或密钥错误）", "Authentication rejected (bad credentials)"));
     }
     Ok((handle, jump_keep))
 }
@@ -543,10 +537,10 @@ async fn download(
 
     match res {
         Ok(_) => sink.send(WorkerEvent::TransferDone {
-            id, ok: true, message: format!("已下载 {name}"), refresh_dir: None,
+            id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已下载 {name}"), crate::i18n::Lang::En => format!("Downloaded {name}") }, refresh_dir: None,
         }),
         Err(e) => sink.send(WorkerEvent::TransferDone {
-            id, ok: false, message: format!("下载失败：{e}"), refresh_dir: None,
+            id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("下载失败：{e}"), crate::i18n::Lang::En => format!("Download failed: {e}") }, refresh_dir: None,
         }),
     }
 }
@@ -591,10 +585,10 @@ async fn upload(
     .await;
     match res {
         Ok(_) => sink.send(WorkerEvent::TransferDone {
-            id, ok: true, message: format!("已上传 {name}"), refresh_dir: Some(remote_dir),
+            id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已上传 {name}"), crate::i18n::Lang::En => format!("Uploaded {name}") }, refresh_dir: Some(remote_dir),
         }),
         Err(e) => sink.send(WorkerEvent::TransferDone {
-            id, ok: false, message: format!("上传失败：{e}"), refresh_dir: None,
+            id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("上传失败：{e}"), crate::i18n::Lang::En => format!("Upload failed: {e}") }, refresh_dir: None,
         }),
     }
 }
@@ -612,10 +606,10 @@ async fn read_text_file(
     let data = sftp.read(path).await?;
     let limit = if force { 16 * 1024 * 1024 } else { 4 * 1024 * 1024 };
     if data.len() > limit {
-        anyhow::bail!("文件过大（>{}MB）", limit / 1024 / 1024);
+        anyhow::bail!("{}", match crate::i18n::current() { crate::i18n::Lang::Zh => format!("文件过大（>{}MB）", limit / 1024 / 1024), crate::i18n::Lang::En => format!("File too large (>{}MB)", limit / 1024 / 1024) });
     }
     if data.iter().take(8000).any(|b| *b == 0) {
-        anyhow::bail!("非文本文件，无法以文本方式打开");
+        anyhow::bail!("{}", crate::i18n::tr("非文本文件，无法以文本方式打开", "Not a text file"));
     }
     Ok(String::from_utf8_lossy(&data).into_owned())
 }
@@ -627,14 +621,14 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
             let parent = remote_parent(&path);
             sftp.create_dir(&path)
                 .await
-                .map(|_| (format!("已创建目录：{path}"), Some(parent)))
+                .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已创建目录：{path}"), crate::i18n::Lang::En => format!("Created dir: {path}") }, Some(parent)))
                 .map_err(Into::into)
         }
         UiCommand::CreateFile(path) => {
             let parent = remote_parent(&path);
             sftp.write(&path, b"")
                 .await
-                .map(|_| (format!("已创建文件：{path}"), Some(parent)))
+                .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已创建文件：{path}"), crate::i18n::Lang::En => format!("Created file: {path}") }, Some(parent)))
                 .map_err(Into::into)
         }
         UiCommand::Chmod { path, mode } => {
@@ -645,7 +639,7 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
             };
             sftp.set_metadata(&path, attrs)
                 .await
-                .map(|_| (format!("已修改权限：{:o}", mode & 0o777), Some(parent)))
+                .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已修改权限：{:o}", mode & 0o777), crate::i18n::Lang::En => format!("Chmod: {:o}", mode & 0o777) }, Some(parent)))
                 .map_err(Into::into)
         }
         UiCommand::Delete { path, is_dir } => {
@@ -655,19 +649,19 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
             } else {
                 sftp.remove_file(&path).await
             };
-            r.map(|_| (format!("已删除：{path}"), Some(parent))).map_err(Into::into)
+            r.map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已删除：{path}"), crate::i18n::Lang::En => format!("Deleted: {path}") }, Some(parent))).map_err(Into::into)
         }
         UiCommand::Rename { from, to } => {
             let parent = remote_parent(&to);
             sftp.rename(&from, &to)
                 .await
-                .map(|_| (format!("已重命名为：{to}"), Some(parent)))
+                .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已重命名为：{to}"), crate::i18n::Lang::En => format!("Renamed to: {to}") }, Some(parent)))
                 .map_err(Into::into)
         }
         UiCommand::WriteFile { path, content } => {
             sftp.write(&path, content.as_bytes())
                 .await
-                .map(|_| (format!("已保存：{path}"), None))
+                .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存：{path}"), crate::i18n::Lang::En => format!("Saved: {path}") }, None))
                 .map_err(Into::into)
         }
         _ => Ok(("".into(), None)),
@@ -675,7 +669,7 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
 
     match result {
         Ok((message, refresh_dir)) => sink.send(WorkerEvent::OpDone { message, refresh_dir }),
-        Err(e) => sink.send(WorkerEvent::Error(format!("操作失败：{e}"))),
+        Err(e) => sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("操作失败：{e}"), crate::i18n::Lang::En => format!("Operation failed: {e}") })),
     }
 }
 

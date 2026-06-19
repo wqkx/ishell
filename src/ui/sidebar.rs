@@ -2,6 +2,7 @@
 
 use egui::{Color32, Rect, RichText, Vec2};
 
+use crate::i18n::tr;
 use crate::proto::SysInfo;
 use crate::theme::Palette;
 use crate::ui::{fmt_kb, fmt_rate, net_sparkline, usage_color};
@@ -51,37 +52,37 @@ pub fn show(
         let Some(info) = info else {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("等待系统信息 …").color(Palette::TEXT_DIM));
+                ui.label(RichText::new(tr("等待系统信息 …", "Waiting for system info …")).color(Palette::TEXT_DIM));
             });
             return;
         };
 
         // —— 主机概览 ——
-        section(ui, icon::DESKTOP, "主机信息");
-        kv(ui, "主机名", &info.hostname);
+        section(ui, icon::DESKTOP, tr("主机信息", "Host"));
+        kv(ui, tr("主机名", "Name"), &info.hostname);
         if !info.ip.is_empty() {
             kv(ui, "IP", &info.ip);
         }
         if !info.os.is_empty() {
-            kv(ui, "系统", &info.os);
+            kv(ui, tr("系统", "OS"), &info.os);
         }
-        kv(ui, "运行", &info.uptime);
+        kv(ui, tr("运行", "Up"), &info.uptime);
         ui.add_space(6.0);
 
         // —— CPU / 内存 / 交换：单行对齐，无小标题 ——
         meter_row(ui, "CPU", info.cpu_percent, &format!("{:.0}%", info.cpu_percent));
         meter_row(
             ui,
-            "内存",
+            tr("内存", "Mem"),
             pct(info.mem_used_kb, info.mem_total_kb),
             &format!("{}/{}", fmt_kb(info.mem_used_kb), fmt_kb(info.mem_total_kb)),
         );
         meter_row(
             ui,
-            "交换",
+            tr("交换", "Swap"),
             pct(info.swap_used_kb, info.swap_total_kb),
             &if info.swap_total_kb == 0 {
-                "无".to_string()
+                tr("无", "N/A").to_string()
             } else {
                 format!("{}/{}", fmt_kb(info.swap_used_kb), fmt_kb(info.swap_total_kb))
             },
@@ -97,12 +98,12 @@ pub fn show(
         ui.add_space(6.0);
 
         // —— 进程（≤5，可按 CPU/内存 排序） ——
-        section(ui, icon::LIST_BULLETS, "进程 Top");
+        section(ui, icon::LIST_BULLETS, tr("进程 Top", "Processes"));
         proc_table(ui, info, sort_mem, proc_click);
         ui.add_space(6.0);
 
         // —— 网络（可选网卡，显示实时上下行） ——
-        section(ui, icon::WIFI_HIGH, "网络");
+        section(ui, icon::WIFI_HIGH, tr("网络", "Network"));
         // 选中网卡的速率（空=全部之和）
         let (rx, tx) = if selected_nic.is_empty() {
             (info.net_rx_bps, info.net_tx_bps)
@@ -115,14 +116,14 @@ pub fn show(
         };
         // 网卡选择（单独一行，右对齐，按钮大小合理）
         ui.horizontal(|ui| {
-            ui.label(RichText::new("网卡").color(Palette::TEXT_DIM).size(12.0));
+            ui.label(RichText::new(tr("网卡", "NIC")).color(Palette::TEXT_DIM).size(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let cur = if selected_nic.is_empty() { "全部".to_string() } else { selected_nic.clone() };
+                let cur = if selected_nic.is_empty() { tr("全部", "All").to_string() } else { selected_nic.clone() };
                 egui::ComboBox::from_id_salt("nic_sel")
                     .selected_text(RichText::new(cur).size(12.0))
                     .width(110.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(selected_nic, String::new(), "全部");
+                        ui.selectable_value(selected_nic, String::new(), tr("全部", "All"));
                         for n in &info.nets {
                             ui.selectable_value(selected_nic, n.name.clone(), &n.name);
                         }
@@ -141,7 +142,7 @@ pub fn show(
         ui.add_space(6.0);
 
         // —— 磁盘：每行一个，右起进度条 + 文字同行 ——
-        section(ui, icon::HARD_DRIVES, "磁盘");
+        section(ui, icon::HARD_DRIVES, tr("磁盘", "Disk"));
         for d in &info.disks {
             let avail = d.total_kb.saturating_sub(d.used_kb);
             disk_row(ui, &d.mount, d.percent, &format!("{}/{}", fmt_kb(avail), fmt_kb(d.total_kb)));
@@ -227,7 +228,14 @@ fn gpu_meter(ui: &mut egui::Ui, percent: f32, count: usize) -> egui::Response {
     let mut fill = bar;
     fill.set_width((bar.width() * percent / 100.0).max(2.0));
     p.rect_filled(fill, 0.0, usage_color(percent));
-    let detail = if count > 1 { format!("{count} 卡  {percent:.0}%") } else { format!("{percent:.0}%") };
+    let detail = if count > 1 {
+        match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("{count} 卡  {percent:.0}%"),
+            crate::i18n::Lang::En => format!("x{count}  {percent:.0}%"),
+        }
+    } else {
+        format!("{percent:.0}%")
+    };
     p.text(bar.right_center() - Vec2::new(5.0, 0.0), egui::Align2::RIGHT_CENTER, detail,
         egui::FontId::monospace(11.0), Palette::TEXT);
     resp
@@ -275,14 +283,14 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
         let p = ui.painter_at(rect);
         p.text(rect.left_center(), egui::Align2::LEFT_CENTER, "PID",
             egui::FontId::proportional(10.5), Palette::TEXT_DIM);
-        p.text(rect.left_center() + Vec2::new(pid_w, 0.0), egui::Align2::LEFT_CENTER, "名称",
+        p.text(rect.left_center() + Vec2::new(pid_w, 0.0), egui::Align2::LEFT_CENTER, tr("名称", "Name"),
             egui::FontId::proportional(10.5), Palette::TEXT_DIM);
         let mem_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w, 0.0), rect.right_bottom());
         let cpu_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w + cpu_w, 0.0), egui::pos2(rect.right() - mem_w, rect.bottom()));
         let cpu_col = if !*sort_mem { Palette::ACCENT } else { Palette::TEXT_DIM };
         let mem_col = if *sort_mem { Palette::ACCENT } else { Palette::TEXT_DIM };
         p.text(cpu_rect.right_center(), egui::Align2::RIGHT_CENTER, "CPU%", egui::FontId::proportional(10.5), cpu_col);
-        p.text(mem_rect.right_center(), egui::Align2::RIGHT_CENTER, "内存%", egui::FontId::proportional(10.5), mem_col);
+        p.text(mem_rect.right_center(), egui::Align2::RIGHT_CENTER, tr("内存%", "Mem%"), egui::FontId::proportional(10.5), mem_col);
         if ui.interact(cpu_rect, ui.id().with("sort_cpu"), egui::Sense::click()).clicked() {
             *sort_mem = false;
         }

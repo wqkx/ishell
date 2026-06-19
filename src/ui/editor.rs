@@ -73,11 +73,11 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&ed.path).color(Palette::TEXT_DIM).size(11.0));
             let mb = ed.content.len() as f64 / 1_048_576.0;
-            ui.label(RichText::new(format!("（大文件 {mb:.1} MB · 只读）")).color(Palette::WARN).size(11.0));
+            ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("（大文件 {mb:.1} MB · 只读）"), crate::i18n::Lang::En => format!("(large {mb:.1} MB · read-only)") }).color(Palette::WARN).size(11.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button(RichText::new(format!("{}  改为可编辑", icon::PENCIL_SIMPLE)))
-                    .on_hover_text("大文件编辑会占用较多内存（约文件大小的数倍），关闭后自动释放")
+                    .button(RichText::new(format!("{}  {}", icon::PENCIL_SIMPLE, crate::i18n::tr("改为可编辑", "Make editable"))))
+                    .on_hover_text(crate::i18n::tr("大文件编辑会占用较多内存（约文件大小的数倍），关闭后自动释放", "Editing large files uses several× the file size in RAM; freed on close"))
                     .clicked()
                 {
                     ed.read_only = false;
@@ -110,10 +110,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     ui.horizontal(|ui| {
         ui.label(RichText::new(&ed.path).color(Palette::TEXT_DIM).size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new(RichText::new(format!("{}  保存", icon::FLOPPY_DISK)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+            if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                 save = true;
             }
-            if ui.button(RichText::new(format!("{}  查找", icon::MAGNIFYING_GLASS))).clicked() {
+            if ui.button(RichText::new(format!("{}  {}", icon::MAGNIFYING_GLASS, crate::i18n::tr("查找", "Find")))).clicked() {
                 ed.show_find = !ed.show_find;
             }
         });
@@ -132,19 +132,19 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
-            ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text("查找"));
-            if ui.button("下一个").clicked() {
+            ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
+            if ui.button(crate::i18n::tr("下一个", "Next")).clicked() {
                 if let Some((c0, c1)) = find_from(&ed.content, &ed.find, ed.search_from) {
                     pending_select = Some((c0, c1));
                     ed.search_from = c1;
                     ed.status.clear();
                 } else if !ed.find.is_empty() {
-                    ed.status = "未找到".into();
+                    ed.status = crate::i18n::tr("未找到", "Not found").into();
                 }
             }
             ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text("替换为"));
-            if ui.button("替换").clicked() {
+            ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换为", "Replace with")));
+            if ui.button(crate::i18n::tr("替换", "Replace")).clicked() {
                 let from = ed.search_from.saturating_sub(ed.find.chars().count());
                 if let Some((c0, c1)) = find_from(&ed.content, &ed.find, from) {
                     replace_char_range(&mut ed.content, c0, c1, &ed.replace);
@@ -153,10 +153,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     ed.search_from = nc1;
                 }
             }
-            if ui.button("全部替换").clicked() && !ed.find.is_empty() {
+            if ui.button(crate::i18n::tr("全部替换", "Replace all")).clicked() && !ed.find.is_empty() {
                 let n = ed.content.matches(ed.find.as_str()).count();
                 ed.content = ed.content.replace(ed.find.as_str(), ed.replace.as_str());
-                ed.status = format!("已替换 {n} 处");
+                ed.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已替换 {n} 处"), crate::i18n::Lang::En => format!("Replaced {n}") };
             }
             if !ed.status.is_empty() {
                 ui.label(RichText::new(&ed.status).color(Palette::TEXT_DIM).size(11.0));
