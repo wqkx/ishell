@@ -268,6 +268,8 @@ struct ProcPopup {
     cmd: String,
     cwd: String,
     exe: String,
+    /// 最近一次复制的时刻（ctx 时间，秒），用于短暂显示「已复制」
+    copied_t: Option<f64>,
 }
 
 /// UI 侧的一条端口转发记录。
@@ -468,6 +470,7 @@ impl App {
                 cmd: "/opt/gromacs/bin/gmx mdrun -deffnm md -nb gpu".into(),
                 cwd: "/home/e5-1/sim/run1".into(),
                 exe: "/opt/gromacs/bin/gmx".into(),
+                copied_t: None,
             });
         }
 
@@ -698,16 +701,31 @@ impl eframe::App for App {
         // Logo 生成模式：透明画布上画一个圆角矩形（初始界面背景色）+ iShell（accent 色、同字体）
         if self.logo {
             {
-                let painter = ui.painter();
-                let rect = ui.max_rect().shrink(8.0);
-                painter.rect_filled(rect, 30.0, Palette::BG);
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "iShell",
-                    egui::FontId::proportional(76.0),
-                    Palette::ACCENT,
-                );
+                let square = std::env::var("ISHELL_ICON").is_ok();
+                if square {
+                    // 应用图标：填满方形画布
+                    let painter = ui.painter();
+                    let rect = ui.max_rect().shrink(8.0);
+                    painter.rect_filled(rect, 30.0, Palette::BG);
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "iShell",
+                        egui::FontId::proportional(76.0),
+                        Palette::ACCENT,
+                    );
+                } else {
+                    // logo：圆角矩形贴合文字，四周边距大致相等（避免左右过宽）
+                    let galley = ui.ctx().fonts_mut(|f| {
+                        f.layout_no_wrap("iShell".to_owned(), egui::FontId::proportional(76.0), Palette::ACCENT)
+                    });
+                    let sz = galley.size();
+                    // 上下内边距小一些（galley 自带行间距），让视觉四边接近
+                    let rect = egui::Rect::from_center_size(ui.max_rect().center(), sz + egui::vec2(64.0, 40.0));
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 26.0, Palette::BG);
+                    painter.galley(rect.center() - sz / 2.0, galley, Palette::ACCENT);
+                }
             }
             let ctx = ui.ctx().clone();
             self.drive_screenshot(&ctx);
@@ -859,6 +877,7 @@ impl eframe::App for App {
                     popup = Some(ProcPopup {
                         pid, name: p.name.clone(), cpu: p.cpu, mem: p.mem, pos,
                         cmd: String::new(), cwd: String::new(), exe: String::new(),
+                        copied_t: None,
                     });
                 }
                 let _ = s.cmd_tx.send(UiCommand::ProcDetail(pid));
@@ -1372,6 +1391,9 @@ impl App {
         };
         let mut close = false;
         let mut kill = false;
+        let mut copy_target: Option<String> = None;
+        let copied_t = self.proc_popup.as_ref().and_then(|p| p.copied_t);
+        let now = ctx.input(|i| i.time);
         let win = egui::Window::new("proc_popup")
             .title_bar(false)
             .fixed_pos(pos + egui::vec2(8.0, 8.0))
@@ -1397,18 +1419,40 @@ impl App {
                 kv(ui, "PID", pid.to_string());
                 kv(ui, "CPU", format!("{cpu:.1}%"));
                 kv(ui, crate::i18n::tr("内存", "Mem"), format!("{mem:.1}%"));
+                let tip = crate::i18n::tr("双击复制", "Double-click to copy");
+                // 程序 / 目录：值可双击复制
                 if !exe.is_empty() {
-                    kv(ui, crate::i18n::tr("程序", "Exe"), exe.clone());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("程序", "Exe")).color(Palette::TEXT_DIM).size(12.0));
+                        if ui.add(egui::Label::new(RichText::new(&exe).color(Palette::TEXT).size(12.0).monospace()).sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
+                            copy_target = Some(exe.clone());
+                        }
+                    });
                 }
                 if !cwd.is_empty() {
-                    kv(ui, crate::i18n::tr("目录", "Dir"), cwd.clone());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("目录", "Dir")).color(Palette::TEXT_DIM).size(12.0));
+                        if ui.add(egui::Label::new(RichText::new(&cwd).color(Palette::TEXT).size(12.0).monospace()).sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
+                            copy_target = Some(cwd.clone());
+                        }
+                    });
                 }
+                // 命令：可双击复制
                 if cmd.is_empty() {
                     ui.label(RichText::new(crate::i18n::tr("（正在获取命令…）", "(loading command…)")).color(Palette::TEXT_DIM).size(11.0));
                 } else {
                     ui.add_space(2.0);
                     ui.label(RichText::new(crate::i18n::tr("命令", "Command")).color(Palette::TEXT_DIM).size(12.0));
-                    ui.label(RichText::new(&cmd).size(11.5).monospace().color(Palette::TEXT));
+                    if ui.add(egui::Label::new(RichText::new(&cmd).size(11.5).monospace().color(Palette::TEXT)).sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
+                        copy_target = Some(cmd.clone());
+                    }
+                }
+                // 「已复制」短暂提示
+                if let Some(t) = copied_t {
+                    if now - t < 1.3 {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(format!("{}  {}", icon::CHECK_CIRCLE, crate::i18n::tr("已复制", "Copied"))).color(Palette::OK).size(11.0));
+                    }
                 }
                 ui.separator();
                 if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::SKULL, crate::i18n::tr("强制结束 (kill -9)", "Kill (-9)"))).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
@@ -1417,6 +1461,20 @@ impl App {
             });
 
         let outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
+        // 双击复制 -> 写剪贴板并记录时间（显示「已复制」）
+        if let Some(v) = copy_target {
+            ctx.copy_text(v);
+            if let Some(p) = &mut self.proc_popup {
+                p.copied_t = Some(now);
+            }
+            ctx.request_repaint();
+        }
+        // 让「已复制」提示到点自动消失
+        if let Some(t) = copied_t {
+            if now - t < 1.4 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
         if kill {
             if let Some(s) = self.active.and_then(|i| self.sessions.get(i)) {
                 let _ = s.cmd_tx.send(UiCommand::KillProc(pid));
