@@ -27,6 +27,26 @@ pub struct Terminal {
     history: Vec<String>,
     /// 历史前缀搜索状态
     hist: Option<HistState>,
+    /// 终端内容搜索
+    find: Option<Find>,
+    /// 当前命中所在的屏幕行（高亮用）
+    search_hl: Option<u16>,
+}
+
+/// 终端搜索状态。
+#[derive(Default)]
+struct Find {
+    query: String,
+    hits: Vec<usize>, // 命中行的绝对行号（顶部为 0）
+    cur: usize,
+    focus: bool,
+}
+
+enum FindAction {
+    None,
+    Search,
+    Step(i32),
+    Close,
 }
 
 /// 前缀历史搜索状态：记住起始前缀与当前命中位置。
@@ -86,7 +106,97 @@ impl Terminal {
             input_line: String::new(),
             history: Vec::new(),
             hist: None,
+            find: None,
+            search_hl: None,
         }
+    }
+
+    /// 收集终端全部行文本（含回滚缓冲）。会临时改动 scrollback 并复原。
+    fn collect_lines(&mut self) -> Vec<String> {
+        let saved = self.parser.screen().scrollback();
+        // 设到最大以探测回滚总长度（内部会 clamp 到实际长度）
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let sb = self.parser.screen().scrollback();
+        let rows = self.rows as usize;
+        let cols = self.cols;
+        let mut lines: Vec<String> = Vec::new();
+        let mut off = sb;
+        loop {
+            self.parser.screen_mut().set_scrollback(off);
+            let start_idx = sb - off;
+            for (k, line) in self.parser.screen().rows(0, cols).enumerate() {
+                let idx = start_idx + k;
+                if idx >= lines.len() {
+                    lines.push(line);
+                }
+            }
+            if off == 0 {
+                break;
+            }
+            off = off.saturating_sub(rows);
+        }
+        self.parser.screen_mut().set_scrollback(saved);
+        lines
+    }
+
+    /// 重新执行搜索（查询变化时）。
+    fn run_search(&mut self) {
+        let q = match &self.find {
+            Some(f) if !f.query.is_empty() => f.query.clone(),
+            _ => {
+                if let Some(f) = &mut self.find {
+                    f.hits.clear();
+                }
+                self.search_hl = None;
+                return;
+            }
+        };
+        let lines = self.collect_lines();
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(&q))
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(f) = &mut self.find {
+            f.hits = hits;
+            f.cur = 0;
+        }
+        self.jump_to_current();
+    }
+
+    /// 切换到上/下一个命中。
+    fn search_step(&mut self, dir: i32) {
+        if let Some(f) = &mut self.find {
+            let n = f.hits.len();
+            if n == 0 {
+                return;
+            }
+            f.cur = ((f.cur as i32 + dir).rem_euclid(n as i32)) as usize;
+        }
+        self.jump_to_current();
+    }
+
+    /// 滚动到当前命中行并记录高亮行。
+    fn jump_to_current(&mut self) {
+        let line_idx = match &self.find {
+            Some(f) if !f.hits.is_empty() => f.hits[f.cur.min(f.hits.len() - 1)],
+            _ => {
+                self.search_hl = None;
+                return;
+            }
+        };
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let sb = self.parser.screen().scrollback();
+        let rows = self.rows as usize;
+        let r = rows / 3; // 命中尽量落在上 1/3
+        let start_idx = line_idx.saturating_sub(r);
+        let off = sb.saturating_sub(start_idx);
+        self.parser.screen_mut().set_scrollback(off);
+        self.scrollback = off.min(sb);
+        // 屏幕行 = 绝对行号 - 窗口起始行号
+        let win_start = sb.saturating_sub(self.scrollback);
+        self.search_hl = line_idx.checked_sub(win_start).map(|r| r as u16);
     }
 
     /// 选区按阅读顺序的 (起, 止)（含两端）。
@@ -179,7 +289,76 @@ impl Terminal {
     /// 渲染终端内容。返回本帧用户键盘输入产生的字节流（交给 worker 发送）。
     ///
     /// `focused` 表示终端区域是否持有焦点，决定是否采集键盘事件。
+    /// 渲染搜索栏，返回用户动作。
+    fn draw_find_bar(&mut self, ui: &mut egui::Ui) -> FindAction {
+        use egui_phosphor::regular as icon;
+        let mut action = FindAction::None;
+        egui::Frame::new()
+            .fill(crate::theme::Palette::PANEL_2)
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let f = self.find.as_mut().unwrap();
+                    ui.label(egui::RichText::new(icon::MAGNIFYING_GLASS).color(crate::theme::Palette::TEXT_DIM));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut f.query).desired_width(180.0).hint_text("查找终端内容"));
+                    if f.focus {
+                        resp.request_focus();
+                        f.focus = false;
+                    }
+                    if resp.changed() {
+                        action = FindAction::Search;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        action = FindAction::Step(1);
+                        resp.request_focus();
+                    }
+                    let cnt = if f.hits.is_empty() {
+                        "0/0".to_string()
+                    } else {
+                        format!("{}/{}", f.cur + 1, f.hits.len())
+                    };
+                    ui.label(egui::RichText::new(cnt).color(crate::theme::Palette::TEXT_DIM).size(11.0));
+                    if ui.button(icon::CARET_UP).on_hover_text("上一个").clicked() {
+                        action = FindAction::Step(-1);
+                    }
+                    if ui.button(icon::CARET_DOWN).on_hover_text("下一个").clicked() {
+                        action = FindAction::Step(1);
+                    }
+                    if ui.button(icon::X).clicked() {
+                        action = FindAction::Close;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    action = FindAction::Close;
+                }
+            });
+        action
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Vec<u8> {
+        // Ctrl+Shift+F 切换终端内容搜索
+        if ui.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::F)) {
+            if self.find.is_some() {
+                self.find = None;
+                self.search_hl = None;
+            } else {
+                self.find = Some(Find { focus: true, ..Default::default() });
+            }
+        }
+        if self.find.is_some() {
+            match self.draw_find_bar(ui) {
+                FindAction::Search => self.run_search(),
+                FindAction::Step(d) => self.search_step(d),
+                FindAction::Close => {
+                    self.find = None;
+                    self.search_hl = None;
+                    self.scrollback = 0;
+                    self.parser.screen_mut().set_scrollback(0);
+                }
+                FindAction::None => {}
+            }
+        }
+
         let font = FontId::monospace(self.font_size);
         // 以字符 'M' 的宽高度量单元格尺寸
         let (char_w, char_h) = ui.ctx().fonts_mut(|f| {
@@ -229,6 +408,7 @@ impl Terminal {
                     let nb = (self.scrollback as i64 + lines).clamp(0, 5000) as usize;
                     self.scrollback = nb;
                     self.parser.screen_mut().set_scrollback(nb);
+                    self.search_hl = None; // 手动滚动后高亮失效
                 }
             }
         }
@@ -299,6 +479,15 @@ impl Terminal {
             let pos = origin + Vec2::new(0.0, row as f32 * char_h);
             // 先绘制该行的背景块（处理非默认底色）
             paint_row_backgrounds(&painter, screen, row, self.cols, origin, cell, &tc);
+            // 搜索命中行高亮（整行淡黄底）
+            if self.search_hl == Some(row) {
+                let y = origin.y + row as f32 * char_h;
+                painter.rect_filled(
+                    Rect::from_min_max(egui::pos2(origin.x, y), egui::pos2(rect.right(), y + char_h)),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(0xc2, 0x8e, 0x3c, 90),
+                );
+            }
             // 选区高亮（半透明，文字仍可见）
             if let Some(((sr, sc), (er, ec))) = sel {
                 if row >= sr && row <= er {
@@ -518,7 +707,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// 把特殊按键编码为 ANSI 转义序列；Ctrl 组合键编码为控制字符。
 fn encode_key(key: Key, mods: Modifiers, out: &mut Vec<u8>) {
     // Ctrl+Shift+C/V 保留给复制/粘贴，不作为终端输入
-    if (mods.ctrl || mods.command) && mods.shift && matches!(key, Key::C | Key::V) {
+    if (mods.ctrl || mods.command) && mods.shift && matches!(key, Key::C | Key::V | Key::F) {
         return;
     }
     // Ctrl + 字母 -> 0x01..0x1a
@@ -670,6 +859,24 @@ mod tests {
         t.input_line.clear();
         t.hist = None;
         assert_eq!(t.history_nav(true), b"\x1b[A");
+    }
+
+    #[test]
+    fn terminal_search() {
+        let mut t = Terminal::new();
+        for i in 0..60 {
+            t.feed(format!("line number {i}\r\n").as_bytes());
+        }
+        t.find = Some(Find { query: "number 5".into(), ..Default::default() });
+        t.run_search();
+        let f = t.find.as_ref().unwrap();
+        // "number 5" 命中 5,50..59 等多行
+        assert!(f.hits.len() >= 2, "应找到多处命中，实际 {}", f.hits.len());
+        assert!(t.search_hl.is_some(), "应高亮命中行");
+        // 不存在的查询无命中
+        t.find = Some(Find { query: "zzzNOPE".into(), ..Default::default() });
+        t.run_search();
+        assert!(t.find.as_ref().unwrap().hits.is_empty());
     }
 
     #[test]
