@@ -596,16 +596,10 @@ impl Terminal {
         // 键盘输入
         let mut out = if focused { self.collect_input(ui) } else { Vec::new() };
 
-        // 复制/粘贴：Ctrl+Shift+C / Ctrl+Shift+V，以及右键菜单
-        let (copy_sc, paste_sc) = ui.input(|i| {
-            let m = i.modifiers.command || i.modifiers.ctrl;
-            (
-                m && i.modifiers.shift && i.key_pressed(Key::C),
-                m && i.modifiers.shift && i.key_pressed(Key::V),
-            )
-        });
-        let mut do_copy = copy_sc;
-        let mut do_paste = paste_sc;
+        // 键盘复制/粘贴由 collect_input 内的 Copy/Cut/Paste 事件处理（egui 会把
+        // Ctrl+C/X/V 转成这些事件而不再下发按键）。这里只处理右键菜单。
+        let mut do_copy = false;
+        let mut do_paste = false;
         resp.context_menu(|ui| {
             let sel = self.has_selection();
             if ui.add_enabled(sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
@@ -652,6 +646,7 @@ impl Terminal {
     fn collect_input(&mut self, ui: &egui::Ui) -> Vec<u8> {
         let mut out = Vec::new();
         let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
+        let shift = ui.input(|i| i.modifiers.shift);
         // 全屏程序（vim/less/htop 等用备用屏幕）下不拦截方向键，避免破坏其交互
         let alt = self.parser.screen().alternate_screen();
         if alt {
@@ -681,6 +676,31 @@ impl Terminal {
                         self.hist = None;
                     }
                     out.extend_from_slice(t.as_bytes());
+                }
+                // egui 把 Ctrl+C / Ctrl+X 转成 Copy/Cut 事件且不再下发按键，需在此处理：
+                // 终端里 Ctrl+C 应发 SIGINT(0x03)，而不是“复制”。
+                egui::Event::Copy => {
+                    // macOS：Cmd+C 复制（Ctrl+C 仍以按键事件到达 -> 走 encode_key 发 0x03）。
+                    // 其它平台：command 即 Ctrl —— 无 Shift 发 SIGINT，按住 Shift 才是复制。
+                    let copy_selection = cfg!(target_os = "macos") || shift;
+                    if copy_selection {
+                        if let Some(t) = self.selected_text() {
+                            ui.ctx().copy_text(t);
+                        }
+                    } else {
+                        out.push(0x03);
+                        if !alt {
+                            self.input_line.clear();
+                            self.hist = None;
+                        }
+                    }
+                }
+                egui::Event::Cut => {
+                    // 终端无“剪切”语义：非 macOS 下 Ctrl+X 发 0x18
+                    #[cfg(not(target_os = "macos"))]
+                    if !shift {
+                        out.push(0x18);
+                    }
                 }
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     // 有前缀时，上下键做「本会话历史前缀搜索」（仅普通修饰、非全屏）
