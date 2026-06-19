@@ -1,100 +1,129 @@
+<div align="center">
+
 # iShell
 
-一个用 **Rust** 编写的现代化 SSH 客户端，界面布局参考 FinalShell：
+**一个用 Rust 编写的现代化跨平台 SSH 客户端**
 
-```
-┌───────────────────────────────────────────────────────────┐
-│ 会话标签：🟢 root@host   🟡 ...        ＋新建      [状态]   │
-├──────────┬────────────────────────────────────────────────┤
-│ 系统信息  │                                                │
-│ · 主机    │                  终端 / Shell                  │
-│ · CPU     │              (vt100 全屏交互式)                │
-│ · 内存    │                                                │
-│ · 网络图  ├────────────────────────────────────────────────┤
-│ · 磁盘    │  文件操作区 (SFTP)                              │
-│ · 进程    │  路径栏 | 名称 大小 时间 权限 所有者            │
-└──────────┴────────────────────────────────────────────────┘
-```
+系统监控 · 交互式终端 · SFTP 文件管理 · 端口转发 · 跳板机 —— 一屏搞定
 
-## 技术栈
+[![Release](https://img.shields.io/github/v/release/wqkx/ishell?display_name=tag)](https://github.com/wqkx/ishell/releases)
+[![Linux](https://github.com/wqkx/ishell/actions/workflows/linux.yml/badge.svg)](https://github.com/wqkx/ishell/actions/workflows/linux.yml)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
+![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-| 关注点 | 选型 | 说明 |
-|--------|------|------|
-| GUI | `eframe` / `egui` 0.34 | GPU 渲染的即时模式框架，深色现代风格 |
-| 表格 | `egui_extras` | 文件列表虚拟化表格 |
-| SSH | `russh` 0.61 | 纯 Rust SSH2 协议栈，无需系统 OpenSSH |
-| SFTP | `russh-sftp` 2.3 | 远程文件浏览 |
-| 终端 | `vt100` 0.16 | VT100/ANSI 屏幕模型解析 |
-| 异步 | `tokio` | 后台连接线程 |
+![iShell](docs/screenshots/hero.png)
 
-## 架构
+</div>
 
-- **前台（egui，同步即时模式）** 与 **后台（tokio SSH worker，异步）** 通过 channel 解耦：
-  - UI → Worker：`tokio::sync::mpsc`（非阻塞 `send`）
-  - Worker → UI：`std::sync::mpsc` + `egui::Context::request_repaint`
-- 每个会话 = 一个独立 worker 任务，含：交互式 shell 通道、SFTP 通道、系统信息采集任务（每 2s 一次 exec 探测 `/proc`、`df`、`ps`）。
-- 终端：`vt100` 维护屏幕模型，egui 逐行分段着色渲染，键盘事件编码为 ANSI 序列回写。
+## ✨ 简介
 
-源码结构：
+iShell 的布局灵感来自 **FinalShell**——左侧实时系统信息、中间交互式终端、右下 SFTP 文件管理，
+力求把日常 SSH 运维需要的东西放在同一个窗口里。和 FinalShell / Xshell / MobaXterm / Termius 等
+工具相比，iShell 的取向是：
 
-```
-src/
-├── main.rs            # eframe 入口
-├── app.rs             # 会话管理 + 三区布局
-├── proto.rs           # UI <-> Worker 消息定义
-├── theme.rs           # 深色主题 + 中文字体加载
-├── ssh/
-│   ├── mod.rs         # SSH worker（连接/shell/sftp/exec）
-│   └── sysinfo.rs     # 远程系统信息解析（差分采样）
-├── terminal/mod.rs    # vt100 模拟 + egui 渲染 + 键盘编码
-└── ui/
-    ├── mod.rs         # 绘制辅助（进度条/折线/单位格式化）
-    ├── sidebar.rs     # 左侧系统信息栏
-    ├── file_panel.rs  # 右下 SFTP 文件浏览器
-    └── connect.rs     # 连接对话框
-```
+- **纯 Rust + GPU 即时模式 UI（egui）**——单可执行文件、启动快、占用低、无运行时依赖。
+- **纯 Rust SSH 栈（russh + ring）**——不依赖系统 OpenSSH / PuTTY，跨平台行为一致。
+- **三端一致**——Linux / macOS / Windows 同一套代码与界面。
+- **干净现代的浅色界面**——暖色主题、可切换深色终端，不堆砌工具栏。
 
-## 构建与运行
+> 个人项目，持续打磨中；欢迎 issue / PR。
 
-**跨平台**：Linux / macOS / Windows 均支持。详见 [BUILD.md](BUILD.md)（含各平台说明与 GitHub Actions 自动出包）。
+## 🚀 功能
+
+**连接与会话**
+- 多会话标签：状态圆点、拖拽排序、溢出渐隐、关闭确认
+- 保存连接（**密码本地加密** ChaCha20-Poly1305）、快速连接列表
+- **断线自动重连**（指数退避）+ 手动重连
+- **主机密钥校验**（known_hosts + 首次信任 TOFU，防中间人）
+
+**终端**
+- vt100 / 256 色、滚轮回滚、Tab 补全、焦点锁定
+- **选中复制 / 右键复制粘贴 / Ctrl+Shift+C·V**、**Ctrl+滚轮调字号**
+- **内容搜索**（Ctrl+Shift+F，全回滚缓冲，命中高亮）
+- **输入前缀 + 上下键**的本会话历史检索
+- 深 / 浅终端配色切换
+
+**穿透与批量**
+- **端口转发**：本地转发 + 动态 SOCKS5 代理
+- **跳板机 / ProxyJump**：经堡垒机连接内网目标
+- **命令广播**：向所有已连接会话同时发命令
+
+**文件与监控**
+- SFTP：树形目录 + 列表、拖拽上传、下载（含**文件夹递归**）、改权限 / 重命名 / 删除 / 复制路径、可选默认下载目录
+- **多标签文本编辑器**：语法高亮、查找替换、大文件只读虚拟化（可切换为可编辑）
+- 实时监控：CPU / 内存 / 交换、**GPU（NVIDIA / AMD / Intel）**、网络曲线、磁盘、进程 Top（点击查看详情 + 强制结束）
+
+## 📸 截图
+
+| 快速连接 | 端口转发 |
+|---|---|
+| ![](docs/screenshots/conn.png) | ![](docs/screenshots/fwd.png) |
+
+| GPU 详情 | 进程详情 + 强制结束 |
+|---|---|
+| ![](docs/screenshots/gpu.png) | ![](docs/screenshots/proc.png) |
+
+| 多标签编辑器（大文件只读 + 可切换） |
+|---|
+| ![](docs/screenshots/edit.png) |
+
+## 📦 安装
+
+从 [**Releases**](https://github.com/wqkx/ishell/releases) 下载对应平台的可执行文件：
+
+| 平台 | 文件 |
+|---|---|
+| Linux x86_64 | `ishell-linux-x86_64` |
+| macOS Apple Silicon | `ishell-macos-aarch64` |
+| macOS Intel | `ishell-macos-x86_64` |
+| Windows x86_64 | `ishell-windows-x86_64.exe` |
 
 ```bash
-cargo run --release        # 在目标平台上直接编译运行
+# Linux / macOS
+chmod +x ishell-*            # 赋可执行权限
+./ishell-linux-x86_64
 ```
 
-Linux 可选依赖：`sudo apt install -y libxkbcommon-dev libgl1-mesa-dev fonts-noto-cjk`。
-启动后在弹出的对话框中填入主机、端口、用户名，选择密码或私钥认证即可连接。
+- **macOS** 未签名首次运行：`xattr -dr com.apple.quarantine ./ishell-macos-aarch64`，或“系统设置 → 隐私与安全性 → 仍要打开”。
+- **Windows** SmartScreen：点“更多信息 → 仍要运行”。
 
-## 已实现
+## 🔧 从源码构建
 
-- ✅ **独立全高左操作栏** + 右侧（选项卡 / 终端 / 文件区）分区布局
-- ✅ 现代**浅色**主题（Phosphor 图标库），控件统一圆角/描边/悬停高亮；**深色终端**形成对比
-- ✅ 多会话标签（绘制状态圆点 + 关闭按钮，新建用图标）
-- ✅ 交互式终端（vt100、256 色、滚轮回滚）；**Tab/方向键焦点锁定**，支持 Tab 补全
-  - **选中复制 / 右键复制粘贴 / Ctrl+Shift+C·V**，**Ctrl+滚轮调字号**
-  - **深 / 浅终端配色切换**（右键菜单；默认浅色）
-  - **输入前缀 + 上下键**：本会话命令历史前缀搜索（空行时回退到 shell 自身历史；全屏程序下不拦截）
-  - **内容搜索**：Ctrl+Shift+F 在整个回滚缓冲中查找，命中行高亮、上一个/下一个跳转
-- ✅ **命令广播**：向所有已连接会话同时发送命令（顶栏「群发」）
-- ✅ 左侧实时系统信息（紧凑）：主机名/IP/系统/运行；CPU·内存·交换**单行对齐**；进程 Top5（自适应宽）；网络折线；磁盘**右起进度条**
-- ✅ 文件管理（仿 FinalShell）：**左树形目录 + 右文件列表**（随当前目录同步展开），底部面板可拖动调高，文件类型图标
-  - 刷新/上级/双击进入；**拖拽上传**、右键**下载（含文件夹递归）**、传输进度浮窗
-  - 右键**改权限**（rwx 九宫格）、**重命名**、**删除**、**复制路径**；新建文件夹/文件
-- ✅ **多标签文本编辑器**（标明来源服务器、语法高亮、查找替换、大文件只读虚拟化）
-- ✅ **SSH 端口转发**：本地转发（本地端口→远端 host:port）+ 动态转发（本地 SOCKS5 代理）
-- ✅ **跳板机 / ProxyJump**：经堡垒机连接内网目标主机
-- ✅ **断线自动重连**：曾连上的会话掉线后按指数退避自动重连（最多 5 次），随时可手动「重连」
-- ✅ **保存/加载已有连接**（`~/.config/ishell/connections.json`）
-- ✅ 密码 / 私钥认证（私钥支持**原生文件选择器**，rfd + xdg-portal）
+需要 [Rust](https://rustup.rs/)（stable）。在目标平台上：
 
-## 安全说明
+```bash
+cargo run --release
+```
 
-- **主机密钥校验**：连接时按 `~/.ssh/known_hosts` 校验服务器指纹——已记录且匹配则直接连接；未知主机首次连接弹窗确认指纹（TOFU），同意后写入 known_hosts；若已记录但密钥改变则拒绝并告警（防中间人）。
-- **保存密码加密**：连接密码/口令以 ChaCha20-Poly1305 加密存于 `connections.json`（前缀 `enc:v1:`），密钥随机生成于 `~/.config/ishell/key`（0600）；旧明文文件首次启动自动迁移为密文。属 at-rest 加密（密钥同机），可挡直接读文件偷密码，换机需一并带上 `key`。
+各平台细节、依赖与交叉构建见 [BUILD.md](BUILD.md)。
 
-## 后续可扩展
+## 🏗 架构
 
-- 保存密码加密存储 / 系统钥匙串
-- 跳板机 / ProxyJump（复用端口转发的 direct-tcpip 底层）、远程转发
-- 断线自动重连、文件列表点表头排序、传输取消
-- 终端搜索、会话分组
+- **前台（egui，同步即时模式）** 与 **后台（tokio SSH worker，异步）** 通过 channel 解耦。
+- 每个会话 = 一个独立 worker 任务：交互式 shell 通道、SFTP 通道、每 2s 一次的系统信息探测。
+- 终端用 `vt100` 维护屏幕模型，egui 逐行分段着色渲染，键盘事件编码为 ANSI 序列回写。
+
+| 关注点 | 选型 |
+|---|---|
+| GUI | `eframe` / `egui` 0.34 |
+| SSH / SFTP | `russh` 0.61（ring 后端） / `russh-sftp` 2.3 |
+| 终端 | `vt100` 0.16 |
+| 异步 | `tokio` |
+| 加密存储 | `chacha20poly1305` |
+
+## 🔒 安全
+
+- **主机密钥校验**：known_hosts 校验，未知主机首次连接弹窗确认 SHA256 指纹（TOFU）并写入；密钥改变则拒绝告警。
+- **保存密码加密**：以 ChaCha20-Poly1305 加密落盘，密钥存于本地 `~/.config/ishell/key`（0600）；属 at-rest 加密。
+
+## 🗺 路线图
+
+- 终端分屏 / 同主机多终端、会话分组与搜索
+- SFTP 传输取消 / 队列、本地↔远端双栏
+- 设置面板、快捷键自定义、多语言
+
+---
+
+<div align="center">
+用 Rust 编写 · Linux / macOS / Windows
+</div>
