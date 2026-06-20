@@ -134,19 +134,7 @@ fn install_fonts(ctx: &egui::Context) {
     // Phosphor 图标字体（按钮/文件类型图标）
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
-    // 内置等宽中文字体 Sarasa Mono SC（OFL，子集化）：Latin 半角 + 中文全角严格 1:2，
-    // 设为等宽族首选 —— 终端/编辑器的等宽网格里中文不再有多余间距，中英都清爽。
-    fonts.font_data.insert(
-        "sarasa-mono".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/SarasaMonoSC-Regular.ttf"))),
-    );
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .insert(0, "sarasa-mono".to_owned());
-
-    // 系统中文字体（作为各字体族的后备：补 Sarasa 子集未含的生僻字）
+    // 系统中文字体（作为各字体族的后备）
     if let Some((path, data)) = candidates
         .iter()
         .find_map(|p| std::fs::read(p).ok().map(|d| (*p, d)))

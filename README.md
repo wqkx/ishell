@@ -38,7 +38,7 @@ leans toward:
 
 | Metric | Value |
 |---|---|
-| Binary | single file, **~29 MB** (incl. a bundled CJK monospace font; no runtime deps, no background daemon) |
+| Binary | single file, **~22 MB** (no runtime deps, no background daemon) |
 | Idle CPU | **≈ 0%** (one idle session; system info polled every 2 s) |
 | Memory | **~80 MB** (idle, measured) — native app, **no Electron / JVM / Python** runtime; far below Electron-based clients that idle at hundreds of MB |
 
@@ -132,12 +132,6 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: stored encrypted with ChaCha20-Poly1305; the key lives locally at `~/.config/ishell/key` (0600). This is at-rest encryption.
-
-## 🔤 Fonts
-
-The terminal/editor bundles a subset of [**Sarasa Mono SC**](https://github.com/be5invis/Sarasa-Gothic),
-giving strict **1:2** half-width-Latin / full-width-CJK monospacing so mixed text aligns with no gaps.
-Licensed under the SIL Open Font License 1.1 — see [assets/SarasaMonoSC-LICENSE.txt](assets/SarasaMonoSC-LICENSE.txt).
 
 ---
 

@@ -557,10 +557,24 @@ impl Terminal {
                 }
                 let fmt = cell_format(c, &font, &tc);
                 let x = origin.x + col as f32 * char_w;
-                painter.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, s, font.clone(), fmt.color);
+                if c.is_wide() {
+                    // 全角字符（中文等）占 2 格：放大字号让字形填满两格、纵向居中，
+                    // 消除「半角×2 ≠ 全角」造成的左右空隙，同时保留半角英文原字体。
+                    let wide_font = FontId::new(2.0 * char_w, font.family.clone());
+                    painter.text(
+                        egui::pos2(x, y + char_h / 2.0),
+                        egui::Align2::LEFT_CENTER,
+                        s,
+                        wide_font,
+                        fmt.color,
+                    );
+                } else {
+                    painter.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, s, font.clone(), fmt.color);
+                }
                 if fmt.underline.width > 0.0 {
                     let uy = y + char_h - 1.0;
-                    painter.hline(x..=(x + char_w), uy, fmt.underline);
+                    let w = if c.is_wide() { 2.0 * char_w } else { char_w };
+                    painter.hline(x..=(x + w), uy, fmt.underline);
                 }
             }
         }
