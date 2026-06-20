@@ -63,12 +63,17 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 - **Command broadcast**: send a command to every connected session at once
 
 **Files & monitoring**
-- SFTP: tree + list, **click a header to sort by name / size / time**, drag-and-drop upload, download (incl. **recursive folders**), chmod / rename / delete / copy path, optional default download folder
+- SFTP: tree + list, **click a header to sort by name / size / time** (size & time default to descending — largest / newest first), drag-and-drop upload, download (incl. **recursive folders**), chmod / rename / delete / copy path, optional default download folder
 - **Concurrent transfers** (up to 6 per server; different servers are independent), **cancellable mid-transfer**, click a failed item to see why
-- **Tabbed text editor**: syntax highlighting, find & replace, large-file read-only virtualization (switchable to editable)
+- **Tabbed text editor** (its own OS window): **line numbers**, syntax highlighting, find & replace, large-file read-only virtualization (switchable to editable)
+- **Lightweight image viewer** (its own OS window): double-click a `png / jpg / gif / bmp` to open — zoom (scroll), pan (drag), fit / 1:1, save-as; pure-Rust decoders keep the binary small
 - Live monitor: CPU / memory / swap, **GPU (NVIDIA / AMD / Intel)**, network graph, disks, top processes (click for details + kill -9)
 
 ## 📸 Screenshots
+
+| SFTP file manager + concurrent transfers |
+|---|
+| ![](docs/screenshots/files.png) |
 
 | Quick Connect | Port Forwarding |
 |---|---|
@@ -78,7 +83,7 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 |---|---|
 | ![](docs/screenshots/gpu.png) | ![](docs/screenshots/proc.png) |
 
-| Tabbed editor (large-file read-only + switchable) |
+| Tabbed editor — line numbers, large-file read-only (switchable), opens in its own window |
 |---|
 | ![](docs/screenshots/edit.png) |
 
