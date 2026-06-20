@@ -1677,14 +1677,25 @@ impl App {
                         crate::proto::TransferDir::Download => (icon::DOWNLOAD_SIMPLE, Palette::OK),
                         crate::proto::TransferDir::Upload => (icon::UPLOAD_SIMPLE, Palette::ACCENT),
                     };
-                    // 整个传输项包进一个 scope，便于整体右键
-                    let item = ui.scope(|ui| {
+                    // 整个传输项包进一个感知点击的 scope，便于整体右键（否则右键会穿透到下方终端）
+                    let item = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(dir_icon).color(dir_col).size(13.0));
                             ui.label(RichText::new(&t.name).size(12.0).color(Palette::TEXT));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 match t.ok {
-                                    Some(true) => { ui.label(RichText::new(icon::CHECK_CIRCLE).color(Palette::OK).size(13.0)); }
+                                    Some(true) => {
+                                        ui.label(RichText::new(icon::CHECK_CIRCLE).color(Palette::OK).size(13.0));
+                                        // 下载完成：保留「打开所在文件夹」按钮
+                                        if let Some(local) = &t.local {
+                                            if ui.add(egui::Button::new(RichText::new(icon::FOLDER_OPEN).size(12.0).color(Palette::TEXT_DIM)).frame(false))
+                                                .on_hover_text(crate::i18n::tr("在文件管理器中显示", "Show in file manager"))
+                                                .clicked()
+                                            {
+                                                open_dir = Some(local.clone());
+                                            }
+                                        }
+                                    }
                                     Some(false) => {
                                         // 失败：状态按钮可点击展开失败原因
                                         if ui.add(egui::Button::new(RichText::new(icon::WARNING_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
