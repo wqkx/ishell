@@ -229,6 +229,8 @@ pub struct App {
     /// 编辑器标签页
     editors: Vec<EditorTab>,
     active_editor: usize,
+    /// 「关闭全部」时若有未保存修改，弹确认框
+    editor_close_confirm: bool,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
@@ -358,6 +360,7 @@ impl App {
             allow_close: false,
             editors: Vec::new(),
             active_editor: 0,
+            editor_close_confirm: false,
             next_editor_id: 0,
             trim_after: None,
             show_forwards: false,
@@ -1246,6 +1249,7 @@ impl App {
         let mut close_tab: Option<usize> = None;
         let mut activate: Option<usize> = None;
         let mut do_save = false;
+        let mut close_all = false;
 
         egui::Window::new("editor_win")
             .title_bar(false)
@@ -1254,7 +1258,16 @@ impl App {
             .collapsible(false)
             .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(8))
             .show(ctx, |ui| {
-                // 标签栏：服务器 · 文件名 + 关闭
+                // 标签栏：左侧标签；右上角「关闭全部」
+                ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::X, crate::i18n::tr("关闭全部", "Close all"))).size(12.0).color(Palette::TEXT_DIM)).frame(false))
+                        .on_hover_text(crate::i18n::tr("关闭全部文本文件", "Close all files"))
+                        .clicked()
+                    {
+                        close_all = true;
+                    }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (i, t) in self.editors.iter().enumerate() {
                         let selected = i == self.active_editor;
@@ -1277,6 +1290,9 @@ impl App {
                                 });
                             });
                     }
+                });
+                });
+                });
                 });
                 ui.separator();
 
@@ -1317,6 +1333,58 @@ impl App {
             self.trim_after = Some(4);
             ctx.request_repaint();
         }
+
+        // 「关闭全部」：有未保存修改则先弹确认
+        if close_all {
+            if self.editors.iter().any(|t| t.editor.dirty()) {
+                self.editor_close_confirm = true;
+            } else {
+                self.close_all_editors(ctx);
+            }
+        }
+        if self.editor_close_confirm {
+            let mut do_close = false;
+            let mut cancel = false;
+            egui::Window::new(crate::i18n::tr("关闭全部", "Close all"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_width(300.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(crate::i18n::tr("有未保存的修改，确定关闭全部文本文件吗？", "Some files have unsaved changes. Close all anyway?"));
+                    });
+                    ui.add_space(10.0);
+                    let bw = 80.0;
+                    let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                    ui.horizontal(|ui| {
+                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                        if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("全部关闭", "Close all")).color(egui::Color32::WHITE)).fill(Palette::DANGER).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            do_close = true;
+                        }
+                        if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if do_close {
+                self.editor_close_confirm = false;
+                self.close_all_editors(ctx);
+            } else if cancel {
+                self.editor_close_confirm = false;
+            }
+        }
+    }
+
+    /// 关闭全部编辑器标签，并清理各自的 TextEdit 内存状态。
+    fn close_all_editors(&mut self, ctx: &egui::Context) {
+        for tab in self.editors.drain(..) {
+            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(tab.text_id));
+        }
+        self.active_editor = 0;
+        self.editor_close_confirm = false;
+        self.trim_after = Some(4);
+        ctx.request_repaint();
     }
 
     /// GPU 详情小窗：每块 GPU 使用率 + 显存；鼠标移开或点击外部关闭。

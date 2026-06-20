@@ -97,7 +97,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
         let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, ' ')).max(1.0);
         let total = ed.line_ranges.len();
-        let content_w = (ed.max_line_bytes as f32 + 2.0) * char_w;
+        let digits = total.max(1).to_string().len();
+        let gutter_w = (digits as f32 + 1.5) * char_w; // 行号区宽度
+        let content_w = gutter_w + (ed.max_line_bytes as f32 + 2.0) * char_w;
         let content_h = total as f32 * row_h;
         egui::ScrollArea::both().auto_shrink([false, false]).show_viewport(ui, |ui, vp| {
             ui.set_width(content_w);
@@ -108,9 +110,19 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             let last = (first + visible).min(total);
             let painter = ui.painter();
             for i in first..last {
+                let y = origin.y + i as f32 * row_h;
+                // 行号（右对齐）
+                painter.text(
+                    egui::pos2(origin.x + gutter_w - char_w * 0.7, y),
+                    egui::Align2::RIGHT_TOP,
+                    (i + 1).to_string(),
+                    mono.clone(),
+                    Palette::TEXT_DIM,
+                );
+                // 正文
                 let (s, e) = ed.line_ranges[i];
                 painter.text(
-                    egui::pos2(origin.x, origin.y + i as f32 * row_h),
+                    egui::pos2(origin.x + gutter_w, y),
                     egui::Align2::LEFT_TOP,
                     &ed.content[s..e],
                     mono.clone(),
@@ -204,21 +216,34 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
 
+    // 行号：与正文同处一个 ScrollArea，垂直滚动同步。每个逻辑行一行号（不换行，故对齐）。
+    let n_lines = ed.content.split('\n').count().max(1);
+    let gw = n_lines.to_string().len();
+    let line_nums: String = (1..=n_lines).map(|i| format!("{i:>gw$}")).collect::<Vec<_>>().join("\n");
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        let out = egui::TextEdit::multiline(&mut ed.content)
-            .code_editor()
-            .desired_width(f32::INFINITY)
-            .desired_rows(24)
-            .id(text_id)
-            .layouter(&mut layouter)
-            .show(ui);
-        if let Some((c0, c1)) = pending_select {
-            let id = out.response.id;
-            let mut st = out.state;
-            st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(c0), CCursor::new(c1))));
-            st.store(ui.ctx(), id);
-            out.response.request_focus();
-        }
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            // 行号列（与 TextEdit 顶部内边距对齐）
+            ui.add_space(0.0);
+            ui.vertical(|ui| {
+                ui.add_space(2.0); // 对齐 TextEdit 文本顶部内边距
+                ui.add(egui::Label::new(RichText::new(&line_nums).font(egui::FontId::monospace(13.0)).color(Palette::TEXT_DIM)).selectable(false));
+            });
+            let out = egui::TextEdit::multiline(&mut ed.content)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(24)
+                .id(text_id)
+                .layouter(&mut layouter)
+                .show(ui);
+            if let Some((c0, c1)) = pending_select {
+                let id = out.response.id;
+                let mut st = out.state;
+                st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(c0), CCursor::new(c1))));
+                st.store(ui.ctx(), id);
+                out.response.request_focus();
+            }
+        });
     });
 
     save
