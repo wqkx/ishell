@@ -11,7 +11,6 @@ System monitor · interactive terminal · SFTP file manager · port forwarding �
 **English** · [中文](README.zh-CN.md)
 
 [![Release](https://img.shields.io/github/v/release/wqkx/ishell?display_name=tag)](https://github.com/wqkx/ishell/releases)
-[![Linux](https://github.com/wqkx/ishell/actions/workflows/linux.yml/badge.svg)](https://github.com/wqkx/ishell/actions/workflows/linux.yml)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
