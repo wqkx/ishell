@@ -906,14 +906,11 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
             }
             Dialog::Chmod { path, mode, name } => {
                 modal(&ctx, crate::i18n::tr("修改权限", "Chmod"), |ui| {
-                    // 内容居中（参考传输浮窗的紧凑居中风格）
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(name.as_str()).strong());
-                        ui.add_space(8.0);
-                        chmod_grid(ui, mode);
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("八进制：{:03o}", *mode & 0o777), crate::i18n::Lang::En => format!("Octal: {:03o}", *mode & 0o777) }).monospace().color(Palette::TEXT_DIM));
-                    });
+                    ui.vertical_centered(|ui| ui.label(RichText::new(name.as_str()).strong()));
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| chmod_grid(ui, mode));
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("八进制：{:03o}", *mode & 0o777), crate::i18n::Lang::En => format!("Octal: {:03o}", *mode & 0o777) }).monospace().color(Palette::TEXT_DIM)));
                     ui.add_space(10.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if dlg_btn(ui, crate::i18n::tr("应用", "Apply"), 72.0, 2) {
@@ -1015,36 +1012,44 @@ fn modal(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(280.0);
+            // 固定内容宽度：让按钮/内容居中（add_space 用的 available_width 才稳定）
+            ui.set_width(300.0);
             add(ui);
         });
 }
 
 /// rwx 九宫格复选框，直接修改 mode。
 fn chmod_grid(ui: &mut egui::Ui, mode: &mut u32) {
-    egui::Grid::new("chmod_grid").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
-        ui.label("");
-        ui.label(RichText::new(crate::i18n::tr("读", "R")).size(12.0));
-        ui.label(RichText::new(crate::i18n::tr("写", "W")).size(12.0));
-        ui.label(RichText::new(crate::i18n::tr("执行", "X")).size(12.0));
-        ui.end_row();
-        for (row, (label, base)) in [(crate::i18n::tr("所有者","Owner"), 6u32), (crate::i18n::tr("用户组","Group"), 3), (crate::i18n::tr("其他","Other"), 0)].iter().enumerate() {
-            let _ = row;
-            ui.label(RichText::new(*label).size(12.0));
-            for bit in [2u32, 1, 0] {
-                let shift = base + bit;
-                let mut on = *mode & (1 << shift) != 0;
-                if ui.checkbox(&mut on, "").changed() {
-                    if on {
-                        *mode |= 1 << shift;
-                    } else {
-                        *mode &= !(1 << shift);
-                    }
-                }
+    // 与文件列表类似的表格风格：表头加粗弱化色 + 斑马纹行，列宽统一便于对齐
+    egui::Grid::new("chmod_grid")
+        .num_columns(4)
+        .striped(true)
+        .spacing([18.0, 7.0])
+        .min_col_width(46.0)
+        .show(ui, |ui| {
+            ui.label("");
+            for t in [crate::i18n::tr("读", "R"), crate::i18n::tr("写", "W"), crate::i18n::tr("执行", "X")] {
+                ui.vertical_centered(|ui| ui.label(RichText::new(t).strong().color(Palette::TEXT_DIM).size(12.0)));
             }
             ui.end_row();
-        }
-    });
+            for (label, base) in [(crate::i18n::tr("所有者", "Owner"), 6u32), (crate::i18n::tr("用户组", "Group"), 3), (crate::i18n::tr("其他", "Other"), 0)] {
+                ui.label(RichText::new(label).size(12.0).color(Palette::TEXT));
+                for bit in [2u32, 1, 0] {
+                    let shift = base + bit;
+                    let mut on = *mode & (1 << shift) != 0;
+                    ui.vertical_centered(|ui| {
+                        if ui.checkbox(&mut on, "").changed() {
+                            if on {
+                                *mode |= 1 << shift;
+                            } else {
+                                *mode &= !(1 << shift);
+                            }
+                        }
+                    });
+                }
+                ui.end_row();
+            }
+        });
 }
 
 fn parent_of(path: &str) -> String {
