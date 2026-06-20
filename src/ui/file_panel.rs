@@ -616,13 +616,14 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
         });
     });
 
-    // 表头点击排序：同列切升/降，换列则置升序
+    // 表头点击排序：同列切升/降；换列时按列性质选默认方向——
+    // 大小/修改时间首次点击用降序（先看最大/最新），名称用升序（A→Z）。
     if let Some(k) = sort_click {
         if state.sort_key == k {
             state.sort_desc = !state.sort_desc;
         } else {
             state.sort_key = k;
-            state.sort_desc = false;
+            state.sort_desc = matches!(k, SortKey::Size | SortKey::Mtime);
         }
         state.selected.clear();
         state.anchor = None;
