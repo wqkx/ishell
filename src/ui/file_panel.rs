@@ -467,6 +467,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
         .inner_margin(egui::Margin { left: 6, right: 2, top: 0, bottom: 0 })
         .show(ui, |ui| {
     TableBuilder::new(ui)
+        // 按目录区分滚动状态：进入子目录/切换目录后从顶部开始，不沿用上个目录的滚动位置
+        .id_salt(&cwd)
         .striped(true)
         .resizable(true)
         .sense(Sense::click())

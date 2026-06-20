@@ -27,6 +27,8 @@ pub struct Editor {
     read_only: bool,
     /// 只读模式下各行的字节范围（用于虚拟化渲染）
     line_ranges: Vec<(usize, usize)>,
+    /// 只读模式下最长行的字节数（估算横向内容宽度，供横向滚动）
+    max_line_bytes: usize,
 }
 
 impl Editor {
@@ -37,6 +39,7 @@ impl Editor {
             .unwrap_or_else(|| "txt".into());
         let read_only = content.len() > EDIT_LIMIT;
         let line_ranges = if read_only { compute_line_ranges(&content) } else { Vec::new() };
+        let max_line_bytes = line_ranges.iter().map(|(s, e)| e - s).max().unwrap_or(0);
         Self {
             orig: content.clone(),
             path,
@@ -49,6 +52,7 @@ impl Editor {
             status: String::new(),
             read_only,
             line_ranges,
+            max_line_bytes,
         }
     }
     pub fn dirty(&self) -> bool {
@@ -87,22 +91,33 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             });
         });
         ui.separator();
+        // 手动虚拟化渲染（仅画可见行）。用 show_viewport 而非 show_rows：后者在本窗口里
+        // 不会撑满可用高度（内容只占可见行高度、下方留大片空白）。
+        let mono = egui::TextStyle::Monospace.resolve(ui.style());
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-        egui::ScrollArea::both().auto_shrink([false, false]).show_rows(
-            ui,
-            row_h,
-            ed.line_ranges.len(),
-            |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for i in range {
-                    let (s, e) = ed.line_ranges[i];
-                    ui.add(
-                        egui::Label::new(RichText::new(&ed.content[s..e]).monospace().color(Palette::TEXT))
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                }
-            },
-        );
+        let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, ' ')).max(1.0);
+        let total = ed.line_ranges.len();
+        let content_w = (ed.max_line_bytes as f32 + 2.0) * char_w;
+        let content_h = total as f32 * row_h;
+        egui::ScrollArea::both().auto_shrink([false, false]).show_viewport(ui, |ui, vp| {
+            ui.set_width(content_w);
+            ui.set_height(content_h);
+            let origin = ui.min_rect().min;
+            let first = (vp.min.y / row_h).floor().max(0.0) as usize;
+            let visible = (vp.height() / row_h).ceil() as usize + 2;
+            let last = (first + visible).min(total);
+            let painter = ui.painter();
+            for i in first..last {
+                let (s, e) = ed.line_ranges[i];
+                painter.text(
+                    egui::pos2(origin.x, origin.y + i as f32 * row_h),
+                    egui::Align2::LEFT_TOP,
+                    &ed.content[s..e],
+                    mono.clone(),
+                    Palette::TEXT,
+                );
+            }
+        });
         return false;
     }
 
