@@ -1633,6 +1633,8 @@ impl App {
         let mut pick_dir = false;
         let mut cancel_id: Option<u64> = None;
         let mut toggle_err: Option<u64> = None;
+        let mut remove_id: Option<u64> = None;
+        let mut delete_id: Option<(u64, String)> = None;
         let dl_dir = self.download_dir.to_string_lossy().into_owned();
         let win = egui::Window::new("transfer_win")
             .title_bar(false) // 隐藏过大的默认标题，使用自定义紧凑标题
@@ -1675,65 +1677,83 @@ impl App {
                         crate::proto::TransferDir::Download => (icon::DOWNLOAD_SIMPLE, Palette::OK),
                         crate::proto::TransferDir::Upload => (icon::UPLOAD_SIMPLE, Palette::ACCENT),
                     };
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(dir_icon).color(dir_col).size(13.0));
-                        ui.label(RichText::new(&t.name).size(12.0).color(Palette::TEXT));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            match t.ok {
-                                Some(true) => { ui.label(RichText::new(icon::CHECK_CIRCLE).color(Palette::OK).size(13.0)); }
-                                Some(false) => {
-                                    // 失败：状态按钮可点击展开失败原因
-                                    if ui.add(egui::Button::new(RichText::new(icon::WARNING_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
-                                        .on_hover_text(crate::i18n::tr("点击查看失败原因", "Click for reason"))
-                                        .clicked()
-                                    {
-                                        toggle_err = Some(t.id);
+                    // 整个传输项包进一个 scope，便于整体右键
+                    let item = ui.scope(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(dir_icon).color(dir_col).size(13.0));
+                            ui.label(RichText::new(&t.name).size(12.0).color(Palette::TEXT));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                match t.ok {
+                                    Some(true) => { ui.label(RichText::new(icon::CHECK_CIRCLE).color(Palette::OK).size(13.0)); }
+                                    Some(false) => {
+                                        // 失败：状态按钮可点击展开失败原因
+                                        if ui.add(egui::Button::new(RichText::new(icon::WARNING_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
+                                            .on_hover_text(crate::i18n::tr("点击查看失败原因", "Click for reason"))
+                                            .clicked()
+                                        {
+                                            toggle_err = Some(t.id);
+                                        }
+                                    }
+                                    None => {
+                                        // 进行中：取消按钮 + 转圈
+                                        if ui.add(egui::Button::new(RichText::new(icon::X_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
+                                            .on_hover_text(crate::i18n::tr("取消", "Cancel"))
+                                            .clicked()
+                                        {
+                                            cancel_id = Some(t.id);
+                                        }
+                                        ui.spinner();
                                     }
                                 }
-                                None => {
-                                    // 进行中：取消按钮 + 转圈
-                                    if ui.add(egui::Button::new(RichText::new(icon::X_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
-                                        .on_hover_text(crate::i18n::tr("取消", "Cancel"))
-                                        .clicked()
-                                    {
-                                        cancel_id = Some(t.id);
-                                    }
-                                    ui.spinner();
-                                }
-                            }
-                            // 下载完成：打开所在文件夹
-                            if t.ok == Some(true) {
-                                if let Some(local) = &t.local {
-                                    if ui.add(egui::Button::new(RichText::new(icon::FOLDER_OPEN).size(12.0).color(Palette::TEXT_DIM)).frame(false))
-                                        .on_hover_text(crate::i18n::tr("在文件管理器中显示", "Show in file manager"))
-                                        .clicked()
-                                    {
-                                        open_dir = Some(local.clone());
-                                    }
-                                }
-                            }
+                            });
                         });
+                        let frac = if t.total > 0 { t.done as f32 / t.total as f32 } else if t.ok == Some(true) { 1.0 } else { 0.0 };
+                        let pct = (frac.clamp(0.0, 1.0) * 100.0).round() as i32;
+                        // 完成（成功）：进度条直接显示「100% 总大小」，不再单独一行
+                        let bar_text = if t.ok == Some(true) {
+                            format!("100%  {}", crate::ui::fmt_bytes(t.total as f64))
+                        } else {
+                            format!("{pct}%")
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                                .fill(dir_col)
+                                .text(RichText::new(bar_text).size(10.0))
+                                .desired_height(10.0)
+                                .corner_radius(2.0),
+                        );
+                        // 进行中才显示详情行（已传/总量 + 实时速度）；完成后不再单独一行
+                        if t.ok.is_none() {
+                            let mut detail = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
+                            if t.speed > 0.0 {
+                                detail.push_str(&format!("  ·  {}", crate::ui::fmt_rate(t.speed)));
+                            }
+                            ui.label(RichText::new(detail).size(10.0).color(Palette::TEXT_DIM));
+                        }
+                        // 失败且已展开：显示失败原因
+                        if t.ok == Some(false) && t.show_err && !t.message.is_empty() {
+                            ui.label(RichText::new(&t.message).color(Palette::DANGER).size(11.0));
+                        }
                     });
-                    let frac = if t.total > 0 { t.done as f32 / t.total as f32 } else if t.ok == Some(true) { 1.0 } else { 0.0 };
-                    // 进度条上显示百分比
-                    let pct = (frac.clamp(0.0, 1.0) * 100.0).round() as i32;
-                    ui.add(
-                        egui::ProgressBar::new(frac.clamp(0.0, 1.0))
-                            .fill(dir_col)
-                            .text(RichText::new(format!("{pct}%")).size(10.0))
-                            .desired_height(10.0)
-                            .corner_radius(2.0),
-                    );
-                    // 详情行：已传/总量；进行中再附实时速度
-                    let mut detail = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
-                    if t.ok.is_none() && t.speed > 0.0 {
-                        detail.push_str(&format!("  ·  {}", crate::ui::fmt_rate(t.speed)));
-                    }
-                    ui.label(RichText::new(detail).size(10.0).color(Palette::TEXT_DIM));
-                    // 失败且已展开：显示失败原因
-                    if t.ok == Some(false) && t.show_err && !t.message.is_empty() {
-                        ui.label(RichText::new(&t.message).color(Palette::DANGER).size(11.0));
-                    }
+                    // 右键菜单：打开所在文件 / 删除记录 / 删文件并删记录
+                    item.response.context_menu(|ui| {
+                        if let Some(local) = &t.local {
+                            if ui.button(crate::i18n::tr("打开所在文件", "Reveal file")).clicked() {
+                                open_dir = Some(local.clone());
+                                ui.close();
+                            }
+                        }
+                        if ui.button(crate::i18n::tr("删除记录", "Remove from list")).clicked() {
+                            remove_id = Some(t.id);
+                            ui.close();
+                        }
+                        if let Some(local) = &t.local {
+                            if ui.button(RichText::new(crate::i18n::tr("删除文件并移除记录", "Delete file & remove")).color(Palette::DANGER)).clicked() {
+                                delete_id = Some((t.id, local.clone()));
+                                ui.close();
+                            }
+                        }
+                    });
                     ui.add_space(4.0);
                 }
                 if let Some(p) = open_dir {
@@ -1764,6 +1784,21 @@ impl App {
                 if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
                     t.show_err = !t.show_err;
                 }
+            }
+            self.xfer_just_opened = true;
+        }
+        // 删除记录（仅移除列表项）
+        if let Some(id) = remove_id {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                s.transfers.retain(|t| t.id != id);
+            }
+            self.xfer_just_opened = true;
+        }
+        // 删除文件并移除记录
+        if let Some((id, path)) = delete_id {
+            let _ = std::fs::remove_file(&path);
+            if let Some(s) = self.sessions.get_mut(idx) {
+                s.transfers.retain(|t| t.id != id);
             }
             self.xfer_just_opened = true;
         }
