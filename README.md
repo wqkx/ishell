@@ -21,10 +21,8 @@ System monitor · interactive terminal · SFTP file manager · port forwarding �
 
 ## ✨ Overview
 
-iShell's layout is inspired by **FinalShell** — live system info on the left, an interactive terminal
-in the center, and an SFTP file manager at the bottom-right — aiming to keep everything you need for
-daily SSH work in a single window. Compared to FinalShell / Xshell / MobaXterm / Termius, iShell
-leans toward:
+iShell puts everything you need for daily SSH work in a single window — live system info on the left,
+an interactive terminal in the center, and an SFTP file manager at the bottom-right. It leans toward:
 
 - **High performance, low resource usage (the core)** — pure Rust + a GPU immediate-mode UI (egui): a single binary, fast startup, low memory/CPU footprint, no runtime deps or background services.
 - **A pure-Rust SSH stack (russh + ring)** — no dependency on the system OpenSSH / PuTTY; consistent behavior across platforms.
@@ -38,7 +36,7 @@ leans toward:
 
 | Metric | Value |
 |---|---|
-| Binary | single file, **~22 MB** (no runtime deps, no background daemon) |
+| Binary | single file, no runtime deps / daemon — **Linux ~23 MB · macOS ~14–16 MB · Windows ~20 MB** |
 | Idle CPU | **≈ 0%** (one idle session; system info polled every 2 s) |
 | Memory | **~80 MB** (idle, measured) — native app, **no Electron / JVM / Python** runtime; far below Electron-based clients that idle at hundreds of MB |
 
