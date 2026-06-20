@@ -975,13 +975,18 @@ fn paint_row_backgrounds(
 ) {
     for col in 0..cols {
         if let Some(c) = screen.cell(row, col) {
+            // 宽字符（中文等）的续格由其首格统一铺底，避免只盖住半个字
+            if c.is_wide_continuation() {
+                continue;
+            }
             let mut bg = vt_color(c.bgcolor(), Color32::TRANSPARENT, tc);
             if c.inverse() {
                 bg = vt_color(c.fgcolor(), tc.fg, tc);
             }
             if bg != Color32::TRANSPARENT {
+                let w = if c.is_wide() { cell.x * 2.0 } else { cell.x };
                 let pos = origin + Vec2::new(col as f32 * cell.x, row as f32 * cell.y);
-                painter.rect_filled(Rect::from_min_size(pos, cell), 0.0, bg);
+                painter.rect_filled(Rect::from_min_size(pos, Vec2::new(w, cell.y)), 0.0, bg);
             }
         }
     }
