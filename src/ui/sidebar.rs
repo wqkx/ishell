@@ -179,8 +179,12 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
     });
 }
 
-/// 同 kv，但值可双击复制到剪贴板（用于 IP 等）。
+/// 同 kv，但值可双击复制到剪贴板（用于 IP 等），复制后短暂显示「已复制」。
 fn kv_copy(ui: &mut egui::Ui, k: &str, v: &str) {
+    let id = ui.id().with(("kv_copy", k));
+    let now = ui.input(|i| i.time);
+    let flash: Option<f64> = ui.ctx().data(|d| d.get_temp(id));
+    let copied = flash.map_or(false, |t| now - t < 1.2);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         ui.label(RichText::new(k).color(Palette::TEXT_DIM).size(12.0));
@@ -189,6 +193,11 @@ fn kv_copy(ui: &mut egui::Ui, k: &str, v: &str) {
             .on_hover_text(tr("双击复制", "Double-click to copy"));
         if resp.double_clicked() {
             ui.ctx().copy_text(v.to_string());
+            ui.ctx().data_mut(|d| d.insert_temp(id, now));
+        }
+        if copied {
+            ui.label(RichText::new(format!("{}  {}", egui_phosphor::regular::CHECK, tr("已复制", "Copied"))).color(Palette::OK).size(11.0));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
         }
     });
 }

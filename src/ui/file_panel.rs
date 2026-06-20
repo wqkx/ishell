@@ -44,6 +44,8 @@ pub struct FilePanelState {
     pub sort_desc: bool,
     /// 「复制路径」按钮的成功反馈时刻（短暂显示对勾）
     pub copy_flash: Option<f64>,
+    /// 面包屑单击导航的延后执行（路径, 单击时刻）——给双击编辑留判定窗口
+    pub pending_nav: Option<(String, f64)>,
 }
 
 /// 文件列表排序键。
@@ -335,8 +337,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                     }
                 } else {
                     // 面包屑：路径超长时横向滚动（隐藏滚动条，滚轮滚动）；
-                    // 单击逐级跳转，双击路径任意处（含分段、空白）进入编辑模式
+                    // 单击逐级跳转，双击路径任意处（含分段、空白）进入编辑模式。
+                    // 单击导航延后 ~0.28s 执行，期间若发生双击则取消，避免双击误触发跳转。
+                    let now_t = ui.input(|i| i.time);
+                    let cwd_s = state.cwd.clone();
                     let mut enter_edit = false;
+                    let mut nav_click: Option<String> = None;
                     egui::ScrollArea::horizontal()
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .auto_shrink([false, false])
@@ -344,26 +350,24 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;
                                 let root = ui.add(egui::Label::new(RichText::new(icon::HOUSE).color(Palette::ACCENT)).sense(Sense::click()));
-                                if root.clicked() {
-                                    bc_nav = Some("/".into());
-                                }
                                 if root.double_clicked() {
                                     enter_edit = true;
+                                } else if root.clicked() {
+                                    nav_click = Some("/".into());
                                 }
                                 let mut acc = String::new();
-                                for seg in state.cwd.split('/').filter(|s| !s.is_empty()) {
+                                for seg in cwd_s.split('/').filter(|s| !s.is_empty()) {
                                     ui.label(RichText::new("›").color(Palette::TEXT_DIM));
                                     acc.push('/');
                                     acc.push_str(seg);
                                     let here = acc.clone();
-                                    let is_last = here == state.cwd;
+                                    let is_last = here == cwd_s;
                                     let color = if is_last { Palette::TEXT } else { Palette::TEXT_DIM };
                                     let r = ui.add(egui::Label::new(RichText::new(seg).color(color)).sense(Sense::click()));
-                                    if r.clicked() {
-                                        bc_nav = Some(here);
-                                    }
                                     if r.double_clicked() {
                                         enter_edit = true;
+                                    } else if r.clicked() {
+                                        nav_click = Some(here);
                                     }
                                 }
                                 // 末尾空白：双击也进入编辑
@@ -379,6 +383,18 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                     if enter_edit {
                         state.path_edit = Some(state.cwd.clone());
                         state.path_edit_focus = true;
+                        state.pending_nav = None;
+                    } else if let Some(p) = nav_click {
+                        state.pending_nav = Some((p, now_t));
+                    }
+                    // 延时执行单击导航（其间未发生双击）
+                    if let Some((p, t)) = state.pending_nav.clone() {
+                        if now_t - t >= 0.28 {
+                            bc_nav = Some(p);
+                            state.pending_nav = None;
+                        } else {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+                        }
                     }
                 }
             });
