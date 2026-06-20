@@ -327,6 +327,8 @@ struct ImageTab {
     server: String,
     path: String,
     tex: egui::TextureHandle,
+    /// 原始字节（用于「另存为」，保留源格式/质量）
+    data: Vec<u8>,
     /// 原始像素尺寸
     size: egui::Vec2,
     /// 缩放系数；0 表示「首帧自动适应窗口」
@@ -480,10 +482,15 @@ impl App {
                 }
                 let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
                 let tex = cc.egui_ctx.load_texture("demo_img", color, egui::TextureOptions::LINEAR);
+                let mut data = Vec::new();
+                if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, px) {
+                    let _ = image::DynamicImage::ImageRgba8(buf).write_to(&mut std::io::Cursor::new(&mut data), image::ImageFormat::Png);
+                }
                 app.image_tabs.push(ImageTab {
                     server,
                     path: "/home/e5-1/pic/gradient.png".into(),
                     tex,
+                    data,
                     size: egui::vec2(w as f32, h as f32),
                     zoom: 0.0,
                     offset: egui::Vec2::ZERO,
@@ -824,6 +831,7 @@ impl eframe::App for App {
                         server,
                         path,
                         tex,
+                        data,
                         size: egui::vec2(size[0] as f32, size[1] as f32),
                         zoom: 0.0,
                         offset: egui::Vec2::ZERO,
@@ -1494,6 +1502,8 @@ impl App {
         let mut close_tab: Option<usize> = None;
         let mut activate: Option<usize> = None;
         let mut close_all = false;
+        let mut save_msg: Option<String> = None;
+        let mut nav_delta: i32 = 0; // 方向键切换上一张/下一张
 
         egui::Window::new("image_win")
             .title_bar(false)
@@ -1549,6 +1559,16 @@ impl App {
                                 t.zoom = 1.0;
                                 t.offset = egui::Vec2::ZERO;
                             }
+                            // 另存为本地文件（写回原始字节，保留源格式）
+                            if ui.button(crate::i18n::tr("另存为…", "Save as…")).clicked() && !t.data.is_empty() {
+                                let fname = t.path.rsplit('/').next().unwrap_or("image");
+                                if let Some(path) = rfd::FileDialog::new().set_file_name(fname).save_file() {
+                                    save_msg = Some(match std::fs::write(&path, &t.data) {
+                                        Ok(_) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存到 {}", path.display()), crate::i18n::Lang::En => format!("Saved to {}", path.display()) },
+                                        Err(e) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("保存失败：{e}"), crate::i18n::Lang::En => format!("Save failed: {e}") },
+                                    });
+                                }
+                            }
                             if t.zoom > 0.0 {
                                 ui.label(RichText::new(format!("{}%", (t.zoom * 100.0).round() as i32)).color(Palette::TEXT_DIM).size(11.0));
                             }
@@ -1563,7 +1583,12 @@ impl App {
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect, 0.0, Palette::PANEL_2);
 
-                    // 首帧自动适应窗口（不放大超过 1:1）
+                    // 双击复位为「适应窗口」
+                    if resp.double_clicked() {
+                        t.zoom = 0.0;
+                        t.offset = egui::Vec2::ZERO;
+                    }
+                    // 首帧/复位后自动适应窗口（不放大超过 1:1）
                     if t.zoom <= 0.0 {
                         let fit = (rect.width() / t.size.x).min(rect.height() / t.size.y).min(1.0);
                         t.zoom = fit.clamp(0.02, 32.0);
@@ -1595,10 +1620,26 @@ impl App {
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                     painter.image(t.tex.id(), img_rect, uv, egui::Color32::WHITE);
                 }
+
+                // 方向键切换上一张/下一张（仅当指针在本窗口内，避免抢占终端/编辑器按键）
+                if ui.ui_contains_pointer() {
+                    nav_delta = ui.input(|i| {
+                        i.key_pressed(egui::Key::ArrowRight) as i32 - i.key_pressed(egui::Key::ArrowLeft) as i32
+                    });
+                }
             });
 
         if let Some(i) = activate {
             self.active_image = i;
+        }
+        if nav_delta != 0 && !self.image_tabs.is_empty() {
+            let n = self.image_tabs.len() as i32;
+            self.active_image = (self.active_image as i32 + nav_delta).rem_euclid(n) as usize;
+        }
+        if let Some(msg) = save_msg {
+            if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
+                s.status = msg;
+            }
         }
         if close_all {
             self.image_tabs.clear();
