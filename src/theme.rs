@@ -63,7 +63,7 @@ pub fn apply(ctx: &egui::Context) {
     };
     v.window_corner_radius = CornerRadius::same(10);
 
-    // 统一小圆角（FinalShell 风格的小圆角矩形）
+    // 统一小圆角
     let r = CornerRadius::same(4);
 
     // 非交互（标签、分隔线）

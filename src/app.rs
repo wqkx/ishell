@@ -1945,7 +1945,7 @@ impl App {
     }
 }
 
-/// 扁平按钮（无边框、悬停高亮），用于标签栏等处，贴近 FinalShell 风格。
+/// 扁平按钮（无边框、悬停高亮），用于标签栏等处。
 /// 对话框按钮：用 egui 原生按钮（自然高度，仅约束最小宽度），由 egui 居中文字，
 /// 与全局其它按钮一致，避免硬编码像素偏移在不同字体下错位。
 fn dialog_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>, width: f32) -> bool {

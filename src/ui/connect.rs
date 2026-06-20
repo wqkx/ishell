@@ -157,7 +157,7 @@ impl ConnectForm {
         result
     }
 
-    /// 快速连接列表视图（仿 FinalShell）。
+    /// 快速连接列表视图。
     fn list_view(&mut self, ui: &mut egui::Ui, result: &mut Option<ConnectConfig>) {
         use egui_phosphor::regular as icon;
         ui.horizontal(|ui| {

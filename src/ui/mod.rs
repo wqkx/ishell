@@ -42,7 +42,7 @@ pub fn usage_color(percent: f32) -> Color32 {
     }
 }
 
-/// 绘制网络速率折线图（含刻度值与水平虚线网格，仿 FinalShell）。
+/// 绘制网络速率折线图（含刻度值与水平虚线网格）。
 /// `slots` 为横轴总点位数（决定点间距/密度）；数据从右侧（最新）向左排布。
 pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, slots: usize) {
     let desired = Vec2::new(ui.available_width(), height);

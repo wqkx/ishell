@@ -1,4 +1,4 @@
-//! 右下文件操作区（仿 FinalShell）：左侧树形目录 + 右侧文件列表。
+//! 右下文件操作区：左侧树形目录 + 右侧文件列表。
 //! 支持：进入/刷新目录、拖拽上传、右键下载/删除/重命名/改权限、复制路径、新建文件/目录。
 
 use std::collections::{HashMap, HashSet};
@@ -256,7 +256,7 @@ fn draw_node(
 
 /// 右侧：工具栏 + 文件表格。
 fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<FileAction>) {
-    // FinalShell 风格工具栏：扁平图标条（带浅色背景）
+    // 工具栏：扁平图标条（带浅色背景）
     use egui_phosphor::regular as icon;
     let mut bc_nav: Option<String> = None;
     egui::Frame::new()
@@ -774,7 +774,7 @@ fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, m
     });
 }
 
-/// 工具栏图标按钮（FinalShell 风格：扁平无边框，悬停高亮）。
+/// 工具栏图标按钮（扁平无边框，悬停高亮）。
 fn tool_btn(ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
     tool_btn_color(ui, icon, tip, Palette::TEXT)
 }
