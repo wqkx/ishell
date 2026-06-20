@@ -36,6 +36,8 @@ struct Session {
     proc_sort_mem: bool,
     /// 已读取待打开到编辑器的文件（path, content）
     pending_open: Vec<(String, String)>,
+    /// 已读取待打开到看图工具的图片（path, 原始字节）
+    pending_image: Vec<(String, Vec<u8>)>,
     /// 向 worker 回复"是否信任未知主机"
     hostkey_tx: UnboundedSender<bool>,
     /// 待确认的未知主机（host, 指纹）
@@ -137,6 +139,10 @@ impl Session {
                     self.pending_open.push((path, content));
                     self.status = crate::i18n::tr("已打开文件", "File opened").into();
                 }
+                WorkerEvent::ImageOpened { path, data } => {
+                    self.pending_image.push((path, data));
+                    self.status = crate::i18n::tr("已打开图片", "Image opened").into();
+                }
                 WorkerEvent::OpDone { message, refresh_dir } => {
                     self.status = message;
                     self.refresh_dir(refresh_dir);
@@ -231,6 +237,9 @@ pub struct App {
     active_editor: usize,
     /// 「关闭全部」时若有未保存修改，弹确认框
     editor_close_confirm: bool,
+    /// 看图工具：已打开的图片标签
+    image_tabs: Vec<ImageTab>,
+    active_image: usize,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
@@ -313,6 +322,19 @@ struct EditorTab {
     text_id: egui::Id,
 }
 
+/// 看图工具的一个标签页（一张已加载的图片）。
+struct ImageTab {
+    server: String,
+    path: String,
+    tex: egui::TextureHandle,
+    /// 原始像素尺寸
+    size: egui::Vec2,
+    /// 缩放系数；0 表示「首帧自动适应窗口」
+    zoom: f32,
+    /// 平移偏移（像素）
+    offset: egui::Vec2,
+}
+
 /// 自检截图状态。
 struct Shot {
     path: String,
@@ -361,6 +383,8 @@ impl App {
             editors: Vec::new(),
             active_editor: 0,
             editor_close_confirm: false,
+            image_tabs: Vec::new(),
+            active_image: 0,
             next_editor_id: 0,
             trim_after: None,
             show_forwards: false,
@@ -437,6 +461,33 @@ impl App {
                     text_id: t3,
                 });
                 app.active_editor = 1; // 默认显示大文件标签
+            }
+        }
+
+        // 自检：看图工具——合成一张彩色渐变图打开
+        if std::env::var("ISHELL_DEMO_IMG").is_ok() {
+            if let Some(server) = app.sessions.first().map(|s| s.title.clone()) {
+                let (w, h) = (240usize, 160usize);
+                let mut px = vec![0u8; w * h * 4];
+                for y in 0..h {
+                    for x in 0..w {
+                        let i = (y * w + x) * 4;
+                        px[i] = (x * 255 / w) as u8;
+                        px[i + 1] = (y * 255 / h) as u8;
+                        px[i + 2] = 128;
+                        px[i + 3] = 255;
+                    }
+                }
+                let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
+                let tex = cc.egui_ctx.load_texture("demo_img", color, egui::TextureOptions::LINEAR);
+                app.image_tabs.push(ImageTab {
+                    server,
+                    path: "/home/e5-1/pic/gradient.png".into(),
+                    tex,
+                    size: egui::vec2(w as f32, h as f32),
+                    zoom: 0.0,
+                    offset: egui::Vec2::ZERO,
+                });
             }
         }
 
@@ -558,6 +609,7 @@ impl App {
             selected_nic: String::new(),
             proc_sort_mem: false,
             pending_open: Vec::new(),
+            pending_image: Vec::new(),
             hostkey_tx,
             pending_hostkey: None,
             forwards: Vec::new(),
@@ -686,6 +738,10 @@ impl App {
                 s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
                 let _ = s.cmd_tx.send(UiCommand::ReadFile { path, force });
             }
+            FileAction::OpenImage { path } => {
+                s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
+                let _ = s.cmd_tx.send(UiCommand::ReadImage { path });
+            }
         }
     }
 }
@@ -737,6 +793,7 @@ impl eframe::App for App {
 
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
         let mut new_tabs: Vec<(String, String, String, UnboundedSender<UiCommand>)> = Vec::new();
+        let mut new_images: Vec<(String, Vec<u8>, String)> = Vec::new();
         for s in &mut self.sessions {
             s.drain_events();
             if s.connected && !s.initialized {
@@ -745,6 +802,40 @@ impl eframe::App for App {
             }
             for (path, content) in s.pending_open.drain(..) {
                 new_tabs.push((path, content, s.title.clone(), s.cmd_tx.clone()));
+            }
+            for (path, data) in s.pending_image.drain(..) {
+                new_images.push((path, data, s.title.clone()));
+            }
+        }
+        for (path, data, server) in new_images {
+            // 同一服务器同一图片已打开则切到该标签
+            if let Some(i) = self.image_tabs.iter().position(|t| t.server == server && t.path == path) {
+                self.active_image = i;
+                continue;
+            }
+            match image::load_from_memory(&data) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    let name = format!("img:{server}:{path}");
+                    let tex = ui.ctx().load_texture(name, color, egui::TextureOptions::LINEAR);
+                    self.image_tabs.push(ImageTab {
+                        server,
+                        path,
+                        tex,
+                        size: egui::vec2(size[0] as f32, size[1] as f32),
+                        zoom: 0.0,
+                        offset: egui::Vec2::ZERO,
+                    });
+                    self.active_image = self.image_tabs.len() - 1;
+                }
+                Err(e) => {
+                    let msg = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("图片解码失败：{e}"), crate::i18n::Lang::En => format!("Decode failed: {e}") };
+                    if let Some(sess) = self.sessions.iter_mut().find(|s| s.title == server) {
+                        sess.status = msg;
+                    }
+                }
             }
         }
         for (path, content, server, tx) in new_tabs {
@@ -921,6 +1012,9 @@ impl eframe::App for App {
 
         // 文本编辑器浮窗
         self.editor_window(&ctx);
+
+        // 看图工具浮窗
+        self.image_window(&ctx);
 
         // 未知主机指纹确认（TOFU）
         self.host_key_dialog(&ctx);
@@ -1385,6 +1479,140 @@ impl App {
         self.editor_close_confirm = false;
         self.trim_after = Some(4);
         ctx.request_repaint();
+    }
+
+    /// 看图工具浮窗：独立可缩放窗口；滚轮以光标为锚点缩放，拖动平移。
+    fn image_window(&mut self, ctx: &egui::Context) {
+        use egui_phosphor::regular as icon;
+        if self.image_tabs.is_empty() {
+            return;
+        }
+        if self.active_image >= self.image_tabs.len() {
+            self.active_image = self.image_tabs.len() - 1;
+        }
+
+        let mut close_tab: Option<usize> = None;
+        let mut activate: Option<usize> = None;
+        let mut close_all = false;
+
+        egui::Window::new("image_win")
+            .title_bar(false)
+            .default_size([720.0, 560.0])
+            .min_size([320.0, 240.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                // 标签栏：左侧标签；右上角「关闭全部」
+                ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::X, crate::i18n::tr("关闭全部", "Close all"))).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                        close_all = true;
+                    }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (i, t) in self.image_tabs.iter().enumerate() {
+                        let selected = i == self.active_image;
+                        let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
+                        egui::Frame::new()
+                            .fill(fill)
+                            .corner_radius(5)
+                            .inner_margin(egui::Margin::symmetric(8, 3))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
+                                    let label = format!("{} {}·{}", icon::IMAGE, t.server, fname);
+                                    let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
+                                    if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click())).clicked() {
+                                        activate = Some(i);
+                                    }
+                                    if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                                        close_tab = Some(i);
+                                    }
+                                });
+                            });
+                    }
+                });
+                });
+                });
+                });
+                ui.separator();
+
+                // 工具栏：路径 + 尺寸/缩放 + 适应/1:1
+                if let Some(t) = self.image_tabs.get_mut(self.active_image) {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&t.path).color(Palette::TEXT_DIM).size(11.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(crate::i18n::tr("适应窗口", "Fit")).clicked() {
+                                t.zoom = 0.0;
+                                t.offset = egui::Vec2::ZERO;
+                            }
+                            if ui.button("1:1").clicked() {
+                                t.zoom = 1.0;
+                                t.offset = egui::Vec2::ZERO;
+                            }
+                            if t.zoom > 0.0 {
+                                ui.label(RichText::new(format!("{}%", (t.zoom * 100.0).round() as i32)).color(Palette::TEXT_DIM).size(11.0));
+                            }
+                            ui.label(RichText::new(format!("{}×{}", t.size.x as i32, t.size.y as i32)).color(Palette::TEXT_DIM).size(11.0));
+                        });
+                    });
+                    ui.separator();
+
+                    // 画布：棋盘灰底 + 图片，支持滚轮缩放与拖动平移
+                    let avail = ui.available_size();
+                    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 0.0, Palette::PANEL_2);
+
+                    // 首帧自动适应窗口（不放大超过 1:1）
+                    if t.zoom <= 0.0 {
+                        let fit = (rect.width() / t.size.x).min(rect.height() / t.size.y).min(1.0);
+                        t.zoom = fit.clamp(0.02, 32.0);
+                        t.offset = egui::Vec2::ZERO;
+                    }
+                    // 滚轮缩放：以光标为锚点，保持光标下的像素不动
+                    if resp.hovered() {
+                        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                        if scroll_y != 0.0 {
+                            let old = t.zoom;
+                            let new = (old * (scroll_y * 0.0015).exp()).clamp(0.02, 32.0);
+                            if let Some(ptr) = resp.hover_pos() {
+                                let d = ptr - rect.center();
+                                let k = new / old;
+                                t.offset = d * (1.0 - k) + t.offset * k;
+                            }
+                            t.zoom = new;
+                        }
+                    }
+                    // 拖动平移
+                    if resp.dragged() {
+                        t.offset += resp.drag_delta();
+                    }
+
+                    // 绘制图片
+                    let disp = t.size * t.zoom;
+                    let center = rect.center() + t.offset;
+                    let img_rect = egui::Rect::from_center_size(center, disp);
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    painter.image(t.tex.id(), img_rect, uv, egui::Color32::WHITE);
+                }
+            });
+
+        if let Some(i) = activate {
+            self.active_image = i;
+        }
+        if close_all {
+            self.image_tabs.clear();
+            self.active_image = 0;
+            self.trim_after = Some(4);
+        } else if let Some(i) = close_tab {
+            if i < self.image_tabs.len() {
+                self.image_tabs.remove(i); // 丢弃 TextureHandle 即释放 GPU 纹理
+            }
+            if self.active_image >= self.image_tabs.len() && !self.image_tabs.is_empty() {
+                self.active_image = self.image_tabs.len() - 1;
+            }
+            self.trim_after = Some(4);
+        }
     }
 
     /// GPU 详情小窗：每块 GPU 使用率 + 显存；鼠标移开或点击外部关闭。

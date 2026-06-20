@@ -59,6 +59,8 @@ pub enum UiCommand {
     Rename { from: String, to: String },
     /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制
     ReadFile { path: String, force: bool },
+    /// 读取图片文件原始字节（用于看图工具打开）
+    ReadImage { path: String },
     /// 写回文本文件内容（保存）
     WriteFile { path: String, content: String },
     /// 查询进程详情（cmdline / cwd / exe）
@@ -111,6 +113,8 @@ pub enum WorkerEvent {
     HostKeyPrompt { host: String, fingerprint: String },
     /// 文本文件已读取，打开编辑器
     FileOpened { path: String, content: String },
+    /// 图片文件已读取（原始字节），打开看图工具
+    ImageOpened { path: String, data: Vec<u8> },
     /// 一次文件操作成功完成（携带提示文本与需要刷新的目录）
     OpDone { message: String, refresh_dir: Option<String> },
     /// 传输开始（携带总字节数与方向）

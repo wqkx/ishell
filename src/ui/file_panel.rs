@@ -89,6 +89,14 @@ pub enum FileAction {
     CopyPath(String),
     /// 双击文本文件 -> 打开编辑器（force=true 放宽大小限制）
     OpenFile { path: String, force: bool },
+    /// 双击图片文件 -> 打开看图工具
+    OpenImage { path: String },
+}
+
+/// 是否为可用看图工具打开的常见图片扩展名。
+pub fn is_image_path(name: &str) -> bool {
+    let lower = name.rsplit('.').next().map(|e| e.to_ascii_lowercase());
+    matches!(lower.as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "bmp"))
 }
 
 impl FilePanelState {
@@ -442,6 +450,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     let mut clicks: Vec<usize> = Vec::new(); // 本帧被点击的行
     let mut rclick: Option<usize> = None; // 本帧被右键的行
     let mut open_file: Option<String> = None; // 双击文本文件
+    let mut open_image: Option<String> = None; // 双击图片文件
     let mut confirm_open: Option<(String, u64)> = None; // 大文件待确认
     let mut rename_commit: Option<(String, String)> = None;
     let mut cancel_rename = false;
@@ -587,6 +596,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                         state.pending_rename = None;
                         if e.is_dir {
                             navigate = Some(full.clone());
+                        } else if is_image_path(&e.name) {
+                            // 图片文件 -> 看图工具
+                            open_image = Some(full.clone());
                         } else if e.size > 4 * 1024 * 1024 {
                             // 大文件先确认
                             confirm_open = Some((full.clone(), e.size));
@@ -647,6 +659,10 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     // 双击打开文本文件
     if let Some(p) = open_file {
         actions.push(FileAction::OpenFile { path: p, force: false });
+    }
+    // 双击打开图片
+    if let Some(p) = open_image {
+        actions.push(FileAction::OpenImage { path: p });
     }
     if let Some((p, size)) = confirm_open {
         state.dialog = Some(Dialog::ConfirmOpenLarge { path: p, size });

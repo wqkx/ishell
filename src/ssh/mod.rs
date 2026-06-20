@@ -326,6 +326,18 @@ pub async fn run(
                             });
                         }
                     }
+                    Some(UiCommand::ReadImage { path }) => {
+                        if let Some(sftp) = &sftp {
+                            let sftp = sftp.clone();
+                            let s = sink.clone();
+                            tokio::spawn(async move {
+                                match read_image_file(&sftp, &path).await {
+                                    Ok(data) => s.send(WorkerEvent::ImageOpened { path, data }),
+                                    Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{e}"), crate::i18n::Lang::En => format!("Open failed: {e}") })),
+                                }
+                            });
+                        }
+                    }
                     Some(cmd @ (UiCommand::Mkdir(_)
                         | UiCommand::CreateFile(_)
                         | UiCommand::Chmod { .. }
@@ -862,6 +874,19 @@ async fn read_text_file(
         anyhow::bail!("{}", crate::i18n::tr("非文本文件，无法以文本方式打开", "Not a text file"));
     }
     Ok(String::from_utf8_lossy(&data).into_owned())
+}
+
+/// 读取图片文件原始字节（带大小上限，避免误开超大文件拖慢界面）。
+async fn read_image_file(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let data = sftp.read(path).await?;
+    let limit = 32 * 1024 * 1024;
+    if data.len() > limit {
+        anyhow::bail!("{}", match crate::i18n::current() { crate::i18n::Lang::Zh => format!("图片过大（>{}MB）", limit / 1024 / 1024), crate::i18n::Lang::En => format!("Image too large (>{}MB)", limit / 1024 / 1024) });
+    }
+    Ok(data)
 }
 
 /// 执行一次 SFTP 写类操作，结果以 [`WorkerEvent::OpDone`]/`Error` 上报。
