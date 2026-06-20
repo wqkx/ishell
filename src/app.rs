@@ -1416,10 +1416,16 @@ impl App {
                         ui.label(RichText::new(v).color(Palette::TEXT).size(12.0).monospace());
                     });
                 };
-                kv(ui, "PID", pid.to_string());
+                let tip = crate::i18n::tr("双击复制", "Double-click to copy");
+                // PID：值可双击复制
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("PID").color(Palette::TEXT_DIM).size(12.0));
+                    if ui.add(egui::Label::new(RichText::new(pid.to_string()).color(Palette::TEXT).size(12.0).monospace()).sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
+                        copy_target = Some(pid.to_string());
+                    }
+                });
                 kv(ui, "CPU", format!("{cpu:.1}%"));
                 kv(ui, crate::i18n::tr("内存", "Mem"), format!("{mem:.1}%"));
-                let tip = crate::i18n::tr("双击复制", "Double-click to copy");
                 // 程序 / 目录：值可双击复制
                 if !exe.is_empty() {
                     ui.horizontal(|ui| {

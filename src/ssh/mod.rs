@@ -758,33 +758,72 @@ async fn upload(
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let name = basename(&local);
-    let remote = join_remote(&remote_dir, &name);
-    let total = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
-    sink.send(WorkerEvent::TransferStart {
-        id, name: name.clone(), total, dir: crate::proto::TransferDir::Upload,
-    });
+    let is_dir = tokio::fs::metadata(&local).await.map(|m| m.is_dir()).unwrap_or(false);
+
     let res: anyhow::Result<()> = async {
-        let mut lf = tokio::fs::File::open(&local).await?;
-        let mut rf = sftp.create(&remote).await?;
+        // 收集待上传文件：(本地路径, 远程路径, 大小)；目录则递归并记录要创建的远端目录
+        let mut files: Vec<(std::path::PathBuf, String, u64)> = Vec::new();
+        let mut mkdirs: Vec<String> = Vec::new();
+        if is_dir {
+            let local_root = std::path::PathBuf::from(&local);
+            let root_remote = join_remote(&remote_dir, &name);
+            mkdirs.push(root_remote.clone());
+            let mut stack = vec![local_root.clone()];
+            while let Some(dir) = stack.pop() {
+                let mut rd = tokio::fs::read_dir(&dir).await?;
+                while let Some(entry) = rd.next_entry().await? {
+                    let p = entry.path();
+                    let rel = p.strip_prefix(&local_root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    let rpath = format!("{root_remote}/{rel}");
+                    let ft = entry.file_type().await?;
+                    if ft.is_dir() {
+                        mkdirs.push(rpath);
+                        stack.push(p);
+                    } else if ft.is_file() {
+                        let sz = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                        files.push((p, rpath, sz));
+                    }
+                }
+            }
+        } else {
+            let sz = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
+            files.push((std::path::PathBuf::from(&local), join_remote(&remote_dir, &name), sz));
+        }
+
+        let total: u64 = files.iter().map(|f| f.2).sum();
+        sink.send(WorkerEvent::TransferStart {
+            id, name: name.clone(), total, dir: crate::proto::TransferDir::Upload,
+        });
+
+        // 先按深度建好远端目录（父先于子），已存在则忽略
+        mkdirs.sort_by_key(|d| d.matches('/').count());
+        for d in &mkdirs {
+            let _ = sftp.create_dir(d.clone()).await;
+        }
+
         let mut buf = vec![0u8; 128 * 1024];
         let (mut done, mut last) = (0u64, 0u64);
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                anyhow::bail!("canceled");
+        for (lpath, rpath, _sz) in files {
+            let mut lf = tokio::fs::File::open(&lpath).await?;
+            let mut rf = sftp.create(&rpath).await?;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    anyhow::bail!("canceled");
+                }
+                let n = lf.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                rf.write_all(&buf[..n]).await?;
+                done += n as u64;
+                if done - last >= 256 * 1024 {
+                    last = done;
+                    sink.send(WorkerEvent::TransferProgress { id, done });
+                }
             }
-            let n = lf.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            rf.write_all(&buf[..n]).await?;
-            done += n as u64;
-            if done - last >= 256 * 1024 {
-                last = done;
-                sink.send(WorkerEvent::TransferProgress { id, done });
-            }
+            rf.flush().await?;
+            rf.shutdown().await?;
         }
-        rf.flush().await?;
-        rf.shutdown().await?;
         sink.send(WorkerEvent::TransferProgress { id, done });
         Ok(())
     }

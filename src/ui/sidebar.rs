@@ -61,7 +61,7 @@ pub fn show(
         section(ui, icon::DESKTOP, tr("主机信息", "Host"));
         kv(ui, tr("主机名", "Name"), &info.hostname);
         if !info.ip.is_empty() {
-            kv(ui, "IP", &info.ip);
+            kv_copy(ui, "IP", &info.ip);
         }
         if !info.os.is_empty() {
             kv(ui, tr("系统", "OS"), &info.os);
@@ -176,6 +176,20 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
         ui.spacing_mut().item_spacing.y = 0.0;
         ui.label(RichText::new(format!("{k}")).color(Palette::TEXT_DIM).size(12.0));
         ui.label(RichText::new(v).color(Palette::TEXT).size(12.0));
+    });
+}
+
+/// 同 kv，但值可双击复制到剪贴板（用于 IP 等）。
+fn kv_copy(ui: &mut egui::Ui, k: &str, v: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.label(RichText::new(k).color(Palette::TEXT_DIM).size(12.0));
+        let resp = ui
+            .add(egui::Label::new(RichText::new(v).color(Palette::TEXT).size(12.0)).sense(egui::Sense::click()))
+            .on_hover_text(tr("双击复制", "Double-click to copy"));
+        if resp.double_clicked() {
+            ui.ctx().copy_text(v.to_string());
+        }
     });
 }
 
