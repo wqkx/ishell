@@ -560,14 +560,13 @@ impl Terminal {
                 let fmt = cell_format(c, &font, &tc);
                 let x = origin.x + col as f32 * char_w;
                 if c.is_wide() {
-                    // 全角字符（中文等）占 2 格：放大字号让字形填满两格、纵向居中，
-                    // 消除「半角×2 ≠ 全角」造成的左右空隙，同时保留半角英文原字体。
-                    let wide_font = FontId::new(2.0 * char_w, font.family.clone());
+                    // 全角字符（中文等）占 2 格：与半角同字号，在两格内水平+纵向居中。
+                    // 不再放大，避免中文比英文大、底部超出基线；左右仅余很小的均匀间距。
                     painter.text(
-                        egui::pos2(x, y + char_h / 2.0),
-                        egui::Align2::LEFT_CENTER,
+                        egui::pos2(x + char_w, y + char_h / 2.0),
+                        egui::Align2::CENTER_CENTER,
                         s,
-                        wide_font,
+                        font.clone(),
                         fmt.color,
                     );
                 } else {
