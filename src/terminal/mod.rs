@@ -379,11 +379,13 @@ impl Terminal {
 
         let font = FontId::monospace(self.font_size);
         // 以字符 'M' 的宽高度量单元格尺寸
-        let (char_w, char_h) = ui.ctx().fonts_mut(|f| {
+        let (char_w, glyph_h) = ui.ctx().fonts_mut(|f| {
             let w = f.glyph_width(&font, 'M');
             let h = f.row_height(&font);
             (w, h)
         });
+        // 行高 = 字形高度 × 1.2，避免上下两行过挤；字形在行内纵向居中
+        let char_h = glyph_h * 1.2;
         let cell = Vec2::new(char_w, char_h);
 
         let avail = ui.available_size();
@@ -569,10 +571,12 @@ impl Terminal {
                         fmt.color,
                     );
                 } else {
-                    painter.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, s, font.clone(), fmt.color);
+                    // 半角字符：纵向居中，使 1.2× 行高的额外留白上下均分
+                    painter.text(egui::pos2(x, y + char_h / 2.0), egui::Align2::LEFT_CENTER, s, font.clone(), fmt.color);
                 }
                 if fmt.underline.width > 0.0 {
-                    let uy = y + char_h - 1.0;
+                    // 下划线落在居中字形的底部附近
+                    let uy = y + (char_h + glyph_h) / 2.0 - 1.0;
                     let w = if c.is_wide() { 2.0 * char_w } else { char_w };
                     painter.hline(x..=(x + w), uy, fmt.underline);
                 }
