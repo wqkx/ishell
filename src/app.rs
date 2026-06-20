@@ -1718,21 +1718,39 @@ impl App {
                                 }
                             });
                         });
-                        let frac = if t.total > 0 { t.done as f32 / t.total as f32 } else if t.ok == Some(true) { 1.0 } else { 0.0 };
+                        let done = t.ok == Some(true);
+                        let frac = if done { 1.0 } else if t.total > 0 { t.done as f32 / t.total as f32 } else { 0.0 };
                         let pct = (frac.clamp(0.0, 1.0) * 100.0).round() as i32;
-                        // 完成（成功）：进度条直接显示「100% 总大小」，不再单独一行
-                        let bar_text = if t.ok == Some(true) {
-                            format!("100%  {}", crate::ui::fmt_bytes(t.total as f64))
-                        } else {
-                            format!("{pct}%")
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(frac.clamp(0.0, 1.0))
-                                .fill(dir_col)
-                                .text(RichText::new(bar_text).size(10.0))
-                                .desired_height(10.0)
-                                .corner_radius(2.0),
-                        );
+                        // 进行中/失败：条上居中显示百分比；完成：条上分两端（大小靠左、100% 靠右）
+                        let mut bar = egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                            .fill(dir_col)
+                            .desired_height(10.0)
+                            .corner_radius(2.0);
+                        if !done {
+                            bar = bar.text(RichText::new(format!("{pct}%")).size(10.0));
+                        }
+                        let bar_resp = ui.add(bar);
+                        if done {
+                            let rect = bar_resp.rect;
+                            let p = ui.painter_at(rect);
+                            let font = egui::FontId::proportional(10.0);
+                            // 大小靠左
+                            p.text(
+                                egui::pos2(rect.left() + 6.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                crate::ui::fmt_bytes(t.total as f64),
+                                font.clone(),
+                                egui::Color32::WHITE,
+                            );
+                            // 100% 靠右
+                            p.text(
+                                egui::pos2(rect.right() - 6.0, rect.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                "100%",
+                                font,
+                                egui::Color32::WHITE,
+                            );
+                        }
                         // 进行中才显示详情行（已传/总量 + 实时速度）；完成后不再单独一行
                         if t.ok.is_none() {
                             let mut detail = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
