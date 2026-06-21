@@ -2,6 +2,10 @@
 
 use egui::{Color32, CornerRadius, Stroke};
 
+/// 中文后备字体的全局缩放（UI 上让中英文同观感、按钮内垂直居中）。
+/// 终端按此值反向放大以抵消缩小，从而减小全角字之间的间距。
+pub const CJK_SCALE: f32 = 0.92;
+
 /// 主题色板：参考 **Claude / Anthropic** 官网风格——暖米白底 + Claude 珊瑚橙强调色。
 pub struct Palette;
 impl Palette {
@@ -148,7 +152,7 @@ fn install_fonts(ctx: &egui::Context) {
         // 中文（Noto CJK 等）的垂直度量比 Latin 字体更高、字面更满，按钮上会显得偏大且靠下。
         // 略缩小并上移，使中英文在同一行/按钮内大小观感一致、垂直居中。
         fd.tweak = egui::FontTweak {
-            scale: 0.92,
+            scale: CJK_SCALE,
             y_offset_factor: -0.06,
             ..Default::default()
         };

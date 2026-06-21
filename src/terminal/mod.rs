@@ -227,8 +227,16 @@ impl Terminal {
             let c1 = if row == er { ec } else { self.cols.saturating_sub(1) };
             let mut line = String::new();
             for col in c0..=c1 {
-                let ch = screen.cell(row, col).map(|c| c.contents()).unwrap_or_default();
-                line.push_str(if ch.is_empty() { " " } else { ch });
+                let Some(cell) = screen.cell(row, col) else {
+                    line.push(' ');
+                    continue;
+                };
+                // 宽字符（中文等）的续格不输出，避免复制出来每个汉字后多一个空格
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let ch = cell.contents();
+                line.push_str(if ch.is_empty() { " " } else { &ch });
             }
             out.push_str(line.trim_end());
             if row != er {
@@ -534,6 +542,22 @@ impl Terminal {
         let sel = self.ordered_selection();
         let screen = self.parser.screen();
         let origin = rect.min;
+
+        // 可见行中的链接：用于悬停下划线 + 点击打开（鼠标上报模式下让位给 TUI）
+        let mut link_rects: Vec<(Rect, String)> = Vec::new();
+        if !report_mouse {
+            for row in 0..self.rows {
+                for (sc, ec, url) in find_row_urls(screen, row, self.cols) {
+                    let x0 = origin.x + sc as f32 * char_w;
+                    let x1 = origin.x + (ec as f32 + 1.0) * char_w;
+                    let y = origin.y + row as f32 * char_h;
+                    link_rects.push((Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)), url));
+                }
+            }
+        }
+        let hover_pos = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p));
+        let hover_link = hover_pos.and_then(|p| link_rects.iter().find(|(r, _)| r.contains(p)).map(|(_, u)| u.clone()));
+
         for row in 0..self.rows {
             let y = origin.y + row as f32 * char_h;
             // 先绘制该行的背景块（处理非默认底色）
@@ -572,13 +596,15 @@ impl Terminal {
                 let fmt = cell_format(c, &font, &tc);
                 let x = origin.x + col as f32 * char_w;
                 if c.is_wide() {
-                    // 全角字符（中文等）占 2 格：与半角同字号，在两格内水平+纵向居中。
-                    // 不再放大，避免中文比英文大、底部超出基线；左右仅余很小的均匀间距。
+                    // 全角字符（中文等）占 2 格：在两格内水平+纵向居中。
+                    // 用反向放大的字号抵消 CJK 后备字体的全局缩小（CJK_SCALE），
+                    // 让全角字以原始大小填满更多两格空间，减小字间距；行高 1.2× 留白足以容纳。
+                    let wfont = FontId::monospace(self.font_size / crate::theme::CJK_SCALE);
                     painter.text(
                         egui::pos2(x + char_w, y + char_h / 2.0),
                         egui::Align2::CENTER_CENTER,
                         s,
-                        font.clone(),
+                        wfont,
                         fmt.color,
                     );
                 } else {
@@ -591,6 +617,20 @@ impl Terminal {
                     let w = if c.is_wide() { 2.0 * char_w } else { char_w };
                     painter.hline(x..=(x + w), uy, fmt.underline);
                 }
+            }
+        }
+
+        // 悬停的链接：手型光标 + 下划线；点击打开
+        if let Some(p) = hover_pos {
+            if let Some((r, _)) = link_rects.iter().find(|(r, _)| r.contains(p)) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                let uy = (origin.y + ((r.top() - origin.y) / char_h).round() * char_h) + (char_h + glyph_h) / 2.0 - 1.0;
+                painter.hline(r.left()..=r.right(), uy, Stroke::new(1.0, crate::theme::Palette::ACCENT));
+            }
+        }
+        if resp.clicked() {
+            if let Some(url) = &hover_link {
+                open_url(url);
             }
         }
 
@@ -958,6 +998,63 @@ fn encode_mouse(enc: vt100::MouseProtocolEncoding, cb: u8, col: u16, row: u16, p
     }
 }
 
+/// 用系统默认浏览器打开 URL。
+fn open_url(url: &str) {
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+}
+
+/// 在一行里查找 http(s) 链接，返回 (起列, 止列(含), url)。列号按屏幕单元格计。
+fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, String)> {
+    // 逐字符记录 (起始列, 字符)；宽字符续格跳过
+    let mut chars: Vec<(u16, char)> = Vec::new();
+    let mut col = 0u16;
+    while col < cols {
+        let wide = screen.cell(row, col).is_some_and(|c| c.is_wide());
+        match screen.cell(row, col) {
+            Some(c) if c.is_wide_continuation() => {}
+            Some(c) => chars.push((col, c.contents().chars().next().unwrap_or(' '))),
+            None => chars.push((col, ' ')),
+        }
+        col += if wide { 2 } else { 1 };
+    }
+    let text: String = chars.iter().map(|(_, c)| *c).collect();
+    let mut urls = Vec::new();
+    let mut byte = 0usize;
+    while let Some(rel) = text[byte..].find("http") {
+        let start = byte + rel;
+        let rest = &text[start..];
+        if rest.starts_with("http://") || rest.starts_with("https://") {
+            // 扩展到空白或明显的分隔符为止
+            let mut end = start;
+            for (k, ch) in rest.char_indices() {
+                if ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '`' | '|') {
+                    break;
+                }
+                end = start + k + ch.len_utf8();
+            }
+            let url = text[start..end]
+                .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '!' | '?'))
+                .to_string();
+            let ulen = url.chars().count();
+            if ulen > 0 {
+                let start_char = text[..start].chars().count();
+                let sc = chars[start_char.min(chars.len() - 1)].0;
+                let ec = chars[(start_char + ulen - 1).min(chars.len() - 1)].0;
+                urls.push((sc, ec, url));
+            }
+            byte = end;
+        } else {
+            byte = start + 4;
+        }
+    }
+    urls
+}
+
 fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> TextFormat {
     let mut fg = vt_color(c.fgcolor(), tc.fg, tc);
     // 反显：文字改用背景色（实际背景块在 paint_row_backgrounds 中绘制）
@@ -1029,6 +1126,21 @@ fn xterm256(i: u8, tc: &TermColors) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_urls_in_row() {
+        let mut p = vt100::Parser::new(2, 80, 0);
+        p.process(b"see https://example.com/a/b, or http://x.y/z! end");
+        let got: Vec<String> = find_row_urls(p.screen(), 0, 80).into_iter().map(|(_, _, u)| u).collect();
+        assert_eq!(got, vec!["https://example.com/a/b".to_string(), "http://x.y/z".to_string()]);
+    }
+
+    #[test]
+    fn no_url_no_match() {
+        let mut p = vt100::Parser::new(2, 80, 0);
+        p.process(b"plain text httpsomething not a url");
+        assert!(find_row_urls(p.screen(), 0, 80).is_empty());
+    }
 
     #[test]
     fn prefix_history_search() {
