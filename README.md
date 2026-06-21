@@ -35,7 +35,7 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 
 | Metric | Value |
 |---|---|
-| Binary | single file, no runtime deps / daemon — **Linux ~13 MB · macOS ~10 MB · Windows ~12 MB** (size-optimized: opt-level `s` + fat LTO + strip) |
+| Binary | single file, no runtime deps / daemon — **Linux ~12 MB · macOS ~8–9 MB · Windows ~10 MB** (size-optimized: opt-level `s` + fat LTO + strip) |
 | Idle CPU | **≈ 0%** (one idle session; system info polled every 2 s) |
 | Memory | **~80 MB** (idle, measured) — native app, **no Electron / JVM / Python** runtime; far below Electron-based clients that idle at hundreds of MB |
 
