@@ -30,6 +30,8 @@ pub enum AuthMethod {
     Password(String),
     /// 私钥文件路径（可选 passphrase）
     KeyFile { path: String, passphrase: Option<String> },
+    /// 使用本机 ssh-agent 中的私钥（SSH_AUTH_SOCK / Windows OpenSSH 命名管道）
+    Agent,
 }
 
 /// UI -> Worker 指令。

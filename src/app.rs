@@ -419,7 +419,7 @@ impl App {
                         host: parts[0].into(),
                         port,
                         username: parts[2].into(),
-                        auth: AuthMethod::KeyFile { path: parts[3].into(), passphrase: None },
+                        auth: if parts[3] == "agent" { AuthMethod::Agent } else { AuthMethod::KeyFile { path: parts[3].into(), passphrase: None } },
                         label: String::new(),
                         // 自检：ISHELL_JUMP="host|port|user|key" 时经跳板机连接
                         jump: std::env::var("ISHELL_JUMP").ok().and_then(|s| {
@@ -439,6 +439,10 @@ impl App {
         // 自检：直接打开新建表单（截图核对输入框样式）
         if std::env::var("ISHELL_DEMO_FORM").is_ok() {
             app.connect_form.open_form_for_demo();
+        }
+        // 自检：打开快速连接列表（截图核对导入按钮）
+        if std::env::var("ISHELL_DEMO_CONN").is_ok() {
+            app.connect_form.open_dialog();
         }
         // 自检：注入演示编辑器内容（截图核对代码高亮 + 多标签）
         if std::env::var("ISHELL_DEMO_EDIT").is_ok() {

@@ -10,6 +10,8 @@ use crate::theme::Palette;
 enum AuthKind {
     Password,
     Key,
+    /// 本机 ssh-agent
+    Agent,
 }
 
 #[derive(PartialEq)]
@@ -47,6 +49,8 @@ pub struct ConnectForm {
     sel: Option<usize>,
     /// 待确认删除的连接索引
     confirm_delete: Option<usize>,
+    /// 导入等操作的提示信息（中性绿色）
+    notice: Option<String>,
 }
 
 impl Default for ConnectForm {
@@ -74,6 +78,7 @@ impl Default for ConnectForm {
             saved: store::load(),
             sel: None,
             confirm_delete: None,
+            notice: None,
         }
     }
 }
@@ -174,9 +179,20 @@ impl ConnectForm {
                     self.reset_form();
                     self.mode = Mode::Form;
                 }
+                // 从 ~/.ssh/config 导入
+                if ui
+                    .add(egui::Button::new(RichText::new(format!("{}  {}", icon::DOWNLOAD_SIMPLE, crate::i18n::tr("导入 ssh/config", "Import ssh/config"))).color(Palette::TEXT)).wrap_mode(egui::TextWrapMode::Extend))
+                    .on_hover_text(crate::i18n::tr("从 ~/.ssh/config 导入主机（无密钥默认用 agent）", "Import hosts from ~/.ssh/config"))
+                    .clicked()
+                {
+                    self.import_ssh_config();
+                }
             });
         });
         ui.label(RichText::new(crate::i18n::tr("单击选择，双击连接", "Click to select, double-click to connect")).color(Palette::TEXT_DIM).size(11.0));
+        if let Some(msg) = &self.notice {
+            ui.label(RichText::new(msg).color(Palette::OK).size(11.0));
+        }
         ui.separator();
         ui.set_min_width(500.0);
 
@@ -256,6 +272,31 @@ impl ConnectForm {
         });
     }
 
+    /// 从 ~/.ssh/config 导入主机，按 名称+host 去重合并后保存。
+    fn import_ssh_config(&mut self) {
+        let imported = store::import_ssh_config();
+        if imported.is_empty() {
+            self.notice = Some(crate::i18n::tr("未找到 ~/.ssh/config 或无可导入主机", "No ~/.ssh/config hosts found").into());
+            return;
+        }
+        let mut added = 0;
+        let mut updated = 0;
+        for c in imported {
+            if let Some(slot) = self.saved.iter_mut().find(|s| s.name == c.name && s.host == c.host) {
+                *slot = c;
+                updated += 1;
+            } else {
+                self.saved.push(c);
+                added += 1;
+            }
+        }
+        store::save(&self.saved);
+        self.notice = Some(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("已导入：新增 {added}，更新 {updated}"),
+            crate::i18n::Lang::En => format!("Imported: {added} new, {updated} updated"),
+        });
+    }
+
     fn reset_form(&mut self) {
         self.name.clear();
         self.host.clear();
@@ -305,10 +346,16 @@ impl ConnectForm {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.auth, AuthKind::Password, crate::i18n::tr("密码", "Password"));
                     ui.selectable_value(&mut self.auth, AuthKind::Key, crate::i18n::tr("私钥", "Key"));
+                    ui.selectable_value(&mut self.auth, AuthKind::Agent, crate::i18n::tr("Agent", "Agent"));
                 });
                 ui.end_row();
 
                 match self.auth {
+                    AuthKind::Agent => {
+                        ui.label("");
+                        ui.label(RichText::new(crate::i18n::tr("使用本机 ssh-agent 中的私钥（先 ssh-add）", "Use keys from local ssh-agent (ssh-add first)")).color(Palette::TEXT_DIM).size(11.0));
+                        ui.end_row();
+                    }
                     AuthKind::Password => {
                         ui.label(crate::i18n::tr("密码", "Password"));
                         ui.add(egui::TextEdit::singleline(&mut self.password).desired_width(w).password(true));
@@ -357,9 +404,15 @@ impl ConnectForm {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.j_auth, AuthKind::Password, crate::i18n::tr("密码", "Password"));
                         ui.selectable_value(&mut self.j_auth, AuthKind::Key, crate::i18n::tr("私钥", "Key"));
+                        ui.selectable_value(&mut self.j_auth, AuthKind::Agent, crate::i18n::tr("Agent", "Agent"));
                     });
                     ui.end_row();
                     match self.j_auth {
+                        AuthKind::Agent => {
+                            ui.label("");
+                            ui.label(RichText::new(crate::i18n::tr("使用本机 ssh-agent", "Use local ssh-agent")).color(Palette::TEXT_DIM).size(11.0));
+                            ui.end_row();
+                        }
                         AuthKind::Password => {
                             ui.label(crate::i18n::tr("跳板密码", "Jump pwd"));
                             ui.add(egui::TextEdit::singleline(&mut self.j_password).desired_width(w).password(true));
@@ -426,7 +479,7 @@ impl ConnectForm {
         self.password = c.password;
         self.key_path = c.key_path;
         self.passphrase = c.passphrase;
-        self.auth = if c.auth_kind == "key" { AuthKind::Key } else { AuthKind::Password };
+        self.auth = match c.auth_kind.as_str() { "key" => AuthKind::Key, "agent" => AuthKind::Agent, _ => AuthKind::Password };
         self.use_jump = c.use_jump;
         self.j_host = c.jump_host;
         self.j_port = c.jump_port.to_string();
@@ -434,7 +487,7 @@ impl ConnectForm {
         self.j_password = c.jump_password;
         self.j_key_path = c.jump_key_path;
         self.j_passphrase = c.jump_passphrase;
-        self.j_auth = if c.jump_auth_kind == "key" { AuthKind::Key } else { AuthKind::Password };
+        self.j_auth = match c.jump_auth_kind.as_str() { "key" => AuthKind::Key, "agent" => AuthKind::Agent, _ => AuthKind::Password };
         self.error = None;
     }
 
@@ -450,7 +503,7 @@ impl ConnectForm {
             host: self.host.trim().to_string(),
             port: self.port.trim().parse().unwrap_or(22),
             username: self.username.trim().to_string(),
-            auth_kind: if self.auth == AuthKind::Key { "key".into() } else { "password".into() },
+            auth_kind: match self.auth { AuthKind::Key => "key".into(), AuthKind::Agent => "agent".into(), AuthKind::Password => "password".into() },
             password: self.password.clone(),
             key_path: self.key_path.trim().to_string(),
             passphrase: self.passphrase.clone(),
@@ -458,7 +511,7 @@ impl ConnectForm {
             jump_host: self.j_host.trim().to_string(),
             jump_port: self.j_port.trim().parse().unwrap_or(22),
             jump_username: self.j_username.trim().to_string(),
-            jump_auth_kind: if self.j_auth == AuthKind::Key { "key".into() } else { "password".into() },
+            jump_auth_kind: match self.j_auth { AuthKind::Key => "key".into(), AuthKind::Agent => "agent".into(), AuthKind::Password => "password".into() },
             jump_password: self.j_password.clone(),
             jump_key_path: self.j_key_path.trim().to_string(),
             jump_passphrase: self.j_passphrase.clone(),
@@ -482,6 +535,7 @@ impl ConnectForm {
         }
         let auth = match self.auth {
             AuthKind::Password => AuthMethod::Password(self.password.clone()),
+            AuthKind::Agent => AuthMethod::Agent,
             AuthKind::Key => {
                 if self.key_path.trim().is_empty() {
                     return Err(crate::i18n::tr("请填写私钥路径", "Enter key file").into());
@@ -506,6 +560,7 @@ impl ConnectForm {
             }
             let jauth = match self.j_auth {
                 AuthKind::Password => AuthMethod::Password(self.j_password.clone()),
+                AuthKind::Agent => AuthMethod::Agent,
                 AuthKind::Key => {
                     if self.j_key_path.trim().is_empty() {
                         return Err(crate::i18n::tr("请填写跳板私钥路径", "Enter jump key file").into());

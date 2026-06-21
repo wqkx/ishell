@@ -429,8 +429,56 @@ where
                 .await?
                 .success()
         }
+        AuthMethod::Agent => authenticate_agent(handle, username).await?,
     };
     Ok(ok)
+}
+
+/// 用本机 ssh-agent 中的私钥逐个尝试认证。
+async fn authenticate_agent<H>(handle: &mut Handle<H>, username: &str) -> anyhow::Result<bool>
+where
+    H: Handler,
+    H::Error: std::error::Error + Send + Sync + 'static,
+{
+    use russh::keys::agent::client::AgentClient;
+    use russh::keys::agent::AgentIdentity;
+
+    let cannot = |e: String| match crate::i18n::current() {
+        crate::i18n::Lang::Zh => format!("无法连接 ssh-agent（SSH_AUTH_SOCK 是否已设置？）：{e}"),
+        crate::i18n::Lang::En => format!("Cannot reach ssh-agent: {e}"),
+    };
+    #[cfg(unix)]
+    let mut agent = AgentClient::connect_env()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", cannot(e.to_string())))?
+        .dynamic();
+    #[cfg(windows)]
+    let mut agent = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", cannot(e.to_string())))?
+        .dynamic();
+
+    let ids = agent.request_identities().await?;
+    if ids.is_empty() {
+        anyhow::bail!("{}", crate::i18n::tr("ssh-agent 中没有可用私钥（先 ssh-add）", "No keys in ssh-agent (run ssh-add)"));
+    }
+    for id in ids {
+        let AgentIdentity::PublicKey { key, .. } = id else { continue };
+        // RSA 须用 rsa-sha2-512；其它算法 hash_alg 用 None
+        let hash_alg = if matches!(key.algorithm(), russh::keys::ssh_key::Algorithm::Rsa { .. }) {
+            Some(russh::keys::HashAlg::Sha512)
+        } else {
+            None
+        };
+        if handle
+            .authenticate_publickey_with(username, key, hash_alg, &mut agent)
+            .await?
+            .success()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 建立 TCP + SSH 握手并完成认证。可选经跳板机（ProxyJump）连接。
