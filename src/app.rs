@@ -973,11 +973,9 @@ impl eframe::App for App {
                     });
                 }
             });
-        // 右键左侧栏：语言设置
-        side.response.context_menu(|ui| {
-            ui.label(RichText::new(crate::i18n::tr("语言", "Language")).color(Palette::TEXT_DIM).size(11.0));
-            crate::i18n::language_menu(ui);
-        });
+        // 右键左侧操作栏空白处：语言设置（面板 response 默认不感知次级点击，需 interact）。
+        // 可点击行（IP/网卡/进程行）会捕获右键，故在 sidebar 内对这些行单独附加同一菜单。
+        crate::i18n::lang_context_menu(&side.response.interact(egui::Sense::click()));
         // 进程行被点击：打开详情小窗并请求详情
         if let Some((pid, pos)) = proc_click {
             let mut popup = None;
