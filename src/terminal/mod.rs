@@ -36,6 +36,12 @@ pub struct Terminal {
     utf8_pending: Vec<u8>,
     /// 外部（如「在终端 cd 到此处」）请求下一帧聚焦终端
     focus_req: bool,
+    /// 会话日志：开启后把远端原始字节追加写入该文件（typescript 式）
+    log_file: Option<std::fs::File>,
+    /// 关键字高亮（ERROR/WARN 等）开关
+    highlight: bool,
+    /// 由 OSC 7 解析到的当前工作目录（用于断线重连后恢复）
+    osc7_cwd: Option<String>,
 }
 
 /// 终端搜索状态。
@@ -116,7 +122,15 @@ impl Terminal {
             held_btn: None,
             utf8_pending: Vec::new(),
             focus_req: false,
+            log_file: None,
+            highlight: true,
+            osc7_cwd: None,
         }
+    }
+
+    /// 由 OSC 7 解析到的当前工作目录（若 shell 上报）。
+    pub fn cwd(&self) -> Option<&str> {
+        self.osc7_cwd.as_deref()
     }
 
     /// 收集终端全部行文本（含回滚缓冲）。会临时改动 scrollback 并复原。
@@ -274,6 +288,15 @@ impl Terminal {
 
     /// 喂入来自远程的原始字节。
     pub fn feed(&mut self, bytes: &[u8]) {
+        // 会话日志：原样落盘（可用 cat 回放）
+        if let Some(f) = &mut self.log_file {
+            use std::io::Write;
+            let _ = f.write_all(bytes);
+        }
+        // OSC 7 上报的工作目录（shell 配置后会发；用于断线重连恢复 cwd）
+        if let Some(p) = parse_osc7(bytes) {
+            self.osc7_cwd = Some(p);
+        }
         // 合并上次暂存的不完整 UTF-8 前缀，并把本次结尾不完整的多字节序列暂存到下次，
         // 避免一个中文字符被拆在两个数据块里导致乱码。
         let mut data = std::mem::take(&mut self.utf8_pending);
@@ -587,6 +610,8 @@ impl Terminal {
             }
             // 逐格绘制字形：固定网格定位，避免 CJK / 宽字符的字形步进破坏对齐。
             // 空内容（含宽字符的续格）跳过；宽字符自身在本格绘制，自然跨两格。
+            // 关键字高亮：覆盖匹配单元格的文字颜色
+            let hl = if self.highlight { highlight_colors(screen, row, self.cols) } else { Vec::new() };
             for col in 0..self.cols {
                 let Some(c) = screen.cell(row, col) else { continue };
                 let s = c.contents();
@@ -594,6 +619,7 @@ impl Terminal {
                     continue;
                 }
                 let fmt = cell_format(c, &font, &tc);
+                let color = hl.get(col as usize).copied().flatten().unwrap_or(fmt.color);
                 let x = origin.x + col as f32 * char_w;
                 if c.is_wide() {
                     // 全角字符（中文等）占 2 格：在两格内水平+纵向居中。
@@ -605,11 +631,11 @@ impl Terminal {
                         egui::Align2::CENTER_CENTER,
                         s,
                         wfont,
-                        fmt.color,
+                        color,
                     );
                 } else {
                     // 半角字符：纵向居中，使 1.2× 行高的额外留白上下均分
-                    painter.text(egui::pos2(x, y + char_h / 2.0), egui::Align2::LEFT_CENTER, s, font.clone(), fmt.color);
+                    painter.text(egui::pos2(x, y + char_h / 2.0), egui::Align2::LEFT_CENTER, s, font.clone(), color);
                 }
                 if fmt.underline.width > 0.0 {
                     // 下划线落在居中字形的底部附近
@@ -669,6 +695,7 @@ impl Terminal {
         // Ctrl+C/X/V 转成这些事件而不再下发按键）。这里只处理右键菜单。
         let mut do_copy = false;
         let mut do_paste = false;
+        let mut start_log = false;
         resp.context_menu(|ui| {
             let sel = self.has_selection();
             if ui.add_enabled(sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
@@ -689,9 +716,30 @@ impl Terminal {
                 self.dark = !self.dark;
                 ui.close();
             }
+            if ui.checkbox(&mut self.highlight, crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN")).clicked() {
+                ui.close();
+            }
+            ui.separator();
+            // 会话日志录制
+            if self.log_file.is_some() {
+                if ui.button(crate::i18n::tr("停止录制日志", "Stop recording")).clicked() {
+                    self.log_file = None;
+                    ui.close();
+                }
+            } else if ui.button(crate::i18n::tr("录制会话日志…", "Record session log…")).clicked() {
+                start_log = true;
+                ui.close();
+            }
             ui.separator();
             ui.menu_button(crate::i18n::tr("语言", "Language"), crate::i18n::language_menu);
         });
+        if start_log {
+            if let Some(path) = rfd::FileDialog::new().set_file_name("session.log").save_file() {
+                if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    self.log_file = Some(f);
+                }
+            }
+        }
         if do_copy {
             if let Some(t) = self.selected_text() {
                 ui.ctx().copy_text(t);
@@ -1008,6 +1056,106 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
 }
 
+/// 解析 OSC 7（`ESC ] 7 ; file://host/path BEL|ST`），返回最后一个上报的本地路径。
+fn parse_osc7(data: &[u8]) -> Option<String> {
+    let pat = b"\x1b]7;";
+    let mut result = None;
+    let mut i = 0;
+    while i + pat.len() <= data.len() {
+        let Some(rel) = data[i..].windows(pat.len()).position(|w| w == pat) else { break };
+        let start = i + rel + pat.len();
+        let mut end = start;
+        while end < data.len() {
+            if data[end] == 0x07 || (data[end] == 0x1b && data.get(end + 1) == Some(&b'\\')) {
+                break;
+            }
+            end += 1;
+        }
+        if end >= data.len() {
+            break; // 序列不完整
+        }
+        if let Ok(s) = std::str::from_utf8(&data[start..end]) {
+            if let Some(rest) = s.strip_prefix("file://") {
+                // 去掉 host 段，取从第一个 '/' 起的路径并做 percent 解码
+                if let Some(slash) = rest.find('/') {
+                    result = Some(percent_decode(&rest[slash..]));
+                }
+            }
+        }
+        i = end + 1;
+    }
+    result
+}
+
+/// 简单 percent 解码（%XX -> 字节）。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 关键字高亮规则（小写匹配子串 -> 颜色）。red=错误，orange=警告。
+const HL_RULES: &[(&str, Color32)] = &[
+    ("error", Color32::from_rgb(0xd0, 0x40, 0x40)),
+    ("fatal", Color32::from_rgb(0xd0, 0x40, 0x40)),
+    ("panic", Color32::from_rgb(0xd0, 0x40, 0x40)),
+    ("fail", Color32::from_rgb(0xd0, 0x40, 0x40)),
+    ("warn", Color32::from_rgb(0xc8, 0x8a, 0x20)),
+];
+
+/// 计算一行各单元格的高亮覆盖色（None=不覆盖）。关键字为 ASCII，按 1 列/字符。
+fn highlight_colors(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<Option<Color32>> {
+    let mut chars: Vec<(u16, char)> = Vec::new();
+    let mut col = 0u16;
+    while col < cols {
+        let wide = screen.cell(row, col).is_some_and(|c| c.is_wide());
+        match screen.cell(row, col) {
+            Some(c) if c.is_wide_continuation() => {}
+            Some(c) => chars.push((col, c.contents().chars().next().unwrap_or(' '))),
+            None => chars.push((col, ' ')),
+        }
+        col += if wide { 2 } else { 1 };
+    }
+    let text: String = chars.iter().map(|(_, c)| *c).collect();
+    let lower = text.to_lowercase();
+    let mut out = vec![None; cols as usize];
+    for (kw, color) in HL_RULES {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(kw) {
+            let start = from + rel;
+            let start_char = text[..start].chars().count();
+            for k in 0..kw.chars().count() {
+                if let Some(&(c, _)) = chars.get(start_char + k) {
+                    out[c as usize] = Some(*color);
+                }
+            }
+            from = start + kw.len();
+        }
+    }
+    out
+}
+
 /// 在一行里查找 http(s) 链接，返回 (起列, 止列(含), url)。列号按屏幕单元格计。
 fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, String)> {
     // 逐字符记录 (起始列, 字符)；宽字符续格跳过
@@ -1126,6 +1274,24 @@ fn xterm256(i: u8, tc: &TermColors) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc7_parsing() {
+        let data = b"\x1b]7;file://host/home/user/%E4%B8%AD%E6%96%87\x07";
+        assert_eq!(parse_osc7(data).as_deref(), Some("/home/user/\u{4e2d}\u{6587}"));
+        assert_eq!(parse_osc7(b"no osc here"), None);
+    }
+
+    #[test]
+    fn highlight_keywords() {
+        let mut p = vt100::Parser::new(2, 80, 0);
+        p.process(b"INFO ok then ERROR boom and WARN x");
+        let hl = highlight_colors(p.screen(), 0, 80);
+        let txt = "INFO ok then ERROR boom and WARN x";
+        assert!(hl[txt.find("ERROR").unwrap()].is_some());
+        assert!(hl[txt.find("WARN").unwrap()].is_some());
+        assert!(hl[0].is_none()); // INFO 不在规则内
+    }
 
     #[test]
     fn detect_urls_in_row() {

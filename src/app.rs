@@ -55,6 +55,10 @@ struct Session {
     reconnect_at: Option<std::time::Instant>,
     /// 已自动重连次数
     reconnect_tries: u32,
+    /// 由 OSC 7 记录的终端工作目录（断线重连后用于 cd 恢复）
+    last_cwd: String,
+    /// 重连后待恢复 cwd
+    restore_cwd: bool,
 }
 
 /// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
@@ -102,6 +106,12 @@ impl Session {
                     self.reconnect_tries = 0;
                     self.reconnect_at = None;
                     self.status = crate::i18n::tr("已连接", "Connected").into();
+                    // 重连后恢复工作目录（若断线前由 OSC 7 记录过）
+                    if self.restore_cwd && !self.last_cwd.is_empty() {
+                        let quoted = format!("'{}'", self.last_cwd.replace('\'', "'\\''"));
+                        let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("cd {quoted}\r").into_bytes()));
+                    }
+                    self.restore_cwd = false;
                     // 断线前被中断的传输：重连后用新通道重发，底层据本地/远端已有字节自动续传
                     for t in &mut self.transfers {
                         if !t.paused {
@@ -141,7 +151,12 @@ impl Session {
                         self.status = format!("{} · {}", self.status, tail);
                     }
                 }
-                WorkerEvent::TerminalData(bytes) => self.terminal.feed(&bytes),
+                WorkerEvent::TerminalData(bytes) => {
+                    self.terminal.feed(&bytes);
+                    if let Some(c) = self.terminal.cwd() {
+                        self.last_cwd = c.to_string();
+                    }
+                }
                 WorkerEvent::SysInfo(info) => {
                     // 历史曲线记录当前选中网卡（空=全部）的速率
                     let (rx, tx) = if self.selected_nic.is_empty() {
@@ -689,6 +704,8 @@ impl App {
             was_connected: false,
             reconnect_at: None,
             reconnect_tries: 0,
+            last_cwd: String::new(),
+            restore_cwd: false,
         });
         self.active = Some(self.sessions.len() - 1);
     }
@@ -709,6 +726,7 @@ impl App {
         s.forwards.clear();
         s.pending_hostkey = None;
         s.reconnect_at = None;
+        s.restore_cwd = true; // 重连成功后尝试 cd 回 last_cwd（保留不清空）
         s.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
     }
 
