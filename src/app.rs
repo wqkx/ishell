@@ -1381,67 +1381,50 @@ impl App {
                                     let pointer = ui.input(|i| i.pointer.interact_pos());
                                     let drag_down = ui.input(|i| i.pointer.any_down());
                                     let ctx = ui.ctx().clone();
+                                    let body_font = egui::TextStyle::Body.resolve(ui.style());
                                     let mut acc = 0.0f32; // 目标布局累计左边界
                                     for (i, s) in self.sessions.iter().enumerate() {
+                                        let selected = active == Some(i);
+                                        // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
+                                        let title_w = ctx.fonts_mut(|f| f.layout_no_wrap(s.title.clone(), body_font.clone(), Palette::TEXT).rect.width());
+                                        let w = 58.0 + title_w;
                                         let target = acc;
                                         let id = egui::Id::new(("tabx", s.uid));
                                         let dragging_this = drag_down && dragging_tab == Some(i);
                                         let x = if dragging_this {
-                                            // 跟手：光标 - 抓取偏移；dur=0 直接置位并刷新动画状态
                                             let want = pointer.map(|p| p.x - origin.x - grab_dx).unwrap_or(target);
-                                            ctx.animate_value_with_time(id, want, 0.0)
+                                            ctx.animate_value_with_time(id, want, 0.0) // 跟手
                                         } else {
                                             ctx.animate_value_with_time(id, target, 0.14) // 缓动到目标槽
                                         };
-                                        let place = egui::Rect::from_min_size(egui::pos2(origin.x + x, origin.y), egui::vec2(400.0, tab_h));
-                                        let selected = active == Some(i);
-                                        let fill = if dragging_this {
-                                            Palette::ACCENT_SOFT
-                                        } else if selected {
-                                            Palette::PANEL
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        };
-                                        let inner = ui.scope_builder(
-                                            egui::UiBuilder::new().max_rect(place).layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                            |ui| {
-                                                egui::Frame::new()
-                                                    .fill(fill)
-                                                    .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
-                                                    .inner_margin(egui::Margin::symmetric(9, 4))
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal(|ui| {
-                                                            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
-                                                            let color = if s.connected { Palette::OK } else { Palette::WARN };
-                                                            ui.painter().circle_filled(dot.center(), 4.0, color);
-                                                            let title = RichText::new(&s.title).color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
-                                                            let tr = ui
-                                                                .add(egui::Label::new(title).selectable(false).sense(Sense::click_and_drag()))
-                                                                .on_hover_text(s.tip.as_str());
-                                                            if tr.clicked() {
-                                                                to_activate = Some(i);
-                                                            }
-                                                            if tr.middle_clicked() {
-                                                                to_close = Some(i);
-                                                            }
-                                                            if tr.drag_started() {
-                                                                drag_start = Some(i);
-                                                                if let Some(p) = pointer {
-                                                                    new_grab = Some(p.x - (origin.x + x)); // 记录抓取偏移
-                                                                }
-                                                            }
-                                                            if ui
-                                                                .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
-                                                                .on_hover_text(crate::i18n::tr("关闭会话", "Close session"))
-                                                                .clicked()
-                                                            {
-                                                                to_close = Some(i);
-                                                            }
-                                                        });
-                                                    });
-                                            },
-                                        );
-                                        let w = inner.response.rect.width();
+                                        let tab_rect = egui::Rect::from_min_size(egui::pos2(origin.x + x, origin.y), egui::vec2(w, tab_h));
+                                        // 交互：整张标签可点击（激活）/拖动（排序）；关闭区在上层优先
+                                        let resp = ui.interact(tab_rect, egui::Id::new(("tab", s.uid)), Sense::click_and_drag()).on_hover_text(s.tip.as_str());
+                                        let close_rect = egui::Rect::from_center_size(egui::pos2(tab_rect.right() - 18.0, tab_rect.center().y), egui::vec2(18.0, 18.0));
+                                        let close_resp = ui.interact(close_rect, egui::Id::new(("tabclose", s.uid)), Sense::click());
+                                        // 绘制
+                                        let fill = if dragging_this { Palette::ACCENT_SOFT } else if selected { Palette::PANEL } else { egui::Color32::TRANSPARENT };
+                                        let p = ui.painter();
+                                        p.rect_filled(tab_rect, egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, fill);
+                                        p.circle_filled(egui::pos2(tab_rect.left() + 14.0, tab_rect.center().y), 4.0, if s.connected { Palette::OK } else { Palette::WARN });
+                                        let tcolor = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
+                                        p.text(egui::pos2(tab_rect.left() + 25.0, tab_rect.center().y), egui::Align2::LEFT_CENTER, &s.title, body_font.clone(), tcolor);
+                                        let xcolor = if close_resp.hovered() { Palette::DANGER } else { Palette::TEXT_DIM };
+                                        p.text(close_rect.center(), egui::Align2::CENTER_CENTER, icon::X, egui::FontId::proportional(12.0), xcolor);
+                                        // 事件：关闭优先于激活
+                                        if close_resp.clicked() {
+                                            to_close = Some(i);
+                                        } else if resp.clicked() {
+                                            to_activate = Some(i);
+                                        } else if resp.middle_clicked() {
+                                            to_close = Some(i);
+                                        }
+                                        if resp.drag_started() {
+                                            drag_start = Some(i);
+                                            if let Some(pp) = pointer {
+                                                new_grab = Some(pp.x - (origin.x + x));
+                                            }
+                                        }
                                         // 命中用「目标槽」位置，稳定判断拖到哪个槽
                                         tab_rects.push((i, egui::Rect::from_min_size(egui::pos2(origin.x + target, origin.y), egui::vec2(w, tab_h))));
                                         acc += w + spacing;
