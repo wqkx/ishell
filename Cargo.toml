@@ -5,8 +5,9 @@ edition = "2021"
 description = "现代化 Rust SSH 客户端，仿 FinalShell 布局（系统信息 + 终端 + SFTP 文件管理）"
 
 [dependencies]
-# GUI（GPU 渲染的即时模式框架）
-eframe = { version = "0.34", default-features = true }
+# GUI（GPU 渲染的即时模式框架）。仅保留原生所需特性：glow 渲染 + 默认字体 + x11/wayland，
+# 去掉 accesskit(a11y)、web 屏幕阅读、persistence 等，缩减体积（本应用自管配置持久化）。
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 egui = "0.34"
 egui_extras = "0.34"  # 表格 + 轻量代码高亮（不启用 syntect，避免常驻大内存）
 egui-phosphor = "0.12" # 图标字体（对应 egui 0.34）
@@ -67,7 +68,8 @@ rfd = "0.17"
 winresource = "0.1"
 
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level = "s"   # 优化体积（GUI 仅事件驱动重绘，活跃渲染影响可忽略）
+lto = true        # fat LTO：更激进的跨 crate 内联与死代码消除
 codegen-units = 1
 strip = true
+# 保留 panic = unwind：某个传输/worker 任务 panic 不至于整应用崩溃
