@@ -44,6 +44,10 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 # 看图工具 + 自检截图：仅启用少数常见格式的纯 Rust 解码器以控制体积（不含 webp 等较大依赖）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
 
+# 文件夹压缩下载：远端 tar.gz 打包后下载，本地用纯 Rust 解包（不依赖系统 tar）
+tar = "0.4"
+flate2 = "1"
+
 # 工具
 anyhow = "1"
 log = "0.4"

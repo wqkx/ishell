@@ -53,7 +53,7 @@ fn start_xfer(
             Ok(sftp) => {
                 let sftp = Arc::new(sftp);
                 match p {
-                    PendingXfer::Download { id, remote, local } => download(sftp, id, remote, local, &s, cancel).await,
+                    PendingXfer::Download { id, remote, local } => download(h.clone(), sftp, id, remote, local, &s, cancel).await,
                     PendingXfer::Upload { id, local, remote_dir } => upload(sftp.as_ref(), id, local, remote_dir, &s, cancel).await,
                 }
             }
@@ -570,6 +570,39 @@ async fn exec_capture(handle: &Handle<ClientHandler>, cmd: &str) -> anyhow::Resu
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// 执行命令，返回 (退出码, stderr)。
+async fn exec_status(handle: &Handle<ClientHandler>, cmd: &str) -> anyhow::Result<(i32, String)> {
+    let mut channel = handle.channel_open_session().await?;
+    channel.exec(true, cmd).await?;
+    let mut code = -1i32;
+    let mut err = Vec::new();
+    // 注意：ExitStatus 通常在 Eof 之前到达，但不能在 Eof 处提前 break，
+    // 否则可能漏掉退出码；这里一直读到通道关闭（wait 返回 None）。
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::ExtendedData { data, ext } if ext == 1 => err.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
+            _ => {}
+        }
+    }
+    Ok((code, String::from_utf8_lossy(&err).into_owned()))
+}
+
+/// POSIX 单引号转义，用于把路径安全嵌入 shell 命令。
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 本地解压 tar.gz 到 dest 目录（纯 Rust，不依赖系统 tar）。
+fn extract_tar_gz(path: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    let f = std::fs::File::open(path)?;
+    let gz = flate2::read::GzDecoder::new(f);
+    let mut ar = tar::Archive::new(gz);
+    std::fs::create_dir_all(dest)?;
+    ar.unpack(dest)?;
+    Ok(())
+}
+
 /// 读取远程目录，返回（规范化后的绝对路径, 条目列表）。目录在前、按名排序。
 async fn list_dir(
     sftp: &russh_sftp::client::SftpSession,
@@ -603,7 +636,73 @@ async fn list_dir(
 
 /// 下载（单文件或整个目录）并上报进度。大文件用多个并发分段读取流水线化，
 /// 抵消 SFTP「单请求等一个往返」的吞吐瓶颈（高延迟链路上提速明显）。
+/// 压缩下载一个目录：远端 tar.gz 打包到临时文件 → 单文件并发下载 → 本地解包。
+/// 进度按压缩包字节上报。返回 Err 表示不支持/失败（上层回退到逐文件）。
+async fn download_dir_compressed(
+    handle: &Arc<Handle<ClientHandler>>,
+    sftp: &Arc<russh_sftp::client::SftpSession>,
+    id: u64,
+    remote: &str,
+    local: &str,
+    sink: &UiSink,
+    cancel: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let name = basename(remote);
+    let parent = remote_parent(remote);
+    let tmp_remote = format!("/tmp/.ishell_dl_{id}.tar.gz");
+
+    // 远端打包（czf：gzip 默认级别；-C 进入父目录，仅打包目标目录名）
+    let cmd = format!("tar czf {} -C {} {}", sh_quote(&tmp_remote), sh_quote(&parent), sh_quote(&name));
+    let (code, err) = exec_status(handle, &cmd).await?;
+    if code != 0 {
+        let _ = exec_status(handle, &format!("rm -f {}", sh_quote(&tmp_remote))).await;
+        anyhow::bail!("tar 打包失败（{code}）：{err}");
+    }
+    let size = sftp.metadata(&tmp_remote).await.ok().and_then(|m| m.size).unwrap_or(0);
+    sink.send(WorkerEvent::TransferStart { id, name: name.clone(), total: size, dir: crate::proto::TransferDir::Download });
+
+    // 下载压缩包到本地临时文件（并发分段 + 进度）
+    let local_tgz = std::path::PathBuf::from(format!("{local}.ishelldl.tgz"));
+    let done = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let prog = {
+        let (d, s, st) = (done.clone(), sink.clone(), stop.clone());
+        tokio::spawn(async move {
+            let mut last = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let v = d.load(Ordering::Relaxed);
+                if v != last {
+                    last = v;
+                    s.send(WorkerEvent::TransferProgress { id, done: v });
+                }
+                if st.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        })
+    };
+    let dl = download_file(sftp, &tmp_remote, &local_tgz, size, cancel, &done).await;
+    stop.store(true, Ordering::Relaxed);
+    let _ = prog.await;
+    // 清理远端临时包（无论成败）
+    let _ = exec_status(handle, &format!("rm -f {}", sh_quote(&tmp_remote))).await;
+    dl?;
+    sink.send(WorkerEvent::TransferProgress { id, done: size });
+
+    // 本地解包到 local 的父目录（归档顶层即目录名，解包后落在 local）
+    let dest = std::path::Path::new(local)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let tgz = local_tgz.clone();
+    tokio::task::spawn_blocking(move || extract_tar_gz(&tgz, &dest)).await??;
+    let _ = std::fs::remove_file(&local_tgz);
+    Ok(())
+}
+
 async fn download(
+    handle: Arc<Handle<ClientHandler>>,
     sftp: Arc<russh_sftp::client::SftpSession>,
     id: u64,
     remote: String,
@@ -613,6 +712,26 @@ async fn download(
 ) {
     let name = basename(&remote);
     let is_dir = sftp.metadata(&remote).await.map(|m| m.is_dir()).unwrap_or(false);
+
+    // 目录优先走压缩下载（远端 tar.gz 打包 → 单文件并发下载 → 本地解包），
+    // 大幅减少多小文件的逐个 SFTP 往返；任何失败则回退到逐文件下载。
+    if is_dir {
+        match download_dir_compressed(&handle, &sftp, id, &remote, &local, sink, &cancel).await {
+            Ok(()) => {
+                sink.send(WorkerEvent::TransferDone {
+                    id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已下载 {name}"), crate::i18n::Lang::En => format!("Downloaded {name}") }, refresh_dir: None,
+                });
+                return;
+            }
+            Err(e) => {
+                if cancel.load(Ordering::Relaxed) {
+                    sink.send(WorkerEvent::TransferDone { id, ok: false, message: crate::i18n::tr("已取消", "Canceled").into(), refresh_dir: None });
+                    return;
+                }
+                log::warn!("压缩下载失败，回退逐文件：{e}");
+            }
+        }
+    }
 
     let res: anyhow::Result<()> = async {
         // 收集待下载文件：(远程绝对路径, 本地路径, 大小)
