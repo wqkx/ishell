@@ -220,6 +220,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     let n_lines = ed.content.split('\n').count().max(1);
     let gw = n_lines.to_string().len();
     let line_nums: String = (1..=n_lines).map(|i| format!("{i:>gw$}")).collect::<Vec<_>>().join("\n");
+    // 让编辑区至少撑满窗口高度（内容不足一屏时也填满，点击空白处可定位光标）。
+    let row_h = ui.ctx().fonts_mut(|f| f.row_height(&egui::FontId::monospace(13.0)));
+    let fill_rows = (((ui.available_height() - 6.0) / row_h).floor() as usize).max(8);
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -232,7 +235,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             let out = egui::TextEdit::multiline(&mut ed.content)
                 .code_editor()
                 .desired_width(f32::INFINITY)
-                .desired_rows(24)
+                .desired_rows(fill_rows)
                 .id(text_id)
                 .layouter(&mut layouter)
                 .show(ui);
