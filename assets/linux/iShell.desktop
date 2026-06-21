@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=iShell
+GenericName=SSH Client
+Comment=Modern Rust SSH client — terminal + SFTP + monitoring
+Exec=@EXEC@
+Icon=ishell
+Terminal=false
+Categories=Network;RemoteAccess;FileTransfer;System;
+Keywords=SSH;SFTP;Terminal;Remote;Shell;
+StartupWMClass=iShell
+StartupNotify=true
