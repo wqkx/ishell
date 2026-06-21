@@ -495,6 +495,9 @@ impl App {
         if std::env::var("ISHELL_DEMO_DELETE").is_ok() {
             app.connect_form.open_delete_demo();
         }
+        if std::env::var("ISHELL_DEMO_LIST").is_ok() {
+            app.connect_form.open_list_demo();
+        }
         // 自检：注入演示编辑器内容（截图核对代码高亮 + 多标签）
         if std::env::var("ISHELL_DEMO_EDIT").is_ok() {
             if let Some((server, tx)) = app.sessions.first().map(|s| (s.title.clone(), s.cmd_tx.clone())) {

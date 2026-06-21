@@ -54,6 +54,13 @@ pub struct SavedConnection {
     pub jump_key_path: String,
     #[serde(default)]
     pub jump_passphrase: String,
+    // —— 组织 ——
+    /// 分组（文件夹）名；空表示「未分组」
+    #[serde(default)]
+    pub group: String,
+    /// 标签（逗号分隔，自由文本），参与搜索
+    #[serde(default)]
+    pub tags: String,
 }
 
 fn default_auth() -> String {
@@ -506,6 +513,8 @@ fn parse_ssh_config_text(text: &str, default_user: &str) -> Vec<SavedConnection>
             jump_password: String::new(),
             jump_key_path: String::new(),
             jump_passphrase: String::new(),
+            group: crate::i18n::tr("导入", "Imported").to_string(),
+            tags: String::new(),
         });
     }
     out

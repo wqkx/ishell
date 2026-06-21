@@ -34,6 +34,11 @@ pub struct ConnectForm {
     key_path: String,
     passphrase: String,
     auth: AuthKind,
+    /// 分组与标签（组织用）
+    group: String,
+    tags: String,
+    /// 快速连接列表的搜索过滤词
+    search: String,
     // —— 跳板机 ——
     use_jump: bool,
     j_host: String,
@@ -68,6 +73,9 @@ impl Default for ConnectForm {
             key_path: String::new(),
             passphrase: String::new(),
             auth: AuthKind::Password,
+            group: String::new(),
+            tags: String::new(),
+            search: String::new(),
             use_jump: false,
             j_host: String::new(),
             j_port: "22".into(),
@@ -114,6 +122,22 @@ impl ConnectForm {
             mk("db", "db.internal", "root", "agent"),
             mk("gw", "gw.example.com", "admin", "password"),
         ]);
+    }
+
+    /// 自检：打开分组列表（仅供截图）。
+    pub fn open_list_demo(&mut self) {
+        self.open = true;
+        self.mode = Mode::List;
+        let mk = |n: &str, h: &str, u: &str, g: &str, t: &str| SavedConnection {
+            name: n.into(), host: h.into(), port: 22, username: u.into(), group: g.into(), tags: t.into(), ..Default::default()
+        };
+        self.saved = vec![
+            mk("生产 Web", "10.0.0.5", "deploy", "生产环境", "web,nginx"),
+            mk("生产 DB", "10.0.0.9", "root", "生产环境", "db,mysql"),
+            mk("测试机", "192.168.1.20", "test", "测试环境", "qa"),
+            mk("跳板机", "gw.example.com", "admin", "测试环境", "bastion"),
+            mk("家里 NAS", "192.168.50.2", "nas", "", "home"),
+        ];
     }
 
     /// 自检：打开删除确认对话框（仅供截图）。
@@ -284,6 +308,21 @@ impl ConnectForm {
         ui.separator();
         ui.set_min_width(500.0);
 
+        // 搜索框（名称/主机/用户/分组/标签）
+        if !self.saved.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
+                let clear_w = if self.search.is_empty() { 0.0 } else { 22.0 };
+                ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(ui.available_width() - clear_w - 4.0).hint_text(crate::i18n::tr("搜索名称/主机/用户/分组/标签", "Search name/host/user/group/tags")));
+                if !self.search.is_empty()
+                    && ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked()
+                {
+                    self.search.clear();
+                }
+            });
+            ui.add_space(2.0);
+        }
+
         egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
             if self.saved.is_empty() {
                 ui.add_space(20.0);
@@ -292,11 +331,49 @@ impl ConnectForm {
                 });
                 return;
             }
+            // 过滤
+            let q = self.search.trim().to_lowercase();
+            let mut filtered: Vec<usize> = self
+                .saved
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    q.is_empty()
+                        || c.name.to_lowercase().contains(&q)
+                        || c.host.to_lowercase().contains(&q)
+                        || c.username.to_lowercase().contains(&q)
+                        || c.group.to_lowercase().contains(&q)
+                        || c.tags.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if filtered.is_empty() {
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(crate::i18n::tr("无匹配", "No match")).color(Palette::TEXT_DIM));
+                });
+                return;
+            }
+            // 按（是否未分组, 分组名, 名称）排序：命名分组在前、未分组在后
+            filtered.sort_by_key(|&i| {
+                let c = &self.saved[i];
+                (c.group.is_empty(), c.group.to_lowercase(), c.name.to_lowercase())
+            });
+
             let mut connect_idx = None;
             let mut edit_idx = None;
             let mut del_idx = None;
             let mut sel_idx = None;
-            for (i, c) in self.saved.iter().enumerate() {
+            let mut cur_group: Option<String> = None;
+            for &i in &filtered {
+                let c = &self.saved[i];
+                // 分组标题（分组变化时插入一行）
+                if cur_group.as_deref() != Some(c.group.as_str()) {
+                    cur_group = Some(c.group.clone());
+                    let label = if c.group.is_empty() { crate::i18n::tr("未分组", "Ungrouped").to_string() } else { c.group.clone() };
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("{}  {}", icon::FOLDER, label)).strong().color(Palette::TEXT_DIM).size(12.0));
+                }
                 let selected = self.sel == Some(i);
                 // 预分配固定行高，整行可点击；高亮仅覆盖本行
                 let row_h = 30.0;
@@ -403,6 +480,8 @@ impl ConnectForm {
         self.key_path.clear();
         self.passphrase.clear();
         self.auth = AuthKind::Password;
+        self.group.clear();
+        self.tags.clear();
         self.use_jump = false;
         self.j_host.clear();
         self.j_port = "22".into();
@@ -437,6 +516,14 @@ impl ConnectForm {
 
                 ui.label(crate::i18n::tr("用户名", "User"));
                 ui.add(egui::TextEdit::singleline(&mut self.username).desired_width(w));
+                ui.end_row();
+
+                ui.label(crate::i18n::tr("分组", "Group"));
+                ui.add(egui::TextEdit::singleline(&mut self.group).desired_width(w).hint_text(crate::i18n::tr("可留空，用于归类", "Optional folder")));
+                ui.end_row();
+
+                ui.label(crate::i18n::tr("标签", "Tags"));
+                ui.add(egui::TextEdit::singleline(&mut self.tags).desired_width(w).hint_text(crate::i18n::tr("逗号分隔，参与搜索", "Comma-separated, searchable")));
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("认证方式", "Auth"));
@@ -577,6 +664,8 @@ impl ConnectForm {
         self.key_path = c.key_path;
         self.passphrase = c.passphrase;
         self.auth = match c.auth_kind.as_str() { "key" => AuthKind::Key, "agent" => AuthKind::Agent, _ => AuthKind::Password };
+        self.group = c.group;
+        self.tags = c.tags;
         self.use_jump = c.use_jump;
         self.j_host = c.jump_host;
         self.j_port = c.jump_port.to_string();
@@ -612,6 +701,8 @@ impl ConnectForm {
             jump_password: self.j_password.clone(),
             jump_key_path: self.j_key_path.trim().to_string(),
             jump_passphrase: self.j_passphrase.clone(),
+            group: self.group.trim().to_string(),
+            tags: self.tags.trim().to_string(),
         };
         if let Some(slot) = self.saved.iter_mut().find(|c| c.name == name && c.host == entry.host) {
             *slot = entry;
