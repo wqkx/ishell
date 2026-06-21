@@ -37,6 +37,9 @@ serde_json = "1"
 chacha20poly1305 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
+# 系统钥匙串（存放加密主密钥）：Linux Secret Service / macOS Keychain / Windows 凭据管理器；
+# 不可用时回退到本地 key 文件。zbus 已被其它依赖引入，增量体积有限。
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 
 # 看图工具 + 自检截图：仅启用少数常见格式的纯 Rust 解码器以控制体积（不含 webp 等较大依赖）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }

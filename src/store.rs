@@ -81,17 +81,94 @@ fn config_path() -> Option<PathBuf> {
 // ---------- 密钥与加解密 ----------
 
 /// 读取本地密钥；不存在则随机生成并以 0600 写入。
+const KEYCHAIN_SERVICE: &str = "ishell";
+const KEYCHAIN_USER: &str = "master-key";
+
+/// 钥匙串是否可用：Linux 上必须有 D-Bus 会话总线，否则跳过（避免无总线时阻塞）。
+fn keychain_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+            return true;
+        }
+        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+            return std::path::Path::new(&rt).join("bus").exists();
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// 在限定时间内执行可能阻塞的钥匙串操作；超时则放弃（线程将自行结束/泄漏一次，因主密钥已缓存）。
+fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
+}
+
+fn keychain_entry() -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).ok()
+}
+
+/// 从系统钥匙串读取 32 字节主密钥（base64 存储）。
+fn keychain_get_key() -> Option<[u8; 32]> {
+    if !keychain_available() {
+        return None;
+    }
+    let s = with_timeout(|| keychain_entry()?.get_password().ok())??;
+    let b = STANDARD.decode(s).ok()?;
+    (b.len() == 32).then(|| {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&b);
+        k
+    })
+}
+
+/// 写入系统钥匙串；成功返回 true。
+fn keychain_set_key(k: &[u8; 32]) -> bool {
+    if !keychain_available() {
+        return false;
+    }
+    let v = STANDARD.encode(k);
+    with_timeout(move || keychain_entry().and_then(|e| e.set_password(&v).ok()).is_some()).unwrap_or(false)
+}
+
+/// 进程内缓存的主密钥（仅加载一次，避免反复访问钥匙串）。
+static MASTER_KEY: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+
+/// 取（或创建）加密主密钥。优先系统钥匙串；不可用时回退到本地 `key` 文件（0600）。
 fn load_or_create_key() -> Option<[u8; 32]> {
+    *MASTER_KEY.get_or_init(compute_master_key)
+}
+
+fn compute_master_key() -> Option<[u8; 32]> {
+    // 1) 系统钥匙串优先
+    if let Some(k) = keychain_get_key() {
+        return Some(k);
+    }
     let path = config_dir()?.join("key");
+    // 2) 迁移：旧 key 文件 → 钥匙串；确认可读回后删除明文文件
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() == 32 {
             let mut k = [0u8; 32];
             k.copy_from_slice(&bytes);
+            if keychain_set_key(&k) && keychain_get_key() == Some(k) {
+                let _ = std::fs::remove_file(&path);
+            }
             return Some(k);
         }
     }
+    // 3) 新建密钥：优先存钥匙串，不可用则落本地文件（保持旧行为）
     let mut k = [0u8; 32];
     getrandom::getrandom(&mut k).ok()?;
+    if keychain_set_key(&k) {
+        return Some(k);
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
