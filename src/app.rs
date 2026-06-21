@@ -645,6 +645,10 @@ impl App {
                 s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, spec: None, paused: false, done: 73_400_320, total: 104_857_600, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
                 s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, spec: None, paused: false, done: 2048, total: 2048, ok: Some(true), local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
                 s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, spec: None, paused: false, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                // 自检：再塞一批，验证滚动
+                for i in 4..16u64 {
+                    s.transfers.push(Transfer { id: i, name: format!("file_{i}.dat"), dir: Download, spec: None, paused: false, done: i * 1000, total: 20000, ok: if i % 3 == 0 { Some(true) } else { None }, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                }
             }
             app.show_transfers = true;
         }
@@ -2130,7 +2134,9 @@ impl App {
                     ui.label(RichText::new(crate::i18n::tr("暂无传输任务", "No transfers")).color(Palette::TEXT_DIM).size(12.0));
                 }
                 let mut open_dir: Option<String> = None;
-                for t in s.transfers.iter().rev().take(20) {
+                // 列表过长时滚动：约 8 条高度封顶，其余可滚动查看
+                egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true]).show(ui, |ui| {
+                for t in s.transfers.iter().rev().take(50) {
                     // 下载=绿色，上传=珊瑚橙，颜色区分方向
                     let (dir_icon, dir_col) = match t.dir {
                         crate::proto::TransferDir::Download => (icon::DOWNLOAD_SIMPLE, Palette::OK),
@@ -2260,6 +2266,7 @@ impl App {
                     });
                     ui.add_space(4.0);
                 }
+                });
                 if let Some(p) = open_dir {
                     open_containing_folder(&p);
                 }
