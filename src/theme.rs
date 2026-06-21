@@ -123,14 +123,24 @@ pub fn apply(ctx: &egui::Context) {
 /// 尝试加载系统中常见的中文字体，让远程中文输出/文件名正常显示。
 fn install_fonts(ctx: &egui::Context) {
     let candidates = [
+        // Linux：Noto CJK / 文泉驿
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        // macOS：苹方为主，附带多种系统中文字体作后备（不同 macOS 版本路径/字体不尽相同）
         "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        // Windows：微软雅黑 / 黑体 / 宋体
         "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyh.ttf",
         "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
     ];
 
     let mut fonts = egui::FontDefinitions::default();
@@ -138,15 +148,18 @@ fn install_fonts(ctx: &egui::Context) {
     // Phosphor 图标字体（按钮/文件类型图标）
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
-    // 系统中文字体（作为各字体族的后备）
-    if let Some((path, data)) = candidates
-        .iter()
-        .find_map(|p| std::fs::read(p).ok().map(|d| (*p, d)))
-    {
-        log::info!("加载中文字体：{path}");
-        // 选简体（SC）字面作为各字体族的「后备」：英文/ASCII 仍走系统默认等宽字体
+    // 系统中文字体（作为各字体族的后备）。
+    // 逐个候选读取，并**校验该字面确实能渲染汉字「中」**——避免选到一个不含 CJK 字形的
+    // 字面（如 macOS 上字体集合的家族名被本地化为「苹方-简」时旧逻辑按 "SC" 匹配会落空），
+    // 那种情况下中文会全部显示为「口」字方块。
+    if let Some((path, data, idx)) = candidates.iter().find_map(|p| {
+        let data = std::fs::read(p).ok()?;
+        let idx = cjk_face_index(&data)?; // None = 该文件无可渲染汉字的字面，跳过
+        Some((*p, data, idx))
+    }) {
+        log::info!("加载中文字体：{path}（face #{idx}）");
+        // 选含汉字的字面作为各字体族的「后备」：英文/ASCII 仍走系统默认等宽字体
         // （终端英文更好看），仅缺字（中文）时回退到该 CJK 字体。
-        let idx = cjk_face_index(&data);
         let mut fd = egui::FontData::from_owned(data);
         fd.index = idx;
         // 中文（Noto CJK 等）的垂直度量比 Latin 字体更高、字面更满，按钮上会显得偏大且靠下。
@@ -167,28 +180,37 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 取字体集合中某个字面的 Family 名（name_id=1）。
-fn face_family(data: &[u8], index: u32) -> Option<String> {
-    let face = ttf_parser::Face::parse(data, index).ok()?;
+/// 取某个字面的 Family 名（name_id=1）。
+fn face_family(face: &ttf_parser::Face) -> Option<String> {
     face.names()
         .into_iter()
         .filter(|n| n.name_id == ttf_parser::name_id::FAMILY)
         .find_map(|n| n.to_string())
 }
 
-/// 选择普通（非 Mono）CJK 字面索引；优先简体（SC），否则第一个非 Mono 面，再不行用 0。
-fn cjk_face_index(data: &[u8]) -> u32 {
+/// 在字体集合中挑出**确实能渲染汉字**的字面索引。
+/// 必要条件：该字面含汉字「中」的字形（直接按字形表校验，不靠家族名——因为
+/// macOS 苹方等字体家族名可能被本地化为「苹方-简」，按 "SC" 匹配会落空）。
+/// 偏好顺序：简体且非 Mono > 非 Mono > 任意含汉字的字面。返回 None 表示该文件不含 CJK。
+fn cjk_face_index(data: &[u8]) -> Option<u32> {
     let n = ttf_parser::fonts_in_collection(data).unwrap_or(1);
-    let mut first_non_mono = None;
+    let mut any_cjk = None; // 任意能渲染「中」的字面
+    let mut non_mono = None; // 能渲染「中」且非 Mono
     for i in 0..n {
-        let Some(fam) = face_family(data, i) else { continue };
-        if fam.contains("Mono") {
+        let Ok(face) = ttf_parser::Face::parse(data, i) else { continue };
+        // 关键校验：该字面必须能渲染汉字，否则中文会是「口」字方块
+        if face.glyph_index('中').is_none() {
             continue;
         }
-        if fam.contains("SC") {
-            return i;
+        any_cjk.get_or_insert(i);
+        let fam = face_family(&face).unwrap_or_default();
+        if fam.contains("Mono") {
+            continue; // 等宽 CJK 面字距偏大，UI 上不优先
         }
-        first_non_mono.get_or_insert(i);
+        if fam.contains("SC") || fam.contains('简') {
+            return Some(i); // 优先简体
+        }
+        non_mono.get_or_insert(i);
     }
-    first_non_mono.unwrap_or(0)
+    non_mono.or(any_cjk)
 }
