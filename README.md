@@ -35,7 +35,7 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 
 | Metric | Value |
 |---|---|
-| Binary | single file, no runtime deps / daemon — **Linux ~23 MB · macOS ~14–16 MB · Windows ~20 MB** |
+| Binary | single file, no runtime deps / daemon — **Linux ~13 MB · macOS ~10 MB · Windows ~12 MB** (size-optimized: opt-level `s` + fat LTO + strip) |
 | Idle CPU | **≈ 0%** (one idle session; system info polled every 2 s) |
 | Memory | **~80 MB** (idle, measured) — native app, **no Electron / JVM / Python** runtime; far below Electron-based clients that idle at hundreds of MB |
 
@@ -44,28 +44,36 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 ## 🚀 Features
 
 **Connections & sessions**
-- Multi-session tabs: status dots, drag-to-reorder, overflow fade, close confirmation
-- Saved connections (**passwords encrypted locally** with ChaCha20-Poly1305) + a quick-connect list
-- **Auto-reconnect** on drop (exponential backoff) + manual reconnect
+- Multi-session tabs: status dots, **smooth drag-to-reorder animation**, overflow fade, close confirmation
+- **Authentication**: password, key file, or **SSH agent** (`SSH_AUTH_SOCK` / Windows OpenSSH pipe)
+- **Import `~/.ssh/config`** (pick which hosts; Host / HostName / User / Port / IdentityFile / ProxyJump)
+- **Groups / tags / search** for saved connections
+- Saved-password key stored in the **OS keychain** (Secret Service / Keychain / Credential Manager), with an encrypted-file fallback
+- **Auto-reconnect** on drop (exponential backoff) + manual reconnect; **restores working dir** (OSC 7) on reconnect
 - **Host-key verification** (known_hosts + trust-on-first-use, anti-MITM)
 
 **Terminal**
 - vt100 / 256-color, scrollback, Tab completion, focus locking
 - **Selection copy / right-click copy & paste / Ctrl+Shift+C·V**, **Ctrl+scroll to resize font**
+- **Clickable URLs**, **ERROR/WARN keyword highlighting**, **session logging** to file
 - **Content search** (Ctrl+Shift+F, full scrollback, match highlighting)
 - **Prefix + Up/Down** per-session history search
-- Dark / light terminal toggle
+- Dark / light terminal toggle; full CJK / IME input
 
 **Tunneling & batch**
 - **Port forwarding**: local forward + dynamic SOCKS5 proxy
 - **Jump host / ProxyJump**: reach internal targets through a bastion
 - **Command broadcast**: send a command to every connected session at once
 
-**Files & monitoring**
-- SFTP: tree + list, **click a header to sort by name / size / time** (size & time default to descending — largest / newest first), drag-and-drop upload, download (incl. **recursive folders**), chmod / rename / delete / copy path, optional default download folder
-- **Concurrent transfers** (up to 6 per server; different servers are independent), **cancellable mid-transfer**, click a failed item to see why
+**Files & transfers**
+- SFTP: tree + list, **name filter**, **click a header to sort by name / size / time** (size & time default to descending), drag-and-drop upload, **"open this dir in terminal"**, chmod / rename / delete / copy path, optional default download folder
+- **Resumable transfers**: byte-level resume + auto-retry on transient errors; **auto-resume after reconnect** with a pause/resume/retry queue
+- **Folder compress-download**: tar.gz on the server, single-file parallel download, pure-Rust unpack — fast for many small files
+- **Concurrent transfers** (up to 6 per server; independent across servers), cancellable mid-transfer
 - **Tabbed text editor** (its own OS window): **line numbers**, syntax highlighting, find & replace, large-file read-only virtualization (switchable to editable)
-- **Lightweight image viewer** (its own OS window): double-click a `png / jpg / gif / bmp` to open — zoom (scroll), pan (drag), fit / 1:1, save-as; pure-Rust decoders keep the binary small
+- **Lightweight image viewer** (its own OS window): double-click a `png / jpg / gif / bmp` — zoom / pan / fit / 1:1 / save-as
+
+**Monitoring**
 - Live monitor: CPU / memory / swap, **GPU (NVIDIA / AMD / Intel)**, network graph, disks, top processes (click for details + kill -9)
 
 ## 📸 Screenshots
