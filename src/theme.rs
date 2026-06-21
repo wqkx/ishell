@@ -145,6 +145,13 @@ fn install_fonts(ctx: &egui::Context) {
         let idx = cjk_face_index(&data);
         let mut fd = egui::FontData::from_owned(data);
         fd.index = idx;
+        // 中文（Noto CJK 等）的垂直度量比 Latin 字体更高、字面更满，按钮上会显得偏大且靠下。
+        // 略缩小并上移，使中英文在同一行/按钮内大小观感一致、垂直居中。
+        fd.tweak = egui::FontTweak {
+            scale: 0.92,
+            y_offset_factor: -0.06,
+            ..Default::default()
+        };
         fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(fd));
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             fonts.families.entry(family).or_default().push("cjk".to_owned());
