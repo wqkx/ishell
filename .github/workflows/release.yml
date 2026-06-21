@@ -46,11 +46,41 @@ jobs:
         shell: bash
         run: cp "target/${{ matrix.target }}/release/ishell${{ matrix.ext }}" "${{ matrix.asset }}"
 
+      # macOS：把裸二进制打包成带图标的 .app，使其在「访达 / 启动台」显示 logo 并可正常启动。
+      # .app 是目录，用 ditto 压成单文件上传（保留结构与权限）。同时保留裸二进制供 CLI 使用。
+      - name: Bundle macOS .app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          APP="iShell.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/ishell" "$APP/Contents/MacOS/ishell"
+          chmod +x "$APP/Contents/MacOS/ishell"
+          # 由 256px PNG 生成多尺寸 icns（启动台/程序坞实际用 ≤256，足够清晰）
+          mkdir icon.iconset
+          for s in 16 32 128 256; do
+            sips -z $s $s assets/icon.png --out "icon.iconset/icon_${s}x${s}.png" >/dev/null
+            d=$((s*2)); sips -z $d $d assets/icon.png --out "icon.iconset/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+          # 版本号取自 tag（去掉前缀 v）；非法/缺失时回退
+          VER="${GITHUB_REF_NAME#v}"; case "$VER" in ""|*[!0-9.]*) VER="0.0.0";; esac
+          sed "s/__VERSION__/$VER/g" assets/macos/Info.plist > "$APP/Contents/Info.plist"
+          ditto -c -k --keepParent "$APP" "${{ matrix.asset }}.app.zip"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
+
+      - name: Upload macOS .app
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}.app.zip
+          path: ${{ matrix.asset }}.app.zip
 
   release:
     needs: build
