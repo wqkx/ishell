@@ -1014,27 +1014,30 @@ impl eframe::App for App {
         // 3) 左侧操作栏：独立全高区域
         let mut proc_click: Option<(u32, egui::Pos2)> = None;
         let mut gpu_click: Option<egui::Pos2> = None;
-        let side = egui::Panel::left("sidebar")
+        egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(300.0)
             .size_range(220.0..=460.0)
             .frame(egui::Frame::new().fill(Palette::PANEL).inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 }))
-            .show_inside(ui, |ui| match self.active {
-                Some(idx) if idx < self.sessions.len() => {
-                    let s = &mut self.sessions[idx];
-                    sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click, &mut gpu_click);
-                }
-                _ => {
-                    ui.add_space(16.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(egui_phosphor::regular::PLUGS).size(28.0).color(Palette::TEXT_DIM));
-                        ui.label(RichText::new(crate::i18n::tr("未连接", "Not connected")).color(Palette::TEXT_DIM));
-                    });
+            .show_inside(ui, |ui| {
+                // 背景层右键弹语言菜单：在子控件之前注册，置于最底层 z 序，
+                // 这样不会抢走进程行/网卡/IP 等子控件的左键；空白处右键仍可触发。
+                let bg = ui.interact(ui.max_rect(), ui.id().with("sidebar_bg"), egui::Sense::click());
+                crate::i18n::lang_context_menu(&bg);
+                match self.active {
+                    Some(idx) if idx < self.sessions.len() => {
+                        let s = &mut self.sessions[idx];
+                        sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click, &mut gpu_click);
+                    }
+                    _ => {
+                        ui.add_space(16.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new(egui_phosphor::regular::PLUGS).size(28.0).color(Palette::TEXT_DIM));
+                            ui.label(RichText::new(crate::i18n::tr("未连接", "Not connected")).color(Palette::TEXT_DIM));
+                        });
+                    }
                 }
             });
-        // 右键左侧操作栏空白处：语言设置（面板 response 默认不感知次级点击，需 interact）。
-        // 可点击行（IP/网卡/进程行）会捕获右键，故在 sidebar 内对这些行单独附加同一菜单。
-        crate::i18n::lang_context_menu(&side.response.interact(egui::Sense::click()));
         // 进程行被点击：打开详情小窗并请求详情
         if let Some((pid, pos)) = proc_click {
             let mut popup = None;
