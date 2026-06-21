@@ -1355,9 +1355,17 @@ impl App {
                                 .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
+                                        let drag_down = ui.input(|i| i.pointer.any_down());
                                         for (i, s) in self.sessions.iter().enumerate() {
                                             let selected = self.active == Some(i);
-                                            let fill = if selected { Palette::PANEL } else { egui::Color32::TRANSPARENT };
+                                            let dragging_this = drag_down && self.dragging_tab == Some(i);
+                                            let fill = if dragging_this {
+                                                Palette::ACCENT_SOFT // 被拖动的标签高亮「拎起」
+                                            } else if selected {
+                                                Palette::PANEL
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            };
                                             let inner = egui::Frame::new()
                                                 .fill(fill)
                                                 .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
@@ -1406,19 +1414,24 @@ impl App {
                             if off + vw < cw - 0.5 {
                                 edge_fade(ui.painter(), out.inner_rect, false, Palette::PANEL_2);
                             }
-                            // 拖拽排序：记录起点，松开时按指针所在标签确定目标位置
+                            // 拖拽排序：实时跟手——拖动到其它标签上方即刻交换位置，
+                            // 不再等松手才生硬地跳过去。交换后被拖标签落到目标位，
+                            // 指针仍在其上方（to==from）故不会来回抖动。
                             if let Some(f) = drag_start {
                                 self.dragging_tab = Some(f);
                             }
-                            if ui.input(|i| i.pointer.any_released()) {
-                                if let Some(from) = self.dragging_tab.take() {
+                            if let Some(from) = self.dragging_tab {
+                                if ui.input(|i| i.pointer.any_down()) {
                                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                                         if let Some(&(to, _)) = tab_rects.iter().find(|(_, r)| r.contains(pos)) {
                                             if to != from {
                                                 reorder = Some((from, to));
+                                                self.dragging_tab = Some(to); // 跟随到新位置
                                             }
                                         }
                                     }
+                                } else {
+                                    self.dragging_tab = None; // 松手结束
                                 }
                             }
                         });
