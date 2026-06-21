@@ -42,6 +42,8 @@ pub struct FilePanelState {
     /// 列表排序键 + 是否降序
     pub sort_key: SortKey,
     pub sort_desc: bool,
+    /// 按名称过滤当前目录列表（不区分大小写子串匹配）
+    pub filter: String,
     /// 「复制路径」按钮的成功反馈时刻（短暂显示对勾）
     pub copy_flash: Option<f64>,
     /// 面包屑单击导航的延后执行（路径, 单击时刻）——给双击编辑留判定窗口
@@ -133,6 +135,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState) -> Vec<FileAction> {
     if state.cwd != state.synced_cwd {
         sync_tree(state, &mut actions);
         state.synced_cwd = state.cwd.clone();
+        state.filter.clear(); // 切目录后清空过滤
     }
 
     // 左侧目录树（自带浅色卡片，与右侧留出空隙）
@@ -426,6 +429,33 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     }
 
     let cwd = state.cwd.clone();
+    let total_count = state.listings.get(&cwd).map(|e| e.len()).unwrap_or(0);
+
+    // 名称过滤行
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM).size(12.0));
+        let clear_w = if state.filter.is_empty() { 0.0 } else { 22.0 };
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut state.filter)
+                .desired_width(ui.available_width() - clear_w - 4.0)
+                .hint_text(crate::i18n::tr("按名称过滤", "Filter by name")),
+        );
+        if resp.changed() {
+            // 过滤变化会改变行索引，清空选择避免错位
+            state.selected.clear();
+            state.anchor = None;
+        }
+        if !state.filter.is_empty()
+            && ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
+                .on_hover_text(crate::i18n::tr("清除过滤", "Clear"))
+                .clicked()
+        {
+            state.filter.clear();
+        }
+    });
+    ui.add_space(2.0);
+
     let mut entries = match state.listings.get(&cwd) {
         Some(e) => e.clone(),
         None => return,
@@ -444,6 +474,20 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                 if desc { ord.reverse() } else { ord }
             })
         });
+    }
+    // 应用名称过滤
+    if !state.filter.trim().is_empty() {
+        let f = state.filter.to_lowercase();
+        entries.retain(|e| e.name.to_lowercase().contains(&f));
+        if entries.is_empty() {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("无匹配（共 {total_count} 项）"),
+                    crate::i18n::Lang::En => format!("No match ({total_count} items)"),
+                }).color(Palette::TEXT_DIM).size(12.0));
+            });
+        }
     }
 
     let mut navigate: Option<String> = None;
