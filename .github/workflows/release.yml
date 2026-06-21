@@ -53,7 +53,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          PKG="ishell-linux-x86_64"
+          # 包内目录用 iShell（解压后即 iShell/），避免与同名裸二进制文件冲突
+          PKG="iShell"
           mkdir -p "$PKG"
           cp "target/${{ matrix.target }}/release/ishell" "$PKG/ishell"
           chmod +x "$PKG/ishell"
