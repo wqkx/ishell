@@ -240,6 +240,9 @@ pub struct App {
     /// 看图工具：已打开的图片标签
     image_tabs: Vec<ImageTab>,
     active_image: usize,
+    /// 一次性请求：新开/切换后把对应独立窗口置前并聚焦
+    editor_focus: bool,
+    image_focus: bool,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
@@ -387,6 +390,8 @@ impl App {
             editor_close_confirm: false,
             image_tabs: Vec::new(),
             active_image: 0,
+            editor_focus: false,
+            image_focus: false,
             next_editor_id: 0,
             trim_after: None,
             show_forwards: false,
@@ -815,6 +820,7 @@ impl eframe::App for App {
             }
         }
         for (path, data, server) in new_images {
+            self.image_focus = true; // 打开/切换后聚焦看图窗口
             // 同一服务器同一图片已打开则切到该标签
             if let Some(i) = self.image_tabs.iter().position(|t| t.server == server && t.path == path) {
                 self.active_image = i;
@@ -847,6 +853,7 @@ impl eframe::App for App {
             }
         }
         for (path, content, server, tx) in new_tabs {
+            self.editor_focus = true; // 打开/切换后聚焦编辑器窗口
             // 同一服务器同一文件已打开则切到该标签
             if let Some(i) = self.editors.iter().position(|t| t.server == server && t.editor.path == path) {
                 self.active_editor = i;
@@ -1367,6 +1374,11 @@ impl App {
             .with_min_inner_size([480.0, 320.0]);
 
         ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
+            // 新开/切换文件后把本窗口置前并聚焦
+            if self.editor_focus {
+                vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.editor_focus = false;
+            }
             let mut close_tab: Option<usize> = None;
             let mut activate: Option<usize> = None;
             let mut do_save = false;
@@ -1520,6 +1532,11 @@ impl App {
             .with_min_inner_size([320.0, 240.0]);
 
         ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
+            // 新开/切换图片后把本窗口置前并聚焦
+            if self.image_focus {
+                vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.image_focus = false;
+            }
             let mut close_tab: Option<usize> = None;
             let mut activate: Option<usize> = None;
             let mut save_msg: Option<String> = None;
