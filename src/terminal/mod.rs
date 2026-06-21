@@ -34,6 +34,8 @@ pub struct Terminal {
     held_btn: Option<u8>,
     /// 跨数据块暂存的不完整 UTF-8 尾字节（避免多字节中文被拆分后乱码）
     utf8_pending: Vec<u8>,
+    /// 外部（如「在终端 cd 到此处」）请求下一帧聚焦终端
+    focus_req: bool,
 }
 
 /// 终端搜索状态。
@@ -113,6 +115,7 @@ impl Terminal {
             search_hl: None,
             held_btn: None,
             utf8_pending: Vec::new(),
+            focus_req: false,
         }
     }
 
@@ -256,6 +259,11 @@ impl Terminal {
         self.clipboard.as_mut()?.get_text().ok()
     }
 
+    /// 请求下一帧让终端区域获得键盘焦点。
+    pub fn request_focus(&mut self) {
+        self.focus_req = true;
+    }
+
     /// 喂入来自远程的原始字节。
     pub fn feed(&mut self, bytes: &[u8]) {
         // 合并上次暂存的不完整 UTF-8 前缀，并把本次结尾不完整的多字节序列暂存到下次，
@@ -393,6 +401,10 @@ impl Terminal {
         let (rect, resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
         if resp.clicked() {
             resp.request_focus();
+        }
+        if self.focus_req {
+            resp.request_focus();
+            self.focus_req = false;
         }
         let focused = resp.has_focus();
 

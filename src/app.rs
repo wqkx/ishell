@@ -758,6 +758,12 @@ impl App {
                 s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
                 let _ = s.cmd_tx.send(UiCommand::ReadImage { path });
             }
+            FileAction::CdTerminal(path) => {
+                // 以 POSIX 单引号转义路径后在终端 cd，并聚焦终端
+                let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+                let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("cd {quoted}\r").into_bytes()));
+                s.terminal.request_focus();
+            }
         }
     }
 }

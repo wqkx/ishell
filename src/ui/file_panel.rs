@@ -91,6 +91,8 @@ pub enum FileAction {
     OpenFile { path: String, force: bool },
     /// 双击图片文件 -> 打开看图工具
     OpenImage { path: String },
+    /// 在终端 cd 到该目录并聚焦终端
+    CdTerminal(String),
 }
 
 /// 是否为可用看图工具打开的常见图片扩展名。
@@ -461,6 +463,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("filelist_bg"), Sense::click());
     let mut bg_new_dir = false;
     let mut bg_new_file = false;
+    let mut bg_cd = false;
     bg.context_menu(|ui| {
         if ui.button(format!("{}  {}", icon::FOLDER_PLUS, crate::i18n::tr("新建文件夹", "New folder"))).clicked() {
             bg_new_dir = true;
@@ -469,6 +472,13 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
         if ui.button(format!("{}  {}", icon::FILE_PLUS, crate::i18n::tr("新建文件", "New file"))).clicked() {
             bg_new_file = true;
             ui.close();
+        }
+        if !state.cwd.is_empty() {
+            ui.separator();
+            if ui.button(format!("{}  {}", icon::TERMINAL_WINDOW, crate::i18n::tr("在终端打开当前目录", "Open current dir in terminal"))).clicked() {
+                bg_cd = true;
+                ui.close();
+            }
         }
     });
 
@@ -636,6 +646,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     if bg_new_file {
         state.dialog = Some(Dialog::NewFile { name: String::new() });
     }
+    if bg_cd {
+        actions.push(FileAction::CdTerminal(state.cwd.clone()));
+    }
 
     // 延时重命名触发：单击后 0.4s 内无双击则进入重命名
     if let Some((i, t)) = state.pending_rename {
@@ -735,6 +748,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
             }
             Menu::NewDir => state.dialog = Some(Dialog::NewDir { name: String::new() }),
             Menu::NewFile => state.dialog = Some(Dialog::NewFile { name: String::new() }),
+            Menu::CdHere(p) => actions.push(FileAction::CdTerminal(p)),
         }
     }
 
@@ -753,6 +767,7 @@ enum Menu {
     Delete { path: String, is_dir: bool, name: String },
     NewDir,
     NewFile,
+    CdHere(String),
 }
 
 /// 条目右键菜单：把用户选择记录到 `menu`。
@@ -775,6 +790,10 @@ fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, m
         }
         if ui.button(format!("{}  {}", icon::COPY, crate::i18n::tr("复制路径", "Copy path"))).clicked() {
             menu.push(Menu::CopyPath(full.to_string()));
+            ui.close();
+        }
+        if e.is_dir && ui.button(format!("{}  {}", icon::TERMINAL_WINDOW, crate::i18n::tr("在终端打开此目录", "Open in terminal"))).clicked() {
+            menu.push(Menu::CdHere(full.to_string()));
             ui.close();
         }
         if ui.button(format!("{}  {}", icon::LOCK_KEY, crate::i18n::tr("改权限", "Chmod"))).clicked() {
