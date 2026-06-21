@@ -15,6 +15,8 @@ use crate::ui::sidebar::{self, NetHistory};
 
 /// 单个 SSH 会话的前台状态。
 struct Session {
+    /// 稳定唯一 id（用于标签滑动动画在重排后仍追踪同一标签）
+    uid: u64,
     title: String,
     /// 悬停提示（user@host，用于标签去掉 IP 后的消歧）
     tip: String,
@@ -281,6 +283,12 @@ pub struct App {
     active: Option<usize>,
     /// 正在拖拽排序的标签源索引
     dragging_tab: Option<usize>,
+    /// 拖拽起点在标签内的横向抓取偏移（让被拖标签跟手而不跳到光标处）
+    tab_grab_dx: f32,
+    /// 标签条总宽缓存（用于撑出横向滚动内容宽度）
+    tab_total_w: f32,
+    /// 会话唯一 id 计数器（标签滑动动画用）
+    next_uid: u64,
     connect_form: ConnectForm,
     /// 默认下载目录（可在传输窗中修改，持久化）
     download_dir: std::path::PathBuf,
@@ -439,6 +447,9 @@ impl App {
             sessions: Vec::new(),
             active: None,
             dragging_tab: None,
+            tab_grab_dx: 0.0,
+            tab_total_w: 1.0,
+            next_uid: 0,
             connect_form: form,
             download_dir: crate::store::load_download_dir().map(std::path::PathBuf::from).unwrap_or_else(downloads_dir),
             show_transfers: false,
@@ -680,7 +691,9 @@ impl App {
         self.show_close_confirm = false; // 新建会话则取消退出提示
         let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg.clone());
 
+        self.next_uid += 1;
         self.sessions.push(Session {
+            uid: self.next_uid,
             title: if cfg.label.trim().is_empty() { cfg.username.clone() } else { cfg.label.trim().to_string() },
             tip: format!("{}@{}:{}", cfg.username, cfg.host, cfg.port),
             cmd_tx,
@@ -1345,93 +1358,127 @@ impl App {
                             self.show_close_confirm = false;
                         }
 
-                        // 剩余空间：标签条横向可滚动（标签多时不再与右侧按钮重叠）
+                        // 剩余空间：标签条横向可滚动；标签按动画位置放置，重排时平滑滑动。
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let mut drag_start: Option<usize> = None;
+                            let mut new_grab: Option<f32> = None;
                             let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
+                            // 先取出标量字段，避免在借用 self.sessions 的循环里再借 self
+                            let dragging_tab = self.dragging_tab;
+                            let active = self.active;
+                            let grab_dx = self.tab_grab_dx;
+                            let total_w_cache = self.tab_total_w;
                             let out = egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
                                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
                                 .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let drag_down = ui.input(|i| i.pointer.any_down());
-                                        for (i, s) in self.sessions.iter().enumerate() {
-                                            let selected = self.active == Some(i);
-                                            let dragging_this = drag_down && self.dragging_tab == Some(i);
-                                            let fill = if dragging_this {
-                                                Palette::ACCENT_SOFT // 被拖动的标签高亮「拎起」
-                                            } else if selected {
-                                                Palette::PANEL
-                                            } else {
-                                                egui::Color32::TRANSPARENT
-                                            };
-                                            let inner = egui::Frame::new()
-                                                .fill(fill)
-                                                .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
-                                                .inner_margin(egui::Margin::symmetric(9, 4))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
-                                                        let color = if s.connected { Palette::OK } else { Palette::WARN };
-                                                        ui.painter().circle_filled(dot.center(), 4.0, color);
-                                                        let title = RichText::new(&s.title)
-                                                            .color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
-                                                        // 标签标题：可点击（激活）+ 可拖拽（排序）
-                                                        let tr = ui
-                                                            .add(egui::Label::new(title).selectable(false).sense(Sense::click_and_drag()))
-                                                            .on_hover_text(s.tip.as_str());
-                                                        if tr.clicked() {
-                                                            to_activate = Some(i);
-                                                        }
-                                                        if tr.middle_clicked() {
-                                                            to_close = Some(i);
-                                                        }
-                                                        if tr.drag_started() {
-                                                            drag_start = Some(i);
-                                                        }
-                                                        // 关闭按钮：独立响应，确保可点
-                                                        if ui
-                                                            .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
-                                                            .on_hover_text(crate::i18n::tr("关闭会话", "Close session"))
-                                                            .clicked()
-                                                        {
-                                                            to_close = Some(i);
-                                                        }
+                                    let tab_h = 26.0;
+                                    let spacing = 4.0;
+                                    // 预留区域撑出滚动内容宽度（用上一帧总宽）
+                                    let (area, _) = ui.allocate_exact_size(egui::vec2(total_w_cache.max(1.0), tab_h), Sense::hover());
+                                    let origin = area.min;
+                                    let pointer = ui.input(|i| i.pointer.interact_pos());
+                                    let drag_down = ui.input(|i| i.pointer.any_down());
+                                    let ctx = ui.ctx().clone();
+                                    let mut acc = 0.0f32; // 目标布局累计左边界
+                                    for (i, s) in self.sessions.iter().enumerate() {
+                                        let target = acc;
+                                        let id = egui::Id::new(("tabx", s.uid));
+                                        let dragging_this = drag_down && dragging_tab == Some(i);
+                                        let x = if dragging_this {
+                                            // 跟手：光标 - 抓取偏移；dur=0 直接置位并刷新动画状态
+                                            let want = pointer.map(|p| p.x - origin.x - grab_dx).unwrap_or(target);
+                                            ctx.animate_value_with_time(id, want, 0.0)
+                                        } else {
+                                            ctx.animate_value_with_time(id, target, 0.14) // 缓动到目标槽
+                                        };
+                                        let place = egui::Rect::from_min_size(egui::pos2(origin.x + x, origin.y), egui::vec2(400.0, tab_h));
+                                        let selected = active == Some(i);
+                                        let fill = if dragging_this {
+                                            Palette::ACCENT_SOFT
+                                        } else if selected {
+                                            Palette::PANEL
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+                                        let inner = ui.scope_builder(
+                                            egui::UiBuilder::new().max_rect(place).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                            |ui| {
+                                                egui::Frame::new()
+                                                    .fill(fill)
+                                                    .corner_radius(egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 })
+                                                    .inner_margin(egui::Margin::symmetric(9, 4))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::hover());
+                                                            let color = if s.connected { Palette::OK } else { Palette::WARN };
+                                                            ui.painter().circle_filled(dot.center(), 4.0, color);
+                                                            let title = RichText::new(&s.title).color(if selected { Palette::TEXT } else { Palette::TEXT_DIM });
+                                                            let tr = ui
+                                                                .add(egui::Label::new(title).selectable(false).sense(Sense::click_and_drag()))
+                                                                .on_hover_text(s.tip.as_str());
+                                                            if tr.clicked() {
+                                                                to_activate = Some(i);
+                                                            }
+                                                            if tr.middle_clicked() {
+                                                                to_close = Some(i);
+                                                            }
+                                                            if tr.drag_started() {
+                                                                drag_start = Some(i);
+                                                                if let Some(p) = pointer {
+                                                                    new_grab = Some(p.x - (origin.x + x)); // 记录抓取偏移
+                                                                }
+                                                            }
+                                                            if ui
+                                                                .add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false))
+                                                                .on_hover_text(crate::i18n::tr("关闭会话", "Close session"))
+                                                                .clicked()
+                                                            {
+                                                                to_close = Some(i);
+                                                            }
+                                                        });
                                                     });
-                                                });
-                                            tab_rects.push((i, inner.response.rect));
-                                        }
-                                    });
+                                            },
+                                        );
+                                        let w = inner.response.rect.width();
+                                        // 命中用「目标槽」位置，稳定判断拖到哪个槽
+                                        tab_rects.push((i, egui::Rect::from_min_size(egui::pos2(origin.x + target, origin.y), egui::vec2(w, tab_h))));
+                                        acc += w + spacing;
+                                    }
+                                    acc // 返回总宽
                                 });
+                            let total_w = out.inner.max(1.0);
+                            self.tab_total_w = total_w;
                             // 溢出渐隐：提示左右还有被隐藏的标签
                             let off = out.state.offset.x;
                             let vw = out.inner_rect.width();
-                            let cw = out.content_size.x;
                             if off > 0.5 {
                                 edge_fade(ui.painter(), out.inner_rect, true, Palette::PANEL_2);
                             }
-                            if off + vw < cw - 0.5 {
+                            if off + vw < total_w - 0.5 {
                                 edge_fade(ui.painter(), out.inner_rect, false, Palette::PANEL_2);
                             }
-                            // 拖拽排序：实时跟手——拖动到其它标签上方即刻交换位置，
-                            // 不再等松手才生硬地跳过去。交换后被拖标签落到目标位，
-                            // 指针仍在其上方（to==from）故不会来回抖动。
+                            // 应用拖拽状态（循环外，避免与 self.sessions 借用冲突）
+                            if let Some(g) = new_grab {
+                                self.tab_grab_dx = g;
+                            }
                             if let Some(f) = drag_start {
                                 self.dragging_tab = Some(f);
                             }
+                            // 拖动过程中：指针进入其它槽即重排，其余标签缓动到新位置（平滑滑动）
                             if let Some(from) = self.dragging_tab {
                                 if ui.input(|i| i.pointer.any_down()) {
                                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                                         if let Some(&(to, _)) = tab_rects.iter().find(|(_, r)| r.contains(pos)) {
                                             if to != from {
                                                 reorder = Some((from, to));
-                                                self.dragging_tab = Some(to); // 跟随到新位置
+                                                self.dragging_tab = Some(to);
                                             }
                                         }
                                     }
                                 } else {
-                                    self.dragging_tab = None; // 松手结束
+                                    self.dragging_tab = None; // 松手：被拖标签从跟手位缓动回目标槽
                                 }
                             }
                         });
