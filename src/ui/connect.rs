@@ -51,6 +51,8 @@ pub struct ConnectForm {
     confirm_delete: Option<usize>,
     /// 导入等操作的提示信息（中性绿色）
     notice: Option<String>,
+    /// 导入 ssh/config 的候选列表（含勾选状态）；Some 时显示选择对话框
+    import_candidates: Option<Vec<(SavedConnection, bool)>>,
 }
 
 impl Default for ConnectForm {
@@ -79,6 +81,7 @@ impl Default for ConnectForm {
             sel: None,
             confirm_delete: None,
             notice: None,
+            import_candidates: None,
         }
     }
 }
@@ -97,6 +100,28 @@ impl ConnectForm {
         self.open = true;
         self.mode = Mode::Form;
         self.reset_form();
+    }
+
+    /// 自检：打开导入选择对话框（仅供截图）。
+    pub fn open_import_demo(&mut self) {
+        self.open = true;
+        self.mode = Mode::List;
+        let mk = |n: &str, h: &str, u: &str, a: &str| {
+            (SavedConnection { name: n.into(), host: h.into(), port: 22, username: u.into(), auth_kind: a.into(), ..Default::default() }, true)
+        };
+        self.import_candidates = Some(vec![
+            mk("web", "10.0.0.5", "deploy", "key"),
+            mk("db", "db.internal", "root", "agent"),
+            mk("gw", "gw.example.com", "admin", "password"),
+        ]);
+    }
+
+    /// 自检：打开删除确认对话框（仅供截图）。
+    pub fn open_delete_demo(&mut self) {
+        self.open = true;
+        self.mode = Mode::List;
+        self.saved = vec![SavedConnection { name: "生产数据库".into(), host: "10.0.0.9".into(), port: 22, username: "root".into(), ..Default::default() }];
+        self.confirm_delete = Some(0);
     }
 
     /// 渲染对话框。返回 `Some(config)` 表示用户点击了「连接」且校验通过。
@@ -128,12 +153,19 @@ impl ConnectForm {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.set_min_width(260.0);
-                    ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("确定删除连接「{name}」吗？"), crate::i18n::Lang::En => format!("Delete \"{name}\"?") });
-                    ui.add_space(10.0);
+                    ui.set_width(300.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("确认删除", "Confirm delete")).size(15.0).strong());
+                        ui.add_space(6.0);
+                        ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("确定删除连接「{name}」吗？"), crate::i18n::Lang::En => format!("Delete \"{name}\"?") });
+                    });
+                    ui.add_space(12.0);
+                    let bw = 80.0;
+                    let total = bw * 2.0 + ui.spacing().item_spacing.x;
                     ui.horizontal(|ui| {
+                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
                         if ui
-                            .add(egui::Button::new(RichText::new(crate::i18n::tr("删除", "Delete")).color(egui::Color32::WHITE)).fill(Palette::DANGER))
+                            .add(egui::Button::new(RichText::new(crate::i18n::tr("删除", "Delete")).color(egui::Color32::WHITE)).fill(Palette::DANGER).min_size(egui::vec2(bw, 0.0)))
                             .clicked()
                         {
                             if i < self.saved.len() {
@@ -143,13 +175,69 @@ impl ConnectForm {
                             self.sel = None;
                             close = true;
                         }
-                        if ui.button(crate::i18n::tr("取消", "Cancel")).clicked() {
+                        if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
                             close = true;
                         }
                     });
                 });
             if close {
                 self.confirm_delete = None;
+            }
+        }
+
+        // 导入 ssh/config 的选择对话框
+        if self.import_candidates.is_some() {
+            let mut do_import = false;
+            let mut cancel = false;
+            egui::Window::new(crate::i18n::tr("导入 ssh/config", "Import ssh/config"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_width(400.0);
+                    let cands = self.import_candidates.as_mut().unwrap();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("发现 {} 台主机，选择要导入的：", cands.len()),
+                            crate::i18n::Lang::En => format!("{} hosts found — choose to import:", cands.len()),
+                        }).color(Palette::TEXT_DIM).size(12.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let all = cands.iter().all(|(_, s)| *s);
+                            if ui.button(if all { crate::i18n::tr("全不选", "None") } else { crate::i18n::tr("全选", "All") }).clicked() {
+                                let v = !all;
+                                for c in cands.iter_mut() {
+                                    c.1 = v;
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, false]).show(ui, |ui| {
+                        for (c, sel) in cands.iter_mut() {
+                            let auth = match c.auth_kind.as_str() { "key" => "key", "agent" => "agent", _ => "pwd" };
+                            ui.checkbox(sel, format!("{}   {}@{}:{}  · {auth}", c.name, c.username, c.host, c.port));
+                        }
+                    });
+                    ui.separator();
+                    ui.add_space(8.0);
+                    let bw = 90.0;
+                    let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                    ui.horizontal(|ui| {
+                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                        let n = cands.iter().filter(|(_, s)| *s).count();
+                        let enabled = n > 0;
+                        if ui.add_enabled(enabled, egui::Button::new(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("导入选中（{n}）"), crate::i18n::Lang::En => format!("Import ({n})") }).color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            do_import = true;
+                        }
+                        if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if do_import {
+                self.apply_import();
+            } else if cancel {
+                self.import_candidates = None;
             }
         }
 
@@ -185,7 +273,7 @@ impl ConnectForm {
                     .on_hover_text(crate::i18n::tr("从 ~/.ssh/config 导入主机（无密钥默认用 agent）", "Import hosts from ~/.ssh/config"))
                     .clicked()
                 {
-                    self.import_ssh_config();
+                    self.open_import_dialog();
                 }
             });
         });
@@ -272,16 +360,25 @@ impl ConnectForm {
         });
     }
 
-    /// 从 ~/.ssh/config 导入主机，按 名称+host 去重合并后保存。
-    fn import_ssh_config(&mut self) {
+    /// 解析 ~/.ssh/config 并打开选择对话框（默认全选）。
+    fn open_import_dialog(&mut self) {
         let imported = store::import_ssh_config();
         if imported.is_empty() {
             self.notice = Some(crate::i18n::tr("未找到 ~/.ssh/config 或无可导入主机", "No ~/.ssh/config hosts found").into());
-            return;
+        } else {
+            self.import_candidates = Some(imported.into_iter().map(|c| (c, true)).collect());
         }
+    }
+
+    /// 把选中的候选项按 名称+host 去重合并后保存。
+    fn apply_import(&mut self) {
+        let Some(cands) = self.import_candidates.take() else { return };
         let mut added = 0;
         let mut updated = 0;
-        for c in imported {
+        for (c, sel) in cands {
+            if !sel {
+                continue;
+            }
             if let Some(slot) = self.saved.iter_mut().find(|s| s.name == c.name && s.host == c.host) {
                 *slot = c;
                 updated += 1;
