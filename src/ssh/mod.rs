@@ -702,6 +702,13 @@ async fn download(
 const DL_PARALLEL: u64 = 8;
 /// 每个分段一次抢占的字节数。
 const DL_CHUNK: u64 = 1024 * 1024;
+/// 单个文件传输遇到瞬时错误时的最大额外重试次数（配合断点续传）。
+const XFER_RETRIES: u32 = 3;
+
+/// 第 attempt 次重试前的退避时长（300ms·2^n，封顶约 4.8s）。
+fn xfer_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(300u64 * (1u64 << attempt.min(4)))
+}
 
 /// 下载单个文件：大文件按偏移并发分段读取，定位写入本地，显著提升高延迟链路吞吐。
 async fn download_file(
@@ -712,14 +719,116 @@ async fn download_file(
     cancel: &Arc<AtomicBool>,
     done: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-
     if let Some(parent) = lpath.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // 小文件（或大小未知）：单流顺序读取，免去并发开销
+    // 小文件（或大小未知）：单流顺序读取；瞬时失败整体重试（重新建文件）。
     if size <= DL_CHUNK {
+        let mut attempt = 0u32;
+        loop {
+            match download_small(sftp, rpath, lpath, cancel, done).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if cancel.load(Ordering::Relaxed) || attempt >= XFER_RETRIES {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(xfer_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+
+    // 大文件：预分配，按偏移并发分段；用「分段完成位图」实现断点续传——
+    // 重试时只补未完成的分段，已完成分段既不重下也不重复计入进度。
+    let n_chunks = size.div_ceil(DL_CHUNK);
+    let out = Arc::new(std::fs::File::create(lpath)?);
+    out.set_len(size)?;
+    let chunk_done: Arc<Vec<AtomicBool>> = Arc::new((0..n_chunks).map(|_| AtomicBool::new(false)).collect());
+
+    let mut attempt = 0u32;
+    loop {
+        let cursor = Arc::new(AtomicU64::new(0)); // 本轮分段游标
+        let workers = DL_PARALLEL.min(n_chunks.max(1));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..workers {
+            let (sftp, out, cursor, done, cancel, chunk_done) =
+                (sftp.clone(), out.clone(), cursor.clone(), done.clone(), cancel.clone(), chunk_done.clone());
+            let rpath = rpath.to_string();
+            set.spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                let mut rf = sftp.open(&rpath).await?;
+                let mut buf = vec![0u8; DL_CHUNK as usize];
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        anyhow::bail!("canceled");
+                    }
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    if idx >= n_chunks {
+                        break;
+                    }
+                    if chunk_done[idx as usize].load(Ordering::Relaxed) {
+                        continue; // 上一轮已完成
+                    }
+                    let off = idx * DL_CHUNK;
+                    let want = std::cmp::min(DL_CHUNK, size - off) as usize;
+                    rf.seek(std::io::SeekFrom::Start(off)).await?;
+                    let mut got = 0usize;
+                    while got < want {
+                        let n = rf.read(&mut buf[got..want]).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        got += n;
+                    }
+                    if got != want {
+                        anyhow::bail!("short read");
+                    }
+                    pwrite(&out, &buf[..want], off)?;
+                    chunk_done[idx as usize].store(true, Ordering::Relaxed);
+                    done.fetch_add(want as u64, Ordering::Relaxed); // 每段只计一次
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+        let mut first_err: Option<anyhow::Error> = None;
+        while let Some(r) = set.join_next().await {
+            match r {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e.into());
+                }
+            }
+        }
+        if chunk_done.iter().all(|b| b.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("canceled");
+        }
+        if attempt >= XFER_RETRIES {
+            return Err(first_err.unwrap_or_else(|| anyhow::anyhow!("incomplete transfer")));
+        }
+        attempt += 1;
+        tokio::time::sleep(xfer_backoff(attempt)).await;
+    }
+}
+
+/// 小文件顺序下载；失败时回退本次已计入的进度字节，便于上层整体重试不重复计数。
+async fn download_small(
+    sftp: &Arc<russh_sftp::client::SftpSession>,
+    rpath: &str,
+    lpath: &std::path::Path,
+    cancel: &Arc<AtomicBool>,
+    done: &Arc<AtomicU64>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut added = 0u64;
+    let res: anyhow::Result<()> = async {
         let mut rf = sftp.open(rpath).await?;
         let mut lf = tokio::fs::File::create(lpath).await?;
         let mut buf = vec![0u8; 128 * 1024];
@@ -733,57 +842,16 @@ async fn download_file(
             }
             lf.write_all(&buf[..n]).await?;
             done.fetch_add(n as u64, Ordering::Relaxed);
+            added += n as u64;
         }
         lf.flush().await?;
-        return Ok(());
+        Ok(())
     }
-
-    // 大文件：预分配，按偏移并发分段；各分段定位写入（pwrite）
-    let out = std::fs::File::create(lpath)?;
-    out.set_len(size)?;
-    let out = Arc::new(out);
-    let cursor = Arc::new(AtomicU64::new(0));
-
-    let mut set = tokio::task::JoinSet::new();
-    for _ in 0..DL_PARALLEL {
-        let sftp = sftp.clone();
-        let out = out.clone();
-        let cursor = cursor.clone();
-        let done = done.clone();
-        let cancel = cancel.clone();
-        let rpath = rpath.to_string();
-        set.spawn(async move {
-            let mut rf = sftp.open(&rpath).await?;
-            let mut buf = vec![0u8; DL_CHUNK as usize];
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    anyhow::bail!("canceled");
-                }
-                let off = cursor.fetch_add(DL_CHUNK, Ordering::Relaxed);
-                if off >= size {
-                    break;
-                }
-                let want = std::cmp::min(DL_CHUNK, size - off) as usize;
-                rf.seek(std::io::SeekFrom::Start(off)).await?; // 仅本地置位，无往返
-                let mut got = 0usize;
-                while got < want {
-                    let n = rf.read(&mut buf[got..want]).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    got += n;
-                }
-                pwrite(&out, &buf[..got], off)?;
-                done.fetch_add(got as u64, Ordering::Relaxed);
-            }
-            Ok::<(), anyhow::Error>(())
-        });
+    .await;
+    if res.is_err() {
+        done.fetch_sub(added, Ordering::Relaxed); // 回退，避免重试重复累加
     }
-    // 任一分段失败（含取消）则整体失败；JoinSet 析构会中止其余分段
-    while let Some(r) = set.join_next().await {
-        r??;
-    }
-    Ok(())
+    res
 }
 
 /// 在指定偏移定位写入（跨平台）。
@@ -816,7 +884,6 @@ async fn upload(
     sink: &UiSink,
     cancel: Arc<AtomicBool>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let name = basename(&local);
     let is_dir = tokio::fs::metadata(&local).await.map(|m| m.is_dir()).unwrap_or(false);
 
@@ -861,30 +928,26 @@ async fn upload(
             let _ = sftp.create_dir(d.clone()).await;
         }
 
-        let mut buf = vec![0u8; 128 * 1024];
-        let (mut done, mut last) = (0u64, 0u64);
-        for (lpath, rpath, _sz) in files {
-            let mut lf = tokio::fs::File::open(&lpath).await?;
-            let mut rf = sftp.create(&rpath).await?;
+        // 逐文件上传：每个文件可断点续传 + 瞬时失败自动重试。
+        let mut done_base = 0u64; // 已完成文件累计字节
+        let last = AtomicU64::new(0); // 上次上报点（跨文件单调）
+        for (lpath, rpath, sz) in files {
+            let mut attempt = 0u32;
             loop {
-                if cancel.load(Ordering::Relaxed) {
-                    anyhow::bail!("canceled");
-                }
-                let n = lf.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                rf.write_all(&buf[..n]).await?;
-                done += n as u64;
-                if done - last >= 256 * 1024 {
-                    last = done;
-                    sink.send(WorkerEvent::TransferProgress { id, done });
+                match upload_file_once(sftp, &lpath, &rpath, &cancel, done_base, id, sink, &last).await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if cancel.load(Ordering::Relaxed) || attempt >= XFER_RETRIES {
+                            return Err(e);
+                        }
+                        attempt += 1;
+                        tokio::time::sleep(xfer_backoff(attempt)).await;
+                    }
                 }
             }
-            rf.flush().await?;
-            rf.shutdown().await?;
+            done_base += sz;
+            sink.send(WorkerEvent::TransferProgress { id, done: done_base });
         }
-        sink.send(WorkerEvent::TransferProgress { id, done });
         Ok(())
     }
     .await;
@@ -901,6 +964,61 @@ async fn upload(
             sink.send(WorkerEvent::TransferDone { id, ok: false, message, refresh_dir: None });
         }
     }
+}
+
+/// 上传单个文件：以远端已有大小为起点续传；带进度节流上报。
+async fn upload_file_once(
+    sftp: &russh_sftp::client::SftpSession,
+    lpath: &std::path::Path,
+    rpath: &str,
+    cancel: &Arc<AtomicBool>,
+    done_base: u64,
+    id: u64,
+    sink: &UiSink,
+    last: &AtomicU64,
+) -> anyhow::Result<()> {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let local_size = tokio::fs::metadata(lpath).await.map(|m| m.len()).unwrap_or(0);
+    // 远端已存在的字节数作为续传起点（仅当不超过本地大小才续传，否则从头覆盖）
+    let remote_size = sftp.metadata(rpath).await.ok().and_then(|m| m.size).unwrap_or(0);
+    let start = if remote_size > 0 && remote_size <= local_size { remote_size } else { 0 };
+
+    // 续传(start>0)保留已传字节；从头(start==0)则 TRUNCATE 覆盖，避免残留旧尾部
+    let flags = if start > 0 {
+        OpenFlags::CREATE | OpenFlags::WRITE
+    } else {
+        OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE
+    };
+    let mut rf = sftp.open_with_flags(rpath, flags).await?;
+    rf.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut lf = tokio::fs::File::open(lpath).await?;
+    if start > 0 {
+        lf.seek(std::io::SeekFrom::Start(start)).await?;
+    }
+
+    let mut buf = vec![0u8; 128 * 1024];
+    let mut pos = start;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("canceled");
+        }
+        let n = lf.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        rf.write_all(&buf[..n]).await?;
+        pos += n as u64;
+        let done = done_base + pos;
+        if done.saturating_sub(last.load(Ordering::Relaxed)) >= 256 * 1024 {
+            last.store(done, Ordering::Relaxed);
+            sink.send(WorkerEvent::TransferProgress { id, done });
+        }
+    }
+    rf.flush().await?;
+    rf.shutdown().await?;
+    Ok(())
 }
 
 fn basename(path: &str) -> String {
