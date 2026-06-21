@@ -710,6 +710,18 @@ fn xfer_backoff(attempt: u32) -> Duration {
     Duration::from_millis(300u64 * (1u64 << attempt.min(4)))
 }
 
+/// 断点信息 sidecar 路径：`<local>.ishellpart`。
+fn part_path(lpath: &std::path::Path) -> std::path::PathBuf {
+    let mut p = lpath.as_os_str().to_os_string();
+    p.push(".ishellpart");
+    std::path::PathBuf::from(p)
+}
+
+/// 容纳 n 个分段标志位所需的字节数。
+fn bitmap_len(n_chunks: u64) -> usize {
+    n_chunks.div_ceil(8) as usize
+}
+
 /// 下载单个文件：大文件按偏移并发分段读取，定位写入本地，显著提升高延迟链路吞吐。
 async fn download_file(
     sftp: &Arc<russh_sftp::client::SftpSession>,
@@ -741,11 +753,56 @@ async fn download_file(
     }
 
     // 大文件：预分配，按偏移并发分段；用「分段完成位图」实现断点续传——
-    // 重试时只补未完成的分段，已完成分段既不重下也不重复计入进度。
+    // 位图持久化到 sidecar（<local>.ishellpart），重连/重发后只补未完成分段。
     let n_chunks = size.div_ceil(DL_CHUNK);
-    let out = Arc::new(std::fs::File::create(lpath)?);
-    out.set_len(size)?;
-    let chunk_done: Arc<Vec<AtomicBool>> = Arc::new((0..n_chunks).map(|_| AtomicBool::new(false)).collect());
+    let part = part_path(lpath);
+
+    // 能否续传：sidecar 存在且记录大小一致、本地文件仍在 → 沿用已完成位图
+    let resume_bm: Option<Vec<u8>> = if lpath.exists() {
+        std::fs::read(&part).ok().and_then(|d| {
+            if d.len() == 8 + bitmap_len(n_chunks) && u64::from_le_bytes(d[0..8].try_into().unwrap()) == size {
+                Some(d[8..].to_vec())
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
+    let out = if resume_bm.is_some() {
+        Arc::new(std::fs::OpenOptions::new().read(true).write(true).open(lpath)?) // 续传：保留已写分段
+    } else {
+        let f = std::fs::File::create(lpath)?;
+        f.set_len(size)?;
+        Arc::new(f)
+    };
+    let chunk_done: Arc<Vec<AtomicBool>> = Arc::new(
+        (0..n_chunks)
+            .map(|i| {
+                let d = resume_bm.as_ref().is_some_and(|b| (b[(i / 8) as usize] >> (i % 8)) & 1 == 1);
+                AtomicBool::new(d)
+            })
+            .collect(),
+    );
+    // 已完成分段计入进度（续传时进度条从断点开始）
+    let pre: u64 = (0..n_chunks)
+        .filter(|&i| chunk_done[i as usize].load(Ordering::Relaxed))
+        .map(|i| std::cmp::min(DL_CHUNK, size - i * DL_CHUNK))
+        .sum();
+    if pre > 0 {
+        done.fetch_add(pre, Ordering::Relaxed);
+    }
+    // sidecar 句柄（写头部 + 预留位图区，保留续传位）
+    let part_file = {
+        let f = std::fs::File::create(&part)?;
+        f.set_len(8 + bitmap_len(n_chunks) as u64)?;
+        pwrite(&f, &size.to_le_bytes(), 0)?;
+        if let Some(b) = &resume_bm {
+            pwrite(&f, b, 8)?;
+        }
+        Arc::new(std::sync::Mutex::new(f))
+    };
 
     let mut attempt = 0u32;
     loop {
@@ -755,6 +812,7 @@ async fn download_file(
         for _ in 0..workers {
             let (sftp, out, cursor, done, cancel, chunk_done) =
                 (sftp.clone(), out.clone(), cursor.clone(), done.clone(), cancel.clone(), chunk_done.clone());
+            let part_file = part_file.clone();
             let rpath = rpath.to_string();
             set.spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -788,6 +846,18 @@ async fn download_file(
                     pwrite(&out, &buf[..want], off)?;
                     chunk_done[idx as usize].store(true, Ordering::Relaxed);
                     done.fetch_add(want as u64, Ordering::Relaxed); // 每段只计一次
+                    // 持久化该分段所在的位图字节（断点信息落盘）
+                    let byte_i = (idx / 8) as usize;
+                    let mut b = 0u8;
+                    for bit in 0..8u64 {
+                        let ci = byte_i as u64 * 8 + bit;
+                        if ci < n_chunks && chunk_done[ci as usize].load(Ordering::Relaxed) {
+                            b |= 1 << bit;
+                        }
+                    }
+                    if let Ok(g) = part_file.lock() {
+                        let _ = pwrite(&g, &[b], 8 + byte_i as u64);
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             });
@@ -805,9 +875,11 @@ async fn download_file(
             }
         }
         if chunk_done.iter().all(|b| b.load(Ordering::Relaxed)) {
+            let _ = std::fs::remove_file(&part); // 完成则清理断点文件
             return Ok(());
         }
         if cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&part); // 用户取消则不保留断点
             anyhow::bail!("canceled");
         }
         if attempt >= XFER_RETRIES {

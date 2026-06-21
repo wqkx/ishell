@@ -57,11 +57,22 @@ struct Session {
     reconnect_tries: u32,
 }
 
+/// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
+#[derive(Clone)]
+enum XferSpec {
+    Download { remote: String, local: String },
+    Upload { local: String, remote_dir: String },
+}
+
 /// UI 侧的一条传输记录。
 struct Transfer {
     id: u64,
     name: String,
     dir: crate::proto::TransferDir,
+    /// 重发规格（用于断线重连续传 / 手动重试）；演示记录为 None
+    spec: Option<XferSpec>,
+    /// 因断线被中断、等待重连后自动续传
+    paused: bool,
     done: u64,
     total: u64,
     /// None=进行中，Some(true/false)=完成/失败
@@ -91,10 +102,36 @@ impl Session {
                     self.reconnect_tries = 0;
                     self.reconnect_at = None;
                     self.status = crate::i18n::tr("已连接", "Connected").into();
+                    // 断线前被中断的传输：重连后用新通道重发，底层据本地/远端已有字节自动续传
+                    for t in &mut self.transfers {
+                        if !t.paused {
+                            continue;
+                        }
+                        match &t.spec {
+                            Some(XferSpec::Download { remote, local }) => {
+                                let _ = self.cmd_tx.send(UiCommand::Download { id: t.id, remote: remote.clone(), local: local.clone() });
+                            }
+                            Some(XferSpec::Upload { local, remote_dir }) => {
+                                let _ = self.cmd_tx.send(UiCommand::Upload { id: t.id, local: local.clone(), remote_dir: remote_dir.clone() });
+                            }
+                            None => continue,
+                        }
+                        t.paused = false;
+                        t.message = crate::i18n::tr("续传中 …", "Resuming …").into();
+                    }
                 }
                 WorkerEvent::Disconnected(reason) => {
                     self.connected = false;
                     self.status = reason;
+                    // 进行中的传输标记为暂停，等重连后续传（不计为失败）
+                    for t in &mut self.transfers {
+                        if t.spec.is_some() && t.ok != Some(true) {
+                            t.ok = None;
+                            t.paused = true;
+                            t.speed = 0.0;
+                            t.message = crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume").into();
+                        }
+                    }
                     // 仅对"曾连上又掉线"的会话自动重连，最多 5 次，指数退避
                     const MAX_TRIES: u32 = 5;
                     if self.was_connected && self.reconnect_tries < MAX_TRIES {
@@ -153,7 +190,7 @@ impl Session {
                         t.total = total;
                         t.dir = dir;
                     } else {
-                        self.transfers.push(Transfer { id, name, dir, done: 0, total, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                        self.transfers.push(Transfer { id, name, dir, spec: None, paused: false, done: 0, total, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
                     }
                 }
                 WorkerEvent::TransferProgress { id, done } => {
@@ -179,13 +216,21 @@ impl Session {
                     }
                 }
                 WorkerEvent::TransferDone { id, ok, message, refresh_dir } => {
+                    let connected = self.connected;
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
-                        t.ok = Some(ok);
-                        if ok && t.total == 0 {
-                            t.total = t.done;
+                        if !ok && !connected && t.spec.is_some() {
+                            // 断线引起的失败：转为暂停，等重连续传
+                            t.paused = true;
+                            t.speed = 0.0;
+                            t.message = crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume").into();
+                        } else {
+                            t.ok = Some(ok);
+                            if ok && t.total == 0 {
+                                t.total = t.done;
+                            }
+                            t.message = message.clone();
+                            t.speed = 0.0;
                         }
-                        t.message = message.clone();
-                        t.speed = 0.0;
                     }
                     self.status = message;
                     self.refresh_dir(refresh_dir);
@@ -573,9 +618,9 @@ impl App {
         if std::env::var("ISHELL_DEMO_XFER").is_ok() {
             if let Some(s) = app.sessions.first_mut() {
                 use crate::proto::TransferDir::*;
-                s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, done: 73_400_320, total: 104_857_600, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
-                s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, done: 2048, total: 2048, ok: Some(true), local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
-                s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, spec: None, paused: false, done: 73_400_320, total: 104_857_600, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, spec: None, paused: false, done: 2048, total: 2048, ok: Some(true), local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, spec: None, paused: false, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
             }
             app.show_transfers = true;
         }
@@ -712,7 +757,9 @@ impl App {
                 let id = s.next_xfer;
                 s.next_xfer += 1;
                 s.transfers.push(Transfer {
-                    id, name, dir: crate::proto::TransferDir::Download, done: 0, total: 0, ok: None,
+                    id, name, dir: crate::proto::TransferDir::Download,
+                    spec: Some(XferSpec::Download { remote: remote.clone(), local: local.clone() }), paused: false,
+                    done: 0, total: 0, ok: None,
                     local: Some(local.clone()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
                 });
                 let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local });
@@ -724,7 +771,9 @@ impl App {
                 let id = s.next_xfer;
                 s.next_xfer += 1;
                 s.transfers.push(Transfer {
-                    id, name, dir: crate::proto::TransferDir::Upload, done: 0, total: 0, ok: None,
+                    id, name, dir: crate::proto::TransferDir::Upload,
+                    spec: Some(XferSpec::Upload { local: local.clone(), remote_dir: remote_dir.clone() }), paused: false,
+                    done: 0, total: 0, ok: None,
                     local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
                 });
                 let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir });
@@ -2014,6 +2063,7 @@ impl App {
         let mut toggle_err: Option<u64> = None;
         let mut remove_id: Option<u64> = None;
         let mut delete_id: Option<(u64, String)> = None;
+        let mut resume_id: Option<u64> = None;
         let dl_dir = self.download_dir.to_string_lossy().into_owned();
         let win = egui::Window::new("transfer_win")
             .title_bar(false) // 隐藏过大的默认标题，使用自定义紧凑标题
@@ -2076,12 +2126,28 @@ impl App {
                                         }
                                     }
                                     Some(false) => {
-                                        // 失败：状态按钮可点击展开失败原因
+                                        // 失败：可重试（有重发规格时）+ 状态按钮展开原因
                                         if ui.add(egui::Button::new(RichText::new(icon::WARNING_CIRCLE).color(Palette::DANGER).size(13.0)).frame(false))
                                             .on_hover_text(crate::i18n::tr("点击查看失败原因", "Click for reason"))
                                             .clicked()
                                         {
                                             toggle_err = Some(t.id);
+                                        }
+                                        if t.spec.is_some()
+                                            && ui.add(egui::Button::new(RichText::new(icon::ARROW_CLOCKWISE).color(Palette::ACCENT).size(13.0)).frame(false))
+                                                .on_hover_text(crate::i18n::tr("重试", "Retry"))
+                                                .clicked()
+                                        {
+                                            resume_id = Some(t.id);
+                                        }
+                                    }
+                                    None if t.paused => {
+                                        // 已中断/暂停：续传按钮
+                                        if ui.add(egui::Button::new(RichText::new(icon::ARROW_CLOCKWISE).color(Palette::ACCENT).size(13.0)).frame(false))
+                                            .on_hover_text(crate::i18n::tr("续传", "Resume"))
+                                            .clicked()
+                                        {
+                                            resume_id = Some(t.id);
                                         }
                                     }
                                     None => {
@@ -2185,6 +2251,24 @@ impl App {
                 let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
             }
             self.xfer_just_opened = true; // 避免点击被当作窗外点击而关窗
+        }
+        // 续传/重试：按重发规格重新发起，底层据已有字节自动续传
+        if let Some(id) = resume_id {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                if let Some(spec) = s.transfers.iter().find(|t| t.id == id).and_then(|t| t.spec.clone()) {
+                    match spec {
+                        XferSpec::Download { remote, local } => { let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local }); }
+                        XferSpec::Upload { local, remote_dir } => { let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir }); }
+                    }
+                    if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+                        t.ok = None;
+                        t.paused = false;
+                        t.show_err = false;
+                        t.message = crate::i18n::tr("续传中 …", "Resuming …").into();
+                    }
+                }
+            }
+            self.xfer_just_opened = true;
         }
         // 切换失败原因展开
         if let Some(id) = toggle_err {
