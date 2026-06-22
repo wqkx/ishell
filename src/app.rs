@@ -2148,7 +2148,7 @@ impl App {
                             let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
                             egui::Frame::new()
                                 .fill(fill)
-                                .corner_radius(5)
+                                .corner_radius(6)
                                 .inner_margin(egui::Margin::symmetric(8, 3))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
@@ -2306,7 +2306,7 @@ impl App {
                             let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
                             egui::Frame::new()
                                 .fill(fill)
-                                .corner_radius(5)
+                                .corner_radius(6)
                                 .inner_margin(egui::Margin::symmetric(8, 3))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
@@ -3103,7 +3103,7 @@ impl App {
                 if !s.connected {
                     egui::Frame::new()
                         .fill(Palette::ACCENT_SOFT)
-                        .corner_radius(4)
+                        .corner_radius(6)
                         .inner_margin(egui::Margin::symmetric(8, 5))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -3160,7 +3160,7 @@ fn flat_button(ui: &mut egui::Ui, text: &RichText, tip: &str) -> bool {
         v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
         v.widgets.active.bg_stroke = egui::Stroke::NONE;
         clicked = ui
-            .add(egui::Button::new(text.clone()).corner_radius(5.0))
+            .add(egui::Button::new(text.clone()).corner_radius(6.0))
             .on_hover_text(tip)
             .clicked();
     });

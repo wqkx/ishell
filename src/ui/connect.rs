@@ -385,9 +385,9 @@ impl ConnectForm {
                 let full_w = ui.available_width();
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::click());
                 if selected {
-                    ui.painter().rect_filled(rect, 4.0, Palette::ACCENT_SOFT);
+                    ui.painter().rect_filled(rect, 6.0, Palette::ACCENT_SOFT);
                 } else if resp.hovered() {
-                    ui.painter().rect_filled(rect, 4.0, Palette::PANEL_2);
+                    ui.painter().rect_filled(rect, 6.0, Palette::PANEL_2);
                 }
                 // 在该行 rect 内绘制内容（编辑/删除按钮在上层，单独响应点击）
                 ui.scope_builder(
@@ -645,7 +645,8 @@ impl ConnectForm {
         }
 
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
+        // 右对齐、主操作（连接）置最右（macOS 习惯）；保存/返回为次级幽灵按钮
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add(
                 egui::Button::new(RichText::new(format!("{}  {}", egui_phosphor::regular::PLUGS_CONNECTED, crate::i18n::tr("连接", "Connect"))).color(egui::Color32::WHITE))
                     .fill(Palette::ACCENT)

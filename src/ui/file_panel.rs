@@ -989,7 +989,7 @@ fn tool_btn_color(ui: &mut egui::Ui, icon: &str, tip: &str, color: egui::Color32
             .add(
                 egui::Button::new(RichText::new(icon).size(16.0).color(color))
                     .min_size(egui::vec2(30.0, 26.0))
-                    .corner_radius(5.0),
+                    .corner_radius(6.0),
             )
             .on_hover_text(tip)
             .clicked();
