@@ -6,6 +6,13 @@ use egui::{Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, TextFormat, Vec
 /// 默认字号（pt）。
 const FONT_SIZE: f32 = 14.0;
 
+/// 全局终端配色开关（深=true）：所有终端共享同一值，切一个即全部同步。
+/// 首次访问时从持久化设置初始化。
+fn term_dark_flag() -> &'static std::sync::atomic::AtomicBool {
+    static F: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    F.get_or_init(|| std::sync::atomic::AtomicBool::new(crate::store::load_term_dark()))
+}
+
 pub struct Terminal {
     parser: vt100::Parser,
     cols: u16,
@@ -117,7 +124,7 @@ impl Terminal {
             sel_anchor: None,
             sel_cursor: None,
             clipboard: None,
-            dark: crate::store::load_term_dark(), // 沿用上次选择，默认浅色
+            dark: term_dark_flag().load(std::sync::atomic::Ordering::Relaxed), // 全局配色，沿用上次选择
 
             input_line: String::new(),
             history: Vec::new(),
@@ -400,6 +407,8 @@ impl Terminal {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Vec<u8> {
+        // 从全局配色同步：任一终端切换后，所有终端下一帧统一生效
+        self.dark = term_dark_flag().load(std::sync::atomic::Ordering::Relaxed);
         // Ctrl+Shift+F 切换终端内容搜索
         if ui.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::F)) {
             if self.find.is_some() {
@@ -736,8 +745,11 @@ impl Terminal {
                 crate::i18n::tr("切换为深色终端", "Dark terminal")
             };
             if ui.button(theme_label).clicked() {
-                self.dark = !self.dark;
-                crate::store::save_term_dark(self.dark); // 记住选择，下次启动沿用
+                let nd = !self.dark;
+                // 写全局开关：所有终端同步切换；并存盘记住选择
+                term_dark_flag().store(nd, std::sync::atomic::Ordering::Relaxed);
+                crate::store::save_term_dark(nd);
+                self.dark = nd;
                 ui.close();
             }
             if ui.checkbox(&mut self.highlight, crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN")).clicked() {
