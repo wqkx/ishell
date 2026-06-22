@@ -44,6 +44,8 @@ pub struct Terminal {
     osc7_cwd: Option<String>,
     /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
     ime_preedit: String,
+    /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
+    prev_focused: bool,
 }
 
 /// 终端搜索状态。
@@ -128,6 +130,7 @@ impl Terminal {
             highlight: true,
             osc7_cwd: None,
             ime_preedit: String::new(),
+            prev_focused: false,
         }
     }
 
@@ -441,6 +444,11 @@ impl Terminal {
             self.focus_req = false;
         }
         let focused = resp.has_focus();
+        // 诊断：焦点变化时打印一次（IME 启用依赖终端持有焦点）
+        if focused != self.prev_focused {
+            log::info!("terminal focus = {focused}");
+            self.prev_focused = focused;
+        }
 
         // 关键：终端聚焦时锁定 Tab / 方向键 / Esc，使其传给 shell（修复 Tab 补全），
         // 而不是被 egui 用于控件间焦点切换。
