@@ -6,30 +6,46 @@ use egui::{Color32, CornerRadius, Stroke};
 /// 终端按此值反向放大以抵消缩小，从而减小全角字之间的间距。
 pub const CJK_SCALE: f32 = 0.92;
 
+// ——— 设计令牌（统一圆角 / 字阶，全局复用，避免散落的魔法数字）———
+/// 圆角刻度：控件 / 浮层·菜单 / 窗口
+pub const R_SM: u8 = 6;
+pub const R_MD: u8 = 8;
+pub const R_LG: u8 = 12;
+/// 字阶（pt）：注释 / 正文 / 强调 / 标题（供各 UI 复用，将逐步替换散落的硬编码字号）。
+/// 暂允许未使用：本轮先建立令牌，字号统一替换作为后续单独一轮（跨多文件）进行。
+#[allow(dead_code)]
+pub const FS_NOTE: f32 = 11.0;
+#[allow(dead_code)]
+pub const FS_BODY: f32 = 12.0;
+#[allow(dead_code)]
+pub const FS_STRONG: f32 = 13.0;
+#[allow(dead_code)]
+pub const FS_TITLE: f32 = 16.0;
+
 /// 主题色板：参考 **Claude / Anthropic** 官网风格——暖米白底 + Claude 珊瑚橙强调色。
 pub struct Palette;
 impl Palette {
-    /// 窗口背景（暖米白，略深）
-    pub const BG: Color32 = Color32::from_rgb(0xeb, 0xe8, 0xe0);
-    /// 面板背景（象牙白卡片）
-    pub const PANEL: Color32 = Color32::from_rgb(0xfa, 0xf9, 0xf5);
-    /// 次级面板 / 选项卡条（bone）
-    pub const PANEL_2: Color32 = Color32::from_rgb(0xf0, 0xee, 0xe6);
-    /// 进度条轨道（暖灰）
-    pub const TRACK: Color32 = Color32::from_rgb(0xe3, 0xdf, 0xd3);
-    /// 分隔线 / 边框（加深一档，让面板/分区边界更清晰）
-    pub const BORDER: Color32 = Color32::from_rgb(0xcd, 0xc7, 0xb5);
-    /// 主强调色（Claude 珊瑚橙）
-    pub const ACCENT: Color32 = Color32::from_rgb(0xd9, 0x77, 0x57);
-    pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0xf5, 0xe4, 0xda);
-    /// 文本（暖近黑 / 暖灰）
+    /// 窗口背景（暖米白，最底层画布）
+    pub const BG: Color32 = Color32::from_rgb(0xec, 0xe9, 0xe1);
+    /// 面板背景（象牙白卡片，较画布更亮以拉开层级）
+    pub const PANEL: Color32 = Color32::from_rgb(0xfd, 0xfc, 0xf9);
+    /// 次级面板 / 选项卡条（bone，提亮一档避免与画布糊在一起）
+    pub const PANEL_2: Color32 = Color32::from_rgb(0xf4, 0xf1, 0xea);
+    /// 进度条轨道 / 悬停底（暖灰）
+    pub const TRACK: Color32 = Color32::from_rgb(0xe7, 0xe2, 0xd6);
+    /// 分隔线 / 边框（调浅一档，少用硬边框、多靠柔影分区，更显轻盈）
+    pub const BORDER: Color32 = Color32::from_rgb(0xdc, 0xd7, 0xc9);
+    /// 主强调色（Claude 珊瑚橙，略加饱和让主操作更活泼）
+    pub const ACCENT: Color32 = Color32::from_rgb(0xd9, 0x70, 0x49);
+    pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0xf7, 0xe7, 0xdc);
+    /// 文本（暖近黑 / 暖灰，非纯黑）
     pub const TEXT: Color32 = Color32::from_rgb(0x2a, 0x28, 0x24);
     /// 次要文字（加深以满足 WCAG AA 小字对比）
     pub const TEXT_DIM: Color32 = Color32::from_rgb(0x54, 0x51, 0x4a);
-    /// 语义色（柔和暖调）
-    pub const OK: Color32 = Color32::from_rgb(0x5b, 0x8a, 0x56);
-    pub const WARN: Color32 = Color32::from_rgb(0xc2, 0x8e, 0x3c);
-    pub const DANGER: Color32 = Color32::from_rgb(0xc0, 0x56, 0x4b);
+    /// 语义色（柔和暖调，较前略提明度/饱和更清亮）
+    pub const OK: Color32 = Color32::from_rgb(0x5e, 0x94, 0x57);
+    pub const WARN: Color32 = Color32::from_rgb(0xcc, 0x94, 0x38);
+    pub const DANGER: Color32 = Color32::from_rgb(0xcb, 0x5a, 0x4d);
     /// 终端背景（比面板更深一些的暖灰）与默认前景
     pub const TERM_BG: Color32 = Color32::from_rgb(0xd7, 0xd2, 0xc4);
     pub const TERM_FG: Color32 = Color32::from_rgb(0x2a, 0x28, 0x24);
@@ -53,22 +69,24 @@ pub fn apply(ctx: &egui::Context) {
     v.hyperlink_color = Palette::ACCENT;
     v.selection.bg_fill = Palette::ACCENT_SOFT;
     v.selection.stroke = Stroke::new(1.0, Palette::ACCENT);
+    // 柔影：更大更淡的投影（Apple 质感核心），少用硬边框、靠阴影表达层次
     v.window_shadow = egui::epaint::Shadow {
-        offset: [0, 6],
-        blur: 20,
+        offset: [0, 4],
+        blur: 28,
         spread: 0,
-        color: Color32::from_black_alpha(50),
+        color: Color32::from_black_alpha(28),
     };
     v.popup_shadow = egui::epaint::Shadow {
         offset: [0, 3],
-        blur: 12,
+        blur: 16,
         spread: 0,
-        color: Color32::from_black_alpha(40),
+        color: Color32::from_black_alpha(26),
     };
-    v.window_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(R_LG);
+    v.menu_corner_radius = CornerRadius::same(R_MD);
 
-    // 统一小圆角
-    let r = CornerRadius::same(4);
+    // 统一控件圆角（令牌）
+    let r = CornerRadius::same(R_SM);
 
     // 非交互（标签、分隔线）
     v.widgets.noninteractive.bg_fill = Palette::PANEL;
@@ -110,12 +128,12 @@ pub fn apply(ctx: &egui::Context) {
     style.interaction.selectable_labels = false;
     style.interaction.multi_widget_text_select = false;
 
-    // 间距：行高更舒展
-    style.spacing.item_spacing = egui::vec2(6.0, 6.0);
-    style.spacing.window_margin = egui::Margin::same(12);
-    style.spacing.menu_margin = egui::Margin::same(6);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.interact_size.y = 26.0;
+    // 间距：8pt 网格，更舒展的留白（Apple 风格）
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(14);
+    style.spacing.menu_margin = egui::Margin::same(8);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.interact_size.y = 28.0;
 
     // egui 0.34 按明/暗主题分别存 Style；`set_global_style` 只改「当前激活主题」那一份。
     // Windows 浅色模式下激活的是浅色槽 → 会落到 egui 默认浅色样式（灰底 #f8f8f8 + 默认间距），
