@@ -446,7 +446,7 @@ impl Terminal {
         let focused = resp.has_focus();
         // 诊断：焦点变化时打印一次（IME 启用依赖终端持有焦点）
         if focused != self.prev_focused {
-            log::info!("terminal focus = {focused}");
+            log::debug!("terminal focus = {focused}");
             self.prev_focused = focused;
         }
 
@@ -741,6 +741,19 @@ impl Terminal {
             if ui.checkbox(&mut self.highlight, crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN")).clicked() {
                 ui.close();
             }
+            // 强制 X11：修复 Wayland 下 fcitx 等输入法无法输入中文（重启后生效）
+            #[cfg(target_os = "linux")]
+            {
+                let mut fx = crate::store::load_force_x11();
+                if ui
+                    .checkbox(&mut fx, crate::i18n::tr("强制 X11（修复输入法·重启生效）", "Force X11 (fix IME · restart)"))
+                    .on_hover_text(crate::i18n::tr("Wayland 下输入法常失效；开启后下次启动改走 X11", "IME often fails on Wayland; enabling switches to X11 on next launch"))
+                    .clicked()
+                {
+                    crate::store::save_force_x11(fx);
+                    ui.close();
+                }
+            }
             ui.separator();
             // 会话日志录制
             if self.log_file.is_some() {
@@ -803,12 +816,12 @@ impl Terminal {
                 }
                 // 输入法预编辑（组字中）：暂存以在光标处显示，不发往远端
                 egui::Event::Ime(egui::ImeEvent::Preedit(s)) => {
-                    log::info!("IME Preedit: {s:?}");
+                    log::debug!("IME Preedit: {s:?}");
                     self.ime_preedit = s;
                 }
                 // 输入法提交（中文等）：清空预编辑，提交串以 UTF-8 发往远端
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
-                    log::info!("IME Commit: {t:?}");
+                    log::debug!("IME Commit: {t:?}");
                     self.ime_preedit.clear();
                     if !alt {
                         self.input_line.push_str(&t);
@@ -818,7 +831,7 @@ impl Terminal {
                 }
                 // 输入法启用/禁用：清掉残留预编辑
                 egui::Event::Ime(egui::ImeEvent::Enabled) | egui::Event::Ime(egui::ImeEvent::Disabled) => {
-                    log::info!("IME enabled/disabled event");
+                    log::debug!("IME enabled/disabled event");
                     self.ime_preedit.clear();
                 }
                 egui::Event::Paste(t) => {

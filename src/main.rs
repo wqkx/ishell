@@ -31,6 +31,15 @@ fn load_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // 强制 X11（XWayland）：Wayland 下 winit 类应用 fcitx/输入法常失效（与 Chrome/Electron 同病），
+    // 清空 WAYLAND_DISPLAY 让 winit 退回 X11（其 XIM 输入法正常）。须在 eframe/winit 初始化前。
+    // 由持久化设置或环境变量 ISHELL_X11 开启；仅 Linux 有意义。
+    #[cfg(target_os = "linux")]
+    if store::load_force_x11() || std::env::var_os("ISHELL_X11").is_some() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        log::info!("已强制 X11 后端（清空 WAYLAND_DISPLAY）以修复输入法");
+    }
+
     // Logo / 图标生成模式：窄长（logo）或方形（icon）画布，用于截图生成素材
     let logo = std::env::var("ISHELL_LOGO").is_ok();
     let icon_gen = std::env::var("ISHELL_ICON").is_ok();

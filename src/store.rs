@@ -300,6 +300,31 @@ pub fn save_lang(code: &str) {
     }
 }
 
+// ---------- 强制 X11 后端（修复 Wayland 下输入法失效） ----------
+
+fn force_x11_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("force_x11"))
+}
+
+/// 是否强制走 X11（XWayland）：Wayland 下 winit 类应用 fcitx 输入法常失效，
+/// 清空 WAYLAND_DISPLAY 改走 X11 的 XIM 可修复。文件内容 "1" 为开启。
+pub fn load_force_x11() -> bool {
+    force_x11_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// 保存「强制 X11」开关（下次启动生效）。
+pub fn save_force_x11(on: bool) {
+    if let Some(p) = force_x11_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, if on { "1" } else { "0" });
+    }
+}
+
 // ---------- 传输冲突策略 ----------
 
 fn conflict_policy_path() -> Option<PathBuf> {
