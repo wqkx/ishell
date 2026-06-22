@@ -45,7 +45,8 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 
 **Connections & sessions**
 - Multi-session tabs: status dots, **smooth drag-to-reorder animation**, overflow fade, close confirmation
-- **Authentication**: password, key file, or **SSH agent** (`SSH_AUTH_SOCK` / Windows OpenSSH pipe)
+- **Authentication**: password, key file, **SSH agent** (`SSH_AUTH_SOCK` / Windows OpenSSH pipe), or **keyboard-interactive (OTP / 2FA)**
+- **Agent forwarding (`-A`)**: let remote processes reuse your local ssh-agent keys (no re-auth across hops)
 - **Import `~/.ssh/config`** (pick which hosts; Host / HostName / User / Port / IdentityFile / ProxyJump)
 - **Groups / tags / search** for saved connections
 - Saved-password key stored in the **OS keychain** (Secret Service / Keychain / Credential Manager), with an encrypted-file fallback
@@ -64,9 +65,12 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 - **Port forwarding**: local forward + dynamic SOCKS5 proxy
 - **Jump host / ProxyJump**: reach internal targets through a bastion
 - **Command broadcast**: send a command to every connected session at once
+- **Command snippets**: save frequent commands, send to the current session terminal in one click (optional auto-Enter), persisted
 
 **Files & transfers**
-- SFTP: tree + list, **name filter**, **click a header to sort by name / size / time** (size & time default to descending), drag-and-drop upload, **"open this dir in terminal"**, chmod / rename / delete / copy path, optional default download folder
+- SFTP: tree + list, **name filter**, **click a header to sort by name / size / time** (size & time default to descending), drag-and-drop upload, **"open this dir in terminal"**, chmod / rename / copy path, optional default download folder
+- **Multi-select batch ops**: Ctrl/Shift + rubber-band select; **batch delete** (Delete key / toolbar, recursive for folders), **batch download**
+- **Remote copy / move**: right-click "Copy / Cut" + "Paste here", done entirely on the server (multi-select, recursive)
 - **Resumable transfers**: byte-level resume + auto-retry on transient errors; **auto-resume after reconnect** with a pause/resume/retry queue
 - **Folder compress-download**: tar.gz on the server, single-file parallel download, pure-Rust unpack — fast for many small files
 - **Concurrent transfers** (up to 6 per server; independent across servers), cancellable mid-transfer
