@@ -342,6 +342,8 @@ pub struct App {
     broadcast_input: String,
     /// 命令片段库（snippets）窗口 + 数据 + 编辑缓冲
     show_snippets: bool,
+    /// 片段浮窗刚打开（本帧跳过"点击外部关闭"判定）
+    snip_just_opened: bool,
     snippets: Vec<crate::store::Snippet>,
     /// 正在编辑的片段索引（None = 新建）+ 表单缓冲
     snip_editing: Option<usize>,
@@ -495,6 +497,7 @@ impl App {
             show_broadcast: false,
             broadcast_input: String::new(),
             show_snippets: false,
+            snip_just_opened: false,
             snippets: crate::store::load_snippets(),
             snip_editing: None,
             snip_name: String::new(),
@@ -1297,57 +1300,79 @@ impl App {
             return;
         }
         use egui_phosphor::regular as icon;
-        let mut open = true;
         let mut send_cmd: Option<(String, bool)> = None;
         let mut edit: Option<usize> = None;
         let mut delete: Option<usize> = None;
         let mut save_now = false;
+        let mut close_win = false;
         let mut changed = false;
-        egui::Window::new(format!("{}  {}", icon::CODE, crate::i18n::tr("命令片段", "Snippets")))
-            .open(&mut open)
-            .default_width(440.0)
-            .collapsible(false)
+        // 与「传输 / 转发」面板同款：右上角锚定、无标题栏、PANEL 底色的紧凑浮窗
+        let win = egui::Window::new("snippet_win")
+            .title_bar(false)
+            .anchor(egui::Align2::RIGHT_TOP, [-10.0, 44.0])
+            .default_width(340.0)
+            .resizable(false)
+            .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, false]).show(ui, |ui| {
-                    if self.snippets.is_empty() {
-                        ui.label(RichText::new(crate::i18n::tr("还没有片段，在下方新增。", "No snippets yet. Add one below.")).color(Palette::TEXT_DIM));
-                    }
+                // 自定义紧凑标题栏
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}  {}", icon::CODE, crate::i18n::tr("命令片段", "Snippets"))).strong().size(13.0).color(Palette::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                            close_win = true;
+                        }
+                    });
+                });
+                ui.separator();
+
+                if self.snippets.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(crate::i18n::tr("暂无片段，在下方新增", "No snippets; add one below")).color(Palette::TEXT_DIM).size(12.0));
+                }
+                // 列表：点名称即发送到当前会话终端；右侧编辑 / 删除（无边框图标，风格统一）
+                egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
                     for (i, sn) in self.snippets.iter().enumerate() {
                         ui.horizontal(|ui| {
+                            ui.label(RichText::new(icon::PAPER_PLANE_TILT).color(Palette::ACCENT).size(13.0));
                             let label = if sn.name.trim().is_empty() { sn.command.clone() } else { sn.name.clone() };
                             if ui
-                                .add(egui::Button::new(RichText::new(format!("{}  {}", icon::PAPER_PLANE_TILT, label)).color(egui::Color32::WHITE)).fill(Palette::ACCENT))
-                                .on_hover_text(&sn.command)
+                                .add(egui::Label::new(RichText::new(label).size(12.0).color(Palette::TEXT)).sense(Sense::click()))
+                                .on_hover_text(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("发送：{}", sn.command), crate::i18n::Lang::En => format!("Send: {}", sn.command) })
                                 .clicked()
                             {
                                 send_cmd = Some((sn.command.clone(), sn.run));
                             }
-                            if ui.button(icon::PENCIL_SIMPLE).on_hover_text(crate::i18n::tr("编辑", "Edit")).clicked() {
-                                edit = Some(i);
-                            }
-                            if ui.button(RichText::new(icon::TRASH).color(Palette::DANGER)).on_hover_text(crate::i18n::tr("删除", "Delete")).clicked() {
-                                delete = Some(i);
-                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new(RichText::new(icon::TRASH).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("删除", "Delete")).clicked() {
+                                    delete = Some(i);
+                                }
+                                if ui.add(egui::Button::new(RichText::new(icon::PENCIL_SIMPLE).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("编辑", "Edit")).clicked() {
+                                    edit = Some(i);
+                                }
+                            });
                         });
+                        // 有名称时在下方以等宽小字补充命令原文
                         if !sn.name.trim().is_empty() {
-                            ui.label(RichText::new(&sn.command).monospace().size(11.0).color(Palette::TEXT_DIM));
+                            ui.label(RichText::new(&sn.command).monospace().size(10.5).color(Palette::TEXT_DIM));
                         }
-                        ui.separator();
+                        ui.add_space(3.0);
                     }
                 });
-                ui.add_space(6.0);
+
+                ui.separator();
                 let editing = self.snip_editing.is_some();
-                ui.label(RichText::new(if editing { crate::i18n::tr("编辑片段", "Edit snippet") } else { crate::i18n::tr("新增片段", "New snippet") }).strong());
+                ui.label(RichText::new(if editing { crate::i18n::tr("编辑片段", "Edit snippet") } else { crate::i18n::tr("新增片段", "New snippet") }).strong().size(12.0));
+                ui.add_space(2.0);
                 egui::Grid::new("snip_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label(crate::i18n::tr("名称", "Name"));
-                    ui.add(egui::TextEdit::singleline(&mut self.snip_name).desired_width(300.0).hint_text(crate::i18n::tr("可选，便于识别", "Optional label")));
+                    ui.add(egui::TextEdit::singleline(&mut self.snip_name).desired_width(210.0).hint_text(crate::i18n::tr("可选，便于识别", "Optional label")));
                     ui.end_row();
                     ui.label(crate::i18n::tr("命令", "Command"));
-                    ui.add(egui::TextEdit::multiline(&mut self.snip_cmd).desired_width(300.0).desired_rows(2));
+                    ui.add(egui::TextEdit::multiline(&mut self.snip_cmd).desired_width(210.0).desired_rows(2));
                     ui.end_row();
                 });
                 ui.checkbox(&mut self.snip_run, crate::i18n::tr("发送后自动回车执行", "Press Enter after sending"));
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.add(egui::Button::new(RichText::new(if editing { crate::i18n::tr("保存", "Save") } else { crate::i18n::tr("添加", "Add") }).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                         save_now = true;
@@ -1408,9 +1433,12 @@ impl App {
                 s.terminal.request_focus();
             }
         }
-        if !open {
+        // 点击窗口外部自动隐藏（打开当帧除外），或点 X 关闭
+        let clicked_outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
+        if close_win || (clicked_outside && !self.snip_just_opened) {
             self.show_snippets = false;
         }
+        self.snip_just_opened = false;
     }
 
     /// 关闭窗口前确认（仍有会话时）。
@@ -1576,6 +1604,9 @@ impl App {
                         }
                         if flat_button(ui, &RichText::new(format!("{} {}", icon::CODE, crate::i18n::tr("片段", "Snip"))), crate::i18n::tr("命令片段库：保存常用命令一键发送到终端", "Command snippets: save & send common commands")) {
                             self.show_snippets = !self.show_snippets;
+                            if self.show_snippets {
+                                self.snip_just_opened = true;
+                            }
                         }
                         // 分隔竖线：把标签区（标签 + 新建）与右侧功能区分开（短、低调，和谐配色）
                         {
