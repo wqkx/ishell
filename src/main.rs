@@ -57,11 +57,7 @@ fn main() -> eframe::Result<()> {
             .with_app_id("ishell")
             .with_icon(load_icon())
     };
-    let native_options = eframe::NativeOptions {
-        viewport,
-        renderer: eframe::Renderer::Wgpu, // 跨平台色彩一致，修复 Windows 颜色洗白
-        ..Default::default()
-    };
+    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native(
         "iShell",

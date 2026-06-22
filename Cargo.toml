@@ -5,10 +5,9 @@ edition = "2021"
 description = "现代化 Rust SSH 客户端，仿 FinalShell 布局（系统信息 + 终端 + SFTP 文件管理）"
 
 [dependencies]
-# GUI（GPU 渲染的即时模式框架）。改用 wgpu 渲染：跨平台 sRGB/色彩处理一致，
-# 修复 Windows 上 glow 帧缓冲双重 gamma 导致的颜色被「洗白」。+ 默认字体 + x11/wayland。
+# GUI（GPU 渲染的即时模式框架）。仅保留原生所需特性：glow 渲染 + 默认字体 + x11/wayland，
 # 去掉 accesskit(a11y)、web 屏幕阅读、persistence 等，缩减体积（本应用自管配置持久化）。
-eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 egui = "0.34"
 egui_extras = "0.34"  # 表格 + 轻量代码高亮（不启用 syntect，避免常驻大内存）
 egui-phosphor = "0.12" # 图标字体（对应 egui 0.34）
