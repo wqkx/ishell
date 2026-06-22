@@ -118,6 +118,16 @@ chmod +x ishell-*            # 赋可执行权限
 - **macOS** 未签名首次运行：`xattr -dr com.apple.quarantine ./ishell-macos-aarch64`，或“系统设置 → 隐私与安全性 → 仍要打开”。
 - **Windows** SmartScreen：点“更多信息 → 仍要运行”。
 
+## ❓ 常见问题
+
+**Linux Wayland 下输入法（fcitx/ibus）打不了中文？**
+部分 Wayland 桌面（如 KDE Plasma / GNOME）对 winit 类应用的 `text-input-v3` 协议支持有坑，导致 fcitx 等输入法无法激活、组字（和 Chrome/Electron 同病）。解决：**改走 X11（XWayland）**，其 XIM 输入法正常。两种开启方式（任选其一）：
+
+- **应用内**：终端区右键 → 勾选「**强制 X11（修复输入法·重启生效）**」→ **重启 iShell**。该设置持久化，设一次即可。
+- **环境变量**：`ISHELL_X11=1 ./ishell-linux-x86_64`（或临时 `WAYLAND_DISPLAY= ./ishell-linux-x86_64`）。
+
+> 权衡：强制 X11 会损失部分原生 Wayland 体验（如分数缩放更顺滑），换来输入法可用——与 Chrome 的 `--ozone-platform=x11` 同理。默认仍走 Wayland，仅在你开启后切换。
+
 ## 🔧 从源码构建
 
 需要 [Rust](https://rustup.rs/)（stable）。在目标平台上：

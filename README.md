@@ -118,6 +118,16 @@ chmod +x ishell-*            # make it executable
 - **macOS** (unsigned, first run): `xattr -dr com.apple.quarantine ./ishell-macos-aarch64`, or "System Settings → Privacy & Security → Open Anyway".
 - **Windows** SmartScreen: click "More info → Run anyway".
 
+## ❓ Troubleshooting
+
+**Chinese/IME (fcitx/ibus) won't type on Linux Wayland?**
+Some Wayland desktops (KDE Plasma / GNOME) have flaky `text-input-v3` support for winit-based apps, so fcitx-style IMEs never activate or compose (same issue as Chrome/Electron). Fix: **switch to X11 (XWayland)**, where XIM input works. Two ways (either one):
+
+- **In-app**: right-click the terminal → check "**Force X11 (fix IME · restart)**" → **restart iShell**. The setting is persisted — set it once.
+- **Env var**: `ISHELL_X11=1 ./ishell-linux-x86_64` (or temporarily `WAYLAND_DISPLAY= ./ishell-linux-x86_64`).
+
+> Trade-off: forcing X11 loses some native-Wayland niceties (e.g. smoother fractional scaling) in exchange for a working IME — the same trade-off as Chrome's `--ozone-platform=x11`. The default is still Wayland; it only switches when you enable this.
+
 ## 🔧 Build from source
 
 Requires [Rust](https://rustup.rs/) (stable). On the target platform:
