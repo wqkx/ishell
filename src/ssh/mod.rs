@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use russh::client::{self, Handle, Handler};
 use russh::keys::ssh_key;
-use russh::ChannelMsg;
+use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::proto::{AuthMethod, ConnectConfig, FileEntry, UiCommand, WorkerEvent};
@@ -89,10 +89,29 @@ struct ClientHandler {
     sink: UiSink,
     /// UI 对"是否信任新主机"的回复
     decision_rx: UnboundedReceiver<bool>,
+    /// 是否转发本机 ssh-agent：为真时桥接远端回连的 auth-agent 通道到本地 agent
+    agent_forward: bool,
 }
 
 impl Handler for ClientHandler {
     type Error = russh::Error;
+
+    // 远端进程使用 SSH_AUTH_SOCK 时，服务器经此回调打开 auth-agent 通道；
+    // 把它与本机 ssh-agent socket 双向对接，即实现 agent 转发（-A）。
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if self.agent_forward {
+            tokio::spawn(async move {
+                if let Err(e) = bridge_local_agent(channel).await {
+                    log::debug!("agent 转发桥接结束：{e}");
+                }
+            });
+        }
+        Ok(())
+    }
 
     async fn check_server_key(
         &mut self,
@@ -166,7 +185,7 @@ pub async fn run(
     sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("正在连接 {}:{} …", cfg.host, cfg.port), crate::i18n::Lang::En => format!("Connecting {}:{} …", cfg.host, cfg.port) }));
 
     // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
-    let (handle, _jump_handle) = match connect(&cfg, &sink, hostkey_rx).await {
+    let (handle, _jump_handle) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
         Ok(h) => h,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("连接失败：{e}"), crate::i18n::Lang::En => format!("Connect failed: {e}") }));
@@ -176,7 +195,7 @@ pub async fn run(
     let handle = Arc::new(handle);
 
     // 1) 交互式 shell 通道
-    let mut shell = match open_shell(&handle).await {
+    let mut shell = match open_shell(&handle, cfg.forward_agent).await {
         Ok(c) => c,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开 shell 失败：{e}"), crate::i18n::Lang::En => format!("Open shell failed: {e}") }));
@@ -390,6 +409,45 @@ pub async fn run(
                             task.abort();
                         }
                     }
+                    // 远端批量复制/移动：经 shell 执行 cp -a / mv，独立任务不阻塞交互
+                    Some(UiCommand::CopyMove { srcs, dest_dir, do_move }) => {
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        tokio::spawn(async move {
+                            let mut joined = String::new();
+                            for p in &srcs {
+                                joined.push_str(&sh_quote(p));
+                                joined.push(' ');
+                            }
+                            let dest = sh_quote(&dest_dir);
+                            // `--` 终止选项解析，避免以 - 开头的文件名被当作开关
+                            let cmd = if do_move {
+                                format!("mv -f -- {joined}{dest}")
+                            } else {
+                                format!("cp -a -- {joined}{dest}")
+                            };
+                            let n = srcs.len();
+                            match exec_status(&h, &cmd).await {
+                                Ok((0, _)) => s.send(WorkerEvent::OpDone {
+                                    message: match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("{}完成（{n} 项）", if do_move { "移动" } else { "复制" }),
+                                        crate::i18n::Lang::En => format!("{} done ({n})", if do_move { "Move" } else { "Copy" }),
+                                    },
+                                    refresh_dir: Some(dest_dir.clone()),
+                                }),
+                                Ok((code, err)) => s.send(WorkerEvent::Error(match crate::i18n::current() {
+                                    crate::i18n::Lang::Zh => format!("操作失败（码 {code}）：{}", err.trim()),
+                                    crate::i18n::Lang::En => format!("Failed (code {code}): {}", err.trim()),
+                                })),
+                                Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() {
+                                    crate::i18n::Lang::Zh => format!("操作失败：{e}"),
+                                    crate::i18n::Lang::En => format!("Failed: {e}"),
+                                })),
+                            }
+                        });
+                    }
+                    // 键盘交互回答仅在认证阶段由 connect() 消费；正常运行期收到则忽略
+                    Some(UiCommand::KbdResponse(_)) => {}
                     Some(UiCommand::Disconnect) | None => {
                         let _ = shell.eof().await;
                         sink.send(WorkerEvent::Disconnected(crate::i18n::tr("已断开", "Disconnected").into()));
@@ -411,12 +469,15 @@ async fn authenticate<H>(
     handle: &mut Handle<H>,
     username: &str,
     auth: &AuthMethod,
+    sink: &UiSink,
+    cmd_rx: &mut UnboundedReceiver<UiCommand>,
 ) -> anyhow::Result<bool>
 where
     H: Handler,
     H::Error: std::error::Error + Send + Sync + 'static,
 {
     let ok = match auth {
+        AuthMethod::Interactive => authenticate_interactive(handle, username, sink, cmd_rx).await?,
         AuthMethod::Password(pw) => handle.authenticate_password(username, pw).await?.success(),
         AuthMethod::KeyFile { path, passphrase } => {
             let key = russh::keys::load_secret_key(path, passphrase.as_deref())?;
@@ -481,12 +542,76 @@ where
     Ok(false)
 }
 
+/// 把远端 agent-forward 通道与本机 ssh-agent（unix socket / Windows 命名管道）双向对接。
+async fn bridge_local_agent(channel: Channel<client::Msg>) -> anyhow::Result<()> {
+    let mut remote = channel.into_stream();
+    #[cfg(unix)]
+    {
+        let sock = std::env::var("SSH_AUTH_SOCK").map_err(|_| anyhow::anyhow!("SSH_AUTH_SOCK 未设置"))?;
+        let mut local = tokio::net::UnixStream::connect(sock).await?;
+        tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
+    }
+    #[cfg(windows)]
+    {
+        let mut local = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(r"\\.\pipe\openssh-ssh-agent")?;
+        tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
+    }
+    Ok(())
+}
+
+/// 键盘交互（keyboard-interactive）认证：循环把服务器提示交给 UI、等回答再提交，
+/// 直至成功或失败。支持 OTP / 二次验证等多步提示。响应经 `cmd_rx` 收 `KbdResponse`。
+async fn authenticate_interactive<H>(
+    handle: &mut Handle<H>,
+    username: &str,
+    sink: &UiSink,
+    cmd_rx: &mut UnboundedReceiver<UiCommand>,
+) -> anyhow::Result<bool>
+where
+    H: Handler,
+    H::Error: std::error::Error + Send + Sync + 'static,
+{
+    use client::KeyboardInteractiveAuthResponse as Resp;
+    let mut resp = handle
+        .authenticate_keyboard_interactive_start(username.to_string(), None)
+        .await?;
+    loop {
+        match resp {
+            Resp::Success => return Ok(true),
+            Resp::Failure { .. } => return Ok(false),
+            Resp::InfoRequest { name, instructions, prompts } => {
+                // 空提示组（部分服务器仅发指示信息）：直接回空响应推进
+                if prompts.is_empty() {
+                    resp = handle.authenticate_keyboard_interactive_respond(Vec::new()).await?;
+                    continue;
+                }
+                sink.send(WorkerEvent::KbdPrompt {
+                    name,
+                    instructions,
+                    prompts: prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect(),
+                });
+                // 等 UI 回答；连接前不会有其它指令，收到断开/通道关闭即视为取消
+                let answers = loop {
+                    match cmd_rx.recv().await {
+                        Some(UiCommand::KbdResponse(a)) => break a,
+                        Some(UiCommand::Disconnect) | None => return Ok(false),
+                        _ => {}
+                    }
+                };
+                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+            }
+        }
+    }
+}
+
 /// 建立 TCP + SSH 握手并完成认证。可选经跳板机（ProxyJump）连接。
 /// 返回目标主机句柄，以及需保持存活的跳板机句柄（None 表示直连）。
 async fn connect(
     cfg: &ConnectConfig,
     sink: &UiSink,
     hostkey_rx: UnboundedReceiver<bool>,
+    cmd_rx: &mut UnboundedReceiver<UiCommand>,
 ) -> anyhow::Result<(Handle<ClientHandler>, Option<Handle<JumpHandler>>)> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
@@ -499,6 +624,7 @@ async fn connect(
         port: cfg.port,
         sink: sink.clone(),
         decision_rx: hostkey_rx,
+        agent_forward: cfg.forward_agent,
     };
 
     let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {
@@ -506,7 +632,7 @@ async fn connect(
         sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("正在连接跳板机 {}:{} …", jump.host, jump.port), crate::i18n::Lang::En => format!("Connecting jump {}:{} …", jump.host, jump.port) }));
         let jhandler = JumpHandler { host: jump.host.clone(), port: jump.port, sink: sink.clone() };
         let mut jhandle = client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?;
-        if !authenticate(&mut jhandle, &jump.username, &jump.auth).await? {
+        if !authenticate(&mut jhandle, &jump.username, &jump.auth, sink, cmd_rx).await? {
             anyhow::bail!("{}", crate::i18n::tr("跳板机认证被拒绝", "Jump host auth rejected"));
         }
         // 2) 经跳板机打开到目标主机的 direct-tcpip 通道，并在该流上完成目标 SSH 握手
@@ -522,16 +648,21 @@ async fn connect(
     };
 
     sink.send(WorkerEvent::Status(crate::i18n::tr("正在认证 …", "Authenticating …").into()));
-    if !authenticate(&mut handle, &cfg.username, &cfg.auth).await? {
+    if !authenticate(&mut handle, &cfg.username, &cfg.auth, sink, cmd_rx).await? {
         anyhow::bail!("{}", crate::i18n::tr("认证被拒绝（用户名/密码或密钥错误）", "Authentication rejected (bad credentials)"));
     }
     Ok((handle, jump_keep))
 }
 
-/// 打开带 PTY 的交互式 shell 通道。
-async fn open_shell(handle: &Handle<ClientHandler>) -> anyhow::Result<russh::Channel<client::Msg>> {
+/// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发。
+async fn open_shell(handle: &Handle<ClientHandler>, forward_agent: bool) -> anyhow::Result<russh::Channel<client::Msg>> {
     // request_pty/request_shell 均为 &self，channel 之后按值返回，无需 mut
     let channel = handle.channel_open_session().await?;
+    // 在该会话通道上请求 agent 转发；服务器随后回连的 auth-agent 通道由
+    // ClientHandler::server_channel_open_agent_forward 桥接到本机 agent。
+    if forward_agent {
+        let _ = channel.agent_forward(false).await;
+    }
     channel
         .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
         .await?;

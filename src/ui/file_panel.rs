@@ -48,6 +48,8 @@ pub struct FilePanelState {
     pub copy_flash: Option<f64>,
     /// 面包屑单击导航的延后执行（路径, 单击时刻）——给双击编辑留判定窗口
     pub pending_nav: Option<(String, f64)>,
+    /// 剪贴板：待粘贴的远端绝对路径列表 + 是否为剪切（true=移动，false=复制）
+    pub clip: Option<(Vec<String>, bool)>,
 }
 
 /// 文件列表排序键。
@@ -88,6 +90,8 @@ pub enum FileAction {
     Chmod { path: String, mode: u32 },
     Delete { path: String, is_dir: bool },
     Rename { from: String, to: String },
+    /// 远端批量复制/移动到目标目录（do_move=true 为移动）
+    CopyMove { srcs: Vec<String>, dest_dir: String, do_move: bool },
     CopyPath(String),
     /// 双击文本文件 -> 打开编辑器（force=true 放宽大小限制）
     OpenFile { path: String, force: bool },
@@ -273,6 +277,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     use egui_phosphor::regular as icon;
     let mut bc_nav: Option<String> = None;
     let mut delete_selected = false; // 工具栏删除按钮 / Delete 键触发的批量删除请求
+    let mut paste_here = false; // 工具栏粘贴按钮触发
+    let has_clip = state.clip.is_some(); // 剪贴板是否有待粘贴内容
     egui::Frame::new()
         .fill(Palette::PANEL_2)
         .corner_radius(6)
@@ -306,6 +312,17 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                     };
                     if tool_btn_color(ui, icon::TRASH, &tip, Palette::DANGER) {
                         delete_selected = true;
+                    }
+                }
+                // 粘贴：剪贴板有内容时显示，提示复制/移动与数量
+                if let Some((srcs, do_move)) = &state.clip {
+                    let n = srcs.len();
+                    let tip = match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("{}到此目录（{n} 项）", if *do_move { "移动" } else { "复制" }),
+                        crate::i18n::Lang::En => format!("{} here ({n})", if *do_move { "Move" } else { "Copy" }),
+                    };
+                    if tool_btn_color(ui, icon::CLIPBOARD_TEXT, &tip, Palette::ACCENT) {
+                        paste_here = true;
                     }
                 }
                 // 复制路径：点击后短暂显示绿色对勾，再恢复
@@ -529,6 +546,13 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
             bg_new_file = true;
             ui.close();
         }
+        if has_clip {
+            ui.separator();
+            if ui.button(format!("{}  {}", icon::CLIPBOARD_TEXT, crate::i18n::tr("粘贴到此目录", "Paste here"))).clicked() {
+                paste_here = true;
+                ui.close();
+            }
+        }
         if !state.cwd.is_empty() {
             ui.separator();
             if ui.button(format!("{}  {}", icon::TERMINAL_WINDOW, crate::i18n::tr("在终端打开当前目录", "Open current dir in terminal"))).clicked() {
@@ -676,7 +700,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                     if r.secondary_clicked() {
                         rclick = Some(i);
                     }
-                    entry_context(&r, e, i, &full, &mut menu);
+                    entry_context(&r, e, i, &full, has_clip, &mut menu);
                 });
             }
         });
@@ -816,9 +840,34 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                     state.dialog = Some(Dialog::ConfirmDelete { items });
                 }
             }
+            Menu::Copy(idx) => {
+                let srcs = clip_targets(state, &entries, &cwd, idx);
+                if !srcs.is_empty() {
+                    state.clip = Some((srcs, false));
+                }
+            }
+            Menu::Cut(idx) => {
+                let srcs = clip_targets(state, &entries, &cwd, idx);
+                if !srcs.is_empty() {
+                    state.clip = Some((srcs, true));
+                }
+            }
+            Menu::Paste => paste_here = true,
             Menu::NewDir => state.dialog = Some(Dialog::NewDir { name: String::new() }),
             Menu::NewFile => state.dialog = Some(Dialog::NewFile { name: String::new() }),
             Menu::CdHere(p) => actions.push(FileAction::CdTerminal(p)),
+        }
+    }
+
+    // 粘贴：工具栏按钮或右键菜单触发；移动后清空剪贴板，复制可重复粘贴
+    if paste_here {
+        if let Some((srcs, do_move)) = state.clip.clone() {
+            if !srcs.is_empty() {
+                actions.push(FileAction::CopyMove { srcs, dest_dir: cwd.clone(), do_move });
+                if do_move {
+                    state.clip = None;
+                }
+            }
         }
     }
 
@@ -851,13 +900,18 @@ enum Menu {
     Chmod { path: String, mode: u32, name: String },
     Rename { path: String, name: String },
     Delete(usize),
+    /// 复制 / 剪切右键项（含多选）到剪贴板
+    Copy(usize),
+    Cut(usize),
+    /// 粘贴剪贴板内容到当前目录
+    Paste,
     NewDir,
     NewFile,
     CdHere(String),
 }
 
 /// 条目右键菜单：把用户选择记录到 `menu`。
-fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, menu: &mut Vec<Menu>) {
+fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, has_clip: bool, menu: &mut Vec<Menu>) {
     use egui_phosphor::regular as icon;
     resp.context_menu(|ui| {
         if ui.button(format!("{}  {}", icon::FOLDER_PLUS, crate::i18n::tr("新建文件夹", "New folder"))).clicked() {
@@ -878,6 +932,21 @@ fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, m
             menu.push(Menu::CopyPath(full.to_string()));
             ui.close();
         }
+        ui.separator();
+        // 复制 / 剪切 到剪贴板（含多选）；粘贴到当前目录
+        if ui.button(format!("{}  {}", icon::COPY_SIMPLE, crate::i18n::tr("复制", "Copy"))).clicked() {
+            menu.push(Menu::Copy(idx));
+            ui.close();
+        }
+        if ui.button(format!("{}  {}", icon::SCISSORS, crate::i18n::tr("剪切", "Cut"))).clicked() {
+            menu.push(Menu::Cut(idx));
+            ui.close();
+        }
+        if has_clip && ui.button(format!("{}  {}", icon::CLIPBOARD_TEXT, crate::i18n::tr("粘贴到此目录", "Paste here"))).clicked() {
+            menu.push(Menu::Paste);
+            ui.close();
+        }
+        ui.separator();
         if e.is_dir && ui.button(format!("{}  {}", icon::TERMINAL_WINDOW, crate::i18n::tr("在终端打开此目录", "Open in terminal"))).clicked() {
             menu.push(Menu::CdHere(full.to_string()));
             ui.close();
@@ -896,6 +965,21 @@ fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, m
             ui.close();
         }
     });
+}
+
+/// 计算放入剪贴板的源路径：右键项在多选内则取整组选中，否则只取该项。
+fn clip_targets(state: &FilePanelState, entries: &[FileEntry], cwd: &str, idx: usize) -> Vec<String> {
+    let targets: Vec<usize> = if state.selected.contains(&idx) && state.selected.len() > 1 {
+        let mut v: Vec<usize> = state.selected.iter().copied().collect();
+        v.sort_unstable();
+        v
+    } else {
+        vec![idx]
+    };
+    targets
+        .iter()
+        .filter_map(|&k| entries.get(k).map(|e| join_path(cwd, &e.name)))
+        .collect()
 }
 
 /// 工具栏图标按钮（扁平无边框，悬停高亮）。

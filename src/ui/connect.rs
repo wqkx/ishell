@@ -12,6 +12,8 @@ enum AuthKind {
     Key,
     /// 本机 ssh-agent
     Agent,
+    /// 键盘交互（支持 OTP / 二次验证）
+    Interactive,
 }
 
 #[derive(PartialEq)]
@@ -34,6 +36,8 @@ pub struct ConnectForm {
     key_path: String,
     passphrase: String,
     auth: AuthKind,
+    /// 转发本机 ssh-agent（-A）
+    forward_agent: bool,
     /// 分组与标签（组织用）
     group: String,
     tags: String,
@@ -73,6 +77,7 @@ impl Default for ConnectForm {
             key_path: String::new(),
             passphrase: String::new(),
             auth: AuthKind::Password,
+            forward_agent: false,
             group: String::new(),
             tags: String::new(),
             search: String::new(),
@@ -238,7 +243,7 @@ impl ConnectForm {
                     ui.separator();
                     egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, false]).show(ui, |ui| {
                         for (c, sel) in cands.iter_mut() {
-                            let auth = match c.auth_kind.as_str() { "key" => "key", "agent" => "agent", _ => "pwd" };
+                            let auth = match c.auth_kind.as_str() { "key" => "key", "agent" => "agent", "interactive" => "2fa", _ => "pwd" };
                             ui.checkbox(sel, format!("{}   {}@{}:{}  · {auth}", c.name, c.username, c.host, c.port));
                         }
                     });
@@ -480,6 +485,7 @@ impl ConnectForm {
         self.key_path.clear();
         self.passphrase.clear();
         self.auth = AuthKind::Password;
+        self.forward_agent = false;
         self.group.clear();
         self.tags.clear();
         self.use_jump = false;
@@ -531,6 +537,7 @@ impl ConnectForm {
                     ui.selectable_value(&mut self.auth, AuthKind::Password, crate::i18n::tr("密码", "Password"));
                     ui.selectable_value(&mut self.auth, AuthKind::Key, crate::i18n::tr("私钥", "Key"));
                     ui.selectable_value(&mut self.auth, AuthKind::Agent, crate::i18n::tr("Agent", "Agent"));
+                    ui.selectable_value(&mut self.auth, AuthKind::Interactive, crate::i18n::tr("交互/2FA", "2FA"));
                 });
                 ui.end_row();
 
@@ -538,6 +545,11 @@ impl ConnectForm {
                     AuthKind::Agent => {
                         ui.label("");
                         ui.label(RichText::new(crate::i18n::tr("使用本机 ssh-agent 中的私钥（先 ssh-add）", "Use keys from local ssh-agent (ssh-add first)")).color(Palette::TEXT_DIM).size(11.0));
+                        ui.end_row();
+                    }
+                    AuthKind::Interactive => {
+                        ui.label("");
+                        ui.label(RichText::new(crate::i18n::tr("登录时按服务器提示逐项输入（支持验证码 / 二次验证）", "Answer server prompts at login (OTP / 2FA)")).color(Palette::TEXT_DIM).size(11.0));
                         ui.end_row();
                     }
                     AuthKind::Password => {
@@ -567,6 +579,10 @@ impl ConnectForm {
                 }
             });
 
+        ui.add_space(6.0);
+        ui.checkbox(&mut self.forward_agent, crate::i18n::tr("转发本机 ssh-agent（-A）", "Forward ssh-agent (-A)"))
+            .on_hover_text(crate::i18n::tr("让远端进程复用本机 agent 的私钥；仅在连接可信主机时开启", "Let remote reuse local agent keys; enable only for trusted hosts"));
+
         ui.add_space(8.0);
         ui.checkbox(&mut self.use_jump, crate::i18n::tr("通过跳板机连接（ProxyJump）", "Via jump host (ProxyJump)"));
         if self.use_jump {
@@ -592,6 +608,8 @@ impl ConnectForm {
                     });
                     ui.end_row();
                     match self.j_auth {
+                        // 跳板机不提供交互/2FA 选项；此分支仅为枚举穷尽
+                        AuthKind::Interactive => {}
                         AuthKind::Agent => {
                             ui.label("");
                             ui.label(RichText::new(crate::i18n::tr("使用本机 ssh-agent", "Use local ssh-agent")).color(Palette::TEXT_DIM).size(11.0));
@@ -663,7 +681,8 @@ impl ConnectForm {
         self.password = c.password;
         self.key_path = c.key_path;
         self.passphrase = c.passphrase;
-        self.auth = match c.auth_kind.as_str() { "key" => AuthKind::Key, "agent" => AuthKind::Agent, _ => AuthKind::Password };
+        self.auth = match c.auth_kind.as_str() { "key" => AuthKind::Key, "agent" => AuthKind::Agent, "interactive" => AuthKind::Interactive, _ => AuthKind::Password };
+        self.forward_agent = c.forward_agent;
         self.group = c.group;
         self.tags = c.tags;
         self.use_jump = c.use_jump;
@@ -689,7 +708,8 @@ impl ConnectForm {
             host: self.host.trim().to_string(),
             port: self.port.trim().parse().unwrap_or(22),
             username: self.username.trim().to_string(),
-            auth_kind: match self.auth { AuthKind::Key => "key".into(), AuthKind::Agent => "agent".into(), AuthKind::Password => "password".into() },
+            auth_kind: match self.auth { AuthKind::Key => "key".into(), AuthKind::Agent => "agent".into(), AuthKind::Interactive => "interactive".into(), AuthKind::Password => "password".into() },
+            forward_agent: self.forward_agent,
             password: self.password.clone(),
             key_path: self.key_path.trim().to_string(),
             passphrase: self.passphrase.clone(),
@@ -697,7 +717,7 @@ impl ConnectForm {
             jump_host: self.j_host.trim().to_string(),
             jump_port: self.j_port.trim().parse().unwrap_or(22),
             jump_username: self.j_username.trim().to_string(),
-            jump_auth_kind: match self.j_auth { AuthKind::Key => "key".into(), AuthKind::Agent => "agent".into(), AuthKind::Password => "password".into() },
+            jump_auth_kind: match self.j_auth { AuthKind::Key => "key".into(), AuthKind::Agent => "agent".into(), AuthKind::Interactive => "interactive".into(), AuthKind::Password => "password".into() },
             jump_password: self.j_password.clone(),
             jump_key_path: self.j_key_path.trim().to_string(),
             jump_passphrase: self.j_passphrase.clone(),
@@ -724,6 +744,7 @@ impl ConnectForm {
         let auth = match self.auth {
             AuthKind::Password => AuthMethod::Password(self.password.clone()),
             AuthKind::Agent => AuthMethod::Agent,
+            AuthKind::Interactive => AuthMethod::Interactive,
             AuthKind::Key => {
                 if self.key_path.trim().is_empty() {
                     return Err(crate::i18n::tr("请填写私钥路径", "Enter key file").into());
@@ -749,6 +770,7 @@ impl ConnectForm {
             let jauth = match self.j_auth {
                 AuthKind::Password => AuthMethod::Password(self.j_password.clone()),
                 AuthKind::Agent => AuthMethod::Agent,
+                AuthKind::Interactive => AuthMethod::Interactive,
                 AuthKind::Key => {
                     if self.j_key_path.trim().is_empty() {
                         return Err(crate::i18n::tr("请填写跳板私钥路径", "Enter jump key file").into());
@@ -775,6 +797,7 @@ impl ConnectForm {
             auth,
             label: self.name.trim().to_string(),
             jump,
+            forward_agent: self.forward_agent,
         })
     }
 }

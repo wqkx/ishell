@@ -14,6 +14,8 @@ pub struct ConnectConfig {
     pub label: String,
     /// 可选跳板机：先连它，再经 direct-tcpip 连到目标主机
     pub jump: Option<JumpHost>,
+    /// 转发本机 ssh-agent（OpenSSH 的 `-A`）：远端进程可复用本机 agent 私钥
+    pub forward_agent: bool,
 }
 
 /// 跳板机（堡垒机）连接信息。
@@ -32,6 +34,8 @@ pub enum AuthMethod {
     KeyFile { path: String, passphrase: Option<String> },
     /// 使用本机 ssh-agent 中的私钥（SSH_AUTH_SOCK / Windows OpenSSH 命名管道）
     Agent,
+    /// 键盘交互（keyboard-interactive）：按服务器提示逐项输入，支持 OTP / 二次验证
+    Interactive,
 }
 
 /// UI -> Worker 指令。
@@ -59,6 +63,10 @@ pub enum UiCommand {
     Delete { path: String, is_dir: bool },
     /// 重命名 / 移动
     Rename { from: String, to: String },
+    /// 远端批量复制 / 移动到目标目录（经 shell 执行 cp -a / mv）
+    CopyMove { srcs: Vec<String>, dest_dir: String, do_move: bool },
+    /// 键盘交互认证：用户对服务器提示的逐项回答（顺序与 prompts 一致）
+    KbdResponse(Vec<String>),
     /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制
     ReadFile { path: String, force: bool },
     /// 读取图片文件原始字节（用于看图工具打开）
@@ -113,6 +121,9 @@ pub enum WorkerEvent {
     DirListing { path: String, entries: Vec<FileEntry> },
     /// 首次连接的未知主机，请 UI 确认是否信任其指纹（TOFU）
     HostKeyPrompt { host: String, fingerprint: String },
+    /// 键盘交互认证：服务器下发一组提示，请 UI 收集回答后回 `KbdResponse`
+    /// prompts 每项为 (提示文本, 是否回显)；echo=false 的项应做密码遮蔽
+    KbdPrompt { name: String, instructions: String, prompts: Vec<(String, bool)> },
     /// 文本文件已读取，打开编辑器
     FileOpened { path: String, content: String },
     /// 图片文件已读取（原始字节），打开看图工具
