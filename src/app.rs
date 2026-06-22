@@ -2008,6 +2008,11 @@ impl App {
                                         let fill = if dragging_this { Palette::ACCENT_SOFT } else if selected { Palette::PANEL } else { egui::Color32::TRANSPARENT };
                                         let p = ui.painter();
                                         p.rect_filled(tab_rect, egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, fill);
+                                        // 激活标签底部 2px 珊瑚下划线（更清晰的激活指示）
+                                        if selected && !dragging_this {
+                                            let y = tab_rect.bottom() - 1.0;
+                                            p.hline(tab_rect.left()..=tab_rect.right(), y, egui::Stroke::new(2.0, Palette::ACCENT));
+                                        }
                                         p.circle_filled(egui::pos2(tab_rect.left() + 14.0, tab_rect.center().y), 4.0, if s.connected { Palette::OK } else { Palette::WARN });
                                         let tcolor = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
                                         p.text(egui::pos2(tab_rect.left() + 25.0, tab_rect.center().y), egui::Align2::LEFT_CENTER, &s.title, body_font.clone(), tcolor);

@@ -162,11 +162,13 @@ impl ConnectForm {
         let mut open = self.open;
 
         let title = if self.mode == Mode::List { crate::i18n::tr("快速连接", "Quick Connect") } else { crate::i18n::tr("新建连接", "New Connection") };
+        // 表单较窄（贴合输入列宽，按钮右对齐不至于飘太远）；列表略宽以容纳连接条目
+        let win_width = if self.mode == Mode::List { 520.0 } else { 430.0 };
         egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(520.0)
+            .default_width(win_width)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| match self.mode {
                 Mode::List => self.list_view(ui, &mut result),

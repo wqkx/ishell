@@ -223,10 +223,10 @@ fn meter_row(ui: &mut egui::Ui, label: &str, percent: f32, detail: &str) {
         rect.left_top() + Vec2::new(label_w, 2.0),
         rect.right_bottom() - Vec2::new(0.0, 2.0),
     );
-    p.rect_filled(bar, 0.0, Palette::TRACK);
+    p.rect_filled(bar, 2.0, Palette::TRACK);
     let mut fill = bar;
     fill.set_width((bar.width() * percent / 100.0).max(2.0));
-    p.rect_filled(fill, 0.0, usage_color(percent));
+    p.rect_filled(fill, 2.0, usage_color(percent));
     p.text(
         bar.right_center() - Vec2::new(5.0, 0.0),
         egui::Align2::RIGHT_CENTER,
@@ -248,10 +248,10 @@ fn gpu_meter(ui: &mut egui::Ui, percent: f32, count: usize) -> egui::Response {
     p.text(rect.left_center() + Vec2::new(1.0, 0.0), egui::Align2::LEFT_CENTER, "GPU",
         egui::FontId::proportional(12.0), Palette::TEXT);
     let bar = Rect::from_min_max(rect.left_top() + Vec2::new(label_w, 2.0), rect.right_bottom() - Vec2::new(0.0, 2.0));
-    p.rect_filled(bar, 0.0, Palette::TRACK);
+    p.rect_filled(bar, 2.0, Palette::TRACK);
     let mut fill = bar;
     fill.set_width((bar.width() * percent / 100.0).max(2.0));
-    p.rect_filled(fill, 0.0, usage_color(percent));
+    p.rect_filled(fill, 2.0, usage_color(percent));
     let detail = if count > 1 {
         match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!("{count} 卡  {percent:.0}%"),
@@ -272,12 +272,12 @@ fn disk_row(ui: &mut egui::Ui, mount: &str, percent: f32, detail: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
     let p = ui.painter_at(rect);
 
-    p.rect_filled(rect, 0.0, Palette::TRACK);
+    p.rect_filled(rect, 2.0, Palette::TRACK);
     // 使用量：从右侧起填充（半透明，柔和不刺眼）
     let w = rect.width() * percent / 100.0;
     let used = Rect::from_min_max(egui::pos2(rect.right() - w, rect.top()), rect.right_bottom());
     let c = usage_color(percent);
-    p.rect_filled(used, 0.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 90));
+    p.rect_filled(used, 2.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 90));
 
     p.text(
         rect.left_center() + Vec2::new(6.0, 0.0),
