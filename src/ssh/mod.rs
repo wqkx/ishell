@@ -14,7 +14,7 @@ use russh::keys::ssh_key;
 use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::proto::{AuthMethod, ConnectConfig, FileEntry, UiCommand, WorkerEvent};
+use crate::proto::{AuthMethod, ConflictPolicy, ConnectConfig, FileEntry, UiCommand, WorkerEvent};
 use sysinfo::{SysSampler, PROBE_CMD};
 
 /// 同一会话同时进行的最大传输数（不同会话各自独立）。
@@ -22,8 +22,8 @@ const MAX_CONCURRENT_XFER: usize = 6;
 
 /// 待执行/进行中的传输任务描述。
 enum PendingXfer {
-    Download { id: u64, remote: String, local: String },
-    Upload { id: u64, local: String, remote_dir: String },
+    Download { id: u64, remote: String, local: String, policy: ConflictPolicy },
+    Upload { id: u64, local: String, remote_dir: String, policy: ConflictPolicy },
 }
 
 impl PendingXfer {
@@ -53,8 +53,8 @@ fn start_xfer(
             Ok(sftp) => {
                 let sftp = Arc::new(sftp);
                 match p {
-                    PendingXfer::Download { id, remote, local } => download(h.clone(), sftp, id, remote, local, &s, cancel).await,
-                    PendingXfer::Upload { id, local, remote_dir } => upload(sftp.as_ref(), id, local, remote_dir, &s, cancel).await,
+                    PendingXfer::Download { id, remote, local, policy } => download(h.clone(), sftp, id, remote, local, policy, &s, cancel).await,
+                    PendingXfer::Upload { id, local, remote_dir, policy } => upload(sftp.as_ref(), id, local, remote_dir, policy, &s, cancel).await,
                 }
             }
             Err(e) => s.send(WorkerEvent::TransferDone {
@@ -83,14 +83,60 @@ impl UiSink {
 }
 
 /// russh 客户端回调处理器：校验主机密钥（known_hosts + 首次信任 TOFU）。
+/// UI 对主机密钥确认的回复通道；跳板机与目标主机共享（顺序询问，不并发）。
+type HostKeyDecision = Arc<tokio::sync::Mutex<UnboundedReceiver<bool>>>;
+
 struct ClientHandler {
     host: String,
     port: u16,
     sink: UiSink,
-    /// UI 对"是否信任新主机"的回复
-    decision_rx: UnboundedReceiver<bool>,
+    /// UI 对"是否信任新主机/接受变更密钥"的回复
+    decision_rx: HostKeyDecision,
     /// 是否转发本机 ssh-agent：为真时桥接远端回连的 auth-agent 通道到本地 agent
     agent_forward: bool,
+}
+
+/// 用户主目录下的 known_hosts 路径（与 russh 内部一致）。
+fn known_hosts_file() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow::anyhow!("找不到用户主目录"))?;
+    Ok(std::path::PathBuf::from(home).join(".ssh").join("known_hosts"))
+}
+
+/// 主机密钥变更后用户确认接受：删除 known_hosts 中该主机的旧行，再写入新键。
+fn replace_known_host(host: &str, port: u16, new_key: &ssh_key::PublicKey) -> anyhow::Result<()> {
+    // 收集匹配该主机的行号（russh 的匹配能处理哈希主机名）
+    let remove: std::collections::HashSet<usize> = russh::keys::known_hosts::known_host_keys(host, port)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    let path = known_hosts_file()?;
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        // known_host_keys 的行号从 1 计；过滤掉这些行后回写
+        let kept: String = content
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| !remove.contains(&(i + 1)))
+            .map(|(_, l)| format!("{l}\n"))
+            .collect();
+        std::fs::write(&path, kept)?;
+    }
+    russh::keys::known_hosts::learn_known_hosts(host, port, new_key)?;
+    Ok(())
+}
+
+impl ClientHandler {
+    /// 未知或变更的主机密钥：弹窗请用户确认（changed=true 表示密钥已变更）。
+    async fn ask_trust(&mut self, fp: String, changed: bool) -> bool {
+        self.sink.send(WorkerEvent::HostKeyPrompt {
+            host: format!("{}:{}", self.host, self.port),
+            fingerprint: fp,
+            changed,
+        });
+        matches!(self.decision_rx.lock().await.recv().await, Some(true))
+    }
 }
 
 impl Handler for ClientHandler {
@@ -125,22 +171,24 @@ impl Handler for ClientHandler {
             Ok(true) => Ok(true),
             // 未知主机 -> 请 UI 确认（TOFU），同意则写入 known_hosts
             Ok(false) => {
-                self.sink.send(WorkerEvent::HostKeyPrompt {
-                    host: format!("{}:{}", self.host, self.port),
-                    fingerprint: fp,
-                });
-                match self.decision_rx.recv().await {
-                    Some(true) => {
-                        let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
-                        Ok(true)
-                    }
-                    _ => Ok(false),
+                if self.ask_trust(fp, false).await {
+                    let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
             }
-            // 已记录但密钥不一致 -> 可能中间人攻击，拒绝并提示手动处理
+            // 已记录但密钥不一致 -> 可能中间人攻击；在 UI 内确认是否接受新键并替换旧行
             Err(_) => {
-                self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("主机密钥已改变（{}），可能存在中间人攻击！请手动编辑 ~/.ssh/known_hosts 删除旧行后重试。", fp), crate::i18n::Lang::En => format!("Host key changed ({})! Possible MITM. Remove the old line in ~/.ssh/known_hosts and retry.", fp) }));
-                Ok(false)
+                if self.ask_trust(fp, true).await {
+                    if let Err(e) = replace_known_host(&self.host, self.port, server_public_key) {
+                        self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("更新 known_hosts 失败：{e}"), crate::i18n::Lang::En => format!("Failed to update known_hosts: {e}") }));
+                        return Ok(false);
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
         }
     }
@@ -151,6 +199,19 @@ struct JumpHandler {
     host: String,
     port: u16,
     sink: UiSink,
+    /// 与目标主机共享的确认通道（跳板机先于目标询问，不并发）
+    decision_rx: HostKeyDecision,
+}
+
+impl JumpHandler {
+    async fn ask_trust(&mut self, fp: String, changed: bool) -> bool {
+        self.sink.send(WorkerEvent::HostKeyPrompt {
+            host: format!("{}:{} (jump)", self.host, self.port),
+            fingerprint: fp,
+            changed,
+        });
+        matches!(self.decision_rx.lock().await.recv().await, Some(true))
+    }
 }
 
 impl Handler for JumpHandler {
@@ -160,16 +221,28 @@ impl Handler for JumpHandler {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
+        let fp = server_public_key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
         match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
             Ok(true) => Ok(true),
+            // 跳板机首次连接也需 TOFU 用户确认（不再自动信任，防中间人冒充堡垒机）
             Ok(false) => {
-                let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
-                self.sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已信任跳板机 {} 的主机指纹", self.host), crate::i18n::Lang::En => format!("Trusted jump host key: {}", self.host) }));
-                Ok(true)
+                if self.ask_trust(fp, false).await {
+                    let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
             Err(_) => {
-                self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("跳板机 {} 主机密钥已改变，可能存在中间人攻击，已拒绝。", self.host), crate::i18n::Lang::En => format!("Jump host {} key changed; possible MITM. Rejected.", self.host) }));
-                Ok(false)
+                if self.ask_trust(fp, true).await {
+                    if let Err(e) = replace_known_host(&self.host, self.port, server_public_key) {
+                        self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("更新 known_hosts 失败：{e}"), crate::i18n::Lang::En => format!("Failed to update known_hosts: {e}") }));
+                        return Ok(false);
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
         }
     }
@@ -303,8 +376,8 @@ pub async fn run(
                         }
                     }
                     // 传输：独立任务（独立 SFTP 通道），不阻塞交互 shell
-                    Some(UiCommand::Download { id, remote, local }) => {
-                        let p = PendingXfer::Download { id, remote, local };
+                    Some(UiCommand::Download { id, remote, local, policy }) => {
+                        let p = PendingXfer::Download { id, remote, local, policy };
                         if active_xfer < MAX_CONCURRENT_XFER {
                             start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
                             active_xfer += 1;
@@ -312,8 +385,8 @@ pub async fn run(
                             pending_xfer.push_back(p);
                         }
                     }
-                    Some(UiCommand::Upload { id, local, remote_dir }) => {
-                        let p = PendingXfer::Upload { id, local, remote_dir };
+                    Some(UiCommand::Upload { id, local, remote_dir, policy }) => {
+                        let p = PendingXfer::Upload { id, local, remote_dir, policy };
                         if active_xfer < MAX_CONCURRENT_XFER {
                             start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
                             active_xfer += 1;
@@ -619,18 +692,21 @@ async fn connect(
         ..Default::default()
     });
 
+    // 主机密钥确认通道：跳板机与目标主机共享（顺序询问，不并发）
+    let decision_rx: HostKeyDecision = Arc::new(tokio::sync::Mutex::new(hostkey_rx));
+
     let target_handler = ClientHandler {
         host: cfg.host.clone(),
         port: cfg.port,
         sink: sink.clone(),
-        decision_rx: hostkey_rx,
+        decision_rx: decision_rx.clone(),
         agent_forward: cfg.forward_agent,
     };
 
     let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {
         // 1) 先连跳板机并认证
         sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("正在连接跳板机 {}:{} …", jump.host, jump.port), crate::i18n::Lang::En => format!("Connecting jump {}:{} …", jump.host, jump.port) }));
-        let jhandler = JumpHandler { host: jump.host.clone(), port: jump.port, sink: sink.clone() };
+        let jhandler = JumpHandler { host: jump.host.clone(), port: jump.port, sink: sink.clone(), decision_rx: decision_rx.clone() };
         let mut jhandle = client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?;
         if !authenticate(&mut jhandle, &jump.username, &jump.auth, sink, cmd_rx).await? {
             anyhow::bail!("{}", crate::i18n::tr("跳板机认证被拒绝", "Jump host auth rejected"));
@@ -719,6 +795,13 @@ async fn exec_status(handle: &Handle<ClientHandler>, cmd: &str) -> anyhow::Resul
     Ok((code, String::from_utf8_lossy(&err).into_owned()))
 }
 
+/// 生成 n 字节的随机十六进制串（用于临时文件名，避免可预测路径被 symlink 抢占）。
+fn rand_hex(n: usize) -> String {
+    let mut b = vec![0u8; n];
+    let _ = getrandom::getrandom(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 /// POSIX 单引号转义，用于把路径安全嵌入 shell 命令。
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -780,7 +863,8 @@ async fn download_dir_compressed(
 ) -> anyhow::Result<()> {
     let name = basename(remote);
     let parent = remote_parent(remote);
-    let tmp_remote = format!("/tmp/.ishell_dl_{id}.tar.gz");
+    // 随机文件名：防止可预测路径在共享 /tmp 上被预置 symlink 抢占（竞态/越权写）
+    let tmp_remote = format!("/tmp/.ishell_dl_{id}_{}.tar.gz", rand_hex(8));
 
     // 远端打包（czf：gzip 默认级别；-C 进入父目录，仅打包目标目录名）
     let cmd = format!("tar czf {} -C {} {}", sh_quote(&tmp_remote), sh_quote(&parent), sh_quote(&name));
@@ -793,7 +877,7 @@ async fn download_dir_compressed(
     sink.send(WorkerEvent::TransferStart { id, name: name.clone(), total: size, dir: crate::proto::TransferDir::Download });
 
     // 下载压缩包到本地临时文件（并发分段 + 进度）
-    let local_tgz = std::path::PathBuf::from(format!("{local}.ishelldl.tgz"));
+    let local_tgz = std::path::PathBuf::from(format!("{local}.ishelldl.{}.tgz", rand_hex(6)));
     let done = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let prog = {
@@ -832,17 +916,76 @@ async fn download_dir_compressed(
     Ok(())
 }
 
+/// 给本地路径找一个不冲突的变体：`file.ext` → `file (1).ext`；目录 `dir` → `dir (1)`。
+fn local_nonexistent(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return path.to_string();
+    }
+    let is_dir = p.is_dir();
+    let parent = p.parent();
+    let fname = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let (stem, ext) = split_name(&fname, is_dir);
+    for n in 1..10000u32 {
+        let cand_name = match &ext { Some(e) => format!("{stem} ({n}).{e}"), None => format!("{stem} ({n})") };
+        let cand = match parent { Some(d) => d.join(&cand_name), None => std::path::PathBuf::from(&cand_name) };
+        if !cand.exists() {
+            return cand.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
+}
+
+/// 给远端目录里的名字找一个不冲突的变体。
+async fn remote_nonexistent(sftp: &russh_sftp::client::SftpSession, dir: &str, name: &str, is_dir: bool) -> String {
+    let (stem, ext) = split_name(name, is_dir);
+    for n in 1..10000u32 {
+        let cand = match &ext { Some(e) => format!("{stem} ({n}).{e}"), None => format!("{stem} ({n})") };
+        if sftp.metadata(&join_remote(dir, &cand)).await.is_err() {
+            return cand;
+        }
+    }
+    name.to_string()
+}
+
+/// 拆分文件名为 (主名, 扩展)；目录或无扩展时扩展为 None（首字符的点不算扩展）。
+fn split_name(fname: &str, is_dir: bool) -> (String, Option<String>) {
+    if is_dir {
+        return (fname.to_string(), None);
+    }
+    match fname.rfind('.') {
+        Some(d) if d > 0 => (fname[..d].to_string(), Some(fname[d + 1..].to_string())),
+        _ => (fname.to_string(), None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn download(
     handle: Arc<Handle<ClientHandler>>,
     sftp: Arc<russh_sftp::client::SftpSession>,
     id: u64,
     remote: String,
     local: String,
+    policy: ConflictPolicy,
     sink: &UiSink,
     cancel: Arc<AtomicBool>,
 ) {
     let name = basename(&remote);
     let is_dir = sftp.metadata(&remote).await.map(|m| m.is_dir()).unwrap_or(false);
+
+    // 冲突处理：本地目标已存在时，按策略 跳过 / 重命名 / 覆盖
+    let local = if std::path::Path::new(&local).exists() {
+        match policy {
+            ConflictPolicy::Skip => {
+                sink.send(WorkerEvent::TransferDone { id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已跳过（本地已存在）：{name}"), crate::i18n::Lang::En => format!("Skipped (exists): {name}") }, refresh_dir: None });
+                return;
+            }
+            ConflictPolicy::Rename => local_nonexistent(&local),
+            ConflictPolicy::Overwrite => local,
+        }
+    } else {
+        local
+    };
 
     // 目录优先走压缩下载（远端 tar.gz 打包 → 单文件并发下载 → 本地解包），
     // 大幅减少多小文件的逐个 SFTP 往返；任何失败则回退到逐文件下载。
@@ -1203,11 +1346,26 @@ async fn upload(
     id: u64,
     local: String,
     remote_dir: String,
+    policy: ConflictPolicy,
     sink: &UiSink,
     cancel: Arc<AtomicBool>,
 ) {
     let name = basename(&local);
     let is_dir = tokio::fs::metadata(&local).await.map(|m| m.is_dir()).unwrap_or(false);
+
+    // 冲突处理：远端目标已存在时，按策略 跳过 / 重命名 / 覆盖
+    let name = if sftp.metadata(&join_remote(&remote_dir, &name)).await.is_ok() {
+        match policy {
+            ConflictPolicy::Skip => {
+                sink.send(WorkerEvent::TransferDone { id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已跳过（远端已存在）：{name}"), crate::i18n::Lang::En => format!("Skipped (exists): {name}") }, refresh_dir: None });
+                return;
+            }
+            ConflictPolicy::Rename => remote_nonexistent(sftp, &remote_dir, &name, is_dir).await,
+            ConflictPolicy::Overwrite => name,
+        }
+    } else {
+        name
+    };
 
     let res: anyhow::Result<()> = async {
         // 收集待上传文件：(本地路径, 远程路径, 大小)；目录则递归并记录要创建的远端目录

@@ -27,6 +27,34 @@ pub struct JumpHost {
     pub auth: AuthMethod,
 }
 
+/// 传输目标已存在时的冲突处理策略（全局设置，默认覆盖）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// 覆盖（默认）：继续传输，替换/续写目标
+    Overwrite,
+    /// 跳过：目标已存在则不传输
+    Skip,
+    /// 重命名：自动取不冲突的新名（如 `name (1)`）
+    Rename,
+}
+
+impl ConflictPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConflictPolicy::Overwrite => "overwrite",
+            ConflictPolicy::Skip => "skip",
+            ConflictPolicy::Rename => "rename",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "skip" => ConflictPolicy::Skip,
+            "rename" => ConflictPolicy::Rename,
+            _ => ConflictPolicy::Overwrite,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum AuthMethod {
     Password(String),
@@ -48,9 +76,9 @@ pub enum UiCommand {
     /// 请求列出远程目录（SFTP）
     ListDir(String),
     /// 下载远程文件到本地路径
-    Download { id: u64, remote: String, local: String },
+    Download { id: u64, remote: String, local: String, policy: ConflictPolicy },
     /// 上传本地文件到远程目录
-    Upload { id: u64, local: String, remote_dir: String },
+    Upload { id: u64, local: String, remote_dir: String, policy: ConflictPolicy },
     /// 取消某个传输任务（进行中或排队中）
     CancelTransfer(u64),
     /// 新建目录
@@ -119,8 +147,8 @@ pub enum WorkerEvent {
     SysInfo(Box<SysInfo>),
     /// 目录列表结果
     DirListing { path: String, entries: Vec<FileEntry> },
-    /// 首次连接的未知主机，请 UI 确认是否信任其指纹（TOFU）
-    HostKeyPrompt { host: String, fingerprint: String },
+    /// 未知主机请 UI 确认指纹（TOFU）；changed=true 表示主机密钥**已变更**（更危险）
+    HostKeyPrompt { host: String, fingerprint: String, changed: bool },
     /// 键盘交互认证：服务器下发一组提示，请 UI 收集回答后回 `KbdResponse`
     /// prompts 每项为 (提示文本, 是否回显)；echo=false 的项应做密码遮蔽
     KbdPrompt { name: String, instructions: String, prompts: Vec<(String, bool)> },

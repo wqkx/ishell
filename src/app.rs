@@ -5,7 +5,7 @@ use std::sync::Arc;
 use egui::{RichText, Sense};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::proto::{AuthMethod, ConnectConfig, UiCommand, WorkerEvent};
+use crate::proto::{AuthMethod, ConflictPolicy, ConnectConfig, UiCommand, WorkerEvent};
 use crate::ssh::{self, UiSink};
 use crate::terminal::Terminal;
 use crate::theme::Palette;
@@ -42,8 +42,8 @@ struct Session {
     pending_image: Vec<(String, Vec<u8>)>,
     /// 向 worker 回复"是否信任未知主机"
     hostkey_tx: UnboundedSender<bool>,
-    /// 待确认的未知主机（host, 指纹）
-    pending_hostkey: Option<(String, String)>,
+    /// 待确认的主机（host, 指纹, 是否为密钥变更）
+    pending_hostkey: Option<(String, String, bool)>,
     /// 待回答的键盘交互认证提示（None = 无）
     kbd_prompt: Option<KbdPrompt>,
     /// 端口转发列表
@@ -176,10 +176,10 @@ impl Session {
                         }
                         match &t.spec {
                             Some(XferSpec::Download { remote, local }) => {
-                                let _ = self.cmd_tx.send(UiCommand::Download { id: t.id, remote: remote.clone(), local: local.clone() });
+                                let _ = self.cmd_tx.send(UiCommand::Download { id: t.id, remote: remote.clone(), local: local.clone(), policy: ConflictPolicy::Overwrite });
                             }
                             Some(XferSpec::Upload { local, remote_dir }) => {
-                                let _ = self.cmd_tx.send(UiCommand::Upload { id: t.id, local: local.clone(), remote_dir: remote_dir.clone() });
+                                let _ = self.cmd_tx.send(UiCommand::Upload { id: t.id, local: local.clone(), remote_dir: remote_dir.clone(), policy: ConflictPolicy::Overwrite });
                             }
                             None => continue,
                         }
@@ -244,8 +244,8 @@ impl Session {
                     let answers = vec![String::new(); prompts.len()];
                     self.kbd_prompt = Some(KbdPrompt { name, instructions, prompts, answers });
                 }
-                WorkerEvent::HostKeyPrompt { host, fingerprint } => {
-                    self.pending_hostkey = Some((host, fingerprint));
+                WorkerEvent::HostKeyPrompt { host, fingerprint, changed } => {
+                    self.pending_hostkey = Some((host, fingerprint, changed));
                     self.status = crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
                 }
                 WorkerEvent::FileOpened { path, content } => {
@@ -383,6 +383,8 @@ pub struct App {
     /// 命令广播栏是否显示 + 输入内容
     show_broadcast: bool,
     broadcast_input: String,
+    /// 传输冲突策略（目标已存在时；默认覆盖）
+    conflict_policy: ConflictPolicy,
     /// 文件剪贴板（跨 tab 共享）：复制/剪切的源项
     file_clip: Option<FileClip>,
     /// 待确认的粘贴（剪切 或 跨服务器：执行前二次确认）
@@ -547,6 +549,7 @@ impl App {
             fwd_form: ForwardForm::default(),
             show_broadcast: false,
             broadcast_input: String::new(),
+            conflict_policy: crate::store::load_conflict_policy().map(|s| ConflictPolicy::from_str(&s)).unwrap_or(ConflictPolicy::Overwrite),
             file_clip: None,
             pending_paste: None,
             relays: Vec::new(),
@@ -881,6 +884,7 @@ impl App {
 
     /// 翻译文件面板动作为 SFTP 指令或剪贴板操作。
     fn handle_file_action(&mut self, idx: usize, action: FileAction) {
+        let policy = self.conflict_policy;
         // 剪贴板 / 粘贴需同时访问 App 级剪贴板与会话信息，单独前置处理
         match action {
             FileAction::ClipCopy { items } => return self.set_clip(idx, items, false),
@@ -905,7 +909,7 @@ impl App {
                     done: 0, total: 0, ok: None,
                     local: Some(local.clone()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
                 });
-                let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local });
+                let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy });
                 self.show_transfers = true;
                 self.xfer_just_opened = true;
             }
@@ -919,7 +923,7 @@ impl App {
                     done: 0, total: 0, ok: None,
                     local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
                 });
-                let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir });
+                let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy });
                 self.show_transfers = true;
                 self.xfer_just_opened = true;
             }
@@ -1042,7 +1046,7 @@ impl App {
                     let s = &mut self.sessions[si];
                     let id = s.next_xfer;
                     s.next_xfer += 1;
-                    let _ = s.cmd_tx.send(UiCommand::Download { id, remote: src_path.clone(), local: tmp.to_string_lossy().into_owned() });
+                    let _ = s.cmd_tx.send(UiCommand::Download { id, remote: src_path.clone(), local: tmp.to_string_lossy().into_owned(), policy: ConflictPolicy::Overwrite });
                     id
                 };
                 self.relays.push(Relay {
@@ -1123,7 +1127,7 @@ impl App {
                             let s = &mut self.sessions[di];
                             let id = s.next_xfer;
                             s.next_xfer += 1;
-                            let _ = s.cmd_tx.send(UiCommand::Upload { id, local: tmp, remote_dir: dest_dir });
+                            let _ = s.cmd_tx.send(UiCommand::Upload { id, local: tmp, remote_dir: dest_dir, policy: ConflictPolicy::Overwrite });
                             id
                         };
                         self.relays[i].phase = RelayPhase::Up(upid);
@@ -1463,25 +1467,42 @@ impl App {
         let Some(idx) = self.sessions.iter().position(|s| s.pending_hostkey.is_some()) else {
             return;
         };
-        let (host, fp) = self.sessions[idx].pending_hostkey.clone().unwrap();
+        let (host, fp, changed) = self.sessions[idx].pending_hostkey.clone().unwrap();
         let mut decision: Option<bool> = None;
         egui::Modal::new(egui::Id::new("hostkey_modal"))
             .show(ctx, |ui| {
-                ui.set_width(380.0);
-                ui.label(RichText::new(crate::i18n::tr("未知主机", "Unknown host")).size(16.0).strong());
-                ui.add_space(8.0);
-                ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("首次连接主机：{host}"), crate::i18n::Lang::En => format!("First connect: {host}") });
-                ui.add_space(4.0);
-                ui.label(RichText::new(crate::i18n::tr("指纹 (SHA256)：", "Fingerprint (SHA256):")).color(Palette::TEXT_DIM).size(12.0));
-                ui.label(RichText::new(&fp).monospace());
-                ui.add_space(6.0);
-                ui.label(RichText::new(crate::i18n::tr("请确认该指纹与目标服务器一致；信任后将写入 ~/.ssh/known_hosts。", "Verify the fingerprint matches the server; trusting writes to ~/.ssh/known_hosts.")).color(Palette::TEXT_DIM).size(11.0));
+                ui.set_width(400.0);
+                if changed {
+                    // 主机密钥变更：更醒目的红色警告 + 在 UI 内替换 known_hosts
+                    ui.label(RichText::new(crate::i18n::tr("⚠ 主机密钥已变更", "⚠ Host key changed")).size(16.0).strong().color(Palette::DANGER));
+                    ui.add_space(8.0);
+                    ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("主机：{host}"), crate::i18n::Lang::En => format!("Host: {host}") });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(crate::i18n::tr("新指纹 (SHA256)：", "New fingerprint (SHA256):")).color(Palette::TEXT_DIM).size(12.0));
+                    ui.label(RichText::new(&fp).monospace());
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(crate::i18n::tr("known_hosts 中记录的密钥与服务器当前不符。若非你主动更换了服务器密钥，可能是中间人攻击！接受将删除旧密钥并写入新密钥。", "The recorded key differs from the server's. If you didn't rotate the key, this could be a MITM attack! Accepting removes the old key and stores the new one.")).color(Palette::DANGER).size(11.0));
+                } else {
+                    ui.label(RichText::new(crate::i18n::tr("未知主机", "Unknown host")).size(16.0).strong());
+                    ui.add_space(8.0);
+                    ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("首次连接主机：{host}"), crate::i18n::Lang::En => format!("First connect: {host}") });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(crate::i18n::tr("指纹 (SHA256)：", "Fingerprint (SHA256):")).color(Palette::TEXT_DIM).size(12.0));
+                    ui.label(RichText::new(&fp).monospace());
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(crate::i18n::tr("请确认该指纹与目标服务器一致；信任后将写入 ~/.ssh/known_hosts。", "Verify the fingerprint matches the server; trusting writes to ~/.ssh/known_hosts.")).color(Palette::TEXT_DIM).size(11.0));
+                }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    let bw = 96.0;
+                    let bw = 120.0;
                     let total = bw * 2.0 + ui.spacing().item_spacing.x;
                     ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                    if dialog_button(ui, crate::i18n::tr("信任并连接", "Trust & connect"), Some(Palette::ACCENT), bw) {
+                    let (accept_label, accept_col) = if changed {
+                        (crate::i18n::tr("删除旧密钥并信任", "Replace & trust"), Palette::DANGER)
+                    } else {
+                        (crate::i18n::tr("信任并连接", "Trust & connect"), Palette::ACCENT)
+                    };
+                    if dialog_button(ui, accept_label, Some(accept_col), bw) {
                         decision = Some(true);
                     }
                     if dialog_button(ui, crate::i18n::tr("拒绝", "Reject"), None, bw) {
@@ -2741,7 +2762,17 @@ impl App {
         let mut remove_id: Option<u64> = None;
         let mut delete_id: Option<(u64, String)> = None;
         let mut resume_id: Option<u64> = None;
+        let mut cycle_policy = false;
         let dl_dir = self.download_dir.to_string_lossy().into_owned();
+        // 冲突策略短标签（中/英），用于标题栏按钮显示
+        let policy_label = match (self.conflict_policy, crate::i18n::current()) {
+            (ConflictPolicy::Overwrite, crate::i18n::Lang::Zh) => "覆盖",
+            (ConflictPolicy::Skip, crate::i18n::Lang::Zh) => "跳过",
+            (ConflictPolicy::Rename, crate::i18n::Lang::Zh) => "重命名",
+            (ConflictPolicy::Overwrite, crate::i18n::Lang::En) => "Overwrite",
+            (ConflictPolicy::Skip, crate::i18n::Lang::En) => "Skip",
+            (ConflictPolicy::Rename, crate::i18n::Lang::En) => "Rename",
+        };
         let win = egui::Window::new("transfer_win")
             .title_bar(false) // 隐藏过大的默认标题，使用自定义紧凑标题
             .anchor(egui::Align2::RIGHT_TOP, [-10.0, 44.0])
@@ -2759,6 +2790,14 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                             close_win = true;
+                        }
+                        // 冲突策略：目标已存在时的默认处理；点击循环切换（覆盖→跳过→重命名），持久化
+                        if ui
+                            .add(egui::Button::new(RichText::new(format!("{} {}", icon::COPY_SIMPLE, policy_label)).size(11.0).color(Palette::TEXT_DIM)).frame(false))
+                            .on_hover_text(crate::i18n::tr("目标已存在时的默认处理（点击切换：覆盖 / 跳过 / 重命名）", "Default when target exists (click to cycle: Overwrite / Skip / Rename)"))
+                            .clicked()
+                        {
+                            cycle_policy = true;
                         }
                         if ui
                             .add(egui::Button::new(RichText::new(icon::FOLDER_OPEN).size(13.0).color(Palette::TEXT_DIM)).frame(false))
@@ -2937,8 +2976,8 @@ impl App {
             if let Some(s) = self.sessions.get_mut(idx) {
                 if let Some(spec) = s.transfers.iter().find(|t| t.id == id).and_then(|t| t.spec.clone()) {
                     match spec {
-                        XferSpec::Download { remote, local } => { let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local }); }
-                        XferSpec::Upload { local, remote_dir } => { let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir }); }
+                        XferSpec::Download { remote, local } => { let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy: ConflictPolicy::Overwrite }); }
+                        XferSpec::Upload { local, remote_dir } => { let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy: ConflictPolicy::Overwrite }); }
                     }
                     if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
                         t.ok = None;
@@ -2981,6 +3020,16 @@ impl App {
                 crate::store::save_download_dir(&dir.to_string_lossy());
             }
             self.xfer_just_opened = true; // 选择期间点击不算"外部点击"，避免关窗
+        }
+        // 冲突策略循环切换：覆盖 → 跳过 → 重命名 → 覆盖，并持久化
+        if cycle_policy {
+            self.conflict_policy = match self.conflict_policy {
+                ConflictPolicy::Overwrite => ConflictPolicy::Skip,
+                ConflictPolicy::Skip => ConflictPolicy::Rename,
+                ConflictPolicy::Rename => ConflictPolicy::Overwrite,
+            };
+            crate::store::save_conflict_policy(self.conflict_policy.as_str());
+            self.xfer_just_opened = true; // 切换点击不算窗外点击
         }
         // 点击窗口外部任意位置自动隐藏（打开当帧除外，避免被开启动作立即关闭）
         let clicked_outside = win

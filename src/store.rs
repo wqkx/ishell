@@ -300,6 +300,28 @@ pub fn save_lang(code: &str) {
     }
 }
 
+// ---------- 传输冲突策略 ----------
+
+fn conflict_policy_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("conflict_policy"))
+}
+
+/// 读取冲突策略字符串（"overwrite"/"skip"/"rename"），未设置则 None（调用方默认覆盖）。
+pub fn load_conflict_policy() -> Option<String> {
+    let s = std::fs::read_to_string(conflict_policy_path()?).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// 保存冲突策略字符串。
+pub fn save_conflict_policy(policy: &str) {
+    if let Some(p) = conflict_policy_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, policy);
+    }
+}
+
 // ---------- 读写 ----------
 
 /// 读取已保存连接列表（内存中为明文密码）。
