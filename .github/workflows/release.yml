@@ -12,6 +12,10 @@ permissions:
 
 jobs:
   build:
+    # 网络韧性：禁用 cargo 的 HTTP/2 多路复用（规避 "HTTP2 framing layer" 报错），并多重试
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
     strategy:
       fail-fast: false
       matrix:
