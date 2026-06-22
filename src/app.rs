@@ -2763,7 +2763,7 @@ impl App {
         let mut resume_id: Option<u64> = None;
         let mut cycle_policy = false;
         let dl_dir = self.download_dir.to_string_lossy().into_owned();
-        // 冲突策略短标签（中/英），用于标题栏按钮显示
+        // 冲突策略短标签（中/英）+ 按策略区分的图标，用于标题栏按钮显示
         let policy_label = match (self.conflict_policy, crate::i18n::current()) {
             (ConflictPolicy::Overwrite, crate::i18n::Lang::Zh) => "覆盖",
             (ConflictPolicy::Skip, crate::i18n::Lang::Zh) => "跳过",
@@ -2771,6 +2771,11 @@ impl App {
             (ConflictPolicy::Overwrite, crate::i18n::Lang::En) => "Overwrite",
             (ConflictPolicy::Skip, crate::i18n::Lang::En) => "Skip",
             (ConflictPolicy::Rename, crate::i18n::Lang::En) => "Rename",
+        };
+        let policy_icon = match self.conflict_policy {
+            ConflictPolicy::Overwrite => icon::SWAP,       // 覆盖=替换
+            ConflictPolicy::Skip => icon::SKIP_FORWARD,    // 跳过
+            ConflictPolicy::Rename => icon::PENCIL_SIMPLE, // 重命名
         };
         let win = egui::Window::new("transfer_win")
             .title_bar(false) // 隐藏过大的默认标题，使用自定义紧凑标题
@@ -2792,7 +2797,7 @@ impl App {
                         }
                         // 冲突策略：目标已存在时的默认处理；点击循环切换（覆盖→跳过→重命名），持久化
                         if ui
-                            .add(egui::Button::new(RichText::new(format!("{} {}", icon::COPY_SIMPLE, policy_label)).size(11.0).color(Palette::TEXT_DIM)).frame(false))
+                            .add(egui::Button::new(RichText::new(format!("{} {}", policy_icon, policy_label)).size(11.0).color(Palette::TEXT_DIM)).frame(false))
                             .on_hover_text(crate::i18n::tr("目标已存在时的默认处理（点击切换：覆盖 / 跳过 / 重命名）", "Default when target exists (click to cycle: Overwrite / Skip / Rename)"))
                             .clicked()
                         {

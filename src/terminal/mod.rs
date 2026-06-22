@@ -795,10 +795,12 @@ impl Terminal {
                 }
                 // 输入法预编辑（组字中）：暂存以在光标处显示，不发往远端
                 egui::Event::Ime(egui::ImeEvent::Preedit(s)) => {
+                    log::info!("IME Preedit: {s:?}");
                     self.ime_preedit = s;
                 }
                 // 输入法提交（中文等）：清空预编辑，提交串以 UTF-8 发往远端
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                    log::info!("IME Commit: {t:?}");
                     self.ime_preedit.clear();
                     if !alt {
                         self.input_line.push_str(&t);
@@ -808,6 +810,7 @@ impl Terminal {
                 }
                 // 输入法启用/禁用：清掉残留预编辑
                 egui::Event::Ime(egui::ImeEvent::Enabled) | egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                    log::info!("IME enabled/disabled event");
                     self.ime_preedit.clear();
                 }
                 egui::Event::Paste(t) => {
