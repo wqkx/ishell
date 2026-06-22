@@ -325,6 +325,30 @@ pub fn save_force_x11(on: bool) {
     }
 }
 
+// ---------- 终端配色（深/浅） ----------
+
+fn term_dark_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("term_dark"))
+}
+
+/// 终端是否用深色（文件内容 "1" 为深色）；未设置默认浅色（随主题暖色）。
+pub fn load_term_dark() -> bool {
+    term_dark_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// 保存终端配色选择。
+pub fn save_term_dark(dark: bool) {
+    if let Some(p) = term_dark_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, if dark { "1" } else { "0" });
+    }
+}
+
 // ---------- 传输冲突策略 ----------
 
 fn conflict_policy_path() -> Option<PathBuf> {

@@ -117,7 +117,8 @@ impl Terminal {
             sel_anchor: None,
             sel_cursor: None,
             clipboard: None,
-            dark: false,
+            dark: crate::store::load_term_dark(), // 沿用上次选择，默认浅色
+
             input_line: String::new(),
             history: Vec::new(),
             hist: None,
@@ -736,6 +737,7 @@ impl Terminal {
             };
             if ui.button(theme_label).clicked() {
                 self.dark = !self.dark;
+                crate::store::save_term_dark(self.dark); // 记住选择，下次启动沿用
                 ui.close();
             }
             if ui.checkbox(&mut self.highlight, crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN")).clicked() {
