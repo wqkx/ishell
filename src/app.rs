@@ -98,6 +98,49 @@ struct Transfer {
     last_t: Option<std::time::Instant>,
 }
 
+/// App 级文件剪贴板（跨 tab 共享）。
+struct FileClip {
+    /// (绝对路径, 是否目录)
+    items: Vec<(String, bool)>,
+    /// true=剪切（粘贴时移动），false=复制
+    is_cut: bool,
+    src_uid: u64,
+    src_host: String,
+    src_port: u16,
+    src_label: String,
+}
+
+/// 待确认的粘贴计划（剪切，或跨服务器复制/剪切，执行前二次确认）。
+struct PendingPaste {
+    items: Vec<(String, bool)>,
+    is_cut: bool,
+    /// 源与目标是否不同服务器（需经本地中转）
+    cross: bool,
+    src_uid: u64,
+    dest_uid: u64,
+    dest_dir: String,
+    src_label: String,
+    dest_label: String,
+}
+
+/// 跨服务器中转任务：源会话下载到本地临时 → 目标会话上传 →（剪切则删源）。
+struct Relay {
+    src_path: String,
+    is_dir: bool,
+    src_uid: u64,
+    dest_uid: u64,
+    dest_dir: String,
+    is_cut: bool,
+    tmp: std::path::PathBuf,
+    phase: RelayPhase,
+}
+
+/// 中转任务阶段：保存对应会话里的传输 id，用于轮询完成状态。
+enum RelayPhase {
+    Down(u64),
+    Up(u64),
+}
+
 /// 键盘交互认证的一组待回答提示（每项 (提示文本, 是否回显) + 用户输入缓冲）。
 struct KbdPrompt {
     name: String,
@@ -340,6 +383,14 @@ pub struct App {
     /// 命令广播栏是否显示 + 输入内容
     show_broadcast: bool,
     broadcast_input: String,
+    /// 文件剪贴板（跨 tab 共享）：复制/剪切的源项
+    file_clip: Option<FileClip>,
+    /// 待确认的粘贴（剪切 或 跨服务器：执行前二次确认）
+    pending_paste: Option<PendingPaste>,
+    /// 跨服务器中转任务（下载→上传→可选删源）
+    relays: Vec<Relay>,
+    /// 中转临时目录去重计数
+    relay_seq: u64,
     /// 命令片段库（snippets）窗口 + 数据 + 编辑缓冲
     show_snippets: bool,
     /// 片段浮窗刚打开（本帧跳过"点击外部关闭"判定）
@@ -496,6 +547,10 @@ impl App {
             fwd_form: ForwardForm::default(),
             show_broadcast: false,
             broadcast_input: String::new(),
+            file_clip: None,
+            pending_paste: None,
+            relays: Vec::new(),
+            relay_seq: 0,
             show_snippets: false,
             snip_just_opened: false,
             snippets: crate::store::load_snippets(),
@@ -826,6 +881,13 @@ impl App {
 
     /// 翻译文件面板动作为 SFTP 指令或剪贴板操作。
     fn handle_file_action(&mut self, idx: usize, action: FileAction) {
+        // 剪贴板 / 粘贴需同时访问 App 级剪贴板与会话信息，单独前置处理
+        match action {
+            FileAction::ClipCopy { items } => return self.set_clip(idx, items, false),
+            FileAction::ClipCut { items } => return self.set_clip(idx, items, true),
+            FileAction::Paste { dest_dir } => return self.start_paste(idx, dest_dir),
+            _ => {}
+        }
         let Some(s) = self.sessions.get_mut(idx) else { return };
         match action {
             FileAction::List(path) => {
@@ -876,14 +938,6 @@ impl App {
             FileAction::Rename { from, to } => {
                 let _ = s.cmd_tx.send(UiCommand::Rename { from, to });
             }
-            FileAction::CopyMove { srcs, dest_dir, do_move } => {
-                let n = srcs.len();
-                s.status = match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("{}{n} 项到 {dest_dir} …", if do_move { "移动" } else { "复制" }),
-                    crate::i18n::Lang::En => format!("{} {n} item(s) to {dest_dir} …", if do_move { "Moving" } else { "Copying" }),
-                };
-                let _ = s.cmd_tx.send(UiCommand::CopyMove { srcs, dest_dir, do_move });
-            }
             FileAction::CopyPath(p) => {
                 self.ctx.copy_text(p.clone());
                 s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已复制路径：{p}"), crate::i18n::Lang::En => format!("Copied: {p}") };
@@ -901,6 +955,207 @@ impl App {
                 let quoted = format!("'{}'", path.replace('\'', "'\\''"));
                 let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("cd {quoted}\r").into_bytes()));
                 s.terminal.request_focus();
+            }
+            // 已在函数开头前置处理并 return，此处仅为穷尽匹配
+            FileAction::ClipCopy { .. } | FileAction::ClipCut { .. } | FileAction::Paste { .. } => {}
+        }
+    }
+
+    fn session_idx_by_uid(&self, uid: u64) -> Option<usize> {
+        self.sessions.iter().position(|s| s.uid == uid)
+    }
+
+    /// 复制 / 剪切选中项到 App 级剪贴板（跨 tab 共享）。
+    fn set_clip(&mut self, idx: usize, items: Vec<(String, bool)>, is_cut: bool) {
+        let (uid, host, port, label) = match self.sessions.get(idx) {
+            Some(s) => (s.uid, s.cfg.host.clone(), s.cfg.port, s.title.clone()),
+            None => return,
+        };
+        let n = items.len();
+        self.file_clip = Some(FileClip { items, is_cut, src_uid: uid, src_host: host, src_port: port, src_label: label });
+        if let Some(s) = self.sessions.get_mut(idx) {
+            s.status = match (is_cut, crate::i18n::current()) {
+                (true, crate::i18n::Lang::Zh) => format!("已剪切 {n} 项（粘贴时移动）"),
+                (false, crate::i18n::Lang::Zh) => format!("已复制 {n} 项到剪贴板"),
+                (true, crate::i18n::Lang::En) => format!("Cut {n} item(s)"),
+                (false, crate::i18n::Lang::En) => format!("Copied {n} item(s)"),
+            };
+        }
+    }
+
+    /// 粘贴到目标目录：同机直接 cp/mv；剪切或跨服务器需先二次确认。
+    fn start_paste(&mut self, idx: usize, dest_dir: String) {
+        let Some(clip) = self.file_clip.as_ref() else { return };
+        let Some(dest) = self.sessions.get(idx) else { return };
+        let cross = clip.src_host != dest.cfg.host || clip.src_port != dest.cfg.port;
+        let plan = PendingPaste {
+            items: clip.items.clone(),
+            is_cut: clip.is_cut,
+            cross,
+            src_uid: clip.src_uid,
+            dest_uid: dest.uid,
+            dest_dir,
+            src_label: clip.src_label.clone(),
+            dest_label: dest.title.clone(),
+        };
+        // 剪切（移动/删源）或跨服务器（重操作）都要执行前确认；仅同机复制免确认
+        if plan.is_cut || plan.cross {
+            self.pending_paste = Some(plan);
+        } else {
+            self.execute_paste(plan);
+        }
+    }
+
+    /// 真正执行粘贴：同机服务器端 cp/mv；跨机建中转任务（下载→上传）。
+    fn execute_paste(&mut self, plan: PendingPaste) {
+        if !plan.cross {
+            let srcs: Vec<String> = plan.items.iter().map(|(p, _)| p.clone()).collect();
+            if let Some(di) = self.session_idx_by_uid(plan.dest_uid) {
+                let n = srcs.len();
+                let s = &mut self.sessions[di];
+                let _ = s.cmd_tx.send(UiCommand::CopyMove { srcs, dest_dir: plan.dest_dir.clone(), do_move: plan.is_cut });
+                s.status = match (plan.is_cut, crate::i18n::current()) {
+                    (true, crate::i18n::Lang::Zh) => format!("移动 {n} 项 …"),
+                    (false, crate::i18n::Lang::Zh) => format!("复制 {n} 项 …"),
+                    (true, crate::i18n::Lang::En) => format!("Moving {n} …"),
+                    (false, crate::i18n::Lang::En) => format!("Copying {n} …"),
+                };
+            }
+        } else {
+            // 跨服务器：源会话与目标会话都须在线
+            let Some(di) = self.session_idx_by_uid(plan.dest_uid) else { return };
+            let Some(si) = self.session_idx_by_uid(plan.src_uid) else {
+                self.sessions[di].status = crate::i18n::tr("源会话已关闭，无法跨服务器粘贴", "Source session closed; cannot paste across servers").into();
+                return;
+            };
+            for (src_path, is_dir) in &plan.items {
+                let base = src_path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("item").to_string();
+                self.relay_seq += 1;
+                let tmp = std::env::temp_dir()
+                    .join("ishell-relay")
+                    .join(format!("{}-{}", std::process::id(), self.relay_seq))
+                    .join(&base);
+                if let Some(parent) = tmp.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let dlid = {
+                    let s = &mut self.sessions[si];
+                    let id = s.next_xfer;
+                    s.next_xfer += 1;
+                    let _ = s.cmd_tx.send(UiCommand::Download { id, remote: src_path.clone(), local: tmp.to_string_lossy().into_owned() });
+                    id
+                };
+                self.relays.push(Relay {
+                    src_path: src_path.clone(),
+                    is_dir: *is_dir,
+                    src_uid: plan.src_uid,
+                    dest_uid: plan.dest_uid,
+                    dest_dir: plan.dest_dir.clone(),
+                    is_cut: plan.is_cut,
+                    tmp,
+                    phase: RelayPhase::Down(dlid),
+                });
+            }
+            self.show_transfers = true;
+            self.xfer_just_opened = true;
+            let n = plan.items.len();
+            self.sessions[di].status = match (plan.is_cut, crate::i18n::current()) {
+                (true, crate::i18n::Lang::Zh) => format!("跨服务器移动 {n} 项（经本地中转）…"),
+                (false, crate::i18n::Lang::Zh) => format!("跨服务器复制 {n} 项（经本地中转）…"),
+                (true, crate::i18n::Lang::En) => format!("Cross-server move {n} (via local relay) …"),
+                (false, crate::i18n::Lang::En) => format!("Cross-server copy {n} (via local relay) …"),
+            };
+        }
+        // 剪切粘贴后清空剪贴板（复制保留，便于多次粘贴）
+        if plan.is_cut {
+            self.file_clip = None;
+        }
+    }
+
+    /// 删除中转临时文件/目录及其空的任务目录。
+    fn cleanup_relay_tmp(tmp: &std::path::Path, is_dir: bool) {
+        if is_dir {
+            let _ = std::fs::remove_dir_all(tmp);
+        } else {
+            let _ = std::fs::remove_file(tmp);
+        }
+        if let Some(parent) = tmp.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    /// 查询某会话某传输的完成状态（None=进行中/未知）。
+    fn transfer_ok(&self, uid: u64, id: u64) -> Option<bool> {
+        let si = self.session_idx_by_uid(uid)?;
+        self.sessions[si].transfers.iter().find(|t| t.id == id).and_then(|t| t.ok)
+    }
+
+    /// 推进跨服务器中转任务：下载完成→发起上传；上传完成→（剪切则删源）+ 清理临时。
+    fn process_relays(&mut self) {
+        let mut i = 0;
+        while i < self.relays.len() {
+            enum Step { Wait, ToUpload, Done, Failed }
+            let step = {
+                let r = &self.relays[i];
+                match r.phase {
+                    RelayPhase::Down(id) => match self.transfer_ok(r.src_uid, id) {
+                        Some(true) => Step::ToUpload,
+                        Some(false) => Step::Failed,
+                        None if self.session_idx_by_uid(r.src_uid).is_none() => Step::Failed,
+                        None => Step::Wait,
+                    },
+                    RelayPhase::Up(id) => match self.transfer_ok(r.dest_uid, id) {
+                        Some(true) => Step::Done,
+                        Some(false) => Step::Failed,
+                        None if self.session_idx_by_uid(r.dest_uid).is_none() => Step::Failed,
+                        None => Step::Wait,
+                    },
+                }
+            };
+            match step {
+                Step::Wait => i += 1,
+                Step::ToUpload => {
+                    let dest_uid = self.relays[i].dest_uid;
+                    let tmp = self.relays[i].tmp.to_string_lossy().into_owned();
+                    let dest_dir = self.relays[i].dest_dir.clone();
+                    if let Some(di) = self.session_idx_by_uid(dest_uid) {
+                        let upid = {
+                            let s = &mut self.sessions[di];
+                            let id = s.next_xfer;
+                            s.next_xfer += 1;
+                            let _ = s.cmd_tx.send(UiCommand::Upload { id, local: tmp, remote_dir: dest_dir });
+                            id
+                        };
+                        self.relays[i].phase = RelayPhase::Up(upid);
+                        i += 1;
+                    } else {
+                        let (t, d) = (self.relays[i].tmp.clone(), self.relays[i].is_dir);
+                        Self::cleanup_relay_tmp(&t, d);
+                        self.relays.remove(i);
+                    }
+                }
+                Step::Done => {
+                    let (t, d, is_cut, src_uid, src_path) = (
+                        self.relays[i].tmp.clone(),
+                        self.relays[i].is_dir,
+                        self.relays[i].is_cut,
+                        self.relays[i].src_uid,
+                        self.relays[i].src_path.clone(),
+                    );
+                    // 剪切：上传成功后才删源（安全）
+                    if is_cut {
+                        if let Some(sidx) = self.session_idx_by_uid(src_uid) {
+                            let _ = self.sessions[sidx].cmd_tx.send(UiCommand::Delete { path: src_path, is_dir: d });
+                        }
+                    }
+                    Self::cleanup_relay_tmp(&t, d);
+                    self.relays.remove(i);
+                }
+                Step::Failed => {
+                    let (t, d) = (self.relays[i].tmp.clone(), self.relays[i].is_dir);
+                    Self::cleanup_relay_tmp(&t, d);
+                    self.relays.remove(i);
+                }
             }
         }
     }
@@ -967,6 +1222,8 @@ impl eframe::App for App {
                 new_images.push((path, data, s.title.clone()));
             }
         }
+        // 跨服务器中转任务推进（下载完→上传，上传完→剪切则删源）
+        self.process_relays();
         for (path, data, server) in new_images {
             self.image_focus = true; // 打开/切换后聚焦看图窗口
             // 同一服务器同一图片已打开则切到该标签
@@ -1186,6 +1443,9 @@ impl eframe::App for App {
         // 键盘交互认证（OTP / 2FA）
         self.kbd_prompt_dialog(&ctx);
 
+        // 粘贴二次确认（剪切 / 跨服务器）
+        self.paste_confirm_dialog(&ctx);
+
         // 命令片段库
         self.snippets_window(&ctx);
 
@@ -1291,6 +1551,61 @@ impl App {
             let s = &mut self.sessions[idx];
             s.kbd_prompt = None;
             let _ = s.cmd_tx.send(UiCommand::Disconnect);
+        }
+    }
+
+    /// 粘贴二次确认：剪切（移动/删源）或跨服务器（重操作）执行前弹窗确认。
+    fn paste_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(plan) = self.pending_paste.as_ref() else { return };
+        let mut go = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("paste_confirm")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            let n = plan.items.len();
+            let title = match (plan.is_cut, crate::i18n::current()) {
+                (true, crate::i18n::Lang::Zh) => format!("确认移动 {n} 项？"),
+                (false, crate::i18n::Lang::Zh) => format!("确认复制 {n} 项？"),
+                (true, crate::i18n::Lang::En) => format!("Move {n} item(s)?"),
+                (false, crate::i18n::Lang::En) => format!("Copy {n} item(s)?"),
+            };
+            ui.label(RichText::new(title).size(16.0).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("{}  →  {}", plan.src_label, plan.dest_label)).color(Palette::TEXT_DIM).size(12.0));
+            ui.label(RichText::new(&plan.dest_dir).monospace().size(11.0).color(Palette::TEXT_DIM));
+            if plan.cross {
+                ui.add_space(4.0);
+                ui.label(RichText::new(crate::i18n::tr("跨服务器：经本地中转「下载→上传」，大文件较慢。", "Cross-server: relayed via local download→upload; large files are slower.")).color(Palette::WARN).size(11.0));
+            }
+            if plan.is_cut {
+                ui.add_space(4.0);
+                ui.label(RichText::new(crate::i18n::tr("剪切为移动：复制成功后会从源删除，不可恢复。", "Cut = move: source is deleted after a successful copy. Irreversible.")).color(Palette::DANGER).size(11.0));
+            }
+            // 列出名称（最多 8 个）
+            ui.add_space(4.0);
+            let shown: Vec<String> = plan.items.iter().take(8).map(|(p, _)| p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p).to_string()).collect();
+            let more = if n > 8 { format!(" … (+{})", n - 8) } else { String::new() };
+            ui.label(RichText::new(format!("{}{}", shown.join("、"), more)).color(Palette::TEXT_DIM).size(11.0));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let bw = 96.0;
+                let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                let confirm_label = if plan.is_cut { crate::i18n::tr("移动", "Move") } else { crate::i18n::tr("复制", "Copy") };
+                let confirm_col = if plan.is_cut { Palette::DANGER } else { Palette::ACCENT };
+                if dialog_button(ui, confirm_label, Some(confirm_col), bw) {
+                    go = true;
+                }
+                if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
+                    cancel = true;
+                }
+            });
+        });
+        if go {
+            if let Some(plan) = self.pending_paste.take() {
+                self.execute_paste(plan);
+            }
+        } else if cancel {
+            self.pending_paste = None;
         }
     }
 
@@ -2702,6 +3017,7 @@ impl App {
     fn right_body(&mut self, root: &mut egui::Ui, idx: usize) {
         // 右下文件操作区（可拖动调整高度）
         let mut file_actions: Vec<FileAction> = Vec::new();
+        let has_clip = self.file_clip.is_some();
         egui::Panel::bottom("files")
             .resizable(true)
             .default_size(250.0)
@@ -2713,7 +3029,7 @@ impl App {
                     .outer_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 6 }),
             )
             .show_inside(root, |ui| {
-                file_actions = file_panel::show(ui, &mut self.sessions[idx].files);
+                file_actions = file_panel::show(ui, &mut self.sessions[idx].files, has_clip);
             });
         for a in file_actions {
             self.handle_file_action(idx, a);
