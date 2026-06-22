@@ -117,7 +117,12 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.interact_size.y = 26.0;
 
-    ctx.set_global_style(style);
+    // egui 0.34 按明/暗主题分别存 Style；`set_global_style` 只改「当前激活主题」那一份。
+    // Windows 浅色模式下激活的是浅色槽 → 会落到 egui 默认浅色样式（灰底 #f8f8f8 + 默认间距），
+    // 我们的自定义样式被忽略。故：①固定浅色主题（不跟随系统深色）；
+    // ②把自定义样式写入明/暗两个槽，确保任何系统主题下都生效。
+    ctx.set_theme(egui::ThemePreference::Light);
+    ctx.all_styles_mut(|s| *s = style.clone());
 }
 
 /// 尝试加载系统中常见的中文字体，让远程中文输出/文件名正常显示。
