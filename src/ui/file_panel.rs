@@ -73,7 +73,7 @@ pub enum Dialog {
     Upload { local: String },
     Chmod { path: String, mode: u32, name: String },
     Rename { path: String, name: String },
-    ConfirmDelete { path: String, is_dir: bool, name: String },
+    ConfirmDelete { items: Vec<(String, bool, String)> }, // (path, is_dir, name)，支持多选批量删除
     ConfirmOpenLarge { path: String, size: u64 },
 }
 
@@ -272,6 +272,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
     // 工具栏：扁平图标条（带浅色背景）
     use egui_phosphor::regular as icon;
     let mut bc_nav: Option<String> = None;
+    let mut delete_selected = false; // 工具栏删除按钮 / Delete 键触发的批量删除请求
     egui::Frame::new()
         .fill(Palette::PANEL_2)
         .corner_radius(6)
@@ -295,6 +296,17 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
                 }
                 if tool_btn(ui, icon::UPLOAD_SIMPLE, crate::i18n::tr("上传文件", "Upload")) {
                     state.dialog = Some(Dialog::Upload { local: String::new() });
+                }
+                // 删除选中项（多选批量）：仅在有选中时显示，红色提示，数量随选中变化
+                if !state.selected.is_empty() {
+                    let n = state.selected.len();
+                    let tip = match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => if n > 1 { format!("删除选中的 {n} 项") } else { "删除选中".to_string() },
+                        crate::i18n::Lang::En => if n > 1 { format!("Delete {n} selected") } else { "Delete selected".to_string() },
+                    };
+                    if tool_btn_color(ui, icon::TRASH, &tip, Palette::DANGER) {
+                        delete_selected = true;
+                    }
                 }
                 // 复制路径：点击后短暂显示绿色对勾，再恢复
                 let now = ui.input(|i| i.time);
@@ -787,12 +799,42 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<Fi
             Menu::Rename { path, name } => {
                 state.dialog = Some(Dialog::Rename { path, name });
             }
-            Menu::Delete { path, is_dir, name } => {
-                state.dialog = Some(Dialog::ConfirmDelete { path, is_dir, name });
+            Menu::Delete(idx) => {
+                // 多选时批量删除（含文件夹，递归删除）；否则只删右键的那一项
+                let targets: Vec<usize> = if state.selected.contains(&idx) && state.selected.len() > 1 {
+                    let mut v: Vec<usize> = state.selected.iter().copied().collect();
+                    v.sort_unstable();
+                    v
+                } else {
+                    vec![idx]
+                };
+                let items: Vec<(String, bool, String)> = targets
+                    .iter()
+                    .filter_map(|&k| entries.get(k).map(|e| (join_path(&cwd, &e.name), e.is_dir, e.name.clone())))
+                    .collect();
+                if !items.is_empty() {
+                    state.dialog = Some(Dialog::ConfirmDelete { items });
+                }
             }
             Menu::NewDir => state.dialog = Some(Dialog::NewDir { name: String::new() }),
             Menu::NewFile => state.dialog = Some(Dialog::NewFile { name: String::new() }),
             Menu::CdHere(p) => actions.push(FileAction::CdTerminal(p)),
+        }
+    }
+
+    // 批量删除：工具栏删除按钮 或 Delete 键（重命名/路径编辑/已有对话框时不触发）
+    let key_del = ui.input(|i| i.key_pressed(egui::Key::Delete))
+        && state.renaming.is_none()
+        && state.path_edit.is_none();
+    if (delete_selected || key_del) && state.dialog.is_none() && !state.selected.is_empty() {
+        let mut idxs: Vec<usize> = state.selected.iter().copied().collect();
+        idxs.sort_unstable();
+        let items: Vec<(String, bool, String)> = idxs
+            .iter()
+            .filter_map(|&k| entries.get(k).map(|e| (join_path(&cwd, &e.name), e.is_dir, e.name.clone())))
+            .collect();
+        if !items.is_empty() {
+            state.dialog = Some(Dialog::ConfirmDelete { items });
         }
     }
 
@@ -808,7 +850,7 @@ enum Menu {
     CopyPath(String),
     Chmod { path: String, mode: u32, name: String },
     Rename { path: String, name: String },
-    Delete { path: String, is_dir: bool, name: String },
+    Delete(usize),
     NewDir,
     NewFile,
     CdHere(String),
@@ -850,7 +892,7 @@ fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, m
         }
         ui.separator();
         if ui.button(RichText::new(format!("{}  {}", icon::TRASH, crate::i18n::tr("删除", "Delete"))).color(Palette::DANGER)).clicked() {
-            menu.push(Menu::Delete { path: full.to_string(), is_dir: e.is_dir, name: e.name.clone() });
+            menu.push(Menu::Delete(idx));
             ui.close();
         }
     });
@@ -918,6 +960,7 @@ fn file_icon(e: &FileEntry) -> &'static str {
 fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<FileAction>) {
     let ctx = ui.ctx().clone();
     let mut close = false;
+    let mut clear_sel = false; // 批量删除确认后清空选中，避免残留的陈旧行索引
     let cwd = state.cwd.clone();
 
     if let Some(dialog) = &mut state.dialog {
@@ -1021,13 +1064,33 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                     });
                 });
             }
-            Dialog::ConfirmDelete { path, is_dir, name } => {
+            Dialog::ConfirmDelete { items } => {
                 modal(&ctx, crate::i18n::tr("确认删除", "Confirm delete"), |ui| {
-                    ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("确定删除 {} 吗？此操作不可恢复。", name), crate::i18n::Lang::En => format!("Delete {}? This cannot be undone.", name) });
+                    let n = items.len();
+                    if n == 1 {
+                        let name = &items[0].2;
+                        ui.label(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("确定删除 {name} 吗？此操作不可恢复。"),
+                            crate::i18n::Lang::En => format!("Delete {name}? This cannot be undone."),
+                        });
+                    } else {
+                        ui.label(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("确定删除选中的 {n} 项吗？此操作不可恢复。"),
+                            crate::i18n::Lang::En => format!("Delete {n} selected items? This cannot be undone."),
+                        });
+                        // 列出待删名称（最多 8 个，多余省略），让用户复核
+                        ui.add_space(4.0);
+                        let shown: Vec<String> = items.iter().take(8).map(|(_, _, nm)| nm.clone()).collect();
+                        let more = if n > 8 { format!(" … (+{})", n - 8) } else { String::new() };
+                        ui.label(RichText::new(format!("{}{}", shown.join("、"), more)).color(Palette::TEXT_DIM).size(11.0));
+                    }
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if dlg_btn(ui, crate::i18n::tr("删除", "Delete"), 72.0, 1) {
-                            actions.push(FileAction::Delete { path: path.clone(), is_dir: *is_dir });
+                            for (path, is_dir, _) in items.iter() {
+                                actions.push(FileAction::Delete { path: path.clone(), is_dir: *is_dir });
+                            }
+                            clear_sel = true;
                             close = true;
                         }
                         if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
@@ -1062,6 +1125,9 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
     }
     if close {
         state.dialog = None;
+    }
+    if clear_sel {
+        state.selected.clear();
     }
 }
 
