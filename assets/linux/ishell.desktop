@@ -8,5 +8,5 @@ Icon=ishell
 Terminal=false
 Categories=Network;RemoteAccess;FileTransfer;System;
 Keywords=SSH;SFTP;Terminal;Remote;Shell;
-StartupWMClass=iShell
+StartupWMClass=ishell
 StartupNotify=true

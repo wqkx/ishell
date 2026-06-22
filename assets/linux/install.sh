@@ -18,7 +18,7 @@ refresh() {
 }
 
 if [ "$1" = "uninstall" ]; then
-    rm -f "$BIN/ishell" "$ICONS/ishell.png" "$APPS/iShell.desktop"
+    rm -f "$BIN/ishell" "$ICONS/ishell.png" "$APPS/ishell.desktop"
     refresh
     echo "已卸载 iShell。"
     exit 0
@@ -28,14 +28,14 @@ mkdir -p "$BIN" "$ICONS" "$APPS"
 install -m 755 "$DIR/ishell" "$BIN/ishell"
 install -m 644 "$DIR/ishell.png" "$ICONS/ishell.png"
 # 桌面项里写入二进制的绝对路径（菜单启动器不一定继承 PATH）
-sed "s|@EXEC@|$BIN/ishell|g" "$DIR/iShell.desktop" > "$APPS/iShell.desktop"
-chmod 644 "$APPS/iShell.desktop"
+sed "s|@EXEC@|$BIN/ishell|g" "$DIR/ishell.desktop" > "$APPS/ishell.desktop"
+chmod 644 "$APPS/ishell.desktop"
 refresh
 
 echo "已安装："
 echo "  二进制 → $BIN/ishell"
 echo "  图标   → $ICONS/ishell.png"
-echo "  桌面项 → $APPS/iShell.desktop"
+echo "  桌面项 → $APPS/ishell.desktop"
 case ":$PATH:" in
     *":$BIN:"*) ;;
     *) echo "提示：$BIN 不在 PATH 中，命令行调用 ishell 需将其加入 PATH（菜单启动不受影响）。" ;;

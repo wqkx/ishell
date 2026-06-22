@@ -43,8 +43,9 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 560.0])
             .with_title("iShell — Rust SSH 客户端")
-            // app_id 与 Linux 桌面项的 StartupWMClass 一致，使运行窗口关联到启动器图标
-            .with_app_id("iShell")
+            // app_id 必须与 Linux 桌面项 ishell.desktop 的基名/StartupWMClass 完全一致，
+            // GNOME 等用它匹配 .desktop 取图标（不读窗口内嵌 _NET_WM_ICON）；统一小写避免大小写匹配失败
+            .with_app_id("ishell")
             .with_icon(load_icon())
     };
     let native_options = eframe::NativeOptions { viewport, ..Default::default() };

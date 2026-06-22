@@ -61,7 +61,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/ishell" "$PKG/ishell"
           chmod +x "$PKG/ishell"
           cp assets/icon.png "$PKG/ishell.png"
-          cp assets/linux/iShell.desktop "$PKG/iShell.desktop"
+          cp assets/linux/ishell.desktop "$PKG/ishell.desktop"
           cp assets/linux/install.sh "$PKG/install.sh"
           chmod +x "$PKG/install.sh"
           tar czf "${{ matrix.asset }}.tar.gz" "$PKG"

@@ -1363,6 +1363,7 @@ impl App {
                             let mut drag_start: Option<usize> = None;
                             let mut new_grab: Option<f32> = None;
                             let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
+                            let mut drag_w = 0.0f32; // 被拖标签宽度，用于算其跟手中心
                             // 先取出标量字段，避免在借用 self.sessions 的循环里再借 self
                             let dragging_tab = self.dragging_tab;
                             let active = self.active;
@@ -1391,6 +1392,9 @@ impl App {
                                         let target = acc;
                                         let id = egui::Id::new(("tabx", s.uid));
                                         let dragging_this = drag_down && dragging_tab == Some(i);
+                                        if dragging_this {
+                                            drag_w = w;
+                                        }
                                         let x = if dragging_this {
                                             let want = pointer.map(|p| p.x - origin.x - grab_dx).unwrap_or(target);
                                             ctx.animate_value_with_time(id, want, 0.0) // 跟手
@@ -1449,15 +1453,34 @@ impl App {
                             if let Some(f) = drag_start {
                                 self.dragging_tab = Some(f);
                             }
-                            // 拖动过程中：指针进入其它槽即重排，其余标签缓动到新位置（平滑滑动）
+                            // 拖动过程中：用「被拖标签的跟手中心」与相邻标签「目标槽中心」比较，
+                            // 越过相邻标签中点才换位（单帧只移一位）。换位后邻居中心移到另一侧，
+                            // 判定条件自然失效，避免抓取点偏移（grab_dx）导致的来回抖动。
                             if let Some(from) = self.dragging_tab {
                                 if ui.input(|i| i.pointer.any_down()) {
                                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                                        if let Some(&(to, _)) = tab_rects.iter().find(|(_, r)| r.contains(pos)) {
-                                            if to != from {
-                                                reorder = Some((from, to));
-                                                self.dragging_tab = Some(to);
+                                        // 被拖标签跟手中心（屏幕横坐标），与绘制时的跟手位口径一致
+                                        let drag_center = pos.x - self.tab_grab_dx + drag_w / 2.0;
+                                        let mut to = from;
+                                        // 向左：越过左邻目标槽中心
+                                        if from > 0 {
+                                            if let Some(&(_, lr)) = tab_rects.get(from - 1) {
+                                                if drag_center < lr.center().x {
+                                                    to = from - 1;
+                                                }
                                             }
+                                        }
+                                        // 向右：越过右邻目标槽中心（与向左互斥）
+                                        if to == from {
+                                            if let Some(&(_, rr)) = tab_rects.get(from + 1) {
+                                                if drag_center > rr.center().x {
+                                                    to = from + 1;
+                                                }
+                                            }
+                                        }
+                                        if to != from {
+                                            reorder = Some((from, to));
+                                            self.dragging_tab = Some(to);
                                         }
                                     }
                                 } else {
