@@ -42,6 +42,8 @@ pub struct Terminal {
     highlight: bool,
     /// 由 OSC 7 解析到的当前工作目录（用于断线重连后恢复）
     osc7_cwd: Option<String>,
+    /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
+    ime_preedit: String,
 }
 
 /// 终端搜索状态。
@@ -125,6 +127,7 @@ impl Terminal {
             log_file: None,
             highlight: true,
             osc7_cwd: None,
+            ime_preedit: String::new(),
         }
     }
 
@@ -686,6 +689,15 @@ impl Terminal {
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput { rect: irect, cursor_rect: irect });
             });
+            // 在光标处显示 IME 预编辑（组字中的拼音/候选），铺底 + 下划线以便辨识
+            if !self.ime_preedit.is_empty() {
+                let font = egui::FontId::monospace(self.font_size / crate::theme::CJK_SCALE);
+                let galley = painter.layout_no_wrap(self.ime_preedit.clone(), font, crate::theme::Palette::ACCENT);
+                let bg = Rect::from_min_size(ipos, galley.size());
+                painter.rect_filled(bg, 0.0, crate::theme::Palette::PANEL);
+                painter.galley(ipos, galley, crate::theme::Palette::ACCENT);
+                painter.hline(bg.x_range(), bg.max.y - 1.0, Stroke::new(1.0, crate::theme::Palette::ACCENT));
+            }
         }
 
         // 键盘输入
@@ -697,6 +709,8 @@ impl Terminal {
         let mut do_paste = false;
         let mut start_log = false;
         resp.context_menu(|ui| {
+            // 菜单项不换行（否则英文较长的「Highlight ERROR/WARN」会折行，复选框被挤到两行正中）
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             let sel = self.has_selection();
             if ui.add_enabled(sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
                 do_copy = true;
@@ -779,13 +793,22 @@ impl Terminal {
                     }
                     out.extend_from_slice(t.as_bytes());
                 }
-                // 输入法提交（中文等）：提交串以 UTF-8 发往远端
+                // 输入法预编辑（组字中）：暂存以在光标处显示，不发往远端
+                egui::Event::Ime(egui::ImeEvent::Preedit(s)) => {
+                    self.ime_preedit = s;
+                }
+                // 输入法提交（中文等）：清空预编辑，提交串以 UTF-8 发往远端
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                    self.ime_preedit.clear();
                     if !alt {
                         self.input_line.push_str(&t);
                         self.hist = None;
                     }
                     out.extend_from_slice(t.as_bytes());
+                }
+                // 输入法启用/禁用：清掉残留预编辑
+                egui::Event::Ime(egui::ImeEvent::Enabled) | egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                    self.ime_preedit.clear();
                 }
                 egui::Event::Paste(t) => {
                     if !alt {

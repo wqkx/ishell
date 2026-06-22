@@ -2439,7 +2439,7 @@ impl App {
         });
     }
 
-    /// GPU 详情小窗：每块 GPU 使用率 + 显存；鼠标移开或点击外部关闭。
+    /// GPU 详情小窗：每块 GPU 使用率 + 显存；点击窗口外任意处或点 X 关闭（不随鼠标移开关闭）。
     fn gpu_popup_window(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
         let Some(pos) = self.gpu_popup else { return };
@@ -2457,7 +2457,7 @@ impl App {
         let mut close = false;
         let win = egui::Window::new("gpu_popup")
             .title_bar(false)
-            // 窗口套在光标上（光标落在窗口内），这样「鼠标移开即关闭」不会一打开就触发
+            // 略微上移，让窗口左上角靠近点击点
             .fixed_pos(pos - egui::vec2(10.0, 10.0))
             .resizable(false)
             .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
@@ -2493,10 +2493,9 @@ impl App {
                 }
             });
 
-        // 鼠标移开（不在窗口上）或点击外部 -> 关闭
-        let hovered = win.as_ref().map(|r| r.response.hovered()).unwrap_or(false);
+        // 点击窗口外任意处或点 X 关闭（打开当帧除外）；不再因鼠标移开而关闭
         let outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
-        if close || ((outside || !hovered) && !self.gpu_popup_just_opened) {
+        if close || (outside && !self.gpu_popup_just_opened) {
             self.gpu_popup = None;
         }
         self.gpu_popup_just_opened = false;
