@@ -163,7 +163,7 @@ impl ConnectForm {
 
         let title = if self.mode == Mode::List { crate::i18n::tr("快速连接", "Quick Connect") } else { crate::i18n::tr("新建连接", "New Connection") };
         // 表单较窄（贴合输入列宽，按钮右对齐不至于飘太远）；列表略宽以容纳连接条目
-        let win_width = if self.mode == Mode::List { 520.0 } else { 430.0 };
+        let win_width = if self.mode == Mode::List { 520.0 } else { 380.0 };
         egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
@@ -503,35 +503,35 @@ impl ConnectForm {
 
     /// 新建 / 编辑表单视图。
     fn form_view(&mut self, ui: &mut egui::Ui, result: &mut Option<ConnectConfig>) {
-        ui.set_min_width(380.0);
-        let w = 250.0; // 输入框宽度
+        ui.set_min_width(340.0);
+        let w = 250.0; // 私钥路径输入框宽度（其余输入框填满）
         egui::Grid::new("conn_form")
             .num_columns(2)
             .spacing([12.0, 12.0])
             .min_col_width(64.0)
             .show(ui, |ui| {
                 ui.label(crate::i18n::tr("名称", "Name"));
-                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(w).hint_text(crate::i18n::tr("便于识别，可留空", "For display, optional")));
+                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(f32::INFINITY).hint_text(crate::i18n::tr("便于识别，可留空", "For display, optional")));
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("主机", "Host"));
-                ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(w));
+                ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(f32::INFINITY));
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("端口", "Port"));
-                ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(w));
+                ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(f32::INFINITY));
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("用户名", "User"));
-                ui.add(egui::TextEdit::singleline(&mut self.username).desired_width(w));
+                ui.add(egui::TextEdit::singleline(&mut self.username).desired_width(f32::INFINITY));
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("分组", "Group"));
-                ui.add(egui::TextEdit::singleline(&mut self.group).desired_width(w).hint_text(crate::i18n::tr("可留空，用于归类", "Optional folder")));
+                ui.add(egui::TextEdit::singleline(&mut self.group).desired_width(f32::INFINITY).hint_text(crate::i18n::tr("可留空，用于归类", "Optional folder")));
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("标签", "Tags"));
-                ui.add(egui::TextEdit::singleline(&mut self.tags).desired_width(w).hint_text(crate::i18n::tr("逗号分隔，参与搜索", "Comma-separated, searchable")));
+                ui.add(egui::TextEdit::singleline(&mut self.tags).desired_width(f32::INFINITY).hint_text(crate::i18n::tr("逗号分隔，参与搜索", "Comma-separated, searchable")));
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("认证方式", "Auth"));
@@ -556,7 +556,7 @@ impl ConnectForm {
                     }
                     AuthKind::Password => {
                         ui.label(crate::i18n::tr("密码", "Password"));
-                        ui.add(egui::TextEdit::singleline(&mut self.password).desired_width(w).password(true));
+                        ui.add(egui::TextEdit::singleline(&mut self.password).desired_width(f32::INFINITY).password(true));
                         ui.end_row();
                     }
                     AuthKind::Key => {
@@ -575,7 +575,7 @@ impl ConnectForm {
                         });
                         ui.end_row();
                         ui.label(crate::i18n::tr("私钥口令", "Passphrase"));
-                        ui.add(egui::TextEdit::singleline(&mut self.passphrase).desired_width(w).password(true));
+                        ui.add(egui::TextEdit::singleline(&mut self.passphrase).desired_width(f32::INFINITY).password(true));
                         ui.end_row();
                     }
                 }
@@ -594,13 +594,13 @@ impl ConnectForm {
                 .min_col_width(64.0)
                 .show(ui, |ui| {
                     ui.label(crate::i18n::tr("跳板主机", "Jump host"));
-                    ui.add(egui::TextEdit::singleline(&mut self.j_host).desired_width(w));
+                    ui.add(egui::TextEdit::singleline(&mut self.j_host).desired_width(f32::INFINITY));
                     ui.end_row();
                     ui.label(crate::i18n::tr("跳板端口", "Jump port"));
-                    ui.add(egui::TextEdit::singleline(&mut self.j_port).desired_width(w));
+                    ui.add(egui::TextEdit::singleline(&mut self.j_port).desired_width(f32::INFINITY));
                     ui.end_row();
                     ui.label(crate::i18n::tr("跳板用户", "Jump user"));
-                    ui.add(egui::TextEdit::singleline(&mut self.j_username).desired_width(w));
+                    ui.add(egui::TextEdit::singleline(&mut self.j_username).desired_width(f32::INFINITY));
                     ui.end_row();
                     ui.label(crate::i18n::tr("跳板认证", "Jump auth"));
                     ui.horizontal(|ui| {
@@ -619,7 +619,7 @@ impl ConnectForm {
                         }
                         AuthKind::Password => {
                             ui.label(crate::i18n::tr("跳板密码", "Jump pwd"));
-                            ui.add(egui::TextEdit::singleline(&mut self.j_password).desired_width(w).password(true));
+                            ui.add(egui::TextEdit::singleline(&mut self.j_password).desired_width(f32::INFINITY).password(true));
                             ui.end_row();
                         }
                         AuthKind::Key => {
@@ -634,7 +634,7 @@ impl ConnectForm {
                             });
                             ui.end_row();
                             ui.label(crate::i18n::tr("私钥口令", "Passphrase"));
-                            ui.add(egui::TextEdit::singleline(&mut self.j_passphrase).desired_width(w).password(true));
+                            ui.add(egui::TextEdit::singleline(&mut self.j_passphrase).desired_width(f32::INFINITY).password(true));
                             ui.end_row();
                         }
                     }
