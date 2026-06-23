@@ -134,6 +134,13 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.menu_margin = egui::Margin::same(8);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
     style.spacing.interact_size.y = 28.0;
+    // 滚动条：macOS 式悬浮细滚动条（覆盖内容、不挤占布局，悬停加粗），更轻盈
+    style.spacing.scroll = egui::style::ScrollStyle::floating();
+    // 复选框 / 单选框略放大，更清爽易点
+    style.spacing.icon_width = 16.0;
+    style.spacing.icon_width_inner = 9.0;
+    // 单向滚动区（如横向标签条）允许用竖直滚轮滚动（默认 false 导致标签条滚不动）
+    style.always_scroll_the_only_direction = true;
 
     // egui 0.34 按明/暗主题分别存 Style；`set_global_style` 只改「当前激活主题」那一份。
     // Windows 浅色模式下激活的是浅色槽 → 会落到 egui 默认浅色样式（灰底 #f8f8f8 + 默认间距），

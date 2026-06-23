@@ -882,6 +882,20 @@ impl App {
         }
     }
 
+    /// 切换会话标签（delta=+1 下一个 / -1 上一个，循环）。
+    fn switch_tab(&mut self, delta: i32) {
+        let n = self.sessions.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.active.unwrap_or(0) as i32;
+        let next = (cur + delta).rem_euclid(n as i32) as usize;
+        self.active = Some(next);
+        if let Some(s) = self.sessions.get_mut(next) {
+            s.terminal.request_focus();
+        }
+    }
+
     /// 翻译文件面板动作为 SFTP 指令或剪贴板操作。
     fn handle_file_action(&mut self, idx: usize, action: FileAction) {
         let policy = self.conflict_policy;
@@ -1409,6 +1423,16 @@ impl eframe::App for App {
         if let Some(pos) = gpu_click {
             self.gpu_popup = Some(pos);
             self.gpu_popup_just_opened = true;
+        }
+
+        // Ctrl+Tab / Ctrl+Shift+Tab 切换会话标签（consume 以免终端把 Tab 发往远端）
+        if !self.sessions.is_empty() {
+            let ctx = ui.ctx();
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)) {
+                self.switch_tab(-1);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
+                self.switch_tab(1);
+            }
         }
 
         // 4) 顶部选项卡（仅位于右侧区域之上）
@@ -2139,6 +2163,15 @@ impl App {
                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 self.editor_focus = false;
             }
+            // Ctrl+Tab / Ctrl+Shift+Tab 切换编辑器标签（先 consume，免被文本框当作 Tab 字符）
+            let n = self.editors.len();
+            if n > 1 {
+                if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)) {
+                    self.active_editor = (self.active_editor + n - 1) % n;
+                } else if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
+                    self.active_editor = (self.active_editor + 1) % n;
+                }
+            }
             let mut close_tab: Option<usize> = None;
             let mut activate: Option<usize> = None;
             let mut do_save = false;
@@ -2296,6 +2329,15 @@ impl App {
             if self.image_focus {
                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 self.image_focus = false;
+            }
+            // Ctrl+Tab / Ctrl+Shift+Tab 切换看图标签
+            let n = self.image_tabs.len();
+            if n > 1 {
+                if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)) {
+                    self.active_image = (self.active_image + n - 1) % n;
+                } else if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
+                    self.active_image = (self.active_image + 1) % n;
+                }
             }
             let mut close_tab: Option<usize> = None;
             let mut activate: Option<usize> = None;
