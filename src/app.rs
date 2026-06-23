@@ -258,14 +258,9 @@ impl Session {
                 }
                 WorkerEvent::OpDone { message, refresh_dir } => {
                     self.status = message;
-                    // 同时刷新「操作目标目录」与「当前查看目录」：移动/删除的源目录正是 cwd，
-                    // 仅刷新目标目录时，当前视图里的源文件不会消失。
-                    let cwd = self.files.cwd.clone();
-                    let refresh_other = refresh_dir.as_deref().map_or(true, |d| d != cwd);
+                    // 刷新操作目标目录。拖拽移动到「非当前目录」的文件夹时，源目录(cwd)
+                    // 已在前端乐观移除被移动项、不在此刷新，避免整目录重载导致的跳动。
                     self.refresh_dir(refresh_dir);
-                    if refresh_other && !cwd.is_empty() {
-                        self.refresh_dir(Some(cwd));
-                    }
                 }
                 WorkerEvent::TransferStart { id, name, total, dir } => {
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {

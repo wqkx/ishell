@@ -723,8 +723,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     if r.secondary_clicked() {
                         rclick = Some(i);
                     }
-                    // 拖拽源：拖动开始时把（多选则整组、否则单项）源路径放入载荷
-                    if r.drag_started() {
+                    // 拖拽源：整个拖动过程持续写入载荷（多选则整组、否则单项），
+                    // 避免只在 drag_started 一帧设置时偶发丢失/沿用上次的旧载荷。
+                    if r.drag_started() || r.dragged() {
                         let paths = drag_source_paths(state, &entries, &cwd, i);
                         if !paths.is_empty() {
                             r.dnd_set_drag_payload(DragPaths(paths));
@@ -968,8 +969,16 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         }
     }
 
-    // 拖拽移动：释放到某文件夹后发起远端 mv，并清空选择避免陈旧索引
+    // 拖拽移动：释放到某文件夹后发起远端 mv。
     if let Some((srcs, dest_dir)) = drop_move {
+        // 移入「非当前目录」的文件夹：乐观地从当前列表移除被移动项，呈现「移走」效果，
+        // 且不整目录刷新（刷新会跳一下）；目标目录由 worker 的 OpDone 后台刷新（不可见，无跳动）。
+        if dest_dir != cwd {
+            if let Some(list) = state.listings.get_mut(&cwd) {
+                let moved: std::collections::HashSet<String> = srcs.iter().cloned().collect();
+                list.retain(|e| !moved.contains(&join_path(&cwd, &e.name)));
+            }
+        }
         actions.push(FileAction::Move { srcs, dest_dir });
         state.selected.clear();
         state.anchor = None;
