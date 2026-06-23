@@ -67,12 +67,3 @@ pub fn language_menu(ui: &mut egui::Ui) {
         }
     }
 }
-
-/// 给任意 response 附加「右键 → 语言」菜单。
-/// 用于操作栏各处（含会捕获次级点击的可点击行），避免出现右键死角。
-pub fn lang_context_menu(resp: &egui::Response) {
-    resp.context_menu(|ui| {
-        ui.label(egui::RichText::new(tr("语言", "Language")).color(crate::theme::Palette::TEXT_DIM).size(11.0));
-        language_menu(ui);
-    });
-}

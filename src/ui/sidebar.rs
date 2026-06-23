@@ -191,7 +191,7 @@ fn kv_copy(ui: &mut egui::Ui, k: &str, v: &str) {
         let resp = ui
             .add(egui::Label::new(RichText::new(v).color(Palette::TEXT).size(12.0)).sense(egui::Sense::click()))
             .on_hover_text(tr("双击复制", "Double-click to copy"));
-        crate::i18n::lang_context_menu(&resp);
+        crate::app::view_context_menu(&resp);
         if resp.double_clicked() {
             ui.ctx().copy_text(v.to_string());
             ui.ctx().data_mut(|d| d.insert_temp(id, now));
@@ -262,7 +262,7 @@ fn gpu_meter(ui: &mut egui::Ui, percent: f32, count: usize) -> egui::Response {
     };
     p.text(bar.right_center() - Vec2::new(5.0, 0.0), egui::Align2::RIGHT_CENTER, detail,
         egui::FontId::monospace(11.0), Palette::TEXT);
-    crate::i18n::lang_context_menu(&resp);
+    crate::app::view_context_menu(&resp);
     resp
 }
 
@@ -340,7 +340,7 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
         if resp.clicked() {
             *proc_click = Some((proc.pid, resp.interact_pointer_pos().unwrap_or(rect.right_center())));
         }
-        crate::i18n::lang_context_menu(&resp);
+        crate::app::view_context_menu(&resp);
         let p = ui.painter_at(rect);
         p.text(rect.left_center(), egui::Align2::LEFT_CENTER, proc.pid.to_string(),
             egui::FontId::proportional(11.0), Palette::TEXT_DIM);

@@ -48,16 +48,17 @@ pub struct FilePanelState {
     pub copy_flash: Option<f64>,
     /// 面包屑单击导航的延后执行（路径, 单击时刻）——给双击编辑留判定窗口
     pub pending_nav: Option<(String, f64)>,
-    /// 拖拽悬停在「上级目录」按钮上的起始时刻（弹簧式上跳计时）
-    pub up_hover_since: Option<f64>,
-    /// 「上级目录」跳转动画的触发时刻
-    pub up_flash: Option<f64>,
+    /// 弹簧式拖拽导航：当前悬停目标目录与起始时刻 (目标路径, 悬停起点)。
+    /// 目标可为「上级目录」(parent) 或某个文件夹的绝对路径。
+    pub spring_since: Option<(String, f64)>,
+    /// 弹簧式跳转动画的触发时刻（在指针处播放两次脉冲环）
+    pub spring_flash: Option<f64>,
 }
 
-/// 拖拽悬停「上级目录」多久后自动上跳（秒）
-const UP_DWELL: f64 = 0.6;
-/// 上跳动画时长（秒）
-const UP_FLASH: f64 = 0.4;
+/// 拖拽悬停多久后自动进入目标目录（秒）
+const UP_DWELL: f64 = 0.8;
+/// 跳转动画时长（秒，期间播放两次脉冲）
+const UP_FLASH: f64 = 0.5;
 
 /// 文件列表排序键。
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +291,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     use egui_phosphor::regular as icon;
     let mut bc_nav: Option<String> = None;
     let mut paste_here = false; // 工具栏/菜单粘贴触发（has_clip 由 App 传入）
+    // 弹簧式拖拽导航：本帧拖拽悬停的目标目录（Up 按钮的上一层 / 某文件夹），统一计时跳转
+    let mut spring_target: Option<String> = None;
     egui::Frame::new()
         .fill(Palette::PANEL_2)
         .corner_radius(6)
@@ -306,7 +309,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     state.cwd = parent_of(&state.cwd);
                     state.selected.clear();
                 }
-                handle_up_drag(ui, state, &up_resp, actions);
+                handle_up_drag(ui, state, &up_resp, actions, &mut spring_target);
                 if tool_btn(ui, icon::FOLDER_PLUS, crate::i18n::tr("新建目录", "New folder")) {
                     state.dialog = Some(Dialog::NewDir { name: String::new() });
                 }
@@ -720,7 +723,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             r.dnd_set_drag_payload(DragPaths(paths));
                         }
                     }
-                    // 拖拽目标：仅文件夹可接收；悬停高亮，释放即移动
+                    // 拖拽目标：仅文件夹可接收；悬停高亮 + 登记为弹簧目标（停留可进入），释放即移动
                     if e.is_dir {
                         if r.dnd_hover_payload::<DragPaths>().is_some() {
                             dnd_painter.rect_stroke(
@@ -729,6 +732,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                 egui::Stroke::new(1.5, Palette::ACCENT),
                                 egui::StrokeKind::Inside,
                             );
+                            spring_target = Some(full.clone());
                         }
                         if let Some(payload) = r.dnd_release_payload::<DragPaths>() {
                             let srcs = valid_move_srcs(&payload.0, &full);
@@ -957,6 +961,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         state.anchor = None;
     }
 
+    // 弹簧式拖拽导航：在 Up / 文件夹上持续悬停则进入目标目录，并在指针处双闪
+    spring_navigate(ui, state, spring_target, actions);
+
     if let Some(p) = navigate {
         state.cwd = p;
         state.selected.clear();
@@ -1060,60 +1067,68 @@ fn valid_move_srcs(srcs: &[String], dest: &str) -> Vec<String> {
         .collect()
 }
 
-/// 拖拽到「上级目录」按钮的交互：
-/// - 悬停 `UP_DWELL` 秒自动跳到上一层（弹簧式，可逐级上跳），带进度填充与跳转动画；
-/// - 在按钮上释放则把拖拽的文件移动到上一层目录。
-fn handle_up_drag(ui: &mut egui::Ui, state: &mut FilePanelState, up: &egui::Response, actions: &mut Vec<FileAction>) {
-    // 仅在非根目录时有意义（拖拽未进行时 dnd_* 返回 None，自然不触发）
+/// 拖拽到「上级目录」按钮：悬停时高亮并把上一层目录登记为弹簧目标（计时与跳转由
+/// `spring_navigate` 统一处理）；在按钮上释放则把文件移动到上一层目录。
+fn handle_up_drag(ui: &mut egui::Ui, state: &FilePanelState, up: &egui::Response, actions: &mut Vec<FileAction>, spring_target: &mut Option<String>) {
     if state.cwd.is_empty() || state.cwd == "/" {
-        state.up_hover_since = None;
-        state.up_flash = None;
         return;
     }
-    let now = ui.input(|i| i.time);
     let parent = parent_of(&state.cwd);
-
     if let Some(payload) = up.dnd_release_payload::<DragPaths>() {
-        // 释放到 Up：移动到上一层目录
         let srcs = valid_move_srcs(&payload.0, &parent);
         if !srcs.is_empty() {
             actions.push(FileAction::Move { srcs, dest_dir: parent.clone() });
         }
-        state.up_hover_since = None;
     } else if up.dnd_hover_payload::<DragPaths>().is_some() {
-        // 悬停累计：画高亮 + 底部进度条；满 UP_DWELL 自动上跳
-        let since = *state.up_hover_since.get_or_insert(now);
-        let progress = (((now - since) / UP_DWELL) as f32).clamp(0.0, 1.0);
+        // 悬停高亮（无进度条；是否跳转由停留时长决定）
         let rect = up.rect;
         let p = ui.painter();
         p.rect_filled(rect, 6.0, Palette::ACCENT_SOFT);
         p.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, Palette::ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-        p.hline(rect.left()..=(rect.left() + rect.width() * progress), rect.bottom() - 1.5, egui::Stroke::new(2.0, Palette::ACCENT));
+        *spring_target = Some(parent);
+    }
+}
+
+/// 弹簧式拖拽导航的统一处理：在某目标目录上持续悬停 `UP_DWELL` 秒则进入它，
+/// 并在指针处播放两次脉冲环动画；继续悬停可逐级连跳。无悬停目标时复位计时。
+fn spring_navigate(ui: &mut egui::Ui, state: &mut FilePanelState, spring_target: Option<String>, actions: &mut Vec<FileAction>) {
+    let now = ui.input(|i| i.time);
+    if let Some(target) = spring_target {
+        let armed = matches!(&state.spring_since, Some((k, _)) if *k == target);
+        if !armed {
+            state.spring_since = Some((target.clone(), now));
+        }
+        let since = state.spring_since.as_ref().map(|(_, t)| *t).unwrap_or(now);
         if now - since >= UP_DWELL {
-            state.cwd = parent.clone();
+            state.cwd = target.clone();
             state.selected.clear();
-            state.up_hover_since = Some(now); // 继续悬停可逐级上跳
-            state.up_flash = Some(now);
-            if !state.listings.contains_key(&parent) && !state.loading.contains(&parent) {
-                state.loading.insert(parent.clone());
-                actions.push(FileAction::List(parent));
+            state.spring_since = None; // 重新计时，继续悬停可连跳
+            state.spring_flash = Some(now);
+            if !state.listings.contains_key(&target) && !state.loading.contains(&target) {
+                state.loading.insert(target.clone());
+                actions.push(FileAction::List(target));
             }
         }
         ui.ctx().request_repaint();
     } else {
-        state.up_hover_since = None;
+        state.spring_since = None;
     }
 
-    // 跳转完成动画：按钮外扩 + 渐隐的强调描边
-    if let Some(t) = state.up_flash {
+    // 跳转动画：在指针处播放两次脉冲环
+    if let Some(t) = state.spring_flash {
         let e = now - t;
         if e < UP_FLASH {
-            let k = 1.0 - (e / UP_FLASH) as f32; // 1 -> 0
-            let rect = up.rect.expand(2.0 + 5.0 * k);
-            ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0 + 2.0 * k, Palette::ACCENT.gamma_multiply(k.max(0.15))), egui::StrokeKind::Outside);
+            if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                let phase = (e / UP_FLASH) as f32; // 0..1
+                let f = (phase * 2.0).fract(); // 两个脉冲
+                let k = 1.0 - (2.0 * f - 1.0).abs(); // 每个脉冲 0→1→0
+                let r = 9.0 + 13.0 * (1.0 - k); // 环随脉冲收放
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("spring_flash")));
+                painter.circle_stroke(pos, r, egui::Stroke::new(2.0, Palette::ACCENT.gamma_multiply(k.max(0.1))));
+            }
             ui.ctx().request_repaint();
         } else {
-            state.up_flash = None;
+            state.spring_flash = None;
         }
     }
 }
