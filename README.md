@@ -29,8 +29,6 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 - **Multilingual** — English / 中文, switchable from the right-click menu.
 - **A clean, modern light UI** — warm theme, optional dark terminal, no toolbar clutter.
 
-> A personal project, actively polished. Issues / PRs welcome.
-
 ## ⚙️ Footprint
 
 | Metric | Value |
