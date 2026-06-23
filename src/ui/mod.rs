@@ -9,6 +9,19 @@ use egui::{Color32, Rect, Vec2};
 
 use crate::theme::Palette;
 
+/// 路径栏：在可用宽度内单行显示路径，过长时可横向滚动、隐藏滚动条，
+/// 默认贴右（展示末尾，即最具体的文件名/当前目录）；用户手动滚动后保持其位置。
+/// 用于编辑器、看图器等的路径展示。
+pub fn path_scroll(ui: &mut egui::Ui, path: &str) {
+    egui::ScrollArea::horizontal()
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .auto_shrink([false, true])
+        .stick_to_right(true)
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(path).color(Palette::TEXT_DIM).size(11.0)).selectable(false).wrap_mode(egui::TextWrapMode::Extend));
+        });
+}
+
 /// 人性化字节单位（KB 入参为千字节时用 `fmt_kb`）。
 pub fn fmt_bytes(bytes: f64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];

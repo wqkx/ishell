@@ -2536,8 +2536,8 @@ impl App {
                 .show(vctx, |ui| {
                     if let Some(t) = self.image_tabs.get_mut(self.active_image) {
                         // 工具栏：路径 + 尺寸/缩放 + 另存为/1:1/适应窗口
+                        // 按钮先占右侧，路径在剩余宽度里横向滚动、默认贴右
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&t.path).color(Palette::TEXT_DIM).size(11.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button(crate::i18n::tr("适应窗口", "Fit")).clicked() {
                                     t.zoom = 0.0;
@@ -2561,6 +2561,9 @@ impl App {
                                     ui.label(RichText::new(format!("{}%", (t.zoom * 100.0).round() as i32)).color(Palette::TEXT_DIM).size(11.0));
                                 }
                                 ui.label(RichText::new(format!("{}×{}", t.size.x as i32, t.size.y as i32)).color(Palette::TEXT_DIM).size(11.0));
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    crate::ui::path_scroll(ui, &t.path);
+                                });
                             });
                         });
                         ui.separator();

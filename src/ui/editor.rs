@@ -74,10 +74,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
 
     // 大文件：只读、按行虚拟化渲染（仅渲染可见行，内存占用低）
     if ed.read_only {
+        let mb = ed.content.len() as f64 / 1_048_576.0;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&ed.path).color(Palette::TEXT_DIM).size(11.0));
-            let mb = ed.content.len() as f64 / 1_048_576.0;
-            ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("（大文件 {mb:.1} MB · 只读）"), crate::i18n::Lang::En => format!("(large {mb:.1} MB · read-only)") }).color(Palette::WARN).size(11.0));
+            // 按钮 + 大文件提示先占右侧，路径在剩余宽度里横向滚动、默认贴右
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button(RichText::new(format!("{}  {}", icon::PENCIL_SIMPLE, crate::i18n::tr("改为可编辑", "Make editable"))))
@@ -88,6 +87,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     // 释放只读行索引（编辑模式不再需要）
                     ed.line_ranges = Vec::new();
                 }
+                ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("（大文件 {mb:.1} MB · 只读）"), crate::i18n::Lang::En => format!("(large {mb:.1} MB · read-only)") }).color(Palette::WARN).size(11.0));
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    crate::ui::path_scroll(ui, &ed.path);
+                });
             });
         });
         ui.separator();
@@ -133,9 +136,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         return false;
     }
 
-    // 工具栏：保存 / 查找
+    // 工具栏：保存 / 查找（按钮先占右侧，路径在剩余宽度里横向滚动、默认贴右）
     ui.horizontal(|ui| {
-        ui.label(RichText::new(&ed.path).color(Palette::TEXT_DIM).size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                 save = true;
@@ -143,6 +145,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             if ui.button(RichText::new(format!("{}  {}", icon::MAGNIFYING_GLASS, crate::i18n::tr("查找", "Find")))).clicked() {
                 ed.show_find = !ed.show_find;
             }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                crate::ui::path_scroll(ui, &ed.path);
+            });
         });
     });
 

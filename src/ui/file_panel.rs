@@ -333,14 +333,23 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     let mut done = false;
                     let take_focus = state.path_edit_focus;
                     if let Some(buf) = &mut state.path_edit {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(buf)
-                                .desired_width(ui.available_width() - 4.0)
-                                .hint_text(crate::i18n::tr("输入路径后回车跳转，Esc 取消", "Enter path, Enter to go, Esc to cancel")),
-                        );
+                        let out = egui::TextEdit::singleline(buf)
+                            .desired_width(ui.available_width() - 4.0)
+                            .hint_text(crate::i18n::tr("输入路径后回车跳转，Esc 取消", "Enter path, Enter to go, Esc to cancel"))
+                            .show(ui);
                         if take_focus {
-                            resp.request_focus();
+                            // 首帧进入编辑：聚焦并全选路径，便于直接覆盖输入
+                            let len = buf.chars().count();
+                            let id = out.response.id;
+                            let mut st = out.state;
+                            st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(len),
+                            )));
+                            st.store(ui.ctx(), id);
+                            out.response.request_focus();
                         }
+                        let resp = &out.response;
                         if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let t = buf.trim();
                             if !t.is_empty() {
@@ -372,6 +381,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     egui::ScrollArea::horizontal()
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .auto_shrink([false, false])
+                        .stick_to_right(true) // 路径过长时默认展示末尾（当前目录）
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;
@@ -771,6 +781,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     }
     if bg_cd {
         actions.push(FileAction::CdTerminal(state.cwd.clone()));
+    }
+    // 点击列表空白处（非任何行）：若有选中则全部取消选中
+    if bg.clicked() && !state.selected.is_empty() {
+        state.selected.clear();
+        state.anchor = None;
+        state.pending_rename = None;
     }
 
     // 延时重命名触发：单击后 0.4s 内无双击则进入重命名
