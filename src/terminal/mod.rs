@@ -751,19 +751,7 @@ impl Terminal {
             if ui.checkbox(&mut self.highlight, crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN")).clicked() {
                 ui.close();
             }
-            // 强制 X11：修复 Wayland 下 fcitx 等输入法无法输入中文（重启后生效）
-            #[cfg(target_os = "linux")]
-            {
-                let mut fx = crate::store::load_force_x11();
-                if ui
-                    .checkbox(&mut fx, crate::i18n::tr("强制 X11（修复输入法·重启生效）", "Force X11 (fix IME · restart)"))
-                    .on_hover_text(crate::i18n::tr("Wayland 下输入法常失效；开启后下次启动改走 X11", "IME often fails on Wayland; enabling switches to X11 on next launch"))
-                    .clicked()
-                {
-                    crate::store::save_force_x11(fx);
-                    ui.close();
-                }
-            }
+            // 「强制 X11」已移至左侧监控栏的右键菜单，避免 shell 右键项过多
             ui.separator();
             // 会话日志录制
             if self.log_file.is_some() {

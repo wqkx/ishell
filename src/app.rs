@@ -258,7 +258,14 @@ impl Session {
                 }
                 WorkerEvent::OpDone { message, refresh_dir } => {
                     self.status = message;
+                    // 同时刷新「操作目标目录」与「当前查看目录」：移动/删除的源目录正是 cwd，
+                    // 仅刷新目标目录时，当前视图里的源文件不会消失。
+                    let cwd = self.files.cwd.clone();
+                    let refresh_other = refresh_dir.as_deref().map_or(true, |d| d != cwd);
                     self.refresh_dir(refresh_dir);
+                    if refresh_other && !cwd.is_empty() {
+                        self.refresh_dir(Some(cwd));
+                    }
                 }
                 WorkerEvent::TransferStart { id, name, total, dir } => {
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
@@ -1046,8 +1053,9 @@ impl App {
             src_label: clip.src_label.clone(),
             dest_label: dest.title.clone(),
         };
-        // 剪切（移动/删源）或跨服务器（重操作）都要执行前确认；仅同机复制免确认
-        if plan.is_cut || plan.cross {
+        // 仅「跨服务器」需执行前确认（重操作、经本地中转）；同机无论复制还是移动都直接执行——
+        // 同机移动是原子 mv，源在目标写成功前不会丢，无需二次确认。
+        if plan.cross {
             self.pending_paste = Some(plan);
         } else {
             self.execute_paste(plan);
@@ -1423,10 +1431,8 @@ impl eframe::App for App {
                 // 背景层右键弹语言菜单：在子控件之前注册，置于最底层 z 序，
                 // 这样不会抢走进程行/网卡/IP 等子控件的左键；空白处右键仍可触发。
                 let bg = ui.interact(ui.max_rect(), ui.id().with("sidebar_bg"), egui::Sense::click());
-                crate::i18n::lang_context_menu(&bg);
-                // 字体大小（全局界面缩放）：− / 百分比 / ＋ / 复位，步进 10%，范围 70%–200%
-                self.zoom_controls(ui);
-                ui.separator();
+                // 监控栏右键：语言 / 字体大小 / 折叠开关 / 强制 X11 的统一入口
+                self.view_context_menu(&bg);
                 match self.active {
                     Some(idx) if idx < self.sessions.len() => {
                         let s = &mut self.sessions[idx];
@@ -1441,6 +1447,27 @@ impl eframe::App for App {
                     }
                 }
             });
+        } else {
+            // 折叠态：保留一条细边，提供展开按钮 + 同样的右键菜单（否则收起后无处可点回来）
+            egui::Panel::left("sidebar_strip")
+                .resizable(false)
+                .default_size(20.0)
+                .size_range(20.0..=20.0)
+                .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::same(2)))
+                .show_inside(ui, |ui| {
+                    let bg = ui.interact(ui.max_rect(), ui.id().with("sidebar_strip_bg"), egui::Sense::click());
+                    self.view_context_menu(&bg);
+                    ui.add_space(4.0);
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add(egui::Button::new(RichText::new(egui_phosphor::regular::CARET_RIGHT).size(14.0).color(Palette::TEXT_DIM)).frame(false))
+                            .on_hover_text(crate::i18n::tr("展开系统监控栏", "Expand monitor sidebar"))
+                            .clicked()
+                        {
+                            self.sidebar_collapsed = false;
+                        }
+                    });
+                });
         }
         // 进程行被点击：打开详情小窗并请求详情
         if let Some((pid, pos)) = proc_click {
@@ -2011,13 +2038,7 @@ impl App {
                                 self.snip_just_opened = true;
                             }
                         }
-                        // 视图折叠：左侧系统监控栏 / 右下文件栏（图标随状态切换实心/常规提示）
-                        if flat_button(ui, &RichText::new(icon::SIDEBAR_SIMPLE).size(15.0), crate::i18n::tr("显示/隐藏系统监控栏", "Toggle monitor sidebar")) {
-                            self.sidebar_collapsed = !self.sidebar_collapsed;
-                        }
-                        if flat_button(ui, &RichText::new(icon::TREE_VIEW).size(15.0), crate::i18n::tr("显示/隐藏文件栏", "Toggle file panel")) {
-                            self.files_collapsed = !self.files_collapsed;
-                        }
+                        // 折叠监控栏/文件栏的开关已移到左侧监控栏右键菜单，避免右上角按钮过多
                         // 分隔竖线：把标签区（标签 + 新建）与右侧功能区分开（短、低调，和谐配色）
                         {
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(11.0, ui.available_height()), egui::Sense::hover());
@@ -3252,33 +3273,78 @@ impl App {
         });
     }
 
-    /// 左侧栏的字体大小（全局界面缩放）控件：− / 百分比 / ＋ / 复位。
-    /// 仅修改 self.zoom 并持久化；实际缩放在 update() 开头按需 set_zoom_factor。
-    fn zoom_controls(&mut self, ui: &mut egui::Ui) {
-        use egui_phosphor::regular as icon;
-        let mut z = self.zoom;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(crate::i18n::tr("字体大小", "Font size")).color(Palette::TEXT_DIM).size(12.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 右起：复位 / ＋ / 百分比 / −（视觉上从左到右为 − 百分比 ＋ 复位）
-                if flat_button(ui, &RichText::new(icon::ARROW_COUNTER_CLOCKWISE).size(13.0), crate::i18n::tr("复位 100%", "Reset to 100%")) {
-                    z = 1.0;
-                }
-                if flat_button(ui, &RichText::new(icon::PLUS).size(13.0), crate::i18n::tr("放大", "Larger")) {
-                    z += 0.1;
-                }
-                ui.label(RichText::new(format!("{:.0}%", z * 100.0)).strong().color(Palette::TEXT).size(12.0));
-                if flat_button(ui, &RichText::new(icon::MINUS).size(13.0), crate::i18n::tr("缩小", "Smaller")) {
-                    z -= 0.1;
-                }
-            });
-        });
-        // 量化到 5% 网格并夹取范围，避免浮点漂移
+    /// 设置全局界面缩放：量化到 5% 网格、夹在 70%–200%，变化则持久化。
+    fn set_zoom(&mut self, z: f32) {
         let z = ((z * 20.0).round() / 20.0).clamp(0.7, 2.0);
         if (z - self.zoom).abs() > f32::EPSILON {
             self.zoom = z;
             crate::store::save_zoom(z);
         }
+    }
+
+    /// 监控栏（左侧菜单栏）的统一右键菜单：语言 / 字体大小 / 折叠视图 / 强制 X11。
+    /// 折叠后的细条也复用它，保证收起后仍能调出这些功能。
+    fn view_context_menu(&mut self, resp: &egui::Response) {
+        resp.context_menu(|ui| {
+            // 菜单项不换行，避免较长的英文项折行
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+
+            // —— 语言 ——
+            ui.label(RichText::new(crate::i18n::tr("语言", "Language")).color(Palette::TEXT_DIM).size(11.0));
+            crate::i18n::language_menu(ui);
+            ui.separator();
+
+            // —— 字体大小（全局界面缩放）——
+            ui.label(RichText::new(format!("{}  {:.0}%", crate::i18n::tr("字体大小", "Font size"), self.zoom * 100.0)).color(Palette::TEXT_DIM).size(11.0));
+            ui.horizontal(|ui| {
+                // +/- 不关闭菜单，便于连续调整；百分比实时更新
+                if ui.button(RichText::new(egui_phosphor::regular::MINUS).size(13.0)).clicked() {
+                    self.set_zoom(self.zoom - 0.1);
+                }
+                if ui.button(RichText::new(egui_phosphor::regular::PLUS).size(13.0)).clicked() {
+                    self.set_zoom(self.zoom + 0.1);
+                }
+                if ui.button(crate::i18n::tr("复位", "Reset")).clicked() {
+                    self.set_zoom(1.0);
+                }
+            });
+            ui.separator();
+
+            // —— 视图折叠 ——
+            let s_label = if self.sidebar_collapsed {
+                format!("{}  {}", egui_phosphor::regular::SIDEBAR_SIMPLE, crate::i18n::tr("显示系统监控栏", "Show monitor sidebar"))
+            } else {
+                format!("{}  {}", egui_phosphor::regular::SIDEBAR_SIMPLE, crate::i18n::tr("隐藏系统监控栏", "Hide monitor sidebar"))
+            };
+            if ui.button(s_label).clicked() {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
+                ui.close();
+            }
+            let f_label = if self.files_collapsed {
+                format!("{}  {}", egui_phosphor::regular::TREE_VIEW, crate::i18n::tr("显示文件栏", "Show file panel"))
+            } else {
+                format!("{}  {}", egui_phosphor::regular::TREE_VIEW, crate::i18n::tr("隐藏文件栏", "Hide file panel"))
+            };
+            if ui.button(f_label).clicked() {
+                self.files_collapsed = !self.files_collapsed;
+                ui.close();
+            }
+
+            // —— 强制 X11（仅 Linux；修复 Wayland 下输入法）——
+            #[cfg(target_os = "linux")]
+            {
+                ui.separator();
+                let mut fx = crate::store::load_force_x11();
+                if ui
+                    .checkbox(&mut fx, crate::i18n::tr("强制 X11（修复输入法·重启生效）", "Force X11 (fix IME · restart)"))
+                    .on_hover_text(crate::i18n::tr("Wayland 下输入法常失效；开启后下次启动改走 X11", "IME often fails on Wayland; enabling switches to X11 on next launch"))
+                    .clicked()
+                {
+                    crate::store::save_force_x11(fx);
+                    ui.close();
+                }
+            }
+        });
     }
 
     fn right_body(&mut self, root: &mut egui::Ui, idx: usize) {

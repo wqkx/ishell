@@ -722,6 +722,30 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         });
     });
 
+    // 拖拽预览：拖动中在指针旁画一个跟手的小标签（单项显示名称，多项显示数量），
+    // 给「文件正被拖动」一个明确的视觉反馈。
+    if let Some(payload) = egui::DragAndDrop::payload::<DragPaths>(ui.ctx()) {
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let n = payload.0.len();
+            let text = if n == 1 {
+                payload.0[0].rsplit('/').next().unwrap_or("").to_string()
+            } else {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("移动 {n} 项"),
+                    crate::i18n::Lang::En => format!("Move {n} items"),
+                }
+            };
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("file_drag_preview")));
+            let font = egui::FontId::proportional(12.0);
+            let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+            let pad = egui::vec2(8.0, 4.0);
+            let rect = egui::Rect::from_min_size(pos + egui::vec2(14.0, 8.0), galley.size() + pad * 2.0);
+            painter.rect_filled(rect, 6.0, Palette::ACCENT.gamma_multiply(0.95));
+            painter.galley(rect.min + pad, galley, egui::Color32::WHITE);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+    }
+
     // 表头点击排序：同列切升/降；换列时按列性质选默认方向——
     // 大小/修改时间首次点击用降序（先看最大/最新），名称用升序（A→Z）。
     if let Some(k) = sort_click {
