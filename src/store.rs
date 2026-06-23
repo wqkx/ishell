@@ -371,6 +371,31 @@ pub fn save_conflict_policy(policy: &str) {
     }
 }
 
+// ---------- 界面缩放（字体大小） ----------
+
+fn zoom_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("zoom"))
+}
+
+/// 读取界面缩放系数（egui zoom_factor）；未设置默认 1.0，并夹在 [0.7, 2.0]。
+pub fn load_zoom() -> f32 {
+    zoom_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|z| z.clamp(0.7, 2.0))
+        .unwrap_or(1.0)
+}
+
+/// 保存界面缩放系数。
+pub fn save_zoom(zoom: f32) {
+    if let Some(p) = zoom_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, format!("{zoom:.2}"));
+    }
+}
+
 // ---------- 读写 ----------
 
 /// 读取已保存连接列表（内存中为明文密码）。

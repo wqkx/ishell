@@ -236,6 +236,8 @@ fn parse_disk(raw: &str) -> Vec<DiskInfo> {
         let fs = cols[0];
         let total: u64 = cols[1].parse().unwrap_or(0);
         let used: u64 = cols[2].parse().unwrap_or(0);
+        // df 的 Available 列：已扣除 ext4 等为 root 预留的块，是用户态真正可写入的空间
+        let avail: u64 = cols[3].parse().unwrap_or(0);
         let mount = cols[5..].join(" ");
         // 跳过伪文件系统与系统挂载点
         let pseudo_fs = ["tmpfs", "devtmpfs", "overlay", "squashfs", "efivarfs", "ramfs"];
@@ -246,8 +248,10 @@ fn parse_disk(raw: &str) -> Vec<DiskInfo> {
         {
             continue;
         }
-        let percent = used as f32 / total as f32 * 100.0;
-        out.push(DiskInfo { mount, total_kb: total, used_kb: used, percent });
+        // 占用率与 df 的 Capacity 一致：used/(used+avail)，把 root 预留块排除在分母外
+        let denom = used + avail;
+        let percent = if denom > 0 { used as f32 / denom as f32 * 100.0 } else { 0.0 };
+        out.push(DiskInfo { mount, total_kb: total, avail_kb: avail, percent });
     }
     out
 }

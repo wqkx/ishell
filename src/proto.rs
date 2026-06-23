@@ -229,7 +229,8 @@ pub struct NetIface {
 pub struct DiskInfo {
     pub mount: String,
     pub total_kb: u64,
-    pub used_kb: u64,
+    /// df 报告的「真实可用」（已扣除 root 保留块），并非 total-used
+    pub avail_kb: u64,
     pub percent: f32,
 }
 

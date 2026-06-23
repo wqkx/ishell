@@ -430,10 +430,39 @@ pub async fn run(
                             });
                         }
                     }
+                    // 删除经 shell `rm` 执行：SFTP 的 remove_dir 只能删空目录、且对
+                    // 指向目录的符号链接会失败；`rm -rf/-f` 与其它终端工具行为一致，
+                    // 能删非空目录、各类链接与带特殊字符的文件名。
+                    Some(UiCommand::Delete { path, is_dir }) => {
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        tokio::spawn(async move {
+                            let parent = remote_parent(&path);
+                            // `--` 终止选项解析，避免以 - 开头的文件名被当作开关
+                            let cmd = if is_dir {
+                                format!("rm -rf -- {}", sh_quote(&path))
+                            } else {
+                                format!("rm -f -- {}", sh_quote(&path))
+                            };
+                            match exec_status(&h, &cmd).await {
+                                Ok((0, _)) => s.send(WorkerEvent::OpDone {
+                                    message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已删除：{path}"), crate::i18n::Lang::En => format!("Deleted: {path}") },
+                                    refresh_dir: Some(parent),
+                                }),
+                                Ok((code, err)) => s.send(WorkerEvent::Error(match crate::i18n::current() {
+                                    crate::i18n::Lang::Zh => format!("删除失败（码 {code}）：{}", err.trim()),
+                                    crate::i18n::Lang::En => format!("Delete failed (code {code}): {}", err.trim()),
+                                })),
+                                Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() {
+                                    crate::i18n::Lang::Zh => format!("删除失败：{e}"),
+                                    crate::i18n::Lang::En => format!("Delete failed: {e}"),
+                                })),
+                            }
+                        });
+                    }
                     Some(cmd @ (UiCommand::Mkdir(_)
                         | UiCommand::CreateFile(_)
                         | UiCommand::Chmod { .. }
-                        | UiCommand::Delete { .. }
                         | UiCommand::Rename { .. }
                         | UiCommand::WriteFile { .. })) => {
                         if let Some(sftp) = &sftp {
@@ -1562,15 +1591,6 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 .await
                 .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已修改权限：{:o}", mode & 0o777), crate::i18n::Lang::En => format!("Chmod: {:o}", mode & 0o777) }, Some(parent)))
                 .map_err(Into::into)
-        }
-        UiCommand::Delete { path, is_dir } => {
-            let parent = remote_parent(&path);
-            let r = if is_dir {
-                sftp.remove_dir(&path).await
-            } else {
-                sftp.remove_file(&path).await
-            };
-            r.map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已删除：{path}"), crate::i18n::Lang::En => format!("Deleted: {path}") }, Some(parent))).map_err(Into::into)
         }
         UiCommand::Rename { from, to } => {
             let parent = remote_parent(&to);

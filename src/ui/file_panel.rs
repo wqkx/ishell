@@ -94,6 +94,8 @@ pub enum FileAction {
     ClipCut { items: Vec<(String, bool)> },
     /// 把剪贴板内容粘贴到当前目录（同机用 cp/mv，跨机走下载→上传中转，由 App 决定）
     Paste { dest_dir: String },
+    /// 在同一会话内拖拽移动：把 srcs 移动到 dest_dir（远端 mv）
+    Move { srcs: Vec<String>, dest_dir: String },
     CopyPath(String),
     /// 双击文本文件 -> 打开编辑器（force=true 放宽大小限制）
     OpenFile { path: String, force: bool },
@@ -278,7 +280,6 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     // 工具栏：扁平图标条（带浅色背景）
     use egui_phosphor::regular as icon;
     let mut bc_nav: Option<String> = None;
-    let mut delete_selected = false; // 工具栏删除按钮 / Delete 键触发的批量删除请求
     let mut paste_here = false; // 工具栏/菜单粘贴触发（has_clip 由 App 传入）
     egui::Frame::new()
         .fill(Palette::PANEL_2)
@@ -301,20 +302,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                 if tool_btn(ui, icon::FILE_PLUS, crate::i18n::tr("新建文件", "New file")) {
                     state.dialog = Some(Dialog::NewFile { name: String::new() });
                 }
-                if tool_btn(ui, icon::UPLOAD_SIMPLE, crate::i18n::tr("上传文件", "Upload")) {
-                    state.dialog = Some(Dialog::Upload { local: String::new() });
-                }
-                // 删除选中项（多选批量）：仅在有选中时显示，红色提示，数量随选中变化
-                if !state.selected.is_empty() {
-                    let n = state.selected.len();
-                    let tip = match crate::i18n::current() {
-                        crate::i18n::Lang::Zh => if n > 1 { format!("删除选中的 {n} 项") } else { "删除选中".to_string() },
-                        crate::i18n::Lang::En => if n > 1 { format!("Delete {n} selected") } else { "Delete selected".to_string() },
-                    };
-                    if tool_btn_color(ui, icon::TRASH, &tip, Palette::DANGER) {
-                        delete_selected = true;
-                    }
-                }
+                // 上传 / 删除已从工具栏移除：上传走拖拽或空白处右键菜单，删除走右键菜单或 Delete 键
                 // 粘贴：剪贴板有内容时显示（内容/数量由 App 持有）
                 if has_clip
                     && tool_btn_color(ui, icon::CLIPBOARD_TEXT, crate::i18n::tr("粘贴到此目录", "Paste here"), Palette::ACCENT)
@@ -525,6 +513,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let mut confirm_open: Option<(String, u64)> = None; // 大文件待确认
     let mut rename_commit: Option<(String, String)> = None;
     let mut cancel_rename = false;
+    let mut drop_move: Option<(Vec<String>, String)> = None; // 拖拽释放到某文件夹 -> (srcs, dest_dir)
     let now = ui.input(|i| i.time);
     let (mod_ctrl, mod_shift) = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
 
@@ -532,6 +521,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("filelist_bg"), Sense::click());
     let mut bg_new_dir = false;
     let mut bg_new_file = false;
+    let mut bg_upload = false;
     let mut bg_cd = false;
     bg.context_menu(|ui| {
         if ui.button(format!("{}  {}", icon::FOLDER_PLUS, crate::i18n::tr("新建文件夹", "New folder"))).clicked() {
@@ -540,6 +530,10 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         }
         if ui.button(format!("{}  {}", icon::FILE_PLUS, crate::i18n::tr("新建文件", "New file"))).clicked() {
             bg_new_file = true;
+            ui.close();
+        }
+        if ui.button(format!("{}  {}", icon::UPLOAD_SIMPLE, crate::i18n::tr("上传文件", "Upload"))).clicked() {
+            bg_upload = true;
             ui.close();
         }
         if has_clip {
@@ -561,12 +555,14 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     egui::Frame::new()
         .inner_margin(egui::Margin { left: 6, right: 2, top: 0, bottom: 0 })
         .show(ui, |ui| {
+    // 拖拽悬停高亮用独立图层绘制：TableBuilder 闭包内 ui 已被可变借用，不能再取 ui.painter()
+    let dnd_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("file_dnd_hl")));
     TableBuilder::new(ui)
         // 按目录区分滚动状态：进入子目录/切换目录后从顶部开始，不沿用上个目录的滚动位置
         .id_salt(&cwd)
         .striped(true)
         .resizable(true)
-        .sense(Sense::click())
+        .sense(Sense::click_and_drag())
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .column(Column::auto().at_least(190.0).clip(true))
         .column(Column::auto().at_least(80.0))
@@ -696,6 +692,30 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     if r.secondary_clicked() {
                         rclick = Some(i);
                     }
+                    // 拖拽源：拖动开始时把（多选则整组、否则单项）源路径放入载荷
+                    if r.drag_started() {
+                        let paths = drag_source_paths(state, &entries, &cwd, i);
+                        if !paths.is_empty() {
+                            r.dnd_set_drag_payload(DragPaths(paths));
+                        }
+                    }
+                    // 拖拽目标：仅文件夹可接收；悬停高亮，释放即移动
+                    if e.is_dir {
+                        if r.dnd_hover_payload::<DragPaths>().is_some() {
+                            dnd_painter.rect_stroke(
+                                r.rect,
+                                4.0,
+                                egui::Stroke::new(1.5, Palette::ACCENT),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        if let Some(payload) = r.dnd_release_payload::<DragPaths>() {
+                            let srcs = valid_move_srcs(&payload.0, &full);
+                            if !srcs.is_empty() {
+                                drop_move = Some((srcs, full.clone()));
+                            }
+                        }
+                    }
                     entry_context(&r, e, i, &full, has_clip, &mut menu);
                 });
             }
@@ -721,6 +741,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     }
     if bg_new_file {
         state.dialog = Some(Dialog::NewFile { name: String::new() });
+    }
+    if bg_upload {
+        state.dialog = Some(Dialog::Upload { local: String::new() });
     }
     if bg_cd {
         actions.push(FileAction::CdTerminal(state.cwd.clone()));
@@ -864,7 +887,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let key_del = ui.input(|i| i.key_pressed(egui::Key::Delete))
         && state.renaming.is_none()
         && state.path_edit.is_none();
-    if (delete_selected || key_del) && state.dialog.is_none() && !state.selected.is_empty() {
+    if key_del && state.dialog.is_none() && !state.selected.is_empty() {
         let mut idxs: Vec<usize> = state.selected.iter().copied().collect();
         idxs.sort_unstable();
         let items: Vec<(String, bool, String)> = idxs
@@ -874,6 +897,13 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         if !items.is_empty() {
             state.dialog = Some(Dialog::ConfirmDelete { items });
         }
+    }
+
+    // 拖拽移动：释放到某文件夹后发起远端 mv，并清空选择避免陈旧索引
+    if let Some((srcs, dest_dir)) = drop_move {
+        actions.push(FileAction::Move { srcs, dest_dir });
+        state.selected.clear();
+        state.anchor = None;
     }
 
     if let Some(p) = navigate {
@@ -954,6 +984,29 @@ fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, h
             ui.close();
         }
     });
+}
+
+/// 拖拽载荷：被拖动的源绝对路径列表（egui 内部 Arc 持有，需 Send + Sync）。
+#[derive(Clone)]
+struct DragPaths(Vec<String>);
+
+/// 计算拖拽源：与 clip_targets 同规则，仅取路径。
+fn drag_source_paths(state: &FilePanelState, entries: &[FileEntry], cwd: &str, idx: usize) -> Vec<String> {
+    clip_targets(state, entries, cwd, idx).into_iter().map(|(p, _)| p).collect()
+}
+
+/// 把拖拽到目标目录 dest 的源过滤为合法移动：排除目标自身、已直接位于 dest 内、
+/// 以及把祖先目录拖进其子目录的非法情况。
+fn valid_move_srcs(srcs: &[String], dest: &str) -> Vec<String> {
+    srcs.iter()
+        .filter(|s| {
+            let s = s.as_str();
+            s != dest                          // 不能移动到自身
+                && parent_of(s) != dest        // 已在目标目录内，无需移动
+                && !dest.starts_with(&format!("{s}/")) // 不能把父目录拖进自己的子目录
+        })
+        .cloned()
+        .collect()
 }
 
 /// 计算放入剪贴板的源项：右键项在多选内则取整组选中，否则只取该项。

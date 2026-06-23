@@ -144,8 +144,8 @@ pub fn show(
         // —— 磁盘：每行一个，右起进度条 + 文字同行 ——
         section(ui, icon::HARD_DRIVES, tr("磁盘", "Disk"));
         for d in &info.disks {
-            let avail = d.total_kb.saturating_sub(d.used_kb);
-            disk_row(ui, &d.mount, d.percent, &format!("{}/{}", fmt_kb(avail), fmt_kb(d.total_kb)));
+            // 显示 df 的真实可用空间（已扣除 root 预留块），而非 total-used
+            disk_row(ui, &d.mount, d.percent, &format!("{}/{}", fmt_kb(d.avail_kb), fmt_kb(d.total_kb)));
         }
     });
 }

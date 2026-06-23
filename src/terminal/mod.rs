@@ -686,15 +686,11 @@ impl Terminal {
             let (cr, cc) = screen.cursor_position();
             let cpos = origin + Vec2::new(cc as f32 * char_w, cr as f32 * char_h);
             let crect = Rect::from_min_size(cpos, cell);
-            let color = if focused {
-                crate::theme::Palette::ACCENT
-            } else {
-                Color32::from_gray(150)
-            };
+            // 失焦时仍用珊瑚色描边（而非低对比灰），避免点到文件栏/侧栏后光标看似「消失」
             if focused {
-                painter.rect_filled(crect, 1.0, color.gamma_multiply(0.6));
+                painter.rect_filled(crect, 1.0, crate::theme::Palette::ACCENT.gamma_multiply(0.6));
             } else {
-                painter.rect_stroke(crect, 1.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+                painter.rect_stroke(crect, 1.0, Stroke::new(1.2, crate::theme::Palette::ACCENT.gamma_multiply(0.8)), egui::StrokeKind::Inside);
             }
         }
 

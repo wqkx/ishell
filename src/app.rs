@@ -390,6 +390,11 @@ pub struct App {
     /// 命令广播栏是否显示 + 输入内容
     show_broadcast: bool,
     broadcast_input: String,
+    /// 折叠左侧系统监控栏 / 右下文件栏
+    sidebar_collapsed: bool,
+    files_collapsed: bool,
+    /// 全局界面缩放系数（egui zoom_factor），左侧栏可调、持久化
+    zoom: f32,
     /// 传输冲突策略（目标已存在时；默认覆盖）
     conflict_policy: ConflictPolicy,
     /// 文件剪贴板（跨 tab 共享）：复制/剪切的源项
@@ -559,6 +564,9 @@ impl App {
             fwd_just_opened: false,
             fwd_form: ForwardForm::default(),
             show_broadcast: false,
+            sidebar_collapsed: false,
+            files_collapsed: false,
+            zoom: crate::store::load_zoom(),
             broadcast_input: String::new(),
             conflict_policy: crate::store::load_conflict_policy().map(|s| ConflictPolicy::from_str(&s)).unwrap_or(ConflictPolicy::Overwrite),
             file_clip: None,
@@ -981,6 +989,15 @@ impl App {
                 s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
                 let _ = s.cmd_tx.send(UiCommand::ReadImage { path });
             }
+            FileAction::Move { srcs, dest_dir } => {
+                // 同会话内拖拽移动：直接走远端 mv（CopyMove 的 do_move 分支）
+                let n = srcs.len();
+                let _ = s.cmd_tx.send(UiCommand::CopyMove { srcs, dest_dir, do_move: true });
+                s.status = match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("移动 {n} 项 …"),
+                    crate::i18n::Lang::En => format!("Moving {n} item(s) …"),
+                };
+            }
             FileAction::CdTerminal(path) => {
                 // 以 POSIX 单引号转义路径后在终端 cd，并聚焦终端
                 let quoted = format!("'{}'", path.replace('\'', "'\\''"));
@@ -1237,6 +1254,11 @@ impl eframe::App for App {
             return;
         }
 
+        // 全局界面缩放（左侧栏可调）：仅在变化时设置，避免每帧触发重排
+        if (ui.ctx().zoom_factor() - self.zoom).abs() > f32::EPSILON {
+            ui.ctx().set_zoom_factor(self.zoom);
+        }
+
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
         let mut new_tabs: Vec<(String, String, String, UnboundedSender<UiCommand>)> = Vec::new();
         let mut new_images: Vec<(String, Vec<u8>, String)> = Vec::new();
@@ -1391,6 +1413,7 @@ impl eframe::App for App {
         // 3) 左侧操作栏：独立全高区域
         let mut proc_click: Option<(u32, egui::Pos2)> = None;
         let mut gpu_click: Option<egui::Pos2> = None;
+        if !self.sidebar_collapsed {
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(300.0)
@@ -1401,6 +1424,9 @@ impl eframe::App for App {
                 // 这样不会抢走进程行/网卡/IP 等子控件的左键；空白处右键仍可触发。
                 let bg = ui.interact(ui.max_rect(), ui.id().with("sidebar_bg"), egui::Sense::click());
                 crate::i18n::lang_context_menu(&bg);
+                // 字体大小（全局界面缩放）：− / 百分比 / ＋ / 复位，步进 10%，范围 70%–200%
+                self.zoom_controls(ui);
+                ui.separator();
                 match self.active {
                     Some(idx) if idx < self.sessions.len() => {
                         let s = &mut self.sessions[idx];
@@ -1415,6 +1441,7 @@ impl eframe::App for App {
                     }
                 }
             });
+        }
         // 进程行被点击：打开详情小窗并请求详情
         if let Some((pid, pos)) = proc_click {
             let mut popup = None;
@@ -1983,6 +2010,13 @@ impl App {
                             if self.show_snippets {
                                 self.snip_just_opened = true;
                             }
+                        }
+                        // 视图折叠：左侧系统监控栏 / 右下文件栏（图标随状态切换实心/常规提示）
+                        if flat_button(ui, &RichText::new(icon::SIDEBAR_SIMPLE).size(15.0), crate::i18n::tr("显示/隐藏系统监控栏", "Toggle monitor sidebar")) {
+                            self.sidebar_collapsed = !self.sidebar_collapsed;
+                        }
+                        if flat_button(ui, &RichText::new(icon::TREE_VIEW).size(15.0), crate::i18n::tr("显示/隐藏文件栏", "Toggle file panel")) {
+                            self.files_collapsed = !self.files_collapsed;
                         }
                         // 分隔竖线：把标签区（标签 + 新建）与右侧功能区分开（短、低调，和谐配色）
                         {
@@ -3218,25 +3252,56 @@ impl App {
         });
     }
 
+    /// 左侧栏的字体大小（全局界面缩放）控件：− / 百分比 / ＋ / 复位。
+    /// 仅修改 self.zoom 并持久化；实际缩放在 update() 开头按需 set_zoom_factor。
+    fn zoom_controls(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as icon;
+        let mut z = self.zoom;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(crate::i18n::tr("字体大小", "Font size")).color(Palette::TEXT_DIM).size(12.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 右起：复位 / ＋ / 百分比 / −（视觉上从左到右为 − 百分比 ＋ 复位）
+                if flat_button(ui, &RichText::new(icon::ARROW_COUNTER_CLOCKWISE).size(13.0), crate::i18n::tr("复位 100%", "Reset to 100%")) {
+                    z = 1.0;
+                }
+                if flat_button(ui, &RichText::new(icon::PLUS).size(13.0), crate::i18n::tr("放大", "Larger")) {
+                    z += 0.1;
+                }
+                ui.label(RichText::new(format!("{:.0}%", z * 100.0)).strong().color(Palette::TEXT).size(12.0));
+                if flat_button(ui, &RichText::new(icon::MINUS).size(13.0), crate::i18n::tr("缩小", "Smaller")) {
+                    z -= 0.1;
+                }
+            });
+        });
+        // 量化到 5% 网格并夹取范围，避免浮点漂移
+        let z = ((z * 20.0).round() / 20.0).clamp(0.7, 2.0);
+        if (z - self.zoom).abs() > f32::EPSILON {
+            self.zoom = z;
+            crate::store::save_zoom(z);
+        }
+    }
+
     fn right_body(&mut self, root: &mut egui::Ui, idx: usize) {
         // 右下文件操作区（可拖动调整高度）
         let mut file_actions: Vec<FileAction> = Vec::new();
         let has_clip = self.file_clip.is_some();
-        egui::Panel::bottom("files")
-            .resizable(true)
-            .default_size(250.0)
-            .size_range(120.0..=640.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(Palette::PANEL)
-                    .inner_margin(8)
-                    .outer_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 6 }),
-            )
-            .show_inside(root, |ui| {
-                file_actions = file_panel::show(ui, &mut self.sessions[idx].files, has_clip);
-            });
-        for a in file_actions {
-            self.handle_file_action(idx, a);
+        if !self.files_collapsed {
+            egui::Panel::bottom("files")
+                .resizable(true)
+                .default_size(250.0)
+                .size_range(120.0..=640.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(Palette::PANEL)
+                        .inner_margin(8)
+                        .outer_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 6 }),
+                )
+                .show_inside(root, |ui| {
+                    file_actions = file_panel::show(ui, &mut self.sessions[idx].files, has_clip);
+                });
+            for a in file_actions {
+                self.handle_file_action(idx, a);
+            }
         }
 
         // 中间终端区（四周留空隙，与其他区域分开）
