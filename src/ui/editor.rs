@@ -222,7 +222,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     let line_nums: String = (1..=n_lines).map(|i| format!("{i:>gw$}")).collect::<Vec<_>>().join("\n");
     // 让编辑区至少撑满窗口高度（内容不足一屏时也填满，点击空白处可定位光标）。
     let row_h = ui.ctx().fonts_mut(|f| f.row_height(&egui::FontId::monospace(13.0)));
-    let fill_rows = (((ui.available_height() - 6.0) / row_h).floor() as usize).max(8);
+    // 用 ceil（向上取整）让正文背景填满到底部，避免底部露出更浅的面板底色、显得下边距偏大；
+    // 多出的不足一行高度由悬浮滚动条吸收（默认隐藏）。
+    let fill_rows = (((ui.available_height() - 6.0) / row_h).ceil() as usize).max(8);
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
