@@ -62,6 +62,9 @@ pub struct ConnectForm {
     notice: Option<String>,
     /// 导入 ssh/config 的候选列表（含勾选状态）；Some 时显示选择对话框
     import_candidates: Option<Vec<(SavedConnection, bool)>>,
+    /// 正在编辑的原始连接标识 (name, host)；None=新建。
+    /// 用它定位原记录，这样即使改了 host/名称也能更新原条目而非新增。
+    editing: Option<(String, String)>,
 }
 
 impl Default for ConnectForm {
@@ -95,6 +98,7 @@ impl Default for ConnectForm {
             confirm_delete: None,
             notice: None,
             import_candidates: None,
+            editing: None,
         }
     }
 }
@@ -499,6 +503,7 @@ impl ConnectForm {
         self.j_passphrase.clear();
         self.j_auth = AuthKind::Password;
         self.error = None;
+        self.editing = None; // 新建：无原始记录
     }
 
     /// 新建 / 编辑表单视图。
@@ -677,6 +682,8 @@ impl ConnectForm {
 
     fn load_saved(&mut self, i: usize) {
         let c = self.saved[i].clone();
+        // 记住原始标识，保存时据此更新原条目（即使改了 host/名称）
+        self.editing = Some((c.name.clone(), c.host.clone()));
         self.name = c.name;
         self.host = c.host;
         self.port = c.port.to_string();
@@ -727,11 +734,19 @@ impl ConnectForm {
             group: self.group.trim().to_string(),
             tags: self.tags.trim().to_string(),
         };
-        if let Some(slot) = self.saved.iter_mut().find(|c| c.name == name && c.host == entry.host) {
-            *slot = entry;
+        // 定位原记录：编辑态按「进入编辑时的原始 (name, host)」匹配，这样改了 host/名称仍更新原条目；
+        // 新建态则按新的 (name, host) 去重，避免重复新增。
+        let slot = match &self.editing {
+            Some((on, oh)) => self.saved.iter_mut().find(|c| &c.name == on && &c.host == oh),
+            None => self.saved.iter_mut().find(|c| c.name == name && c.host == entry.host),
+        };
+        if let Some(slot) = slot {
+            *slot = entry.clone();
         } else {
-            self.saved.push(entry);
+            self.saved.push(entry.clone());
         }
+        // 更新编辑标识为新值，便于在同一编辑会话内二次保存仍命中同一条目
+        self.editing = Some((entry.name, entry.host));
         store::save(&self.saved);
         self.error = None;
     }
