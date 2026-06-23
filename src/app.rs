@@ -359,6 +359,8 @@ pub struct App {
     xfer_just_opened: bool,
     /// 显示"确认退出"对话框
     show_close_confirm: bool,
+    /// 待确认关闭的标签（仅当该会话仍连接中时弹确认）
+    pending_close_tab: Option<usize>,
     /// 已确认可以关闭
     allow_close: bool,
     /// 编辑器标签页
@@ -540,6 +542,7 @@ impl App {
             show_transfers: false,
             xfer_just_opened: false,
             show_close_confirm: false,
+            pending_close_tab: None,
             allow_close: false,
             editors: Vec::new(),
             active_editor: 0,
@@ -1481,6 +1484,9 @@ impl eframe::App for App {
         // 键盘交互认证（OTP / 2FA）
         self.kbd_prompt_dialog(&ctx);
 
+        // 关闭活动标签二次确认
+        self.close_tab_dialog(&ctx);
+
         // 粘贴二次确认（剪切 / 跨服务器）
         self.paste_confirm_dialog(&ctx);
 
@@ -2144,10 +2150,57 @@ impl App {
                         }
                     }
                     if let Some(i) = to_close {
-                        self.close_session(i);
+                        // 会话仍连接（活动）则弹确认，避免误关；否则直接关闭
+                        if self.sessions.get(i).map(|s| s.connected).unwrap_or(false) {
+                            self.pending_close_tab = Some(i);
+                        } else {
+                            self.close_session(i);
+                        }
                     }
                 });
             });
+    }
+
+    /// 关闭活动标签前的二次确认（会话仍连接时）。
+    fn close_tab_dialog(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.pending_close_tab else { return };
+        // 若该会话已不在或已断开，则无需确认
+        let Some(title) = self.sessions.get(idx).filter(|s| s.connected).map(|s| s.title.clone()) else {
+            self.pending_close_tab = None;
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        egui::Modal::new(egui::Id::new("close_tab_modal")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(crate::i18n::tr("关闭会话", "Close session")).size(16.0).strong());
+                ui.add_space(6.0);
+                ui.label(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("「{title}」仍在连接中，确定关闭吗？"),
+                    crate::i18n::Lang::En => format!("\"{title}\" is still connected. Close it?"),
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let bw = 72.0;
+                let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                if dialog_button(ui, crate::i18n::tr("关闭", "Close"), Some(Palette::DANGER), bw) {
+                    decision = Some(true);
+                }
+                if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
+                    decision = Some(false);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                self.close_session(idx);
+                self.pending_close_tab = None;
+            }
+            Some(false) => self.pending_close_tab = None,
+            None => {}
+        }
     }
 
     /// 多标签文本编辑器浮窗。
