@@ -543,6 +543,13 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
 
     // 空白区域右键 -> 新建文件/目录（仅覆盖列表区域，避免遮挡上方路径栏）
     let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("filelist_bg"), Sense::click());
+    // 在列表空白处释放拖拽 -> 移入当前目录（同一目录内会被 valid_move_srcs 过滤为无操作）
+    if let Some(payload) = bg.dnd_release_payload::<DragPaths>() {
+        let srcs = valid_move_srcs(&payload.0, &cwd);
+        if !srcs.is_empty() {
+            drop_move = Some((srcs, cwd.clone()));
+        }
+    }
     let mut bg_new_dir = false;
     let mut bg_new_file = false;
     let mut bg_upload = false;
@@ -723,7 +730,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             r.dnd_set_drag_payload(DragPaths(paths));
                         }
                     }
-                    // 拖拽目标：仅文件夹可接收；悬停高亮 + 登记为弹簧目标（停留可进入），释放即移动
+                    // 拖拽目标：
+                    // - 文件夹行：悬停高亮 + 登记弹簧目标（停留进入），释放→移入该文件夹；
+                    // - 文件行：释放→移入当前目录（便于弹簧进入文件夹后在其内任意处松手）。
                     if e.is_dir {
                         if r.dnd_hover_payload::<DragPaths>().is_some() {
                             dnd_painter.rect_stroke(
@@ -739,6 +748,11 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             if !srcs.is_empty() {
                                 drop_move = Some((srcs, full.clone()));
                             }
+                        }
+                    } else if let Some(payload) = r.dnd_release_payload::<DragPaths>() {
+                        let srcs = valid_move_srcs(&payload.0, &cwd);
+                        if !srcs.is_empty() {
+                            drop_move = Some((srcs, cwd.clone()));
                         }
                     }
                     entry_context(&r, e, i, &full, has_clip, &mut menu);
@@ -1420,6 +1434,9 @@ fn modal(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
             ui.set_width(300.0);
             add(ui);
         });
+    // 对话框含输入框时，输入法把拼音切成英文（Shift）等状态变化不一定产生 egui 事件，
+    // 不主动重绘会出现「输入了但没显示，须再按一键才刷新」。开着对话框就低频轮询重绘。
+    ctx.request_repaint_after(std::time::Duration::from_millis(120));
 }
 
 /// rwx 九宫格复选框，直接修改 mode。
