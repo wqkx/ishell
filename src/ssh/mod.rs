@@ -34,32 +34,58 @@ impl PendingXfer {
     }
 }
 
-/// 启动一个传输任务：登记取消标志，spawn 后台任务，完成时通过 `done_tx` 通知主循环。
+/// 单个传输的取消句柄：
+/// - `flag` 供传输内部（含 download 已 detach 的分块子任务）协作式中止；
+/// - `stop` 一次性信号，触发后直接 drop 整个传输 future——能立即中止卡在
+///   SFTP `flush`/`shutdown`（pipelined 写的真正落地处）里的上传，标志位无法覆盖这里。
+struct XferCancel {
+    flag: Arc<AtomicBool>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// 启动一个传输任务：登记取消句柄，spawn 后台任务，完成时通过 `done_tx` 通知主循环。
 fn start_xfer(
     handle: &Arc<Handle<ClientHandler>>,
     sink: &UiSink,
     done_tx: &UnboundedSender<u64>,
-    cancels: &mut HashMap<u64, Arc<AtomicBool>>,
+    cancels: &mut HashMap<u64, XferCancel>,
     p: PendingXfer,
 ) {
     let cancel = Arc::new(AtomicBool::new(false));
     let id = p.id();
-    cancels.insert(id, cancel.clone());
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    cancels.insert(id, XferCancel { flag: cancel.clone(), stop: Some(stop_tx) });
     let h = handle.clone();
     let s = sink.clone();
+    let s_cancel = sink.clone();
+    let cancel_work = cancel.clone();
     let dtx = done_tx.clone();
     tokio::spawn(async move {
-        match open_sftp(&h).await {
-            Ok(sftp) => {
-                let sftp = Arc::new(sftp);
-                match p {
-                    PendingXfer::Download { id, remote, local, policy } => download(h.clone(), sftp, id, remote, local, policy, &s, cancel).await,
-                    PendingXfer::Upload { id, local, remote_dir, policy } => upload(sftp.as_ref(), id, local, remote_dir, policy, &s, cancel).await,
+        // 实际传输；被取消时整个 future 在 select 中被 drop，正在进行的 SFTP 写/flush 立即中止
+        let work = async move {
+            match open_sftp(&h).await {
+                Ok(sftp) => {
+                    let sftp = Arc::new(sftp);
+                    match p {
+                        PendingXfer::Download { id, remote, local, policy } => download(h.clone(), sftp, id, remote, local, policy, &s, cancel_work).await,
+                        PendingXfer::Upload { id, local, remote_dir, policy } => upload(sftp.as_ref(), id, local, remote_dir, policy, &s, cancel_work).await,
+                    }
                 }
+                Err(e) => s.send(WorkerEvent::TransferDone {
+                    id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
+                }),
             }
-            Err(e) => s.send(WorkerEvent::TransferDone {
-                id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
-            }),
+        };
+        tokio::select! {
+            biased; // 先看传输是否已完成，避免「刚好完成」时还报成取消
+            _ = work => {}
+            _ = &mut stop_rx => {
+                // 通知可能已 detach 的子任务（download 分块）也尽快停下
+                cancel.store(true, Ordering::Relaxed);
+                s_cancel.send(WorkerEvent::TransferDone {
+                    id, ok: false, message: crate::i18n::tr("已取消", "Canceled").into(), refresh_dir: None,
+                });
+            }
         }
         let _ = dtx.send(id);
     });
@@ -311,7 +337,7 @@ pub async fn run(
     // 传输并发控制：进行中计数 + 排队 + 取消标志；完成时由任务经 xfer_done 通知主循环
     let mut active_xfer = 0usize;
     let mut pending_xfer: VecDeque<PendingXfer> = VecDeque::new();
-    let mut xfer_cancels: HashMap<u64, Arc<AtomicBool>> = HashMap::new();
+    let mut xfer_cancels: HashMap<u64, XferCancel> = HashMap::new();
     let (xfer_done_tx, mut xfer_done_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
     // 4) 主循环：转发终端数据、处理 UI 指令
@@ -395,9 +421,13 @@ pub async fn run(
                         }
                     }
                     Some(UiCommand::CancelTransfer(id)) => {
-                        if let Some(c) = xfer_cancels.get(&id) {
-                            // 进行中：置标志，任务会尽快中止并上报「已取消」
-                            c.store(true, Ordering::Relaxed);
+                        if let Some(c) = xfer_cancels.get_mut(&id) {
+                            // 进行中：置协作标志 + 触发 stop 信号（drop 传输 future，
+                            // 立即中止卡在 flush/shutdown 的上传），任务随后上报「已取消」
+                            c.flag.store(true, Ordering::Relaxed);
+                            if let Some(stop) = c.stop.take() {
+                                let _ = stop.send(());
+                            }
                         } else if let Some(pos) = pending_xfer.iter().position(|p| p.id() == id) {
                             // 仍在排队：直接移除并上报已取消
                             pending_xfer.remove(pos);
