@@ -48,7 +48,16 @@ pub struct FilePanelState {
     pub copy_flash: Option<f64>,
     /// 面包屑单击导航的延后执行（路径, 单击时刻）——给双击编辑留判定窗口
     pub pending_nav: Option<(String, f64)>,
+    /// 拖拽悬停在「上级目录」按钮上的起始时刻（弹簧式上跳计时）
+    pub up_hover_since: Option<f64>,
+    /// 「上级目录」跳转动画的触发时刻
+    pub up_flash: Option<f64>,
 }
+
+/// 拖拽悬停「上级目录」多久后自动上跳（秒）
+const UP_DWELL: f64 = 0.6;
+/// 上跳动画时长（秒）
+const UP_FLASH: f64 = 0.4;
 
 /// 文件列表排序键。
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -292,10 +301,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     state.loading.insert(state.cwd.clone());
                     actions.push(FileAction::List(state.cwd.clone()));
                 }
-                if tool_btn(ui, icon::ARROW_UP, crate::i18n::tr("上级目录", "Up")) && !state.cwd.is_empty() {
+                let up_resp = tool_btn_resp(ui, icon::ARROW_UP, crate::i18n::tr("上级目录", "Up"), Palette::TEXT);
+                if up_resp.clicked() && !state.cwd.is_empty() {
                     state.cwd = parent_of(&state.cwd);
                     state.selected.clear();
                 }
+                handle_up_drag(ui, state, &up_resp, actions);
                 if tool_btn(ui, icon::FOLDER_PLUS, crate::i18n::tr("新建目录", "New folder")) {
                     state.dialog = Some(Dialog::NewDir { name: String::new() });
                 }
@@ -1049,6 +1060,64 @@ fn valid_move_srcs(srcs: &[String], dest: &str) -> Vec<String> {
         .collect()
 }
 
+/// 拖拽到「上级目录」按钮的交互：
+/// - 悬停 `UP_DWELL` 秒自动跳到上一层（弹簧式，可逐级上跳），带进度填充与跳转动画；
+/// - 在按钮上释放则把拖拽的文件移动到上一层目录。
+fn handle_up_drag(ui: &mut egui::Ui, state: &mut FilePanelState, up: &egui::Response, actions: &mut Vec<FileAction>) {
+    // 仅在非根目录时有意义（拖拽未进行时 dnd_* 返回 None，自然不触发）
+    if state.cwd.is_empty() || state.cwd == "/" {
+        state.up_hover_since = None;
+        state.up_flash = None;
+        return;
+    }
+    let now = ui.input(|i| i.time);
+    let parent = parent_of(&state.cwd);
+
+    if let Some(payload) = up.dnd_release_payload::<DragPaths>() {
+        // 释放到 Up：移动到上一层目录
+        let srcs = valid_move_srcs(&payload.0, &parent);
+        if !srcs.is_empty() {
+            actions.push(FileAction::Move { srcs, dest_dir: parent.clone() });
+        }
+        state.up_hover_since = None;
+    } else if up.dnd_hover_payload::<DragPaths>().is_some() {
+        // 悬停累计：画高亮 + 底部进度条；满 UP_DWELL 自动上跳
+        let since = *state.up_hover_since.get_or_insert(now);
+        let progress = (((now - since) / UP_DWELL) as f32).clamp(0.0, 1.0);
+        let rect = up.rect;
+        let p = ui.painter();
+        p.rect_filled(rect, 6.0, Palette::ACCENT_SOFT);
+        p.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, Palette::ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+        p.hline(rect.left()..=(rect.left() + rect.width() * progress), rect.bottom() - 1.5, egui::Stroke::new(2.0, Palette::ACCENT));
+        if now - since >= UP_DWELL {
+            state.cwd = parent.clone();
+            state.selected.clear();
+            state.up_hover_since = Some(now); // 继续悬停可逐级上跳
+            state.up_flash = Some(now);
+            if !state.listings.contains_key(&parent) && !state.loading.contains(&parent) {
+                state.loading.insert(parent.clone());
+                actions.push(FileAction::List(parent));
+            }
+        }
+        ui.ctx().request_repaint();
+    } else {
+        state.up_hover_since = None;
+    }
+
+    // 跳转完成动画：按钮外扩 + 渐隐的强调描边
+    if let Some(t) = state.up_flash {
+        let e = now - t;
+        if e < UP_FLASH {
+            let k = 1.0 - (e / UP_FLASH) as f32; // 1 -> 0
+            let rect = up.rect.expand(2.0 + 5.0 * k);
+            ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0 + 2.0 * k, Palette::ACCENT.gamma_multiply(k.max(0.15))), egui::StrokeKind::Outside);
+            ui.ctx().request_repaint();
+        } else {
+            state.up_flash = None;
+        }
+    }
+}
+
 /// 计算放入剪贴板的源项：右键项在多选内则取整组选中，否则只取该项。
 /// 返回 (绝对路径, 是否目录) 列表。
 fn clip_targets(state: &FilePanelState, entries: &[FileEntry], cwd: &str, idx: usize) -> Vec<(String, bool)> {
@@ -1071,23 +1140,28 @@ fn tool_btn(ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
 }
 
 fn tool_btn_color(ui: &mut egui::Ui, icon: &str, tip: &str, color: egui::Color32) -> bool {
-    let mut clicked = false;
+    tool_btn_resp(ui, icon, tip, color).clicked()
+}
+
+/// 同 `tool_btn_color`，但返回 `Response`（用于需要命中检测/拖拽目标的按钮，如「上级目录」）。
+fn tool_btn_resp(ui: &mut egui::Ui, icon: &str, tip: &str, color: egui::Color32) -> egui::Response {
+    let mut resp = None;
     ui.scope(|ui| {
         let v = ui.visuals_mut();
         v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
         v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
         v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
         v.widgets.active.bg_stroke = egui::Stroke::NONE;
-        clicked = ui
-            .add(
+        resp = Some(
+            ui.add(
                 egui::Button::new(RichText::new(icon).size(16.0).color(color))
                     .min_size(egui::vec2(30.0, 26.0))
                     .corner_radius(6.0),
             )
-            .on_hover_text(tip)
-            .clicked();
+            .on_hover_text(tip),
+        );
     });
-    clicked
+    resp.unwrap()
 }
 
 /// 主名长度（后缀前），用于重命名时默认选中主名。
