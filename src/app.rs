@@ -346,6 +346,8 @@ pub struct App {
     tab_grab_dx: f32,
     /// 标签条总宽缓存（用于撑出横向滚动内容宽度）
     tab_total_w: f32,
+    /// 请求把激活标签滚动到可视区（新建/点击/Ctrl+Tab 切换时置位）
+    scroll_to_active: bool,
     /// 会话唯一 id 计数器（标签滑动动画用）
     next_uid: u64,
     connect_form: ConnectForm,
@@ -370,6 +372,9 @@ pub struct App {
     /// 一次性请求：新开/切换后把对应独立窗口置前并聚焦
     editor_focus: bool,
     image_focus: bool,
+    /// 上次渲染时的激活编辑器/看图标签（用于侦测切换后滚到可视区）
+    editor_shown: usize,
+    image_shown: usize,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
@@ -528,6 +533,7 @@ impl App {
             dragging_tab: None,
             tab_grab_dx: 0.0,
             tab_total_w: 1.0,
+            scroll_to_active: false,
             next_uid: 0,
             connect_form: form,
             download_dir: crate::store::load_download_dir().map(std::path::PathBuf::from).unwrap_or_else(downloads_dir),
@@ -542,6 +548,8 @@ impl App {
             active_image: 0,
             editor_focus: false,
             image_focus: false,
+            editor_shown: 0,
+            image_shown: 0,
             next_editor_id: 0,
             trim_after: None,
             show_forwards: false,
@@ -819,6 +827,7 @@ impl App {
             restore_cwd: false,
         });
         self.active = Some(self.sessions.len() - 1);
+        self.scroll_to_active = true; // 新建标签后滚动到可视区
     }
 
     /// 重连指定会话：用原配置重启 worker，重置连接相关状态，保留标签/目录等。
@@ -891,6 +900,7 @@ impl App {
         let cur = self.active.unwrap_or(0) as i32;
         let next = (cur + delta).rem_euclid(n as i32) as usize;
         self.active = Some(next);
+        self.scroll_to_active = true; // 切换后滚动到可视区
         if let Some(s) = self.sessions.get_mut(next) {
             s.terminal.request_focus();
         }
@@ -1991,6 +2001,7 @@ impl App {
                             let active = self.active;
                             let grab_dx = self.tab_grab_dx;
                             let total_w_cache = self.tab_total_w;
+                            let want_scroll = self.scroll_to_active; // 本帧是否需把激活标签滚到可视区
                             let out = egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
                                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -2012,6 +2023,11 @@ impl App {
                                         let title_w = ctx.fonts_mut(|f| f.layout_no_wrap(s.title.clone(), body_font.clone(), Palette::TEXT).rect.width());
                                         let w = 58.0 + title_w;
                                         let target = acc;
+                                        // 激活标签若被请求滚动到可视区：按其「目标槽」位置请求滚动（带边距余量）
+                                        if selected && want_scroll {
+                                            let r = egui::Rect::from_min_size(egui::pos2(origin.x + target, origin.y), egui::vec2(w, tab_h));
+                                            ui.scroll_to_rect(r.expand2(egui::vec2(12.0, 0.0)), None);
+                                        }
                                         let id = egui::Id::new(("tabx", s.uid));
                                         let dragging_this = drag_down && dragging_tab == Some(i);
                                         if dragging_this {
@@ -2064,6 +2080,7 @@ impl App {
                                 });
                             let total_w = out.inner.max(1.0);
                             self.tab_total_w = total_w;
+                            self.scroll_to_active = false; // 滚动请求一次性消费
                             // 溢出渐隐：提示左右还有被隐藏的标签
                             let off = out.state.offset.x;
                             let vw = out.inner_rect.width();
@@ -2121,6 +2138,10 @@ impl App {
                     }
                     if let Some(i) = to_activate {
                         self.active = Some(i);
+                        self.scroll_to_active = true; // 点击的标签若被遮挡则滚到可视区
+                        if let Some(s) = self.sessions.get_mut(i) {
+                            s.terminal.request_focus(); // 点击标签后焦点切到终端
+                        }
                     }
                     if let Some(i) = to_close {
                         self.close_session(i);
@@ -2180,29 +2201,44 @@ impl App {
             egui::Panel::top("editor_tabs")
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for (i, t) in self.editors.iter().enumerate() {
-                            let selected = i == self.active_editor;
-                            let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
-                            egui::Frame::new()
-                                .fill(fill)
-                                .corner_radius(6)
-                                .inner_margin(egui::Margin::symmetric(8, 3))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let dirty = if t.editor.dirty() { " ●" } else { "" };
-                                        let label = format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty);
-                                        let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                        if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click())).clicked() {
-                                            activate = Some(i);
+                    // 与 shell 标签一致：横向滚动（溢出可滚）+ 激活标签珊瑚下划线 + 切换后滚到可视区
+                    let want_scroll = self.active_editor != self.editor_shown;
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (i, t) in self.editors.iter().enumerate() {
+                                    let selected = i == self.active_editor;
+                                    let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
+                                    let r = egui::Frame::new()
+                                        .fill(fill)
+                                        .corner_radius(6)
+                                        .inner_margin(egui::Margin::symmetric(8, 3))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                let dirty = if t.editor.dirty() { " ●" } else { "" };
+                                                let label = format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty);
+                                                let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
+                                                if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click())).clicked() {
+                                                    activate = Some(i);
+                                                }
+                                                if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                                                    close_tab = Some(i);
+                                                }
+                                            });
+                                        });
+                                    if selected {
+                                        let rect = r.response.rect;
+                                        ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
+                                        if want_scroll {
+                                            ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
                                         }
-                                        if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
-                                            close_tab = Some(i);
-                                        }
-                                    });
-                                });
-                        }
-                    });
+                                    }
+                                }
+                            });
+                        });
+                    self.editor_shown = self.active_editor;
                 });
 
             // 当前标签内容
@@ -2347,29 +2383,44 @@ impl App {
             egui::Panel::top("image_tabs")
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for (i, t) in self.image_tabs.iter().enumerate() {
-                            let selected = i == self.active_image;
-                            let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
-                            egui::Frame::new()
-                                .fill(fill)
-                                .corner_radius(6)
-                                .inner_margin(egui::Margin::symmetric(8, 3))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
-                                        let label = format!("{} {}·{}", icon::IMAGE, t.server, fname);
-                                        let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                        if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click())).clicked() {
-                                            activate = Some(i);
+                    // 与 shell 标签一致：横向滚动 + 激活珊瑚下划线 + 切换后滚到可视区
+                    let want_scroll = self.active_image != self.image_shown;
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (i, t) in self.image_tabs.iter().enumerate() {
+                                    let selected = i == self.active_image;
+                                    let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
+                                    let r = egui::Frame::new()
+                                        .fill(fill)
+                                        .corner_radius(6)
+                                        .inner_margin(egui::Margin::symmetric(8, 3))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
+                                                let label = format!("{} {}·{}", icon::IMAGE, t.server, fname);
+                                                let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
+                                                if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click())).clicked() {
+                                                    activate = Some(i);
+                                                }
+                                                if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                                                    close_tab = Some(i);
+                                                }
+                                            });
+                                        });
+                                    if selected {
+                                        let rect = r.response.rect;
+                                        ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
+                                        if want_scroll {
+                                            ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
                                         }
-                                        if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
-                                            close_tab = Some(i);
-                                        }
-                                    });
-                                });
-                        }
-                    });
+                                    }
+                                }
+                            });
+                        });
+                    self.image_shown = self.active_image;
                 });
 
             egui::CentralPanel::default()
