@@ -1406,11 +1406,10 @@ impl eframe::App for App {
             return;
         }
 
-        // 输入法修复：有文本框获得键盘输入（或任意控件聚焦）时持续请求重绘。否则中文输入法
-        // 按 Shift 切英文等「提交」事件不一定触发重绘，出现「输入了但没显示、须再按一键才刷新」。
-        if ui.ctx().egui_wants_keyboard_input() || ui.ctx().memory(|m| m.focused().is_some()) {
-            ui.ctx().request_repaint();
-        }
+        // 注：曾在此「聚焦文本框时每帧持续重绘」以试图修复 X11/fcitx 的输入法提交延迟，
+        // 但该延迟实为 winit X11/XIM 的事件投递限制（提交事件晚到一拍），重绘并不能解决；
+        // 反而导致开了编辑器/多窗口后两窗口 60fps 永动重绘 → macOS Stage Manager 缩略图不停闪。
+        // 故移除：egui 本就在收到按键/IME 事件时反应式重绘，正常输入不受影响。
 
         // 全局界面缩放（左侧栏可调）：仅在变化时设置，避免每帧触发重排
         if (ui.ctx().zoom_factor() - ui_zoom()).abs() > f32::EPSILON {
@@ -2440,10 +2439,8 @@ impl App {
             .with_min_inner_size([480.0, 320.0]);
 
         ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
-            // 输入法修复：编辑器内有文本框获得输入时持续重绘（同主窗口）
-            if vctx.egui_wants_keyboard_input() || vctx.memory(|m| m.focused().is_some()) {
-                vctx.request_repaint();
-            }
+            // （已移除「聚焦时每帧重绘」的输入法 workaround：它修不了 X11/XIM 的提交延迟，
+            //  却让编辑器窗口永动重绘，触发 macOS Stage Manager 闪烁。详见主 update() 注释。）
             // 新开/切换文件后把本窗口置前并聚焦
             if self.editor_focus {
                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);

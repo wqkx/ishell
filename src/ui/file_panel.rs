@@ -1648,9 +1648,9 @@ fn modal(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
             ui.set_width(300.0);
             add(ui);
         });
-    // 对话框含输入框时，输入法把拼音切成英文（Shift）等状态变化不一定产生 egui 事件，
-    // 不主动重绘会出现「输入了但没显示，须再按一键才刷新」。开着对话框就低频轮询重绘。
-    ctx.request_repaint_after(std::time::Duration::from_millis(120));
+    // 注：原此处有「开着对话框就低频轮询重绘」的输入法 workaround，已移除——
+    // 它同样修不了 X11/XIM 的提交延迟，却让对话框打开期间持续重绘。egui 会在
+    // 收到按键/IME 事件时反应式重绘，对话框输入正常。
 }
 
 /// rwx 九宫格复选框，直接修改 mode。
