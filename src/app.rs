@@ -1027,29 +1027,80 @@ impl App {
             FileAction::Download(remote) => {
                 let name = remote.rsplit('/').next().unwrap_or("download").to_string();
                 let local = self.download_dir.join(&name).to_string_lossy().into_owned();
-                let id = s.next_xfer;
-                s.next_xfer += 1;
-                s.transfers.push(Transfer {
-                    id, name, dir: crate::proto::TransferDir::Download,
-                    spec: Some(XferSpec::Download { remote: remote.clone(), local: local.clone() }), paused: false,
-                    done: 0, total: 0, ok: None,
-                    local: Some(local.clone()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
-                });
-                let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy });
+                // 去重：同一远端文件 → 同一本地路径 的任务已存在时复用它，避免重复任务，
+                // 也顺带恢复此前失败/中断的同一传输（复用 id：worker 据本地已有分段续传，
+                // 并通过覆盖取消句柄停掉可能仍在后台运行的旧任务）。
+                let existing = s.transfers.iter().find(|t| {
+                    t.ok != Some(true) // 已成功完成的不复用（本地可能已变，避免按旧偏移续传出错）
+                        && matches!(&t.spec, Some(XferSpec::Download { remote: r, local: l }) if *r == remote && *l == local)
+                }).map(|t| (t.id, t.ok, t.paused));
+                match existing {
+                    Some((_, None, false)) => {
+                        s.status = match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("{name} 正在下载中"),
+                            crate::i18n::Lang::En => format!("{name} is already downloading"),
+                        };
+                    }
+                    Some((id, _, _)) => {
+                        let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy });
+                        if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+                            t.ok = None; t.paused = false; t.show_err = false;
+                            t.speed = 0.0; t.last_done = 0; t.last_t = None;
+                            t.message = crate::i18n::tr("重新下载 …", "Re-downloading …").into();
+                        }
+                    }
+                    None => {
+                        let id = s.next_xfer;
+                        s.next_xfer += 1;
+                        s.transfers.push(Transfer {
+                            id, name, dir: crate::proto::TransferDir::Download,
+                            spec: Some(XferSpec::Download { remote: remote.clone(), local: local.clone() }), paused: false,
+                            done: 0, total: 0, ok: None,
+                            local: Some(local.clone()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
+                        });
+                        let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy });
+                    }
+                }
                 self.show_transfers = true;
                 self.xfer_just_opened = true;
             }
             FileAction::Upload { local, remote_dir } => {
                 let name = local.rsplit('/').next().unwrap_or("upload").to_string();
-                let id = s.next_xfer;
-                s.next_xfer += 1;
-                s.transfers.push(Transfer {
-                    id, name, dir: crate::proto::TransferDir::Upload,
-                    spec: Some(XferSpec::Upload { local: local.clone(), remote_dir: remote_dir.clone() }), paused: false,
-                    done: 0, total: 0, ok: None,
-                    local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
-                });
-                let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy });
+                // 去重：同一本地文件 → 同一远端目录 的任务已存在时复用它（理由同 Download）。
+                // 这是「上传中途失败/中断后再次上传出现两个任务、旧任务又续传」的根因修复。
+                let existing = s.transfers.iter().find(|t| {
+                    t.ok != Some(true) // 已成功完成的不复用（本地可能已变，避免按旧偏移续传出错）
+                        && matches!(&t.spec, Some(XferSpec::Upload { local: l, remote_dir: r }) if *l == local && *r == remote_dir)
+                }).map(|t| (t.id, t.ok, t.paused));
+                match existing {
+                    Some((_, None, false)) => {
+                        // 已在进行中：忽略重复请求，仅提示并打开传输窗
+                        s.status = match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("{name} 正在上传中"),
+                            crate::i18n::Lang::En => format!("{name} is already uploading"),
+                        };
+                    }
+                    Some((id, _, _)) => {
+                        // 失败/中断/已完成：复用该任务重新上传（同 id，自动续传/覆盖）
+                        let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy });
+                        if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+                            t.ok = None; t.paused = false; t.show_err = false;
+                            t.speed = 0.0; t.last_done = 0; t.last_t = None;
+                            t.message = crate::i18n::tr("重新上传 …", "Re-uploading …").into();
+                        }
+                    }
+                    None => {
+                        let id = s.next_xfer;
+                        s.next_xfer += 1;
+                        s.transfers.push(Transfer {
+                            id, name, dir: crate::proto::TransferDir::Upload,
+                            spec: Some(XferSpec::Upload { local: local.clone(), remote_dir: remote_dir.clone() }), paused: false,
+                            done: 0, total: 0, ok: None,
+                            local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
+                        });
+                        let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy });
+                    }
+                }
                 self.show_transfers = true;
                 self.xfer_just_opened = true;
             }
