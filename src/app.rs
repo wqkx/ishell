@@ -1089,6 +1089,9 @@ impl App {
                     crate::i18n::Lang::En => format!("Moving {n} item(s) …"),
                 };
             }
+            FileAction::Status(msg) => {
+                s.status = msg;
+            }
             FileAction::CdTerminal(path) => {
                 // 以 POSIX 单引号转义路径后在终端 cd，并聚焦终端
                 let quoted = format!("'{}'", path.replace('\'', "'\\''"));

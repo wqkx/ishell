@@ -53,6 +53,33 @@ pub struct FilePanelState {
     pub spring_since: Option<(String, f64)>,
     /// 弹簧式跳转动画的触发时刻（在指针处播放两次脉冲环）
     pub spring_flash: Option<f64>,
+    /// 拖到「文件树」节点上的悬停计时 (节点路径, 悬停起点)：停留够久则展开/折叠该节点。
+    /// 完成一次切换后存 +∞ 作为哨兵，避免在同一节点上反复翻转（移开再回来才会再次触发）。
+    pub tree_spring_since: Option<(String, f64)>,
+    /// 移动操作撤销栈（Ctrl+Z 逐步回退最近的拖拽移动）。
+    pub move_undo: Vec<MoveRecord>,
+}
+
+/// 一次「移动」的撤销记录：被移动项的原始绝对路径 + 落入的目标目录。
+/// 撤销时把 `dest_dir/<basename>` 移回各自原父目录。
+pub struct MoveRecord {
+    /// 移动前各项的绝对路径（同一次拖拽必同源，故共享父目录）
+    pub original: Vec<String>,
+    /// 移动落入的目标目录
+    pub dest_dir: String,
+}
+
+impl FilePanelState {
+    /// 记录一次移动以供撤销；限制栈深度避免无限增长。
+    fn record_move(&mut self, original: Vec<String>, dest_dir: String) {
+        if original.is_empty() {
+            return;
+        }
+        self.move_undo.push(MoveRecord { original, dest_dir });
+        if self.move_undo.len() > 50 {
+            self.move_undo.remove(0);
+        }
+    }
 }
 
 /// 拖拽悬停多久后自动进入目标目录（秒）
@@ -113,6 +140,8 @@ pub enum FileAction {
     OpenImage { path: String },
     /// 在终端 cd 到该目录并聚焦终端
     CdTerminal(String),
+    /// 直接设置状态栏文案（用于撤销等即时提示）
+    Status(String),
 }
 
 /// 是否为可用看图工具打开的常见图片扩展名。
@@ -193,10 +222,31 @@ fn tree(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<FileAct
     ui.spacing_mut().item_spacing.y *= 1.01;
     let mut toggles: Vec<String> = Vec::new();
     let mut select: Option<String> = None;
+    let mut drop: Option<(Vec<String>, String)> = None; // 拖入某树节点 -> (srcs, dest_dir)
+    let mut spring: Option<String> = None; // 拖拽悬停中的树节点（停留展开/折叠）
 
     // 根节点
     let root = state.root.clone();
-    draw_node(ui, state, &root, &root, 0, &mut toggles, &mut select);
+    draw_node(ui, state, &root, &root, 0, &mut toggles, &mut select, &mut drop, &mut spring);
+
+    // 弹簧式展开/折叠：在某树节点上持续悬停 UP_DWELL 秒则切换其展开态，并在指针处双闪；
+    // 切换后把计时设为 +∞ 哨兵，避免同一节点反复翻转（移开再回来方可再次触发）。
+    let now = ui.input(|i| i.time);
+    if let Some(tp) = spring.clone() {
+        let armed = matches!(&state.tree_spring_since, Some((k, _)) if *k == tp);
+        if !armed {
+            state.tree_spring_since = Some((tp.clone(), now));
+        }
+        let since = state.tree_spring_since.as_ref().map(|(_, t)| *t).unwrap_or(now);
+        if since.is_finite() && now - since >= UP_DWELL {
+            toggles.push(tp.clone());
+            state.tree_spring_since = Some((tp.clone(), f64::INFINITY));
+            state.spring_flash = Some(now); // 复用文件区的双闪动画（由 spring_navigate 在指针处绘制）
+        }
+        ui.ctx().request_repaint();
+    } else {
+        state.tree_spring_since = None;
+    }
 
     // 应用展开/折叠
     for p in toggles {
@@ -214,6 +264,21 @@ fn tree(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<FileAct
     if let Some(p) = select {
         state.cwd = p;
         state.selected.clear();
+    }
+    // 应用拖入树节点的移动：乐观地从当前目录移除被移动项（避免整目录刷新跳动），
+    // 记录撤销，再发起远端 mv（目标目录由 worker 的 OpDone 刷新）。
+    if let Some((srcs, dest_dir)) = drop {
+        if dest_dir != state.cwd {
+            let cwd = state.cwd.clone();
+            if let Some(list) = state.listings.get_mut(&cwd) {
+                let moved: HashSet<String> = srcs.iter().cloned().collect();
+                list.retain(|e| !moved.contains(&join_path(&cwd, &e.name)));
+            }
+        }
+        state.record_move(srcs.clone(), dest_dir.clone());
+        actions.push(FileAction::Move { srcs, dest_dir });
+        state.selected.clear();
+        state.anchor = None;
     }
 }
 
@@ -243,6 +308,7 @@ fn ancestors(path: &str) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_node(
     ui: &mut egui::Ui,
     state: &FilePanelState,
@@ -251,6 +317,8 @@ fn draw_node(
     depth: usize,
     toggles: &mut Vec<String>,
     select: &mut Option<String>,
+    drop: &mut Option<(Vec<String>, String)>,
+    spring: &mut Option<String>,
 ) {
     let expanded = state.expanded.contains(path);
     let is_cwd = state.cwd == path;
@@ -258,14 +326,30 @@ fn draw_node(
     let tri = if expanded { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
     let folder = if expanded { egui_phosphor::regular::FOLDER_OPEN } else { egui_phosphor::regular::FOLDER };
     let color = if is_cwd { Palette::ACCENT } else { Palette::TEXT };
-    // 整行可点：占满可用宽度的一块可点击区域；单击展开/折叠，双击在右侧列表打开
+    // 整行可点：占满可用宽度的一块可点击区域；单击展开/折叠，双击在右侧列表打开。
+    // 行高在文本高度基础上 +10%（更松快的疏密度，便于拖拽落点）。
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 1.0;
+    let row_h = (ui.text_style_height(&egui::TextStyle::Body) + 1.0) * 1.1;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
+    // 拖拽目标：把文件列表里的项拖到树中的文件夹上。悬停高亮 + 登记弹簧目标（停留展开/折叠），
+    // 在该节点上松手即移入该目录。
+    let dragging_in = resp.dnd_hover_payload::<DragPaths>().is_some();
     if is_cwd {
+        ui.painter().rect_filled(rect, 4.0, Palette::ACCENT_SOFT);
+    } else if dragging_in {
         ui.painter().rect_filled(rect, 4.0, Palette::ACCENT_SOFT);
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, egui::Color32::from_black_alpha(8));
+    }
+    if dragging_in {
+        ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.5, Palette::ACCENT), egui::StrokeKind::Inside);
+        *spring = Some(path.to_string());
+    }
+    if let Some(payload) = resp.dnd_release_payload::<DragPaths>() {
+        let srcs = valid_move_srcs(&payload.0, path);
+        if !srcs.is_empty() {
+            *drop = Some((srcs, path.to_string()));
+        }
     }
     ui.painter().text(
         egui::pos2(rect.left() + depth as f32 * 12.0 + 4.0, rect.center().y),
@@ -285,7 +369,7 @@ fn draw_node(
         if let Some(entries) = state.listings.get(path) {
             for e in entries.iter().filter(|e| e.is_dir) {
                 let child = join_path(path, &e.name);
-                draw_node(ui, state, &child, &e.name, depth + 1, toggles, select);
+                draw_node(ui, state, &child, &e.name, depth + 1, toggles, select, drop, spring);
             }
         } else if state.loading.contains(path) {
             ui.horizontal(|ui| {
@@ -304,6 +388,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let mut paste_here = false; // 工具栏/菜单粘贴触发（has_clip 由 App 传入）
     // 弹簧式拖拽导航：本帧拖拽悬停的目标目录（Up 按钮的上一层 / 某文件夹），统一计时跳转
     let mut spring_target: Option<String> = None;
+    // 拖到「上级目录」按钮上释放的移动（与文件夹落点统一在表格后处理，便于记录撤销）
+    let mut up_move: Option<(Vec<String>, String)> = None;
     egui::Frame::new()
         .fill(Palette::PANEL_2)
         .corner_radius(6)
@@ -320,7 +406,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     state.cwd = parent_of(&state.cwd);
                     state.selected.clear();
                 }
-                handle_up_drag(ui, state, &up_resp, actions, &mut spring_target);
+                handle_up_drag(ui, state, &up_resp, &mut up_move, &mut spring_target);
                 if tool_btn(ui, icon::FOLDER_PLUS, crate::i18n::tr("新建目录", "New folder")) {
                     state.dialog = Some(Dialog::NewDir { name: String::new() });
                 }
@@ -985,8 +1071,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
             }
         }
     }
+    // 「上级目录」按钮上的释放（几何上独立，已在工具栏阶段取走载荷）兜底并入
+    if drop_move.is_none() {
+        drop_move = up_move.take();
+    }
 
-    // 拖拽移动：释放到某文件夹后发起远端 mv。
+    // 拖拽移动：释放到某文件夹后发起远端 mv，并记录撤销。
     if let Some((srcs, dest_dir)) = drop_move {
         // 移入「非当前目录」的文件夹：乐观地从当前列表移除被移动项，呈现「移走」效果，
         // 且不整目录刷新（刷新会跳一下）；目标目录由 worker 的 OpDone 后台刷新（不可见，无跳动）。
@@ -996,9 +1086,56 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                 list.retain(|e| !moved.contains(&join_path(&cwd, &e.name)));
             }
         }
+        state.record_move(srcs.clone(), dest_dir.clone());
         actions.push(FileAction::Move { srcs, dest_dir });
         state.selected.clear();
         state.anchor = None;
+    }
+
+    // Ctrl+Z 撤销最近一次拖拽移动：把目标目录里的项移回原父目录，并在状态栏提示撤销了什么。
+    // 仅在无文本框聚焦 / 无对话框 / 非重命名时触发，避免抢占输入框自身的撤销。
+    let undo_key = ui.input(|i| {
+        i.key_pressed(egui::Key::Z) && (i.modifiers.command || i.modifiers.ctrl) && !i.modifiers.shift
+    });
+    if undo_key
+        && state.renaming.is_none()
+        && state.path_edit.is_none()
+        && state.dialog.is_none()
+        && ui.ctx().memory(|m| m.focused().is_none())
+    {
+        if let Some(rec) = state.move_undo.pop() {
+            let orig_parent = parent_of(&rec.original[0]);
+            let new_srcs: Vec<String> = rec.original.iter().map(|o| join_path(&rec.dest_dir, basename(o))).collect();
+            // 若当前正看着目标目录，乐观移除将被移走的项（与正向移动一致，避免跳动）
+            if state.cwd == rec.dest_dir {
+                let cwd2 = state.cwd.clone();
+                if let Some(list) = state.listings.get_mut(&cwd2) {
+                    let moved: std::collections::HashSet<String> = new_srcs.iter().cloned().collect();
+                    list.retain(|e| !moved.contains(&join_path(&cwd2, &e.name)));
+                }
+            }
+            // 提示撤销了哪个动作：单项显示名称，多项显示数量；并标注移回的目录
+            let what = if rec.original.len() == 1 {
+                basename(&rec.original[0]).to_string()
+            } else {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("{} 项", rec.original.len()),
+                    crate::i18n::Lang::En => format!("{} items", rec.original.len()),
+                }
+            };
+            let msg = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("已撤销移动：{what} → 移回 {orig_parent}"),
+                crate::i18n::Lang::En => format!("Undo move: {what} → back to {orig_parent}"),
+            };
+            // 先发起反向 mv，再设状态栏文案——确保撤销提示覆盖 Move 自身的「移动中」提示
+            actions.push(FileAction::Move { srcs: new_srcs, dest_dir: orig_parent });
+            actions.push(FileAction::Status(msg));
+            state.selected.clear();
+            state.anchor = None;
+        } else {
+            // 撤销栈为空：明确告知用户没有可撤销的移动
+            actions.push(FileAction::Status(crate::i18n::tr("没有可撤销的移动", "Nothing to undo").into()));
+        }
     }
 
     // 弹簧式拖拽导航：在 Up / 文件夹上持续悬停则进入目标目录，并在指针处双闪
@@ -1109,7 +1246,7 @@ fn valid_move_srcs(srcs: &[String], dest: &str) -> Vec<String> {
 
 /// 拖拽到「上级目录」按钮：悬停时高亮并把上一层目录登记为弹簧目标（计时与跳转由
 /// `spring_navigate` 统一处理）；在按钮上释放则把文件移动到上一层目录。
-fn handle_up_drag(ui: &mut egui::Ui, state: &FilePanelState, up: &egui::Response, actions: &mut Vec<FileAction>, spring_target: &mut Option<String>) {
+fn handle_up_drag(ui: &mut egui::Ui, state: &FilePanelState, up: &egui::Response, up_move: &mut Option<(Vec<String>, String)>, spring_target: &mut Option<String>) {
     if state.cwd.is_empty() || state.cwd == "/" {
         return;
     }
@@ -1117,7 +1254,8 @@ fn handle_up_drag(ui: &mut egui::Ui, state: &FilePanelState, up: &egui::Response
     if let Some(payload) = up.dnd_release_payload::<DragPaths>() {
         let srcs = valid_move_srcs(&payload.0, &parent);
         if !srcs.is_empty() {
-            actions.push(FileAction::Move { srcs, dest_dir: parent.clone() });
+            // 统一交由 file_list 的落点处理（乐观移除 + 记录撤销 + 发起 mv）
+            *up_move = Some((srcs, parent.clone()));
         }
     } else if up.dnd_hover_payload::<DragPaths>().is_some() {
         // 悬停高亮（无进度条；是否跳转由停留时长决定）
@@ -1499,6 +1637,11 @@ fn chmod_grid(ui: &mut egui::Ui, mode: &mut u32) {
         });
 }
 
+/// 取路径最后一段（文件/目录名）。
+fn basename(p: &str) -> &str {
+    p.trim_end_matches('/').rsplit('/').next().unwrap_or(p)
+}
+
 fn parent_of(path: &str) -> String {
     if path.is_empty() || path == "/" {
         return "/".into();
@@ -1544,16 +1687,79 @@ fn perm_string(perm: u32, is_dir: bool, is_link: bool) -> String {
     )
 }
 
-/// 简单的 unix 时间格式化（UTC，无外部依赖）。
+/// 简单的 unix 时间格式化：按本地时区偏移换算后展示（SFTP 的 mtime 为 UTC 纪元秒）。
 fn fmt_mtime(secs: u64) -> String {
     if secs == 0 {
         return "-".into();
     }
-    let days = secs / 86400;
-    let rem = secs % 86400;
+    // 加上本地 UTC 偏移（东区为正）得到本地墙钟秒；偏移取负仍越界则视为无效
+    let local = secs as i64 + local_offset_seconds();
+    if local < 0 {
+        return "-".into();
+    }
+    let local = local as u64;
+    let days = local / 86400;
+    let rem = local % 86400;
     let (h, m) = (rem / 3600, (rem % 3600) / 60);
     let (y, mo, d) = civil_from_days(days as i64);
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+}
+
+/// 本地时区相对 UTC 的偏移（秒，东区为正）。首次查询后缓存，避免逐行重复系统调用。
+/// DST 仅按「当前」状态取一次，跨夏令时边界的历史文件可能差 1 小时，于文件列表足够。
+fn local_offset_seconds() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(query_local_offset_seconds)
+}
+
+#[cfg(unix)]
+fn query_local_offset_seconds() -> i64 {
+    // libc::localtime_r 填充的 tm_gmtoff 即「本地相对 UTC 的秒数偏移」
+    unsafe {
+        let t: libc::time_t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+#[cfg(windows)]
+fn query_local_offset_seconds() -> i64 {
+    // 直接声明 Win32 FFI，免引入额外 crate。TIME_ZONE_INFORMATION 布局固定且稳定。
+    #[repr(C)]
+    struct WinSystemTime {
+        w_year: u16, w_month: u16, w_day_of_week: u16, w_day: u16,
+        w_hour: u16, w_minute: u16, w_second: u16, w_milliseconds: u16,
+    }
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: WinSystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: WinSystemTime,
+        daylight_bias: i32,
+    }
+    extern "system" {
+        fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
+    }
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    unsafe {
+        let mut tzi: TimeZoneInformation = std::mem::zeroed();
+        let r = GetTimeZoneInformation(&mut tzi);
+        // UTC = local + bias(分钟)；夏令时生效时再叠加 daylight_bias，否则用 standard_bias
+        let extra = if r == TIME_ZONE_ID_DAYLIGHT { tzi.daylight_bias } else { tzi.standard_bias };
+        -((tzi.bias + extra) as i64) * 60
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn query_local_offset_seconds() -> i64 {
+    0
 }
 
 /// 自 1970-01-01 起的天数 -> (年,月,日)。算法源自 Howard Hinnant。

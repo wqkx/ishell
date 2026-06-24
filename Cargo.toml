@@ -54,9 +54,12 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 
-# Linux：xdg-portal 纯 Rust 文件选择器（免 GTK）；libc 用于 malloc_trim 归还内存
-[target.'cfg(target_os = "linux")'.dependencies]
+# Unix（Linux/macOS）：libc 用于 malloc_trim 归还内存、localtime_r 取本地时区偏移
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux：xdg-portal 纯 Rust 文件选择器（免 GTK）
+[target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
 
 # 非 Linux（macOS / Windows）：使用 rfd 原生后端

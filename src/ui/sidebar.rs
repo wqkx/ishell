@@ -46,6 +46,9 @@ pub fn show(
     use egui_phosphor::regular as icon;
     egui::ScrollArea::vertical()
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        // 仅用滚轮滚动：禁用「拖拽滚动」，否则内容溢出（窗口缩小）时滚动区会抢走
+        // 背景层的右键按下事件，导致右键菜单时灵时不灵。
+        .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
         .show(ui, |ui| {
         // 适度行距（与快速连接列表一致的舒展感）
         ui.spacing_mut().item_spacing.y = 3.5;
