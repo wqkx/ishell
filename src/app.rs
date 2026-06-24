@@ -2467,7 +2467,10 @@ impl App {
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size([900.0, 640.0])
-            .with_min_inner_size([480.0, 320.0]);
+            .with_min_inner_size([480.0, 320.0])
+            // macOS：最大化/全屏(绿钮)与 eframe 多 viewport 交互时会造出一个错误缩放、关不掉的
+            // 幽灵窗口（仅最大化后出现，无任何警告）。禁用最大化按钮从源头规避；仍可拖边缘调整大小。
+            .with_maximize_button(false);
         let vid = egui::ViewportId::from_hash_of("ishell_editor");
         let state = self.editor_state.clone();
 
@@ -2651,7 +2654,9 @@ impl App {
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size([760.0, 580.0])
-            .with_min_inner_size([320.0, 240.0]);
+            .with_min_inner_size([320.0, 240.0])
+            // 同编辑器窗口：禁用最大化按钮，规避 macOS 最大化触发的幽灵窗口
+            .with_maximize_button(false);
 
         ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
             // 新开/切换图片后把本窗口置前并聚焦
