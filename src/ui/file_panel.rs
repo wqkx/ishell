@@ -189,6 +189,8 @@ fn tree(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<FileAct
     if state.root.is_empty() {
         return;
     }
+    // 行间距收紧 20%（树是紧凑信息，行距小一点更利于浏览）
+    ui.spacing_mut().item_spacing.y *= 0.8;
     let mut toggles: Vec<String> = Vec::new();
     let mut select: Option<String> = None;
 
@@ -252,23 +254,32 @@ fn draw_node(
 ) {
     let expanded = state.expanded.contains(path);
     let is_cwd = state.cwd == path;
-    ui.horizontal(|ui| {
-        ui.add_space(depth as f32 * 12.0);
-        // 用 phosphor 图标，避免 ▸/▾ 在字体缺字形时显示成方块
-        let tri = if expanded { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
-        let folder = if expanded { egui_phosphor::regular::FOLDER_OPEN } else { egui_phosphor::regular::FOLDER };
-        let color = if is_cwd { Palette::ACCENT } else { Palette::TEXT };
-        // 整个节点一个可点击响应：单击展开/折叠，双击在右侧列表打开
-        let resp = ui.add(
-            egui::Label::new(RichText::new(format!("{tri} {folder} {label}")).color(color)).sense(Sense::click()),
-        );
-        if resp.clicked() {
-            toggles.push(path.to_string());
-        }
-        if resp.double_clicked() {
-            *select = Some(path.to_string());
-        }
-    });
+    // 用 phosphor 图标，避免 ▸/▾ 在字体缺字形时显示成方块
+    let tri = if expanded { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT };
+    let folder = if expanded { egui_phosphor::regular::FOLDER_OPEN } else { egui_phosphor::regular::FOLDER };
+    let color = if is_cwd { Palette::ACCENT } else { Palette::TEXT };
+    // 整行可点：占满可用宽度的一块可点击区域；单击展开/折叠，双击在右侧列表打开
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 1.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
+    if is_cwd {
+        ui.painter().rect_filled(rect, 4.0, Palette::ACCENT_SOFT);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_black_alpha(8));
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + depth as f32 * 12.0 + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{tri} {folder} {label}"),
+        font,
+        color,
+    );
+    if resp.clicked() {
+        toggles.push(path.to_string());
+    }
+    if resp.double_clicked() {
+        *select = Some(path.to_string());
+    }
 
     if expanded {
         if let Some(entries) = state.listings.get(path) {
@@ -543,13 +554,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
 
     // 空白区域右键 -> 新建文件/目录（仅覆盖列表区域，避免遮挡上方路径栏）
     let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("filelist_bg"), Sense::click());
-    // 在列表空白处释放拖拽 -> 移入当前目录（同一目录内会被 valid_move_srcs 过滤为无操作）
-    if let Some(payload) = bg.dnd_release_payload::<DragPaths>() {
-        let srcs = valid_move_srcs(&payload.0, &cwd);
-        if !srcs.is_empty() {
-            drop_move = Some((srcs, cwd.clone()));
-        }
-    }
+    // 注意：bg 几何上覆盖整个列表，dnd_release_payload 用 contains_pointer 判定并「取走」载荷，
+    // 若在此处先检查会把本应落到文件夹行的拖放抢走。故放到表格之后、仅当无行接收时再兜底。
     let mut bg_new_dir = false;
     let mut bg_new_file = false;
     let mut bg_upload = false;
@@ -966,6 +972,17 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
             .collect();
         if !items.is_empty() {
             state.dialog = Some(Dialog::ConfirmDelete { items });
+        }
+    }
+
+    // 兜底：拖放释放在列表空白处（无任何行接收）-> 移入当前目录。
+    // 必须在表格渲染之后再取载荷，否则 bg 会抢在文件夹行之前把载荷取走。
+    if drop_move.is_none() {
+        if let Some(payload) = bg.dnd_release_payload::<DragPaths>() {
+            let srcs = valid_move_srcs(&payload.0, &cwd);
+            if !srcs.is_empty() {
+                drop_move = Some((srcs, cwd.clone()));
+            }
         }
     }
 
