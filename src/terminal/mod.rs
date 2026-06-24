@@ -787,6 +787,12 @@ impl Terminal {
         if do_copy || do_paste {
             resp.request_focus();
         }
+        // 有键盘输入/粘贴时回到底部：用户上滚看历史后，一旦打字就应跳回最新（与常见终端一致）。
+        // 仅对键盘/粘贴产生的字节生效；鼠标上报(mouse_out)不触发。
+        if !out.is_empty() && self.scrollback != 0 {
+            self.scrollback = 0;
+            self.parser.screen_mut().set_scrollback(0);
+        }
         // 鼠标上报字节（若有）
         out.extend_from_slice(&mouse_out);
         out
