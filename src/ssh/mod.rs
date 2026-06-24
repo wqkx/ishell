@@ -551,7 +551,10 @@ pub async fn run(
                                 joined.push_str(&sh_quote(p));
                                 joined.push(' ');
                             }
-                            let dest = sh_quote(&dest_dir);
+                            // 目标强制以 "/" 结尾，令 mv/cp 必须把源「移入目录」：
+                            // 若目标不是已存在目录则报错而非把单个文件重命名成目标名，
+                            // 杜绝「拖到目录树后文件被改名、两个目录都找不到」的数据丢失。
+                            let dest = format!("{}/", sh_quote(&dest_dir));
                             // `--` 终止选项解析，避免以 - 开头的文件名被当作开关
                             let cmd = if do_move {
                                 format!("mv -f -- {joined}{dest}")
@@ -559,6 +562,8 @@ pub async fn run(
                                 format!("cp -a -- {joined}{dest}")
                             };
                             let n = srcs.len();
+                            // 失败时需刷新「源目录」，让前端乐观移除的项重新显示（文件其实还在源处）
+                            let src_parent = srcs.first().map(|p| remote_parent(p));
                             match exec_status(&h, &cmd).await {
                                 Ok((0, _)) => s.send(WorkerEvent::OpDone {
                                     message: match crate::i18n::current() {
@@ -567,14 +572,20 @@ pub async fn run(
                                     },
                                     refresh_dir: Some(dest_dir.clone()),
                                 }),
-                                Ok((code, err)) => s.send(WorkerEvent::Error(match crate::i18n::current() {
-                                    crate::i18n::Lang::Zh => format!("操作失败（码 {code}）：{}", err.trim()),
-                                    crate::i18n::Lang::En => format!("Failed (code {code}): {}", err.trim()),
-                                })),
-                                Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() {
-                                    crate::i18n::Lang::Zh => format!("操作失败：{e}"),
-                                    crate::i18n::Lang::En => format!("Failed: {e}"),
-                                })),
+                                Ok((code, err)) => s.send(WorkerEvent::OpDone {
+                                    message: match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("操作失败（码 {code}）：{}", err.trim()),
+                                        crate::i18n::Lang::En => format!("Failed (code {code}): {}", err.trim()),
+                                    },
+                                    refresh_dir: src_parent,
+                                }),
+                                Err(e) => s.send(WorkerEvent::OpDone {
+                                    message: match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("操作失败：{e}"),
+                                        crate::i18n::Lang::En => format!("Failed: {e}"),
+                                    },
+                                    refresh_dir: src_parent,
+                                }),
                             }
                         });
                     }
