@@ -1346,10 +1346,10 @@ impl eframe::App for App {
             return;
         }
 
-        // 输入法修复：有文本框获得键盘输入时低频请求重绘。否则中文输入法按 Shift
-        // 切英文等「提交」事件不一定立即触发重绘，会出现「输入了但没显示、须再按一键才刷新」。
-        if ui.ctx().egui_wants_keyboard_input() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        // 输入法修复：有文本框获得键盘输入（或任意控件聚焦）时持续请求重绘。否则中文输入法
+        // 按 Shift 切英文等「提交」事件不一定触发重绘，出现「输入了但没显示、须再按一键才刷新」。
+        if ui.ctx().egui_wants_keyboard_input() || ui.ctx().memory(|m| m.focused().is_some()) {
+            ui.ctx().request_repaint();
         }
 
         // 全局界面缩放（左侧栏可调）：仅在变化时设置，避免每帧触发重排
@@ -2377,9 +2377,9 @@ impl App {
             .with_min_inner_size([480.0, 320.0]);
 
         ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
-            // 输入法修复：编辑器内有文本框获得输入时低频重绘（同主窗口）
-            if vctx.egui_wants_keyboard_input() {
-                vctx.request_repaint_after(std::time::Duration::from_millis(100));
+            // 输入法修复：编辑器内有文本框获得输入时持续重绘（同主窗口）
+            if vctx.egui_wants_keyboard_input() || vctx.memory(|m| m.focused().is_some()) {
+                vctx.request_repaint();
             }
             // 新开/切换文件后把本窗口置前并聚焦
             if self.editor_focus {

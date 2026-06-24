@@ -189,8 +189,8 @@ fn tree(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<FileAct
     if state.root.is_empty() {
         return;
     }
-    // 行间距相对默认收紧约 8%（先 -20% 再 +15%，折中到舒适的紧凑度）
-    ui.spacing_mut().item_spacing.y *= 0.92;
+    // 行间距与默认基本持平（先 -20%，再 +15%、+10%，回到舒适的疏密度）
+    ui.spacing_mut().item_spacing.y *= 1.01;
     let mut toggles: Vec<String> = Vec::new();
     let mut select: Option<String> = None;
 
