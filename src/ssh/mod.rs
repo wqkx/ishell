@@ -463,26 +463,36 @@ pub async fn run(
                     // 删除经 shell `rm` 执行：SFTP 的 remove_dir 只能删空目录、且对
                     // 指向目录的符号链接会失败；`rm -rf/-f` 与其它终端工具行为一致，
                     // 能删非空目录、各类链接与带特殊字符的文件名。
-                    Some(UiCommand::Delete { path, is_dir }) => {
+                    Some(UiCommand::DeleteMany { paths }) => {
                         let h = handle.clone();
                         let s = sink.clone();
                         tokio::spawn(async move {
-                            let parent = remote_parent(&path);
-                            // `--` 终止选项解析，避免以 - 开头的文件名被当作开关
-                            let cmd = if is_dir {
-                                format!("rm -rf -- {}", sh_quote(&path))
-                            } else {
-                                format!("rm -f -- {}", sh_quote(&path))
-                            };
+                            if paths.is_empty() {
+                                return;
+                            }
+                            let n = paths.len();
+                            let parent = remote_parent(&paths[0]);
+                            // 一条 rm -rf 处理所有路径（文件/目录通用）：单通道，避免多文件并发
+                            // 开过多 SSH 会话（服务端 MaxSessions 默认 ~10）导致「只删掉几个」。
+                            // `--` 终止选项解析，避免以 - 开头的文件名被当作开关。
+                            let mut joined = String::new();
+                            for p in &paths {
+                                joined.push_str(&sh_quote(p));
+                                joined.push(' ');
+                            }
+                            let cmd = format!("rm -rf -- {joined}");
                             match exec_status(&h, &cmd).await {
                                 Ok((0, _)) => s.send(WorkerEvent::OpDone {
-                                    message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已删除：{path}"), crate::i18n::Lang::En => format!("Deleted: {path}") },
+                                    message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已删除 {n} 项"), crate::i18n::Lang::En => format!("Deleted {n} item(s)") },
                                     refresh_dir: Some(parent),
                                 }),
-                                Ok((code, err)) => s.send(WorkerEvent::Error(match crate::i18n::current() {
-                                    crate::i18n::Lang::Zh => format!("删除失败（码 {code}）：{}", err.trim()),
-                                    crate::i18n::Lang::En => format!("Delete failed (code {code}): {}", err.trim()),
-                                })),
+                                Ok((code, err)) => s.send(WorkerEvent::OpDone {
+                                    message: match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("删除失败（码 {code}）：{}", err.trim()),
+                                        crate::i18n::Lang::En => format!("Delete failed (code {code}): {}", err.trim()),
+                                    },
+                                    refresh_dir: Some(parent),
+                                }),
                                 Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() {
                                     crate::i18n::Lang::Zh => format!("删除失败：{e}"),
                                     crate::i18n::Lang::En => format!("Delete failed: {e}"),

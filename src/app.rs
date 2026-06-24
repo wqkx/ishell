@@ -1,6 +1,6 @@
 //! 应用主体：会话管理 + 顶部标签 + 三区布局（系统信息 / 终端 / 文件）。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use egui::{RichText, Sense};
 use tokio::sync::mpsc::UnboundedSender;
@@ -460,19 +460,16 @@ pub struct App {
     pending_close_tab: Option<usize>,
     /// 已确认可以关闭
     allow_close: bool,
-    /// 编辑器标签页
-    editors: Vec<EditorTab>,
-    active_editor: usize,
-    /// 「关闭全部」时若有未保存修改，弹确认框
-    editor_close_confirm: bool,
+    /// 编辑器状态：放在 Arc<Mutex> 里，供 deferred viewport 回调（'static + Send + Sync，
+    /// 无法借用 &mut self）与主 update() 共享。改 deferred 是为根治 macOS 多窗口闪烁
+    /// （immediate viewport 与主窗口同帧渲染、强耦合焦点，触发 Stage Manager 不停重拍）。
+    editor_state: Arc<Mutex<EditorState>>,
     /// 看图工具：已打开的图片标签
     image_tabs: Vec<ImageTab>,
     active_image: usize,
-    /// 一次性请求：新开/切换后把对应独立窗口置前并聚焦
-    editor_focus: bool,
+    /// 一次性请求：新开/切换后把看图窗口置前并聚焦
     image_focus: bool,
-    /// 上次渲染时的激活编辑器/看图标签（用于侦测切换后滚到可视区）
-    editor_shown: usize,
+    /// 上次渲染时的激活看图标签（用于侦测切换后滚到可视区）
     image_shown: usize,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
@@ -578,6 +575,34 @@ struct EditorTab {
     text_id: egui::Id,
 }
 
+/// 编辑器窗口的共享状态（主窗口与 deferred viewport 回调共用，见 App::editor_state）。
+#[derive(Default)]
+struct EditorState {
+    tabs: Vec<EditorTab>,
+    /// 当前激活标签
+    active: usize,
+    /// 上次渲染的激活标签（用于切换后滚到可视区）
+    shown: usize,
+    /// 一次性请求：新开/切换后把编辑器窗口置前并聚焦
+    focus: bool,
+    /// 「关闭全部」时若有未保存修改，弹确认框
+    close_confirm: bool,
+    /// 关闭标签后请求主循环归还内存（trim）
+    trim_request: bool,
+}
+
+impl EditorState {
+    /// 关闭全部标签并清理各自的 TextEdit 内存状态；请求 trim。
+    fn close_all(&mut self, ctx: &egui::Context) {
+        for tab in self.tabs.drain(..) {
+            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(tab.text_id));
+        }
+        self.active = 0;
+        self.close_confirm = false;
+        self.trim_request = true;
+    }
+}
+
 /// 看图工具的一个标签页（一张已加载的图片）。
 struct ImageTab {
     server: String,
@@ -646,14 +671,10 @@ impl App {
             show_close_confirm: false,
             pending_close_tab: None,
             allow_close: false,
-            editors: Vec::new(),
-            active_editor: 0,
-            editor_close_confirm: false,
+            editor_state: Arc::new(Mutex::new(EditorState::default())),
             image_tabs: Vec::new(),
             active_image: 0,
-            editor_focus: false,
             image_focus: false,
-            editor_shown: 0,
             image_shown: 0,
             next_editor_id: 0,
             trim_after: None,
@@ -734,29 +755,30 @@ impl App {
             if let Some((server, tx)) = app.sessions.first().map(|s| (s.title.clone(), s.cmd_tx.clone())) {
                 let code = "use std::io;\n\n// 示例：读取并打印\nfn main() {\n    let mut s = String::new();\n    io::stdin().read_line(&mut s).unwrap();\n    let n: i32 = s.trim().parse().unwrap_or(0);\n    for i in 0..n {\n        println!(\"line {}\", i);\n    }\n}\n".to_string();
                 let t1 = app.alloc_editor_id();
-                app.editors.push(EditorTab {
+                // 大文件（>1MB）→ 只读模式，核对「改为可编辑」按钮
+                let big: String = (0..40000).map(|i| format!("{i}: the quick brown fox jumps over the lazy dog\n")).collect();
+                let t2 = app.alloc_editor_id();
+                let t3 = app.alloc_editor_id();
+                let mut ed = app.editor_state.lock().unwrap();
+                ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/home/e5-1/demo.rs".into(), code),
                     server: server.clone(),
                     cmd_tx: tx.clone(),
                     text_id: t1,
                 });
-                // 大文件（>1MB）→ 只读模式，核对「改为可编辑」按钮
-                let big: String = (0..40000).map(|i| format!("{i}: the quick brown fox jumps over the lazy dog\n")).collect();
-                let t2 = app.alloc_editor_id();
-                app.editors.push(EditorTab {
+                ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
                     server: server.clone(),
                     cmd_tx: tx.clone(),
                     text_id: t2,
                 });
-                let t3 = app.alloc_editor_id();
-                app.editors.push(EditorTab {
+                ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
                     server,
                     cmd_tx: tx,
                     text_id: t3,
                 });
-                app.active_editor = 1; // 默认显示大文件标签
+                ed.active = 1; // 默认显示大文件标签
             }
         }
 
@@ -1116,8 +1138,8 @@ impl App {
             FileAction::Chmod { path, mode } => {
                 let _ = s.cmd_tx.send(UiCommand::Chmod { path, mode });
             }
-            FileAction::Delete { path, is_dir } => {
-                let _ = s.cmd_tx.send(UiCommand::Delete { path, is_dir });
+            FileAction::DeleteMany(paths) => {
+                let _ = s.cmd_tx.send(UiCommand::DeleteMany { paths });
             }
             FileAction::Rename { from, to } => {
                 let _ = s.cmd_tx.send(UiCommand::Rename { from, to });
@@ -1345,7 +1367,7 @@ impl App {
                     // 剪切：上传成功后才删源（安全）
                     if is_cut {
                         if let Some(sidx) = self.session_idx_by_uid(src_uid) {
-                            let _ = self.sessions[sidx].cmd_tx.send(UiCommand::Delete { path: src_path, is_dir: d });
+                            let _ = self.sessions[sidx].cmd_tx.send(UiCommand::DeleteMany { paths: vec![src_path] });
                         }
                     }
                     Self::cleanup_relay_tmp(&t, d);
@@ -1468,19 +1490,20 @@ impl eframe::App for App {
             }
         }
         for (path, content, server, tx) in new_tabs {
-            self.editor_focus = true; // 打开/切换后聚焦编辑器窗口
+            let tid = self.alloc_editor_id(); // 借用 self，需在锁外取
+            let mut ed = self.editor_state.lock().unwrap();
+            ed.focus = true; // 打开/切换后聚焦编辑器窗口
             // 同一服务器同一文件已打开则切到该标签
-            if let Some(i) = self.editors.iter().position(|t| t.server == server && t.editor.path == path) {
-                self.active_editor = i;
+            if let Some(i) = ed.tabs.iter().position(|t| t.server == server && t.editor.path == path) {
+                ed.active = i;
             } else {
-                let tid = self.alloc_editor_id();
-                self.editors.push(EditorTab {
+                ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new(path, content),
                     server,
                     cmd_tx: tx,
                     text_id: tid,
                 });
-                self.active_editor = self.editors.len() - 1;
+                ed.active = ed.tabs.len() - 1;
             }
         }
 
@@ -1508,6 +1531,14 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(d);
         }
 
+        // 编辑器关闭标签后请求归还内存（deferred 回调里无法直接动 App，用共享标志传出）
+        {
+            let mut ed = self.editor_state.lock().unwrap();
+            if ed.trim_request {
+                ed.trim_request = false;
+                self.trim_after = Some(4);
+            }
+        }
         // 关闭编辑器后延迟归还内存（等 galley 缓存淘汰）
         if let Some(n) = self.trim_after {
             if n == 0 {
@@ -2410,49 +2441,57 @@ impl App {
         }
     }
 
-    /// 多标签文本编辑器浮窗。
-    // 在独立 OS 窗口（viewport）里用 Panel::show(ctx) 渲染根 UI —— 这是 viewport 的惯用法；
-    // egui 0.34 将其标记为 deprecated（建议 show_inside），但 viewport 场景下并无根 ui 可用。
+    /// 多标签文本编辑器：独立 OS 窗口，改用 **deferred viewport**——与主窗口的渲染/事件
+    /// 循环解耦（各自独立的重绘调度），规避 immediate viewport 在 macOS 上触发 Stage Manager
+    /// 缩略图不停闪烁的问题。状态放在 self.editor_state（Arc<Mutex>），回调与主 update() 共享。
     #[allow(deprecated)]
     fn editor_window(&mut self, ctx: &egui::Context) {
-        use egui_phosphor::regular as icon;
-        if self.editors.is_empty() {
-            return;
-        }
-        if self.active_editor >= self.editors.len() {
-            self.active_editor = self.editors.len() - 1;
-        }
-
-        // 独立 OS 窗口（immediate viewport）：与主窗口分离，可自由移动/缩放，关闭走原生按钮。
-        let vid = egui::ViewportId::from_hash_of("ishell_editor");
-        let title = self
-            .editors
-            .get(self.active_editor)
-            .map(|t| match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("iShell 编辑器 — {}·{}", t.server, t.editor.filename()),
-                crate::i18n::Lang::En => format!("iShell Editor — {}·{}", t.server, t.editor.filename()),
-            })
-            .unwrap_or_else(|| crate::i18n::tr("iShell 编辑器", "iShell Editor").into());
+        // 标题随激活文件变化：锁内算好即释放，回调运行时再单独加锁（二者不同时持锁）。
+        let title = {
+            let mut ed = self.editor_state.lock().unwrap();
+            if ed.tabs.is_empty() {
+                return; // 无标签：不再注册 viewport → eframe 自动关闭该窗口
+            }
+            if ed.active >= ed.tabs.len() {
+                ed.active = ed.tabs.len() - 1;
+            }
+            let active = ed.active;
+            ed.tabs
+                .get(active)
+                .map(|t| match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("iShell 编辑器 — {}·{}", t.server, t.editor.filename()),
+                    crate::i18n::Lang::En => format!("iShell Editor — {}·{}", t.server, t.editor.filename()),
+                })
+                .unwrap_or_else(|| crate::i18n::tr("iShell 编辑器", "iShell Editor").into())
+        };
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size([900.0, 640.0])
             .with_min_inner_size([480.0, 320.0]);
+        let vid = egui::ViewportId::from_hash_of("ishell_editor");
+        let state = self.editor_state.clone();
 
-        ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
-            // （已移除「聚焦时每帧重绘」的输入法 workaround：它修不了 X11/XIM 的提交延迟，
-            //  却让编辑器窗口永动重绘，触发 macOS Stage Manager 闪烁。详见主 update() 注释。）
+        ctx.show_viewport_deferred(vid, builder, move |vctx, _class| {
+            use egui_phosphor::regular as icon;
+            let mut ed = state.lock().unwrap();
+            if ed.tabs.is_empty() {
+                return;
+            }
+            if ed.active >= ed.tabs.len() {
+                ed.active = ed.tabs.len() - 1;
+            }
             // 新开/切换文件后把本窗口置前并聚焦
-            if self.editor_focus {
+            if ed.focus {
                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                self.editor_focus = false;
+                ed.focus = false;
             }
             // Ctrl+Tab / Ctrl+Shift+Tab 切换编辑器标签（先 consume，免被文本框当作 Tab 字符）
-            let n = self.editors.len();
+            let n = ed.tabs.len();
             if n > 1 {
                 if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)) {
-                    self.active_editor = (self.active_editor + n - 1) % n;
+                    ed.active = (ed.active + n - 1) % n;
                 } else if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
-                    self.active_editor = (self.active_editor + 1) % n;
+                    ed.active = (ed.active + 1) % n;
                 }
             }
             let mut close_tab: Option<usize> = None;
@@ -2464,14 +2503,15 @@ impl App {
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
                     // 与 shell 标签一致：横向滚动（溢出可滚）+ 激活标签珊瑚下划线 + 切换后滚到可视区
-                    let want_scroll = self.active_editor != self.editor_shown;
+                    let want_scroll = ed.active != ed.shown;
+                    let active = ed.active;
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                for (i, t) in self.editors.iter().enumerate() {
-                                    let selected = i == self.active_editor;
+                                for (i, t) in ed.tabs.iter().enumerate() {
+                                    let selected = i == active;
                                     let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
                                     let r = egui::Frame::new()
                                         .fill(fill)
@@ -2500,14 +2540,15 @@ impl App {
                                 }
                             });
                         });
-                    self.editor_shown = self.active_editor;
+                    ed.shown = ed.active;
                 });
 
             // 当前标签内容
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Palette::PANEL).inner_margin(8))
                 .show(vctx, |ui| {
-                    if let Some(tab) = self.editors.get_mut(self.active_editor) {
+                    let active = ed.active;
+                    if let Some(tab) = ed.tabs.get_mut(active) {
                         let tid = tab.text_id;
                         if crate::ui::editor::content(ui, &mut tab.editor, tid) {
                             do_save = true;
@@ -2516,41 +2557,42 @@ impl App {
                 });
 
             if let Some(i) = activate {
-                self.active_editor = i;
+                ed.active = i;
             }
             if do_save {
-                if let Some(tab) = self.editors.get(self.active_editor) {
+                let active = ed.active;
+                if let Some(tab) = ed.tabs.get(active) {
                     let _ = tab.cmd_tx.send(UiCommand::WriteFile {
                         path: tab.editor.path.clone(),
                         content: tab.editor.content.clone(),
                     });
                 }
-                if let Some(tab) = self.editors.get_mut(self.active_editor) {
+                if let Some(tab) = ed.tabs.get_mut(active) {
                     tab.editor.mark_saved();
                 }
             }
             if let Some(i) = close_tab {
-                if i < self.editors.len() {
-                    let closed = self.editors.remove(i);
+                if i < ed.tabs.len() {
+                    let closed = ed.tabs.remove(i);
                     // 清除该编辑器在 egui 内存中的 TextEdit 状态（含撤销历史的文本快照）
                     vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
                 }
-                if self.active_editor >= self.editors.len() && !self.editors.is_empty() {
-                    self.active_editor = self.editors.len() - 1;
+                if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
+                    ed.active = ed.tabs.len() - 1;
                 }
-                self.trim_after = Some(4);
+                ed.trim_request = true;
             }
 
             // 原生关闭按钮：若有未保存修改先拦截并确认，否则关闭全部标签
             if vctx.input(|i| i.viewport().close_requested()) {
-                if self.editors.iter().any(|t| t.editor.dirty()) {
+                if ed.tabs.iter().any(|t| t.editor.dirty()) {
                     vctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    self.editor_close_confirm = true;
+                    ed.close_confirm = true;
                 } else {
-                    self.close_all_editors(vctx);
+                    ed.close_all(vctx);
                 }
             }
-            if self.editor_close_confirm {
+            if ed.close_confirm {
                 let mut do_close = false;
                 let mut cancel = false;
                 egui::Modal::new(egui::Id::new("editor_close_modal")).show(vctx, |ui| {
@@ -2574,23 +2616,12 @@ impl App {
                     });
                 });
                 if do_close {
-                    self.close_all_editors(vctx);
+                    ed.close_all(vctx);
                 } else if cancel {
-                    self.editor_close_confirm = false;
+                    ed.close_confirm = false;
                 }
             }
         });
-    }
-
-    /// 关闭全部编辑器标签，并清理各自的 TextEdit 内存状态。
-    fn close_all_editors(&mut self, ctx: &egui::Context) {
-        for tab in self.editors.drain(..) {
-            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(tab.text_id));
-        }
-        self.active_editor = 0;
-        self.editor_close_confirm = false;
-        self.trim_after = Some(4);
-        ctx.request_repaint();
     }
 
     /// 看图工具浮窗：独立可缩放窗口；滚轮以光标为锚点缩放，拖动平移。

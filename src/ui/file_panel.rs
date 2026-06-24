@@ -125,7 +125,8 @@ pub enum FileAction {
     Mkdir(String),
     CreateFile(String),
     Chmod { path: String, mode: u32 },
-    Delete { path: String, is_dir: bool },
+    /// 批量删除：一条 rm 处理所有路径（单通道），避免多文件时并发开太多 SSH 通道被服务端拒绝
+    DeleteMany(Vec<String>),
     Rename { from: String, to: String },
     /// 复制选中项到 App 级剪贴板（跨 tab 共享）；每项 (绝对路径, 是否目录)
     ClipCopy { items: Vec<(String, bool)> },
@@ -1047,6 +1048,20 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         actions.push(FileAction::Paste { dest_dir: cwd.clone() });
     }
 
+    // Ctrl/Cmd+A 全选当前列表（含已过滤后的所有行）。文本框聚焦/重命名/对话框时不抢，
+    // 让 Ctrl+A 仍作用于文本框自身的全选。
+    let select_all = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::A));
+    if select_all
+        && state.renaming.is_none()
+        && state.path_edit.is_none()
+        && state.dialog.is_none()
+        && ui.ctx().memory(|m| m.focused().is_none())
+        && !entries.is_empty()
+    {
+        state.selected = (0..entries.len()).collect();
+        state.anchor = Some(0);
+    }
+
     // 批量删除：工具栏删除按钮 或 Delete 键（重命名/路径编辑/已有对话框时不触发）
     let key_del = ui.input(|i| i.key_pressed(egui::Key::Delete))
         && state.renaming.is_none()
@@ -1506,18 +1521,25 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                             crate::i18n::Lang::Zh => format!("确定删除选中的 {n} 项吗？此操作不可恢复。"),
                             crate::i18n::Lang::En => format!("Delete {n} selected items? This cannot be undone."),
                         });
-                        // 列出待删名称（最多 8 个，多余省略），让用户复核
+                        // 列出待删名称（最多 4 个，多余用 … 概括），避免文件多时对话框过长
                         ui.add_space(4.0);
-                        let shown: Vec<String> = items.iter().take(8).map(|(_, _, nm)| nm.clone()).collect();
-                        let more = if n > 8 { format!(" … (+{})", n - 8) } else { String::new() };
+                        let shown: Vec<String> = items.iter().take(4).map(|(_, _, nm)| nm.clone()).collect();
+                        let more = if n > 4 {
+                            match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!(" … 等 {n} 项"),
+                                crate::i18n::Lang::En => format!(" … ({n} total)"),
+                            }
+                        } else {
+                            String::new()
+                        };
                         ui.label(RichText::new(format!("{}{}", shown.join("、"), more)).color(Palette::TEXT_DIM).size(11.0));
                     }
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if dlg_btn(ui, crate::i18n::tr("删除", "Delete"), 72.0, 1) {
-                            for (path, is_dir, _) in items.iter() {
-                                actions.push(FileAction::Delete { path: path.clone(), is_dir: *is_dir });
-                            }
+                            // 一条批量删除（单 rm，单通道）——避免多文件时并发开过多 SSH 通道被拒
+                            let paths: Vec<String> = items.iter().map(|(p, _, _)| p.clone()).collect();
+                            actions.push(FileAction::DeleteMany(paths));
                             clear_sel = true;
                             close = true;
                         }

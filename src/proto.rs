@@ -87,8 +87,8 @@ pub enum UiCommand {
     CreateFile(String),
     /// 修改权限（八进制低 9 位）
     Chmod { path: String, mode: u32 },
-    /// 删除文件或目录
-    Delete { path: String, is_dir: bool },
+    /// 批量删除文件/目录：一条 rm 处理所有路径（单通道），避免多文件并发开过多 SSH 通道被拒
+    DeleteMany { paths: Vec<String> },
     /// 重命名 / 移动
     Rename { from: String, to: String },
     /// 远端批量复制 / 移动到目标目录（经 shell 执行 cp -a / mv）
