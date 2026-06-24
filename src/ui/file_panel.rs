@@ -1105,27 +1105,29 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     {
         if let Some(rec) = state.move_undo.pop() {
             let orig_parent = parent_of(&rec.original[0]);
+            // 被撤销项当前所在的位置（正向移动后落在 dest_dir）
             let new_srcs: Vec<String> = rec.original.iter().map(|o| join_path(&rec.dest_dir, basename(o))).collect();
-            // 若当前正看着目标目录，乐观移除将被移走的项（与正向移动一致，避免跳动）
-            if state.cwd == rec.dest_dir {
-                let cwd2 = state.cwd.clone();
-                if let Some(list) = state.listings.get_mut(&cwd2) {
-                    let moved: std::collections::HashSet<String> = new_srcs.iter().cloned().collect();
-                    list.retain(|e| !moved.contains(&join_path(&cwd2, &e.name)));
+            // 关键：把这些项从「目标目录」的缓存列表移除——否则该目录(及树中对应节点)仍显示
+            // 已被移回的文件，看着像「没删除」。无论当前是否正看着该目录都要清，保证再次进入时正确。
+            // 反向移动后落点(orig_parent)由 worker 的 OpDone 刷新，文件在那边重新出现。
+            {
+                let moved: std::collections::HashSet<String> = new_srcs.iter().cloned().collect();
+                if let Some(list) = state.listings.get_mut(&rec.dest_dir) {
+                    list.retain(|e| !moved.contains(&join_path(&rec.dest_dir, &e.name)));
                 }
             }
-            // 提示撤销了哪个动作：单项显示名称，多项显示数量；并标注移回的目录
-            let what = if rec.original.len() == 1 {
-                basename(&rec.original[0]).to_string()
+            // 提示「哪个文件、从哪移回哪」：单项显示文件名，多项显示前几个名字 + 数量
+            let names: Vec<&str> = rec.original.iter().map(|o| basename(o)).collect();
+            let what = if names.len() == 1 {
+                names[0].to_string()
             } else {
-                match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("{} 项", rec.original.len()),
-                    crate::i18n::Lang::En => format!("{} items", rec.original.len()),
-                }
+                let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join("、");
+                let more = if names.len() > 3 { format!(" 等 {} 项", names.len()) } else { String::new() };
+                format!("{shown}{more}")
             };
             let msg = match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("已撤销移动：{what} → 移回 {orig_parent}"),
-                crate::i18n::Lang::En => format!("Undo move: {what} → back to {orig_parent}"),
+                crate::i18n::Lang::Zh => format!("已撤销移动：{what}（从 {} 移回 {}）", rec.dest_dir, orig_parent),
+                crate::i18n::Lang::En => format!("Undid move: {what} (from {} back to {})", rec.dest_dir, orig_parent),
             };
             // 先发起反向 mv，再设状态栏文案——确保撤销提示覆盖 Move 自身的「移动中」提示
             actions.push(FileAction::Move { srcs: new_srcs, dest_dir: orig_parent });
