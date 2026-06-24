@@ -70,6 +70,12 @@ rfd = "0.17"
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+# 本地补丁：修复 glutin 在 macOS 最小化窗口时 make_current 的 .expect panic
+#（编辑器为独立 OS 窗口后，多窗口最小化到 Stage Manager 偶发闪退）。vendor/glutin 为
+# crates.io 0.32.3 原样副本，仅改 is_view_current 一行（无视图时返回 false），跨平台安全。
+[patch.crates-io]
+glutin = { path = "vendor/glutin" }
+
 [profile.release]
 opt-level = "s"   # 优化体积（GUI 仅事件驱动重绘，活跃渲染影响可忽略）
 lto = true        # fat LTO：更激进的跨 crate 内联与死代码消除
