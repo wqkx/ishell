@@ -175,6 +175,51 @@ impl Terminal {
         lines
     }
 
+    /// 把整个缓冲（回滚 + 可见屏）连同颜色/属性序列化为带 SGR 的字节流（行间 `\r\n`）。
+    /// 供 resize 重排使用：vt100 的 `set_size` 不回流（缩小截断底部、放大底部补空白），
+    /// 重建解析器并重放这段字节即可让内容按新宽度回流并贴底（颜色/粗体等属性保留）。
+    fn serialize_buffer(&mut self) -> Vec<u8> {
+        let saved = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let sb = self.parser.screen().scrollback();
+        let rows = self.rows as usize;
+        let cols = self.cols;
+        // 按「全局行索引」去重收集每行的序列化字节（与 collect_lines 同样的遍历方式）
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut off = sb;
+        loop {
+            self.parser.screen_mut().set_scrollback(off);
+            let start_idx = sb - off;
+            {
+                let screen = self.parser.screen();
+                for r in 0..rows {
+                    let idx = start_idx + r;
+                    if idx < lines.len() {
+                        continue;
+                    }
+                    lines.push(serialize_row(screen, r as u16, cols as u16));
+                }
+            }
+            if off == 0 {
+                break;
+            }
+            off = off.saturating_sub(rows);
+        }
+        self.parser.screen_mut().set_scrollback(saved);
+        // 去掉末尾空行（多为放大补出的空白/未用行），重放后内容自然贴底
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(line);
+        }
+        out
+    }
+
     /// 重新执行搜索（查询变化时）。
     fn run_search(&mut self) {
         let q = match &self.find {
@@ -341,15 +386,34 @@ impl Terminal {
     }
 
     /// 调整逻辑尺寸（字符行列）。返回是否真的变化。
+    ///
+    /// 普通屏用「重排」：vt100 的 `set_size` 不回流——缩小直接截断底部行（最新内容/提示符丢失，
+    /// 且不进回滚），放大则在底部补空白（内容贴顶、底部留白），导致「缩小再放大底部不恢复」。
+    /// 这里序列化整缓冲 → 按新尺寸重建解析器 → 重放，使内容按新宽度回流并贴底（保留颜色/属性）。
+    /// 全屏程序（alt-screen）无回滚、会被远端 SIGWINCH 全量重绘，直接 `set_size` 即可。
     pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
         let cols = cols.max(2);
         let rows = rows.max(1);
         if cols == self.cols && rows == self.rows {
             return false;
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.parser.screen_mut().set_size(rows, cols);
+        if self.parser.screen().alternate_screen() {
+            self.cols = cols;
+            self.rows = rows;
+            self.parser.screen_mut().set_size(rows, cols);
+        } else {
+            let data = self.serialize_buffer();
+            let mut np = vt100::Parser::new(rows, cols, 5000);
+            np.process(&data);
+            self.parser = np;
+            self.cols = cols;
+            self.rows = rows;
+            self.scrollback = 0;
+            // 屏幕坐标已变，清掉可能错位的选区/搜索高亮
+            self.sel_anchor = None;
+            self.sel_cursor = None;
+            self.search_hl = None;
+        }
         true
     }
 
@@ -978,6 +1042,124 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 一个单元格的可序列化属性（用于 resize 重排时还原颜色/字形）。
+#[derive(Clone, Copy, PartialEq)]
+struct CellAttrs {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl CellAttrs {
+    const DEFAULT: CellAttrs = CellAttrs {
+        fg: vt100::Color::Default,
+        bg: vt100::Color::Default,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+    };
+    fn of(c: &vt100::Cell) -> Self {
+        Self {
+            fg: c.fgcolor(),
+            bg: c.bgcolor(),
+            bold: c.bold(),
+            dim: c.dim(),
+            italic: c.italic(),
+            underline: c.underline(),
+            inverse: c.inverse(),
+        }
+    }
+    /// 生成「自包含」的 SGR：先 reset(0) 再追加非默认属性，无需跟踪上一状态的开关位。
+    fn sgr(&self) -> Vec<u8> {
+        let mut p: Vec<String> = vec!["0".into()];
+        if self.bold {
+            p.push("1".into());
+        }
+        if self.dim {
+            p.push("2".into());
+        }
+        if self.italic {
+            p.push("3".into());
+        }
+        if self.underline {
+            p.push("4".into());
+        }
+        if self.inverse {
+            p.push("7".into());
+        }
+        push_sgr_color(&mut p, self.fg, true);
+        push_sgr_color(&mut p, self.bg, false);
+        format!("\x1b[{}m", p.join(";")).into_bytes()
+    }
+}
+
+/// 把一个颜色追加为 SGR 参数（前景 fg=true / 背景 fg=false）。
+fn push_sgr_color(p: &mut Vec<String>, c: vt100::Color, fg: bool) {
+    let (base, bright, ext) = if fg { (30u16, 90u16, 38u16) } else { (40, 100, 48) };
+    match c {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(i) => {
+            if i < 8 {
+                p.push((base + i as u16).to_string());
+            } else if i < 16 {
+                p.push((bright + (i as u16 - 8)).to_string());
+            } else {
+                p.push(format!("{ext};5;{i}"));
+            }
+        }
+        vt100::Color::Rgb(r, g, b) => p.push(format!("{ext};2;{r};{g};{b}")),
+    }
+}
+
+/// 把可见屏第 `row` 行序列化为带 SGR 的字节（裁掉行尾空白；空行返回空 Vec）。
+/// 行内属性变化时插入自包含 SGR，行尾补 `\x1b[0m`，使各行互不影响。
+fn serialize_row(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<u8> {
+    // 该行最后一个有内容的列(+1)，用于裁掉行尾空白
+    let mut last = 0u16;
+    for c in 0..cols {
+        if screen.cell(row, c).is_some_and(|cell| cell.has_contents()) {
+            last = c + 1;
+        }
+    }
+    if last == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cur = CellAttrs::DEFAULT; // 行首解析器状态为默认（上一行尾已 reset）
+    let mut col = 0u16;
+    while col < last {
+        let Some(cell) = screen.cell(row, col) else {
+            out.push(b' ');
+            col += 1;
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            col += 1; // 宽字符占位列，跳过（宽字符本体已在前一列输出）
+            continue;
+        }
+        let a = CellAttrs::of(cell);
+        if a != cur {
+            out.extend_from_slice(&a.sgr());
+            cur = a;
+        }
+        let s = cell.contents();
+        if s.is_empty() {
+            out.push(b' ');
+        } else {
+            out.extend_from_slice(s.as_bytes());
+        }
+        col += 1;
+    }
+    out.extend_from_slice(b"\x1b[0m");
+    out
 }
 
 /// 若字节流结尾是一个**不完整**的多字节 UTF-8 序列，返回需要暂存的尾字节数；否则 0。
