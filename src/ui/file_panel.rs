@@ -112,6 +112,8 @@ pub enum Dialog {
     Rename { path: String, name: String },
     ConfirmDelete { items: Vec<(String, bool, String)> }, // (path, is_dir, name)，支持多选批量删除
     ConfirmOpenLarge { path: String, size: u64 },
+    /// 撤销移动确认：what=文件名概述，from=当前所在目录，to=移回的原目录（栈顶记录的预览）
+    ConfirmUndoMove { what: String, from: String, to: String },
 }
 
 /// 面板交互产生的动作，由 App 翻译为 SFTP 指令或剪贴板操作。
@@ -1103,37 +1105,26 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         && state.dialog.is_none()
         && ui.ctx().memory(|m| m.focused().is_none())
     {
-        if let Some(rec) = state.move_undo.pop() {
+        // 不直接执行：弹确认框，明确告知撤销的是「哪些文件、从哪移回哪」，用户确认后才执行。
+        // 仅取栈顶预览（不出栈），真正出栈与反向 mv 在用户点「撤销」后于 dialogs() 中进行。
+        if let Some(rec) = state.move_undo.last() {
             let orig_parent = parent_of(&rec.original[0]);
-            // 被撤销项当前所在的位置（正向移动后落在 dest_dir）
-            let new_srcs: Vec<String> = rec.original.iter().map(|o| join_path(&rec.dest_dir, basename(o))).collect();
-            // 关键：把这些项从「目标目录」的缓存列表移除——否则该目录(及树中对应节点)仍显示
-            // 已被移回的文件，看着像「没删除」。无论当前是否正看着该目录都要清，保证再次进入时正确。
-            // 反向移动后落点(orig_parent)由 worker 的 OpDone 刷新，文件在那边重新出现。
-            {
-                let moved: std::collections::HashSet<String> = new_srcs.iter().cloned().collect();
-                if let Some(list) = state.listings.get_mut(&rec.dest_dir) {
-                    list.retain(|e| !moved.contains(&join_path(&rec.dest_dir, &e.name)));
-                }
-            }
-            // 提示「哪个文件、从哪移回哪」：单项显示文件名，多项显示前几个名字 + 数量
             let names: Vec<&str> = rec.original.iter().map(|o| basename(o)).collect();
             let what = if names.len() == 1 {
                 names[0].to_string()
             } else {
                 let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join("、");
-                let more = if names.len() > 3 { format!(" 等 {} 项", names.len()) } else { String::new() };
+                let more = if names.len() > 3 {
+                    match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!(" 等 {} 项", names.len()),
+                        crate::i18n::Lang::En => format!(" +{} more", names.len() - 3),
+                    }
+                } else {
+                    String::new()
+                };
                 format!("{shown}{more}")
             };
-            let msg = match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("已撤销移动：{what}（从 {} 移回 {}）", rec.dest_dir, orig_parent),
-                crate::i18n::Lang::En => format!("Undid move: {what} (from {} back to {})", rec.dest_dir, orig_parent),
-            };
-            // 先发起反向 mv，再设状态栏文案——确保撤销提示覆盖 Move 自身的「移动中」提示
-            actions.push(FileAction::Move { srcs: new_srcs, dest_dir: orig_parent });
-            actions.push(FileAction::Status(msg));
-            state.selected.clear();
-            state.anchor = None;
+            state.dialog = Some(Dialog::ConfirmUndoMove { what, from: rec.dest_dir.clone(), to: orig_parent });
         } else {
             // 撤销栈为空：明确告知用户没有可撤销的移动
             actions.push(FileAction::Status(crate::i18n::tr("没有可撤销的移动", "Nothing to undo").into()));
@@ -1397,6 +1388,7 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
     let ctx = ui.ctx().clone();
     let mut close = false;
     let mut clear_sel = false; // 批量删除确认后清空选中，避免残留的陈旧行索引
+    let mut undo_confirmed = false; // 撤销移动确认框点了「撤销」
     let cwd = state.cwd.clone();
 
     if let Some(dialog) = &mut state.dialog {
@@ -1557,6 +1549,30 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                     });
                 });
             }
+            Dialog::ConfirmUndoMove { what, from, to } => {
+                modal(&ctx, crate::i18n::tr("撤销移动", "Undo move"), |ui| {
+                    ui.label(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("确定撤销移动 {what} 吗？"),
+                        crate::i18n::Lang::En => format!("Undo moving {what}?"),
+                    });
+                    ui.add_space(4.0);
+                    // 明确「从哪移回哪」，避免误撤销
+                    ui.label(RichText::new(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("从 {from}\n移回 {to}"),
+                        crate::i18n::Lang::En => format!("from {from}\nback to {to}"),
+                    }).color(Palette::TEXT_DIM).size(11.0));
+                    ui.add_space(8.0);
+                    button_row(ui, 72.0, 2, |ui| {
+                        if dlg_btn(ui, crate::i18n::tr("撤销", "Undo"), 72.0, 2) {
+                            undo_confirmed = true;
+                            close = true;
+                        }
+                        if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
+                            close = true;
+                        }
+                    });
+                });
+            }
         }
     }
     if close {
@@ -1564,6 +1580,38 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
     }
     if clear_sel {
         state.selected.clear();
+    }
+    // 用户确认撤销：此刻才出栈并执行反向 mv（与确认框展示的栈顶记录一致）
+    if undo_confirmed {
+        if let Some(rec) = state.move_undo.pop() {
+            let orig_parent = parent_of(&rec.original[0]);
+            let new_srcs: Vec<String> = rec.original.iter().map(|o| join_path(&rec.dest_dir, basename(o))).collect();
+            // 把这些项从「目标目录」缓存移除，否则该目录/树节点仍显示已移回的文件（看着像没删）
+            {
+                let moved: std::collections::HashSet<String> = new_srcs.iter().cloned().collect();
+                if let Some(list) = state.listings.get_mut(&rec.dest_dir) {
+                    list.retain(|e| !moved.contains(&join_path(&rec.dest_dir, &e.name)));
+                }
+            }
+            let names: Vec<&str> = rec.original.iter().map(|o| basename(o)).collect();
+            let what = if names.len() == 1 {
+                names[0].to_string()
+            } else {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("{} 项", names.len()),
+                    crate::i18n::Lang::En => format!("{} items", names.len()),
+                }
+            };
+            let msg = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("已撤销移动：{what}（从 {} 移回 {}）", rec.dest_dir, orig_parent),
+                crate::i18n::Lang::En => format!("Undid move: {what} (from {} back to {})", rec.dest_dir, orig_parent),
+            };
+            // 先发反向 mv，再设提示——确保撤销提示覆盖 Move 自身的「移动中」提示
+            actions.push(FileAction::Move { srcs: new_srcs, dest_dir: orig_parent });
+            actions.push(FileAction::Status(msg));
+            state.selected.clear();
+            state.anchor = None;
+        }
     }
 }
 

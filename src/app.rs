@@ -452,6 +452,8 @@ pub struct App {
     show_transfers: bool,
     /// 传输浮窗刚打开（本帧跳过"点击外部关闭"判定）
     xfer_just_opened: bool,
+    /// 顶部浮层提示 (文案, 起始时刻)：用于撤销等需要醒目反馈的操作，数秒后自动淡出
+    toast: Option<(String, f64)>,
     /// 显示"确认退出"对话框
     show_close_confirm: bool,
     /// 待确认关闭的标签（仅当该会话仍连接中时弹确认）
@@ -640,6 +642,7 @@ impl App {
             download_dir: crate::store::load_download_dir().map(std::path::PathBuf::from).unwrap_or_else(downloads_dir),
             show_transfers: false,
             xfer_just_opened: false,
+            toast: None,
             show_close_confirm: false,
             pending_close_tab: None,
             allow_close: false,
@@ -1141,7 +1144,10 @@ impl App {
                 };
             }
             FileAction::Status(msg) => {
-                s.status = msg;
+                // 状态栏留底 + 顶部醒目浮层（撤销等操作需要明确反馈，避免误操作）
+                let now = self.ctx.input(|i| i.time);
+                s.status = msg.clone();
+                self.toast = Some((msg, now));
             }
             FileAction::CdTerminal(path) => {
                 // 以 POSIX 单引号转义路径后在终端 cd，并聚焦终端
@@ -1657,6 +1663,9 @@ impl eframe::App for App {
             Some(idx) if idx < self.sessions.len() => self.right_body(ui, idx),
             _ => self.welcome(ui),
         }
+
+        // 顶部浮层提示（撤销结果等醒目反馈）
+        self.toast_overlay(&ctx);
 
         // 传输进度浮窗
         self.transfer_window(&ctx);
@@ -3104,6 +3113,39 @@ impl App {
     }
 
     /// 右上角传输进度浮窗（可弹出/隐藏）。
+    /// 顶部居中浮层提示：数秒后淡出。用于撤销结果等需要醒目反馈的操作。
+    fn toast_overlay(&mut self, ctx: &egui::Context) {
+        let Some((msg, t0)) = self.toast.clone() else { return };
+        const DUR: f64 = 3.5; // 显示时长（秒）
+        const FADE: f64 = 0.6; // 末尾淡出时长
+        let now = ctx.input(|i| i.time);
+        let age = now - t0;
+        if age >= DUR {
+            self.toast = None;
+            return;
+        }
+        let alpha = if age > DUR - FADE { ((DUR - age) / FADE) as f32 } else { 1.0 }.clamp(0.0, 1.0);
+        egui::Area::new(egui::Id::new("undo_toast"))
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 54.0])
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.set_opacity(alpha);
+                egui::Frame::new()
+                    .fill(Palette::PANEL_2)
+                    .stroke(egui::Stroke::new(1.0, Palette::ACCENT))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(egui_phosphor::regular::INFO).color(Palette::ACCENT).size(15.0));
+                            ui.label(RichText::new(&msg).color(Palette::TEXT).size(13.0));
+                        });
+                    });
+            });
+        ctx.request_repaint(); // 维持淡出动画
+    }
+
     fn transfer_window(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
         if !self.show_transfers {
