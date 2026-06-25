@@ -761,6 +761,13 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let bg = egui::Color32::from_rgb(252, 252, 250);
     let focused = ui.memory(|m| m.focused() == Some(text_id));
     let page = ((ui.available_height() / row_h).floor() as isize - 2).max(1);
+    let lang = ed.language.clone();
+    let fsize = mono.size;
+    // 右键菜单/查找动作（在闭包外应用，避免借用冲突）
+    let mut do_copy = false;
+    let mut do_cut = false;
+    let mut do_paste = false;
+    let mut do_selall = false;
 
     // ——— 输入（聚焦时）———
     let mut moved = false; // 本帧光标可能移动 → 渲染后滚到可视区
@@ -795,6 +802,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     let cmd = modifiers.command || modifiers.ctrl;
                     match key {
                         egui::Key::S if cmd => save = true,
+                        egui::Key::F if cmd => {
+                            ed.show_find = !ed.show_find;
+                            if ed.show_find {
+                                ed.find_focus = true;
+                            }
+                        }
                         egui::Key::A if cmd => {
                             ed.vsel = Some(0);
                             ed.vcaret = ed.content.len();
@@ -826,6 +839,112 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         ed.vcaret = ed.vcaret.min(ed.content.len());
     }
 
+    use egui_phosphor::regular as icon;
+    // 底部状态栏（仿小文件编辑器）：缩进可切换（矩形按钮、贴左）+ 语言贴右。
+    egui::Panel::bottom("editor_status_v")
+        .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 }))
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.scope(|ui| {
+                    let v = ui.visuals_mut();
+                    v.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.active.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.open.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+                    ui.menu_button(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label()), |ui| {
+                        ui.set_min_width(120.0);
+                        for ind in [Indent::Spaces(2), Indent::Spaces(4), Indent::Tab] {
+                            if ui.selectable_label(ed.indent == ind, ind.label()).clicked() {
+                                ed.indent = ind;
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                if !ed.status.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(&ed.status).color(Palette::TEXT_DIM).size(11.0));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
+                });
+            });
+        });
+
+    // 查找/替换浮层（右上角，与小文件编辑器一致），按字节定位/替换、可撤销。
+    if ed.show_find {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ed.show_find = false;
+        }
+        egui::Area::new(text_id.with("find_overlay_v"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 42.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(Palette::PANEL_2)
+                    .stroke(egui::Stroke::new(1.0, Palette::BORDER))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().interact_size.y = 26.0;
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
+                            let fr = ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
+                            if ed.find_focus {
+                                fr.request_focus();
+                                ed.find_focus = false;
+                            }
+                            if ui.button(crate::i18n::tr("下一个", "Next")).clicked() && !ed.find.is_empty() {
+                                let pat = ed.find.clone();
+                                let from = ed.vcaret.min(ed.content.len());
+                                let found = ed.content[from..].find(&pat).map(|o| from + o).or_else(|| ed.content.find(&pat));
+                                if let Some(b) = found {
+                                    ed.vsel = Some(b);
+                                    ed.vcaret = b + pat.len();
+                                    ed.status.clear();
+                                    moved = true;
+                                } else {
+                                    ed.status = crate::i18n::tr("未找到", "Not found").into();
+                                }
+                            }
+                            ui.add_space(6.0);
+                            ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换为", "Replace with")));
+                            if ui.button(crate::i18n::tr("替换", "Replace")).clicked() {
+                                if let Some((a, b)) = v_sel_range(ed) {
+                                    if !ed.find.is_empty() && &ed.content[a..b] == ed.find.as_str() {
+                                        let rep = ed.replace.clone();
+                                        v_apply(ed, a, b - a, &rep);
+                                        moved = true;
+                                    }
+                                }
+                            }
+                            if ui.button(crate::i18n::tr("全部替换", "Replace all")).clicked() && !ed.find.is_empty() {
+                                let n = ed.content.matches(ed.find.as_str()).count();
+                                if n > 0 {
+                                    let old_len = ed.content.len();
+                                    let newc = ed.content.replace(ed.find.as_str(), ed.replace.as_str());
+                                    v_apply(ed, 0, old_len, &newc);
+                                    ed.status = match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("已替换 {n} 处"),
+                                        crate::i18n::Lang::En => format!("Replaced {n}"),
+                                    };
+                                    moved = true;
+                                }
+                            }
+                            if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                                ed.show_find = false;
+                            }
+                        });
+                    });
+            });
+    }
+
     // ——— 渲染（仅可见行）———
     let total = ed.vlines.len();
     let digits = total.max(1).to_string().len();
@@ -846,6 +965,27 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let origin = ui.min_rect().min;
             let area = egui::Rect::from_min_size(origin, egui::vec2(content_w.max(ui.available_width()), content_h));
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
+            resp.context_menu(|ui| {
+                ui.set_min_width(140.0);
+                let has_sel = v_sel_range(ed).is_some();
+                if ui.add_enabled(has_sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
+                    do_copy = true;
+                    ui.close();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new(crate::i18n::tr("剪切", "Cut"))).clicked() {
+                    do_cut = true;
+                    ui.close();
+                }
+                if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
+                    do_paste = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button(crate::i18n::tr("全选", "Select all")).clicked() {
+                    do_selall = true;
+                    ui.close();
+                }
+            });
             let painter = ui.painter().clone();
             let first = (vp.min.y / row_h).floor().max(0.0) as usize;
             let last = (first + (vp.height() / row_h).ceil() as usize + 2).min(total);
@@ -855,7 +995,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 let (ls, le) = v_line_range(ed, i);
                 let line = ed.content[ls..le].to_string();
                 let y = origin.y + i as f32 * row_h;
-                let galley = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
+                // 逐可见行做语法高亮（按行 tokenize，仅可见行，开销小）
+                let galley = {
+                    let mut job = highlight::highlight(&line, &lang, fsize, &[]);
+                    job.wrap.max_width = f32::INFINITY;
+                    ui.ctx().fonts_mut(|f| f.layout_job(job))
+                };
                 // 选区高亮（半透明灰）
                 if let Some((sa, sb)) = sel {
                     if sb > ls && sa <= le {
@@ -876,6 +1021,23 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
                 // 正文
                 painter.galley(egui::pos2(text_x, y), galley.clone(), Palette::TEXT);
+                // 查找命中高亮（半透明灰，仅本可见行内查找）
+                if ed.show_find && !ed.find.is_empty() {
+                    let pat = ed.find.as_str();
+                    let mut lo = 0usize;
+                    while let Some(off) = line[lo..].find(pat) {
+                        let ms = lo + off;
+                        let me2 = ms + pat.len();
+                        let hx0 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, ms))).left();
+                        let hx1 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, me2))).left();
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(text_x + hx0, y), egui::pos2(text_x + hx1, y + row_h)),
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56),
+                        );
+                        lo = me2;
+                    }
+                }
                 // 光标
                 if focused && ed.vcaret >= ls && ed.vcaret <= le {
                     let cx = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, ed.vcaret - ls))).left();
@@ -921,6 +1083,26 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             }
         });
     });
+    // 右键菜单动作（闭包外应用）
+    if do_selall {
+        ed.vsel = Some(0);
+        ed.vcaret = ed.content.len();
+    }
+    if do_copy || do_cut {
+        if let Some((a, b)) = v_sel_range(ed) {
+            ui.ctx().copy_text(ed.content[a..b].to_string());
+            if do_cut {
+                v_delete_selection(ed);
+            }
+        }
+    }
+    if do_paste {
+        if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+            if !t.is_empty() {
+                v_insert(ed, &t);
+            }
+        }
+    }
     save
 }
 
