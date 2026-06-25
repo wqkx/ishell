@@ -104,6 +104,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         let gutter_w = (digits as f32 + 1.5) * char_w; // 行号区宽度
         let content_w = gutter_w + (ed.max_line_bytes as f32 + 2.0) * char_w;
         let content_h = total as f32 * row_h;
+        let bg = egui::Color32::from_rgb(252, 252, 250); // 近白底，与可编辑模式一致
+        egui::Frame::new().fill(bg).show(ui, |ui| {
         egui::ScrollArea::both().auto_shrink([false, false]).show_viewport(ui, |ui, vp| {
             ui.set_width(content_w);
             ui.set_height(content_h);
@@ -132,6 +134,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     Palette::TEXT,
                 );
             }
+        });
         });
         return false;
     }
@@ -197,9 +200,11 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     }
     ui.separator();
 
-    // 代码编辑区（大文件不做高亮）
+    // 代码编辑区（近白背景，显示更清晰；大文件不做高亮）
+    let bg = egui::Color32::from_rgb(252, 252, 250); // 近白底
     let do_highlight = ed.content.len() <= HIGHLIGHT_LIMIT;
-    let theme = CodeTheme::from_style(ui.style());
+    // 浅色高亮主题、字号 13：在近白底上关键字/字符串/注释对比清晰
+    let theme = CodeTheme::light(13.0);
     let lang = ed.language.clone();
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = if do_highlight {
@@ -221,38 +226,124 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
 
-    // 行号：与正文同处一个 ScrollArea，垂直滚动同步。每个逻辑行一行号（不换行，故对齐）。
+    let mono = egui::FontId::monospace(13.0);
     let n_lines = ed.content.split('\n').count().max(1);
-    let gw = n_lines.to_string().len();
-    let line_nums: String = (1..=n_lines).map(|i| format!("{i:>gw$}")).collect::<Vec<_>>().join("\n");
-    // 让编辑区至少撑满窗口高度（内容不足一屏时也填满，点击空白处可定位光标）。
-    let row_h = ui.ctx().fonts_mut(|f| f.row_height(&egui::FontId::monospace(13.0)));
-    // 用 ceil（向上取整）让正文背景填满到底部，避免底部露出更浅的面板底色、显得下边距偏大；
-    // 多出的不足一行高度由悬浮滚动条吸收（默认隐藏）。
+    let digits = n_lines.to_string().len();
+    let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, '0')).max(1.0);
+    let gutter_w = (digits as f32 + 1.5) * char_w; // 行号列宽
+    let row_h = ui.ctx().fonts_mut(|f| f.row_height(&mono));
+    // 编辑区至少撑满窗口高度（内容不足一屏也填满，便于点击空白定位光标）。
     let fill_rows = (((ui.available_height() - 6.0) / row_h).ceil() as usize).max(8);
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            // 行号列（与 TextEdit 顶部内边距对齐）
-            ui.add_space(0.0);
-            ui.vertical(|ui| {
-                ui.add_space(2.0); // 对齐 TextEdit 文本顶部内边距
-                ui.add(egui::Label::new(RichText::new(&line_nums).font(egui::FontId::monospace(13.0)).color(Palette::TEXT_DIM)).selectable(false));
-            });
-            let out = egui::TextEdit::multiline(&mut ed.content)
-                .code_editor()
-                .desired_width(f32::INFINITY)
-                .desired_rows(fill_rows)
-                .id(text_id)
-                .layouter(&mut layouter)
-                .show(ui);
-            if let Some((c0, c1)) = pending_select {
+
+    egui::Frame::new().fill(bg).show(ui, |ui| {
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            ui.visuals_mut().extreme_bg_color = bg; // TextEdit 自身背景也用近白，无接缝
+            ui.horizontal_top(|ui| {
+                ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
+                let out = egui::TextEdit::multiline(&mut ed.content)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(fill_rows)
+                    .id(text_id)
+                    .layouter(&mut layouter)
+                    .show(ui);
                 let id = out.response.id;
-                let mut st = out.state;
-                st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(c0), CCursor::new(c1))));
-                st.store(ui.ctx(), id);
-                out.response.request_focus();
-            }
+
+                // 行号：按 galley 每行的实际像素位置逐行绘制，与正文严格对齐——彻底解决长文本
+                // 底部缺行号（旧实现用单个多行 Label，高亮字体行高与 Label 不一致会累积错位）。
+                // 仅绘制可见行，避免长文件逐行造 galley 拖慢。
+                {
+                    let clip = ui.clip_rect();
+                    let num_x = out.galley_pos.x - 6.0;
+                    let painter = ui.painter();
+                    for (i, prow) in out.galley.rows.iter().enumerate() {
+                        let y = out.galley_pos.y + prow.pos.y;
+                        if y + row_h < clip.top() || y > clip.bottom() {
+                            continue;
+                        }
+                        painter.text(egui::pos2(num_x, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
+                    }
+                }
+
+                // 查找定位
+                if let Some((c0, c1)) = pending_select {
+                    let mut st = out.state.clone();
+                    st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(c0), CCursor::new(c1))));
+                    st.store(ui.ctx(), id);
+                    out.response.request_focus();
+                }
+
+                // 右键菜单：复制 / 剪切 / 粘贴 / 全选（基于当前选区直接操作内容缓冲）
+                let sel = out.cursor_range.map(|r| r.as_sorted_char_range());
+                let mut act = 0u8; // 1=复制 2=剪切 3=粘贴 4=全选
+                out.response.context_menu(|ui| {
+                    let has_sel = sel.as_ref().is_some_and(|r| r.start != r.end);
+                    if ui.add_enabled(has_sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
+                        act = 1;
+                        ui.close();
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new(crate::i18n::tr("剪切", "Cut"))).clicked() {
+                        act = 2;
+                        ui.close();
+                    }
+                    if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
+                        act = 3;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button(crate::i18n::tr("全选", "Select all")).clicked() {
+                        act = 4;
+                        ui.close();
+                    }
+                });
+                if act != 0 {
+                    let ctx = ui.ctx().clone();
+                    let mut new_cursor: Option<(usize, usize)> = None;
+                    match act {
+                        1 => {
+                            if let Some(r) = &sel {
+                                let (b0, b1) = (char_to_byte(&ed.content, r.start), char_to_byte(&ed.content, r.end));
+                                if b1 > b0 {
+                                    ctx.copy_text(ed.content[b0..b1].to_string());
+                                }
+                            }
+                        }
+                        2 => {
+                            if let Some(r) = &sel {
+                                let (b0, b1) = (char_to_byte(&ed.content, r.start), char_to_byte(&ed.content, r.end));
+                                if b1 > b0 {
+                                    ctx.copy_text(ed.content[b0..b1].to_string());
+                                    ed.content.replace_range(b0..b1, "");
+                                    new_cursor = Some((r.start, r.start));
+                                }
+                            }
+                        }
+                        3 => {
+                            if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                                if let Some(r) = &sel {
+                                    let (b0, b1) = (char_to_byte(&ed.content, r.start), char_to_byte(&ed.content, r.end));
+                                    ed.content.replace_range(b0..b1, &t);
+                                    let nc = r.start + t.chars().count();
+                                    new_cursor = Some((nc, nc));
+                                } else {
+                                    ed.content.push_str(&t);
+                                }
+                            }
+                        }
+                        4 => {
+                            let n = ed.content.chars().count();
+                            new_cursor = Some((0, n));
+                        }
+                        _ => {}
+                    }
+                    if let Some((c0, c1)) = new_cursor {
+                        let mut st = out.state.clone();
+                        st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(c0), CCursor::new(c1))));
+                        st.store(&ctx, id);
+                    }
+                    out.response.request_focus();
+                }
+            });
         });
     });
 
@@ -277,6 +368,11 @@ fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
         out.push((0, 0));
     }
     out
+}
+
+/// 字符下标 → 字节偏移（用于右键复制/剪切/粘贴按选区操作 UTF-8 内容）。
+fn char_to_byte(s: &str, c: usize) -> usize {
+    s.char_indices().nth(c).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 fn find_from(text: &str, query: &str, from_char: usize) -> Option<(usize, usize)> {
