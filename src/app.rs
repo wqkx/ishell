@@ -485,6 +485,9 @@ pub struct App {
     /// 无法借用 &mut self）与主 update() 共享。改 deferred 是为根治 macOS 多窗口闪烁
     /// （immediate viewport 与主窗口同帧渲染、强耦合焦点，触发 Stage Manager 不停重拍）。
     editor_state: Arc<Mutex<EditorState>>,
+    /// 诊断用：IME 测试子窗口的两个文本框缓冲（① 纯净 ② 带高亮 layouter）
+    ime_test: Arc<Mutex<String>>,
+    ime_test2: Arc<Mutex<String>>,
     /// 看图工具：已打开的图片标签
     image_tabs: Vec<ImageTab>,
     active_image: usize,
@@ -695,6 +698,8 @@ impl App {
             pending_close_tab: None,
             allow_close: false,
             editor_state: Arc::new(Mutex::new(EditorState::default())),
+            ime_test: Arc::new(Mutex::new(String::new())),
+            ime_test2: Arc::new(Mutex::new(String::new())),
             image_tabs: Vec::new(),
             active_image: 0,
             image_focus: false,
@@ -1735,6 +1740,7 @@ impl eframe::App for App {
 
         // 文本编辑器浮窗
         self.editor_window(&ctx);
+        self.ime_test_window(&ctx);
 
         // 看图工具浮窗
         self.image_window(&ctx);
@@ -2463,6 +2469,45 @@ impl App {
             Some(false) => self.pending_close_tab = None,
             None => {}
         }
+    }
+
+    /// 诊断：纯净的 IME 测试子窗口（deferred viewport，与编辑器同款窗口）。
+    /// ① 完全普通的 TextEdit；② 带高亮 layouter 的 TextEdit。用于判断中文输不进是
+    /// 「deferred 子窗口本身」还是「自定义 layouter」的问题。确诊后会移除。
+    #[allow(deprecated)]
+    fn ime_test_window(&mut self, ctx: &egui::Context) {
+        let vid = egui::ViewportId::from_hash_of("ishell_ime_test");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("IME 测试窗口")
+            .with_inner_size([480.0, 360.0]);
+        let buf1 = self.ime_test.clone();
+        let buf2 = self.ime_test2.clone();
+        ctx.show_viewport_deferred(vid, builder, move |vctx, _class| {
+            if vctx.egui_wants_keyboard_input() {
+                vctx.request_repaint();
+            }
+            egui::CentralPanel::default().show(vctx, |ui| {
+                ui.add_space(6.0);
+                ui.label("① 普通文本框（无任何自定义）——请尝试输入中文：");
+                {
+                    let mut s = buf1.lock().unwrap();
+                    ui.add(egui::TextEdit::multiline(&mut *s).desired_width(f32::INFINITY).desired_rows(4));
+                    ui.label(format!("字符数：{}", s.chars().count()));
+                }
+                ui.separator();
+                ui.label("② 带语法高亮的文本框——请尝试输入中文：");
+                {
+                    let mut s = buf2.lock().unwrap();
+                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, w: f32| {
+                        let mut job = crate::ui::highlight::highlight(buf.as_str(), "rs", 13.0, &[]);
+                        job.wrap.max_width = w;
+                        ui.ctx().fonts_mut(|f| f.layout_job(job))
+                    };
+                    ui.add(egui::TextEdit::multiline(&mut *s).desired_width(f32::INFINITY).desired_rows(4).layouter(&mut layouter));
+                    ui.label(format!("字符数：{}", s.chars().count()));
+                }
+            });
+        });
     }
 
     /// 多标签文本编辑器：独立 OS 窗口（deferred viewport）。状态放在 self.editor_state（Arc<Mutex>），
