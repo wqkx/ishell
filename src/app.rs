@@ -311,6 +311,20 @@ impl Session {
                         }
                     }
                     self.status = message;
+                    // 上传成功：记下「待选中」的文件名，列表刷新后在该目录选中它（拖动上传后高亮所传文件）
+                    if ok {
+                        if let Some((dir, name)) = self.transfers.iter().find(|t| t.id == id).and_then(|t| match &t.spec {
+                            Some(XferSpec::Upload { remote_dir, .. }) => Some((remote_dir.clone(), t.name.clone())),
+                            _ => None,
+                        }) {
+                            match &mut self.files.pending_select {
+                                Some((d, names)) if *d == dir => {
+                                    names.insert(name);
+                                }
+                                _ => self.files.pending_select = Some((dir, std::iter::once(name).collect())),
+                            }
+                        }
+                    }
                     self.refresh_dir(refresh_dir);
                 }
                 WorkerEvent::Error(e) => self.status = e,

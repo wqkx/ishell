@@ -8,9 +8,10 @@ const FONT_SIZE: f32 = 14.0;
 
 /// 全局终端配色开关（深=true）：所有终端共享同一值，切一个即全部同步。
 /// 首次访问时从持久化设置初始化。
-fn term_dark_flag() -> &'static std::sync::atomic::AtomicBool {
-    static F: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
-    F.get_or_init(|| std::sync::atomic::AtomicBool::new(crate::store::load_term_dark()))
+/// 全局终端配色索引：所有终端共享同一值，切一个即全部同步。首次访问从持久化设置初始化。
+fn term_theme() -> &'static std::sync::atomic::AtomicU8 {
+    static F: std::sync::OnceLock<std::sync::atomic::AtomicU8> = std::sync::OnceLock::new();
+    F.get_or_init(|| std::sync::atomic::AtomicU8::new(crate::store::load_term_theme()))
 }
 
 pub struct Terminal {
@@ -25,8 +26,8 @@ pub struct Terminal {
     sel_cursor: Option<(u16, u16)>,
     /// 系统剪贴板（懒初始化，用于右键粘贴）
     clipboard: Option<arboard::Clipboard>,
-    /// 终端配色：true=深色（默认），false=浅色（随主题暖色）
-    dark: bool,
+    /// 终端配色索引（见 TERM_THEMES）；全局共享，切一个即全部同步
+    theme: u8,
     /// 当前输入行的影子缓冲（用于前缀历史搜索）
     input_line: String,
     /// 本会话命令历史
@@ -111,7 +112,66 @@ impl TermColors {
             ],
         }
     }
+    /// 近白（干净的近白底 + 深前景，ANSI 偏饱和以在白底上清晰）。
+    fn paper() -> Self {
+        Self {
+            bg: Color32::from_rgb(0xfc, 0xfc, 0xfa),
+            fg: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            ansi: [
+                (0x3a, 0x3a, 0x3a), (0xcc, 0x33, 0x33), (0x2e, 0x8b, 0x2e), (0xb8, 0x86, 0x0b),
+                (0x20, 0x60, 0xc0), (0x9c, 0x27, 0xb0), (0x00, 0x97, 0xa7), (0x5a, 0x5a, 0x5a),
+                (0x7a, 0x7a, 0x7a), (0xe5, 0x39, 0x35), (0x38, 0x8e, 0x3c), (0xc9, 0xa2, 0x27),
+                (0x19, 0x76, 0xd2), (0x8e, 0x24, 0xaa), (0x00, 0x83, 0x8f), (0x1a, 0x1a, 0x1a),
+            ],
+        }
+    }
+    /// 柔和深色（Catppuccin Mocha，与界面 Latte 同族，暗变体）。
+    fn mocha() -> Self {
+        Self {
+            bg: Color32::from_rgb(0x1e, 0x1e, 0x2e),
+            fg: Color32::from_rgb(0xcd, 0xd6, 0xf4),
+            ansi: [
+                (0x45, 0x47, 0x5a), (0xf3, 0x8b, 0xa8), (0xa6, 0xe3, 0xa1), (0xf9, 0xe2, 0xaf),
+                (0x89, 0xb4, 0xfa), (0xf5, 0xc2, 0xe7), (0x94, 0xe2, 0xd5), (0xba, 0xc2, 0xde),
+                (0x58, 0x5b, 0x70), (0xf3, 0x8b, 0xa8), (0xa6, 0xe3, 0xa1), (0xf9, 0xe2, 0xaf),
+                (0x89, 0xb4, 0xfa), (0xf5, 0xc2, 0xe7), (0x94, 0xe2, 0xd5), (0xa6, 0xad, 0xc8),
+            ],
+        }
+    }
+    /// 经典浅色（Solarized Light）。
+    fn solarized_light() -> Self {
+        Self {
+            bg: Color32::from_rgb(0xfd, 0xf6, 0xe3),
+            fg: Color32::from_rgb(0x65, 0x7b, 0x83),
+            ansi: [
+                (0x07, 0x36, 0x42), (0xdc, 0x32, 0x2f), (0x85, 0x99, 0x00), (0xb5, 0x89, 0x00),
+                (0x26, 0x8b, 0xd2), (0xd3, 0x36, 0x82), (0x2a, 0xa1, 0x98), (0xee, 0xe8, 0xd5),
+                (0x00, 0x2b, 0x36), (0xcb, 0x4b, 0x16), (0x58, 0x6e, 0x75), (0x65, 0x7b, 0x83),
+                (0x83, 0x94, 0x96), (0x6c, 0x71, 0xc4), (0x93, 0xa1, 0xa1), (0xfd, 0xf6, 0xe3),
+            ],
+        }
+    }
+
+    /// 按索引取配色（与 [`TERM_THEMES`] 顺序一致）。
+    fn by_index(i: u8) -> Self {
+        match i {
+            0 => Self::dark(),
+            2 => Self::paper(),
+            3 => Self::mocha(),
+            4 => Self::solarized_light(),
+            _ => Self::light(), // 1 及越界
+        }
+    }
 }
+
+/// 终端配色清单（索引序）：(中文名, 英文名)。
+const TERM_THEMES: &[(&str, &str)] = &[
+    ("暖黑", "Warm dark"),
+    ("暖米", "Warm light"),
+    ("近白", "Paper"),
+    ("柔和深", "Mocha"),
+    ("经典浅", "Solarized light"),
+];
 
 impl Terminal {
     pub fn new() -> Self {
@@ -124,7 +184,7 @@ impl Terminal {
             sel_anchor: None,
             sel_cursor: None,
             clipboard: None,
-            dark: term_dark_flag().load(std::sync::atomic::Ordering::Relaxed), // 全局配色，沿用上次选择
+            theme: term_theme().load(std::sync::atomic::Ordering::Relaxed), // 全局配色，沿用上次选择
 
             input_line: String::new(),
             history: Vec::new(),
@@ -472,7 +532,7 @@ impl Terminal {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Vec<u8> {
         // 从全局配色同步：任一终端切换后，所有终端下一帧统一生效
-        self.dark = term_dark_flag().load(std::sync::atomic::Ordering::Relaxed);
+        self.theme = term_theme().load(std::sync::atomic::Ordering::Relaxed);
         // Ctrl+Shift+F 切换终端内容搜索
         if ui.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::F)) {
             if self.find.is_some() {
@@ -643,7 +703,7 @@ impl Terminal {
             }
         }
 
-        let tc = if self.dark { TermColors::dark() } else { TermColors::light() };
+        let tc = TermColors::by_index(self.theme);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, tc.bg);
 
@@ -799,19 +859,18 @@ impl Terminal {
                 ui.close();
             }
             ui.separator();
-            let theme_label = if self.dark {
-                crate::i18n::tr("切换为浅色终端", "Light terminal")
-            } else {
-                crate::i18n::tr("切换为深色终端", "Dark terminal")
-            };
-            if ui.button(theme_label).clicked() {
-                let nd = !self.dark;
-                // 写全局开关：所有终端同步切换；并存盘记住选择
-                term_dark_flag().store(nd, std::sync::atomic::Ordering::Relaxed);
-                crate::store::save_term_dark(nd);
-                self.dark = nd;
-                ui.close();
-            }
+            // 终端配色：多套主题（深/浅/近白/柔和深/经典浅），选中即全局同步并存盘
+            ui.menu_button(crate::i18n::tr("终端配色", "Terminal theme"), |ui| {
+                for (i, (zh, en)) in TERM_THEMES.iter().enumerate() {
+                    let i = i as u8;
+                    if ui.selectable_label(self.theme == i, crate::i18n::tr(zh, en)).clicked() {
+                        term_theme().store(i, std::sync::atomic::Ordering::Relaxed);
+                        crate::store::save_term_theme(i);
+                        self.theme = i;
+                        ui.close();
+                    }
+                }
+            });
             if ui.checkbox(&mut self.highlight, crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN")).clicked() {
                 ui.close();
             }
@@ -1354,6 +1413,8 @@ const HL_RULES: &[(&str, Color32)] = &[
     ("fatal", Color32::from_rgb(0xd0, 0x40, 0x40)),
     ("panic", Color32::from_rgb(0xd0, 0x40, 0x40)),
     ("fail", Color32::from_rgb(0xd0, 0x40, 0x40)),
+    // "warning" 放在 "warn" 之前，确保整词都被着色（否则子串匹配只染前 4 个字符）
+    ("warning", Color32::from_rgb(0xc8, 0x8a, 0x20)),
     ("warn", Color32::from_rgb(0xc8, 0x8a, 0x20)),
 ];
 

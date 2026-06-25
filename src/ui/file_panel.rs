@@ -58,6 +58,8 @@ pub struct FilePanelState {
     pub tree_spring_since: Option<(String, f64)>,
     /// 移动操作撤销栈（Ctrl+Z 逐步回退最近的拖拽移动）。
     pub move_undo: Vec<MoveRecord>,
+    /// 上传成功后待选中的项：(目录, 文件名集合)。该目录刷新渲染时按名选中并清空。
+    pub pending_select: Option<(String, std::collections::HashSet<String>)>,
 }
 
 /// 一次「移动」的撤销记录：被移动项的原始绝对路径 + 落入的目标目录。
@@ -624,6 +626,17 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     crate::i18n::Lang::En => format!("No match ({total_count} items)"),
                 }).color(Palette::TEXT_DIM).size(12.0));
             });
+        }
+    }
+
+    // 上传成功后选中所传文件：当前目录刷新出新列表时，按文件名定位行号并选中（命中后才清空，
+    // 以兼容「刷新尚未到达、文件暂未出现」的情形）。
+    if let Some(names) = state.pending_select.as_ref().filter(|(d, _)| *d == cwd).map(|(_, n)| n.clone()) {
+        let sel: HashSet<usize> = entries.iter().enumerate().filter(|(_, e)| names.contains(&e.name)).map(|(i, _)| i).collect();
+        if !sel.is_empty() {
+            state.anchor = sel.iter().min().copied();
+            state.selected = sel;
+            state.pending_select = None;
         }
     }
 
