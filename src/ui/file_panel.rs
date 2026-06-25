@@ -471,9 +471,28 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
                 }
 
-                // 收藏夹：弹出可滚动路径列表，点路径进入、右侧删除，点其它处关闭
-                let star = tool_btn_resp(ui, icon::STAR, crate::i18n::tr("收藏夹", "Favorites"), Palette::TEXT);
+                // 收藏夹：弹出可滚动路径列表，点路径进入、右侧删除，点其它处关闭。
+                // 图标：当前目录已收藏=实心灰 ★，未收藏=空心 ☆；弹窗打开时按钮显示按下态（灰底）。
+                let cwd_fav = !state.cwd.is_empty() && state.favorites.iter().any(|f| f == &state.cwd);
                 let pop_id = ui.make_persistent_id("fav_popup");
+                let pop_open = ui.memory(|m| m.is_popup_open(pop_id));
+                let star_glyph = if cwd_fav { "★" } else { "☆" };
+                let star_col = if cwd_fav { Palette::TEXT_DIM } else { Palette::TEXT };
+                let star = ui
+                    .scope(|ui| {
+                        let v = ui.visuals_mut();
+                        v.widgets.inactive.weak_bg_fill = if pop_open { Palette::TRACK } else { egui::Color32::TRANSPARENT };
+                        v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                        v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                        v.widgets.active.bg_stroke = egui::Stroke::NONE;
+                        ui.add(
+                            egui::Button::new(RichText::new(star_glyph).size(16.0).color(star_col))
+                                .min_size(egui::vec2(30.0, 26.0))
+                                .corner_radius(6.0),
+                        )
+                        .on_hover_text(crate::i18n::tr("收藏夹", "Favorites"))
+                    })
+                    .inner;
                 if star.clicked() {
                     ui.memory_mut(|m| m.toggle_popup(pop_id));
                 }
@@ -646,6 +665,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     }
 
     let cwd = state.cwd.clone();
+    let favs = state.favorites.clone(); // 供表格内右键菜单判断「已收藏」（state 在表格闭包里已被可变借用）
     let total_count = state.listings.get(&cwd).map(|e| e.len()).unwrap_or(0);
 
     // 名称过滤行：左侧留边（与操作栏一致）、右侧顶到边
@@ -782,7 +802,13 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         }
         if !state.cwd.is_empty() {
             ui.separator();
-            if ui.button(format!("{}  {}", icon::STAR, crate::i18n::tr("收藏当前目录", "Bookmark current dir"))).clicked() {
+            let faved = state.favorites.iter().any(|f| f == &state.cwd);
+            let lbl = if faved {
+                format!("★  {}", crate::i18n::tr("取消收藏当前目录", "Remove bookmark"))
+            } else {
+                format!("☆  {}", crate::i18n::tr("收藏当前目录", "Bookmark current dir"))
+            };
+            if ui.button(lbl).clicked() {
                 bg_fav = true;
                 ui.close();
             }
@@ -793,7 +819,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         }
     });
     if bg_fav {
-        add_favorite(state, state.cwd.clone());
+        toggle_favorite(state, state.cwd.clone());
     }
 
     egui::Frame::new()
@@ -970,7 +996,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             drop_move = Some((srcs, cwd.clone()));
                         }
                     }
-                    entry_context(&r, e, i, &full, has_clip, &mut menu);
+                    let is_fav = favs.iter().any(|f| f == &full);
+                    entry_context(&r, e, i, &full, has_clip, is_fav, &mut menu);
                 });
             }
         });
@@ -1159,7 +1186,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
             Menu::NewDir => state.dialog = Some(Dialog::NewDir { name: String::new() }),
             Menu::NewFile => state.dialog = Some(Dialog::NewFile { name: String::new() }),
             Menu::CdHere(p) => actions.push(FileAction::CdTerminal(p)),
-            Menu::Favorite(p) => add_favorite(state, p),
+            Menu::Favorite(p) => toggle_favorite(state, p),
         }
     }
 
@@ -1295,7 +1322,7 @@ enum Menu {
 }
 
 /// 条目右键菜单：把用户选择记录到 `menu`。
-fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, has_clip: bool, menu: &mut Vec<Menu>) {
+fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, has_clip: bool, is_fav: bool, menu: &mut Vec<Menu>) {
     use egui_phosphor::regular as icon;
     resp.context_menu(|ui| {
         if ui.button(format!("{}  {}", icon::FOLDER_PLUS, crate::i18n::tr("新建文件夹", "New folder"))).clicked() {
@@ -1331,9 +1358,16 @@ fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, h
             ui.close();
         }
         ui.separator();
-        if e.is_dir && ui.button(format!("{}  {}", icon::STAR, crate::i18n::tr("收藏该文件夹", "Bookmark folder"))).clicked() {
-            menu.push(Menu::Favorite(full.to_string()));
-            ui.close();
+        if e.is_dir {
+            let lbl = if is_fav {
+                format!("★  {}", crate::i18n::tr("取消收藏该文件夹", "Remove bookmark"))
+            } else {
+                format!("☆  {}", crate::i18n::tr("收藏该文件夹", "Bookmark folder"))
+            };
+            if ui.button(lbl).clicked() {
+                menu.push(Menu::Favorite(full.to_string()));
+                ui.close();
+            }
         }
         if e.is_dir && ui.button(format!("{}  {}", icon::TERMINAL_WINDOW, crate::i18n::tr("在终端打开此目录", "Open in terminal"))).clicked() {
             menu.push(Menu::CdHere(full.to_string()));
@@ -1481,12 +1515,16 @@ fn trailing_path(p: &str, max: usize) -> String {
     }
 }
 
-/// 加入收藏（去重）并持久化到该服务器的收藏表。
-fn add_favorite(state: &mut FilePanelState, path: String) {
-    if path.is_empty() || state.favorites.iter().any(|f| f == &path) {
+/// 收藏/取消收藏切换并持久化到该服务器的收藏表。
+fn toggle_favorite(state: &mut FilePanelState, path: String) {
+    if path.is_empty() {
         return;
     }
-    state.favorites.push(path);
+    if let Some(i) = state.favorites.iter().position(|f| f == &path) {
+        state.favorites.remove(i);
+    } else {
+        state.favorites.push(path);
+    }
     crate::store::save_favorites(&state.server_key, &state.favorites);
 }
 
