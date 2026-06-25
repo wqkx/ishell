@@ -4,9 +4,9 @@
 use egui::text::CCursor;
 use egui::text_selection::CCursorRange;
 use egui::RichText;
-use egui_extras::syntax_highlighting::{highlight, CodeTheme};
 
 use crate::theme::Palette;
+use crate::ui::highlight::{self, Indent};
 
 /// 超过该大小则不做语法高亮（省内存/CPU）。
 const HIGHLIGHT_LIMIT: usize = 256 * 1024;
@@ -29,6 +29,8 @@ pub struct Editor {
     line_ranges: Vec<(usize, usize)>,
     /// 只读模式下最长行的字节数（估算横向内容宽度，供横向滚动）
     max_line_bytes: usize,
+    /// 自动探测到的缩进风格（Tab 键 / 回车续进据此）
+    indent: Indent,
 }
 
 impl Editor {
@@ -40,6 +42,7 @@ impl Editor {
         let read_only = content.len() > EDIT_LIMIT;
         let line_ranges = if read_only { compute_line_ranges(&content) } else { Vec::new() };
         let max_line_bytes = line_ranges.iter().map(|(s, e)| e - s).max().unwrap_or(0);
+        let indent = highlight::detect_indent(&content);
         Self {
             orig: content.clone(),
             path,
@@ -53,6 +56,7 @@ impl Editor {
             read_only,
             line_ranges,
             max_line_bytes,
+            indent,
         }
     }
     pub fn dirty(&self) -> bool {
@@ -200,15 +204,36 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     }
     ui.separator();
 
-    // 代码编辑区（近白背景，显示更清晰；大文件不做高亮）
+    // —— 自动缩进：本编辑器聚焦时拦截 Tab / Shift+Tab / 回车，手动处理后阻止 TextEdit 默认行为 ——
+    // 用上一帧存储的光标位置（consume 必须在 TextEdit.show() 之前）。
+    if ui.memory(|m| m.focused() == Some(text_id)) {
+        if let Some(r) = egui::text_edit::TextEditState::load(ui.ctx(), text_id).and_then(|s| s.cursor.char_range()) {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                apply_enter(&mut ed.content, r, ed.indent, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+                apply_indent(&mut ed.content, r, ed.indent, false, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
+                apply_indent(&mut ed.content, r, ed.indent, true, ui.ctx(), text_id);
+            }
+        }
+    }
+
+    // 代码编辑区（近白背景，显示更清晰；大文件不做高亮/lint）
     let bg = egui::Color32::from_rgb(252, 252, 250); // 近白底
     let do_highlight = ed.content.len() <= HIGHLIGHT_LIMIT;
-    // 浅色高亮主题、字号 13：在近白底上关键字/字符串/注释对比清晰
-    let theme = CodeTheme::light(13.0);
+    // 初级 lint：括号配对（仅对可高亮大小的文件，避免大文件每帧扫描）
+    let (err_lines, err_ranges, lint_msg): (std::collections::HashSet<usize>, Vec<std::ops::Range<usize>>, Option<String>) =
+        if do_highlight {
+            let (lines, ranges, msg) = highlight::lint_brackets(&ed.content, &ed.language);
+            (lines.into_iter().collect(), ranges, msg)
+        } else {
+            (Default::default(), Vec::new(), None)
+        };
     let lang = ed.language.clone();
+    let err_for_layout = err_ranges.clone();
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = if do_highlight {
-            highlight(ui.ctx(), ui.style(), &theme, buf.as_str(), &lang)
+            highlight::highlight(buf.as_str(), &lang, 13.0, &err_for_layout)
         } else {
             let mut j = egui::text::LayoutJob::default();
             j.append(
@@ -225,6 +250,16 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         job.wrap.max_width = wrap_width;
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
+
+    // 状态行：缩进风格 + lint 概述
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.label(RichText::new(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label())).color(Palette::TEXT_DIM).size(11.0));
+        if let Some(msg) = &lint_msg {
+            ui.separator();
+            ui.label(RichText::new(msg).color(Palette::DANGER).size(11.0));
+        }
+    });
 
     let mono = egui::FontId::monospace(13.0);
     let n_lines = ed.content.split('\n').count().max(1);
@@ -261,7 +296,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                         if y + row_h < clip.top() || y > clip.bottom() {
                             continue;
                         }
-                        painter.text(egui::pos2(num_x, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
+                        // 该行有 lint 错误（括号不匹配）则行号标红
+                        let col = if err_lines.contains(&i) { Palette::DANGER } else { Palette::TEXT_DIM };
+                        painter.text(egui::pos2(num_x, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), col);
                     }
                 }
 
@@ -373,6 +410,113 @@ fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
 /// 字符下标 → 字节偏移（用于右键复制/剪切/粘贴按选区操作 UTF-8 内容）。
 fn char_to_byte(s: &str, c: usize) -> usize {
     s.char_indices().nth(c).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// 字节偏移 → 字符下标。
+fn byte_to_char(s: &str, b: usize) -> usize {
+    s[..b.min(s.len())].chars().count()
+}
+
+/// 写回 TextEdit 光标（c0=c1 即折叠光标）。
+fn set_cursor(ctx: &egui::Context, id: egui::Id, c0: usize, c1: usize) {
+    if let Some(mut st) = egui::text_edit::TextEditState::load(ctx, id) {
+        st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(c0), CCursor::new(c1))));
+        st.store(ctx, id);
+    }
+}
+
+/// 回车自动续进：删掉选区（若有）后插入「换行 + 当前行前导空白」；若行尾是 `{([:` 再加一级缩进。
+fn apply_enter(content: &mut String, r: CCursorRange, indent: Indent, ctx: &egui::Context, id: egui::Id) {
+    let range = r.as_sorted_char_range();
+    let cs = range.start;
+    let (bs, be) = (char_to_byte(content, cs), char_to_byte(content, range.end));
+    if be > bs {
+        content.replace_range(bs..be, "");
+    }
+    let b = char_to_byte(content, cs); // == bs（删除后）
+    let line_start = content[..b].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let lead: String = content[line_start..b].chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+    let before = content[line_start..b].trim_end();
+    let mut ins = String::from("\n");
+    ins.push_str(&lead);
+    if before.ends_with(|c| matches!(c, '{' | '(' | '[' | ':')) {
+        ins.push_str(&indent.unit());
+    }
+    content.insert_str(b, &ins);
+    let new_c = cs + ins.chars().count();
+    set_cursor(ctx, id, new_c, new_c);
+}
+
+/// 行首去掉最多一个缩进单位（一个 tab，或最多 unit_width 个空格），返回删除的字节数。
+fn dedent_line(content: &mut String, ls: usize, indent: Indent) -> usize {
+    if ls < content.len() && content.as_bytes()[ls] == b'\t' {
+        content.remove(ls);
+        return 1;
+    }
+    let w = match indent {
+        Indent::Spaces(n) => n,
+        Indent::Tab => 4,
+    };
+    let mut k = 0;
+    while k < w && ls + k < content.len() && content.as_bytes()[ls + k] == b' ' {
+        k += 1;
+    }
+    if k > 0 {
+        content.replace_range(ls..ls + k, "");
+    }
+    k
+}
+
+/// Tab / Shift+Tab：无选区时插入一级缩进 / 反缩进当前行；有选区时整体缩进 / 反缩进涉及的各行。
+fn apply_indent(content: &mut String, r: CCursorRange, indent: Indent, dedent: bool, ctx: &egui::Context, id: egui::Id) {
+    let range = r.as_sorted_char_range();
+    let (cs, ce) = (range.start, range.end);
+    let unit = indent.unit();
+
+    if !dedent && cs == ce {
+        // 单光标：原位插入一级缩进
+        let b = char_to_byte(content, cs);
+        content.insert_str(b, &unit);
+        set_cursor(ctx, id, cs + unit.chars().count(), cs + unit.chars().count());
+        return;
+    }
+
+    // 收集选区涉及的各行行首（无选区时即当前行）
+    let bs = char_to_byte(content, cs);
+    let be = char_to_byte(content, ce);
+    let first_line_start = content[..bs].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let mut line_starts: Vec<usize> = vec![first_line_start];
+    let mut search = first_line_start;
+    while search < be {
+        match content[search..be].find('\n') {
+            Some(off) => {
+                let ls = search + off + 1;
+                if ls < be {
+                    line_starts.push(ls);
+                    search = ls;
+                } else {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+
+    // 从后往前改，避免前面行的字节偏移被后续插入/删除影响
+    let mut total_delta: i64 = 0;
+    for &ls in line_starts.iter().rev() {
+        if dedent {
+            total_delta -= dedent_line(content, ls, indent) as i64;
+        } else {
+            content.insert_str(ls, &unit);
+            total_delta += unit.len() as i64;
+        }
+    }
+    // 选区调整为「首行行首 → 原选区末尾按字节增量平移」，使整块保持选中
+    let new_cs = byte_to_char(content, first_line_start);
+    let new_ce_byte = ((be as i64) + total_delta).max(first_line_start as i64) as usize;
+    let new_ce = byte_to_char(content, new_ce_byte.min(content.len()));
+    set_cursor(ctx, id, new_cs, new_ce);
 }
 
 fn find_from(text: &str, query: &str, from_char: usize) -> Option<(usize, usize)> {

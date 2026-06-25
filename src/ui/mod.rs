@@ -3,6 +3,7 @@
 pub mod connect;
 pub mod editor;
 pub mod file_panel;
+pub mod highlight;
 pub mod sidebar;
 
 use egui::{Color32, Rect, Vec2};
