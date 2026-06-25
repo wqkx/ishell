@@ -986,7 +986,14 @@ impl App {
             terminal: Terminal::new(),
             sysinfo: None,
             net_hist: NetHistory::default(),
-            files: FilePanelState::default(),
+            files: {
+                let key = format!("{}@{}:{}", cfg.username, cfg.host, cfg.port);
+                FilePanelState {
+                    favorites: crate::store::load_favorites(&key),
+                    server_key: key,
+                    ..Default::default()
+                }
+            },
             last_size: (0, 0),
             initialized: false,
             transfers: Vec::new(),
