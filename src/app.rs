@@ -2555,7 +2555,9 @@ impl App {
                             // 左侧剩余宽度：横向滚动标签（溢出可滚）+ 激活标签珊瑚下划线 + 切换后滚到可视区
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 egui::ScrollArea::horizontal()
-                                    .auto_shrink([false, false])
+                                    // 高度随内容（不撑满整行）——否则标签条会填满行高并顶到上方，
+                                    // 与右侧按钮无法在同一水平线居中。
+                                    .auto_shrink([false, true])
                                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
@@ -2605,9 +2607,9 @@ impl App {
                 }
             }
 
-            // 当前标签内容
+            // 当前标签内容（无内边距：底部状态栏、编辑区贴到窗口左右/底边，仿 VSCode）
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(Palette::PANEL).inner_margin(8))
+                .frame(egui::Frame::new().fill(Palette::PANEL).inner_margin(0))
                 .show(vctx, |ui| {
                     let active = ed.active;
                     if let Some(tab) = ed.tabs.get_mut(active) {

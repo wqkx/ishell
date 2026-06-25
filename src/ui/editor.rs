@@ -320,24 +320,38 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     let gutter_w = (digits as f32 + 1.5) * char_w; // 行号列宽
     let row_h = ui.ctx().fonts_mut(|f| f.row_height(&mono));
     // 底部固定状态栏（仿 VSCode）：缩进规则可点切换 + lint 概述 + 语言。先占住底部，编辑区填其余。
+    // 无内边距 → 内容贴到窗口左右/底边；缩进按钮做成「与栏等高的矩形」(无圆角、贴左)。
     egui::Panel::bottom("editor_status")
-        .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::symmetric(8, 3)))
+        .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::ZERO))
         .show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.menu_button(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label()), |ui| {
-                    ui.set_min_width(120.0);
-                    for ind in [Indent::Spaces(2), Indent::Spaces(4), Indent::Tab] {
-                        if ui.selectable_label(ed.indent == ind, ind.label()).clicked() {
-                            ed.indent = ind;
-                            ui.close();
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // 缩进按钮：矩形（无圆角）、与状态栏等高、贴左
+                ui.scope(|ui| {
+                    let v = ui.visuals_mut();
+                    v.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.active.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.open.corner_radius = egui::CornerRadius::ZERO;
+                    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0); // 决定按钮（即状态栏）高度与左右内边距
+                    ui.menu_button(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label()), |ui| {
+                        ui.set_min_width(120.0);
+                        for ind in [Indent::Spaces(2), Indent::Spaces(4), Indent::Tab] {
+                            if ui.selectable_label(ed.indent == ind, ind.label()).clicked() {
+                                ed.indent = ind;
+                                ui.close();
+                            }
                         }
-                    }
+                    });
                 });
                 if let Some(msg) = &lint_msg {
-                    ui.separator();
+                    ui.add_space(8.0);
                     ui.label(RichText::new(msg).color(Palette::DANGER).size(11.0));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
                 });
             });

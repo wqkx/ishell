@@ -26,7 +26,7 @@ impl Indent {
     /// 人类可读标签（状态栏显示）。
     pub fn label(&self) -> String {
         match self {
-            Indent::Spaces(n) => format!("{n} 空格"),
+            Indent::Spaces(n) => format!("{n} {}", crate::i18n::tr("空格", "spaces")),
             Indent::Tab => "Tab".into(),
         }
     }
