@@ -200,8 +200,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     // 用上一帧存储的光标位置（consume 必须在 TextEdit.show() 之前）。
     // 关键：输入法组字/提交（有 Ime 事件）时不拦截 Enter，否则会吃掉中文提交导致无法输入中文。
     let ime_active = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
-    // 临时关闭自动缩进拦截，确诊它是否就是导致中文输入失效的回归（consume_key 动了事件队列）。
-    if false && !ime_active && ui.memory(|m| m.focused() == Some(text_id)) {
+    if !ime_active && ui.memory(|m| m.focused() == Some(text_id)) {
         if let Some(r) = egui::text_edit::TextEditState::load(ui.ctx(), text_id).and_then(|s| s.cursor.char_range()) {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
                 apply_enter(&mut ed.content, r, ed.indent, ui.ctx(), text_id);
