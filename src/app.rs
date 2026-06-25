@@ -187,10 +187,8 @@ impl Session {
                         let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("cd {quoted}\r").into_bytes()));
                     }
                     self.restore_cwd = false;
-                    // 已同意过 OSC 7 注入 → 每次（重）连接的新 shell 静默重新注入，使工作目录持续上报。
-                    if osc7_consent() {
-                        let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
-                    }
+                    // OSC 7 注入改为「点菜单时按需注入」（那时 shell 闲置在提示符，回显可被可靠吞掉），
+                    // 不在连接时自动注入，避免与 MOTD/首个提示符的输出竞争、以及每次连接都注入。
                     // 断线前被中断的传输：重连后用新通道重发，底层据本地/远端已有字节自动续传
                     for t in &mut self.transfers {
                         if !t.paused {
@@ -3725,10 +3723,11 @@ impl App {
                     s.files.cwd = cwd;
                     s.files.selected.clear();
                 }
-                // 无 cwd 时点该菜单：已同意过则静默注入；否则弹确认框（同意后记住）
+                // 无 cwd 时点该菜单：已同意过则静默注入（吞掉命令回显）；否则弹确认框（同意后记住）
                 if s.terminal.take_inject_request() {
                     if osc7_consent() {
                         let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
+                        s.terminal.expect_echo(OSC7_SNIPPET);
                         s.osc7_pending_reveal = true;
                     } else {
                         s.osc7_confirm = true;
@@ -3763,6 +3762,7 @@ impl App {
                         Some(true) => {
                             set_osc7_consent(true);
                             let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
+                            s.terminal.expect_echo(OSC7_SNIPPET);
                             s.osc7_pending_reveal = true;
                             s.osc7_confirm = false;
                         }

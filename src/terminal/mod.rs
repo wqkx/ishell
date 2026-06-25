@@ -54,6 +54,11 @@ pub struct Terminal {
     reveal_cwd: Option<String>,
     /// 无 cwd 时点该菜单 → 请求 App 弹确认框注入 OSC 7
     inject_request: bool,
+    /// 待吞掉的「注入命令」回显（注入是我们替用户键入的，shell 必然回显，这里把它从输出里抹掉）
+    echo_expect: Vec<u8>,
+    echo_pos: usize,
+    /// 回显匹配完成后，再吞掉紧随的回车换行（命令执行的 Enter 回显）
+    echo_tail: bool,
     /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
     ime_preedit: String,
     /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
@@ -208,6 +213,9 @@ impl Terminal {
             osc7_cwd: None,
             reveal_cwd: None,
             inject_request: false,
+            echo_expect: Vec::new(),
+            echo_pos: 0,
+            echo_tail: false,
             ime_preedit: String::new(),
             prev_focused: false,
         }
@@ -224,6 +232,53 @@ impl Terminal {
     /// 取走「无 cwd 时请求注入」标志。
     pub fn take_inject_request(&mut self) -> bool {
         std::mem::take(&mut self.inject_request)
+    }
+    /// 登记一段「我们替用户键入」的命令文本，其 shell 回显将从输出中被吞掉（不显示在终端）。
+    /// 须在发送命令后、回显到达前调用（即点击注入的同一帧）。
+    pub fn expect_echo(&mut self, s: &str) {
+        self.echo_expect = s.as_bytes().to_vec();
+        self.echo_pos = 0;
+        self.echo_tail = false;
+    }
+    /// 从输入字节里剥掉待吞的注入命令回显；遇到非预期可见字节即放弃（保证不误吞真实输出）。
+    fn strip_echo(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut aborted = false;
+        for &b in input {
+            if aborted {
+                out.push(b);
+                continue;
+            }
+            if self.echo_pos < self.echo_expect.len() {
+                if b == self.echo_expect[self.echo_pos] {
+                    self.echo_pos += 1;
+                    if self.echo_pos >= self.echo_expect.len() {
+                        self.echo_tail = true; // 命令体已吞完，接着吞回车换行
+                    }
+                    continue;
+                }
+                if b == b'\r' || b == b'\n' {
+                    continue; // 终端自动换行/回显格式，忽略
+                }
+                // 出现非预期可见字节：放弃吞回显，原样输出剩余（避免误吞真实内容）
+                self.echo_expect.clear();
+                self.echo_pos = 0;
+                self.echo_tail = false;
+                aborted = true;
+                out.push(b);
+            } else if self.echo_tail {
+                if b == b'\r' || b == b'\n' {
+                    continue;
+                }
+                self.echo_tail = false;
+                aborted = true;
+                out.push(b);
+            } else {
+                aborted = true;
+                out.push(b);
+            }
+        }
+        out
     }
 
     /// 收集终端全部行文本（含回滚缓冲）。会临时改动 scrollback 并复原。
@@ -426,6 +481,14 @@ impl Terminal {
 
     /// 喂入来自远程的原始字节。
     pub fn feed(&mut self, bytes: &[u8]) {
+        // 注入命令的回显吞除（仅当有待吞内容时）
+        let stripped;
+        let bytes: &[u8] = if self.echo_pos < self.echo_expect.len() || self.echo_tail {
+            stripped = self.strip_echo(bytes);
+            &stripped
+        } else {
+            bytes
+        };
         // 会话日志：原样落盘（可用 cat 回放）
         if let Some(f) = &mut self.log_file {
             use std::io::Write;
