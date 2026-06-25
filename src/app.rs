@@ -381,13 +381,11 @@ fn init_view_state() {
 
 /// 监控栏（左侧菜单栏）统一右键菜单：语言 / 字体大小 / 折叠视图 / 强制 X11。
 /// 背景层与各子控件、以及折叠后的细条都调用它，保证右键处处一致。
-/// 取两色的中间色（线性 RGB 平均），用于终端边框在窗口色与终端底色之间过渡。
+/// 终端边框色：偏向终端底色 b 的加权混合（1/3 窗口色 a + 2/3 终端色 b）。
+/// 比 50/50 更贴近终端——深色主题更深、浅色主题更接近自身底色，过渡更自然。
 fn blend_color(a: egui::Color32, b: egui::Color32) -> egui::Color32 {
-    egui::Color32::from_rgb(
-        ((a.r() as u16 + b.r() as u16) / 2) as u8,
-        ((a.g() as u16 + b.g() as u16) / 2) as u8,
-        ((a.b() as u16 + b.b() as u16) / 2) as u8,
-    )
+    let mix = |x: u8, y: u8| ((x as u16 + 2 * y as u16) / 3) as u8;
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 pub fn view_context_menu(resp: &egui::Response) {
@@ -1115,7 +1113,8 @@ impl App {
                 self.xfer_just_opened = true;
             }
             FileAction::Upload { local, remote_dir } => {
-                let name = local.rsplit('/').next().unwrap_or("upload").to_string();
+                // 同时按 / 和 \ 取名，兼容 Windows 路径（否则显示带盘符的整段路径）
+                let name = local.rsplit(['/', '\\']).next().unwrap_or("upload").to_string();
                 // 去重：同一本地文件 → 同一远端目录 的任务已存在时复用它（理由同 Download）。
                 // 这是「上传中途失败/中断后再次上传出现两个任务、旧任务又续传」的根因修复。
                 let existing = s.transfers.iter().find(|t| {
@@ -2535,6 +2534,8 @@ impl App {
                     let want_scroll = ed.active != ed.shown;
                     let active = ed.active;
                     ui.horizontal(|ui| {
+                        // 固定行高并整体垂直居中，保证保存/查找按钮与标签上下对齐
+                        ui.set_min_height(28.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                                 do_save = true;

@@ -1430,7 +1430,7 @@ async fn upload(
     sink: &UiSink,
     cancel: Arc<AtomicBool>,
 ) {
-    let name = basename(&local);
+    let name = local_basename(&local); // 本地路径用 Windows 兼容的取名（处理反斜杠/盘符）
     let is_dir = tokio::fs::metadata(&local).await.map(|m| m.is_dir()).unwrap_or(false);
 
     // 冲突处理：远端目标已存在时，按策略 跳过 / 重命名 / 覆盖
@@ -1583,6 +1583,12 @@ async fn upload_file_once(
 
 fn basename(path: &str) -> String {
     path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// 取「本地」路径的文件名：同时按 `/` 和 `\` 切分，正确处理 Windows 路径
+/// （否则 `C:\Users\x\a.txt` 会被当成整体文件名上传，远端文件名也带上盘符路径）。
+fn local_basename(path: &str) -> String {
+    path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
 /// 读取远程文本文件（拒绝含 NUL 的二进制文件；非 force 时限制 4MB）。
