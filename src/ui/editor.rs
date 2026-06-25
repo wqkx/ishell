@@ -462,42 +462,46 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     }
                 }
 
-                // 查找：默认半透明灰高亮「所有」匹配项（next 仅用于定位/选中当前一个）。
+                // 查找：半透明灰高亮匹配项。关键性能：只在「当前可视区」内查找与高亮，
+                // 不每帧全文件扫描（大文件原来每帧扫全文 + 每个匹配 O(偏移) 转换 → 严重卡顿）。
                 if ed.show_find && !ed.find.is_empty() {
                     let clip = ui.clip_rect();
-                    // 当前选中(被 next 定位)的范围：跳过其叠加，避免与半透明选区叠加变深、盖住字符
-                    let cur = out.cursor_range.map(|r| r.as_sorted_char_range()).map(|r| (r.start, r.end));
-                    let painter = ui.painter();
-                    let hl = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56);
                     let gp = out.galley_pos;
-                    let pat_len = ed.find.chars().count();
-                    let mut start = 0usize;
-                    let mut cnt = 0u32;
-                    while let Some(off) = ed.content[start..].find(ed.find.as_str()) {
-                        let b0 = start + off;
-                        let b1 = b0 + ed.find.len();
-                        let c0 = byte_to_char(&ed.content, b0);
-                        let c1 = c0 + pat_len;
-                        if cur == Some((c0, c1)) {
-                            start = b1;
-                            continue;
-                        }
-                        let a = out.galley.pos_from_cursor(CCursor::new(c0));
-                        let z = out.galley.pos_from_cursor(CCursor::new(c1));
-                        // 仅同一行的匹配画一个矩形（查找词通常不含换行）
-                        if (z.top() - a.top()).abs() < 1.0 {
-                            let r = egui::Rect::from_min_max(
-                                egui::pos2(gp.x + a.left(), gp.y + a.top()),
-                                egui::pos2(gp.x + z.left(), gp.y + a.bottom()),
-                            );
-                            if r.intersects(clip) {
-                                painter.rect_filled(r, 2.0, hl);
+                    // 可视区对应的字符范围（galley 内坐标）
+                    let top = (clip.top() - gp.y).max(0.0);
+                    let bot = (clip.bottom() - gp.y).max(0.0);
+                    let first_c = out.galley.cursor_from_pos(egui::vec2(0.0, top)).index;
+                    let last_c = out.galley.cursor_from_pos(egui::vec2(f32::INFINITY, bot)).index;
+                    if last_c > first_c {
+                        let fb = char_to_byte(&ed.content, first_c);
+                        let lb = char_to_byte(&ed.content, last_c).min(ed.content.len());
+                        let cur = out.cursor_range.map(|r| r.as_sorted_char_range()).map(|r| (r.start, r.end));
+                        let painter = ui.painter();
+                        let hl = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56);
+                        let pat = ed.find.as_str();
+                        let pat_chars = ed.find.chars().count();
+                        let slice = &ed.content[fb..lb];
+                        let mut local = 0usize; // slice 内字节偏移
+                        let mut base_char = first_c; // slice[..local] 对应的全文字符数
+                        let mut scanned = 0usize; // 已统计到的 slice 字节，用于增量累加字符数
+                        while let Some(off) = slice[local..].find(pat) {
+                            let b_in_slice = local + off;
+                            base_char += slice[scanned..b_in_slice].chars().count();
+                            scanned = b_in_slice;
+                            let c0 = base_char;
+                            let c1 = c0 + pat_chars;
+                            if cur != Some((c0, c1)) {
+                                let a = out.galley.pos_from_cursor(CCursor::new(c0));
+                                let z = out.galley.pos_from_cursor(CCursor::new(c1));
+                                if (z.top() - a.top()).abs() < 1.0 {
+                                    let r = egui::Rect::from_min_max(
+                                        egui::pos2(gp.x + a.left(), gp.y + a.top()),
+                                        egui::pos2(gp.x + z.left(), gp.y + a.bottom()),
+                                    );
+                                    painter.rect_filled(r, 2.0, hl);
+                                }
                             }
-                        }
-                        start = b1;
-                        cnt += 1;
-                        if cnt >= 2000 {
-                            break;
+                            local = b_in_slice + pat.len();
                         }
                     }
                 }
