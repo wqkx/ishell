@@ -322,7 +322,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     // 底部固定状态栏（仿 VSCode）：缩进规则可点切换 + lint 概述 + 语言。先占住底部，编辑区填其余。
     // 无内边距 → 内容贴到窗口左右/底边；缩进按钮做成「与栏等高的矩形」(无圆角、贴左)。
     egui::Panel::bottom("editor_status")
-        .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::ZERO))
+        // 栏底色贴窗口左右/底边；左右留 8px 内边距，文字/按钮不顶边、不被遮挡；上下 0 让按钮与栏等高。
+        .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 }))
         .show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -380,9 +381,13 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
             ui.horizontal_top(|ui| {
                 ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
+                // 宽度填满「行号列之后的剩余可视宽度」而非 INFINITY：否则「行号列 + 无限宽正文」总宽
+                // 永远超过视口，横向滚动条常驻（且与视口边缘反复争用空间而闪动）。短行时正好填满、
+                // 无横向滚动条；仅当某行确实更长（不换行）时才出现横向滚动条。
+                let avail = ui.available_width().max(50.0);
                 let out = egui::TextEdit::multiline(&mut ed.content)
                     .code_editor()
-                    .desired_width(f32::INFINITY)
+                    .desired_width(avail)
                     .desired_rows(fill_rows)
                     .id(text_id)
                     .layouter(&mut layouter)
