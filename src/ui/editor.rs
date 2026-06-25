@@ -280,8 +280,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     egui::Frame::new().fill(bg).show(ui, |ui| {
         // 滚动条独立成右侧一列（不浮在内容上）——必须在创建 ScrollArea 之前设置
         ui.spacing_mut().scroll.floating = false;
-        // 滚动条滑块在近白底上保持可见的灰度（默认 active 偏白，拖动时会与背景混在一起）；
-        // 槽底用近白以与内容一致。这些须设在「创建 ScrollArea 的这个 ui」上才对滚动条生效。
+        // 滑块颜色取 widgets.*.bg_fill（默认 floating 样式用 fg_stroke，会忽略 bg_fill 而显白）。
+        ui.spacing_mut().scroll.foreground_color = false;
+        // 滑块在近白底上保持可见灰度（默认拖动时偏白看不清）；槽底用近白与内容一致。
         ui.visuals_mut().extreme_bg_color = bg;
         ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(202);
         ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_gray(168);

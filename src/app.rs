@@ -2512,6 +2512,12 @@ impl App {
                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ed.focus = false;
             }
+            // 编辑器内有文本框获得键盘输入时持续重绘：保证输入法预编辑/候选窗位置随光标上报，
+            // 否则中文输入法在此独立窗口里组字/上屏不正常（此前为治 Stage Manager 闪烁误删了它，
+            // 现仅作用于「编辑器窗口且正在输入」，主窗口不受影响）。
+            if vctx.egui_wants_keyboard_input() {
+                vctx.request_repaint();
+            }
             // Ctrl+Tab / Ctrl+Shift+Tab 切换编辑器标签（先 consume，免被文本框当作 Tab 字符）
             let n = ed.tabs.len();
             if n > 1 {
@@ -2537,6 +2543,7 @@ impl App {
                         // 固定行高并整体垂直居中，保证保存/查找按钮与标签上下对齐
                         ui.set_min_height(28.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.set_min_height(28.0); // 子布局也撑到行高，按钮才会真正垂直居中
                             if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                                 do_save = true;
                             }
@@ -3633,7 +3640,14 @@ impl App {
         // 6px 内边距（边框）用「窗口暖米」与「当前终端主题底色」的中间色（固定色，非渐变），
         // 让窗口与 shell 之间过渡柔和、不再是生硬的一圈暖米。
         let mut reconnect_click = false;
-        let term_border = blend_color(Palette::TERM_BG, crate::terminal::current_bg());
+        let tbg = crate::terminal::current_bg();
+        // 浅色终端（经典浅/近白/暖米）边框直接用终端底色，与 shell 一致、无缝；
+        // 深色终端用偏向终端的混合色，略留层次。
+        let term_border = if tbg.r() as u32 + tbg.g() as u32 + tbg.b() as u32 > 450 {
+            tbg
+        } else {
+            blend_color(Palette::TERM_BG, tbg)
+        };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
