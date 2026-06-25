@@ -2486,12 +2486,10 @@ impl App {
         let buf1 = self.ime_test.clone();
         let buf2 = self.ime_test2.clone();
         ctx.show_viewport_deferred(vid, builder, move |vctx, _class| {
-            if vctx.egui_wants_keyboard_input() {
-                vctx.request_repaint();
-            }
+            vctx.request_repaint(); // 诊断：无条件每帧重绘，验证次级窗口反复输入中文是否依赖持续重绘
             egui::CentralPanel::default().show(vctx, |ui| {
                 ui.add_space(6.0);
-                ui.label("① 普通文本框（无任何自定义）——请尝试输入中文：");
+                ui.label("① 普通文本框（无任何自定义）——请尝试『反复』输入中文：");
                 {
                     let mut s = buf1.lock().unwrap();
                     ui.add(egui::TextEdit::multiline(&mut *s).desired_width(f32::INFINITY).desired_rows(4));
@@ -2522,6 +2520,7 @@ impl App {
             .with_title("IME 测试窗口(immediate)")
             .with_inner_size([480.0, 220.0]);
         ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
+            vctx.request_repaint(); // 诊断：无条件每帧重绘
             egui::CentralPanel::default().show(vctx, |ui| {
                 ui.add_space(6.0);
                 ui.label("③ immediate 模式 普通文本框——请尝试『反复』输入中文：");
