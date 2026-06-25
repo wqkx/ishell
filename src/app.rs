@@ -2543,11 +2543,13 @@ impl App {
                         // 固定行高并整体垂直居中，保证保存/查找按钮与标签上下对齐
                         ui.set_min_height(28.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.set_min_height(28.0); // 子布局也撑到行高，按钮才会真正垂直居中
+                            // 居中要点：不在子布局再 set_min_height（与主窗口 top_tabs 一致），
+                            // 否则按钮会被顶到上方；行高由外层 horizontal 的 set_min_height(28) 决定。
                             if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                                 do_save = true;
                             }
-                            if ui.button(RichText::new(format!("{}  {}", icon::MAGNIFYING_GLASS, crate::i18n::tr("查找", "Find")))).clicked() {
+                            // 查找：采用主窗口右侧按钮（flat_button）样式
+                            if flat_button(ui, &RichText::new(format!("{} {}", icon::MAGNIFYING_GLASS, crate::i18n::tr("查找", "Find"))), crate::i18n::tr("查找 / 替换", "Find / replace")) {
                                 toggle_find = true;
                             }
                             // 左侧剩余宽度：横向滚动标签（溢出可滚）+ 激活标签珊瑚下划线 + 切换后滚到可视区

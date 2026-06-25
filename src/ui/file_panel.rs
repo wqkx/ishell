@@ -60,6 +60,12 @@ pub struct FilePanelState {
     pub move_undo: Vec<MoveRecord>,
     /// 上传成功后待选中的项：(目录, 文件名集合)。该目录刷新渲染时按名选中并清空。
     pub pending_select: Option<(String, std::collections::HashSet<String>)>,
+    /// 「返回上一个目录」历史栈（浏览器式后退；区别于「上级目录」=parent）。
+    pub nav_history: Vec<String>,
+    /// 上一帧末的 cwd，用于检测目录切换并把旧目录压入历史。
+    pub nav_prev: String,
+    /// 本次切换由「后退」触发（不再压栈，避免来回循环）。
+    pub nav_pending_back: bool,
 }
 
 /// 一次「移动」的撤销记录：被移动项的原始绝对路径 + 落入的目标目录。
@@ -168,6 +174,19 @@ impl FilePanelState {
 
 pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Vec<FileAction> {
     let mut actions = Vec::new();
+
+    // 导航历史：检测上一帧的目录切换；非「后退」触发时，把旧目录压入历史，供「返回上一个目录」用。
+    if state.cwd != state.nav_prev {
+        if state.nav_pending_back {
+            state.nav_pending_back = false;
+        } else if !state.nav_prev.is_empty() {
+            state.nav_history.push(state.nav_prev.clone());
+            if state.nav_history.len() > 100 {
+                state.nav_history.remove(0);
+            }
+        }
+        state.nav_prev = state.cwd.clone();
+    }
 
     // 拖入文件 -> 上传到当前目录
     let dropped: Vec<String> = ui.input(|i| {
@@ -406,18 +425,22 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     state.loading.insert(state.cwd.clone());
                     actions.push(FileAction::List(state.cwd.clone()));
                 }
+                // 返回上一个目录（浏览器式后退，可连续返回；区别于「上级目录」=parent）
+                let back_enabled = !state.nav_history.is_empty();
+                let back_col = if back_enabled { Palette::TEXT } else { Palette::TEXT_DIM };
+                if tool_btn_color(ui, icon::ARROW_LEFT, crate::i18n::tr("返回上一个目录", "Back"), back_col) && back_enabled {
+                    if let Some(prev) = state.nav_history.pop() {
+                        state.nav_pending_back = true;
+                        state.cwd = prev;
+                        state.selected.clear();
+                    }
+                }
                 let up_resp = tool_btn_resp(ui, icon::ARROW_UP, crate::i18n::tr("上级目录", "Up"), Palette::TEXT);
                 if up_resp.clicked() && !state.cwd.is_empty() {
                     state.cwd = parent_of(&state.cwd);
                     state.selected.clear();
                 }
                 handle_up_drag(ui, state, &up_resp, &mut up_move, &mut spring_target);
-                if tool_btn(ui, icon::FOLDER_PLUS, crate::i18n::tr("新建目录", "New folder")) {
-                    state.dialog = Some(Dialog::NewDir { name: String::new() });
-                }
-                if tool_btn(ui, icon::FILE_PLUS, crate::i18n::tr("新建文件", "New file")) {
-                    state.dialog = Some(Dialog::NewFile { name: String::new() });
-                }
                 // 上传 / 删除已从工具栏移除：上传走拖拽或空白处右键菜单，删除走右键菜单或 Delete 键
                 // 粘贴：剪贴板有内容时显示（内容/数量由 App 持有）
                 if has_clip
@@ -599,6 +622,22 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         Some(e) => e.clone(),
         None => return,
     };
+    // 预取：进入目录后顺带请求各「直接子文件夹」的列表，点进下一级时即时显示（命中缓存）。
+    // 每个子目录只在未缓存且未加载时请求一次；上限避免极端目录发起过多请求。
+    {
+        let mut prefetched = 0;
+        for e in entries.iter().filter(|e| e.is_dir && !e.is_link) {
+            if prefetched >= 64 {
+                break;
+            }
+            let sub = join_path(&cwd, &e.name);
+            if !state.listings.contains_key(&sub) && !state.loading.contains(&sub) {
+                state.loading.insert(sub.clone());
+                actions.push(FileAction::List(sub));
+                prefetched += 1;
+            }
+        }
+    }
     // 排序：目录始终在前，组内按所选键升/降序
     {
         let key = state.sort_key;
@@ -707,7 +746,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         .column(Column::auto().at_least(80.0))
         .column(Column::auto().at_least(140.0))
         .column(Column::auto().at_least(96.0))
-        .column(Column::remainder())
+        // owner 列用 auto 而非 remainder：列表填不满时右侧留白，便于右键空白处操作当前文件夹
+        .column(Column::auto().at_least(120.0))
         .header(22.0, |mut h| {
             let (cur, desc) = (state.sort_key, state.sort_desc);
             // 可排序表头：点击切换排序键/方向，激活列显示升降箭头
