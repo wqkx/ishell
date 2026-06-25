@@ -515,6 +515,10 @@ pub struct App {
     image_focus: bool,
     /// 上次渲染时的激活看图标签（用于侦测切换后滚到可视区）
     image_shown: usize,
+    /// 看图标签拖动重排状态（仿主窗口）
+    img_tab_drag: Option<usize>,
+    img_grab_dx: f32,
+    img_total_w: f32,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
@@ -635,6 +639,10 @@ struct EditorState {
     close_tab_confirm: Option<usize>,
     /// 关闭标签后请求主循环归还内存（trim）
     trim_request: bool,
+    /// 标签拖动重排状态（仿主窗口）：拖动索引 / 抓取偏移 / 内容总宽缓存
+    tab_drag: Option<usize>,
+    tab_grab_dx: f32,
+    tab_total_w: f32,
 }
 
 impl EditorState {
@@ -722,6 +730,9 @@ impl App {
             active_image: 0,
             image_focus: false,
             image_shown: 0,
+            img_tab_drag: None,
+            img_grab_dx: 0.0,
+            img_total_w: 0.0,
             next_editor_id: 0,
             trim_after: None,
             show_forwards: false,
@@ -2555,23 +2566,18 @@ impl App {
             let mut close_tab: Option<usize> = None;
             let mut activate: Option<usize> = None;
             let mut do_save = false;
-            let mut drag_idx: Option<usize> = None; // 本帧正被拖动的标签
-            let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new(); // 各标签矩形（用于拖动落点判定）
-
             let mut toggle_find = false;
-            // 标签栏：左侧可滚动标签，右侧「保存 / 查找」（对齐主窗口风格）
+            // 标签栏：左侧可拖动重排的标签（仿主窗口，带跟手+缓动），右侧「保存 / 查找」
             egui::Panel::top("editor_tabs")
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
                     ui.style_mut().interaction.tooltip_delay = 0.5; // 悬停 0.5s 才弹出完整路径
                     let want_scroll = ed.active != ed.shown;
-                    let active = ed.active;
                     ui.horizontal(|ui| {
                         // 固定行高并整体垂直居中，保证保存/查找按钮与标签上下对齐
                         ui.set_min_height(28.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // 居中要点：不在子布局再 set_min_height（与主窗口 top_tabs 一致），
-                            // 否则按钮会被顶到上方；行高由外层 horizontal 的 set_min_height(28) 决定。
+                            // 居中要点：不在子布局再 set_min_height（与主窗口 top_tabs 一致）。
                             if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                                 do_save = true;
                             }
@@ -2579,69 +2585,40 @@ impl App {
                             if flat_button(ui, &RichText::new(format!("{} {}", icon::MAGNIFYING_GLASS, crate::i18n::tr("查找", "Find"))), crate::i18n::tr("查找 / 替换", "Find / replace")) {
                                 toggle_find = true;
                             }
-                            // 左侧剩余宽度：横向滚动标签（溢出可滚）+ 激活标签珊瑚下划线 + 切换后滚到可视区
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                egui::ScrollArea::horizontal()
-                                    // 高度随内容（不撑满整行）——否则标签条会填满行高并顶到上方，
-                                    // 与右侧按钮无法在同一水平线居中。
-                                    .auto_shrink([false, true])
-                                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                                    .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL) // 拖动标签不触发滚动
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            for (i, t) in ed.tabs.iter().enumerate() {
-                                                let selected = i == active;
-                                                let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
-                                                let r = egui::Frame::new()
-                                                    .fill(fill)
-                                                    .corner_radius(6)
-                                                    .inner_margin(egui::Margin::symmetric(8, 3))
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal(|ui| {
-                                                            let dirty = if t.editor.dirty() { " ●" } else { "" };
-                                                            let label = format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty);
-                                                            let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                                            // 标签悬停 0.5s 显示完整路径；可拖动重排
-                                                            let lab = ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click_and_drag()))
-                                                                .on_hover_text(t.editor.path.as_str());
-                                                            if lab.clicked() {
-                                                                activate = Some(i);
-                                                            }
-                                                            if lab.dragged() {
-                                                                drag_idx = Some(i);
-                                                            }
-                                                            if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
-                                                                close_tab = Some(i);
-                                                            }
-                                                        });
-                                                    });
-                                                tab_rects.push((i, r.response.rect));
-                                                if selected {
-                                                    let rect = r.response.rect;
-                                                    ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
-                                                    if want_scroll {
-                                                        ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    });
+                                let labels: Vec<(u64, String, String)> = ed
+                                    .tabs
+                                    .iter()
+                                    .map(|t| {
+                                        let dirty = if t.editor.dirty() { " ●" } else { "" };
+                                        (
+                                            t.text_id.value(),
+                                            format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty),
+                                            t.editor.path.clone(),
+                                        )
+                                    })
+                                    .collect();
+                                let active = ed.active;
+                                // 解引用为 &mut EditorState，借用检查器才允许同时可变借用多个不相交字段
+                                let edm: &mut EditorState = &mut ed;
+                                let (act, cls, reord) = draggable_tabs(ui, &mut edm.tab_drag, &mut edm.tab_grab_dx, &mut edm.tab_total_w, active, want_scroll, &labels);
+                                if let Some(a) = act {
+                                    activate = Some(a);
+                                }
+                                if let Some(c) = cls {
+                                    close_tab = Some(c);
+                                }
+                                if let Some((from, to)) = reord {
+                                    if from < ed.tabs.len() && to < ed.tabs.len() {
+                                        ed.tabs.swap(from, to);
+                                        ed.active = if ed.active == from { to } else if ed.active == to { from } else { ed.active };
+                                    }
+                                }
                             });
                         });
                     });
                     ed.shown = ed.active;
                 });
-            // 拖动重排标签：拖动中实时把被拖标签与指针所在标签交换（活动标签跟随移动）
-            if let Some(src) = drag_idx {
-                if let Some(px) = vctx.input(|i| i.pointer.interact_pos().map(|p| p.x)) {
-                    if let Some(&(dst, _)) = tab_rects.iter().find(|(_, r)| px >= r.left() && px <= r.right()) {
-                        if dst != src && src < ed.tabs.len() && dst < ed.tabs.len() {
-                            ed.tabs.swap(src, dst);
-                            ed.active = if ed.active == src { dst } else if ed.active == dst { src } else { ed.active };
-                        }
-                    }
-                }
-            }
             if toggle_find {
                 let active = ed.active;
                 if let Some(t) = ed.tabs.get_mut(active) {
@@ -2839,16 +2816,13 @@ impl App {
             let mut do_fit = false;
             let mut do_one = false;
             let mut do_save_as = false;
-            let mut drag_idx: Option<usize> = None;
-            let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
-            // 标签栏（仿编辑器：左侧可滚动标签，右侧操作按钮，整体垂直居中）
+            // 标签栏（仿编辑器/主窗口：左侧可拖动重排的标签，右侧操作按钮，整体垂直居中）
             egui::Panel::top("image_tabs")
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
                     ui.style_mut().interaction.tooltip_delay = 0.5; // 悬停 0.5s 显示完整路径
                     let want_scroll = self.active_image != self.image_shown;
-                    let active = self.active_image;
                     ui.horizontal(|ui| {
                         ui.set_min_height(28.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2862,66 +2836,38 @@ impl App {
                             if flat_button(ui, &RichText::new(crate::i18n::tr("适应窗口", "Fit")), crate::i18n::tr("适应窗口", "Fit to window")) {
                                 do_fit = true;
                             }
-                            // 左侧剩余宽度：横向滚动标签（高度随内容，与右侧按钮同线居中）
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                egui::ScrollArea::horizontal()
-                                    .auto_shrink([false, true])
-                                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                                    .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL) // 拖动标签不触发滚动
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            for (i, t) in self.image_tabs.iter().enumerate() {
-                                                let selected = i == active;
-                                                let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
-                                                let r = egui::Frame::new()
-                                                    .fill(fill)
-                                                    .corner_radius(6)
-                                                    .inner_margin(egui::Margin::symmetric(8, 3))
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal(|ui| {
-                                                            let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
-                                                            let label = format!("{} {}·{}", icon::IMAGE, t.server, fname);
-                                                            let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                                            let lab = ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click_and_drag()))
-                                                                .on_hover_text(t.path.as_str());
-                                                            if lab.clicked() {
-                                                                activate = Some(i);
-                                                            }
-                                                            if lab.dragged() {
-                                                                drag_idx = Some(i);
-                                                            }
-                                                            if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
-                                                                close_tab = Some(i);
-                                                            }
-                                                        });
-                                                    });
-                                                tab_rects.push((i, r.response.rect));
-                                                if selected {
-                                                    let rect = r.response.rect;
-                                                    ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
-                                                    if want_scroll {
-                                                        ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    });
+                                let labels: Vec<(u64, String, String)> = self
+                                    .image_tabs
+                                    .iter()
+                                    .map(|t| {
+                                        let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
+                                        (
+                                            egui::Id::new((&t.server, &t.path)).value(),
+                                            format!("{} {}·{}", icon::IMAGE, t.server, fname),
+                                            t.path.clone(),
+                                        )
+                                    })
+                                    .collect();
+                                let active = self.active_image;
+                                let (act, cls, reord) = draggable_tabs(ui, &mut self.img_tab_drag, &mut self.img_grab_dx, &mut self.img_total_w, active, want_scroll, &labels);
+                                if let Some(a) = act {
+                                    activate = Some(a);
+                                }
+                                if let Some(c) = cls {
+                                    close_tab = Some(c);
+                                }
+                                if let Some((from, to)) = reord {
+                                    if from < self.image_tabs.len() && to < self.image_tabs.len() {
+                                        self.image_tabs.swap(from, to);
+                                        self.active_image = if self.active_image == from { to } else if self.active_image == to { from } else { self.active_image };
+                                    }
+                                }
                             });
                         });
                     });
                     self.image_shown = self.active_image;
                 });
-            // 拖动重排标签：拖动中实时与指针所在标签交换
-            if let Some(src) = drag_idx {
-                if let Some(px) = vctx.input(|i| i.pointer.interact_pos().map(|p| p.x)) {
-                    if let Some(&(dst, _)) = tab_rects.iter().find(|(_, r)| px >= r.left() && px <= r.right()) {
-                        if dst != src && src < self.image_tabs.len() && dst < self.image_tabs.len() {
-                            self.image_tabs.swap(src, dst);
-                            self.active_image = if self.active_image == src { dst } else if self.active_image == dst { src } else { self.active_image };
-                        }
-                    }
-                }
-            }
 
             // 底部状态栏（仿编辑器：贴窗口左右/底边；左侧尺寸/缩放，右侧文件名）
             egui::Panel::bottom("image_status")
@@ -3860,6 +3806,140 @@ fn dialog_button(ui: &mut egui::Ui, label: &str, fill: Option<egui::Color32>, wi
         btn = btn.fill(f);
     }
     ui.add(btn).clicked()
+}
+
+/// 可拖动重排 + 缓动动画的标签条（仿主窗口顶部标签）。在当前 `ui` 内画一行可横向滚动的标签。
+/// `labels`：每项 (稳定 uid, 显示文本, 悬停提示)。`drag`/`grab_dx`/`total_w` 为调用方持有的状态。
+/// 返回 (要激活索引, 要关闭索引, 重排 (from,to))。
+fn draggable_tabs(
+    ui: &mut egui::Ui,
+    drag: &mut Option<usize>,
+    grab_dx: &mut f32,
+    total_w: &mut f32,
+    active: usize,
+    want_scroll: bool,
+    labels: &[(u64, String, String)],
+) -> (Option<usize>, Option<usize>, Option<(usize, usize)>) {
+    let mut to_activate = None;
+    let mut to_close = None;
+    let mut reorder = None;
+    let mut drag_start: Option<usize> = None;
+    let mut new_grab: Option<f32> = None;
+    let mut drag_w = 0.0f32;
+    let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
+    let dragging_tab = *drag;
+    let total_w_in = (*total_w).max(1.0);
+    let out = egui::ScrollArea::horizontal()
+        .auto_shrink([false, true])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
+        .show(ui, |ui| {
+            let tab_h = 24.0;
+            let spacing = 4.0;
+            let (area, _) = ui.allocate_exact_size(egui::vec2(total_w_in, tab_h), Sense::hover());
+            let origin = area.min;
+            let pointer = ui.input(|i| i.pointer.interact_pos());
+            let drag_down = ui.input(|i| i.pointer.any_down());
+            let ctx = ui.ctx().clone();
+            let font = egui::FontId::proportional(12.0);
+            let mut acc = 0.0f32;
+            for (i, (uid, text, tip)) in labels.iter().enumerate() {
+                let selected = active == i;
+                let title_w = ctx.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), Palette::TEXT).rect.width());
+                let w = title_w + 16.0 + 22.0; // 左内边距 + 文本 + 右侧关闭区
+                let target = acc;
+                if selected && want_scroll {
+                    let r = egui::Rect::from_min_size(egui::pos2(origin.x + target, origin.y), egui::vec2(w, tab_h));
+                    ui.scroll_to_rect(r.expand2(egui::vec2(12.0, 0.0)), None);
+                }
+                let id = egui::Id::new(("dtabx", *uid));
+                let dragging_this = drag_down && dragging_tab == Some(i);
+                if dragging_this {
+                    drag_w = w;
+                }
+                let x = if dragging_this {
+                    let want = pointer.map(|p| p.x - origin.x - *grab_dx).unwrap_or(target);
+                    ctx.animate_value_with_time(id, want, 0.0) // 跟手
+                } else {
+                    ctx.animate_value_with_time(id, target, 0.14) // 缓动到目标槽
+                };
+                let tab_rect = egui::Rect::from_min_size(egui::pos2(origin.x + x, origin.y), egui::vec2(w, tab_h));
+                let resp = ui.interact(tab_rect, egui::Id::new(("dtab", *uid)), Sense::click_and_drag()).on_hover_text(tip.as_str());
+                let close_rect = egui::Rect::from_center_size(egui::pos2(tab_rect.right() - 12.0, tab_rect.center().y), egui::vec2(16.0, 16.0));
+                let close_resp = ui.interact(close_rect, egui::Id::new(("dtabclose", *uid)), Sense::click());
+                let p = ui.painter();
+                let fill = if dragging_this { Palette::ACCENT_SOFT } else if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
+                p.rect_filled(tab_rect, 6, fill);
+                if selected && !dragging_this {
+                    p.hline(tab_rect.left()..=tab_rect.right(), tab_rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
+                }
+                let tcolor = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
+                p.text(egui::pos2(tab_rect.left() + 8.0, tab_rect.center().y), egui::Align2::LEFT_CENTER, text, font.clone(), tcolor);
+                let xcolor = if close_resp.hovered() { Palette::DANGER } else { Palette::TEXT_DIM };
+                p.text(close_rect.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::X, egui::FontId::proportional(11.0), xcolor);
+                if close_resp.clicked() {
+                    to_close = Some(i);
+                } else if resp.clicked() {
+                    to_activate = Some(i);
+                } else if resp.middle_clicked() {
+                    to_close = Some(i);
+                }
+                if resp.drag_started() {
+                    drag_start = Some(i);
+                    if let Some(pp) = pointer {
+                        new_grab = Some(pp.x - (origin.x + x));
+                    }
+                }
+                tab_rects.push((i, egui::Rect::from_min_size(egui::pos2(origin.x + target, origin.y), egui::vec2(w, tab_h))));
+                acc += w + spacing;
+            }
+            acc
+        });
+    *total_w = out.inner.max(1.0);
+    // 溢出渐隐提示
+    let off = out.state.offset.x;
+    let vw = out.inner_rect.width();
+    if off > 0.5 {
+        edge_fade(ui.painter(), out.inner_rect, true, Palette::BG);
+    }
+    if off + vw < out.inner - 0.5 {
+        edge_fade(ui.painter(), out.inner_rect, false, Palette::BG);
+    }
+    if let Some(g) = new_grab {
+        *grab_dx = g;
+    }
+    if let Some(f) = drag_start {
+        *drag = Some(f);
+    }
+    if let Some(from) = *drag {
+        if ui.input(|i| i.pointer.any_down()) {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                let drag_center = pos.x - *grab_dx + drag_w / 2.0;
+                let mut to = from;
+                if from > 0 {
+                    if let Some(&(_, lr)) = tab_rects.get(from - 1) {
+                        if drag_center < lr.center().x {
+                            to = from - 1;
+                        }
+                    }
+                }
+                if to == from {
+                    if let Some(&(_, rr)) = tab_rects.get(from + 1) {
+                        if drag_center > rr.center().x {
+                            to = from + 1;
+                        }
+                    }
+                }
+                if to != from {
+                    reorder = Some((from, to));
+                    *drag = Some(to);
+                }
+            }
+        } else {
+            *drag = None;
+        }
+    }
+    (to_activate, to_close, reorder)
 }
 
 fn flat_button(ui: &mut egui::Ui, text: &RichText, tip: &str) -> bool {
