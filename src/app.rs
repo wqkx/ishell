@@ -1513,6 +1513,7 @@ impl eframe::App for App {
                 }
             }
         }
+        let opened_editor = !new_tabs.is_empty();
         for (path, content, server, tx) in new_tabs {
             let tid = self.alloc_editor_id(); // 借用 self，需在锁外取
             let mut ed = self.editor_state.lock().unwrap();
@@ -1529,6 +1530,11 @@ impl eframe::App for App {
                 });
                 ed.active = ed.tabs.len() - 1;
             }
+        }
+        // 编辑器是独立 deferred 子窗口：新开/切换文件后必须显式唤醒它重绘，否则内容不刷新，
+        // 要手动点一下窗口才更新。
+        if opened_editor {
+            ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
 
         // 断线自动重连：到点的执行重连，并安排下次唤醒（即使无交互也能触发）
