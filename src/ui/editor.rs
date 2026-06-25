@@ -23,12 +23,6 @@ pub struct Editor {
     show_find: bool,
     search_from: usize,
     status: String,
-    /// 大文件只读模式
-    read_only: bool,
-    /// 只读模式下各行的字节范围（用于虚拟化渲染）
-    line_ranges: Vec<(usize, usize)>,
-    /// 只读模式下最长行的字节数（估算横向内容宽度，供横向滚动）
-    max_line_bytes: usize,
     /// 自动探测到的缩进风格（Tab 键 / 回车续进据此）
     indent: Indent,
     /// 上一帧的非空选区（右键会折叠选区，菜单复制/剪切用这个冻结值）
@@ -50,6 +44,20 @@ pub struct Editor {
     vgoal_col: Option<usize>,
     /// 选区锚点（Some 时 [anchor, caret] 为选区）
     vsel: Option<usize>,
+    /// 虚拟编辑器撤销/重做栈（操作式，省内存）
+    vundo: Vec<EditOp>,
+    vredo: Vec<EditOp>,
+}
+
+/// 一次编辑操作：把 content[at..at+removed.len()] 由 removed 换成 inserted。
+#[derive(Clone)]
+struct EditOp {
+    at: usize,
+    removed: String,
+    inserted: String,
+    /// 操作后光标位置（用于撤销/重做后定位）
+    caret_after: usize,
+    caret_before: usize,
 }
 
 impl Editor {
@@ -58,9 +66,6 @@ impl Editor {
             .rsplit_once('.')
             .map(|(_, e)| e.to_lowercase())
             .unwrap_or_else(|| "txt".into());
-        let read_only = content.len() > EDIT_LIMIT;
-        let line_ranges = if read_only { compute_line_ranges(&content) } else { Vec::new() };
-        let max_line_bytes = line_ranges.iter().map(|(s, e)| e - s).max().unwrap_or(0);
         let indent = highlight::detect_indent(&content);
         Self {
             orig: content.clone(),
@@ -72,9 +77,6 @@ impl Editor {
             show_find: false,
             search_from: 0,
             status: String::new(),
-            read_only,
-            line_ranges,
-            max_line_bytes,
             indent,
             last_sel: None,
             menu_sel: None,
@@ -85,6 +87,8 @@ impl Editor {
             vmax: 0,
             vgoal_col: None,
             vsel: None,
+            vundo: Vec::new(),
+            vredo: Vec::new(),
         }
     }
     /// 切换查找栏（供窗口标签栏的「查找」按钮调用）；打开时请求聚焦查找框。
@@ -111,72 +115,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     use egui_phosphor::regular as icon;
     let mut save = false;
 
-    // 大文件：只读、按行虚拟化渲染（仅渲染可见行，内存占用低）
-    if ed.read_only {
-        let mb = ed.content.len() as f64 / 1_048_576.0;
-        ui.horizontal(|ui| {
-            // 按钮 + 大文件提示先占右侧，路径在剩余宽度里横向滚动、默认贴右
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(RichText::new(format!("{}  {}", icon::PENCIL_SIMPLE, crate::i18n::tr("改为可编辑", "Make editable"))))
-                    .on_hover_text(crate::i18n::tr("大文件编辑会占用较多内存（约文件大小的数倍），关闭后自动释放", "Editing large files uses several× the file size in RAM; freed on close"))
-                    .clicked()
-                {
-                    ed.read_only = false;
-                    // 释放只读行索引（编辑模式不再需要）
-                    ed.line_ranges = Vec::new();
-                }
-                ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("（大文件 {mb:.1} MB · 只读）"), crate::i18n::Lang::En => format!("(large {mb:.1} MB · read-only)") }).color(Palette::WARN).size(11.0));
-            });
-        });
-        ui.separator();
-        // 手动虚拟化渲染（仅画可见行）。用 show_viewport 而非 show_rows：后者在本窗口里
-        // 不会撑满可用高度（内容只占可见行高度、下方留大片空白）。
-        let mono = egui::TextStyle::Monospace.resolve(ui.style());
-        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-        let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, ' ')).max(1.0);
-        let total = ed.line_ranges.len();
-        let digits = total.max(1).to_string().len();
-        let gutter_w = (digits as f32 + 1.5) * char_w; // 行号区宽度
-        let content_w = gutter_w + (ed.max_line_bytes as f32 + 2.0) * char_w;
-        let content_h = total as f32 * row_h;
-        let bg = egui::Color32::from_rgb(252, 252, 250); // 近白底，与可编辑模式一致
-        egui::Frame::new().fill(bg).show(ui, |ui| {
-        egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id).show_viewport(ui, |ui, vp| {
-            ui.set_width(content_w);
-            ui.set_height(content_h);
-            let origin = ui.min_rect().min;
-            let first = (vp.min.y / row_h).floor().max(0.0) as usize;
-            let visible = (vp.height() / row_h).ceil() as usize + 2;
-            let last = (first + visible).min(total);
-            let painter = ui.painter();
-            for i in first..last {
-                let y = origin.y + i as f32 * row_h;
-                // 行号（右对齐）
-                painter.text(
-                    egui::pos2(origin.x + gutter_w - char_w * 0.7, y),
-                    egui::Align2::RIGHT_TOP,
-                    (i + 1).to_string(),
-                    mono.clone(),
-                    Palette::TEXT_DIM,
-                );
-                // 正文
-                let (s, e) = ed.line_ranges[i];
-                painter.text(
-                    egui::pos2(origin.x + gutter_w, y),
-                    egui::Align2::LEFT_TOP,
-                    &ed.content[s..e],
-                    mono.clone(),
-                    Palette::TEXT,
-                );
-            }
-        });
-        });
-        return false;
-    }
-
-    // 大文件「改为可编辑」后：用虚拟化可编辑器（仅渲染可见行，避免 egui TextEdit 给整文件建 galley
-    // 的内存与每帧重排开销）。小/中文件仍用功能完整的 egui TextEdit。
+    // 大文件直接用虚拟化可编辑器（仅渲染可见行，避免 egui TextEdit 给整文件建 galley 的内存与每帧
+    // 重排开销）；已去掉只读模式。小/中文件仍用功能完整的 egui TextEdit。
     if ed.content.len() > EDIT_LIMIT {
         return editable_virtual(ui, ed, text_id);
     }
@@ -636,26 +576,6 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     save
 }
 
-/// 计算每行的字节范围（不含换行符），用于只读虚拟化渲染。
-fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            let end = if i > start && text.as_bytes()[i - 1] == b'\r' { i - 1 } else { i };
-            out.push((start, end));
-            start = i + 1;
-        }
-    }
-    if start < text.len() {
-        out.push((start, text.len()));
-    }
-    if out.is_empty() {
-        out.push((0, 0));
-    }
-    out
-}
-
 // ———————————————————————— 虚拟化可编辑器（大文件，Phase 1） ————————————————————————
 
 fn compute_line_starts(s: &str) -> Vec<usize> {
@@ -697,12 +617,37 @@ fn v_recompute(ed: &mut Editor) {
         .max()
         .unwrap_or(0);
 }
+/// 把 content[at..at+removed_len] 替换为 inserted，并记录一条可撤销操作（连续输入会合并）。
+fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: &str) {
+    let caret_before = ed.vcaret;
+    let removed = ed.content[at..at + removed_len].to_string();
+    ed.content.replace_range(at..at + removed_len, inserted);
+    ed.vcaret = at + inserted.len();
+    ed.vsel = None;
+    // 连续单段输入（非换行）合并到上一条，避免每个字符一条撤销记录
+    let mergeable = removed.is_empty() && !inserted.is_empty() && !inserted.contains('\n');
+    if mergeable {
+        if let Some(last) = ed.vundo.last_mut() {
+            if last.removed.is_empty() && !last.inserted.ends_with('\n') && last.at + last.inserted.len() == at {
+                last.inserted.push_str(inserted);
+                last.caret_after = ed.vcaret;
+                ed.vredo.clear();
+                v_recompute(ed);
+                return;
+            }
+        }
+    }
+    ed.vundo.push(EditOp { at, removed, inserted: inserted.to_string(), caret_before, caret_after: ed.vcaret });
+    if ed.vundo.len() > 5000 {
+        ed.vundo.remove(0);
+    }
+    ed.vredo.clear();
+    v_recompute(ed);
+}
 fn v_delete_selection(ed: &mut Editor) -> bool {
     if let Some((a, b)) = v_sel_range(ed) {
-        ed.content.replace_range(a..b, "");
-        ed.vcaret = a;
-        ed.vsel = None;
-        v_recompute(ed);
+        v_apply(ed, a, b - a, "");
+        ed.vgoal_col = None;
         true
     } else {
         ed.vsel = None;
@@ -710,12 +655,9 @@ fn v_delete_selection(ed: &mut Editor) -> bool {
     }
 }
 fn v_insert(ed: &mut Editor, t: &str) {
-    v_delete_selection(ed);
-    ed.content.insert_str(ed.vcaret, t);
-    ed.vcaret += t.len();
-    ed.vsel = None;
+    let (at, rl) = if let Some((a, b)) = v_sel_range(ed) { (a, b - a) } else { (ed.vcaret, 0) };
+    v_apply(ed, at, rl, t);
     ed.vgoal_col = None;
-    v_recompute(ed);
 }
 fn v_backspace(ed: &mut Editor) {
     if v_delete_selection(ed) {
@@ -725,10 +667,8 @@ fn v_backspace(ed: &mut Editor) {
         return;
     }
     let prev = prev_char_boundary(&ed.content, ed.vcaret);
-    ed.content.replace_range(prev..ed.vcaret, "");
-    ed.vcaret = prev;
+    v_apply(ed, prev, ed.vcaret - prev, "");
     ed.vgoal_col = None;
-    v_recompute(ed);
 }
 fn v_delete_fwd(ed: &mut Editor) {
     if v_delete_selection(ed) {
@@ -738,9 +678,30 @@ fn v_delete_fwd(ed: &mut Editor) {
         return;
     }
     let next = next_char_boundary(&ed.content, ed.vcaret);
-    ed.content.replace_range(ed.vcaret..next, "");
+    v_apply(ed, ed.vcaret, next - ed.vcaret, "");
     ed.vgoal_col = None;
-    v_recompute(ed);
+}
+fn v_undo(ed: &mut Editor) {
+    if let Some(op) = ed.vundo.pop() {
+        let end = op.at + op.inserted.len();
+        ed.content.replace_range(op.at..end, &op.removed);
+        ed.vcaret = op.caret_before.min(ed.content.len());
+        ed.vsel = None;
+        ed.vgoal_col = None;
+        v_recompute(ed);
+        ed.vredo.push(op);
+    }
+}
+fn v_redo(ed: &mut Editor) {
+    if let Some(op) = ed.vredo.pop() {
+        let end = op.at + op.removed.len();
+        ed.content.replace_range(op.at..end, &op.inserted);
+        ed.vcaret = op.caret_after.min(ed.content.len());
+        ed.vsel = None;
+        ed.vgoal_col = None;
+        v_recompute(ed);
+        ed.vundo.push(op);
+    }
 }
 fn v_move_h(ed: &mut Editor, fwd: bool, shift: bool) {
     ed.vgoal_col = None;
@@ -838,6 +799,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             ed.vsel = Some(0);
                             ed.vcaret = ed.content.len();
                         }
+                        egui::Key::Z if cmd && modifiers.shift => v_redo(ed),
+                        egui::Key::Z if cmd => v_undo(ed),
+                        egui::Key::Y if cmd => v_redo(ed),
                         egui::Key::Backspace => v_backspace(ed),
                         egui::Key::Delete => v_delete_fwd(ed),
                         egui::Key::Enter => v_insert(ed, "\n"),
