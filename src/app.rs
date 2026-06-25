@@ -489,6 +489,8 @@ pub struct App {
     ime_test: Arc<Mutex<String>>,
     ime_test2: Arc<Mutex<String>>,
     ime_test3: String,
+    /// 诊断：提交后是否需要下一帧重新允许 IME（重置输入法上下文，修「只能输一次」）
+    ime_rearm: Arc<Mutex<bool>>,
     /// 看图工具：已打开的图片标签
     image_tabs: Vec<ImageTab>,
     active_image: usize,
@@ -702,6 +704,7 @@ impl App {
             ime_test: Arc::new(Mutex::new(String::new())),
             ime_test2: Arc::new(Mutex::new(String::new())),
             ime_test3: String::new(),
+            ime_rearm: Arc::new(Mutex::new(false)),
             image_tabs: Vec::new(),
             active_image: 0,
             image_focus: false,
@@ -2485,11 +2488,25 @@ impl App {
             .with_inner_size([480.0, 360.0]);
         let buf1 = self.ime_test.clone();
         let buf2 = self.ime_test2.clone();
+        let rearm = self.ime_rearm.clone();
         ctx.show_viewport_deferred(vid, builder, move |vctx, _class| {
-            vctx.request_repaint(); // 诊断：无条件每帧重绘，验证次级窗口反复输入中文是否依赖持续重绘
+            vctx.request_repaint();
+            // 修「只能输一次」尝试：上一帧检测到提交 → 本帧重新允许 IME（已先关一帧）。
+            {
+                let mut r = rearm.lock().unwrap();
+                if *r {
+                    vctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+                    *r = false;
+                }
+                let committed = vctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(egui::ImeEvent::Commit(_)))));
+                if committed {
+                    vctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
+                    *r = true; // 下一帧再开，重置输入法上下文
+                }
+            }
             egui::CentralPanel::default().show(vctx, |ui| {
                 ui.add_space(6.0);
-                ui.label("① 普通文本框（无任何自定义）——请尝试『反复』输入中文：");
+                ui.label("① 提交后自动重置 IME ——请尝试『反复』输入中文：");
                 {
                     let mut s = buf1.lock().unwrap();
                     ui.add(egui::TextEdit::multiline(&mut *s).desired_width(f32::INFINITY).desired_rows(4));
