@@ -120,7 +120,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         let content_h = total as f32 * row_h;
         let bg = egui::Color32::from_rgb(252, 252, 250); // 近白底，与可编辑模式一致
         egui::Frame::new().fill(bg).show(ui, |ui| {
-        egui::ScrollArea::both().auto_shrink([false, false]).show_viewport(ui, |ui, vp| {
+        egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id).show_viewport(ui, |ui, vp| {
             ui.set_width(content_w);
             ui.set_height(content_h);
             let origin = ui.min_rect().min;
@@ -396,6 +396,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(140);
         egui::ScrollArea::both()
             .auto_shrink([false, false])
+            .id_salt(text_id) // 按标签区分滚动状态：否则各标签共用同一滚动位置、互相带动
             .show(ui, |ui| {
             ui.visuals_mut().extreme_bg_color = bg; // TextEdit 自身背景也用近白，无接缝
             // 去掉聚焦/悬停/未聚焦时的边框描边（橙色聚焦框）

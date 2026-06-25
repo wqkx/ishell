@@ -169,6 +169,11 @@ impl Session {
                         let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("cd {quoted}\r").into_bytes()));
                     }
                     self.restore_cwd = false;
+                    // 自动注入 OSC 7 上报：让 shell 每次提示符上报工作目录，供「在文件列表中显示当前目录」
+                    // 等功能使用（bash 用 PROMPT_COMMAND，zsh 用 precmd hook）。仅作用于当前交互式会话，
+                    // 不写入 rc 文件、不持久化；每次（重）连接的新 shell 都重新注入。前导空格避免进 history。
+                    let osc7 = r#" __ishell_cwd(){ printf '\033]7;file://localhost%s\007' "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd __ishell_cwd 2>/dev/null; else case "$PROMPT_COMMAND" in *__ishell_cwd*) ;; *) PROMPT_COMMAND="__ishell_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac; fi; __ishell_cwd"#;
+                    let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("{osc7}\r").into_bytes()));
                     // 断线前被中断的传输：重连后用新通道重发，底层据本地/远端已有字节自动续传
                     for t in &mut self.transfers {
                         if !t.paused {
