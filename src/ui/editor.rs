@@ -44,6 +44,8 @@ pub struct Editor {
     vcaret: usize,
     /// 各行起始字节偏移（缓存，编辑后重算）
     vlines: Vec<usize>,
+    /// 最长行字节数（缓存，随 vlines 一起算，避免每帧全行扫描）
+    vmax: usize,
     /// 上下移动时保持的目标列（字符数；None 表示用当前列）
     vgoal_col: Option<usize>,
     /// 选区锚点（Some 时 [anchor, caret] 为选区）
@@ -80,6 +82,7 @@ impl Editor {
             find_focus: false,
             vcaret: 0,
             vlines: Vec::new(),
+            vmax: 0,
             vgoal_col: None,
             vsel: None,
         }
@@ -685,6 +688,14 @@ fn v_sel_range(ed: &Editor) -> Option<(usize, usize)> {
 }
 fn v_recompute(ed: &mut Editor) {
     ed.vlines = compute_line_starts(&ed.content);
+    // 最长行字节数（含尾行）——缓存，渲染时直接用，避免每帧扫全部行
+    ed.vmax = ed
+        .vlines
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .chain(std::iter::once(ed.content.len() - ed.vlines.last().copied().unwrap_or(0)))
+        .max()
+        .unwrap_or(0);
 }
 fn v_delete_selection(ed: &mut Editor) -> bool {
     if let Some((a, b)) = v_sel_range(ed) {
@@ -855,14 +866,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let total = ed.vlines.len();
     let digits = total.max(1).to_string().len();
     let gutter_w = (digits as f32 + 1.5) * char_w;
-    let max_line_bytes = ed
-        .vlines
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .chain(std::iter::once(ed.content.len() - ed.vlines.last().copied().unwrap_or(0)))
-        .max()
-        .unwrap_or(0);
-    let content_w = gutter_w + (max_line_bytes as f32 + 2.0) * char_w;
+    let content_w = gutter_w + (ed.vmax as f32 + 2.0) * char_w;
     let content_h = total as f32 * row_h;
 
     egui::Frame::new().fill(bg).show(ui, |ui| {
@@ -941,15 +945,15 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ed.vgoal_col = None;
                 }
             }
-            // 光标随输入/点击滚到可视区（仅在确有移动时，否则会锁住滚动条）
-            if moved || resp.clicked() || resp.drag_started() {
+            // 仅键盘移动光标时滚到可视区（点击/拖拽不滚——指针已在目标处，强制滚动会在底部抖动）。
+            if moved {
                 let cl = v_line_of(ed, ed.vcaret);
                 let (ls, le) = v_line_range(ed, cl);
                 let line = ed.content[ls..le].to_string();
                 let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
                 let cx = g.pos_from_cursor(CCursor::new(byte_to_char(&line, ed.vcaret - ls))).left();
                 let cy = origin.y + cl as f32 * row_h;
-                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x + cx, cy), egui::vec2(2.0, row_h)).expand2(egui::vec2(char_w * 3.0, row_h)), None);
+                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x + cx, cy), egui::vec2(2.0, row_h)), None);
             }
         });
     });
