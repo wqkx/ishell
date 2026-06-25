@@ -37,6 +37,8 @@ pub struct Editor {
     menu_sel: Option<(usize, usize)>,
     /// 自绘输入法：当前预编辑(组字)文本在 content 中的字符范围 [start,end)；无组字为 None。
     ime_preedit: Option<(usize, usize)>,
+    /// 打开查找栏时请求把焦点定位到查找输入框（一次性）
+    find_focus: bool,
 }
 
 impl Editor {
@@ -66,11 +68,15 @@ impl Editor {
             last_sel: None,
             menu_sel: None,
             ime_preedit: None,
+            find_focus: false,
         }
     }
-    /// 切换查找栏（供窗口标签栏的「查找」按钮调用）。
+    /// 切换查找栏（供窗口标签栏的「查找」按钮调用）；打开时请求聚焦查找框。
     pub fn toggle_find(&mut self) {
         self.show_find = !self.show_find;
+        if self.show_find {
+            self.find_focus = true;
+        }
     }
     pub fn dirty(&self) -> bool {
         self.content != self.orig
@@ -157,8 +163,14 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::S)) {
         save = true;
     }
-    if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::F)) {
-        ed.show_find = true;
+    // Ctrl/Cmd+F：切换查找栏（再次按下关闭）；打开时聚焦查找框。
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F))
+        || ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F))
+    {
+        ed.show_find = !ed.show_find;
+        if ed.show_find {
+            ed.find_focus = true;
+        }
     }
 
     // 查找/替换栏：浮动在编辑器右上角（不占据正文行、避开右侧滚动条），带外边框，仿 VSCode。
@@ -182,7 +194,11 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
-                            ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
+                            let fr = ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
+                            if ed.find_focus {
+                                fr.request_focus();
+                                ed.find_focus = false;
+                            }
                             if ui.button(crate::i18n::tr("下一个", "Next")).clicked() {
                                 if let Some((c0, c1)) = find_from(&ed.content, &ed.find, ed.search_from) {
                                     pending_select = Some((c0, c1));
@@ -405,7 +421,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
             ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
             // 选区/查找当前项用半透明灰，盖在字上仍能看清字符（默认不透明会完全遮住）
-            ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 96);
+            ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(130, 130, 130, 70);
             ui.horizontal_top(|ui| {
                 ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
                 // 宽度比「行号列之后的剩余可视宽度」再小几像素：保证短行时正文总宽严格小于视口，
@@ -449,6 +465,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                 // 查找：默认半透明灰高亮「所有」匹配项（next 仅用于定位/选中当前一个）。
                 if ed.show_find && !ed.find.is_empty() {
                     let clip = ui.clip_rect();
+                    // 当前选中(被 next 定位)的范围：跳过其叠加，避免与半透明选区叠加变深、盖住字符
+                    let cur = out.cursor_range.map(|r| r.as_sorted_char_range()).map(|r| (r.start, r.end));
                     let painter = ui.painter();
                     let hl = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56);
                     let gp = out.galley_pos;
@@ -460,6 +478,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                         let b1 = b0 + ed.find.len();
                         let c0 = byte_to_char(&ed.content, b0);
                         let c1 = c0 + pat_len;
+                        if cur == Some((c0, c1)) {
+                            start = b1;
+                            continue;
+                        }
                         let a = out.galley.pos_from_cursor(CCursor::new(c0));
                         let z = out.galley.pos_from_cursor(CCursor::new(c1));
                         // 仅同一行的匹配画一个矩形（查找词通常不含换行）

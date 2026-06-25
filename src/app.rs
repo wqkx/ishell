@@ -3864,7 +3864,11 @@ fn draggable_tabs(
                     ctx.animate_value_with_time(id, target, 0.14) // 缓动到目标槽
                 };
                 let tab_rect = egui::Rect::from_min_size(egui::pos2(origin.x + x, origin.y), egui::vec2(w, tab_h));
-                let resp = ui.interact(tab_rect, egui::Id::new(("dtab", *uid)), Sense::click_and_drag()).on_hover_text(tip.as_str());
+                let mut resp = ui.interact(tab_rect, egui::Id::new(("dtab", *uid)), Sense::click_and_drag());
+                // 拖动期间不弹路径提示（避免拖着拖着冒出悬停 tooltip）
+                if dragging_tab.is_none() && !tip.is_empty() {
+                    resp = resp.on_hover_text(tip.as_str());
+                }
                 let close_rect = egui::Rect::from_center_size(egui::pos2(tab_rect.right() - 12.0, tab_rect.center().y), egui::vec2(16.0, 16.0));
                 let close_resp = ui.interact(close_rect, egui::Id::new(("dtabclose", *uid)), Sense::click());
                 let p = ui.painter();
