@@ -485,9 +485,10 @@ pub struct App {
     /// 无法借用 &mut self）与主 update() 共享。改 deferred 是为根治 macOS 多窗口闪烁
     /// （immediate viewport 与主窗口同帧渲染、强耦合焦点，触发 Stage Manager 不停重拍）。
     editor_state: Arc<Mutex<EditorState>>,
-    /// 诊断用：IME 测试子窗口的两个文本框缓冲（① 纯净 ② 带高亮 layouter）
+    /// 诊断用：IME 测试子窗口的文本框缓冲（① 纯净 deferred ② 带高亮 deferred ③ 纯净 immediate）
     ime_test: Arc<Mutex<String>>,
     ime_test2: Arc<Mutex<String>>,
+    ime_test3: String,
     /// 看图工具：已打开的图片标签
     image_tabs: Vec<ImageTab>,
     active_image: usize,
@@ -700,6 +701,7 @@ impl App {
             editor_state: Arc::new(Mutex::new(EditorState::default())),
             ime_test: Arc::new(Mutex::new(String::new())),
             ime_test2: Arc::new(Mutex::new(String::new())),
+            ime_test3: String::new(),
             image_tabs: Vec::new(),
             active_image: 0,
             image_focus: false,
@@ -1741,6 +1743,7 @@ impl eframe::App for App {
         // 文本编辑器浮窗
         self.editor_window(&ctx);
         self.ime_test_window(&ctx);
+        self.ime_test_immediate(&ctx);
 
         // 看图工具浮窗
         self.image_window(&ctx);
@@ -2506,6 +2509,24 @@ impl App {
                     ui.add(egui::TextEdit::multiline(&mut *s).desired_width(f32::INFINITY).desired_rows(4).layouter(&mut layouter));
                     ui.label(format!("字符数：{}", s.chars().count()));
                 }
+            });
+        });
+    }
+
+    /// 诊断：immediate（即时）模式的纯净测试子窗口。immediate viewport 在父窗口事件循环里渲染，
+    /// 若它能「反复」输入中文（而 deferred 的只能一次），说明把编辑器改回 immediate 可修好 IME。
+    #[allow(deprecated)]
+    fn ime_test_immediate(&mut self, ctx: &egui::Context) {
+        let vid = egui::ViewportId::from_hash_of("ishell_ime_test_imm");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("IME 测试窗口(immediate)")
+            .with_inner_size([480.0, 220.0]);
+        ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
+            egui::CentralPanel::default().show(vctx, |ui| {
+                ui.add_space(6.0);
+                ui.label("③ immediate 模式 普通文本框——请尝试『反复』输入中文：");
+                ui.add(egui::TextEdit::multiline(&mut self.ime_test3).desired_width(f32::INFINITY).desired_rows(5));
+                ui.label(format!("字符数：{}", self.ime_test3.chars().count()));
             });
         });
     }
