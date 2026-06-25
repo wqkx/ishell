@@ -898,9 +898,18 @@ impl Terminal {
                     }
                 }
             });
-            if ui.checkbox(&mut self.highlight, crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN")).clicked() {
-                ui.close();
-            }
+            // 高亮 ERROR/WARN：改成与「终端配色」一致的二级菜单（是 / 否）
+            ui.menu_button(crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN"), |ui| {
+                ui.set_min_width(90.0);
+                if ui.selectable_label(self.highlight, crate::i18n::tr("是", "Yes")).clicked() {
+                    self.highlight = true;
+                    ui.close();
+                }
+                if ui.selectable_label(!self.highlight, crate::i18n::tr("否", "No")).clicked() {
+                    self.highlight = false;
+                    ui.close();
+                }
+            });
             // 「强制 X11」已移至左侧监控栏的右键菜单，避免 shell 右键项过多
             ui.separator();
             // 会话日志录制

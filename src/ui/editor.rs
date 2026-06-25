@@ -403,6 +403,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
             ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
             ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
+            // 选区/查找当前项用半透明灰，盖在字上仍能看清字符（默认不透明会完全遮住）
+            ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 96);
             ui.horizontal_top(|ui| {
                 ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
                 // 宽度比「行号列之后的剩余可视宽度」再小几像素：保证短行时正文总宽严格小于视口，
@@ -440,6 +442,40 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                         // 该行有 lint 错误（括号不匹配）则行号标红
                         let col = if err_lines.contains(&i) { Palette::DANGER } else { Palette::TEXT_DIM };
                         painter.text(egui::pos2(num_x, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), col);
+                    }
+                }
+
+                // 查找：默认半透明灰高亮「所有」匹配项（next 仅用于定位/选中当前一个）。
+                if ed.show_find && !ed.find.is_empty() {
+                    let clip = ui.clip_rect();
+                    let painter = ui.painter();
+                    let hl = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56);
+                    let gp = out.galley_pos;
+                    let pat_len = ed.find.chars().count();
+                    let mut start = 0usize;
+                    let mut cnt = 0u32;
+                    while let Some(off) = ed.content[start..].find(ed.find.as_str()) {
+                        let b0 = start + off;
+                        let b1 = b0 + ed.find.len();
+                        let c0 = byte_to_char(&ed.content, b0);
+                        let c1 = c0 + pat_len;
+                        let a = out.galley.pos_from_cursor(CCursor::new(c0));
+                        let z = out.galley.pos_from_cursor(CCursor::new(c1));
+                        // 仅同一行的匹配画一个矩形（查找词通常不含换行）
+                        if (z.top() - a.top()).abs() < 1.0 {
+                            let r = egui::Rect::from_min_max(
+                                egui::pos2(gp.x + a.left(), gp.y + a.top()),
+                                egui::pos2(gp.x + z.left(), gp.y + a.bottom()),
+                            );
+                            if r.intersects(clip) {
+                                painter.rect_filled(r, 2.0, hl);
+                            }
+                        }
+                        start = b1;
+                        cnt += 1;
+                        if cnt >= 2000 {
+                            break;
+                        }
                     }
                 }
 
