@@ -2465,9 +2465,8 @@ impl App {
         }
     }
 
-    /// 多标签文本编辑器：独立 OS 窗口，改用 **deferred viewport**——与主窗口的渲染/事件
-    /// 循环解耦（各自独立的重绘调度），规避 immediate viewport 在 macOS 上触发 Stage Manager
-    /// 缩略图不停闪烁的问题。状态放在 self.editor_state（Arc<Mutex>），回调与主 update() 共享。
+    /// 多标签文本编辑器：独立 OS 窗口（deferred viewport）。状态放在 self.editor_state（Arc<Mutex>），
+    /// 回调与主 update() 共享。
     #[allow(deprecated)]
     fn editor_window(&mut self, ctx: &egui::Context) {
         // 标题随激活文件变化：锁内算好即释放，回调运行时再单独加锁（二者不同时持锁）。
@@ -2492,8 +2491,6 @@ impl App {
             .with_title(title)
             .with_inner_size([900.0, 640.0])
             .with_min_inner_size([480.0, 320.0])
-            // macOS：最大化/全屏(绿钮)与 eframe 多 viewport 交互时会造出一个错误缩放、关不掉的
-            // 幽灵窗口（仅最大化后出现，无任何警告）。禁用最大化按钮从源头规避；仍可拖边缘调整大小。
             .with_maximize_button(false);
         let vid = egui::ViewportId::from_hash_of("ishell_editor");
         let state = self.editor_state.clone();
@@ -2512,9 +2509,6 @@ impl App {
                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ed.focus = false;
             }
-            // 编辑器内有文本框获得键盘输入时持续重绘：保证输入法预编辑/候选窗位置随光标上报，
-            // 否则中文输入法在此独立窗口里组字/上屏不正常（此前为治 Stage Manager 闪烁误删了它，
-            // 现仅作用于「编辑器窗口且正在输入」，主窗口不受影响）。
             if vctx.egui_wants_keyboard_input() {
                 vctx.request_repaint();
             }
