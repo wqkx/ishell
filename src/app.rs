@@ -13,6 +13,20 @@ use crate::ui::connect::ConnectForm;
 use crate::ui::file_panel::{self, FileAction, FilePanelState};
 use crate::ui::sidebar::{self, NetHistory};
 
+/// 是否已同意「向 shell 注入 OSC 7 上报工作目录」。同意一次后持久化，后续静默注入。
+/// 用全局原子（启动时从 store 载入），便于 Session 的连接回调直接读取。
+static OSC7_CONSENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn osc7_consent() -> bool {
+    OSC7_CONSENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn set_osc7_consent(v: bool) {
+    OSC7_CONSENT.store(v, std::sync::atomic::Ordering::Relaxed);
+    crate::store::save_osc7_consent(v);
+}
+/// 注入到交互式 shell 的 OSC 7 上报片段（bash 用 PROMPT_COMMAND，zsh 用 precmd）。
+/// 仅作用于当前会话、不写 rc、不持久化；前导空格尽量不进 history。
+const OSC7_SNIPPET: &str = r#" __ishell_cwd(){ printf '\033]7;file://localhost%s\007' "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd __ishell_cwd 2>/dev/null; else case "$PROMPT_COMMAND" in *__ishell_cwd*) ;; *) PROMPT_COMMAND="__ishell_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac; fi; __ishell_cwd"#;
+
 /// 单个 SSH 会话的前台状态。
 struct Session {
     /// 稳定唯一 id（用于标签滑动动画在重排后仍追踪同一标签）
@@ -63,6 +77,10 @@ struct Session {
     last_cwd: String,
     /// 重连后待恢复 cwd
     restore_cwd: bool,
+    /// 待弹出「注入 OSC 7」确认框（右键功能在无 cwd 时触发）
+    osc7_confirm: bool,
+    /// 已注入、等下个提示符上报 cwd 后把文件区跳过去
+    osc7_pending_reveal: bool,
 }
 
 /// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
@@ -169,11 +187,10 @@ impl Session {
                         let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("cd {quoted}\r").into_bytes()));
                     }
                     self.restore_cwd = false;
-                    // 自动注入 OSC 7 上报：让 shell 每次提示符上报工作目录，供「在文件列表中显示当前目录」
-                    // 等功能使用（bash 用 PROMPT_COMMAND，zsh 用 precmd hook）。仅作用于当前交互式会话，
-                    // 不写入 rc 文件、不持久化；每次（重）连接的新 shell 都重新注入。前导空格避免进 history。
-                    let osc7 = r#" __ishell_cwd(){ printf '\033]7;file://localhost%s\007' "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd __ishell_cwd 2>/dev/null; else case "$PROMPT_COMMAND" in *__ishell_cwd*) ;; *) PROMPT_COMMAND="__ishell_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac; fi; __ishell_cwd"#;
-                    let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("{osc7}\r").into_bytes()));
+                    // 已同意过 OSC 7 注入 → 每次（重）连接的新 shell 静默重新注入，使工作目录持续上报。
+                    if osc7_consent() {
+                        let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
+                    }
                     // 断线前被中断的传输：重连后用新通道重发，底层据本地/远端已有字节自动续传
                     for t in &mut self.transfers {
                         if !t.paused {
@@ -382,6 +399,7 @@ fn set_ui_zoom(z: f32) {
 /// 启动时把已保存的缩放载入全局。
 fn init_view_state() {
     ZOOM_BITS.store(crate::store::load_zoom().to_bits(), std::sync::atomic::Ordering::Relaxed);
+    OSC7_CONSENT.store(crate::store::load_osc7_consent(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 监控栏（左侧菜单栏）统一右键菜单：语言 / 字体大小 / 折叠视图 / 强制 X11。
@@ -980,6 +998,8 @@ impl App {
             reconnect_tries: 0,
             last_cwd: String::new(),
             restore_cwd: false,
+            osc7_confirm: false,
+            osc7_pending_reveal: false,
         });
         self.active = Some(self.sessions.len() - 1);
         self.scroll_to_active = true; // 新建标签后滚动到可视区
@@ -3758,6 +3778,59 @@ impl App {
                 if let Some(cwd) = s.terminal.take_reveal_cwd() {
                     s.files.cwd = cwd;
                     s.files.selected.clear();
+                }
+                // 无 cwd 时点该菜单：已同意过则静默注入；否则弹确认框（同意后记住）
+                if s.terminal.take_inject_request() {
+                    if osc7_consent() {
+                        let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
+                        s.osc7_pending_reveal = true;
+                    } else {
+                        s.osc7_confirm = true;
+                    }
+                }
+                if s.osc7_confirm {
+                    let mut decided: Option<bool> = None;
+                    egui::Modal::new(egui::Id::new("osc7_confirm_modal")).show(ui.ctx(), |ui| {
+                        ui.set_width(370.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new(crate::i18n::tr("获取终端当前目录", "Track terminal directory")).size(16.0).strong());
+                            ui.add_space(6.0);
+                            ui.label(crate::i18n::tr(
+                                "需向当前 shell 注入一行命令以上报工作目录（仅本会话、不写配置文件）。同意后将记住，后续自动静默注入。",
+                                "Inject one line into the current shell to report its directory (this session only, not written to config). Remembered after you agree.",
+                            ));
+                        });
+                        ui.add_space(12.0);
+                        let bw = 110.0;
+                        let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                        ui.horizontal(|ui| {
+                            ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                            if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("同意并注入", "Agree & inject")).color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
+                                decided = Some(true);
+                            }
+                            if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
+                                decided = Some(false);
+                            }
+                        });
+                    });
+                    match decided {
+                        Some(true) => {
+                            set_osc7_consent(true);
+                            let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
+                            s.osc7_pending_reveal = true;
+                            s.osc7_confirm = false;
+                        }
+                        Some(false) => s.osc7_confirm = false,
+                        None => {}
+                    }
+                }
+                // 注入后：下个提示符上报 cwd 时把文件区跳过去
+                if s.osc7_pending_reveal {
+                    if let Some(cwd) = s.terminal.cwd() {
+                        s.files.cwd = cwd.to_string();
+                        s.files.selected.clear();
+                        s.osc7_pending_reveal = false;
+                    }
                 }
                 let size = s.terminal.size();
                 if size != s.last_size && s.connected {

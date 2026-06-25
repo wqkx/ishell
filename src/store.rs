@@ -325,6 +325,28 @@ pub fn save_force_x11(on: bool) {
     }
 }
 
+fn osc7_consent_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("osc7_consent"))
+}
+
+/// 是否已同意「自动向 shell 注入 OSC 7 上报」（同意一次后续静默注入）。
+pub fn load_osc7_consent() -> bool {
+    osc7_consent_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// 保存 OSC 7 注入同意标志。
+pub fn save_osc7_consent(on: bool) {
+    if let Some(p) = osc7_consent_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, if on { "1" } else { "0" });
+    }
+}
+
 // ---------- 终端配色（多套主题，按索引存储） ----------
 
 fn term_theme_path() -> Option<PathBuf> {
