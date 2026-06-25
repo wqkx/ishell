@@ -39,6 +39,15 @@ pub struct Editor {
     ime_preedit: Option<(usize, usize)>,
     /// 打开查找栏时请求把焦点定位到查找输入框（一次性）
     find_focus: bool,
+    /// —— 虚拟化可编辑器（大文件）状态 ——
+    /// 光标字节偏移
+    vcaret: usize,
+    /// 各行起始字节偏移（缓存，编辑后重算）
+    vlines: Vec<usize>,
+    /// 上下移动时保持的目标列（字符数；None 表示用当前列）
+    vgoal_col: Option<usize>,
+    /// 选区锚点（Some 时 [anchor, caret] 为选区）
+    vsel: Option<usize>,
 }
 
 impl Editor {
@@ -69,6 +78,10 @@ impl Editor {
             menu_sel: None,
             ime_preedit: None,
             find_focus: false,
+            vcaret: 0,
+            vlines: Vec::new(),
+            vgoal_col: None,
+            vsel: None,
         }
     }
     /// 切换查找栏（供窗口标签栏的「查找」按钮调用）；打开时请求聚焦查找框。
@@ -157,6 +170,12 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         });
         });
         return false;
+    }
+
+    // 大文件「改为可编辑」后：用虚拟化可编辑器（仅渲染可见行，避免 egui TextEdit 给整文件建 galley
+    // 的内存与每帧重排开销）。小/中文件仍用功能完整的 egui TextEdit。
+    if ed.content.len() > EDIT_LIMIT {
+        return editable_virtual(ui, ed, text_id);
     }
 
     // 保存/查找按钮已上移到窗口标签栏右侧（对齐主窗口风格）；此处仅保留快捷键。
@@ -632,6 +651,309 @@ fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
         out.push((0, 0));
     }
     out
+}
+
+// ———————————————————————— 虚拟化可编辑器（大文件，Phase 1） ————————————————————————
+
+fn compute_line_starts(s: &str) -> Vec<usize> {
+    let mut v = Vec::with_capacity(s.len() / 40 + 1);
+    v.push(0);
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            v.push(i + 1);
+        }
+    }
+    v
+}
+fn prev_char_boundary(s: &str, b: usize) -> usize {
+    s[..b].chars().next_back().map(|c| b - c.len_utf8()).unwrap_or(0)
+}
+fn next_char_boundary(s: &str, b: usize) -> usize {
+    s[b.min(s.len())..].chars().next().map(|c| b + c.len_utf8()).unwrap_or_else(|| s.len())
+}
+fn v_line_of(ed: &Editor, b: usize) -> usize {
+    ed.vlines.partition_point(|&s| s <= b).saturating_sub(1)
+}
+/// 第 i 行的字节范围 [起, 止)（止不含行尾换行符）。
+fn v_line_range(ed: &Editor, i: usize) -> (usize, usize) {
+    let s = ed.vlines[i];
+    let e = if i + 1 < ed.vlines.len() { ed.vlines[i + 1] - 1 } else { ed.content.len() };
+    (s, e)
+}
+fn v_sel_range(ed: &Editor) -> Option<(usize, usize)> {
+    ed.vsel.map(|a| (a.min(ed.vcaret), a.max(ed.vcaret))).filter(|(a, b)| a < b)
+}
+fn v_recompute(ed: &mut Editor) {
+    ed.vlines = compute_line_starts(&ed.content);
+}
+fn v_delete_selection(ed: &mut Editor) -> bool {
+    if let Some((a, b)) = v_sel_range(ed) {
+        ed.content.replace_range(a..b, "");
+        ed.vcaret = a;
+        ed.vsel = None;
+        v_recompute(ed);
+        true
+    } else {
+        ed.vsel = None;
+        false
+    }
+}
+fn v_insert(ed: &mut Editor, t: &str) {
+    v_delete_selection(ed);
+    ed.content.insert_str(ed.vcaret, t);
+    ed.vcaret += t.len();
+    ed.vsel = None;
+    ed.vgoal_col = None;
+    v_recompute(ed);
+}
+fn v_backspace(ed: &mut Editor) {
+    if v_delete_selection(ed) {
+        return;
+    }
+    if ed.vcaret == 0 {
+        return;
+    }
+    let prev = prev_char_boundary(&ed.content, ed.vcaret);
+    ed.content.replace_range(prev..ed.vcaret, "");
+    ed.vcaret = prev;
+    ed.vgoal_col = None;
+    v_recompute(ed);
+}
+fn v_delete_fwd(ed: &mut Editor) {
+    if v_delete_selection(ed) {
+        return;
+    }
+    if ed.vcaret >= ed.content.len() {
+        return;
+    }
+    let next = next_char_boundary(&ed.content, ed.vcaret);
+    ed.content.replace_range(ed.vcaret..next, "");
+    ed.vgoal_col = None;
+    v_recompute(ed);
+}
+fn v_move_h(ed: &mut Editor, fwd: bool, shift: bool) {
+    ed.vgoal_col = None;
+    if !shift {
+        if let Some((a, b)) = v_sel_range(ed) {
+            ed.vcaret = if fwd { b } else { a };
+            ed.vsel = None;
+            return;
+        }
+        ed.vsel = None;
+    } else if ed.vsel.is_none() {
+        ed.vsel = Some(ed.vcaret);
+    }
+    ed.vcaret = if fwd { next_char_boundary(&ed.content, ed.vcaret) } else { prev_char_boundary(&ed.content, ed.vcaret) };
+}
+fn v_move_v(ed: &mut Editor, delta: isize, shift: bool) {
+    if shift && ed.vsel.is_none() {
+        ed.vsel = Some(ed.vcaret);
+    }
+    if !shift {
+        ed.vsel = None;
+    }
+    let line = v_line_of(ed, ed.vcaret);
+    let (ls, _) = v_line_range(ed, line);
+    let col = ed.vgoal_col.unwrap_or_else(|| ed.content[ls..ed.vcaret].chars().count());
+    ed.vgoal_col = Some(col);
+    let target = (line as isize + delta).clamp(0, ed.vlines.len() as isize - 1) as usize;
+    let (ts, te) = v_line_range(ed, target);
+    let line_chars = ed.content[ts..te].chars().count();
+    let c = col.min(line_chars);
+    ed.vcaret = ts + char_to_byte(&ed.content[ts..te], c);
+}
+fn v_move_edge(ed: &mut Editor, end: bool, shift: bool) {
+    ed.vgoal_col = None;
+    if shift && ed.vsel.is_none() {
+        ed.vsel = Some(ed.vcaret);
+    }
+    if !shift {
+        ed.vsel = None;
+    }
+    let line = v_line_of(ed, ed.vcaret);
+    let (ls, le) = v_line_range(ed, line);
+    ed.vcaret = if end { le } else { ls };
+}
+
+/// 虚拟化可编辑器：仅渲染可见行 + 自绘光标/选区。返回 true 表示请求保存（Ctrl+S）。
+fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
+    let mut save = false;
+    if ed.vlines.is_empty() {
+        v_recompute(ed);
+    }
+    ed.vcaret = ed.vcaret.min(ed.content.len());
+
+    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, ' ')).max(1.0);
+    let bg = egui::Color32::from_rgb(252, 252, 250);
+    let focused = ui.memory(|m| m.focused() == Some(text_id));
+    let page = ((ui.available_height() / row_h).floor() as isize - 2).max(1);
+
+    // ——— 输入（聚焦时）———
+    let mut moved = false; // 本帧光标可能移动 → 渲染后滚到可视区
+    if focused {
+        let events = ui.input(|i| i.events.clone());
+        moved = events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Text(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Ime(egui::ImeEvent::Commit(_))
+                    | egui::Event::Key { pressed: true, .. }
+            )
+        });
+        for ev in events {
+            match ev {
+                egui::Event::Text(t) if !t.is_empty() => v_insert(ed, &t),
+                egui::Event::Paste(t) if !t.is_empty() => v_insert(ed, &t),
+                egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => v_insert(ed, &t),
+                egui::Event::Copy => {
+                    if let Some(s) = v_sel_range(ed).map(|(a, b)| ed.content[a..b].to_string()) {
+                        ui.ctx().copy_text(s);
+                    }
+                }
+                egui::Event::Cut => {
+                    if let Some(s) = v_sel_range(ed).map(|(a, b)| ed.content[a..b].to_string()) {
+                        ui.ctx().copy_text(s);
+                        v_delete_selection(ed);
+                    }
+                }
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    let cmd = modifiers.command || modifiers.ctrl;
+                    match key {
+                        egui::Key::S if cmd => save = true,
+                        egui::Key::A if cmd => {
+                            ed.vsel = Some(0);
+                            ed.vcaret = ed.content.len();
+                        }
+                        egui::Key::Backspace => v_backspace(ed),
+                        egui::Key::Delete => v_delete_fwd(ed),
+                        egui::Key::Enter => v_insert(ed, "\n"),
+                        egui::Key::Tab => {
+                            let u = ed.indent.unit();
+                            v_insert(ed, &u);
+                        }
+                        egui::Key::ArrowLeft => v_move_h(ed, false, modifiers.shift),
+                        egui::Key::ArrowRight => v_move_h(ed, true, modifiers.shift),
+                        egui::Key::ArrowUp => v_move_v(ed, -1, modifiers.shift),
+                        egui::Key::ArrowDown => v_move_v(ed, 1, modifiers.shift),
+                        egui::Key::Home => v_move_edge(ed, false, modifiers.shift),
+                        egui::Key::End => v_move_edge(ed, true, modifiers.shift),
+                        egui::Key::PageUp => v_move_v(ed, -page, modifiers.shift),
+                        egui::Key::PageDown => v_move_v(ed, page, modifiers.shift),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        ed.vcaret = ed.vcaret.min(ed.content.len());
+    }
+
+    // ——— 渲染（仅可见行）———
+    let total = ed.vlines.len();
+    let digits = total.max(1).to_string().len();
+    let gutter_w = (digits as f32 + 1.5) * char_w;
+    let max_line_bytes = ed
+        .vlines
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .chain(std::iter::once(ed.content.len() - ed.vlines.last().copied().unwrap_or(0)))
+        .max()
+        .unwrap_or(0);
+    let content_w = gutter_w + (max_line_bytes as f32 + 2.0) * char_w;
+    let content_h = total as f32 * row_h;
+
+    egui::Frame::new().fill(bg).show(ui, |ui| {
+        ui.spacing_mut().scroll.floating = false;
+        ui.spacing_mut().scroll.foreground_color = false;
+        ui.visuals_mut().extreme_bg_color = bg;
+        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(202);
+        ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_gray(168);
+        ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(140);
+        egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id).show_viewport(ui, |ui, vp| {
+            ui.set_width(content_w);
+            ui.set_height(content_h);
+            let origin = ui.min_rect().min;
+            let area = egui::Rect::from_min_size(origin, egui::vec2(content_w.max(ui.available_width()), content_h));
+            let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
+            let painter = ui.painter().clone();
+            let first = (vp.min.y / row_h).floor().max(0.0) as usize;
+            let last = (first + (vp.height() / row_h).ceil() as usize + 2).min(total);
+            let sel = v_sel_range(ed);
+            let text_x = origin.x + gutter_w;
+            for i in first..last {
+                let (ls, le) = v_line_range(ed, i);
+                let line = ed.content[ls..le].to_string();
+                let y = origin.y + i as f32 * row_h;
+                let galley = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
+                // 选区高亮（半透明灰）
+                if let Some((sa, sb)) = sel {
+                    if sb > ls && sa <= le {
+                        let a_in = sa.clamp(ls, le);
+                        let b_in = sb.clamp(ls, le);
+                        let ax = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, a_in - ls))).left();
+                        let bx = if sb > le {
+                            // 选区跨到下一行：高亮到行尾再多一点（表示选中换行）
+                            galley.rect.right() + char_w * 0.5
+                        } else {
+                            galley.pos_from_cursor(CCursor::new(byte_to_char(&line, b_in - ls))).left()
+                        };
+                        let r = egui::Rect::from_min_max(egui::pos2(text_x + ax, y), egui::pos2(text_x + bx, y + row_h));
+                        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(130, 130, 130, 80));
+                    }
+                }
+                // 行号
+                painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
+                // 正文
+                painter.galley(egui::pos2(text_x, y), galley.clone(), Palette::TEXT);
+                // 光标
+                if focused && ed.vcaret >= ls && ed.vcaret <= le {
+                    let cx = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, ed.vcaret - ls))).left();
+                    painter.vline(text_x + cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
+                }
+            }
+            // 行号分割线
+            painter.vline(text_x - 3.0, origin.y..=(origin.y + content_h).min(origin.y + vp.max.y), egui::Stroke::new(1.0, Palette::BORDER));
+            // 点击 / 拖拽定位光标与选区
+            if resp.clicked() || resp.drag_started() || resp.dragged() {
+                if resp.clicked() || resp.drag_started() {
+                    ui.memory_mut(|m| m.request_focus(text_id));
+                }
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let li = (((pos.y - origin.y) / row_h).floor().max(0.0) as usize).min(total.saturating_sub(1));
+                    let (ls, le) = v_line_range(ed, li);
+                    let line = ed.content[ls..le].to_string();
+                    let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
+                    let cc = g.cursor_from_pos(egui::vec2(pos.x - text_x, 0.0)).index;
+                    let b = ls + char_to_byte(&line, cc);
+                    if resp.drag_started() {
+                        ed.vsel = Some(b);
+                    } else if resp.dragged() {
+                        if ed.vsel.is_none() {
+                            ed.vsel = Some(ed.vcaret);
+                        }
+                    } else {
+                        ed.vsel = None;
+                    }
+                    ed.vcaret = b;
+                    ed.vgoal_col = None;
+                }
+            }
+            // 光标随输入/点击滚到可视区（仅在确有移动时，否则会锁住滚动条）
+            if moved || resp.clicked() || resp.drag_started() {
+                let cl = v_line_of(ed, ed.vcaret);
+                let (ls, le) = v_line_range(ed, cl);
+                let line = ed.content[ls..le].to_string();
+                let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
+                let cx = g.pos_from_cursor(CCursor::new(byte_to_char(&line, ed.vcaret - ls))).left();
+                let cy = origin.y + cl as f32 * row_h;
+                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x + cx, cy), egui::vec2(2.0, row_h)).expand2(egui::vec2(char_w * 3.0, row_h)), None);
+            }
+        });
+    });
+    save
 }
 
 /// 字符下标 → 字节偏移（用于右键复制/剪切/粘贴按选区操作 UTF-8 内容）。
