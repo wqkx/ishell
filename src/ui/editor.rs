@@ -31,6 +31,10 @@ pub struct Editor {
     max_line_bytes: usize,
     /// 自动探测到的缩进风格（Tab 键 / 回车续进据此）
     indent: Indent,
+    /// 上一帧的非空选区（右键会折叠选区，菜单复制/剪切用这个冻结值）
+    last_sel: Option<(usize, usize)>,
+    /// 右键打开菜单时冻结的选区
+    menu_sel: Option<(usize, usize)>,
 }
 
 impl Editor {
@@ -57,7 +61,13 @@ impl Editor {
             line_ranges,
             max_line_bytes,
             indent,
+            last_sel: None,
+            menu_sel: None,
         }
+    }
+    /// 切换查找栏（供窗口标签栏的「查找」按钮调用）。
+    pub fn toggle_find(&mut self) {
+        self.show_find = !self.show_find;
     }
     pub fn dirty(&self) -> bool {
         self.content != self.orig
@@ -92,9 +102,6 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     ed.line_ranges = Vec::new();
                 }
                 ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("（大文件 {mb:.1} MB · 只读）"), crate::i18n::Lang::En => format!("(large {mb:.1} MB · read-only)") }).color(Palette::WARN).size(11.0));
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    crate::ui::path_scroll(ui, &ed.path);
-                });
             });
         });
         ui.separator();
@@ -143,21 +150,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         return false;
     }
 
-    // 工具栏：保存 / 查找（按钮先占右侧，路径在剩余宽度里横向滚动、默认贴右）
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
-                save = true;
-            }
-            if ui.button(RichText::new(format!("{}  {}", icon::MAGNIFYING_GLASS, crate::i18n::tr("查找", "Find")))).clicked() {
-                ed.show_find = !ed.show_find;
-            }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                crate::ui::path_scroll(ui, &ed.path);
-            });
-        });
-    });
-
+    // 保存/查找按钮已上移到窗口标签栏右侧（对齐主窗口风格）；此处仅保留快捷键。
     if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::S)) {
         save = true;
     }
@@ -206,7 +199,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
 
     // —— 自动缩进：本编辑器聚焦时拦截 Tab / Shift+Tab / 回车，手动处理后阻止 TextEdit 默认行为 ——
     // 用上一帧存储的光标位置（consume 必须在 TextEdit.show() 之前）。
-    if ui.memory(|m| m.focused() == Some(text_id)) {
+    // 关键：输入法组字/提交（有 Ime 事件）时不拦截 Enter，否则会吃掉中文提交导致无法输入中文。
+    let ime_active = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
+    if !ime_active && ui.memory(|m| m.focused() == Some(text_id)) {
         if let Some(r) = egui::text_edit::TextEditState::load(ui.ctx(), text_id).and_then(|s| s.cursor.char_range()) {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
                 apply_enter(&mut ed.content, r, ed.indent, ui.ctx(), text_id);
@@ -310,11 +305,29 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     out.response.request_focus();
                 }
 
-                // 右键菜单：复制 / 剪切 / 粘贴 / 全选（基于当前选区直接操作内容缓冲）
-                let sel = out.cursor_range.map(|r| r.as_sorted_char_range());
+                // 右键菜单：复制 / 剪切 / 粘贴 / 全选。
+                // 难点：右键会被 TextEdit 当成点击而折叠选区，导致「全选后右键复制」复制不到。
+                // 解法：每帧记录非空选区到 last_sel；右键当帧不清它，并冻结成 menu_sel 供菜单使用。
+                let cur_sel = out
+                    .cursor_range
+                    .map(|r| r.as_sorted_char_range())
+                    .filter(|r| r.start != r.end)
+                    .map(|r| (r.start, r.end));
+                if cur_sel.is_some() {
+                    ed.last_sel = cur_sel;
+                } else if !out.response.secondary_clicked() {
+                    ed.last_sel = None;
+                }
+                if out.response.secondary_clicked() {
+                    ed.menu_sel = cur_sel.or(ed.last_sel);
+                }
+                let menu_sel = ed.menu_sel;
+                // 当前光标折叠位（粘贴无选区时的插入点）
+                let caret = out.cursor_range.map(|r| r.as_sorted_char_range().start).unwrap_or(0);
                 let mut act = 0u8; // 1=复制 2=剪切 3=粘贴 4=全选
                 out.response.context_menu(|ui| {
-                    let has_sel = sel.as_ref().is_some_and(|r| r.start != r.end);
+                    ui.set_min_width(150.0); // 菜单不至于太窄
+                    let has_sel = menu_sel.is_some();
                     if ui.add_enabled(has_sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
                         act = 1;
                         ui.close();
@@ -338,41 +351,43 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     let mut new_cursor: Option<(usize, usize)> = None;
                     match act {
                         1 => {
-                            if let Some(r) = &sel {
-                                let (b0, b1) = (char_to_byte(&ed.content, r.start), char_to_byte(&ed.content, r.end));
+                            if let Some((c0, c1)) = menu_sel {
+                                let (b0, b1) = (char_to_byte(&ed.content, c0), char_to_byte(&ed.content, c1));
                                 if b1 > b0 {
                                     ctx.copy_text(ed.content[b0..b1].to_string());
                                 }
                             }
                         }
                         2 => {
-                            if let Some(r) = &sel {
-                                let (b0, b1) = (char_to_byte(&ed.content, r.start), char_to_byte(&ed.content, r.end));
+                            if let Some((c0, c1)) = menu_sel {
+                                let (b0, b1) = (char_to_byte(&ed.content, c0), char_to_byte(&ed.content, c1));
                                 if b1 > b0 {
                                     ctx.copy_text(ed.content[b0..b1].to_string());
                                     ed.content.replace_range(b0..b1, "");
-                                    new_cursor = Some((r.start, r.start));
+                                    new_cursor = Some((c0, c0));
+                                    ed.last_sel = None;
                                 }
                             }
                         }
                         3 => {
                             if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
-                                if let Some(r) = &sel {
-                                    let (b0, b1) = (char_to_byte(&ed.content, r.start), char_to_byte(&ed.content, r.end));
-                                    ed.content.replace_range(b0..b1, &t);
-                                    let nc = r.start + t.chars().count();
-                                    new_cursor = Some((nc, nc));
-                                } else {
-                                    ed.content.push_str(&t);
-                                }
+                                // 有冻结选区则替换它，否则插入到当前光标
+                                let (c0, c1) = menu_sel.unwrap_or((caret, caret));
+                                let (b0, b1) = (char_to_byte(&ed.content, c0), char_to_byte(&ed.content, c1));
+                                ed.content.replace_range(b0..b1, &t);
+                                let nc = c0 + t.chars().count();
+                                new_cursor = Some((nc, nc));
+                                ed.last_sel = None;
                             }
                         }
                         4 => {
                             let n = ed.content.chars().count();
                             new_cursor = Some((0, n));
+                            ed.last_sel = if n > 0 { Some((0, n)) } else { None };
                         }
                         _ => {}
                     }
+                    ed.menu_sel = None;
                     if let Some((c0, c1)) = new_cursor {
                         let mut st = out.state.clone();
                         st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(c0), CCursor::new(c1))));

@@ -164,6 +164,11 @@ impl TermColors {
     }
 }
 
+/// 当前终端主题的背景色（供外层窗口把边框做成「暖米→终端底色」的渐变过渡）。
+pub fn current_bg() -> Color32 {
+    TermColors::by_index(term_theme().load(std::sync::atomic::Ordering::Relaxed)).bg
+}
+
 /// 终端配色清单（索引序）：(中文名, 英文名)。
 const TERM_THEMES: &[(&str, &str)] = &[
     ("暖黑", "Warm dark"),
@@ -847,6 +852,7 @@ impl Terminal {
         let mut do_paste = false;
         let mut start_log = false;
         resp.context_menu(|ui| {
+            ui.set_min_width(170.0); // 菜单宽度足些，看着舒服
             // 菜单项不换行（否则英文较长的「Highlight ERROR/WARN」会折行，复选框被挤到两行正中）
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             let sel = self.has_selection();
@@ -861,6 +867,7 @@ impl Terminal {
             ui.separator();
             // 终端配色：多套主题（深/浅/近白/柔和深/经典浅），选中即全局同步并存盘
             ui.menu_button(crate::i18n::tr("终端配色", "Terminal theme"), |ui| {
+                ui.set_min_width(180.0); // 够宽，英文主题名不至于显示不下
                 for (i, (zh, en)) in TERM_THEMES.iter().enumerate() {
                     let i = i as u8;
                     if ui.selectable_label(self.theme == i, crate::i18n::tr(zh, en)).clicked() {

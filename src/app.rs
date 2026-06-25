@@ -381,6 +381,22 @@ fn init_view_state() {
 
 /// 监控栏（左侧菜单栏）统一右键菜单：语言 / 字体大小 / 折叠视图 / 强制 X11。
 /// 背景层与各子控件、以及折叠后的细条都调用它，保证右键处处一致。
+/// 画一个线性渐变四边形（终端边框「暖米→终端底色」的过渡）。
+/// vertical=true：上→下 a→b；否则左→右 a→b。
+fn grad_quad(painter: &egui::Painter, rect: egui::Rect, a: egui::Color32, b: egui::Color32, vertical: bool) {
+    use egui::epaint::{Mesh, Vertex};
+    let uv = egui::epaint::WHITE_UV;
+    let (tl, tr, br, bl) = if vertical { (a, a, b, b) } else { (a, b, b, a) };
+    let mut mesh = Mesh::default();
+    let i = mesh.vertices.len() as u32;
+    mesh.vertices.push(Vertex { pos: rect.left_top(), uv, color: tl });
+    mesh.vertices.push(Vertex { pos: rect.right_top(), uv, color: tr });
+    mesh.vertices.push(Vertex { pos: rect.right_bottom(), uv, color: br });
+    mesh.vertices.push(Vertex { pos: rect.left_bottom(), uv, color: bl });
+    mesh.indices.extend_from_slice(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 pub fn view_context_menu(resp: &egui::Response) {
     resp.context_menu(|ui| {
         // 菜单项不换行，避免较长英文项折行
@@ -601,6 +617,8 @@ struct EditorState {
     focus: bool,
     /// 「关闭全部」时若有未保存修改，弹确认框
     close_confirm: bool,
+    /// 关闭单个「脏」标签前的确认（标签索引）
+    close_tab_confirm: Option<usize>,
     /// 关闭标签后请求主循环归还内存（trim）
     trim_request: bool,
 }
@@ -2515,50 +2533,74 @@ impl App {
             let mut activate: Option<usize> = None;
             let mut do_save = false;
 
-            // 标签栏
+            let mut toggle_find = false;
+            // 标签栏：左侧可滚动标签，右侧「保存 / 查找」（对齐主窗口风格）
             egui::Panel::top("editor_tabs")
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
-                    // 与 shell 标签一致：横向滚动（溢出可滚）+ 激活标签珊瑚下划线 + 切换后滚到可视区
+                    ui.style_mut().interaction.tooltip_delay = 0.5; // 悬停 0.5s 才弹出完整路径
                     let want_scroll = ed.active != ed.shown;
                     let active = ed.active;
-                    egui::ScrollArea::horizontal()
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, t) in ed.tabs.iter().enumerate() {
-                                    let selected = i == active;
-                                    let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
-                                    let r = egui::Frame::new()
-                                        .fill(fill)
-                                        .corner_radius(6)
-                                        .inner_margin(egui::Margin::symmetric(8, 3))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                let dirty = if t.editor.dirty() { " ●" } else { "" };
-                                                let label = format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty);
-                                                let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                                if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click())).clicked() {
-                                                    activate = Some(i);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                                do_save = true;
+                            }
+                            if ui.button(RichText::new(format!("{}  {}", icon::MAGNIFYING_GLASS, crate::i18n::tr("查找", "Find")))).clicked() {
+                                toggle_find = true;
+                            }
+                            // 左侧剩余宽度：横向滚动标签（溢出可滚）+ 激活标签珊瑚下划线 + 切换后滚到可视区
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                egui::ScrollArea::horizontal()
+                                    .auto_shrink([false, false])
+                                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for (i, t) in ed.tabs.iter().enumerate() {
+                                                let selected = i == active;
+                                                let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
+                                                let r = egui::Frame::new()
+                                                    .fill(fill)
+                                                    .corner_radius(6)
+                                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            let dirty = if t.editor.dirty() { " ●" } else { "" };
+                                                            let label = format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty);
+                                                            let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
+                                                            // 标签悬停 0.5s 显示完整路径（不再常驻显示路径）
+                                                            if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click()))
+                                                                .on_hover_text(t.editor.path.as_str())
+                                                                .clicked()
+                                                            {
+                                                                activate = Some(i);
+                                                            }
+                                                            if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                                                                close_tab = Some(i);
+                                                            }
+                                                        });
+                                                    });
+                                                if selected {
+                                                    let rect = r.response.rect;
+                                                    ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
+                                                    if want_scroll {
+                                                        ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
+                                                    }
                                                 }
-                                                if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
-                                                    close_tab = Some(i);
-                                                }
-                                            });
+                                            }
                                         });
-                                    if selected {
-                                        let rect = r.response.rect;
-                                        ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
-                                        if want_scroll {
-                                            ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
-                                        }
-                                    }
-                                }
+                                    });
                             });
                         });
+                    });
                     ed.shown = ed.active;
                 });
+            if toggle_find {
+                let active = ed.active;
+                if let Some(t) = ed.tabs.get_mut(active) {
+                    t.editor.toggle_find();
+                }
+            }
 
             // 当前标签内容
             egui::CentralPanel::default()
@@ -2589,15 +2631,72 @@ impl App {
                 }
             }
             if let Some(i) = close_tab {
-                if i < ed.tabs.len() {
-                    let closed = ed.tabs.remove(i);
-                    // 清除该编辑器在 egui 内存中的 TextEdit 状态（含撤销历史的文本快照）
-                    vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
+                // 脏标签：先弹确认（保存并关闭 / 不保存 / 取消）；干净标签直接关
+                if ed.tabs.get(i).map(|t| t.editor.dirty()).unwrap_or(false) {
+                    ed.close_tab_confirm = Some(i);
+                } else {
+                    if i < ed.tabs.len() {
+                        let closed = ed.tabs.remove(i);
+                        // 清除该编辑器在 egui 内存中的 TextEdit 状态（含撤销历史的文本快照）
+                        vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
+                    }
+                    if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
+                        ed.active = ed.tabs.len() - 1;
+                    }
+                    ed.trim_request = true;
                 }
-                if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
-                    ed.active = ed.tabs.len() - 1;
+            }
+            // 脏标签关闭确认
+            if let Some(ti) = ed.close_tab_confirm {
+                let name = ed.tabs.get(ti).map(|t| t.editor.filename()).unwrap_or_default();
+                let mut decision = 0u8; // 1=保存并关闭 2=不保存关闭 3=取消
+                egui::Modal::new(egui::Id::new("editor_tab_close_modal")).show(vctx, |ui| {
+                    ui.set_width(330.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("关闭标签", "Close tab")).size(16.0).strong());
+                        ui.add_space(6.0);
+                        ui.label(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("{name} 有未保存的修改"),
+                            crate::i18n::Lang::En => format!("{name} has unsaved changes"),
+                        });
+                    });
+                    ui.add_space(12.0);
+                    let bw = 100.0;
+                    let total = bw * 3.0 + ui.spacing().item_spacing.x * 2.0;
+                    ui.horizontal(|ui| {
+                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                        if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("保存并关闭", "Save & close")).color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            decision = 1;
+                        }
+                        if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("不保存", "Discard")).color(Palette::DANGER)).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            decision = 2;
+                        }
+                        if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            decision = 3;
+                        }
+                    });
+                });
+                if decision != 0 {
+                    if decision == 1 {
+                        if let Some(t) = ed.tabs.get(ti) {
+                            let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone() });
+                        }
+                        if let Some(t) = ed.tabs.get_mut(ti) {
+                            t.editor.mark_saved();
+                        }
+                    }
+                    if decision == 1 || decision == 2 {
+                        if ti < ed.tabs.len() {
+                            let closed = ed.tabs.remove(ti);
+                            vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
+                        }
+                        if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
+                            ed.active = ed.tabs.len() - 1;
+                        }
+                        ed.trim_request = true;
+                    }
+                    ed.close_tab_confirm = None;
                 }
-                ed.trim_request = true;
             }
 
             // 原生关闭按钮：若有未保存修改先拦截并确认，否则关闭全部标签
@@ -3546,6 +3645,21 @@ impl App {
                     .outer_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 0 }),
             )
             .show_inside(root, |ui| {
+                // 边框渐变：6px 内边距从窗口暖米过渡到当前终端主题底色，消除生硬的一圈边框色
+                //（深色主题尤其明显）。在外扩的裁剪区里绘制，覆盖到 margin 区域。
+                {
+                    let tbg = crate::terminal::current_bg();
+                    let outer = Palette::TERM_BG;
+                    if tbg != outer {
+                        let c = ui.max_rect();
+                        let m = 6.0;
+                        let p = ui.painter().with_clip_rect(c.expand(m));
+                        grad_quad(&p, egui::Rect::from_min_max(egui::pos2(c.left() - m, c.top() - m), egui::pos2(c.right() + m, c.top())), outer, tbg, true);
+                        grad_quad(&p, egui::Rect::from_min_max(egui::pos2(c.left() - m, c.bottom()), egui::pos2(c.right() + m, c.bottom() + m)), tbg, outer, true);
+                        grad_quad(&p, egui::Rect::from_min_max(egui::pos2(c.left() - m, c.top()), egui::pos2(c.left(), c.bottom())), outer, tbg, false);
+                        grad_quad(&p, egui::Rect::from_min_max(egui::pos2(c.right(), c.top()), egui::pos2(c.right() + m, c.bottom())), tbg, outer, false);
+                    }
+                }
                 let s = &mut self.sessions[idx];
                 // 断线提示条 + 手动重连（初次"连接中"不显示）
                 if !s.connected {
