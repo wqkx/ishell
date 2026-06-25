@@ -161,42 +161,48 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         ed.show_find = true;
     }
 
-    // 查找/替换栏
+    // 查找/替换栏：仿「文件传输」浮窗——PANEL_2 卡片、统一控件高度、两侧留边。
     let mut pending_select: Option<(usize, usize)> = None;
     if ed.show_find {
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
-            ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
-            if ui.button(crate::i18n::tr("下一个", "Next")).clicked() {
-                if let Some((c0, c1)) = find_from(&ed.content, &ed.find, ed.search_from) {
-                    pending_select = Some((c0, c1));
-                    ed.search_from = c1;
-                    ed.status.clear();
-                } else if !ed.find.is_empty() {
-                    ed.status = crate::i18n::tr("未找到", "Not found").into();
-                }
-            }
-            ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换为", "Replace with")));
-            if ui.button(crate::i18n::tr("替换", "Replace")).clicked() {
-                let from = ed.search_from.saturating_sub(ed.find.chars().count());
-                if let Some((c0, c1)) = find_from(&ed.content, &ed.find, from) {
-                    replace_char_range(&mut ed.content, c0, c1, &ed.replace);
-                    let nc1 = c0 + ed.replace.chars().count();
-                    pending_select = Some((c0, nc1));
-                    ed.search_from = nc1;
-                }
-            }
-            if ui.button(crate::i18n::tr("全部替换", "Replace all")).clicked() && !ed.find.is_empty() {
-                let n = ed.content.matches(ed.find.as_str()).count();
-                ed.content = ed.content.replace(ed.find.as_str(), ed.replace.as_str());
-                ed.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已替换 {n} 处"), crate::i18n::Lang::En => format!("Replaced {n}") };
-            }
-            if !ed.status.is_empty() {
-                ui.label(RichText::new(&ed.status).color(Palette::TEXT_DIM).size(11.0));
-            }
-        });
+        egui::Frame::new()
+            .fill(Palette::PANEL_2)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.spacing_mut().interact_size.y = 26.0; // 统一搜索框与按钮高度
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
+                    ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
+                    if ui.button(crate::i18n::tr("下一个", "Next")).clicked() {
+                        if let Some((c0, c1)) = find_from(&ed.content, &ed.find, ed.search_from) {
+                            pending_select = Some((c0, c1));
+                            ed.search_from = c1;
+                            ed.status.clear();
+                        } else if !ed.find.is_empty() {
+                            ed.status = crate::i18n::tr("未找到", "Not found").into();
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换为", "Replace with")));
+                    if ui.button(crate::i18n::tr("替换", "Replace")).clicked() {
+                        let from = ed.search_from.saturating_sub(ed.find.chars().count());
+                        if let Some((c0, c1)) = find_from(&ed.content, &ed.find, from) {
+                            replace_char_range(&mut ed.content, c0, c1, &ed.replace);
+                            let nc1 = c0 + ed.replace.chars().count();
+                            pending_select = Some((c0, nc1));
+                            ed.search_from = nc1;
+                        }
+                    }
+                    if ui.button(crate::i18n::tr("全部替换", "Replace all")).clicked() && !ed.find.is_empty() {
+                        let n = ed.content.matches(ed.find.as_str()).count();
+                        ed.content = ed.content.replace(ed.find.as_str(), ed.replace.as_str());
+                        ed.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已替换 {n} 处"), crate::i18n::Lang::En => format!("Replaced {n}") };
+                    }
+                    if !ed.status.is_empty() {
+                        ui.label(RichText::new(&ed.status).color(Palette::TEXT_DIM).size(11.0));
+                    }
+                });
+            });
     }
 
     // —— 自绘输入法 ——
@@ -381,10 +387,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
             ui.horizontal_top(|ui| {
                 ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
-                // 宽度填满「行号列之后的剩余可视宽度」而非 INFINITY：否则「行号列 + 无限宽正文」总宽
-                // 永远超过视口，横向滚动条常驻（且与视口边缘反复争用空间而闪动）。短行时正好填满、
-                // 无横向滚动条；仅当某行确实更长（不换行）时才出现横向滚动条。
-                let avail = ui.available_width().max(50.0);
+                // 宽度比「行号列之后的剩余可视宽度」再小几像素：保证短行时正文总宽严格小于视口，
+                // 横向滚动条不出现、也不会因恰好等于视口而反复出现/消失地闪动；仅当某行确实更长
+                // （不换行）时正文才超出视口、出现横向滚动条。
+                let avail = (ui.available_width() - 6.0).max(50.0);
                 let out = egui::TextEdit::multiline(&mut ed.content)
                     .code_editor()
                     .desired_width(avail)

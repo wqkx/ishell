@@ -418,8 +418,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         .fill(Palette::PANEL_2)
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(6, 4))
-        // 工具栏卡片四周留外边距，左右与上方一致，不顶到边
-        .outer_margin(egui::Margin { left: 4, right: 4, top: 2, bottom: 2 })
+        // 左侧外边距、不给右侧留边（右侧顶到边）
+        .outer_margin(egui::Margin { left: 8, right: 0, top: 2, bottom: 2 })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if tool_btn(ui, icon::ARROW_CLOCKWISE, crate::i18n::tr("刷新", "Refresh")) && !state.cwd.is_empty() {
@@ -595,9 +595,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let cwd = state.cwd.clone();
     let total_count = state.listings.get(&cwd).map(|e| e.len()).unwrap_or(0);
 
-    // 名称过滤行：左右各留 6px，与右侧对称、不顶边
+    // 名称过滤行：左侧留边（与操作栏一致）、右侧顶到边
     egui::Frame::new()
-        .inner_margin(egui::Margin { left: 6, right: 6, top: 0, bottom: 0 })
+        .inner_margin(egui::Margin { left: 12, right: 0, top: 0, bottom: 0 })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM).size(12.0));
