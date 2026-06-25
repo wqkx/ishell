@@ -272,6 +272,19 @@ pub fn highlight(text: &str, ext: &str, font_size: f32, errors: &[Range<usize>])
     job
 }
 
+/// 是否对该语言做括号 lint。仅常见、括号配平规则明确的编程语言才判断；
+/// 文本/标记/配置/shell 等不判（避免对不认识的文本误报）。
+pub fn lint_enabled(ext: &str) -> bool {
+    matches!(
+        ext,
+        "rs" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cu"
+            | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+            | "go" | "java" | "kt" | "kts" | "swift" | "scala"
+            | "py" | "pyw" | "rb" | "php" | "lua"
+            | "json" | "css" | "scss" | "less"
+    )
+}
+
 /// 初级 lint：括号 () [] {} 配对检查（跳过注释/字符串内的括号）。
 /// 返回 (出问题的 0 基行号集合, 字节范围集合用于下划线, 概述文案)。
 pub fn lint_brackets(text: &str, ext: &str) -> (Vec<usize>, Vec<Range<usize>>, Option<String>) {

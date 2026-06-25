@@ -195,7 +195,6 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             }
         });
     }
-    ui.separator();
 
     // —— 自动缩进：本编辑器聚焦时拦截 Tab / Shift+Tab / 回车，手动处理后阻止 TextEdit 默认行为 ——
     // 用上一帧存储的光标位置（consume 必须在 TextEdit.show() 之前）。
@@ -216,9 +215,9 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     // 代码编辑区（近白背景，显示更清晰；大文件不做高亮/lint）
     let bg = egui::Color32::from_rgb(252, 252, 250); // 近白底
     let do_highlight = ed.content.len() <= HIGHLIGHT_LIMIT;
-    // 初级 lint：括号配对（仅对可高亮大小的文件，避免大文件每帧扫描）
+    // 初级 lint：仅对「可高亮大小 + 已知编程语言」做括号配对（不认识的文本类型不判，避免误报）
     let (err_lines, err_ranges, lint_msg): (std::collections::HashSet<usize>, Vec<std::ops::Range<usize>>, Option<String>) =
-        if do_highlight {
+        if do_highlight && highlight::lint_enabled(&ed.language) {
             let (lines, ranges, msg) = highlight::lint_brackets(&ed.content, &ed.language);
             (lines.into_iter().collect(), ranges, msg)
         } else {
@@ -246,28 +245,50 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
 
-    // 状态行：缩进风格 + lint 概述
-    ui.horizontal(|ui| {
-        ui.add_space(2.0);
-        ui.label(RichText::new(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label())).color(Palette::TEXT_DIM).size(11.0));
-        if let Some(msg) = &lint_msg {
-            ui.separator();
-            ui.label(RichText::new(msg).color(Palette::DANGER).size(11.0));
-        }
-    });
-
     let mono = egui::FontId::monospace(13.0);
     let n_lines = ed.content.split('\n').count().max(1);
     let digits = n_lines.to_string().len();
     let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, '0')).max(1.0);
     let gutter_w = (digits as f32 + 1.5) * char_w; // 行号列宽
     let row_h = ui.ctx().fonts_mut(|f| f.row_height(&mono));
-    // 编辑区至少撑满窗口高度（内容不足一屏也填满，便于点击空白定位光标）。
-    let fill_rows = (((ui.available_height() - 6.0) / row_h).ceil() as usize).max(8);
+    // 底部固定状态栏（仿 VSCode）：缩进规则可点切换 + lint 概述 + 语言。先占住底部，编辑区填其余。
+    egui::Panel::bottom("editor_status")
+        .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::symmetric(8, 3)))
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.menu_button(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label()), |ui| {
+                    ui.set_min_width(120.0);
+                    for ind in [Indent::Spaces(2), Indent::Spaces(4), Indent::Tab] {
+                        if ui.selectable_label(ed.indent == ind, ind.label()).clicked() {
+                            ed.indent = ind;
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some(msg) = &lint_msg {
+                    ui.separator();
+                    ui.label(RichText::new(msg).color(Palette::DANGER).size(11.0));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
+                });
+            });
+        });
 
+    // 编辑区填满状态栏以上的剩余高度（内容不足一屏也填满，便于点击空白定位光标）。
+    let fill_rows = (((ui.available_height() - 6.0) / row_h).ceil() as usize).max(8);
     egui::Frame::new().fill(bg).show(ui, |ui| {
-        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        // 滚动条独立成右侧一列（不浮在内容上）——必须在创建 ScrollArea 之前设置
+        ui.spacing_mut().scroll.floating = false;
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
             ui.visuals_mut().extreme_bg_color = bg; // TextEdit 自身背景也用近白，无接缝
+            // 去掉聚焦/悬停/未聚焦时的边框描边（橙色聚焦框）
+            ui.visuals_mut().widgets.active.bg_stroke = egui::Stroke::NONE;
+            ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
+            ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
             ui.horizontal_top(|ui| {
                 ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
                 let out = egui::TextEdit::multiline(&mut ed.content)
@@ -278,6 +299,13 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     .layouter(&mut layouter)
                     .show(ui);
                 let id = out.response.id;
+                // 行号与正文之间一条浅浅的竖向分割线
+                {
+                    let x = out.galley_pos.x - 3.0;
+                    let top = out.galley_pos.y;
+                    let bot = (top + out.galley.rows.last().map(|r| r.pos.y + row_h).unwrap_or(row_h)).max(top + ui.clip_rect().height());
+                    ui.painter().vline(x, top..=bot, egui::Stroke::new(1.0, Palette::BORDER));
+                }
 
                 // 行号：按 galley 每行的实际像素位置逐行绘制，与正文严格对齐——彻底解决长文本
                 // 底部缺行号（旧实现用单个多行 Label，高亮字体行高与 Label 不一致会累积错位）。
@@ -313,12 +341,15 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     .map(|r| r.as_sorted_char_range())
                     .filter(|r| r.start != r.end)
                     .map(|r| (r.start, r.end));
-                if cur_sel.is_some() {
-                    ed.last_sel = cur_sel;
-                } else if !out.response.secondary_clicked() {
-                    ed.last_sel = None;
+                // 右键的「按下」就会折叠选区（且早于 secondary_clicked 的「释放」一帧），
+                // 因此必须在 secondary_pressed 这一帧、用上一帧仍在的 last_sel 冻结。
+                let sec_pressed = ui.input(|i| i.pointer.secondary_pressed());
+                if let Some(s) = cur_sel {
+                    ed.last_sel = Some(s);
+                } else if !sec_pressed {
+                    ed.last_sel = None; // 非右键造成的折叠（左键/打字）才清，保证右键当帧 last_sel 仍在
                 }
-                if out.response.secondary_clicked() {
+                if sec_pressed {
                     ed.menu_sel = cur_sel.or(ed.last_sel);
                 }
                 let menu_sel = ed.menu_sel;

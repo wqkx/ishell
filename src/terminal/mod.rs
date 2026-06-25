@@ -867,7 +867,7 @@ impl Terminal {
             ui.separator();
             // 终端配色：多套主题（深/浅/近白/柔和深/经典浅），选中即全局同步并存盘
             ui.menu_button(crate::i18n::tr("终端配色", "Terminal theme"), |ui| {
-                ui.set_min_width(180.0); // 够宽，英文主题名不至于显示不下
+                ui.set_min_width(120.0);
                 for (i, (zh, en)) in TERM_THEMES.iter().enumerate() {
                     let i = i as u8;
                     if ui.selectable_label(self.theme == i, crate::i18n::tr(zh, en)).clicked() {
