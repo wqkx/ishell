@@ -2794,106 +2794,113 @@ impl App {
             let mut close_tab: Option<usize> = None;
             let mut activate: Option<usize> = None;
             let mut save_msg: Option<String> = None;
+            let mut do_fit = false;
+            let mut do_one = false;
+            let mut do_save_as = false;
 
-            // 标签栏
+            // 标签栏（仿编辑器：左侧可滚动标签，右侧操作按钮，整体垂直居中）
             egui::Panel::top("image_tabs")
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
-                    // 与 shell 标签一致：横向滚动 + 激活珊瑚下划线 + 切换后滚到可视区
+                    ui.style_mut().interaction.tooltip_delay = 0.5; // 悬停 0.5s 显示完整路径
                     let want_scroll = self.active_image != self.image_shown;
-                    egui::ScrollArea::horizontal()
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, t) in self.image_tabs.iter().enumerate() {
-                                    let selected = i == self.active_image;
-                                    let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
-                                    let r = egui::Frame::new()
-                                        .fill(fill)
-                                        .corner_radius(6)
-                                        .inner_margin(egui::Margin::symmetric(8, 3))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
-                                                let label = format!("{} {}·{}", icon::IMAGE, t.server, fname);
-                                                let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                                if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click())).clicked() {
-                                                    activate = Some(i);
+                    let active = self.active_image;
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(28.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // 另存为=主操作(珊瑚填充，对齐编辑器「保存」)；1:1/适应窗口=扁平按钮(对齐「查找」)
+                            if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("另存为", "Save as"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                                do_save_as = true;
+                            }
+                            if flat_button(ui, &RichText::new("1:1"), crate::i18n::tr("原始大小", "Actual size")) {
+                                do_one = true;
+                            }
+                            if flat_button(ui, &RichText::new(crate::i18n::tr("适应窗口", "Fit")), crate::i18n::tr("适应窗口", "Fit to window")) {
+                                do_fit = true;
+                            }
+                            // 左侧剩余宽度：横向滚动标签（高度随内容，与右侧按钮同线居中）
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                egui::ScrollArea::horizontal()
+                                    .auto_shrink([false, true])
+                                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for (i, t) in self.image_tabs.iter().enumerate() {
+                                                let selected = i == active;
+                                                let fill = if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
+                                                let r = egui::Frame::new()
+                                                    .fill(fill)
+                                                    .corner_radius(6)
+                                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
+                                                            let label = format!("{} {}·{}", icon::IMAGE, t.server, fname);
+                                                            let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
+                                                            if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click()))
+                                                                .on_hover_text(t.path.as_str())
+                                                                .clicked()
+                                                            {
+                                                                activate = Some(i);
+                                                            }
+                                                            if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                                                                close_tab = Some(i);
+                                                            }
+                                                        });
+                                                    });
+                                                if selected {
+                                                    let rect = r.response.rect;
+                                                    ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
+                                                    if want_scroll {
+                                                        ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
+                                                    }
                                                 }
-                                                if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
-                                                    close_tab = Some(i);
-                                                }
-                                            });
+                                            }
                                         });
-                                    if selected {
-                                        let rect = r.response.rect;
-                                        ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
-                                        if want_scroll {
-                                            ui.scroll_to_rect(rect.expand2(egui::vec2(12.0, 0.0)), None);
-                                        }
-                                    }
-                                }
+                                    });
                             });
                         });
+                    });
                     self.image_shown = self.active_image;
                 });
 
-            egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(Palette::PANEL).inner_margin(8))
+            // 底部状态栏（仿编辑器：贴窗口左右/底边；左侧尺寸/缩放，右侧文件名）
+            egui::Panel::bottom("image_status")
+                .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin { left: 8, right: 8, top: 2, bottom: 2 }))
                 .show(vctx, |ui| {
-                    if let Some(t) = self.image_tabs.get_mut(self.active_image) {
-                        // 工具栏：路径 + 尺寸/缩放 + 另存为/1:1/适应窗口
-                        // 按钮先占右侧，路径在剩余宽度里横向滚动、默认贴右
+                    if let Some(t) = self.image_tabs.get(self.active_image) {
                         ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{}×{}", t.size.x as i32, t.size.y as i32)).color(Palette::TEXT_DIM).size(11.0));
+                            if t.zoom > 0.0 {
+                                ui.label(RichText::new("·").color(Palette::TEXT_DIM).size(11.0));
+                                ui.label(RichText::new(format!("{}%", (t.zoom * 100.0).round() as i32)).color(Palette::TEXT_DIM).size(11.0));
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button(crate::i18n::tr("适应窗口", "Fit")).clicked() {
-                                    t.zoom = 0.0;
-                                    t.offset = egui::Vec2::ZERO;
-                                }
-                                if ui.button("1:1").clicked() {
-                                    t.zoom = 1.0;
-                                    t.offset = egui::Vec2::ZERO;
-                                }
-                                // 另存为本地文件（写回原始字节，保留源格式）
-                                if ui.button(crate::i18n::tr("另存为…", "Save as…")).clicked() && !t.data.is_empty() {
-                                    let fname = t.path.rsplit('/').next().unwrap_or("image");
-                                    if let Some(path) = rfd::FileDialog::new().set_file_name(fname).save_file() {
-                                        save_msg = Some(match std::fs::write(&path, &t.data) {
-                                            Ok(_) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存到 {}", path.display()), crate::i18n::Lang::En => format!("Saved to {}", path.display()) },
-                                            Err(e) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("保存失败：{e}"), crate::i18n::Lang::En => format!("Save failed: {e}") },
-                                        });
-                                    }
-                                }
-                                if t.zoom > 0.0 {
-                                    ui.label(RichText::new(format!("{}%", (t.zoom * 100.0).round() as i32)).color(Palette::TEXT_DIM).size(11.0));
-                                }
-                                ui.label(RichText::new(format!("{}×{}", t.size.x as i32, t.size.y as i32)).color(Palette::TEXT_DIM).size(11.0));
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                    crate::ui::path_scroll(ui, &t.path);
-                                });
+                                let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
+                                ui.label(RichText::new(fname).color(Palette::TEXT_DIM).size(11.0)).on_hover_text(t.path.as_str());
                             });
                         });
-                        ui.separator();
+                    }
+                });
 
-                        // 画布：灰底 + 图片，支持滚轮缩放与拖动平移
+            // 画布（贴窗口边）：灰底 + 图片，滚轮以光标为锚缩放、拖动平移、双击适应窗口
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(0))
+                .show(vctx, |ui| {
+                    if let Some(t) = self.image_tabs.get_mut(self.active_image) {
                         let avail = ui.available_size();
                         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
                         let painter = ui.painter_at(rect);
                         painter.rect_filled(rect, 0.0, Palette::PANEL_2);
-
-                        // 双击复位为「适应窗口」
                         if resp.double_clicked() {
                             t.zoom = 0.0;
                             t.offset = egui::Vec2::ZERO;
                         }
-                        // 首帧/复位后自动适应窗口（不放大超过 1:1）
                         if t.zoom <= 0.0 {
                             let fit = (rect.width() / t.size.x).min(rect.height() / t.size.y).min(1.0);
                             t.zoom = fit.clamp(0.02, 32.0);
                             t.offset = egui::Vec2::ZERO;
                         }
-                        // 滚轮缩放：以光标为锚点，保持光标下的像素不动
                         if resp.hovered() {
                             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
                             if scroll_y != 0.0 {
@@ -2907,12 +2914,9 @@ impl App {
                                 t.zoom = new;
                             }
                         }
-                        // 拖动平移
                         if resp.dragged() {
                             t.offset += resp.drag_delta();
                         }
-
-                        // 绘制图片
                         let disp = t.size * t.zoom;
                         let center = rect.center() + t.offset;
                         let img_rect = egui::Rect::from_center_size(center, disp);
@@ -2923,6 +2927,34 @@ impl App {
 
             if let Some(i) = activate {
                 self.active_image = i;
+            }
+            // 应用标签栏按钮（在标签栏闭包外执行，避免与遍历 image_tabs 的不可变借用冲突）
+            let active = self.active_image;
+            if do_fit {
+                if let Some(t) = self.image_tabs.get_mut(active) {
+                    t.zoom = 0.0;
+                    t.offset = egui::Vec2::ZERO;
+                }
+            }
+            if do_one {
+                if let Some(t) = self.image_tabs.get_mut(active) {
+                    t.zoom = 1.0;
+                    t.offset = egui::Vec2::ZERO;
+                }
+            }
+            if do_save_as {
+                if let Some(t) = self.image_tabs.get(active) {
+                    if !t.data.is_empty() {
+                        let fname = t.path.rsplit('/').next().unwrap_or("image").to_string();
+                        let data = t.data.clone();
+                        if let Some(path) = rfd::FileDialog::new().set_file_name(&fname).save_file() {
+                            save_msg = Some(match std::fs::write(&path, &data) {
+                                Ok(_) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存到 {}", path.display()), crate::i18n::Lang::En => format!("Saved to {}", path.display()) },
+                                Err(e) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("保存失败：{e}"), crate::i18n::Lang::En => format!("Save failed: {e}") },
+                            });
+                        }
+                    }
+                }
             }
             // 方向键切换上一张/下一张（本窗口聚焦时即可，独立窗口不会抢占主窗口按键）
             let nav_delta = vctx.input(|i| {
