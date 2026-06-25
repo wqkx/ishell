@@ -2530,6 +2530,8 @@ impl App {
             let mut close_tab: Option<usize> = None;
             let mut activate: Option<usize> = None;
             let mut do_save = false;
+            let mut drag_idx: Option<usize> = None; // 本帧正被拖动的标签
+            let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new(); // 各标签矩形（用于拖动落点判定）
 
             let mut toggle_find = false;
             // 标签栏：左侧可滚动标签，右侧「保存 / 查找」（对齐主窗口风格）
@@ -2559,6 +2561,7 @@ impl App {
                                     // 与右侧按钮无法在同一水平线居中。
                                     .auto_shrink([false, true])
                                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                    .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL) // 拖动标签不触发滚动
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             for (i, t) in ed.tabs.iter().enumerate() {
@@ -2573,18 +2576,21 @@ impl App {
                                                             let dirty = if t.editor.dirty() { " ●" } else { "" };
                                                             let label = format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty);
                                                             let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                                            // 标签悬停 0.5s 显示完整路径（不再常驻显示路径）
-                                                            if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click()))
-                                                                .on_hover_text(t.editor.path.as_str())
-                                                                .clicked()
-                                                            {
+                                                            // 标签悬停 0.5s 显示完整路径；可拖动重排
+                                                            let lab = ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click_and_drag()))
+                                                                .on_hover_text(t.editor.path.as_str());
+                                                            if lab.clicked() {
                                                                 activate = Some(i);
+                                                            }
+                                                            if lab.dragged() {
+                                                                drag_idx = Some(i);
                                                             }
                                                             if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                                                                 close_tab = Some(i);
                                                             }
                                                         });
                                                     });
+                                                tab_rects.push((i, r.response.rect));
                                                 if selected {
                                                     let rect = r.response.rect;
                                                     ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
@@ -2600,6 +2606,17 @@ impl App {
                     });
                     ed.shown = ed.active;
                 });
+            // 拖动重排标签：拖动中实时把被拖标签与指针所在标签交换（活动标签跟随移动）
+            if let Some(src) = drag_idx {
+                if let Some(px) = vctx.input(|i| i.pointer.interact_pos().map(|p| p.x)) {
+                    if let Some(&(dst, _)) = tab_rects.iter().find(|(_, r)| px >= r.left() && px <= r.right()) {
+                        if dst != src && src < ed.tabs.len() && dst < ed.tabs.len() {
+                            ed.tabs.swap(src, dst);
+                            ed.active = if ed.active == src { dst } else if ed.active == dst { src } else { ed.active };
+                        }
+                    }
+                }
+            }
             if toggle_find {
                 let active = ed.active;
                 if let Some(t) = ed.tabs.get_mut(active) {
@@ -2797,6 +2814,8 @@ impl App {
             let mut do_fit = false;
             let mut do_one = false;
             let mut do_save_as = false;
+            let mut drag_idx: Option<usize> = None;
+            let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
             // 标签栏（仿编辑器：左侧可滚动标签，右侧操作按钮，整体垂直居中）
             egui::Panel::top("image_tabs")
@@ -2823,6 +2842,7 @@ impl App {
                                 egui::ScrollArea::horizontal()
                                     .auto_shrink([false, true])
                                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                                    .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL) // 拖动标签不触发滚动
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             for (i, t) in self.image_tabs.iter().enumerate() {
@@ -2837,17 +2857,20 @@ impl App {
                                                             let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
                                                             let label = format!("{} {}·{}", icon::IMAGE, t.server, fname);
                                                             let color = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                                                            if ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click()))
-                                                                .on_hover_text(t.path.as_str())
-                                                                .clicked()
-                                                            {
+                                                            let lab = ui.add(egui::Label::new(RichText::new(label).color(color).size(12.0)).selectable(false).sense(Sense::click_and_drag()))
+                                                                .on_hover_text(t.path.as_str());
+                                                            if lab.clicked() {
                                                                 activate = Some(i);
+                                                            }
+                                                            if lab.dragged() {
+                                                                drag_idx = Some(i);
                                                             }
                                                             if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
                                                                 close_tab = Some(i);
                                                             }
                                                         });
                                                     });
+                                                tab_rects.push((i, r.response.rect));
                                                 if selected {
                                                     let rect = r.response.rect;
                                                     ui.painter().hline(rect.left()..=rect.right(), rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
@@ -2863,6 +2886,17 @@ impl App {
                     });
                     self.image_shown = self.active_image;
                 });
+            // 拖动重排标签：拖动中实时与指针所在标签交换
+            if let Some(src) = drag_idx {
+                if let Some(px) = vctx.input(|i| i.pointer.interact_pos().map(|p| p.x)) {
+                    if let Some(&(dst, _)) = tab_rects.iter().find(|(_, r)| px >= r.left() && px <= r.right()) {
+                        if dst != src && src < self.image_tabs.len() && dst < self.image_tabs.len() {
+                            self.image_tabs.swap(src, dst);
+                            self.active_image = if self.active_image == src { dst } else if self.active_image == dst { src } else { self.active_image };
+                        }
+                    }
+                }
+            }
 
             // 底部状态栏（仿编辑器：贴窗口左右/底边；左侧尺寸/缩放，右侧文件名）
             egui::Panel::bottom("image_status")
