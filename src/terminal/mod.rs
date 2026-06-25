@@ -50,6 +50,8 @@ pub struct Terminal {
     highlight: bool,
     /// 由 OSC 7 解析到的当前工作目录（用于断线重连后恢复）
     osc7_cwd: Option<String>,
+    /// 右键菜单「在文件列表中显示当前目录」请求：App 取走后导航文件区
+    reveal_cwd: Option<String>,
     /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
     ime_preedit: String,
     /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
@@ -202,6 +204,7 @@ impl Terminal {
             log_file: None,
             highlight: true,
             osc7_cwd: None,
+            reveal_cwd: None,
             ime_preedit: String::new(),
             prev_focused: false,
         }
@@ -210,6 +213,10 @@ impl Terminal {
     /// 由 OSC 7 解析到的当前工作目录（若 shell 上报）。
     pub fn cwd(&self) -> Option<&str> {
         self.osc7_cwd.as_deref()
+    }
+    /// 取走「在文件列表中显示当前目录」请求（右键菜单触发）。
+    pub fn take_reveal_cwd(&mut self) -> Option<String> {
+        self.reveal_cwd.take()
     }
 
     /// 收集终端全部行文本（含回滚缓冲）。会临时改动 scrollback 并复原。
@@ -865,6 +872,19 @@ impl Terminal {
                 ui.close();
             }
             ui.separator();
+            // 在文件列表中显示终端当前目录（依赖 shell 上报的 OSC 7 cwd）
+            {
+                let cwd = self.osc7_cwd.clone();
+                if ui
+                    .add_enabled(cwd.is_some(), egui::Button::new(crate::i18n::tr("在文件列表中显示当前目录", "Show current dir in files")))
+                    .on_hover_text(crate::i18n::tr("需 shell 上报工作目录（OSC 7）", "Requires shell OSC 7 cwd reporting"))
+                    .clicked()
+                {
+                    self.reveal_cwd = cwd;
+                    ui.close();
+                }
+            }
+            ui.separator();
             // 终端配色：多套主题（深/浅/近白/柔和深/经典浅），选中即全局同步并存盘
             ui.menu_button(crate::i18n::tr("终端配色", "Terminal theme"), |ui| {
                 ui.set_min_width(120.0);
@@ -893,8 +913,6 @@ impl Terminal {
                 start_log = true;
                 ui.close();
             }
-            ui.separator();
-            ui.menu_button(crate::i18n::tr("语言", "Language"), crate::i18n::language_menu);
         });
         if start_log {
             if let Some(path) = rfd::FileDialog::new().set_file_name("session.log").save_file() {

@@ -3683,6 +3683,11 @@ impl App {
                 if !input.is_empty() {
                     let _ = s.cmd_tx.send(UiCommand::TerminalInput(input));
                 }
+                // 右键菜单「在文件列表中显示当前目录」：把文件区导航到终端当前目录
+                if let Some(cwd) = s.terminal.take_reveal_cwd() {
+                    s.files.cwd = cwd;
+                    s.files.selected.clear();
+                }
                 let size = s.terminal.size();
                 if size != s.last_size && s.connected {
                     s.last_size = size;
