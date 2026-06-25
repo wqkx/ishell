@@ -35,6 +35,8 @@ pub struct Editor {
     last_sel: Option<(usize, usize)>,
     /// 右键打开菜单时冻结的选区
     menu_sel: Option<(usize, usize)>,
+    /// 自绘输入法：当前预编辑(组字)文本在 content 中的字符范围 [start,end)；无组字为 None。
+    ime_preedit: Option<(usize, usize)>,
 }
 
 impl Editor {
@@ -63,6 +65,7 @@ impl Editor {
             indent,
             last_sel: None,
             menu_sel: None,
+            ime_preedit: None,
         }
     }
     /// 切换查找栏（供窗口标签栏的「查找」按钮调用）。
@@ -194,6 +197,71 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                 ui.label(RichText::new(&ed.status).color(Palette::TEXT_DIM).size(11.0));
             }
         });
+    }
+
+    // —— 自绘输入法 ——
+    // egui 0.34 的 Commit 处理有个门：`cursor_range.secondary.index == state.ime_cursor_range.secondary.index`
+    // 才插入提交文本，而 `ime_cursor_range` 只在 Enabled/Preedit 事件里更新。fcitx(X11) 这类「只发
+    // Commit、不发 Enabled/Preedit」的输入法下，该值永远停在 0：第一次光标在 0 能插入，插入后光标
+    // 移动，第二次起门永远不通过 → 中文只能输一次。这里在 TextEdit 之前自行处理 Preedit/Commit
+    // 直接写入缓冲、再移除全部 Ime 事件，绕开该 bug；独立窗口保留、各平台通用。
+    let ime_events: Vec<egui::ImeEvent> = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| if let egui::Event::Ime(ev) = e { Some(ev.clone()) } else { None })
+            .collect()
+    });
+    if !ime_events.is_empty() && ui.memory(|m| m.focused() == Some(text_id)) {
+        // 当前选区（字符索引）；无则取末尾
+        let (mut sel0, mut sel1) = egui::text_edit::TextEditState::load(ui.ctx(), text_id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| (r.primary.index.min(r.secondary.index), r.primary.index.max(r.secondary.index)))
+            .unwrap_or_else(|| {
+                let n = ed.content.chars().count();
+                (n, n)
+            });
+        for ev in ime_events {
+            match ev {
+                egui::ImeEvent::Enabled => {}
+                egui::ImeEvent::Preedit(t) => {
+                    if t == "\n" || t == "\r" {
+                        continue;
+                    }
+                    // 有进行中的预编辑则替换它，否则替换当前选区
+                    let (s, e) = ed.ime_preedit.take().unwrap_or((sel0, sel1));
+                    replace_char_range(&mut ed.content, s, e, &t);
+                    let end = s + t.chars().count();
+                    if !t.is_empty() {
+                        ed.ime_preedit = Some((s, end));
+                    }
+                    sel0 = end;
+                    sel1 = end;
+                    set_cursor(ui.ctx(), text_id, end, end);
+                }
+                egui::ImeEvent::Commit(t) => {
+                    if t == "\n" || t == "\r" {
+                        continue;
+                    }
+                    let (s, e) = ed.ime_preedit.take().unwrap_or((sel0, sel1));
+                    replace_char_range(&mut ed.content, s, e, &t);
+                    let end = s + t.chars().count();
+                    sel0 = end;
+                    sel1 = end;
+                    set_cursor(ui.ctx(), text_id, end, end);
+                }
+                egui::ImeEvent::Disabled => {
+                    // 取消未提交的组字
+                    if let Some((s, e)) = ed.ime_preedit.take() {
+                        replace_char_range(&mut ed.content, s, e, "");
+                        sel0 = s;
+                        sel1 = s;
+                        set_cursor(ui.ctx(), text_id, s, s);
+                    }
+                }
+            }
+        }
+        // 已自行处理，移除全部 Ime 事件，避免 egui 用坏掉的 Commit 门重复处理
+        ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
     }
 
     // —— 自动缩进：本编辑器聚焦时拦截 Tab / Shift+Tab / 回车，手动处理后阻止 TextEdit 默认行为 ——

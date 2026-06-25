@@ -485,9 +485,6 @@ pub struct App {
     /// 无法借用 &mut self）与主 update() 共享。改 deferred 是为根治 macOS 多窗口闪烁
     /// （immediate viewport 与主窗口同帧渲染、强耦合焦点，触发 Stage Manager 不停重拍）。
     editor_state: Arc<Mutex<EditorState>>,
-    /// 诊断：IME 事件诊断窗口的文本框缓冲 + (事件总数, 最近事件日志)
-    ime_diag_buf: Arc<Mutex<String>>,
-    ime_diag: Arc<Mutex<(u32, Vec<String>)>>,
     /// 看图工具：已打开的图片标签
     image_tabs: Vec<ImageTab>,
     active_image: usize,
@@ -698,8 +695,6 @@ impl App {
             pending_close_tab: None,
             allow_close: false,
             editor_state: Arc::new(Mutex::new(EditorState::default())),
-            ime_diag_buf: Arc::new(Mutex::new(String::new())),
-            ime_diag: Arc::new(Mutex::new((0, Vec::new()))),
             image_tabs: Vec::new(),
             active_image: 0,
             image_focus: false,
@@ -1740,7 +1735,6 @@ impl eframe::App for App {
 
         // 文本编辑器浮窗
         self.editor_window(&ctx);
-        self.ime_diag_window(&ctx);
 
         // 看图工具浮窗
         self.image_window(&ctx);
@@ -2469,59 +2463,6 @@ impl App {
             Some(false) => self.pending_close_tab = None,
             None => {}
         }
-    }
-
-    /// 诊断：直接显示子窗口收到的每个 IME 事件。判断「第一次提交后输入法事件是否还送达」——
-    /// 若继续打拼音时事件计数仍增长 → 事件在送达、可自绘 IME 修；否则 winit 不再投递、修不了。
-    #[allow(deprecated)]
-    fn ime_diag_window(&mut self, ctx: &egui::Context) {
-        let vid = egui::ViewportId::from_hash_of("ishell_ime_diag");
-        let builder = egui::ViewportBuilder::default()
-            .with_title("IME 事件诊断")
-            .with_inner_size([540.0, 400.0]);
-        let buf = self.ime_diag_buf.clone();
-        let log = self.ime_diag.clone();
-        ctx.show_viewport_deferred(vid, builder, move |vctx, _class| {
-            vctx.request_repaint();
-            vctx.input(|i| {
-                for e in &i.events {
-                    if let egui::Event::Ime(ime) = e {
-                        let desc = match ime {
-                            egui::ImeEvent::Enabled => "Enabled".to_string(),
-                            egui::ImeEvent::Preedit(s) => format!("Preedit({s:?})"),
-                            egui::ImeEvent::Commit(s) => format!("Commit({s:?})"),
-                            egui::ImeEvent::Disabled => "Disabled".to_string(),
-                        };
-                        let mut l = log.lock().unwrap();
-                        l.0 += 1;
-                        let n = l.0;
-                        l.1.push(format!("#{n}  {desc}"));
-                        if l.1.len() > 14 {
-                            l.1.remove(0);
-                        }
-                    }
-                }
-            });
-            egui::CentralPanel::default().show(vctx, |ui| {
-                ui.add_space(6.0);
-                ui.label("在下框打中文。第一次提交后，继续打拼音，看「事件总数」是否还在涨：");
-                {
-                    let mut s = buf.lock().unwrap();
-                    ui.add(egui::TextEdit::multiline(&mut *s).desired_width(f32::INFINITY).desired_rows(3));
-                }
-                if ui.button("清空日志").clicked() {
-                    let mut l = log.lock().unwrap();
-                    l.0 = 0;
-                    l.1.clear();
-                }
-                ui.separator();
-                let l = log.lock().unwrap();
-                ui.label(RichText::new(format!("IME 事件总数：{}", l.0)).strong());
-                for line in l.1.iter() {
-                    ui.label(RichText::new(line).monospace().size(11.0));
-                }
-            });
-        });
     }
 
     /// 多标签文本编辑器：独立 OS 窗口（deferred viewport）。状态放在 self.editor_state（Arc<Mutex>），
