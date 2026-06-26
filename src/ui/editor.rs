@@ -1438,6 +1438,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let painter = ui.painter().clone();
             let sel = v_sel_range(ed);
             let caret_line = v_line_of(ed, ed.vcaret); // 当前行高亮
+            let unit_cols = match ed.indent { Indent::Spaces(n) => (n as usize).max(1), Indent::Tab => 4 }; // 缩进参考线步长
             // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
             let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
                 let vis_a = ed.vlines.get(top_line).copied().unwrap_or(0);
@@ -1464,6 +1465,23 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 // 当前行高亮（极淡）：聚焦且无选区时，给光标所在行铺一层很淡的底
                 if focused && sel.is_none() && i == caret_line {
                     painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.right(), y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10));
+                }
+                // 缩进参考线：在各缩进层级之间画很淡的竖线
+                {
+                    let mut lead = 0usize;
+                    for c in line_full.chars() {
+                        match c {
+                            ' ' => lead += 1,
+                            '\t' => lead += unit_cols,
+                            _ => break,
+                        }
+                    }
+                    let mut col = unit_cols;
+                    while col < lead {
+                        let gx = text_x + col as f32 * char_w;
+                        painter.vline(gx, y..=(y + row_h), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20)));
+                        col += unit_cols;
+                    }
                 }
                 // 仅取窗口片段（char_to_byte 至多遍历到 last_col 个字符）
                 let seg_a = char_to_byte(line_full, first_col);
