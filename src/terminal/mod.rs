@@ -63,6 +63,8 @@ pub struct Terminal {
     ime_preedit: String,
     /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
     prev_focused: bool,
+    /// 上次是否处于备用屏（vim/less 等）；用于离开备用屏时恢复光标可见，防「光标丢失」
+    prev_alt: bool,
 }
 
 /// 终端搜索状态。
@@ -218,6 +220,7 @@ impl Terminal {
             echo_tail: false,
             ime_preedit: String::new(),
             prev_focused: false,
+            prev_alt: false,
         }
     }
 
@@ -521,10 +524,22 @@ impl Terminal {
                 self.parser = vt100::Parser::new(self.rows, self.cols, 5000);
                 self.scrollback = 0;
                 self.parser.process(after);
+                self.ensure_cursor_after_alt();
                 return;
             }
         }
         self.parser.process(bytes);
+        self.ensure_cursor_after_alt();
+    }
+
+    /// 离开备用屏（如退出 vim/less/htop）时，确保光标恢复可见——有些程序异常退出（被 Ctrl+C/
+    /// 断线打断）会漏发「显示光标」(`ESC[?25h`)，导致回到 shell 后光标一直不显示（「光标丢失」）。
+    fn ensure_cursor_after_alt(&mut self) {
+        let alt = self.parser.screen().alternate_screen();
+        if self.prev_alt && !alt && self.parser.screen().hide_cursor() {
+            self.parser.process(b"\x1b[?25h");
+        }
+        self.prev_alt = alt;
     }
 
     /// 调整逻辑尺寸（字符行列）。返回是否真的变化。

@@ -21,7 +21,6 @@ pub struct Editor {
     find: String,
     replace: String,
     show_find: bool,
-    search_from: usize,
     status: String,
     /// 自动探测到的缩进风格（Tab 键 / 回车续进据此）
     indent: Indent,
@@ -33,6 +32,14 @@ pub struct Editor {
     ime_preedit: Option<(usize, usize)>,
     /// 打开查找栏时请求把焦点定位到查找输入框（一次性）
     find_focus: bool,
+    /// —— VSCode 风格查找/替换选项 ——
+    find_case: bool,    // 区分大小写
+    find_word: bool,    // 全字匹配
+    find_regex: bool,   // 正则
+    replace_open: bool, // 展开替换行
+    /// 所有匹配（字节范围）缓存 + 缓存签名（变化时重算）
+    find_matches: Vec<(usize, usize)>,
+    find_sig: u64,
     /// —— 虚拟化可编辑器（大文件）状态 ——
     /// 光标字节偏移
     vcaret: usize,
@@ -75,13 +82,18 @@ impl Editor {
             find: String::new(),
             replace: String::new(),
             show_find: false,
-            search_from: 0,
             status: String::new(),
             indent,
             last_sel: None,
             menu_sel: None,
             ime_preedit: None,
             find_focus: false,
+            find_case: false,
+            find_word: false,
+            find_regex: false,
+            replace_open: false,
+            find_matches: Vec::new(),
+            find_sig: 0,
             vcaret: 0,
             vlines: Vec::new(),
             vmax: 0,
@@ -112,7 +124,6 @@ impl Editor {
 /// 渲染编辑器内容（工具栏 + 查找栏 + 代码区）。返回 true 表示请求保存。
 /// `text_id` 为该编辑器固定的 TextEdit Id（用于关闭时清理其状态/撤销历史）。
 pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
-    use egui_phosphor::regular as icon;
     let mut save = false;
 
     // 大文件直接用虚拟化可编辑器（仅渲染可见行，避免 egui TextEdit 给整文件建 galley 的内存与每帧
@@ -135,70 +146,31 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         }
     }
 
-    // 查找/替换栏：浮动在编辑器右上角（不占据正文行、避开右侧滚动条），带外边框，仿 VSCode。
+    // 查找/替换：VSCode 风格浮层（共用 find_widget）。
     let mut pending_select: Option<(usize, usize)> = None;
     if ed.show_find {
-        // Esc 关闭
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            ed.show_find = false;
+        let caret_char = egui::text_edit::TextEditState::load(ui.ctx(), text_id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index)
+            .unwrap_or(0);
+        let caret_byte = char_to_byte(&ed.content, caret_char);
+        match find_widget(ui, ed, text_id, caret_byte) {
+            FindOut::Goto(a, b) => {
+                pending_select = Some((byte_to_char(&ed.content, a), byte_to_char(&ed.content, b)));
+            }
+            FindOut::ReplaceOne(a, b) => {
+                let c0 = byte_to_char(&ed.content, a);
+                let c1 = byte_to_char(&ed.content, b);
+                let rep = ed.replace.clone();
+                replace_char_range(&mut ed.content, c0, c1, &rep);
+                pending_select = Some((c0, c0 + rep.chars().count()));
+            }
+            FindOut::ReplaceAll(newc) => {
+                ed.content = newc;
+                pending_select = Some((0, 0));
+            }
+            FindOut::None => {}
         }
-        egui::Area::new(text_id.with("find_overlay"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 42.0)) // 右上角，避开滚动条与上方标签栏
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::new()
-                    .fill(Palette::PANEL_2)
-                    .stroke(egui::Stroke::new(1.0, Palette::BORDER)) // 外边框
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().interact_size.y = 26.0; // 统一搜索框与按钮高度
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
-                            let fr = ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
-                            if ed.find_focus {
-                                fr.request_focus();
-                                ed.find_focus = false;
-                            }
-                            if ui.button(crate::i18n::tr("下一个", "Next")).clicked() {
-                                if let Some((c0, c1)) = find_from(&ed.content, &ed.find, ed.search_from) {
-                                    pending_select = Some((c0, c1));
-                                    ed.search_from = c1;
-                                    ed.status.clear();
-                                } else if !ed.find.is_empty() {
-                                    ed.status = crate::i18n::tr("未找到", "Not found").into();
-                                }
-                            }
-                            ui.add_space(6.0);
-                            ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换为", "Replace with")));
-                            if ui.button(crate::i18n::tr("替换", "Replace")).clicked() {
-                                let from = ed.search_from.saturating_sub(ed.find.chars().count());
-                                if let Some((c0, c1)) = find_from(&ed.content, &ed.find, from) {
-                                    replace_char_range(&mut ed.content, c0, c1, &ed.replace);
-                                    let nc1 = c0 + ed.replace.chars().count();
-                                    pending_select = Some((c0, nc1));
-                                    ed.search_from = nc1;
-                                }
-                            }
-                            if ui.button(crate::i18n::tr("全部替换", "Replace all")).clicked() && !ed.find.is_empty() {
-                                let n = ed.content.matches(ed.find.as_str()).count();
-                                ed.content = ed.content.replace(ed.find.as_str(), ed.replace.as_str());
-                                ed.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已替换 {n} 处"), crate::i18n::Lang::En => format!("Replaced {n}") };
-                            }
-                            if !ed.status.is_empty() {
-                                ui.label(RichText::new(&ed.status).color(Palette::TEXT_DIM).size(11.0));
-                            }
-                            // 关闭按钮
-                            if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false))
-                                .on_hover_text(crate::i18n::tr("关闭 (Esc)", "Close (Esc)"))
-                                .clicked()
-                            {
-                                ed.show_find = false;
-                            }
-                        });
-                    });
-            });
     }
 
     // —— 自绘输入法 ——
@@ -424,12 +396,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     }
                 }
 
-                // 查找：半透明灰高亮匹配项。关键性能：只在「当前可视区」内查找与高亮，
-                // 不每帧全文件扫描（大文件原来每帧扫全文 + 每个匹配 O(偏移) 转换 → 严重卡顿）。
+                // 查找：半透明灰高亮匹配项（用全局匹配缓存，含大小写/全字/正则；仅画可视区内的）。
                 if ed.show_find && !ed.find.is_empty() {
                     let clip = ui.clip_rect();
                     let gp = out.galley_pos;
-                    // 可视区对应的字符范围（galley 内坐标）
                     let top = (clip.top() - gp.y).max(0.0);
                     let bot = (clip.bottom() - gp.y).max(0.0);
                     let first_c = out.galley.cursor_from_pos(egui::vec2(0.0, top)).index;
@@ -440,30 +410,20 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                         let cur = out.cursor_range.map(|r| r.as_sorted_char_range()).map(|r| (r.start, r.end));
                         let painter = ui.painter();
                         let hl = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56);
-                        let pat = ed.find.as_str();
-                        let pat_chars = ed.find.chars().count();
-                        let slice = &ed.content[fb..lb];
-                        let mut local = 0usize; // slice 内字节偏移
-                        let mut base_char = first_c; // slice[..local] 对应的全文字符数
-                        let mut scanned = 0usize; // 已统计到的 slice 字节，用于增量累加字符数
-                        while let Some(off) = slice[local..].find(pat) {
-                            let b_in_slice = local + off;
-                            base_char += slice[scanned..b_in_slice].chars().count();
-                            scanned = b_in_slice;
-                            let c0 = base_char;
-                            let c1 = c0 + pat_chars;
-                            if cur != Some((c0, c1)) {
-                                let a = out.galley.pos_from_cursor(CCursor::new(c0));
-                                let z = out.galley.pos_from_cursor(CCursor::new(c1));
-                                if (z.top() - a.top()).abs() < 1.0 {
-                                    let r = egui::Rect::from_min_max(
-                                        egui::pos2(gp.x + a.left(), gp.y + a.top()),
-                                        egui::pos2(gp.x + z.left(), gp.y + a.bottom()),
-                                    );
-                                    painter.rect_filled(r, 2.0, hl);
-                                }
+                        let mlo = ed.find_matches.partition_point(|&(s, _)| s < fb);
+                        let mhi = ed.find_matches.partition_point(|&(s, _)| s < lb);
+                        for &(ma, mb) in &ed.find_matches[mlo..mhi] {
+                            let c0 = byte_to_char(&ed.content, ma);
+                            let c1 = byte_to_char(&ed.content, mb);
+                            if cur == Some((c0, c1)) {
+                                continue;
                             }
-                            local = b_in_slice + pat.len();
+                            let a = out.galley.pos_from_cursor(CCursor::new(c0));
+                            let z = out.galley.pos_from_cursor(CCursor::new(c1));
+                            if (z.top() - a.top()).abs() < 1.0 {
+                                let r = egui::Rect::from_min_max(egui::pos2(gp.x + a.left(), gp.y + a.top()), egui::pos2(gp.x + z.left(), gp.y + a.bottom()));
+                                painter.rect_filled(r, 2.0, hl);
+                            }
                         }
                     }
                 }
@@ -747,6 +707,181 @@ fn v_move_edge(ed: &mut Editor, end: bool, shift: bool) {
     ed.vcaret = if end { le } else { ls };
 }
 
+// ———————————————————————— VSCode 风格查找/替换控件（两套编辑器共用） ————————————————————————
+
+enum FindOut {
+    None,
+    Goto(usize, usize),        // 选中并滚到该字节范围
+    ReplaceOne(usize, usize),  // 把该字节范围替换为 ed.replace（字面）
+    ReplaceAll(String),        // 用新全文替换
+}
+
+/// 由查找选项构造正则（字面查找也走正则：escape + 可选 \b）。
+fn build_find_regex(pat: &str, case: bool, word: bool, regex_mode: bool) -> Option<regex::Regex> {
+    let p = if regex_mode {
+        pat.to_string()
+    } else {
+        let esc = regex::escape(pat);
+        if word {
+            format!(r"\b{esc}\b")
+        } else {
+            esc
+        }
+    };
+    regex::RegexBuilder::new(&p).case_insensitive(!case).size_limit(1 << 24).build().ok()
+}
+
+/// 按需重算全部匹配（字节范围）；缓存签名（查找词+选项+内容长度）不变则跳过。
+fn rebuild_matches(ed: &mut Editor) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ed.find.hash(&mut h);
+    ed.find_case.hash(&mut h);
+    ed.find_word.hash(&mut h);
+    ed.find_regex.hash(&mut h);
+    ed.content.len().hash(&mut h);
+    let sig = h.finish();
+    if sig == ed.find_sig {
+        return;
+    }
+    ed.find_sig = sig;
+    ed.find_matches.clear();
+    if ed.find.is_empty() {
+        return;
+    }
+    if let Some(re) = build_find_regex(&ed.find, ed.find_case, ed.find_word, ed.find_regex) {
+        for m in re.find_iter(&ed.content).take(200_000) {
+            if m.end() > m.start() {
+                ed.find_matches.push((m.start(), m.end()));
+            }
+        }
+    }
+}
+
+fn nav_match(matches: &[(usize, usize)], caret: usize, forward: bool) -> Option<(usize, usize)> {
+    if matches.is_empty() {
+        return None;
+    }
+    if forward {
+        matches.iter().find(|&&(a, _)| a > caret).copied().or_else(|| matches.first().copied())
+    } else {
+        matches.iter().rev().find(|&&(a, _)| a < caret).copied().or_else(|| matches.last().copied())
+    }
+}
+
+fn replace_all_content(ed: &Editor) -> Option<String> {
+    let re = build_find_regex(&ed.find, ed.find_case, ed.find_word, ed.find_regex)?;
+    Some(if ed.find_regex {
+        re.replace_all(&ed.content, ed.replace.as_str()).into_owned()
+    } else {
+        re.replace_all(&ed.content, regex::NoExpand(ed.replace.as_str())).into_owned()
+    })
+}
+
+fn find_toggle(ui: &mut egui::Ui, label: &str, on: bool, tip: &str) -> bool {
+    let fill = if on { Palette::ACCENT_SOFT } else { egui::Color32::TRANSPARENT };
+    let col = if on { Palette::ACCENT } else { Palette::TEXT_DIM };
+    ui.add(egui::Button::new(RichText::new(label).size(12.0).color(col)).fill(fill).corner_radius(4.0).min_size(egui::vec2(24.0, 20.0)))
+        .on_hover_text(tip)
+        .clicked()
+}
+
+/// VSCode 风格查找/替换浮层（右上角）；`caret_byte` 为当前光标字节位置；返回要应用的动作。
+fn find_widget(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id, caret_byte: usize) -> FindOut {
+    use egui_phosphor::regular as icon;
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ed.show_find = false;
+        return FindOut::None;
+    }
+    rebuild_matches(ed);
+    let total = ed.find_matches.len();
+    let cur_idx = ed.find_matches.iter().position(|&(a, b)| caret_byte >= a && caret_byte <= b);
+    let mut out = FindOut::None;
+    egui::Area::new(text_id.with("find_widget"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 8.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(Palette::PANEL_2)
+                .stroke(egui::Stroke::new(1.0, Palette::BORDER))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.spacing_mut().interact_size.y = 24.0;
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                    ui.horizontal(|ui| {
+                        let exp = if ed.replace_open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
+                        if ui.add(egui::Button::new(RichText::new(exp).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("展开/收起替换", "Toggle replace")).clicked() {
+                            ed.replace_open = !ed.replace_open;
+                        }
+                        let fr = ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
+                        if ed.find_focus {
+                            fr.request_focus();
+                            ed.find_focus = false;
+                        }
+                        if find_toggle(ui, "Aa", ed.find_case, crate::i18n::tr("区分大小写", "Match case")) {
+                            ed.find_case = !ed.find_case;
+                        }
+                        if find_toggle(ui, "ab", ed.find_word, crate::i18n::tr("全字匹配", "Whole word")) {
+                            ed.find_word = !ed.find_word;
+                        }
+                        if find_toggle(ui, ".*", ed.find_regex, crate::i18n::tr("正则表达式", "Regex")) {
+                            ed.find_regex = !ed.find_regex;
+                        }
+                        let count = if ed.find.is_empty() {
+                            String::new()
+                        } else if total == 0 {
+                            crate::i18n::tr("无结果", "No results").into()
+                        } else if let Some(i) = cur_idx {
+                            match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!("第 {} 项，共 {} 项", i + 1, total),
+                                crate::i18n::Lang::En => format!("{} of {}", i + 1, total),
+                            }
+                        } else {
+                            match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!("共 {} 项", total),
+                                crate::i18n::Lang::En => format!("{} results", total),
+                            }
+                        };
+                        ui.label(RichText::new(count).color(Palette::TEXT_DIM).size(11.0));
+                        if ui.add(egui::Button::new(RichText::new(icon::ARROW_UP).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("上一个", "Previous")).clicked() {
+                            if let Some((a, b)) = nav_match(&ed.find_matches, caret_byte, false) {
+                                out = FindOut::Goto(a, b);
+                            }
+                        }
+                        if ui.add(egui::Button::new(RichText::new(icon::ARROW_DOWN).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("下一个", "Next")).clicked() {
+                            if let Some((a, b)) = nav_match(&ed.find_matches, caret_byte, true) {
+                                out = FindOut::Goto(a, b);
+                            }
+                        }
+                        if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("关闭 (Esc)", "Close (Esc)")).clicked() {
+                            ed.show_find = false;
+                        }
+                    });
+                    if ed.replace_open {
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换", "Replace")));
+                            if ui.add(egui::Button::new(RichText::new(icon::ARROW_BEND_DOWN_LEFT).size(13.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("替换", "Replace")).clicked() {
+                                if let Some(i) = cur_idx {
+                                    let (a, b) = ed.find_matches[i];
+                                    out = FindOut::ReplaceOne(a, b);
+                                } else if let Some((a, b)) = nav_match(&ed.find_matches, caret_byte, true) {
+                                    out = FindOut::Goto(a, b);
+                                }
+                            }
+                            if ui.add(egui::Button::new(RichText::new(icon::ARROWS_DOWN_UP).size(13.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("全部替换", "Replace all")).clicked() && total > 0 {
+                                if let Some(newc) = replace_all_content(ed) {
+                                    out = FindOut::ReplaceAll(newc);
+                                }
+                            }
+                        });
+                    }
+                });
+        });
+    out
+}
+
 /// 虚拟化可编辑器：仅渲染可见行 + 自绘光标/选区。返回 true 表示请求保存（Ctrl+S）。
 fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     let mut save = false;
@@ -839,7 +974,6 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         ed.vcaret = ed.vcaret.min(ed.content.len());
     }
 
-    use egui_phosphor::regular as icon;
     // 底部状态栏（仿小文件编辑器）：缩进可切换（矩形按钮、贴左）+ 语言贴右。
     egui::Panel::bottom("editor_status_v")
         .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 }))
@@ -876,73 +1010,26 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             });
         });
 
-    // 查找/替换浮层（右上角，与小文件编辑器一致），按字节定位/替换、可撤销。
+    // 查找/替换：VSCode 风格浮层（共用 find_widget），按字节定位/替换、可撤销。
     if ed.show_find {
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            ed.show_find = false;
+        match find_widget(ui, ed, text_id, ed.vcaret) {
+            FindOut::Goto(a, b) => {
+                ed.vsel = Some(a);
+                ed.vcaret = b;
+                moved = true;
+            }
+            FindOut::ReplaceOne(a, b) => {
+                let rep = ed.replace.clone();
+                v_apply(ed, a, b - a, &rep);
+                moved = true;
+            }
+            FindOut::ReplaceAll(newc) => {
+                let old = ed.content.len();
+                v_apply(ed, 0, old, &newc);
+                moved = true;
+            }
+            FindOut::None => {}
         }
-        egui::Area::new(text_id.with("find_overlay_v"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 42.0))
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::new()
-                    .fill(Palette::PANEL_2)
-                    .stroke(egui::Stroke::new(1.0, Palette::BORDER))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().interact_size.y = 26.0;
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));
-                            let fr = ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
-                            if ed.find_focus {
-                                fr.request_focus();
-                                ed.find_focus = false;
-                            }
-                            if ui.button(crate::i18n::tr("下一个", "Next")).clicked() && !ed.find.is_empty() {
-                                let pat = ed.find.clone();
-                                let from = ed.vcaret.min(ed.content.len());
-                                let found = ed.content[from..].find(&pat).map(|o| from + o).or_else(|| ed.content.find(&pat));
-                                if let Some(b) = found {
-                                    ed.vsel = Some(b);
-                                    ed.vcaret = b + pat.len();
-                                    ed.status.clear();
-                                    moved = true;
-                                } else {
-                                    ed.status = crate::i18n::tr("未找到", "Not found").into();
-                                }
-                            }
-                            ui.add_space(6.0);
-                            ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换为", "Replace with")));
-                            if ui.button(crate::i18n::tr("替换", "Replace")).clicked() {
-                                if let Some((a, b)) = v_sel_range(ed) {
-                                    if !ed.find.is_empty() && &ed.content[a..b] == ed.find.as_str() {
-                                        let rep = ed.replace.clone();
-                                        v_apply(ed, a, b - a, &rep);
-                                        moved = true;
-                                    }
-                                }
-                            }
-                            if ui.button(crate::i18n::tr("全部替换", "Replace all")).clicked() && !ed.find.is_empty() {
-                                let n = ed.content.matches(ed.find.as_str()).count();
-                                if n > 0 {
-                                    let old_len = ed.content.len();
-                                    let newc = ed.content.replace(ed.find.as_str(), ed.replace.as_str());
-                                    v_apply(ed, 0, old_len, &newc);
-                                    ed.status = match crate::i18n::current() {
-                                        crate::i18n::Lang::Zh => format!("已替换 {n} 处"),
-                                        crate::i18n::Lang::En => format!("Replaced {n}"),
-                                    };
-                                    moved = true;
-                                }
-                            }
-                            if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
-                                ed.show_find = false;
-                            }
-                        });
-                    });
-            });
     }
 
     // ——— 渲染（仅可见行）———
@@ -991,6 +1078,16 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let last = (first + (vp.height() / row_h).ceil() as usize + 2).min(total);
             let sel = v_sel_range(ed);
             let text_x = origin.x + gutter_w;
+            // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
+            let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
+                let vis_a = ed.vlines.get(first).copied().unwrap_or(0);
+                let vis_b = ed.vlines.get(last).copied().unwrap_or(ed.content.len());
+                let mlo = ed.find_matches.partition_point(|&(s, _)| s < vis_a);
+                let mhi = ed.find_matches.partition_point(|&(s, _)| s < vis_b);
+                ed.find_matches[mlo..mhi].to_vec()
+            } else {
+                Vec::new()
+            };
             for i in first..last {
                 let (ls, le) = v_line_range(ed, i);
                 let line = ed.content[ls..le].to_string();
@@ -1021,21 +1118,18 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
                 // 正文
                 painter.galley(egui::pos2(text_x, y), galley.clone(), Palette::TEXT);
-                // 查找命中高亮（半透明灰，仅本可见行内查找）
-                if ed.show_find && !ed.find.is_empty() {
-                    let pat = ed.find.as_str();
-                    let mut lo = 0usize;
-                    while let Some(off) = line[lo..].find(pat) {
-                        let ms = lo + off;
-                        let me2 = ms + pat.len();
-                        let hx0 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, ms))).left();
-                        let hx1 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, me2))).left();
+                // 查找命中高亮（半透明灰）——用全局匹配缓存（含大小写/全字/正则），仅画落在本行的
+                for &(ma, mb) in &vis_matches {
+                    if ma < le && mb > ls {
+                        let a_in = ma.clamp(ls, le);
+                        let b_in = mb.clamp(ls, le);
+                        let hx0 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, a_in - ls))).left();
+                        let hx1 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, b_in - ls))).left();
                         painter.rect_filled(
                             egui::Rect::from_min_max(egui::pos2(text_x + hx0, y), egui::pos2(text_x + hx1, y + row_h)),
                             2.0,
                             egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56),
                         );
-                        lo = me2;
                     }
                 }
                 // 光标
@@ -1216,20 +1310,6 @@ fn apply_indent(content: &mut String, r: CCursorRange, indent: Indent, dedent: b
     let new_ce_byte = ((be as i64) + total_delta).max(first_line_start as i64) as usize;
     let new_ce = byte_to_char(content, new_ce_byte.min(content.len()));
     set_cursor(ctx, id, new_cs, new_ce);
-}
-
-fn find_from(text: &str, query: &str, from_char: usize) -> Option<(usize, usize)> {
-    if query.is_empty() {
-        return None;
-    }
-    let from_byte = text.char_indices().nth(from_char).map(|(b, _)| b).unwrap_or(text.len());
-    let byte = match text[from_byte..].find(query) {
-        Some(r) => from_byte + r,
-        None => text.find(query)?,
-    };
-    let c0 = text[..byte].chars().count();
-    let c1 = c0 + query.chars().count();
-    Some((c0, c1))
 }
 
 fn replace_char_range(text: &mut String, c0: usize, c1: usize, rep: &str) {
