@@ -45,6 +45,8 @@ pub struct Editor {
     goto_focus: bool,
     /// 一次性：请求把该行号居中滚到可视区（Ctrl+G 等用，不受「已可见才不滚」条件限制）
     pending_scroll: Option<usize>,
+    /// 多光标/多选（Ctrl+D 累加）：各选区字节范围(升序)；非空即多选模式，编辑作用于全部
+    msel: Vec<(usize, usize)>,
     /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
     encoding: String,
     /// 原文件行尾风格（内部统一 LF，保存时还原）
@@ -111,6 +113,7 @@ impl Editor {
             goto_text: String::new(),
             goto_focus: false,
             pending_scroll: None,
+            msel: Vec::new(),
             encoding: "UTF-8".into(),
             eol: crate::proto::Eol::Lf,
             mtime: 0,
@@ -926,6 +929,96 @@ fn v_word_range(s: &str, pos: usize) -> Option<(usize, usize)> {
     }
     (end > start).then_some((start, end))
 }
+// ——— 多光标（Ctrl+D 累加选区）———
+/// 把最后一个选区的文本的「下一处」加入 msel（向后找、到尾环绕；跳过已在集合中的）。
+fn v_multi_add_next(ed: &mut Editor) {
+    let &(ls, le) = match ed.msel.last() {
+        Some(r) => r,
+        None => return,
+    };
+    let needle = ed.content[ls..le].to_string();
+    if needle.is_empty() {
+        return;
+    }
+    let n = needle.len();
+    let mut pos = le;
+    for _ in 0..(ed.msel.len() + 2) {
+        let p = match ed.content[pos.min(ed.content.len())..].find(&needle).map(|o| pos + o).or_else(|| ed.content.find(&needle)) {
+            Some(p) => p,
+            None => return,
+        };
+        let r = (p, p + n);
+        if !ed.msel.contains(&r) {
+            ed.msel.push(r);
+            ed.msel.sort_by_key(|x| x.0);
+            ed.vsel = Some(r.0);
+            ed.vcaret = r.1;
+            ed.pending_scroll = Some(v_line_of(ed, r.0));
+            return;
+        }
+        pos = if p + n >= ed.content.len() { 0 } else { p + n };
+    }
+}
+/// Ctrl+D：首次→选中当前选区/光标处的词并入集合；其后→加入下一处相同文本。
+fn v_ctrl_d(ed: &mut Editor) {
+    if ed.msel.is_empty() {
+        if let Some((a, b)) = v_sel_range(ed) {
+            ed.msel.push((a, b));
+            v_multi_add_next(ed);
+        } else if let Some((a, b)) = v_word_range(&ed.content, ed.vcaret) {
+            ed.msel.push((a, b));
+            ed.vsel = Some(a);
+            ed.vcaret = b;
+        }
+    } else {
+        v_multi_add_next(ed);
+    }
+}
+/// 把全部选区替换为 text（一次撤销记录），并把 msel 收为各插入点后的裸光标。
+fn v_multi_replace(ed: &mut Editor, text: &str) {
+    let mut ranges = ed.msel.clone();
+    ranges.sort_by_key(|r| r.0);
+    let mut clean: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in ranges {
+        if clean.last().map_or(false, |l| s < l.1) {
+            continue; // 跳过重叠
+        }
+        clean.push((s, e));
+    }
+    if clean.is_empty() {
+        return;
+    }
+    let lo = clean.first().unwrap().0;
+    let hi = clean.last().unwrap().1;
+    let mut seg = String::new();
+    let mut cursor = lo;
+    let mut carets = Vec::new();
+    for &(s, e) in &clean {
+        seg.push_str(&ed.content[cursor..s]);
+        seg.push_str(text);
+        carets.push(lo + seg.len());
+        cursor = e;
+    }
+    v_apply(ed, lo, hi - lo, &seg);
+    ed.msel = carets.into_iter().map(|p| (p, p)).collect();
+    ed.vcaret = ed.msel.last().map(|r| r.1).unwrap_or(ed.vcaret);
+    ed.vsel = None;
+    ed.vgoal_col = None;
+}
+fn v_multi_backspace(ed: &mut Editor) {
+    let del: Vec<(usize, usize)> = ed.msel.iter().map(|&(s, e)| if e > s { (s, e) } else { (prev_char_boundary(&ed.content, s), s) }).collect();
+    ed.msel = del;
+    v_multi_replace(ed, "");
+}
+fn v_multi_delete(ed: &mut Editor) {
+    let del: Vec<(usize, usize)> = ed.msel.iter().map(|&(s, e)| if e > s { (s, e) } else { (s, next_char_boundary(&ed.content, s)) }).collect();
+    ed.msel = del;
+    v_multi_replace(ed, "");
+}
+fn v_multi_copy(ed: &Editor) -> String {
+    let parts: Vec<String> = ed.msel.iter().filter(|&&(s, e)| e > s).map(|&(s, e)| ed.content[s..e].to_string()).collect();
+    parts.join("\n")
+}
 fn v_move_word(ed: &mut Editor, fwd: bool, shift: bool) {
     ed.vgoal_col = None;
     if !shift {
@@ -1375,6 +1468,50 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             )
         });
         for ev in events {
+            // 多光标模式（msel 非空）：编辑/复制作用于全部选区；移动等其它键退出多选、走常规
+            if !ed.msel.is_empty() {
+                let mut handled = true;
+                match &ev {
+                    egui::Event::Text(t) if !t.is_empty() => v_multi_replace(ed, t),
+                    egui::Event::Paste(t) if !t.is_empty() => v_multi_replace(ed, t),
+                    egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => v_multi_replace(ed, t),
+                    egui::Event::Copy => {
+                        let s = v_multi_copy(ed);
+                        if !s.is_empty() {
+                            ui.ctx().copy_text(s);
+                        }
+                    }
+                    egui::Event::Cut => {
+                        let s = v_multi_copy(ed);
+                        if !s.is_empty() {
+                            ui.ctx().copy_text(s);
+                            v_multi_replace(ed, "");
+                        }
+                    }
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        let cmd = modifiers.command || modifiers.ctrl;
+                        match key {
+                            egui::Key::Escape => ed.msel.clear(),
+                            egui::Key::Backspace => v_multi_backspace(ed),
+                            egui::Key::Delete => v_multi_delete(ed),
+                            egui::Key::Enter => v_multi_replace(ed, "\n"),
+                            egui::Key::Tab => {
+                                let u = ed.indent.unit();
+                                v_multi_replace(ed, &u);
+                            }
+                            egui::Key::D if cmd => v_ctrl_d(ed),
+                            _ => {
+                                ed.msel.clear();
+                                handled = false;
+                            }
+                        }
+                    }
+                    _ => handled = false,
+                }
+                if handled {
+                    continue;
+                }
+            }
             match ev {
                 egui::Event::Text(t) if !t.is_empty() => {
                     // 自动补全括号/引号：无选区→插入成对并把光标放中间；有选区→用括号包裹并保留选中
@@ -1426,25 +1563,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             ed.vsel = Some(0);
                             ed.vcaret = ed.content.len();
                         }
-                        egui::Key::D if cmd => {
-                            // 无选区→选中光标处的词；有选区→跳选下一处相同文本（单选，非多光标）
-                            if let Some((a, b)) = v_sel_range(ed) {
-                                let needle = ed.content[a..b].to_string();
-                                if !needle.is_empty() {
-                                    let from = b;
-                                    let found = ed.content[from..].find(&needle).map(|o| from + o).or_else(|| ed.content.find(&needle));
-                                    if let Some(p) = found {
-                                        ed.vsel = Some(p);
-                                        ed.vcaret = p + needle.len();
-                                        ed.pending_scroll = Some(v_line_of(ed, p));
-                                        moved = true;
-                                    }
-                                }
-                            } else if let Some((a, b)) = v_word_range(&ed.content, ed.vcaret) {
-                                ed.vsel = Some(a);
-                                ed.vcaret = b;
-                            }
-                        }
+                        egui::Key::D if cmd => v_ctrl_d(ed),
                         egui::Key::Z if cmd && modifiers.shift => v_redo(ed),
                         egui::Key::Z if cmd => v_undo(ed),
                         egui::Key::Y if cmd => v_redo(ed),
@@ -1637,7 +1756,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 }
             });
             let painter = ui.painter().clone();
-            let sel = v_sel_range(ed);
+            // 多选时用 msel 全部选区/光标；否则用单选区 + 单光标
+            let sels: Vec<(usize, usize)> = if !ed.msel.is_empty() { ed.msel.clone() } else { v_sel_range(ed).into_iter().collect() };
+            let carets: Vec<usize> = if !ed.msel.is_empty() { ed.msel.iter().map(|&(_, e)| e).collect() } else { vec![ed.vcaret] };
             let caret_line = v_line_of(ed, ed.vcaret); // 当前行高亮
             let unit_cols = match ed.indent { Indent::Spaces(n) => (n as usize).max(1), Indent::Tab => 4 }; // 缩进参考线步长
             let brackets = if focused { bracket_match(&ed.content, ed.vcaret) } else { None }; // 括号匹配高亮
@@ -1665,7 +1786,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 let line_full: &str = &ed.content[ls..le]; // 切片，不整行拷贝（超长行整行 to_string 也很贵）
                 let y = clip.top() + k as f32 * row_h;
                 // 当前行高亮（极淡）：聚焦且无选区时，给光标所在行铺一层很淡的底
-                if focused && sel.is_none() && i == caret_line {
+                if focused && sels.is_empty() && i == caret_line {
                     painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.right(), y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10));
                 }
                 // 缩进参考线：在各缩进层级之间画很淡的竖线
@@ -1697,9 +1818,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 };
                 // 行内字节偏移 → 屏幕 x（窗口外钳制到窗口边缘，超出部分本就不可见）
                 let x_of = |lb: usize| -> f32 { seg_x + galley.pos_from_cursor(CCursor::new(byte_to_char(seg, lb.clamp(seg_a, seg_b) - seg_a))).left() };
-                // 选区/查找当前项高亮：半透明珊瑚色
-                if let Some((sa, sb)) = sel {
-                    if sb > ls && sa <= le {
+                // 选区/查找当前项高亮：半透明珊瑚色（多选时画全部）
+                for &(sa, sb) in &sels {
+                    if sb > sa && sb > ls && sa <= le {
                         let ax = x_of(sa.clamp(ls, le) - ls);
                         let bx = if sb > le { clip.right() } else { x_of(sb.clamp(ls, le) - ls) };
                         painter.rect_filled(egui::Rect::from_min_max(egui::pos2(ax, y), egui::pos2(bx, y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 60));
@@ -1719,7 +1840,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 }
                 // 查找命中高亮（半透明灰），跳过「当前项」(=选区)避免叠灰盖字。
                 for &(ma, mb) in &vis_matches {
-                    if sel == Some((ma, mb)) {
+                    if sels.contains(&(ma, mb)) {
                         continue;
                     }
                     if ma < le && mb > ls {
@@ -1728,10 +1849,14 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         painter.rect_filled(egui::Rect::from_min_max(egui::pos2(hx0, y), egui::pos2(hx1, y + row_h)), 2.0, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56));
                     }
                 }
-                // 光标
-                if focused && ed.vcaret >= ls && ed.vcaret <= le {
-                    let cx = x_of(ed.vcaret - ls);
-                    painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
+                // 光标（多选时每个选区末尾各画一个）
+                if focused {
+                    for &cp in &carets {
+                        if cp >= ls && cp <= le {
+                            let cx = x_of(cp - ls);
+                            painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
+                        }
+                    }
                 }
                 // 行号列固定在左侧：最后画（铺底盖住横向滚到下面的正文）+ 右对齐行号
                 painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.left() + gutter_w, y + row_h)), 0.0, bg);
@@ -1745,6 +1870,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ui.memory_mut(|m| m.request_focus(text_id));
                 }
                 if let Some(pos) = resp.interact_pointer_pos() {
+                    ed.msel.clear(); // 点击退出多选
                     let k = ((pos.y - clip.top()) / row_h).floor().max(0.0) as usize;
                     let li = (top_line + k).min(total.saturating_sub(1));
                     let (ls, le) = v_line_range(ed, li);
