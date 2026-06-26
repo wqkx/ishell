@@ -1099,9 +1099,13 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
 
             let area = egui::Rect::from_min_size(egui::pos2(origin.x, clip.top()), egui::vec2(content_w.max(ui.available_width()), view_h));
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
+            // 右键弹菜单时选区可能被折叠/失焦：在右键按下这一帧冻结当前选区，供菜单复制/剪切/粘贴使用
+            if ui.input(|i| i.pointer.secondary_pressed()) {
+                ed.menu_sel = v_sel_range(ed);
+            }
             resp.context_menu(|ui| {
-                ui.set_min_width(140.0);
-                let has_sel = v_sel_range(ed).is_some();
+                ui.set_min_width(160.0);
+                let has_sel = ed.menu_sel.is_some();
                 if ui.add_enabled(has_sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
                     do_copy = true;
                     ui.close();
@@ -1236,20 +1240,35 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         ed.vsel = Some(0);
         ed.vcaret = ed.content.len();
     }
+    // 复制/剪切用「冻结的右键选区」(menu_sel)，避免右键折叠选区后复制不到
     if do_copy || do_cut {
-        if let Some((a, b)) = v_sel_range(ed) {
-            ui.ctx().copy_text(ed.content[a..b].to_string());
-            if do_cut {
-                v_delete_selection(ed);
+        if let Some((a, b)) = ed.menu_sel {
+            let (a, b) = (a.min(ed.content.len()), b.min(ed.content.len()));
+            if b > a {
+                ui.ctx().copy_text(ed.content[a..b].to_string());
+                if do_cut {
+                    v_apply(ed, a, b - a, "");
+                    ed.vgoal_col = None;
+                }
             }
         }
     }
     if do_paste {
         if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
             if !t.is_empty() {
-                v_insert(ed, &t);
+                // 有冻结选区则替换它，否则插入到光标
+                if let Some((a, b)) = ed.menu_sel.filter(|&(a, b)| b > a) {
+                    let (a, b) = (a.min(ed.content.len()), b.min(ed.content.len()));
+                    v_apply(ed, a, b - a, &t);
+                } else {
+                    v_insert(ed, &t);
+                }
+                ed.vgoal_col = None;
             }
         }
+    }
+    if do_copy || do_cut || do_paste {
+        ed.menu_sel = None;
     }
     save
 }
