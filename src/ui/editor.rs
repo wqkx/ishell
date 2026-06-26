@@ -1070,7 +1070,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     // 内容高度封顶在 f32 安全区：大文件行数巨大时 (总行数×行高) 可达数百万像素，拖到最底部时
     // vp 偏移的 f32 精度只剩约 0.5px，导致抖动/卡顿。封顶后改按「行号」虚拟化、用视口相对坐标绘制，
     // 纵向坐标始终很小、不再丢精度。
-    let content_h = (total as f32 * row_h).min(2_000_000.0);
+    // 末尾额外留 3 行空白：可滚到最后一行之下，避免底部横向滚动条遮住最后一行、也便于操作。
+    let pad_rows = 3usize;
+    let content_h = ((total + pad_rows) as f32 * row_h).min(2_000_000.0);
 
     egui::Frame::new().fill(bg).show(ui, |ui| {
         ui.spacing_mut().scroll.floating = false;
@@ -1088,7 +1090,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let max_off = (content_h - view_h).max(1.0);
             let frac = (vp.min.y / max_off).clamp(0.0, 1.0);
             let visible = (view_h / row_h).ceil() as usize + 2;
-            let max_top = total.saturating_sub(visible.saturating_sub(2)); // 最大首行号
+            let max_top = (total + pad_rows).saturating_sub(visible.saturating_sub(2)); // 最大首行号（含末尾留白）
             let top_line = ((frac * max_top as f32).round() as usize).min(max_top);
             let text_x = origin.x + gutter_w;
 
