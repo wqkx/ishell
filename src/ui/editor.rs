@@ -1015,6 +1015,32 @@ fn v_multi_delete(ed: &mut Editor) {
     ed.msel = del;
     v_multi_replace(ed, "");
 }
+/// 多选模式下移动所有光标（左/右）：选区折叠到一侧，裸光标按字符移动；保持多选。
+fn v_multi_move(ed: &mut Editor, fwd: bool) {
+    let mut carets: Vec<usize> = ed
+        .msel
+        .iter()
+        .map(|&(s, e)| {
+            if e > s {
+                if fwd {
+                    e
+                } else {
+                    s
+                }
+            } else if fwd {
+                next_char_boundary(&ed.content, e)
+            } else {
+                prev_char_boundary(&ed.content, s)
+            }
+        })
+        .collect();
+    carets.sort_unstable();
+    carets.dedup();
+    ed.msel = carets.into_iter().map(|p| (p, p)).collect();
+    ed.vcaret = ed.msel.last().map(|r| r.1).unwrap_or(ed.vcaret);
+    ed.vsel = None;
+    ed.vgoal_col = None;
+}
 fn v_multi_copy(ed: &Editor) -> String {
     let parts: Vec<String> = ed.msel.iter().filter(|&&(s, e)| e > s).map(|&(s, e)| ed.content[s..e].to_string()).collect();
     parts.join("\n")
@@ -1500,6 +1526,8 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                                 v_multi_replace(ed, &u);
                             }
                             egui::Key::D if cmd => v_ctrl_d(ed),
+                            egui::Key::ArrowLeft if !cmd => v_multi_move(ed, false),
+                            egui::Key::ArrowRight if !cmd => v_multi_move(ed, true),
                             _ => {
                                 ed.msel.clear();
                                 handled = false;
@@ -1509,6 +1537,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     _ => handled = false,
                 }
                 if handled {
+                    moved = true; // 视角跟随主光标
                     continue;
                 }
             }
@@ -1730,6 +1759,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
 
             let area = egui::Rect::from_min_size(egui::pos2(origin.x, clip.top()), egui::vec2(content_w.max(ui.available_width()), view_h));
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
+            // 聚焦时锁定方向键/Tab/Esc 到编辑器，避免被 egui 用于切换到底部状态栏按钮等控件
+            if focused {
+                ui.memory_mut(|m| {
+                    m.set_focus_lock_filter(text_id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true });
+                });
+            }
             // 右键弹菜单时选区可能被折叠/失焦：在右键按下这一帧冻结当前选区，供菜单复制/剪切/粘贴使用
             if ui.input(|i| i.pointer.secondary_pressed()) {
                 ed.menu_sel = v_sel_range(ed);
@@ -1907,20 +1942,52 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ed.vgoal_col = None;
                 }
             }
-            // 跳转到行等：把目标行居中滚入可视区（无条件，优先于下面的「仅越界才滚」）
+            // 垂直滚动：跳转到行(居中,无条件) 或 键盘移动越界时。用 clip.left() 占位，避免扰动横向滚动。
             if let Some(tl) = ed.pending_scroll.take() {
                 let target_top = tl.saturating_sub(visible / 2);
                 let target_off = (target_top as f32 / max_top.max(1) as f32) * max_off;
-                let screen_y = origin.y + target_off;
-                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x, screen_y), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
+                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + 1.0, origin.y + target_off), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
             } else if moved {
-                // 仅键盘移动光标时滚到可视区（点击/拖拽不滚）。光标行不在可视范围才滚。
                 let cl = v_line_of(ed, ed.vcaret);
                 if cl < top_line || cl + 2 >= top_line + visible {
                     let target_top = cl.saturating_sub(visible / 4);
                     let target_off = (target_top as f32 / max_top.max(1) as f32) * max_off;
-                    let screen_y = origin.y + target_off;
-                    ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x, screen_y), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
+                    ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + 1.0, origin.y + target_off), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
+                }
+            }
+            // 横向滚动：键盘移动后让光标列跟随进可视区（保留 gutter 左余量），y 取已可见行不扰动纵向。
+            if moved {
+                let cl = v_line_of(ed, ed.vcaret);
+                let (ls2, _) = v_line_range(ed, cl);
+                let caret_x = text_x + ed.content[ls2..ed.vcaret].chars().count() as f32 * char_w;
+                ui.scroll_to_rect(egui::Rect::from_min_max(egui::pos2(caret_x - gutter_w - char_w * 2.0, clip.top() + 1.0), egui::pos2(caret_x + char_w * 2.0, clip.top() + row_h)), None);
+            }
+            // 拖拽选择到视口边缘时自动滚动（垂直 + 水平）
+            if resp.dragged() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let mut scrolled = false;
+                    let tt = if pos.y < clip.top() + row_h {
+                        Some(top_line.saturating_sub(2))
+                    } else if pos.y > clip.bottom() - row_h {
+                        Some((top_line + 2).min(max_top))
+                    } else {
+                        None
+                    };
+                    if let Some(tt) = tt {
+                        let off = (tt as f32 / max_top.max(1) as f32) * max_off;
+                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + 1.0, origin.y + off), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
+                        scrolled = true;
+                    }
+                    if pos.x > clip.right() - char_w {
+                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.right() + char_w * 4.0, clip.top() + 1.0), egui::vec2(2.0, row_h)), None);
+                        scrolled = true;
+                    } else if pos.x < clip.left() + gutter_w + char_w {
+                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + gutter_w - char_w * 4.0, clip.top() + 1.0), egui::vec2(2.0, row_h)), None);
+                        scrolled = true;
+                    }
+                    if scrolled {
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
         });
