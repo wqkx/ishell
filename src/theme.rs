@@ -2,9 +2,9 @@
 
 use egui::{Color32, CornerRadius, Stroke};
 
-/// 中文后备字体的全局缩放。设为 1.0：让中文字形按整数物理像素栅格化，避免非整数缩放导致的
-/// 「发虚」（mac Retina 尤其明显）。代价：中英文大小观感略有差异、按钮内垂直略偏。
-pub const CJK_SCALE: f32 = 1.0;
+/// 中文后备字体的全局缩放（UI 上让中英文同观感、按钮内垂直居中）。
+/// 终端按此值反向放大以抵消缩小，从而减小全角字之间的间距。
+pub const CJK_SCALE: f32 = 0.92;
 
 // ——— 设计令牌（统一圆角 / 字阶，全局复用，避免散落的魔法数字）———
 /// 圆角刻度：控件 / 浮层·菜单 / 窗口
@@ -196,7 +196,7 @@ fn install_fonts(ctx: &egui::Context) {
         // 略缩小并上移，使中英文在同一行/按钮内大小观感一致、垂直居中。
         fd.tweak = egui::FontTweak {
             scale: CJK_SCALE,
-            y_offset_factor: 0.0, // 不做非整数垂直偏移（会造成子像素模糊）
+            y_offset_factor: -0.06,
             ..Default::default()
         };
         fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(fd));
