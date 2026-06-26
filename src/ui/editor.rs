@@ -1705,8 +1705,6 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         painter.rect_filled(egui::Rect::from_min_max(egui::pos2(ax, y), egui::pos2(bx, y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 60));
                     }
                 }
-                // 行号
-                painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
                 // 正文
                 painter.galley(egui::pos2(seg_x, y), galley.clone(), Palette::TEXT);
                 // 括号匹配：给光标相邻括号及其匹配括号描边
@@ -1735,12 +1733,15 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     let cx = x_of(ed.vcaret - ls);
                     painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
                 }
+                // 行号列固定在左侧：最后画（铺底盖住横向滚到下面的正文）+ 右对齐行号
+                painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.left() + gutter_w, y + row_h)), 0.0, bg);
+                painter.text(egui::pos2(clip.left() + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
             }
-            // 行号分割线
-            painter.vline(text_x - 3.0, clip.top()..=clip.bottom(), egui::Stroke::new(1.0, Palette::BORDER));
-            // 点击 / 拖拽定位光标与选区（行号 = top_line + 视口内行偏移）
-            if resp.clicked() || resp.drag_started() || resp.dragged() {
-                if resp.clicked() || resp.drag_started() {
+            // 行号分割线（固定在左侧行号列右缘）
+            painter.vline(clip.left() + gutter_w - 3.0, clip.top()..=clip.bottom(), egui::Stroke::new(1.0, Palette::BORDER));
+            // 点击 / 双击 / 拖拽定位光标与选区（行号 = top_line + 视口内行偏移）
+            if resp.clicked() || resp.drag_started() || resp.dragged() || resp.double_clicked() {
+                if resp.clicked() || resp.drag_started() || resp.double_clicked() {
                     ui.memory_mut(|m| m.request_focus(text_id));
                 }
                 if let Some(pos) = resp.interact_pointer_pos() {
@@ -1756,16 +1757,27 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(seg.clone(), mono.clone(), Palette::TEXT));
                     let cc = g.cursor_from_pos(egui::vec2(pos.x - seg_x, 0.0)).index;
                     let b = ls + seg_a + char_to_byte(&seg, cc);
-                    if resp.drag_started() {
+                    if resp.double_clicked() {
+                        // 双击选中光标处的词
+                        if let Some((wa, wb)) = v_word_range(&ed.content, b) {
+                            ed.vsel = Some(wa);
+                            ed.vcaret = wb;
+                        } else {
+                            ed.vsel = None;
+                            ed.vcaret = b;
+                        }
+                    } else if resp.drag_started() {
                         ed.vsel = Some(b);
+                        ed.vcaret = b;
                     } else if resp.dragged() {
                         if ed.vsel.is_none() {
                             ed.vsel = Some(ed.vcaret);
                         }
+                        ed.vcaret = b;
                     } else {
                         ed.vsel = None;
+                        ed.vcaret = b;
                     }
-                    ed.vcaret = b;
                     ed.vgoal_col = None;
                 }
             }
