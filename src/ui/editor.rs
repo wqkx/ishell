@@ -418,7 +418,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                         for &(ma, mb) in &ed.find_matches[mlo..mhi] {
                             let c0 = byte_to_char(&ed.content, ma);
                             let c1 = byte_to_char(&ed.content, mb);
-                            if cur == Some((c0, c1)) {
+                            // 跳过「当前项」：当前选区，或本帧刚 next 定位到的项（避免 1 帧灰盖字）
+                            if cur == Some((c0, c1)) || pending_select == Some((c0, c1)) {
                                 continue;
                             }
                             let a = out.galley.pos_from_cursor(CCursor::new(c0));
@@ -867,7 +868,8 @@ fn find_widget(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id, caret_byte
                     });
                     if ed.replace_open {
                         ui.horizontal(|ui| {
-                            ui.add_space(20.0);
+                            // 与查找行的折叠箭头同宽的占位（同为首项 → 与查找输入框左对齐）
+                            ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
                             ui.add(egui::TextEdit::singleline(&mut ed.replace).desired_width(150.0).hint_text(crate::i18n::tr("替换", "Replace")));
                             if ui.add(egui::Button::new(RichText::new(icon::ARROW_BEND_DOWN_LEFT).size(13.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("替换", "Replace")).clicked() {
                                 if let Some(i) = cur_idx {
@@ -1126,8 +1128,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
                 // 正文
                 painter.galley(egui::pos2(text_x, y), galley.clone(), Palette::TEXT);
-                // 查找命中高亮（半透明灰）——用全局匹配缓存（含大小写/全字/正则），仅画落在本行的
+                // 查找命中高亮（半透明灰）——用全局匹配缓存（含大小写/全字/正则），仅画落在本行的。
+                // 跳过「当前项」(=选区)：它已用半透明珊瑚色画在字下层，不再叠灰盖字。
                 for &(ma, mb) in &vis_matches {
+                    if sel == Some((ma, mb)) {
+                        continue;
+                    }
                     if ma < le && mb > ls {
                         let a_in = ma.clamp(ls, le);
                         let b_in = mb.clamp(ls, le);
