@@ -498,6 +498,25 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     }
                 }
 
+                // 括号匹配：给光标相邻括号及其匹配括号描边
+                if ui.memory(|m| m.focused() == Some(text_id)) {
+                    if let Some(cr) = out.cursor_range {
+                        let caret_byte = char_to_byte(&ed.content, cr.primary.index);
+                        if let Some((ba, bb)) = bracket_match(&ed.content, caret_byte) {
+                            let gp = out.galley_pos;
+                            let painter = ui.painter();
+                            for bp in [ba, bb] {
+                                let c0 = byte_to_char(&ed.content, bp);
+                                let a = out.galley.pos_from_cursor(CCursor::new(c0));
+                                let z = out.galley.pos_from_cursor(CCursor::new(c0 + 1));
+                                if (z.top() - a.top()).abs() < 1.0 {
+                                    painter.rect_stroke(egui::Rect::from_min_max(egui::pos2(gp.x + a.left(), gp.y + a.top()), egui::pos2(gp.x + z.left(), gp.y + a.bottom())), 2.0, egui::Stroke::new(1.0, Palette::ACCENT), egui::StrokeKind::Inside);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 查找定位
                 if let Some((c0, c1)) = pending_select {
                     let mut st = out.state.clone();
@@ -953,6 +972,63 @@ fn auto_close_for(t: &str) -> Option<&'static str> {
         "`" => Some("`"),
         _ => None,
     }
+}
+
+/// 若字节 bp 处是括号，返回 (该括号位置, 匹配括号位置)；否则 None。扫描有上限、忽略字符串/注释。
+fn bracket_at(s: &str, bp: usize) -> Option<(usize, usize)> {
+    const OPENS: [char; 3] = ['(', '[', '{'];
+    const CLOSES: [char; 3] = [')', ']', '}'];
+    const CAP: usize = 200_000;
+    if bp >= s.len() || !s.is_char_boundary(bp) {
+        return None;
+    }
+    let c = s[bp..].chars().next()?;
+    if let Some(oi) = OPENS.iter().position(|&o| o == c) {
+        let close = CLOSES[oi];
+        let mut depth = 1i32;
+        for (off, ch) in s[bp + c.len_utf8()..].char_indices().take(CAP) {
+            if ch == c {
+                depth += 1;
+            } else if ch == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((bp, bp + c.len_utf8() + off));
+                }
+            }
+        }
+        None
+    } else if let Some(ci) = CLOSES.iter().position(|&o| o == c) {
+        let open = OPENS[ci];
+        let mut depth = 1i32;
+        let mut i = bp;
+        let mut n = 0usize;
+        while i > 0 && n < CAP {
+            let ch = s[..i].chars().next_back().unwrap();
+            i -= ch.len_utf8();
+            n += 1;
+            if ch == c {
+                depth += 1;
+            } else if ch == open {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((bp, i));
+                }
+            }
+        }
+        None
+    } else {
+        None
+    }
+}
+/// 找到与 caret 相邻（左/右）的括号及其匹配位置。
+fn bracket_match(s: &str, caret: usize) -> Option<(usize, usize)> {
+    if caret > 0 {
+        let before = prev_char_boundary(s, caret);
+        if let Some(r) = bracket_at(s, before) {
+            return Some(r);
+        }
+    }
+    bracket_at(s, caret)
 }
 
 // ———————————————————————— VSCode 风格查找/替换控件（两套编辑器共用） ————————————————————————
@@ -1439,6 +1515,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let sel = v_sel_range(ed);
             let caret_line = v_line_of(ed, ed.vcaret); // 当前行高亮
             let unit_cols = match ed.indent { Indent::Spaces(n) => (n as usize).max(1), Indent::Tab => 4 }; // 缩进参考线步长
+            let brackets = if focused { bracket_match(&ed.content, ed.vcaret) } else { None }; // 括号匹配高亮
             // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
             let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
                 let vis_a = ed.vlines.get(top_line).copied().unwrap_or(0);
@@ -1507,6 +1584,16 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
                 // 正文
                 painter.galley(egui::pos2(seg_x, y), galley.clone(), Palette::TEXT);
+                // 括号匹配：给光标相邻括号及其匹配括号描边
+                if let Some((ba, bb)) = brackets {
+                    for &bp in &[ba, bb] {
+                        if bp >= ls && bp < le {
+                            let bx0 = x_of(bp - ls);
+                            let bx1 = x_of(bp + 1 - ls);
+                            painter.rect_stroke(egui::Rect::from_min_max(egui::pos2(bx0, y), egui::pos2(bx1, y + row_h)), 2.0, egui::Stroke::new(1.0, Palette::ACCENT), egui::StrokeKind::Inside);
+                        }
+                    }
+                }
                 // 查找命中高亮（半透明灰），跳过「当前项」(=选区)避免叠灰盖字。
                 for &(ma, mb) in &vis_matches {
                     if sel == Some((ma, mb)) {
