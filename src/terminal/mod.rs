@@ -65,6 +65,8 @@ pub struct Terminal {
     prev_focused: bool,
     /// 上次是否处于备用屏（vim/less 等）；用于离开备用屏时恢复光标可见，防「光标丢失」
     prev_alt: bool,
+    /// 正在拖动右侧滚动条（区别于拖动选择文本）
+    sb_dragging: bool,
 }
 
 /// 终端搜索状态。
@@ -221,6 +223,7 @@ impl Terminal {
             ime_preedit: String::new(),
             prev_focused: false,
             prev_alt: false,
+            sb_dragging: false,
         }
     }
 
@@ -747,6 +750,17 @@ impl Terminal {
             }
         }
 
+        // 右侧滚动条几何：探测可回滚总行数（set MAX 读回再还原，仅改偏移不重排，开销很小）
+        let max_sb = {
+            let cur = self.scrollback;
+            self.parser.screen_mut().set_scrollback(usize::MAX);
+            let m = self.parser.screen().scrollback();
+            self.parser.screen_mut().set_scrollback(cur);
+            m
+        };
+        let sb_w = 8.0;
+        let sb_track = Rect::from_min_max(egui::pos2(rect.right() - sb_w, rect.top()), rect.max);
+
         if report_mouse {
             // 转发鼠标按键/移动给远端
             let events = ui.input(|i| i.events.clone());
@@ -788,19 +802,35 @@ impl Terminal {
                 }
             }
         } else {
-            // 本地拖拽选择文本
+            // 拖动起点落在右侧滚动条上 → 拖滚动条；否则本地拖拽选择文本
             if resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    let c = cell_at(p);
-                    self.sel_anchor = Some(c);
-                    self.sel_cursor = Some(c);
+                    if max_sb > 0 && p.x >= sb_track.left() {
+                        self.sb_dragging = true;
+                    } else {
+                        let c = cell_at(p);
+                        self.sel_anchor = Some(c);
+                        self.sel_cursor = Some(c);
+                    }
                 }
-            } else if resp.dragged() {
+            } else if resp.dragged() && !self.sb_dragging {
                 if let Some(p) = resp.interact_pointer_pos() {
                     self.sel_cursor = Some(cell_at(p));
                 }
             }
-            if resp.clicked() {
+            if self.sb_dragging {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let f = ((p.y - sb_track.top()) / sb_track.height().max(1.0)).clamp(0.0, 1.0);
+                    let nb = (((1.0 - f) * max_sb as f32).round() as usize).min(max_sb);
+                    self.scrollback = nb;
+                    self.parser.screen_mut().set_scrollback(nb);
+                    self.search_hl = None;
+                }
+            }
+            if resp.drag_stopped() {
+                self.sb_dragging = false;
+            }
+            if resp.clicked() && !self.sb_dragging {
                 self.clear_selection();
             }
         }
@@ -939,6 +969,24 @@ impl Terminal {
                 painter.galley(ipos, galley, crate::theme::Palette::ACCENT);
                 painter.hline(bg.x_range(), bg.max.y - 1.0, Stroke::new(1.0, crate::theme::Palette::ACCENT));
             }
+        }
+
+        // 右侧滚动条（仅有可回滚历史时显示）：滑块高=视口/总量，位置由 scrollback 决定（0=底/最新）。
+        if max_sb > 0 {
+            let total = rows as f32 + max_sb as f32;
+            let handle_h = (sb_track.height() * (rows as f32 / total)).clamp(24.0, sb_track.height());
+            let pos_frac = 1.0 - (self.scrollback as f32 / max_sb as f32);
+            let handle_top = sb_track.top() + (sb_track.height() - handle_h) * pos_frac;
+            let handle = Rect::from_min_size(egui::pos2(sb_track.left() + 1.0, handle_top), Vec2::new(sb_w - 2.0, handle_h));
+            let hovered = hover_pos.map_or(false, |p| sb_track.contains(p));
+            let col = if self.sb_dragging {
+                egui::Color32::from_gray(110)
+            } else if hovered {
+                egui::Color32::from_gray(140)
+            } else {
+                egui::Color32::from_gray(175)
+            };
+            painter.rect_filled(handle, 3.0, col);
         }
 
         // 键盘输入

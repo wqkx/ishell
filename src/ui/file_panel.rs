@@ -825,6 +825,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     egui::Frame::new()
         .inner_margin(egui::Margin { left: 6, right: 2, top: 0, bottom: 0 })
         .show(ui, |ui| {
+    // 滚动条滑块用灰度（非浮动），尤其拖动(active)时用深灰——否则默认拖动时偏白看不见
+    ui.spacing_mut().scroll.floating = false;
+    ui.spacing_mut().scroll.foreground_color = false;
+    ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(190);
+    ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_gray(150);
+    ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(110);
     // 拖拽悬停高亮用独立图层绘制：TableBuilder 闭包内 ui 已被可变借用，不能再取 ui.painter()
     let dnd_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("file_dnd_hl")));
     TableBuilder::new(ui)

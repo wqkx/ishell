@@ -357,7 +357,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             // 选区/查找当前项用半透明灰，盖在字上仍能看清字符（默认不透明会完全遮住）
             ui.visuals_mut().selection.bg_fill = {
                 let a = Palette::ACCENT;
-                egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 90) // 当前项/选区：半透明珊瑚色，比未选中灰更醒目、仍透字
+                egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 60) // 当前项/选区：半透明珊瑚色，比未选中灰更醒目、仍透字
             };
             ui.horizontal_top(|ui| {
                 ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
@@ -818,7 +818,7 @@ fn find_widget(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id, caret_byte
                     ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Palette::TEXT_DIM);
                     ui.horizontal(|ui| {
                         let exp = if ed.replace_open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
-                        if ui.add(egui::Button::new(RichText::new(exp).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("展开/收起替换", "Toggle replace")).clicked() {
+                        if ui.add(egui::Button::new(RichText::new(exp).size(12.0).color(Palette::TEXT_DIM)).frame(false).min_size(egui::vec2(20.0, 20.0))).on_hover_text(crate::i18n::tr("展开/收起替换", "Toggle replace")).clicked() {
                             ed.replace_open = !ed.replace_open;
                         }
                         let fr = ui.add(egui::TextEdit::singleline(&mut ed.find).desired_width(150.0).hint_text(crate::i18n::tr("查找", "Find")));
@@ -1119,7 +1119,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         };
                         let r = egui::Rect::from_min_max(egui::pos2(text_x + ax, y), egui::pos2(text_x + bx, y + row_h));
                         let a = Palette::ACCENT;
-                        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 90));
+                        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 60));
                     }
                 }
                 // 行号
