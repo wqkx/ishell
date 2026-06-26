@@ -39,6 +39,10 @@ pub struct Editor {
     replace_open: bool, // 展开替换行
     /// 下载中占位：只显示文件名、不可编辑（内容到位后清除）
     loading: bool,
+    /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
+    encoding: String,
+    /// 原文件行尾风格（内部统一 LF，保存时还原）
+    eol: crate::proto::Eol,
     /// 所有匹配（字节范围）缓存 + 缓存签名（变化时重算）
     find_matches: Vec<(usize, usize)>,
     find_sig: u64,
@@ -95,6 +99,8 @@ impl Editor {
             find_regex: false,
             replace_open: false,
             loading: false,
+            encoding: "UTF-8".into(),
+            eol: crate::proto::Eol::Lf,
             find_matches: Vec::new(),
             find_sig: 0,
             vcaret: 0,
@@ -124,6 +130,16 @@ impl Editor {
     }
     pub fn set_loading(&mut self, v: bool) {
         self.loading = v;
+    }
+    pub fn set_meta(&mut self, encoding: String, eol: crate::proto::Eol) {
+        self.encoding = encoding;
+        self.eol = eol;
+    }
+    pub fn encoding(&self) -> &str {
+        &self.encoding
+    }
+    pub fn eol(&self) -> crate::proto::Eol {
+        self.eol
     }
 }
 
@@ -349,6 +365,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" }).color(Palette::TEXT_DIM).size(11.0));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0));
                 });
             });
         });
@@ -1039,6 +1059,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" }).color(Palette::TEXT_DIM).size(11.0));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0));
                 });
             });
         });

@@ -1588,6 +1588,25 @@ fn local_basename(path: &str) -> String {
     path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
+/// 探测字节的字符编码并解码为 String，返回 (文本, 编码名)。
+/// UTF-8(含 BOM) 优先；非 UTF-8 用 chardetng 猜测（中文环境多为 GBK/GB18030）。
+fn decode_text(data: &[u8]) -> (String, String) {
+    // UTF-8 BOM
+    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return (String::from_utf8_lossy(&data[3..]).into_owned(), "UTF-8".into());
+    }
+    // 无损 UTF-8 直接用
+    if let Ok(s) = std::str::from_utf8(data) {
+        return (s.to_string(), "UTF-8".into());
+    }
+    // 非 UTF-8：探测后解码
+    let mut det = chardetng::EncodingDetector::new();
+    det.feed(data, true);
+    let enc = det.guess(None, true);
+    let (cow, actual, _) = enc.decode(data);
+    (cow.into_owned(), actual.name().to_string())
+}
+
 /// 分块读取远程文本文件并上报进度（驱动占位标签上的珊瑚色进度条），与下载文件一致地分块读取。
 /// 非 force 时限制 4MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB 且跳过二进制检查。
 async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, force: bool, id: u64, sink: &UiSink) {
@@ -1633,8 +1652,14 @@ async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, f
                 sink.send(WorkerEvent::FileLoadFailed { id, message: crate::i18n::tr("非文本文件，无法以文本方式打开", "Not a text file").into() });
                 return;
             }
-            let content = String::from_utf8_lossy(&data).into_owned();
-            sink.send(WorkerEvent::FileOpened { id, path: path.to_string(), content });
+            // 探测编码并解码（UTF-8 优先，非 UTF-8 用 chardetng 猜 GBK/GB18030 等），再把行尾统一成 LF
+            let (decoded, encoding) = decode_text(&data);
+            let (content, eol) = if decoded.contains("\r\n") {
+                (decoded.replace("\r\n", "\n"), crate::proto::Eol::Crlf)
+            } else {
+                (decoded, crate::proto::Eol::Lf)
+            };
+            sink.send(WorkerEvent::FileOpened { id, path: path.to_string(), content, encoding, eol });
         }
         Err(e) => {
             let msg = if e.to_string().contains("__TOO_LARGE__") {
@@ -1695,8 +1720,15 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已重命名为：{to}"), crate::i18n::Lang::En => format!("Renamed to: {to}") }, Some(parent)))
                 .map_err(Into::into)
         }
-        UiCommand::WriteFile { path, content } => {
-            sftp.write(&path, content.as_bytes())
+        UiCommand::WriteFile { path, content, encoding, eol } => {
+            // 内部统一 LF → 按原文件行尾还原；再按原编码编码后写回，避免破坏非 UTF-8 文件 / 改动行尾。
+            let text = match eol {
+                crate::proto::Eol::Crlf => content.replace('\n', "\r\n"),
+                crate::proto::Eol::Lf => content,
+            };
+            let enc = encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+            let (bytes, _, _) = enc.encode(&text);
+            sftp.write(&path, bytes.as_ref())
                 .await
                 .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存：{path}"), crate::i18n::Lang::En => format!("Saved: {path}") }, None))
                 .map_err(Into::into)

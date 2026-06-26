@@ -30,6 +30,10 @@ vt100 = "0.16"
 # 编辑器查找/替换：大小写 / 全字 / 正则
 regex = "1"
 
+# 编辑器字符编码：探测(chardetng) + 解码/编码(encoding_rs)，支持 GBK/GB18030 等非 UTF-8 文件
+encoding_rs = "0.8"
+chardetng = "0.1"
+
 # 剪贴板读取（终端右键粘贴 / Ctrl+Shift+V）
 arboard = "3"
 

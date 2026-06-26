@@ -50,8 +50,8 @@ struct Session {
     selected_nic: String,
     /// 进程列表是否按内存排序（false = 按 CPU）
     proc_sort_mem: bool,
-    /// 已读取待填充到占位编辑器标签的文件（id, path, content）
-    pending_open: Vec<(u64, String, String)>,
+    /// 已读取待填充到占位编辑器标签的文件（id, path, content, encoding, eol）
+    pending_open: Vec<(u64, String, String, String, crate::proto::Eol)>,
     /// 待新建的占位编辑器标签（id, path）——双击打开时立即建，显示文件名 + 进度条
     pending_placeholder: Vec<(u64, String)>,
     /// 文件下载进度（id, done, total），驱动占位标签进度条
@@ -274,8 +274,8 @@ impl Session {
                     self.pending_hostkey = Some((host, fingerprint, changed));
                     self.status = crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
                 }
-                WorkerEvent::FileOpened { id, path, content } => {
-                    self.pending_open.push((id, path, content));
+                WorkerEvent::FileOpened { id, path, content, encoding, eol } => {
+                    self.pending_open.push((id, path, content, encoding, eol));
                     self.status = crate::i18n::tr("已打开文件", "File opened").into();
                 }
                 WorkerEvent::FileLoadProgress { id, done, total } => {
@@ -1542,7 +1542,7 @@ impl eframe::App for App {
 
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
         let mut new_placeholders: Vec<(u64, String, String, UnboundedSender<UiCommand>)> = Vec::new(); // id, path, server, tx
-        let mut filled: Vec<(u64, String, String)> = Vec::new(); // id, path, content
+        let mut filled: Vec<(u64, String, String, String, crate::proto::Eol)> = Vec::new(); // id, path, content, encoding, eol
         let mut load_progress: Vec<(u64, u64, u64)> = Vec::new();
         let mut load_fail: Vec<u64> = Vec::new();
         let mut new_images: Vec<(String, Vec<u8>, String)> = Vec::new();
@@ -1555,8 +1555,8 @@ impl eframe::App for App {
             for (id, path) in s.pending_placeholder.drain(..) {
                 new_placeholders.push((id, path, s.title.clone(), s.cmd_tx.clone()));
             }
-            for (id, path, content) in s.pending_open.drain(..) {
-                filled.push((id, path, content));
+            for (id, path, content, encoding, eol) in s.pending_open.drain(..) {
+                filled.push((id, path, content, encoding, eol));
             }
             for p in s.pending_load_progress.drain(..) {
                 load_progress.push(p);
@@ -1632,9 +1632,11 @@ impl eframe::App for App {
                 }
             }
             // 3) 内容就位：占位标签变为可编辑、填入内容
-            for (id, path, content) in filled {
+            for (id, path, content, encoding, eol) in filled {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
-                    t.editor = crate::ui::editor::Editor::new(path, content);
+                    let mut editor = crate::ui::editor::Editor::new(path, content);
+                    editor.set_meta(encoding, eol);
+                    t.editor = editor;
                     t.load_id = None;
                 }
             }
@@ -2729,6 +2731,8 @@ impl App {
                     let _ = tab.cmd_tx.send(UiCommand::WriteFile {
                         path: tab.editor.path.clone(),
                         content: tab.editor.content.clone(),
+                        encoding: tab.editor.encoding().to_string(),
+                        eol: tab.editor.eol(),
                     });
                 }
                 if let Some(tab) = ed.tabs.get_mut(active) {
@@ -2784,7 +2788,7 @@ impl App {
                 if decision != 0 {
                     if decision == 1 {
                         if let Some(t) = ed.tabs.get(ti) {
-                            let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone() });
+                            let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone(), encoding: t.editor.encoding().to_string(), eol: t.editor.eol() });
                         }
                         if let Some(t) = ed.tabs.get_mut(ti) {
                             t.editor.mark_saved();
