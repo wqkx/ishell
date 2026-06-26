@@ -1544,7 +1544,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         ed.vsel = None;
                         v_recompute(ed);
                     }
-                    v_insert(ed, &t); // 提交文本走可撤销插入
+                    // 多光标模式：英文/输入法提交也要作用到全部光标（系统输入法激活后字母走 Commit 而非 Text）
+                    if ed.msel.is_empty() {
+                        v_insert(ed, &t);
+                    } else {
+                        v_multi_replace(ed, &t);
+                    }
                 }
                 egui::ImeEvent::Disabled => {
                     if let Some((s, e)) = ed.vime_preedit.take() {
