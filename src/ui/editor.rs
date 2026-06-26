@@ -43,6 +43,8 @@ pub struct Editor {
     goto_open: bool,
     goto_text: String,
     goto_focus: bool,
+    /// 一次性：请求把该行号居中滚到可视区（Ctrl+G 等用，不受「已可见才不滚」条件限制）
+    pending_scroll: Option<usize>,
     /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
     encoding: String,
     /// 原文件行尾风格（内部统一 LF，保存时还原）
@@ -108,6 +110,7 @@ impl Editor {
             goto_open: false,
             goto_text: String::new(),
             goto_focus: false,
+            pending_scroll: None,
             encoding: "UTF-8".into(),
             eol: crate::proto::Eol::Lf,
             mtime: 0,
@@ -157,6 +160,12 @@ impl Editor {
     }
     pub fn set_mtime(&mut self, m: u32) {
         self.mtime = m;
+    }
+    pub fn set_eol(&mut self, e: crate::proto::Eol) {
+        self.eol = e;
+    }
+    pub fn set_encoding(&mut self, enc: String) {
+        self.encoding = enc;
     }
 }
 
@@ -331,6 +340,25 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                 apply_move_line(&mut ed.content, r, true, ui.ctx(), text_id);
             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown)) {
                 apply_move_line(&mut ed.content, r, false, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D) || i.consume_key(egui::Modifiers::CTRL, egui::Key::D)) {
+                // 无选区→选中光标处的词；有选区→跳选下一处相同文本（单选）
+                let range = r.as_sorted_char_range();
+                if range.start == range.end {
+                    let b = char_to_byte(&ed.content, range.start);
+                    if let Some((wa, wb)) = v_word_range(&ed.content, b) {
+                        set_cursor(ui.ctx(), text_id, byte_to_char(&ed.content, wa), byte_to_char(&ed.content, wb));
+                    }
+                } else {
+                    let bs = char_to_byte(&ed.content, range.start);
+                    let be = char_to_byte(&ed.content, range.end);
+                    let needle = ed.content[bs..be].to_string();
+                    if !needle.is_empty() {
+                        if let Some(p) = ed.content[be..].find(&needle).map(|o| be + o).or_else(|| ed.content.find(&needle)) {
+                            let c0 = byte_to_char(&ed.content, p);
+                            set_cursor(ui.ctx(), text_id, c0, c0 + needle.chars().count());
+                        }
+                    }
+                }
             }
         }
     }
@@ -410,9 +438,25 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
                     ui.add_space(10.0);
-                    ui.label(RichText::new(match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" }).color(Palette::TEXT_DIM).size(11.0));
+                    // 行尾：点击切换 LF/CRLF
+                    let eol_txt = match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" };
+                    if ui.add(egui::Label::new(RichText::new(eol_txt).color(Palette::TEXT_DIM).size(11.0)).sense(egui::Sense::click())).on_hover_text(crate::i18n::tr("点击切换行尾 LF/CRLF", "Click to toggle LF/CRLF")).clicked() {
+                        let n = match ed.eol() { crate::proto::Eol::Crlf => crate::proto::Eol::Lf, crate::proto::Eol::Lf => crate::proto::Eol::Crlf };
+                        ed.set_eol(n);
+                    }
                     ui.add_space(10.0);
-                    ui.label(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0));
+                    // 编码：点击从菜单选择（保存时按所选编码写回）
+                    ui.menu_button(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0), |ui| {
+                        ui.set_min_width(120.0);
+                        for enc in ["UTF-8", "GBK", "GB18030", "Big5", "Shift_JIS", "EUC-KR", "windows-1252", "ISO-8859-1"] {
+                            if ui.selectable_label(ed.encoding() == enc, enc).clicked() {
+                                ed.set_encoding(enc.to_string());
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(crate::i18n::tr("点击选择保存编码", "Click to choose save encoding"));
                 });
             });
         });
@@ -858,6 +902,29 @@ fn v_word_boundary(s: &str, b: usize, fwd: bool) -> usize {
         }
     }
     i
+}
+/// 光标处的「词」字节范围（前后扩展词字符）；无词则 None。
+fn v_word_range(s: &str, pos: usize) -> Option<(usize, usize)> {
+    let is_w = |c: char| c.is_alphanumeric() || c == '_';
+    let mut start = pos.min(s.len());
+    let mut end = start;
+    while start > 0 {
+        let c = s[..start].chars().next_back().unwrap();
+        if is_w(c) {
+            start -= c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    while end < s.len() {
+        let c = s[end..].chars().next().unwrap();
+        if is_w(c) {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (end > start).then_some((start, end))
 }
 fn v_move_word(ed: &mut Editor, fwd: bool, shift: bool) {
     ed.vgoal_col = None;
@@ -1359,6 +1426,25 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             ed.vsel = Some(0);
                             ed.vcaret = ed.content.len();
                         }
+                        egui::Key::D if cmd => {
+                            // 无选区→选中光标处的词；有选区→跳选下一处相同文本（单选，非多光标）
+                            if let Some((a, b)) = v_sel_range(ed) {
+                                let needle = ed.content[a..b].to_string();
+                                if !needle.is_empty() {
+                                    let from = b;
+                                    let found = ed.content[from..].find(&needle).map(|o| from + o).or_else(|| ed.content.find(&needle));
+                                    if let Some(p) = found {
+                                        ed.vsel = Some(p);
+                                        ed.vcaret = p + needle.len();
+                                        ed.pending_scroll = Some(v_line_of(ed, p));
+                                        moved = true;
+                                    }
+                                }
+                            } else if let Some((a, b)) = v_word_range(&ed.content, ed.vcaret) {
+                                ed.vsel = Some(a);
+                                ed.vcaret = b;
+                            }
+                        }
                         egui::Key::Z if cmd && modifiers.shift => v_redo(ed),
                         egui::Key::Z if cmd => v_undo(ed),
                         egui::Key::Y if cmd => v_redo(ed),
@@ -1435,9 +1521,25 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
                     ui.add_space(10.0);
-                    ui.label(RichText::new(match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" }).color(Palette::TEXT_DIM).size(11.0));
+                    // 行尾：点击切换 LF/CRLF
+                    let eol_txt = match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" };
+                    if ui.add(egui::Label::new(RichText::new(eol_txt).color(Palette::TEXT_DIM).size(11.0)).sense(egui::Sense::click())).on_hover_text(crate::i18n::tr("点击切换行尾 LF/CRLF", "Click to toggle LF/CRLF")).clicked() {
+                        let n = match ed.eol() { crate::proto::Eol::Crlf => crate::proto::Eol::Lf, crate::proto::Eol::Lf => crate::proto::Eol::Crlf };
+                        ed.set_eol(n);
+                    }
                     ui.add_space(10.0);
-                    ui.label(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0));
+                    // 编码：点击从菜单选择（保存时按所选编码写回）
+                    ui.menu_button(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0), |ui| {
+                        ui.set_min_width(120.0);
+                        for enc in ["UTF-8", "GBK", "GB18030", "Big5", "Shift_JIS", "EUC-KR", "windows-1252", "ISO-8859-1"] {
+                            if ui.selectable_label(ed.encoding() == enc, enc).clicked() {
+                                ed.set_encoding(enc.to_string());
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(crate::i18n::tr("点击选择保存编码", "Click to choose save encoding"));
                 });
             });
         });
@@ -1470,6 +1572,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             ed.vcaret = v_line_range(ed, line).0;
             ed.vsel = None;
             ed.vgoal_col = None;
+            ed.pending_scroll = Some(line);
             moved = true;
         }
     }
@@ -1666,8 +1769,14 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ed.vgoal_col = None;
                 }
             }
-            // 仅键盘移动光标时滚到可视区（点击/拖拽不滚）。光标行不在可视范围才滚，目标按封顶后的偏移算。
-            if moved {
+            // 跳转到行等：把目标行居中滚入可视区（无条件，优先于下面的「仅越界才滚」）
+            if let Some(tl) = ed.pending_scroll.take() {
+                let target_top = tl.saturating_sub(visible / 2);
+                let target_off = (target_top as f32 / max_top.max(1) as f32) * max_off;
+                let screen_y = origin.y + target_off;
+                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x, screen_y), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
+            } else if moved {
+                // 仅键盘移动光标时滚到可视区（点击/拖拽不滚）。光标行不在可视范围才滚。
                 let cl = v_line_of(ed, ed.vcaret);
                 if cl < top_line || cl + 2 >= top_line + visible {
                     let target_top = cl.saturating_sub(visible / 4);
