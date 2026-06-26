@@ -951,7 +951,7 @@ async fn download_dir_compressed(
         anyhow::bail!("tar 打包失败（{code}）：{err}");
     }
     let size = sftp.metadata(&tmp_remote).await.ok().and_then(|m| m.size).unwrap_or(0);
-    sink.send(WorkerEvent::TransferStart { id, name: name.clone(), total: size, dir: crate::proto::TransferDir::Download });
+    sink.send(WorkerEvent::TransferStart { id, name: name.clone(), total: size, dir: crate::proto::TransferDir::Download, local: Some(local.to_string()) });
 
     // 下载压缩包到本地临时文件（并发分段 + 进度）
     let local_tgz = std::path::PathBuf::from(format!("{local}.ishelldl.{}.tgz", rand_hex(6)));
@@ -1114,7 +1114,7 @@ async fn download(
 
         let total: u64 = files.iter().map(|f| f.2).sum();
         sink.send(WorkerEvent::TransferStart {
-            id, name: name.clone(), total, dir: crate::proto::TransferDir::Download,
+            id, name: name.clone(), total, dir: crate::proto::TransferDir::Download, local: Some(local.clone()),
         });
 
         // 累计已下载字节（多任务共享）+ 周期性上报进度
@@ -1476,7 +1476,7 @@ async fn upload(
 
         let total: u64 = files.iter().map(|f| f.2).sum();
         sink.send(WorkerEvent::TransferStart {
-            id, name: name.clone(), total, dir: crate::proto::TransferDir::Upload,
+            id, name: name.clone(), total, dir: crate::proto::TransferDir::Upload, local: None,
         });
 
         // 先按深度建好远端目录（父先于子），已存在则忽略

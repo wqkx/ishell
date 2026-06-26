@@ -163,7 +163,7 @@ pub enum WorkerEvent {
     /// 一次文件操作成功完成（携带提示文本与需要刷新的目录）
     OpDone { message: String, refresh_dir: Option<String> },
     /// 传输开始（携带总字节数与方向）
-    TransferStart { id: u64, name: String, total: u64, dir: TransferDir },
+    TransferStart { id: u64, name: String, total: u64, dir: TransferDir, local: Option<String> },
     /// 传输进度（已完成字节）
     TransferProgress { id: u64, done: u64 },
     /// 传输结束

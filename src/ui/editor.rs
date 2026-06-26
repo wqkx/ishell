@@ -390,6 +390,7 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                 let avail = (ui.available_width() - 6.0).max(50.0);
                 let out = egui::TextEdit::multiline(&mut ed.content)
                     .code_editor()
+                    .frame(egui::Frame::new()) // 空 Frame：去掉 TextEdit 自带边框（聚焦/编辑态的深色框）；背景由外层 Frame 提供
                     .desired_width(avail)
                     .desired_rows(fill_rows)
                     .id(text_id)

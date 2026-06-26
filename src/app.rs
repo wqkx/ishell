@@ -295,13 +295,17 @@ impl Session {
                     // 已在前端乐观移除被移动项、不在此刷新，避免整目录重载导致的跳动。
                     self.refresh_dir(refresh_dir);
                 }
-                WorkerEvent::TransferStart { id, name, total, dir } => {
+                WorkerEvent::TransferStart { id, name, total, dir, local } => {
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                         t.name = name;
                         t.total = total;
                         t.dir = dir;
+                        // 冲突重命名后，worker 上报的是最终本地路径；更新它，使「打开所在文件夹」定位到重命名后的文件
+                        if local.is_some() {
+                            t.local = local;
+                        }
                     } else {
-                        self.transfers.push(Transfer { id, name, dir, spec: None, paused: false, done: 0, total, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                        self.transfers.push(Transfer { id, name, dir, spec: None, paused: false, done: 0, total, ok: None, local, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
                     }
                 }
                 WorkerEvent::TransferProgress { id, done } => {
