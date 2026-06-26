@@ -95,8 +95,8 @@ pub enum UiCommand {
     CopyMove { srcs: Vec<String>, dest_dir: String, do_move: bool },
     /// 键盘交互认证：用户对服务器提示的逐项回答（顺序与 prompts 一致）
     KbdResponse(Vec<String>),
-    /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制
-    ReadFile { path: String, force: bool },
+    /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制。id 关联占位标签的下载进度
+    ReadFile { id: u64, path: String, force: bool },
     /// 读取图片文件原始字节（用于看图工具打开）
     ReadImage { path: String },
     /// 写回文本文件内容（保存）
@@ -152,8 +152,12 @@ pub enum WorkerEvent {
     /// 键盘交互认证：服务器下发一组提示，请 UI 收集回答后回 `KbdResponse`
     /// prompts 每项为 (提示文本, 是否回显)；echo=false 的项应做密码遮蔽
     KbdPrompt { name: String, instructions: String, prompts: Vec<(String, bool)> },
-    /// 文本文件已读取，打开编辑器
-    FileOpened { path: String, content: String },
+    /// 文本文件已读取，填充对应占位编辑器标签（id 与 ReadFile 一致）
+    FileOpened { id: u64, path: String, content: String },
+    /// 文本文件下载进度（驱动占位标签上的珊瑚色进度条）
+    FileLoadProgress { id: u64, done: u64, total: u64 },
+    /// 文本文件打开失败（移除占位标签 + 提示）
+    FileLoadFailed { id: u64, message: String },
     /// 图片文件已读取（原始字节），打开看图工具
     ImageOpened { path: String, data: Vec<u8> },
     /// 一次文件操作成功完成（携带提示文本与需要刷新的目录）

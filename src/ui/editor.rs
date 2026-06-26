@@ -37,6 +37,8 @@ pub struct Editor {
     find_word: bool,    // 全字匹配
     find_regex: bool,   // 正则
     replace_open: bool, // 展开替换行
+    /// 下载中占位：只显示文件名、不可编辑（内容到位后清除）
+    loading: bool,
     /// 所有匹配（字节范围）缓存 + 缓存签名（变化时重算）
     find_matches: Vec<(usize, usize)>,
     find_sig: u64,
@@ -92,6 +94,7 @@ impl Editor {
             find_word: false,
             find_regex: false,
             replace_open: false,
+            loading: false,
             find_matches: Vec::new(),
             find_sig: 0,
             vcaret: 0,
@@ -119,12 +122,30 @@ impl Editor {
     pub fn filename(&self) -> String {
         self.path.trim_end_matches('/').rsplit('/').next().unwrap_or(&self.path).to_string()
     }
+    pub fn set_loading(&mut self, v: bool) {
+        self.loading = v;
+    }
 }
 
 /// 渲染编辑器内容（工具栏 + 查找栏 + 代码区）。返回 true 表示请求保存。
 /// `text_id` 为该编辑器固定的 TextEdit Id（用于关闭时清理其状态/撤销历史）。
 pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     let mut save = false;
+
+    // 下载中占位：只显示文件名、不可编辑（进度由标签栏的珊瑚色进度条体现）。
+    if ed.loading {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(252, 252, 250)))
+            .show_inside(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    ui.label(RichText::new(ed.filename()).size(16.0).color(Palette::TEXT));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(crate::i18n::tr("下载中 …", "Downloading …")).size(12.0).color(Palette::TEXT_DIM));
+                });
+            });
+        return false;
+    }
 
     // 大文件直接用虚拟化可编辑器（仅渲染可见行，避免 egui TextEdit 给整文件建 galley 的内存与每帧
     // 重排开销）；已去掉只读模式。小/中文件仍用功能完整的 egui TextEdit。

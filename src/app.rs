@@ -50,8 +50,14 @@ struct Session {
     selected_nic: String,
     /// 进程列表是否按内存排序（false = 按 CPU）
     proc_sort_mem: bool,
-    /// 已读取待打开到编辑器的文件（path, content）
-    pending_open: Vec<(String, String)>,
+    /// 已读取待填充到占位编辑器标签的文件（id, path, content）
+    pending_open: Vec<(u64, String, String)>,
+    /// 待新建的占位编辑器标签（id, path）——双击打开时立即建，显示文件名 + 进度条
+    pending_placeholder: Vec<(u64, String)>,
+    /// 文件下载进度（id, done, total），驱动占位标签进度条
+    pending_load_progress: Vec<(u64, u64, u64)>,
+    /// 文件打开失败（id, message）——移除占位标签 + 提示
+    pending_load_fail: Vec<(u64, String)>,
     /// 已读取待打开到看图工具的图片（path, 原始字节）
     pending_image: Vec<(String, Vec<u8>)>,
     /// 向 worker 回复"是否信任未知主机"
@@ -268,9 +274,16 @@ impl Session {
                     self.pending_hostkey = Some((host, fingerprint, changed));
                     self.status = crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
                 }
-                WorkerEvent::FileOpened { path, content } => {
-                    self.pending_open.push((path, content));
+                WorkerEvent::FileOpened { id, path, content } => {
+                    self.pending_open.push((id, path, content));
                     self.status = crate::i18n::tr("已打开文件", "File opened").into();
+                }
+                WorkerEvent::FileLoadProgress { id, done, total } => {
+                    self.pending_load_progress.push((id, done, total));
+                }
+                WorkerEvent::FileLoadFailed { id, message } => {
+                    self.pending_load_fail.push((id, message.clone()));
+                    self.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{message}"), crate::i18n::Lang::En => format!("Open failed: {message}") };
                 }
                 WorkerEvent::ImageOpened { path, data } => {
                     self.pending_image.push((path, data));
@@ -619,6 +632,10 @@ struct EditorTab {
     cmd_tx: UnboundedSender<UiCommand>,
     /// 该编辑器固定的 TextEdit Id（关闭时据此清理 egui 状态/撤销历史）
     text_id: egui::Id,
+    /// 下载中关联的 ReadFile id（Some=加载中占位，None=已就绪）；以及下载进度
+    load_id: Option<u64>,
+    load_done: u64,
+    load_total: u64,
 }
 
 /// 编辑器窗口的共享状态（主窗口与 deferred viewport 回调共用，见 App::editor_state）。
@@ -820,18 +837,27 @@ impl App {
                     server: server.clone(),
                     cmd_tx: tx.clone(),
                     text_id: t1,
+                    load_id: None,
+                    load_done: 0,
+                    load_total: 0,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
                     server: server.clone(),
                     cmd_tx: tx.clone(),
                     text_id: t2,
+                    load_id: None,
+                    load_done: 0,
+                    load_total: 0,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
                     server,
                     cmd_tx: tx,
                     text_id: t3,
+                    load_id: None,
+                    load_done: 0,
+                    load_total: 0,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -1001,6 +1027,9 @@ impl App {
             selected_nic: String::new(),
             proc_sort_mem: false,
             pending_open: Vec::new(),
+            pending_placeholder: Vec::new(),
+            pending_load_progress: Vec::new(),
+            pending_load_fail: Vec::new(),
             pending_image: Vec::new(),
             hostkey_tx,
             pending_hostkey: None,
@@ -1215,7 +1244,11 @@ impl App {
             }
             FileAction::OpenFile { path, force } => {
                 s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
-                let _ = s.cmd_tx.send(UiCommand::ReadFile { path, force });
+                let id = s.next_xfer;
+                s.next_xfer += 1;
+                // 立即建占位标签（显示文件名 + 进度条），下载完成后由 FileOpened 填充内容
+                s.pending_placeholder.push((id, path.clone()));
+                let _ = s.cmd_tx.send(UiCommand::ReadFile { id, path, force });
             }
             FileAction::OpenImage { path } => {
                 s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
@@ -1504,7 +1537,10 @@ impl eframe::App for App {
         }
 
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
-        let mut new_tabs: Vec<(String, String, String, UnboundedSender<UiCommand>)> = Vec::new();
+        let mut new_placeholders: Vec<(u64, String, String, UnboundedSender<UiCommand>)> = Vec::new(); // id, path, server, tx
+        let mut filled: Vec<(u64, String, String)> = Vec::new(); // id, path, content
+        let mut load_progress: Vec<(u64, u64, u64)> = Vec::new();
+        let mut load_fail: Vec<u64> = Vec::new();
         let mut new_images: Vec<(String, Vec<u8>, String)> = Vec::new();
         for s in &mut self.sessions {
             s.drain_events();
@@ -1512,8 +1548,17 @@ impl eframe::App for App {
                 s.initialized = true;
                 s.init_files();
             }
-            for (path, content) in s.pending_open.drain(..) {
-                new_tabs.push((path, content, s.title.clone(), s.cmd_tx.clone()));
+            for (id, path) in s.pending_placeholder.drain(..) {
+                new_placeholders.push((id, path, s.title.clone(), s.cmd_tx.clone()));
+            }
+            for (id, path, content) in s.pending_open.drain(..) {
+                filled.push((id, path, content));
+            }
+            for p in s.pending_load_progress.drain(..) {
+                load_progress.push(p);
+            }
+            for (id, _msg) in s.pending_load_fail.drain(..) {
+                load_fail.push(id);
             }
             for (path, data) in s.pending_image.drain(..) {
                 new_images.push((path, data, s.title.clone()));
@@ -1554,27 +1599,51 @@ impl eframe::App for App {
                 }
             }
         }
-        let opened_editor = !new_tabs.is_empty();
-        for (path, content, server, tx) in new_tabs {
-            let tid = self.alloc_editor_id(); // 借用 self，需在锁外取
-            let mut ed = self.editor_state.lock().unwrap();
-            ed.focus = true; // 打开/切换后聚焦编辑器窗口
-            // 同一服务器同一文件已打开则切到该标签
-            if let Some(i) = ed.tabs.iter().position(|t| t.server == server && t.editor.path == path) {
-                ed.active = i;
-            } else {
-                ed.tabs.push(EditorTab {
-                    editor: crate::ui::editor::Editor::new(path, content),
-                    server,
-                    cmd_tx: tx,
-                    text_id: tid,
-                });
-                ed.active = ed.tabs.len() - 1;
-            }
-        }
-        // 编辑器是独立 deferred 子窗口：新开/切换文件后必须显式唤醒它重绘，否则内容不刷新，
-        // 要手动点一下窗口才更新。
+        // 编辑器标签：立即建占位（loading）→ 进度更新 → 内容就位 → 失败移除。
+        let opened_editor = !new_placeholders.is_empty() || !filled.is_empty() || !load_progress.is_empty() || !load_fail.is_empty();
         if opened_editor {
+            // 占位标签的 text_id 先在锁外分配（alloc_editor_id 借用 self）
+            let mut ph_ids: Vec<egui::Id> = Vec::with_capacity(new_placeholders.len());
+            for _ in &new_placeholders {
+                ph_ids.push(self.alloc_editor_id());
+            }
+            let mut ed = self.editor_state.lock().unwrap();
+            // 1) 新建占位标签（同服务器同文件已打开则切过去）
+            for ((id, path, server, tx), tid) in new_placeholders.into_iter().zip(ph_ids) {
+                ed.focus = true;
+                if let Some(i) = ed.tabs.iter().position(|t| t.server == server && t.editor.path == path) {
+                    ed.active = i;
+                } else {
+                    let mut editor = crate::ui::editor::Editor::new(path, String::new());
+                    editor.set_loading(true);
+                    ed.tabs.push(EditorTab { editor, server, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0 });
+                    ed.active = ed.tabs.len() - 1;
+                }
+            }
+            // 2) 下载进度 → 占位标签
+            for (id, done, total) in load_progress {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+                    t.load_done = done;
+                    t.load_total = total;
+                }
+            }
+            // 3) 内容就位：占位标签变为可编辑、填入内容
+            for (id, path, content) in filled {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+                    t.editor = crate::ui::editor::Editor::new(path, content);
+                    t.load_id = None;
+                }
+            }
+            // 4) 失败：移除对应占位标签
+            for id in load_fail {
+                if let Some(i) = ed.tabs.iter().position(|t| t.load_id == Some(id)) {
+                    ed.tabs.remove(i);
+                    if ed.active >= ed.tabs.len() {
+                        ed.active = ed.tabs.len().saturating_sub(1);
+                    }
+                }
+            }
+            // 编辑器是独立 deferred 子窗口：变化后必须显式唤醒它重绘（含进度条动画）。
             ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
 
@@ -2591,15 +2660,18 @@ impl App {
                                 toggle_find = true;
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let labels: Vec<(u64, String, String)> = ed
+                                let labels: Vec<(u64, String, String, f32)> = ed
                                     .tabs
                                     .iter()
                                     .map(|t| {
                                         let dirty = if t.editor.dirty() { " ●" } else { "" };
+                                        // 加载中 → 进度 [0,1]，驱动 tab 上珊瑚色进度条；否则 -1（不画）
+                                        let prog = if t.load_id.is_some() { (t.load_done as f32 / t.load_total.max(1) as f32).clamp(0.0, 1.0) } else { -1.0 };
                                         (
                                             t.text_id.value(),
                                             format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty),
                                             t.editor.path.clone(),
+                                            prog,
                                         )
                                     })
                                     .collect();
@@ -2842,7 +2914,7 @@ impl App {
                                 do_fit = true;
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let labels: Vec<(u64, String, String)> = self
+                                let labels: Vec<(u64, String, String, f32)> = self
                                     .image_tabs
                                     .iter()
                                     .map(|t| {
@@ -2851,6 +2923,7 @@ impl App {
                                             egui::Id::new((&t.server, &t.path)).value(),
                                             format!("{} {}·{}", icon::IMAGE, t.server, fname),
                                             t.path.clone(),
+                                            -1.0, // 图片标签无下载进度条
                                         )
                                     })
                                     .collect();
@@ -3825,7 +3898,7 @@ fn draggable_tabs(
     total_w: &mut f32,
     active: usize,
     want_scroll: bool,
-    labels: &[(u64, String, String)],
+    labels: &[(u64, String, String, f32)],
 ) -> (Option<usize>, Option<usize>, Option<(usize, usize)>) {
     let mut to_activate = None;
     let mut to_close = None;
@@ -3850,7 +3923,7 @@ fn draggable_tabs(
             let ctx = ui.ctx().clone();
             let font = egui::FontId::proportional(12.0);
             let mut acc = 0.0f32;
-            for (i, (uid, text, tip)) in labels.iter().enumerate() {
+            for (i, (uid, text, tip, prog)) in labels.iter().enumerate() {
                 let selected = active == i;
                 let title_w = ctx.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), Palette::TEXT).rect.width());
                 let w = title_w + 16.0 + 22.0; // 左内边距 + 文本 + 右侧关闭区
@@ -3881,7 +3954,11 @@ fn draggable_tabs(
                 let p = ui.painter();
                 let fill = if dragging_this { Palette::ACCENT_SOFT } else if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
                 p.rect_filled(tab_rect, 6, fill);
-                if selected && !dragging_this {
+                if *prog >= 0.0 {
+                    // 加载中：底部珊瑚线从左到右随下载进度增长（替代选中态整条下划线）
+                    let w_done = (tab_rect.width() * prog.clamp(0.0, 1.0)).max(0.0);
+                    p.hline(tab_rect.left()..=(tab_rect.left() + w_done), tab_rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
+                } else if selected && !dragging_this {
                     p.hline(tab_rect.left()..=tab_rect.right(), tab_rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
                 }
                 let tcolor = if selected { Palette::TEXT } else { Palette::TEXT_DIM };

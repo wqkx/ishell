@@ -436,15 +436,12 @@ pub async fn run(
                             });
                         }
                     }
-                    Some(UiCommand::ReadFile { path, force }) => {
+                    Some(UiCommand::ReadFile { id, path, force }) => {
                         if let Some(sftp) = &sftp {
                             let sftp = sftp.clone();
                             let s = sink.clone();
                             tokio::spawn(async move {
-                                match read_text_file(&sftp, &path, force).await {
-                                    Ok(content) => s.send(WorkerEvent::FileOpened { path, content }),
-                                    Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{e}"), crate::i18n::Lang::En => format!("Open failed: {e}") })),
-                                }
+                                read_file_chunked(&sftp, &path, force, id, &s).await;
                             });
                         }
                     }
@@ -1591,22 +1588,63 @@ fn local_basename(path: &str) -> String {
     path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
-/// 读取远程文本文件。非 force 时限制 4MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB
-/// 且跳过二进制检查（虚拟化编辑器可承载大文件；用户已明确选择以文本方式打开）。
-async fn read_text_file(
-    sftp: &russh_sftp::client::SftpSession,
-    path: &str,
-    force: bool,
-) -> anyhow::Result<String> {
-    let data = sftp.read(path).await?;
+/// 分块读取远程文本文件并上报进度（驱动占位标签上的珊瑚色进度条），与下载文件一致地分块读取。
+/// 非 force 时限制 4MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB 且跳过二进制检查。
+async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, force: bool, id: u64, sink: &UiSink) {
+    use tokio::io::AsyncReadExt;
     let limit = if force { 128 * 1024 * 1024 } else { 4 * 1024 * 1024 };
-    if data.len() > limit {
-        anyhow::bail!("{}", match crate::i18n::current() { crate::i18n::Lang::Zh => format!("文件过大（>{}MB）", limit / 1024 / 1024), crate::i18n::Lang::En => format!("File too large (>{}MB)", limit / 1024 / 1024) });
+    let total = sftp.metadata(path).await.ok().and_then(|m| m.size).unwrap_or(0);
+    // 先报 0 进度：占位标签立即显示空进度条
+    sink.send(WorkerEvent::FileLoadProgress { id, done: 0, total });
+    let too_large = || match crate::i18n::current() {
+        crate::i18n::Lang::Zh => format!("文件过大（>{}MB）", limit / 1024 / 1024),
+        crate::i18n::Lang::En => format!("File too large (>{}MB)", limit / 1024 / 1024),
+    };
+    if total as usize > limit {
+        sink.send(WorkerEvent::FileLoadFailed { id, message: too_large() });
+        return;
     }
-    if !force && data.iter().take(8000).any(|b| *b == 0) {
-        anyhow::bail!("{}", crate::i18n::tr("非文本文件，无法以文本方式打开", "Not a text file"));
+    // 分块读入内存（与 download_small 一致：128KB 一块），每累计 ~256KB 上报一次进度
+    let res: anyhow::Result<Vec<u8>> = async {
+        let mut rf = sftp.open(path).await?;
+        let mut data: Vec<u8> = Vec::with_capacity((total as usize).min(limit).min(16 * 1024 * 1024));
+        let mut buf = vec![0u8; 128 * 1024];
+        let mut last = 0usize;
+        loop {
+            let n = rf.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if data.len() > limit {
+                anyhow::bail!("__TOO_LARGE__");
+            }
+            if data.len() - last >= 256 * 1024 {
+                last = data.len();
+                sink.send(WorkerEvent::FileLoadProgress { id, done: data.len() as u64, total: total.max(data.len() as u64) });
+            }
+        }
+        Ok(data)
     }
-    Ok(String::from_utf8_lossy(&data).into_owned())
+    .await;
+    match res {
+        Ok(data) => {
+            if !force && data.iter().take(8000).any(|b| *b == 0) {
+                sink.send(WorkerEvent::FileLoadFailed { id, message: crate::i18n::tr("非文本文件，无法以文本方式打开", "Not a text file").into() });
+                return;
+            }
+            let content = String::from_utf8_lossy(&data).into_owned();
+            sink.send(WorkerEvent::FileOpened { id, path: path.to_string(), content });
+        }
+        Err(e) => {
+            let msg = if e.to_string().contains("__TOO_LARGE__") {
+                too_large()
+            } else {
+                match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{e}"), crate::i18n::Lang::En => format!("Open failed: {e}") }
+            };
+            sink.send(WorkerEvent::FileLoadFailed { id, message: msg });
+        }
+    }
 }
 
 /// 读取图片文件原始字节（带大小上限，避免误开超大文件拖慢界面）。
