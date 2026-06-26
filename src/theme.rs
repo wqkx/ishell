@@ -207,6 +207,45 @@ fn install_fonts(ctx: &egui::Context) {
         log::warn!("未找到系统中文字体，中文可能显示为方块");
     }
 
+    // 仅 macOS：用系统字体（SF Pro / SF Mono，原生且常规字重）做 UI/终端主字体，
+    // 替掉偏细的默认 Ubuntu-Light/Hack，减轻「字体发虚」；其它平台保持不变。
+    // 拉丁字形走系统字体，中文仍回退到上面的 cjk 字体。
+    #[cfg(target_os = "macos")]
+    {
+        let groups: [(&str, &[&str], egui::FontFamily); 2] = [
+            (
+                "mac_ui",
+                &[
+                    "/System/Library/Fonts/SFNS.ttf",
+                    "/System/Library/Fonts/SFNSText.ttf",
+                    "/System/Library/Fonts/SFNSDisplay.ttf",
+                    "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+                    "/System/Library/Fonts/Supplemental/Arial.ttf",
+                ],
+                egui::FontFamily::Proportional,
+            ),
+            (
+                "mac_mono",
+                &[
+                    "/System/Library/Fonts/SFNSMono.ttf",
+                    "/System/Library/Fonts/Menlo.ttc",
+                    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+                ],
+                egui::FontFamily::Monospace,
+            ),
+        ];
+        for (name, paths, family) in groups {
+            for p in paths {
+                if let Ok(data) = std::fs::read(p) {
+                    fonts.font_data.insert(name.to_owned(), std::sync::Arc::new(egui::FontData::from_owned(data)));
+                    fonts.families.entry(family.clone()).or_default().insert(0, name.to_owned());
+                    log::info!("mac 字体：{family:?} ← {p}");
+                    break;
+                }
+            }
+        }
+    }
+
     ctx.set_fonts(fonts);
 }
 
