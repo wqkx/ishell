@@ -374,8 +374,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             ui.visuals_mut().widgets.active.bg_stroke = egui::Stroke::NONE;
             ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
             ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
-            ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
-            // 选区/查找当前项用半透明灰，盖在字上仍能看清字符（默认不透明会完全遮住）
+            // egui 0.34 用 selection.stroke.color 给「选中的文字」重新着色：设为 NONE(透明) 会让选中
+            // 的文字完全消失（只剩底色）。这里设为正常文字色，保证选中后文字仍清晰可见。
+            ui.visuals_mut().selection.stroke = egui::Stroke::new(1.0, Palette::TEXT);
+            // 选区/查找当前项底色用半透明珊瑚，盖在字上仍能看清字符（默认不透明会完全遮住）
             ui.visuals_mut().selection.bg_fill = {
                 let a = Palette::ACCENT;
                 egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 60) // 当前项/选区：半透明珊瑚色，比未选中灰更醒目、仍透字

@@ -1369,6 +1369,7 @@ enum Menu {
 fn entry_context(resp: &egui::Response, e: &FileEntry, idx: usize, full: &str, has_clip: bool, is_fav: bool, menu: &mut Vec<Menu>) {
     use egui_phosphor::regular as icon;
     resp.context_menu(|ui| {
+        ui.set_min_width(210.0); // 菜单更宽些，长项(如「在文件列表中显示当前目录」)不挤、好点
         if ui.button(format!("{}  {}", icon::FOLDER_PLUS, crate::i18n::tr("新建文件夹", "New folder"))).clicked() {
             menu.push(Menu::NewDir);
             ui.close();
