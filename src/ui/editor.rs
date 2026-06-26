@@ -1471,6 +1471,13 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, ' ')).max(1.0);
     let bg = egui::Color32::from_rgb(252, 252, 250);
     let focused = ui.memory(|m| m.focused() == Some(text_id));
+    // 聚焦时尽早锁定 Tab/方向键/Esc 到编辑器：必须在底部状态栏菜单按钮等可聚焦控件渲染之前设置，
+    // 否则 egui 在渲染那些控件时已用方向键把焦点切走（之前放在 ScrollArea 内、太晚，导致上下键跳到菜单）。
+    if focused {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(text_id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true });
+        });
+    }
     let page = ((ui.available_height() / row_h).floor() as isize - 2).max(1);
     let lang = ed.language.clone();
     let fsize = mono.size;
@@ -1759,12 +1766,6 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
 
             let area = egui::Rect::from_min_size(egui::pos2(origin.x, clip.top()), egui::vec2(content_w.max(ui.available_width()), view_h));
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
-            // 聚焦时锁定方向键/Tab/Esc 到编辑器，避免被 egui 用于切换到底部状态栏按钮等控件
-            if focused {
-                ui.memory_mut(|m| {
-                    m.set_focus_lock_filter(text_id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true });
-                });
-            }
             // 右键弹菜单时选区可能被折叠/失焦：在右键按下这一帧冻结当前选区，供菜单复制/剪切/粘贴使用
             if ui.input(|i| i.pointer.secondary_pressed()) {
                 ed.menu_sel = v_sel_range(ed);
