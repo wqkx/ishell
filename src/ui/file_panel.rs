@@ -124,6 +124,8 @@ pub enum Dialog {
     Rename { path: String, name: String },
     ConfirmDelete { items: Vec<(String, bool, String)> }, // (path, is_dir, name)，支持多选批量删除
     ConfirmOpenLarge { path: String, size: u64 },
+    /// 非文本后缀，确认是否仍用文本编辑器打开
+    ConfirmOpenAsText { path: String, size: u64 },
     /// 撤销移动确认：what=文件名概述，from=当前所在目录，to=移回的原目录（栈顶记录的预览）
     ConfirmUndoMove { what: String, from: String, to: String },
 }
@@ -163,6 +165,32 @@ pub enum FileAction {
 pub fn is_image_path(name: &str) -> bool {
     let lower = name.rsplit('.').next().map(|e| e.to_ascii_lowercase());
     matches!(lower.as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "bmp"))
+}
+
+/// 按后缀粗判是否「可直接以文本/代码打开」。无扩展名（Makefile/LICENSE/dotfile 等）视为文本。
+/// 用于双击打开前的预判：非文本后缀先弹确认框，避免下载后才发现打不开。
+pub fn is_text_path(name: &str) -> bool {
+    let fname = name.rsplit('/').next().unwrap_or(name);
+    let ext = match fname.rsplit_once('.') {
+        Some((base, e)) if !base.is_empty() => e.to_ascii_lowercase(), // 有真正的扩展名
+        _ => return true,                                              // 无扩展名 / dotfile → 视为文本
+    };
+    matches!(
+        ext.as_str(),
+        "txt" | "text" | "log" | "out" | "md" | "markdown" | "rst" | "adoc" | "tex"
+            | "conf" | "cfg" | "config" | "ini" | "toml" | "yaml" | "yml" | "json" | "json5" | "xml" | "plist"
+            | "properties" | "env" | "lock" | "editorconfig" | "csv" | "tsv" | "diff" | "patch"
+            | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "awk" | "sed"
+            | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "m" | "mm"
+            | "rs" | "go" | "py" | "pyi" | "pyw" | "rb" | "php" | "pl" | "pm" | "lua" | "tcl" | "r" | "jl"
+            | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "css" | "scss" | "sass" | "less"
+            | "html" | "htm" | "xhtml" | "svg" | "astro"
+            | "java" | "kt" | "kts" | "scala" | "clj" | "cljs" | "groovy" | "gradle"
+            | "swift" | "dart" | "cs" | "fs" | "vb" | "hs" | "ml" | "mli" | "ex" | "exs" | "erl" | "elm"
+            | "nim" | "zig" | "v" | "d" | "f90" | "f"
+            | "sql" | "graphql" | "gql" | "proto" | "thrift" | "asm" | "s"
+            | "cmake" | "mk" | "makefile" | "dockerfile" | "gitignore" | "gitattributes" | "dockerignore"
+    )
 }
 
 impl FilePanelState {
@@ -764,7 +792,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let mut rclick: Option<usize> = None; // 本帧被右键的行
     let mut open_file: Option<String> = None; // 双击文本文件
     let mut open_image: Option<String> = None; // 双击图片文件
-    let mut confirm_open: Option<(String, u64)> = None; // 大文件待确认
+    let mut confirm_open: Option<(String, u64)> = None; // 大文本文件待确认
+    let mut confirm_text: Option<(String, u64)> = None; // 非文本后缀，待确认是否强开
     let mut rename_commit: Option<(String, String)> = None;
     let mut cancel_rename = false;
     let mut drop_move: Option<(Vec<String>, String)> = None; // 拖拽释放到某文件夹 -> (srcs, dest_dir)
@@ -958,11 +987,13 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                         } else if is_image_path(&e.name) {
                             // 图片文件 -> 看图工具
                             open_image = Some(full.clone());
+                        } else if !is_text_path(&e.name) {
+                            // 非文本后缀：先按后缀判断打不开 → 弹确认框问是否用文本编辑器强开
+                            confirm_text = Some((full.clone(), e.size));
                         } else if e.size > 4 * 1024 * 1024 {
-                            // 大文件先确认
+                            // 大文本文件先确认（虚拟化编辑器可承载）
                             confirm_open = Some((full.clone(), e.size));
                         } else {
-                            // 任意文件都尝试打开，由后台智能判断是否文本（拒绝二进制）
                             open_file = Some(full.clone());
                         }
                     }
@@ -1096,6 +1127,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     }
     if let Some((p, size)) = confirm_open {
         state.dialog = Some(Dialog::ConfirmOpenLarge { path: p, size });
+    }
+    if let Some((p, size)) = confirm_text {
+        state.dialog = Some(Dialog::ConfirmOpenAsText { path: p, size });
     }
 
     // 处理选择（单选 / Ctrl 多选 / Shift 区间）
@@ -1743,7 +1777,7 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                 modal(&ctx, crate::i18n::tr("打开大文件", "Open large file"), |ui| {
                     ui.vertical_centered(|ui| {
                         ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("文件较大（{}），仍要打开吗？", fmt_bytes(*size as f64)), crate::i18n::Lang::En => format!("Large file ({}). Open anyway?", fmt_bytes(*size as f64)) });
-                        ui.label(RichText::new(crate::i18n::tr("将以只读方式打开，可在编辑器内切换为可编辑", "Opens read-only; switch to editable inside the editor")).color(Palette::TEXT_DIM).size(11.0));
+                        ui.label(RichText::new(crate::i18n::tr("将以虚拟化编辑器打开（仅渲染可见行，内存占用低）", "Opens in the virtualized editor (renders only visible lines)")).color(Palette::TEXT_DIM).size(11.0));
                     });
                     ui.add_space(10.0);
                     // 按钮水平居中
@@ -1752,6 +1786,28 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                         let total = bw * 2.0 + ui.spacing().item_spacing.x;
                         ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
                         if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("打开", "Open")).color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            actions.push(FileAction::OpenFile { path: path.clone(), force: true });
+                            close = true;
+                        }
+                        if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+            Dialog::ConfirmOpenAsText { path, size } => {
+                modal(&ctx, crate::i18n::tr("用文本编辑器打开？", "Open as text?"), |ui| {
+                    ui.vertical_centered(|ui| {
+                        let fname = path.rsplit('/').next().unwrap_or(path);
+                        ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("「{}」不是常见文本/代码类型。", fname), crate::i18n::Lang::En => format!("\"{}\" is not a known text type.", fname) });
+                        ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("仍用文本编辑器打开吗？（{}，二进制内容会显示为乱码）", fmt_bytes(*size as f64)), crate::i18n::Lang::En => format!("Open with the text editor anyway? ({}, binary will look garbled)", fmt_bytes(*size as f64)) }).color(Palette::TEXT_DIM).size(11.0));
+                    });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let bw = 100.0;
+                        let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                        if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("文本打开", "Open as text")).color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
                             actions.push(FileAction::OpenFile { path: path.clone(), force: true });
                             close = true;
                         }

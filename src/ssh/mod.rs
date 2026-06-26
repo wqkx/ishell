@@ -1591,18 +1591,19 @@ fn local_basename(path: &str) -> String {
     path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
-/// 读取远程文本文件（拒绝含 NUL 的二进制文件；非 force 时限制 4MB）。
+/// 读取远程文本文件。非 force 时限制 4MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB
+/// 且跳过二进制检查（虚拟化编辑器可承载大文件；用户已明确选择以文本方式打开）。
 async fn read_text_file(
     sftp: &russh_sftp::client::SftpSession,
     path: &str,
     force: bool,
 ) -> anyhow::Result<String> {
     let data = sftp.read(path).await?;
-    let limit = if force { 16 * 1024 * 1024 } else { 4 * 1024 * 1024 };
+    let limit = if force { 128 * 1024 * 1024 } else { 4 * 1024 * 1024 };
     if data.len() > limit {
         anyhow::bail!("{}", match crate::i18n::current() { crate::i18n::Lang::Zh => format!("文件过大（>{}MB）", limit / 1024 / 1024), crate::i18n::Lang::En => format!("File too large (>{}MB)", limit / 1024 / 1024) });
     }
-    if data.iter().take(8000).any(|b| *b == 0) {
+    if !force && data.iter().take(8000).any(|b| *b == 0) {
         anyhow::bail!("{}", crate::i18n::tr("非文本文件，无法以文本方式打开", "Not a text file"));
     }
     Ok(String::from_utf8_lossy(&data).into_owned())
