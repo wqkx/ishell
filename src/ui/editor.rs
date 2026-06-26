@@ -47,6 +47,8 @@ pub struct Editor {
     pending_scroll: Option<usize>,
     /// 多光标/多选（Ctrl+D 累加）：各选区字节范围(升序)；非空即多选模式，编辑作用于全部
     msel: Vec<(usize, usize)>,
+    /// 虚拟编辑器自绘 IME：当前组字(预编辑)文本在 content 中的字节范围；无则 None
+    vime_preedit: Option<(usize, usize)>,
     /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
     encoding: String,
     /// 原文件行尾风格（内部统一 LF，保存时还原）
@@ -114,6 +116,7 @@ impl Editor {
             goto_focus: false,
             pending_scroll: None,
             msel: Vec::new(),
+            vime_preedit: None,
             encoding: "UTF-8".into(),
             eol: crate::proto::Eol::Lf,
             mtime: 0,
@@ -1489,9 +1492,60 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
 
     // ——— 输入（聚焦时）———
     let mut moved = false; // 本帧光标可能移动 → 渲染后滚到可视区
+    // 自绘 IME（同 egui 路径，绕开 egui Commit 门）：处理组字/提交，并在下方上报 o.ime 激活+定位候选框。
+    if focused {
+        let ime_events: Vec<egui::ImeEvent> = ui.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Ime(ev) = e { Some(ev.clone()) } else { None }).collect());
+        if !ime_events.is_empty() {
+            moved = true;
+        }
+        for ev in ime_events {
+            match ev {
+                egui::ImeEvent::Enabled => {}
+                egui::ImeEvent::Preedit(t) => {
+                    if t == "\n" || t == "\r" {
+                        continue;
+                    }
+                    // 组字是临时的：直接改 content、不入撤销栈
+                    let (s, e) = ed.vime_preedit.take().or_else(|| v_sel_range(ed)).unwrap_or((ed.vcaret, ed.vcaret));
+                    let (s, e) = (s.min(ed.content.len()), e.min(ed.content.len()));
+                    ed.content.replace_range(s..e, &t);
+                    let end = s + t.len();
+                    ed.vcaret = end;
+                    ed.vsel = None;
+                    ed.msel.clear();
+                    ed.vime_preedit = if t.is_empty() { None } else { Some((s, end)) };
+                    v_recompute(ed);
+                }
+                egui::ImeEvent::Commit(t) => {
+                    if t == "\n" || t == "\r" {
+                        continue;
+                    }
+                    if let Some((s, e)) = ed.vime_preedit.take() {
+                        let (s, e) = (s.min(ed.content.len()), e.min(ed.content.len()));
+                        ed.content.replace_range(s..e, "");
+                        ed.vcaret = s;
+                        ed.vsel = None;
+                        v_recompute(ed);
+                    }
+                    v_insert(ed, &t); // 提交文本走可撤销插入
+                }
+                egui::ImeEvent::Disabled => {
+                    if let Some((s, e)) = ed.vime_preedit.take() {
+                        let (s, e) = (s.min(ed.content.len()), e.min(ed.content.len()));
+                        ed.content.replace_range(s..e, "");
+                        ed.vcaret = s;
+                        ed.vsel = None;
+                        v_recompute(ed);
+                    }
+                }
+            }
+        }
+        // 已自绘处理，移除 Ime 事件，避免主循环重复处理
+        ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
+    }
     if focused {
         let events = ui.input(|i| i.events.clone());
-        moved = events.iter().any(|e| {
+        moved |= events.iter().any(|e| {
             matches!(
                 e,
                 egui::Event::Text(_)
@@ -1893,6 +1947,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
                         }
                     }
+                    // 在主光标处上报 IME 输入区：激活输入法 + 定位候选框（否则虚拟编辑器无法输入中文）
+                    if ed.vcaret >= ls && ed.vcaret <= le {
+                        let cx = x_of(ed.vcaret - ls);
+                        let irect = egui::Rect::from_min_size(egui::pos2(cx, y), egui::vec2(1.0, row_h));
+                        ui.ctx().output_mut(|o| o.ime = Some(egui::output::IMEOutput { rect: irect, cursor_rect: irect }));
+                    }
                 }
                 // 行号列固定在左侧：最后画（铺底盖住横向滚到下面的正文）+ 右对齐行号
                 painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.left() + gutter_w, y + row_h)), 0.0, bg);
@@ -1983,7 +2043,8 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.right() + char_w * 4.0, clip.top() + 1.0), egui::vec2(2.0, row_h)), None);
                         scrolled = true;
                     } else if pos.x < clip.left() + gutter_w + char_w {
-                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + gutter_w - char_w * 4.0, clip.top() + 1.0), egui::vec2(2.0, row_h)), None);
+                        // 目标点放到视口左缘之外，才会真正向左滚动（之前放在视口内、已可见 → 不滚）
+                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() - char_w * 4.0, clip.top() + 1.0), egui::vec2(2.0, row_h)), None);
                         scrolled = true;
                     }
                     if scrolled {
