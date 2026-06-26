@@ -1508,13 +1508,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let mut do_selall = false;
 
     // ——— 输入（聚焦时）———
-    let mut moved = false; // 本帧光标可能移动 → 渲染后滚到可视区
+    // 视角跟随只看「光标是否真的移动」：按下任意键/输入法每帧都发事件会让旧的 moved 一直为真、
+    // 导致不停把视角拉回光标、无法自由滚动。这里记下输入前的光标，处理完输入后用差异判断。
+    let prev_caret = ed.vcaret;
     // 自绘 IME（同 egui 路径，绕开 egui Commit 门）：处理组字/提交，并在下方上报 o.ime 激活+定位候选框。
     if focused {
         let ime_events: Vec<egui::ImeEvent> = ui.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Ime(ev) = e { Some(ev.clone()) } else { None }).collect());
-        if !ime_events.is_empty() {
-            moved = true;
-        }
         for ev in ime_events {
             match ev {
                 egui::ImeEvent::Enabled => {}
@@ -1567,15 +1566,6 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     }
     if focused {
         let events = ui.input(|i| i.events.clone());
-        moved |= events.iter().any(|e| {
-            matches!(
-                e,
-                egui::Event::Text(_)
-                    | egui::Event::Paste(_)
-                    | egui::Event::Ime(egui::ImeEvent::Commit(_))
-                    | egui::Event::Key { pressed: true, .. }
-            )
-        });
         for ev in events {
             // 多光标模式（msel 非空）：编辑/复制作用于全部选区；移动等其它键退出多选、走常规
             if !ed.msel.is_empty() {
@@ -1627,8 +1617,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     _ => handled = false,
                 }
                 if handled {
-                    moved = true; // 视角跟随主光标
-                    continue;
+                    continue; // 视角跟随由「光标是否移动」统一判断
                 }
             }
             match ev {
@@ -1725,6 +1714,8 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         }
         ed.vcaret = ed.vcaret.min(ed.content.len());
     }
+    // 真正判断光标是否移动（仅此情况才让视角跟随；无移动时自由滚动、绝不拉回）
+    let moved = ed.vcaret != prev_caret;
 
     // 底部状态栏（仿小文件编辑器）：缩进可切换（矩形按钮、贴左）+ 语言贴右。
     egui::Panel::bottom("editor_status_v")
@@ -1792,17 +1783,17 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             FindOut::Goto(a, b) => {
                 ed.vsel = Some(a);
                 ed.vcaret = b;
-                moved = true;
+                ed.pending_scroll = Some(v_line_of(ed, b));
             }
             FindOut::ReplaceOne(a, b) => {
                 let rep = ed.replace.clone();
                 v_apply(ed, a, b - a, &rep);
-                moved = true;
+                ed.pending_scroll = Some(v_line_of(ed, ed.vcaret));
             }
             FindOut::ReplaceAll(newc) => {
                 let old = ed.content.len();
                 v_apply(ed, 0, old, &newc);
-                moved = true;
+                ed.pending_scroll = Some(v_line_of(ed, ed.vcaret));
             }
             FindOut::None => {}
         }
@@ -1815,7 +1806,6 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             ed.vsel = None;
             ed.vgoal_col = None;
             ed.pending_scroll = Some(line);
-            moved = true;
         }
     }
 
