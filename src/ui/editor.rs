@@ -755,6 +755,184 @@ fn v_move_edge(ed: &mut Editor, end: bool, shift: bool) {
     ed.vcaret = if end { le } else { ls };
 }
 
+/// 词边界：从字节 b 向前/后找下一个词边界（跳过空白，再跳过一段同类字符；换行单独成界）。
+fn v_word_boundary(s: &str, b: usize, fwd: bool) -> usize {
+    let is_w = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = b.min(s.len());
+    if fwd {
+        loop {
+            match s[i..].chars().next() {
+                Some(c) if c.is_whitespace() && c != '\n' => i += c.len_utf8(),
+                _ => break,
+            }
+        }
+        if let Some('\n') = s[i..].chars().next() {
+            return i + 1;
+        }
+        let word = s[i..].chars().next().map(is_w).unwrap_or(false);
+        loop {
+            match s[i..].chars().next() {
+                Some(c) if c != '\n' && !c.is_whitespace() && is_w(c) == word => i += c.len_utf8(),
+                _ => break,
+            }
+        }
+    } else {
+        loop {
+            match s[..i].chars().next_back() {
+                Some(c) if c.is_whitespace() && c != '\n' => i -= c.len_utf8(),
+                _ => break,
+            }
+        }
+        if let Some('\n') = s[..i].chars().next_back() {
+            return i - 1;
+        }
+        let word = s[..i].chars().next_back().map(is_w).unwrap_or(false);
+        loop {
+            match s[..i].chars().next_back() {
+                Some(c) if c != '\n' && !c.is_whitespace() && is_w(c) == word => i -= c.len_utf8(),
+                _ => break,
+            }
+        }
+    }
+    i
+}
+fn v_move_word(ed: &mut Editor, fwd: bool, shift: bool) {
+    ed.vgoal_col = None;
+    if !shift {
+        ed.vsel = None;
+    } else if ed.vsel.is_none() {
+        ed.vsel = Some(ed.vcaret);
+    }
+    ed.vcaret = v_word_boundary(&ed.content, ed.vcaret, fwd);
+}
+fn v_delete_word(ed: &mut Editor, fwd: bool) {
+    if v_delete_selection(ed) {
+        return;
+    }
+    let to = v_word_boundary(&ed.content, ed.vcaret, fwd);
+    let (a, b) = if fwd { (ed.vcaret, to) } else { (to, ed.vcaret) };
+    if b > a {
+        v_apply(ed, a, b - a, "");
+    }
+    ed.vgoal_col = None;
+}
+fn v_move_doc(ed: &mut Editor, end: bool, shift: bool) {
+    ed.vgoal_col = None;
+    if !shift {
+        ed.vsel = None;
+    } else if ed.vsel.is_none() {
+        ed.vsel = Some(ed.vcaret);
+    }
+    ed.vcaret = if end { ed.content.len() } else { 0 };
+}
+/// 该语言的行注释前缀（无则 None）。
+fn line_comment(lang: &str) -> Option<&'static str> {
+    Some(match lang {
+        "rs" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "go" | "java" | "kt" | "kts" | "swift" | "dart" | "cs" | "scala" | "php" | "rust" | "json5" | "proto" | "groovy" | "v" | "zig" | "vue" | "svelte" => "//",
+        "py" | "pyw" | "rb" | "sh" | "bash" | "zsh" | "fish" | "pl" | "pm" | "r" | "jl" | "yaml" | "yml" | "toml" | "ini" | "conf" | "cfg" | "config" | "properties" | "dockerfile" | "makefile" | "mk" | "cmake" | "gitignore" | "env" | "tcl" | "nim" | "awk" | "sed" | "gro" | "top" | "itp" | "mdp" | "ndx" => "#",
+        "sql" | "lua" | "hs" | "ml" | "elm" | "adoc" => "--",
+        "clj" | "cljs" | "lisp" | "el" | "asm" | "s" => ";",
+        "vim" => "\"",
+        _ => return None,
+    })
+}
+fn v_toggle_comment(ed: &mut Editor, prefix: &str) {
+    let (sa, sb) = v_sel_range(ed).unwrap_or((ed.vcaret, ed.vcaret));
+    let first = v_line_of(ed, sa);
+    let last = v_line_of(ed, sb.max(sa).saturating_sub(if sb > sa { 1 } else { 0 }));
+    // 判定是否「全部已注释」：非空行都以前缀开头 → 反注释，否则加注释
+    let mut all = true;
+    for li in first..=last {
+        let (ls, le) = v_line_range(ed, li);
+        let t = ed.content[ls..le].trim_start();
+        if !t.is_empty() && !t.starts_with(prefix) {
+            all = false;
+            break;
+        }
+    }
+    let pfx = format!("{prefix} ");
+    // 从后往前改，前面行的偏移不受影响
+    for li in (first..=last).rev() {
+        let (ls, le) = v_line_range(ed, li);
+        let line = &ed.content[ls..le];
+        let indent = line.len() - line.trim_start().len();
+        if all {
+            let after = &line[indent..];
+            if after.starts_with(prefix) {
+                let mut rm = prefix.len();
+                if after[prefix.len()..].starts_with(' ') {
+                    rm += 1;
+                }
+                v_apply(ed, ls + indent, rm, "");
+            }
+        } else if !line[indent..].is_empty() {
+            v_apply(ed, ls + indent, 0, &pfx);
+        }
+    }
+    ed.vsel = None;
+    ed.vgoal_col = None;
+}
+fn v_duplicate_line(ed: &mut Editor, down: bool) {
+    let li = v_line_of(ed, ed.vcaret);
+    let (ls, le) = v_line_range(ed, li);
+    let line = ed.content[ls..le].to_string();
+    let col = ed.vcaret - ls;
+    if down {
+        v_apply(ed, le, 0, &format!("\n{line}"));
+        ed.vcaret = le + 1 + col;
+    } else {
+        v_apply(ed, ls, 0, &format!("{line}\n"));
+        ed.vcaret = ls + col;
+    }
+    ed.vsel = None;
+    ed.vgoal_col = None;
+}
+fn v_move_line(ed: &mut Editor, up: bool) {
+    let li = v_line_of(ed, ed.vcaret);
+    let total = ed.vlines.len();
+    if (up && li == 0) || (!up && li + 1 >= total) {
+        return;
+    }
+    let col = ed.vcaret - v_line_range(ed, li).0;
+    let (a, b) = if up { (li - 1, li) } else { (li, li + 1) };
+    let (as_, _) = v_line_range(ed, a);
+    let (bs, be) = v_line_range(ed, b);
+    let la = ed.content[as_..v_line_range(ed, a).1].to_string();
+    let lb = ed.content[bs..be].to_string();
+    v_apply(ed, as_, be - as_, &format!("{lb}\n{la}"));
+    let target = if up { li - 1 } else { li + 1 };
+    let (ts, te) = v_line_range(ed, target);
+    ed.vcaret = ts + col.min(te - ts);
+    ed.vsel = None;
+    ed.vgoal_col = None;
+}
+fn v_delete_line(ed: &mut Editor) {
+    let li = v_line_of(ed, ed.vcaret);
+    let (ls, le) = v_line_range(ed, li);
+    let total = ed.vlines.len();
+    if li + 1 < total {
+        v_apply(ed, ls, (le + 1) - ls, "");
+    } else if ls > 0 {
+        v_apply(ed, ls - 1, le - (ls - 1), "");
+    } else {
+        v_apply(ed, ls, le - ls, "");
+    }
+    ed.vsel = None;
+    ed.vgoal_col = None;
+}
+/// 输入开括号/引号时自动补全的闭合符。
+fn auto_close_for(t: &str) -> Option<&'static str> {
+    match t {
+        "(" => Some(")"),
+        "[" => Some("]"),
+        "{" => Some("}"),
+        "\"" => Some("\""),
+        "'" => Some("'"),
+        "`" => Some("`"),
+        _ => None,
+    }
+}
+
 // ———————————————————————— VSCode 风格查找/替换控件（两套编辑器共用） ————————————————————————
 
 enum FindOut {
@@ -972,7 +1150,23 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         });
         for ev in events {
             match ev {
-                egui::Event::Text(t) if !t.is_empty() => v_insert(ed, &t),
+                egui::Event::Text(t) if !t.is_empty() => {
+                    // 自动补全括号/引号：无选区→插入成对并把光标放中间；有选区→用括号包裹并保留选中
+                    if let Some(close) = auto_close_for(&t) {
+                        if let Some((a, b)) = v_sel_range(ed) {
+                            let inner = ed.content[a..b].to_string();
+                            v_apply(ed, a, b - a, &format!("{t}{inner}{close}"));
+                            ed.vsel = Some(a + t.len());
+                            ed.vcaret = a + t.len() + inner.len();
+                            ed.vgoal_col = None;
+                        } else {
+                            v_insert(ed, &format!("{t}{close}"));
+                            ed.vcaret -= close.len();
+                        }
+                    } else {
+                        v_insert(ed, &t);
+                    }
+                }
                 egui::Event::Paste(t) if !t.is_empty() => v_insert(ed, &t),
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => v_insert(ed, &t),
                 egui::Event::Copy => {
@@ -1003,6 +1197,14 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         egui::Key::Z if cmd && modifiers.shift => v_redo(ed),
                         egui::Key::Z if cmd => v_undo(ed),
                         egui::Key::Y if cmd => v_redo(ed),
+                        egui::Key::Slash if cmd => {
+                            if let Some(p) = line_comment(&ed.language) {
+                                v_toggle_comment(ed, p);
+                            }
+                        }
+                        egui::Key::K if cmd && modifiers.shift => v_delete_line(ed),
+                        egui::Key::Backspace if cmd => v_delete_word(ed, false),
+                        egui::Key::Delete if cmd => v_delete_word(ed, true),
                         egui::Key::Backspace => v_backspace(ed),
                         egui::Key::Delete => v_delete_fwd(ed),
                         egui::Key::Enter => v_insert(ed, "\n"),
@@ -1010,10 +1212,18 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             let u = ed.indent.unit();
                             v_insert(ed, &u);
                         }
+                        egui::Key::ArrowUp if modifiers.alt && modifiers.shift => v_duplicate_line(ed, false),
+                        egui::Key::ArrowDown if modifiers.alt && modifiers.shift => v_duplicate_line(ed, true),
+                        egui::Key::ArrowUp if modifiers.alt => v_move_line(ed, true),
+                        egui::Key::ArrowDown if modifiers.alt => v_move_line(ed, false),
+                        egui::Key::ArrowLeft if cmd => v_move_word(ed, false, modifiers.shift),
+                        egui::Key::ArrowRight if cmd => v_move_word(ed, true, modifiers.shift),
                         egui::Key::ArrowLeft => v_move_h(ed, false, modifiers.shift),
                         egui::Key::ArrowRight => v_move_h(ed, true, modifiers.shift),
                         egui::Key::ArrowUp => v_move_v(ed, -1, modifiers.shift),
                         egui::Key::ArrowDown => v_move_v(ed, 1, modifiers.shift),
+                        egui::Key::Home if cmd => v_move_doc(ed, false, modifiers.shift),
+                        egui::Key::End if cmd => v_move_doc(ed, true, modifiers.shift),
                         egui::Key::Home => v_move_edge(ed, false, modifiers.shift),
                         egui::Key::End => v_move_edge(ed, true, modifiers.shift),
                         egui::Key::PageUp => v_move_v(ed, -page, modifiers.shift),
@@ -1150,6 +1360,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             });
             let painter = ui.painter().clone();
             let sel = v_sel_range(ed);
+            let caret_line = v_line_of(ed, ed.vcaret); // 当前行高亮
             // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
             let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
                 let vis_a = ed.vlines.get(top_line).copied().unwrap_or(0);
@@ -1173,6 +1384,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 let (ls, le) = v_line_range(ed, i);
                 let line_full: &str = &ed.content[ls..le]; // 切片，不整行拷贝（超长行整行 to_string 也很贵）
                 let y = clip.top() + k as f32 * row_h;
+                // 当前行高亮（极淡）：聚焦且无选区时，给光标所在行铺一层很淡的底
+                if focused && sel.is_none() && i == caret_line {
+                    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.right(), y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10));
+                }
                 // 仅取窗口片段（char_to_byte 至多遍历到 last_col 个字符）
                 let seg_a = char_to_byte(line_full, first_col);
                 let seg_b = char_to_byte(line_full, first_col + cols_vis);
