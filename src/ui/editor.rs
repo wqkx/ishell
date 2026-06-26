@@ -39,6 +39,10 @@ pub struct Editor {
     replace_open: bool, // 展开替换行
     /// 下载中占位：只显示文件名、不可编辑（内容到位后清除）
     loading: bool,
+    /// 跳转到行（Ctrl+G）浮层
+    goto_open: bool,
+    goto_text: String,
+    goto_focus: bool,
     /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
     encoding: String,
     /// 原文件行尾风格（内部统一 LF，保存时还原）
@@ -99,6 +103,9 @@ impl Editor {
             find_regex: false,
             replace_open: false,
             loading: false,
+            goto_open: false,
+            goto_text: String::new(),
+            goto_focus: false,
             encoding: "UTF-8".into(),
             eol: crate::proto::Eol::Lf,
             find_matches: Vec::new(),
@@ -182,9 +189,24 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             ed.find_focus = true;
         }
     }
+    // Ctrl/Cmd+G：跳转到行
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::G)) || ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G)) {
+        ed.goto_open = !ed.goto_open;
+        if ed.goto_open {
+            ed.goto_focus = true;
+        }
+    }
 
     // 查找/替换：VSCode 风格浮层（共用 find_widget）。
     let mut pending_select: Option<(usize, usize)> = None;
+    if ed.goto_open {
+        if let Some(n) = goto_widget(ui, ed, text_id) {
+            // 第 n 行行首的字节偏移 → 字符位置
+            let byte = ed.content.split_inclusive('\n').take(n - 1).map(|s| s.len()).sum::<usize>().min(ed.content.len());
+            let c = byte_to_char(&ed.content, byte);
+            pending_select = Some((c, c));
+        }
+    }
     if ed.show_find {
         let caret_char = egui::text_edit::TextEditState::load(ui.ctx(), text_id)
             .and_then(|s| s.cursor.char_range())
@@ -1012,6 +1034,45 @@ fn find_toggle(ui: &mut egui::Ui, label: &str, on: bool, tip: &str) -> bool {
         .clicked()
 }
 
+/// 跳转到行浮层（顶部居中）；返回 Some(1 基行号) 表示跳转。
+fn goto_widget(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> Option<usize> {
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ed.goto_open = false;
+        return None;
+    }
+    let mut out = None;
+    egui::Area::new(text_id.with("goto"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 44.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(Palette::PANEL_2)
+                .stroke(egui::Stroke::new(1.0, Palette::BORDER))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(252, 252, 250);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("跳转到行", "Go to line")).color(Palette::TEXT_DIM).size(12.0));
+                        let r = ui.add(egui::TextEdit::singleline(&mut ed.goto_text).desired_width(80.0).hint_text("1.."));
+                        if ed.goto_focus {
+                            r.request_focus();
+                            ed.goto_focus = false;
+                        }
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if enter || ui.button(crate::i18n::tr("跳转", "Go")).clicked() {
+                            if let Ok(n) = ed.goto_text.trim().parse::<usize>() {
+                                out = Some(n.max(1));
+                            }
+                            ed.goto_open = false;
+                            ed.goto_text.clear();
+                        }
+                    });
+                });
+        });
+    out
+}
+
 /// VSCode 风格查找/替换浮层（右上角）；`caret_byte` 为当前光标字节位置；返回要应用的动作。
 fn find_widget(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id, caret_byte: usize) -> FindOut {
     use egui_phosphor::regular as icon;
@@ -1190,6 +1251,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                                 ed.find_focus = true;
                             }
                         }
+                        egui::Key::G if cmd => {
+                            ed.goto_open = !ed.goto_open;
+                            if ed.goto_open {
+                                ed.goto_focus = true;
+                            }
+                        }
                         egui::Key::A if cmd => {
                             ed.vsel = Some(0);
                             ed.vcaret = ed.content.len();
@@ -1296,6 +1363,16 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 moved = true;
             }
             FindOut::None => {}
+        }
+    }
+    // 跳转到行
+    if ed.goto_open {
+        if let Some(n) = goto_widget(ui, ed, text_id) {
+            let line = (n - 1).min(ed.vlines.len().saturating_sub(1));
+            ed.vcaret = v_line_range(ed, line).0;
+            ed.vsel = None;
+            ed.vgoal_col = None;
+            moved = true;
         }
     }
 
