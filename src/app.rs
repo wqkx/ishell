@@ -50,8 +50,11 @@ struct Session {
     selected_nic: String,
     /// 进程列表是否按内存排序（false = 按 CPU）
     proc_sort_mem: bool,
-    /// 已读取待填充到占位编辑器标签的文件（id, path, content, encoding, eol）
-    pending_open: Vec<(u64, String, String, String, crate::proto::Eol)>,
+    /// 已读取待填充到占位编辑器标签的文件（id, path, content, encoding, eol, mtime）
+    pending_open: Vec<(u64, String, String, String, crate::proto::Eol, u32)>,
+    /// 保存成功回报的新 mtime（path, mtime）/ 外部改动冲突（path）
+    pending_saved: Vec<(String, u32)>,
+    pending_conflict: Vec<String>,
     /// 待新建的占位编辑器标签（id, path）——双击打开时立即建，显示文件名 + 进度条
     pending_placeholder: Vec<(u64, String)>,
     /// 文件下载进度（id, done, total），驱动占位标签进度条
@@ -274,9 +277,15 @@ impl Session {
                     self.pending_hostkey = Some((host, fingerprint, changed));
                     self.status = crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
                 }
-                WorkerEvent::FileOpened { id, path, content, encoding, eol } => {
-                    self.pending_open.push((id, path, content, encoding, eol));
+                WorkerEvent::FileOpened { id, path, content, encoding, eol, mtime } => {
+                    self.pending_open.push((id, path, content, encoding, eol, mtime));
                     self.status = crate::i18n::tr("已打开文件", "File opened").into();
+                }
+                WorkerEvent::FileSaved { path, mtime } => {
+                    self.pending_saved.push((path, mtime));
+                }
+                WorkerEvent::FileSaveConflict { path } => {
+                    self.pending_conflict.push(path);
                 }
                 WorkerEvent::FileLoadProgress { id, done, total } => {
                     self.pending_load_progress.push((id, done, total));
@@ -640,6 +649,8 @@ struct EditorTab {
     load_id: Option<u64>,
     load_done: u64,
     load_total: u64,
+    /// 保存时检测到文件被外部修改 → 显示冲突横幅
+    save_conflict: bool,
 }
 
 /// 编辑器窗口的共享状态（主窗口与 deferred viewport 回调共用，见 App::editor_state）。
@@ -844,6 +855,7 @@ impl App {
                     load_id: None,
                     load_done: 0,
                     load_total: 0,
+                    save_conflict: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
@@ -853,6 +865,7 @@ impl App {
                     load_id: None,
                     load_done: 0,
                     load_total: 0,
+                    save_conflict: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
@@ -862,6 +875,7 @@ impl App {
                     load_id: None,
                     load_done: 0,
                     load_total: 0,
+                    save_conflict: false,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -1031,6 +1045,8 @@ impl App {
             selected_nic: String::new(),
             proc_sort_mem: false,
             pending_open: Vec::new(),
+            pending_saved: Vec::new(),
+            pending_conflict: Vec::new(),
             pending_placeholder: Vec::new(),
             pending_load_progress: Vec::new(),
             pending_load_fail: Vec::new(),
@@ -1542,10 +1558,12 @@ impl eframe::App for App {
 
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
         let mut new_placeholders: Vec<(u64, String, String, UnboundedSender<UiCommand>)> = Vec::new(); // id, path, server, tx
-        let mut filled: Vec<(u64, String, String, String, crate::proto::Eol)> = Vec::new(); // id, path, content, encoding, eol
+        let mut filled: Vec<(u64, String, String, String, crate::proto::Eol, u32)> = Vec::new(); // id, path, content, encoding, eol, mtime
         let mut load_progress: Vec<(u64, u64, u64)> = Vec::new();
         let mut load_fail: Vec<u64> = Vec::new();
         let mut new_images: Vec<(String, Vec<u8>, String)> = Vec::new();
+        let mut saved: Vec<(String, String, u32)> = Vec::new(); // server, path, mtime
+        let mut conflicts: Vec<(String, String)> = Vec::new(); // server, path
         for s in &mut self.sessions {
             s.drain_events();
             if s.connected && !s.initialized {
@@ -1555,8 +1573,14 @@ impl eframe::App for App {
             for (id, path) in s.pending_placeholder.drain(..) {
                 new_placeholders.push((id, path, s.title.clone(), s.cmd_tx.clone()));
             }
-            for (id, path, content, encoding, eol) in s.pending_open.drain(..) {
-                filled.push((id, path, content, encoding, eol));
+            for (id, path, content, encoding, eol, mtime) in s.pending_open.drain(..) {
+                filled.push((id, path, content, encoding, eol, mtime));
+            }
+            for (path, mtime) in s.pending_saved.drain(..) {
+                saved.push((s.title.clone(), path, mtime));
+            }
+            for path in s.pending_conflict.drain(..) {
+                conflicts.push((s.title.clone(), path));
             }
             for p in s.pending_load_progress.drain(..) {
                 load_progress.push(p);
@@ -1620,7 +1644,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0 });
+                    ed.tabs.push(EditorTab { editor, server, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -1632,10 +1656,10 @@ impl eframe::App for App {
                 }
             }
             // 3) 内容就位：占位标签变为可编辑、填入内容
-            for (id, path, content, encoding, eol) in filled {
+            for (id, path, content, encoding, eol, mtime) in filled {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
                     let mut editor = crate::ui::editor::Editor::new(path, content);
-                    editor.set_meta(encoding, eol);
+                    editor.set_meta(encoding, eol, mtime);
                     t.editor = editor;
                     t.load_id = None;
                 }
@@ -1650,6 +1674,22 @@ impl eframe::App for App {
                 }
             }
             // 编辑器是独立 deferred 子窗口：变化后必须显式唤醒它重绘（含进度条动画）。
+            ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+        }
+        // 保存成功 → 更新对应标签 mtime（避免下次保存误判）；外部改动冲突 → 置标志，编辑器弹横幅。
+        if !saved.is_empty() || !conflicts.is_empty() {
+            let mut ed = self.editor_state.lock().unwrap();
+            for (server, path, mtime) in saved {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.server == server && t.editor.path == path) {
+                    t.editor.set_mtime(mtime);
+                    t.save_conflict = false;
+                }
+            }
+            for (server, path) in conflicts {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.server == server && t.editor.path == path) {
+                    t.save_conflict = true;
+                }
+            }
             ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
 
@@ -2716,6 +2756,30 @@ impl App {
                     let active = ed.active;
                     if let Some(tab) = ed.tabs.get_mut(active) {
                         let tid = tab.text_id;
+                        // 外部改动冲突横幅：保存被拒后提示，可覆盖或取消
+                        if tab.save_conflict {
+                            egui::Frame::new().fill(egui::Color32::from_rgb(255, 244, 220)).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("{}  {}", egui_phosphor::regular::WARNING, crate::i18n::tr("文件已被外部修改，未保存", "File changed externally; not saved"))).color(Palette::TEXT).size(12.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button(crate::i18n::tr("取消", "Cancel")).clicked() {
+                                            tab.save_conflict = false;
+                                        }
+                                        if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("覆盖保存", "Overwrite")).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
+                                            let _ = tab.cmd_tx.send(UiCommand::WriteFile {
+                                                path: tab.editor.path.clone(),
+                                                content: tab.editor.content.clone(),
+                                                encoding: tab.editor.encoding().to_string(),
+                                                eol: tab.editor.eol(),
+                                                expect_mtime: tab.editor.mtime(),
+                                                force: true,
+                                            });
+                                            tab.save_conflict = false;
+                                        }
+                                    });
+                                });
+                            });
+                        }
                         if crate::ui::editor::content(ui, &mut tab.editor, tid) {
                             do_save = true;
                         }
@@ -2733,6 +2797,8 @@ impl App {
                         content: tab.editor.content.clone(),
                         encoding: tab.editor.encoding().to_string(),
                         eol: tab.editor.eol(),
+                        expect_mtime: tab.editor.mtime(),
+                        force: false,
                     });
                 }
                 if let Some(tab) = ed.tabs.get_mut(active) {
@@ -2788,7 +2854,7 @@ impl App {
                 if decision != 0 {
                     if decision == 1 {
                         if let Some(t) = ed.tabs.get(ti) {
-                            let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone(), encoding: t.editor.encoding().to_string(), eol: t.editor.eol() });
+                            let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone(), encoding: t.editor.encoding().to_string(), eol: t.editor.eol(), expect_mtime: t.editor.mtime(), force: false });
                         }
                         if let Some(t) = ed.tabs.get_mut(ti) {
                             t.editor.mark_saved();

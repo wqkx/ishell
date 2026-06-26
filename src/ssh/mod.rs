@@ -1612,7 +1612,9 @@ fn decode_text(data: &[u8]) -> (String, String) {
 async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, force: bool, id: u64, sink: &UiSink) {
     use tokio::io::AsyncReadExt;
     let limit = if force { 128 * 1024 * 1024 } else { 4 * 1024 * 1024 };
-    let total = sftp.metadata(path).await.ok().and_then(|m| m.size).unwrap_or(0);
+    let meta = sftp.metadata(path).await.ok();
+    let total = meta.as_ref().and_then(|m| m.size).unwrap_or(0);
+    let file_mtime = meta.as_ref().and_then(|m| m.mtime).unwrap_or(0);
     // 先报 0 进度：占位标签立即显示空进度条
     sink.send(WorkerEvent::FileLoadProgress { id, done: 0, total });
     let too_large = || match crate::i18n::current() {
@@ -1659,7 +1661,7 @@ async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, f
             } else {
                 (decoded, crate::proto::Eol::Lf)
             };
-            sink.send(WorkerEvent::FileOpened { id, path: path.to_string(), content, encoding, eol });
+            sink.send(WorkerEvent::FileOpened { id, path: path.to_string(), content, encoding, eol, mtime: file_mtime });
         }
         Err(e) => {
             let msg = if e.to_string().contains("__TOO_LARGE__") {
@@ -1720,18 +1722,34 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已重命名为：{to}"), crate::i18n::Lang::En => format!("Renamed to: {to}") }, Some(parent)))
                 .map_err(Into::into)
         }
-        UiCommand::WriteFile { path, content, encoding, eol } => {
-            // 内部统一 LF → 按原文件行尾还原；再按原编码编码后写回，避免破坏非 UTF-8 文件 / 改动行尾。
-            let text = match eol {
-                crate::proto::Eol::Crlf => content.replace('\n', "\r\n"),
-                crate::proto::Eol::Lf => content,
+        UiCommand::WriteFile { path, content, encoding, eol, expect_mtime, force } => {
+            // 外部改动检测：非 force 时若远端当前 mtime 与打开时不一致，拒绝写入、回报冲突。
+            let conflict = if !force && expect_mtime != 0 {
+                let cur = sftp.metadata(&path).await.ok().and_then(|m| m.mtime).unwrap_or(0);
+                cur != 0 && cur != expect_mtime
+            } else {
+                false
             };
-            let enc = encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
-            let (bytes, _, _) = enc.encode(&text);
-            sftp.write(&path, bytes.as_ref())
-                .await
-                .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存：{path}"), crate::i18n::Lang::En => format!("Saved: {path}") }, None))
-                .map_err(Into::into)
+            if conflict {
+                sink.send(WorkerEvent::FileSaveConflict { path });
+                Ok((String::new(), None))
+            } else {
+                // 内部统一 LF → 按原文件行尾还原；再按原编码编码后写回，避免破坏非 UTF-8 文件 / 改动行尾。
+                let text = match eol {
+                    crate::proto::Eol::Crlf => content.replace('\n', "\r\n"),
+                    crate::proto::Eol::Lf => content,
+                };
+                let enc = encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+                let (bytes, _, _) = enc.encode(&text);
+                match sftp.write(&path, bytes.as_ref()).await {
+                    Ok(_) => {
+                        let nm = sftp.metadata(&path).await.ok().and_then(|m| m.mtime).unwrap_or(0);
+                        sink.send(WorkerEvent::FileSaved { path: path.clone(), mtime: nm });
+                        Ok((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存：{path}"), crate::i18n::Lang::En => format!("Saved: {path}") }, None))
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
         }
         _ => Ok(("".into(), None)),
     };

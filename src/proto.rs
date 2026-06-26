@@ -100,7 +100,8 @@ pub enum UiCommand {
     /// 读取图片文件原始字节（用于看图工具打开）
     ReadImage { path: String },
     /// 写回文本文件内容（保存）。content 为内部 LF 文本，worker 按 eol 还原行尾、按 encoding 编码后写入。
-    WriteFile { path: String, content: String, encoding: String, eol: Eol },
+    /// expect_mtime≠0 且与远端当前 mtime 不一致且 !force 时，判定外部已改动、拒绝写入并回报冲突。
+    WriteFile { path: String, content: String, encoding: String, eol: Eol, expect_mtime: u32, force: bool },
     /// 查询进程详情（cmdline / cwd / exe）
     ProcDetail(u32),
     /// 强制结束进程（kill -9）
@@ -153,8 +154,12 @@ pub enum WorkerEvent {
     /// prompts 每项为 (提示文本, 是否回显)；echo=false 的项应做密码遮蔽
     KbdPrompt { name: String, instructions: String, prompts: Vec<(String, bool)> },
     /// 文本文件已读取，填充对应占位编辑器标签（id 与 ReadFile 一致）。
-    /// content 已按探测到的编码解码、行尾统一为 LF；encoding/eol 用于保存时还原。
-    FileOpened { id: u64, path: String, content: String, encoding: String, eol: Eol },
+    /// content 已按探测到的编码解码、行尾统一为 LF；encoding/eol 用于保存时还原；mtime 用于外部改动检测。
+    FileOpened { id: u64, path: String, content: String, encoding: String, eol: Eol, mtime: u32 },
+    /// 保存成功（携带新的 mtime，编辑器据此更新，避免下次保存误判为外部改动）
+    FileSaved { path: String, mtime: u32 },
+    /// 保存时检测到文件已被外部修改（未写入）；UI 提示用户是否覆盖
+    FileSaveConflict { path: String },
     /// 文本文件下载进度（驱动占位标签上的珊瑚色进度条）
     FileLoadProgress { id: u64, done: u64, total: u64 },
     /// 文本文件打开失败（移除占位标签 + 提示）

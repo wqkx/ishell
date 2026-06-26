@@ -47,6 +47,8 @@ pub struct Editor {
     encoding: String,
     /// 原文件行尾风格（内部统一 LF，保存时还原）
     eol: crate::proto::Eol,
+    /// 打开/上次保存时的远端 mtime（外部改动检测）
+    mtime: u32,
     /// 所有匹配（字节范围）缓存 + 缓存签名（变化时重算）
     find_matches: Vec<(usize, usize)>,
     find_sig: u64,
@@ -108,6 +110,7 @@ impl Editor {
             goto_focus: false,
             encoding: "UTF-8".into(),
             eol: crate::proto::Eol::Lf,
+            mtime: 0,
             find_matches: Vec::new(),
             find_sig: 0,
             vcaret: 0,
@@ -138,15 +141,22 @@ impl Editor {
     pub fn set_loading(&mut self, v: bool) {
         self.loading = v;
     }
-    pub fn set_meta(&mut self, encoding: String, eol: crate::proto::Eol) {
+    pub fn set_meta(&mut self, encoding: String, eol: crate::proto::Eol, mtime: u32) {
         self.encoding = encoding;
         self.eol = eol;
+        self.mtime = mtime;
     }
     pub fn encoding(&self) -> &str {
         &self.encoding
     }
     pub fn eol(&self) -> crate::proto::Eol {
         self.eol
+    }
+    pub fn mtime(&self) -> u32 {
+        self.mtime
+    }
+    pub fn set_mtime(&mut self, m: u32) {
+        self.mtime = m;
     }
 }
 
