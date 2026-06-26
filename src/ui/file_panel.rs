@@ -167,30 +167,34 @@ pub fn is_image_path(name: &str) -> bool {
     matches!(lower.as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "bmp"))
 }
 
-/// 按后缀粗判是否「可直接以文本/代码打开」。无扩展名（Makefile/LICENSE/dotfile 等）视为文本。
-/// 用于双击打开前的预判：非文本后缀先弹确认框，避免下载后才发现打不开。
+/// 按后缀粗判是否「可直接以文本打开」。采用「黑名单」策略：除了**已知的二进制后缀**，其余一律
+/// 当文本打开（无扩展名、各类科学计算/配置/日志等纯文本格式都直接开，不再误弹确认框）。
+/// 真正的二进制若漏网，后台读取时的 NUL 检查会兜底拒绝并报错。
 pub fn is_text_path(name: &str) -> bool {
     let fname = name.rsplit('/').next().unwrap_or(name);
     let ext = match fname.rsplit_once('.') {
-        Some((base, e)) if !base.is_empty() => e.to_ascii_lowercase(), // 有真正的扩展名
-        _ => return true,                                              // 无扩展名 / dotfile → 视为文本
+        Some((base, e)) if !base.is_empty() => e.to_ascii_lowercase(),
+        _ => return true, // 无扩展名 / dotfile → 文本
     };
-    matches!(
+    // 已知二进制后缀 → 需要确认（图片在调用处单独处理，这里不含）
+    let binary = matches!(
         ext.as_str(),
-        "txt" | "text" | "log" | "out" | "md" | "markdown" | "rst" | "adoc" | "tex"
-            | "conf" | "cfg" | "config" | "ini" | "toml" | "yaml" | "yml" | "json" | "json5" | "xml" | "plist"
-            | "properties" | "env" | "lock" | "editorconfig" | "csv" | "tsv" | "diff" | "patch"
-            | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "awk" | "sed"
-            | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "m" | "mm"
-            | "rs" | "go" | "py" | "pyi" | "pyw" | "rb" | "php" | "pl" | "pm" | "lua" | "tcl" | "r" | "jl"
-            | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "vue" | "svelte" | "css" | "scss" | "sass" | "less"
-            | "html" | "htm" | "xhtml" | "svg" | "astro"
-            | "java" | "kt" | "kts" | "scala" | "clj" | "cljs" | "groovy" | "gradle"
-            | "swift" | "dart" | "cs" | "fs" | "vb" | "hs" | "ml" | "mli" | "ex" | "exs" | "erl" | "elm"
-            | "nim" | "zig" | "v" | "d" | "f90" | "f"
-            | "sql" | "graphql" | "gql" | "proto" | "thrift" | "asm" | "s"
-            | "cmake" | "mk" | "makefile" | "dockerfile" | "gitignore" | "gitattributes" | "dockerignore"
-    )
+        // 压缩 / 打包
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "tbz" | "xz" | "txz" | "zst" | "7z" | "rar" | "lz" | "lz4" | "jar" | "war" | "whl" | "deb" | "rpm" | "apk" | "dmg" | "iso" | "cab"
+        // 可执行 / 目标 / 库
+        | "exe" | "dll" | "so" | "dylib" | "a" | "o" | "obj" | "lib" | "bin" | "elf" | "class" | "pyc" | "pyo" | "wasm" | "msi" | "ko"
+        // 媒体（音视频）
+        | "mp3" | "mp4" | "m4a" | "m4v" | "aac" | "flac" | "wav" | "ogg" | "opus" | "avi" | "mkv" | "mov" | "wmv" | "webm" | "flv" | "mpg" | "mpeg" | "3gp"
+        // 图片（其它入口防呆）/ 字体
+        | "ico" | "icns" | "tif" | "tiff" | "webp" | "heic" | "psd" | "ttf" | "otf" | "ttc" | "woff" | "woff2" | "eot"
+        // 文档（私有二进制容器）
+        | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+        // 数据库 / 序列化 / 数值
+        | "db" | "sqlite" | "sqlite3" | "mdb" | "pkl" | "pickle" | "npy" | "npz" | "mat" | "h5" | "hdf5" | "parquet" | "feather" | "arrow" | "onnx" | "bson"
+        // 科学计算二进制轨迹/态（GROMACS/AMBER/NAMD 等；其文本格式 gro/top/itp/mdp/ndx/xvg/pdb 仍走文本）
+        | "trr" | "xtc" | "tpr" | "edr" | "cpt" | "dcd" | "binpos" | "ncdf" | "nc" | "gbw" | "wfn"
+    );
+    !binary
 }
 
 impl FilePanelState {

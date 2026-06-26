@@ -1046,7 +1046,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let digits = total.max(1).to_string().len();
     let gutter_w = (digits as f32 + 1.5) * char_w;
     let content_w = gutter_w + (ed.vmax as f32 + 2.0) * char_w;
-    let content_h = total as f32 * row_h;
+    // 内容高度封顶在 f32 安全区：大文件行数巨大时 (总行数×行高) 可达数百万像素，拖到最底部时
+    // vp 偏移的 f32 精度只剩约 0.5px，导致抖动/卡顿。封顶后改按「行号」虚拟化、用视口相对坐标绘制，
+    // 纵向坐标始终很小、不再丢精度。
+    let content_h = (total as f32 * row_h).min(2_000_000.0);
 
     egui::Frame::new().fill(bg).show(ui, |ui| {
         ui.spacing_mut().scroll.floating = false;
@@ -1058,8 +1061,17 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id).show_viewport(ui, |ui, vp| {
             ui.set_width(content_w);
             ui.set_height(content_h);
-            let origin = ui.min_rect().min;
-            let area = egui::Rect::from_min_size(origin, egui::vec2(content_w.max(ui.available_width()), content_h));
+            let origin = ui.min_rect().min; // 横向滚动用其 x；纵向改用 clip + 行号映射避免大坐标丢精度
+            let clip = ui.clip_rect();
+            let view_h = clip.height();
+            let max_off = (content_h - view_h).max(1.0);
+            let frac = (vp.min.y / max_off).clamp(0.0, 1.0);
+            let visible = (view_h / row_h).ceil() as usize + 2;
+            let max_top = total.saturating_sub(visible.saturating_sub(2)); // 最大首行号
+            let top_line = ((frac * max_top as f32).round() as usize).min(max_top);
+            let text_x = origin.x + gutter_w;
+
+            let area = egui::Rect::from_min_size(egui::pos2(origin.x, clip.top()), egui::vec2(content_w.max(ui.available_width()), view_h));
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
             resp.context_menu(|ui| {
                 ui.set_min_width(140.0);
@@ -1083,24 +1095,25 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 }
             });
             let painter = ui.painter().clone();
-            let first = (vp.min.y / row_h).floor().max(0.0) as usize;
-            let last = (first + (vp.height() / row_h).ceil() as usize + 2).min(total);
             let sel = v_sel_range(ed);
-            let text_x = origin.x + gutter_w;
             // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
             let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
-                let vis_a = ed.vlines.get(first).copied().unwrap_or(0);
-                let vis_b = ed.vlines.get(last).copied().unwrap_or(ed.content.len());
+                let vis_a = ed.vlines.get(top_line).copied().unwrap_or(0);
+                let vis_b = ed.vlines.get((top_line + visible).min(total)).copied().unwrap_or(ed.content.len());
                 let mlo = ed.find_matches.partition_point(|&(s, _)| s < vis_a);
                 let mhi = ed.find_matches.partition_point(|&(s, _)| s < vis_b);
                 ed.find_matches[mlo..mhi].to_vec()
             } else {
                 Vec::new()
             };
-            for i in first..last {
+            for k in 0..visible {
+                let i = top_line + k;
+                if i >= total {
+                    break;
+                }
                 let (ls, le) = v_line_range(ed, i);
                 let line = ed.content[ls..le].to_string();
-                let y = origin.y + i as f32 * row_h;
+                let y = clip.top() + k as f32 * row_h; // 视口相对，坐标始终小
                 // 逐可见行做语法高亮（按行 tokenize，仅可见行，开销小）
                 let galley = {
                     let mut job = highlight::highlight(&line, &lang, fsize, &[]);
@@ -1114,7 +1127,6 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         let b_in = sb.clamp(ls, le);
                         let ax = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, a_in - ls))).left();
                         let bx = if sb > le {
-                            // 选区跨到下一行：高亮到行尾再多一点（表示选中换行）
                             galley.rect.right() + char_w * 0.5
                         } else {
                             galley.pos_from_cursor(CCursor::new(byte_to_char(&line, b_in - ls))).left()
@@ -1128,8 +1140,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
                 // 正文
                 painter.galley(egui::pos2(text_x, y), galley.clone(), Palette::TEXT);
-                // 查找命中高亮（半透明灰）——用全局匹配缓存（含大小写/全字/正则），仅画落在本行的。
-                // 跳过「当前项」(=选区)：它已用半透明珊瑚色画在字下层，不再叠灰盖字。
+                // 查找命中高亮（半透明灰），跳过「当前项」(=选区)避免叠灰盖字。
                 for &(ma, mb) in &vis_matches {
                     if sel == Some((ma, mb)) {
                         continue;
@@ -1153,14 +1164,15 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 }
             }
             // 行号分割线
-            painter.vline(text_x - 3.0, origin.y..=(origin.y + content_h).min(origin.y + vp.max.y), egui::Stroke::new(1.0, Palette::BORDER));
-            // 点击 / 拖拽定位光标与选区
+            painter.vline(text_x - 3.0, clip.top()..=clip.bottom(), egui::Stroke::new(1.0, Palette::BORDER));
+            // 点击 / 拖拽定位光标与选区（行号 = top_line + 视口内行偏移）
             if resp.clicked() || resp.drag_started() || resp.dragged() {
                 if resp.clicked() || resp.drag_started() {
                     ui.memory_mut(|m| m.request_focus(text_id));
                 }
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    let li = (((pos.y - origin.y) / row_h).floor().max(0.0) as usize).min(total.saturating_sub(1));
+                    let k = ((pos.y - clip.top()) / row_h).floor().max(0.0) as usize;
+                    let li = (top_line + k).min(total.saturating_sub(1));
                     let (ls, le) = v_line_range(ed, li);
                     let line = ed.content[ls..le].to_string();
                     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
@@ -1179,15 +1191,15 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ed.vgoal_col = None;
                 }
             }
-            // 仅键盘移动光标时滚到可视区（点击/拖拽不滚——指针已在目标处，强制滚动会在底部抖动）。
+            // 仅键盘移动光标时滚到可视区（点击/拖拽不滚）。光标行不在可视范围才滚，目标按封顶后的偏移算。
             if moved {
                 let cl = v_line_of(ed, ed.vcaret);
-                let (ls, le) = v_line_range(ed, cl);
-                let line = ed.content[ls..le].to_string();
-                let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
-                let cx = g.pos_from_cursor(CCursor::new(byte_to_char(&line, ed.vcaret - ls))).left();
-                let cy = origin.y + cl as f32 * row_h;
-                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x + cx, cy), egui::vec2(2.0, row_h)), None);
+                if cl < top_line || cl + 2 >= top_line + visible {
+                    let target_top = cl.saturating_sub(visible / 4);
+                    let target_off = (target_top as f32 / max_top.max(1) as f32) * max_off;
+                    let screen_y = origin.y + target_off;
+                    ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(text_x, screen_y), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
+                }
             }
         });
     });
