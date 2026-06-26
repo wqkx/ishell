@@ -10,8 +10,9 @@ use crate::ui::highlight::{self, Indent};
 
 /// 超过该大小则不做语法高亮（省内存/CPU）。
 const HIGHLIGHT_LIMIT: usize = 256 * 1024;
-/// 超过该大小改为只读、按行虚拟化渲染（避免 egui 整文件布局占用巨量内存）。
-const EDIT_LIMIT: usize = 1024 * 1024;
+/// 超过该大小走虚拟化编辑器。设为 0：所有非空文件都用虚拟编辑器（统一一套：多光标/词移动/IME 等全在它上），
+/// 仅空文件用 egui TextEdit（输入首字符后自动切到虚拟编辑器）。
+const EDIT_LIMIT: usize = 0;
 
 pub struct Editor {
     pub path: String,
@@ -1589,10 +1590,17 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             egui::Key::D if cmd => v_ctrl_d(ed),
                             egui::Key::ArrowLeft if !cmd => v_multi_move(ed, false),
                             egui::Key::ArrowRight if !cmd => v_multi_move(ed, true),
-                            _ => {
+                            // 纵向导航 / Ctrl+组合键 → 退出多选、走常规处理
+                            egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Home | egui::Key::End | egui::Key::PageUp | egui::Key::PageDown if !cmd => {
                                 ed.msel.clear();
                                 handled = false;
                             }
+                            _ if cmd => {
+                                ed.msel.clear();
+                                handled = false;
+                            }
+                            // 普通字母/符号键：会另发 Text 事件做多光标插入，这里不清 msel
+                            _ => handled = false,
                         }
                     }
                     _ => handled = false,
