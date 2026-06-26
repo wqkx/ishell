@@ -355,7 +355,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
             ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
             ui.visuals_mut().selection.stroke = egui::Stroke::NONE;
             // 选区/查找当前项用半透明灰，盖在字上仍能看清字符（默认不透明会完全遮住）
-            ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(130, 130, 130, 70);
+            ui.visuals_mut().selection.bg_fill = {
+                let a = Palette::ACCENT;
+                egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 90) // 当前项/选区：半透明珊瑚色，比未选中灰更醒目、仍透字
+            };
             ui.horizontal_top(|ui| {
                 ui.add_space(gutter_w + 4.0); // 预留行号列宽度（行号随后按 galley 位置绘制）
                 // 宽度比「行号列之后的剩余可视宽度」再小几像素：保证短行时正文总宽严格小于视口，
@@ -798,7 +801,7 @@ fn find_widget(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id, caret_byte
     let cur_idx = ed.find_matches.iter().position(|&(a, b)| caret_byte >= a && caret_byte <= b);
     let mut out = FindOut::None;
     egui::Area::new(text_id.with("find_widget"))
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 8.0))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 44.0)) // 标签栏之下，避免遮住保存/查找
         .order(egui::Order::Foreground)
         .show(ui.ctx(), |ui| {
             egui::Frame::new()
@@ -809,6 +812,10 @@ fn find_widget(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id, caret_byte
                 .show(ui, |ui| {
                     ui.spacing_mut().interact_size.y = 24.0;
                     ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                    // 输入框用近白底，和卡片/边框区分开（默认会和 PANEL_2 同色看不清）
+                    ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(252, 252, 250);
+                    ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Palette::BORDER);
+                    ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Palette::TEXT_DIM);
                     ui.horizontal(|ui| {
                         let exp = if ed.replace_open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
                         if ui.add(egui::Button::new(RichText::new(exp).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("展开/收起替换", "Toggle replace")).clicked() {
@@ -1098,7 +1105,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     job.wrap.max_width = f32::INFINITY;
                     ui.ctx().fonts_mut(|f| f.layout_job(job))
                 };
-                // 选区高亮（半透明灰）
+                // 选区/查找当前项高亮：半透明珊瑚色，比未选中匹配的灰更醒目、仍能看清字符
                 if let Some((sa, sb)) = sel {
                     if sb > ls && sa <= le {
                         let a_in = sa.clamp(ls, le);
@@ -1111,7 +1118,8 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             galley.pos_from_cursor(CCursor::new(byte_to_char(&line, b_in - ls))).left()
                         };
                         let r = egui::Rect::from_min_max(egui::pos2(text_x + ax, y), egui::pos2(text_x + bx, y + row_h));
-                        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(130, 130, 130, 80));
+                        let a = Palette::ACCENT;
+                        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 90));
                     }
                 }
                 // 行号
