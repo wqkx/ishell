@@ -50,6 +50,15 @@ pub struct Editor {
     msel: Vec<(usize, usize)>,
     /// 虚拟编辑器自绘 IME：当前组字(预编辑)文本在 content 中的字节范围；无则 None
     vime_preedit: Option<(usize, usize)>,
+    /// 上一帧滚动度量（用于本帧用「设置滚动偏移」方式可靠跟随光标；scroll_to_rect 在本容器不生效）
+    vlast_top: usize,
+    vlast_vis: usize,
+    vlast_voff: f32,
+    vlast_hoff: f32,
+    vlast_vieww: f32,
+    vlast_viewh: f32,
+    /// 拖选到边缘时下一帧要施加的滚动增量 (水平, 垂直)
+    vscroll_nudge: Option<(f32, f32)>,
     /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
     encoding: String,
     /// 原文件行尾风格（内部统一 LF，保存时还原）
@@ -118,6 +127,13 @@ impl Editor {
             pending_scroll: None,
             msel: Vec::new(),
             vime_preedit: None,
+            vlast_top: 0,
+            vlast_vis: 1,
+            vlast_voff: 0.0,
+            vlast_hoff: 0.0,
+            vlast_vieww: 0.0,
+            vlast_viewh: 0.0,
+            vscroll_nudge: None,
             encoding: "UTF-8".into(),
             eol: crate::proto::Eol::Lf,
             mtime: 0,
@@ -1806,6 +1822,39 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let pad_rows = 3usize;
     let content_h = ((total + pad_rows) as f32 * row_h).min(2_000_000.0);
 
+    // —— 用「设置滚动偏移」可靠地让视角跟随光标（scroll_to_rect 在本虚拟容器里不生效）——
+    // 用上一帧度量判断光标是否已在可视区，越界才强制滚动；普通滚动不受影响。
+    let mut force_v: Option<f32> = None;
+    let mut force_h: Option<f32> = None;
+    {
+        let view_h = if ed.vlast_viewh > 0.0 { ed.vlast_viewh } else { ui.available_height() };
+        let view_w = if ed.vlast_vieww > 0.0 { ed.vlast_vieww } else { ui.available_width() };
+        let visible = (view_h / row_h).ceil() as usize + 2;
+        let max_off = (content_h - view_h).max(1.0);
+        let max_top = (total + pad_rows).saturating_sub(visible.saturating_sub(2));
+        let cl = v_line_of(ed, ed.vcaret);
+        if let Some(tl) = ed.pending_scroll.take() {
+            let tt = tl.saturating_sub(visible / 2);
+            force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
+        } else if moved && (cl < ed.vlast_top || cl + 2 >= ed.vlast_top + ed.vlast_vis.max(1)) {
+            let tt = cl.saturating_sub(visible / 4);
+            force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
+        }
+        if moved {
+            let (ls2, _) = v_line_range(ed, cl);
+            let cx = gutter_w + ed.content[ls2..ed.vcaret].chars().count() as f32 * char_w; // 光标在内容坐标里的 x
+            if cx < ed.vlast_hoff + gutter_w + char_w {
+                force_h = Some((cx - gutter_w - char_w * 2.0).max(0.0));
+            } else if cx > ed.vlast_hoff + view_w - char_w * 2.0 {
+                force_h = Some((cx - view_w + char_w * 3.0).max(0.0));
+            }
+        }
+        if let Some((dh, dv)) = ed.vscroll_nudge.take() {
+            force_v = Some((force_v.unwrap_or(ed.vlast_voff) + dv).clamp(0.0, max_off));
+            force_h = Some((force_h.unwrap_or(ed.vlast_hoff) + dh).max(0.0));
+        }
+    }
+
     egui::Frame::new().fill(bg).show(ui, |ui| {
         ui.spacing_mut().scroll.floating = false;
         ui.spacing_mut().scroll.foreground_color = false;
@@ -1813,7 +1862,14 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(202);
         ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_gray(168);
         ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(140);
-        egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id).show_viewport(ui, |ui, vp| {
+        let mut sa = egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id);
+        if let Some(v) = force_v {
+            sa = sa.vertical_scroll_offset(v);
+        }
+        if let Some(h) = force_h {
+            sa = sa.horizontal_scroll_offset(h);
+        }
+        sa.show_viewport(ui, |ui, vp| {
             ui.set_width(content_w);
             ui.set_height(content_h);
             let origin = ui.min_rect().min; // 横向滚动用其 x；纵向改用 clip + 行号映射避免大坐标丢精度
@@ -1825,6 +1881,13 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let max_top = (total + pad_rows).saturating_sub(visible.saturating_sub(2)); // 最大首行号（含末尾留白）
             let top_line = ((frac * max_top as f32).round() as usize).min(max_top);
             let text_x = origin.x + gutter_w;
+            // 记录本帧滚动度量，供下一帧「跟随光标」判断与施加偏移
+            ed.vlast_top = top_line;
+            ed.vlast_vis = visible;
+            ed.vlast_voff = vp.min.y;
+            ed.vlast_hoff = vp.min.x;
+            ed.vlast_vieww = clip.width();
+            ed.vlast_viewh = view_h;
 
             let area = egui::Rect::from_min_size(egui::pos2(origin.x, clip.top()), egui::vec2(content_w.max(ui.available_width()), view_h));
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
@@ -2011,51 +2074,26 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ed.vgoal_col = None;
                 }
             }
-            // 垂直滚动：跳转到行(居中,无条件) 或 键盘移动越界时。用 clip.left() 占位，避免扰动横向滚动。
-            if let Some(tl) = ed.pending_scroll.take() {
-                let target_top = tl.saturating_sub(visible / 2);
-                let target_off = (target_top as f32 / max_top.max(1) as f32) * max_off;
-                ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + 1.0, origin.y + target_off), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
-            } else if moved {
-                let cl = v_line_of(ed, ed.vcaret);
-                if cl < top_line || cl + 2 >= top_line + visible {
-                    let target_top = cl.saturating_sub(visible / 4);
-                    let target_off = (target_top as f32 / max_top.max(1) as f32) * max_off;
-                    ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + 1.0, origin.y + target_off), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
-                }
-            }
-            // 横向滚动：键盘移动后让光标列跟随进可视区（保留 gutter 左余量），y 取已可见行不扰动纵向。
-            if moved {
-                let cl = v_line_of(ed, ed.vcaret);
-                let (ls2, _) = v_line_range(ed, cl);
-                let caret_x = text_x + ed.content[ls2..ed.vcaret].chars().count() as f32 * char_w;
-                ui.scroll_to_rect(egui::Rect::from_min_max(egui::pos2(caret_x - gutter_w - char_w * 2.0, clip.top() + 1.0), egui::pos2(caret_x + char_w * 2.0, clip.top() + row_h)), None);
-            }
-            // 拖拽选择到视口边缘时自动滚动（垂直 + 水平）
+            // 键盘移动的「跟随光标」已在 ScrollArea 创建前用 vertical/horizontal_scroll_offset 施加（可靠）。
+            // 这里只处理拖选到边缘：记录滚动增量，下一帧施加（持续自动滚动）。
             if resp.dragged() {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    let mut scrolled = false;
-                    let tt = if pos.y < clip.top() + row_h {
-                        Some(top_line.saturating_sub(2))
+                    let dv = if pos.y < clip.top() + row_h {
+                        -row_h * 2.0
                     } else if pos.y > clip.bottom() - row_h {
-                        Some((top_line + 2).min(max_top))
+                        row_h * 2.0
                     } else {
-                        None
+                        0.0
                     };
-                    if let Some(tt) = tt {
-                        let off = (tt as f32 / max_top.max(1) as f32) * max_off;
-                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() + 1.0, origin.y + off), egui::vec2(2.0, view_h)), Some(egui::Align::Min));
-                        scrolled = true;
-                    }
-                    if pos.x > clip.right() - char_w {
-                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.right() + char_w * 4.0, clip.top() + 1.0), egui::vec2(2.0, row_h)), None);
-                        scrolled = true;
-                    } else if pos.x < clip.left() + gutter_w + char_w {
-                        // 目标点放到视口左缘之外，才会真正向左滚动（之前放在视口内、已可见 → 不滚）
-                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(clip.left() - char_w * 4.0, clip.top() + 1.0), egui::vec2(2.0, row_h)), None);
-                        scrolled = true;
-                    }
-                    if scrolled {
+                    let dh = if pos.x < clip.left() + gutter_w + char_w {
+                        -char_w * 3.0
+                    } else if pos.x > clip.right() - char_w {
+                        char_w * 3.0
+                    } else {
+                        0.0
+                    };
+                    if dv != 0.0 || dh != 0.0 {
+                        ed.vscroll_nudge = Some((dh, dv));
                         ui.ctx().request_repaint();
                     }
                 }
