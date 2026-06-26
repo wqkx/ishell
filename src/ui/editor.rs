@@ -309,6 +309,18 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                 apply_indent(&mut ed.content, r, ed.indent, false, ui.ctx(), text_id);
             } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
                 apply_indent(&mut ed.content, r, ed.indent, true, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash) || i.consume_key(egui::Modifiers::CTRL, egui::Key::Slash)) {
+                apply_comment(&mut ed.content, r, &ed.language, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::K) || i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::K)) {
+                apply_delete_line(&mut ed.content, r, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::ArrowUp)) {
+                apply_dup_line(&mut ed.content, r, false, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT | egui::Modifiers::SHIFT, egui::Key::ArrowDown)) {
+                apply_dup_line(&mut ed.content, r, true, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp)) {
+                apply_move_line(&mut ed.content, r, true, ui.ctx(), text_id);
+            } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown)) {
+                apply_move_line(&mut ed.content, r, false, ui.ctx(), text_id);
             }
         }
     }
@@ -1804,6 +1816,117 @@ fn apply_indent(content: &mut String, r: CCursorRange, indent: Indent, dedent: b
     let new_ce_byte = ((be as i64) + total_delta).max(first_line_start as i64) as usize;
     let new_ce = byte_to_char(content, new_ce_byte.min(content.len()));
     set_cursor(ctx, id, new_cs, new_ce);
+}
+
+// ——— 小文件(egui)编辑器的注释切换 / 行操作（直接改 content + 写回光标，与 apply_indent 同风格）———
+fn apply_comment(content: &mut String, r: CCursorRange, lang: &str, ctx: &egui::Context, id: egui::Id) {
+    let prefix = match line_comment(lang) {
+        Some(p) => p,
+        None => return,
+    };
+    let range = r.as_sorted_char_range();
+    let bs = char_to_byte(content, range.start);
+    let be = char_to_byte(content, range.end).max(bs);
+    let first = content[..bs].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let mut starts = vec![first];
+    let mut s = first;
+    loop {
+        match content[s..].find('\n') {
+            Some(off) => {
+                let ls = s + off + 1;
+                if ls > be || ls >= content.len() {
+                    break;
+                }
+                starts.push(ls);
+                s = ls;
+            }
+            None => break,
+        }
+    }
+    let line_end = |content: &str, ls: usize| content[ls..].find('\n').map(|o| ls + o).unwrap_or(content.len());
+    let all = starts.iter().all(|&ls| {
+        let t = content[ls..line_end(content, ls)].trim_start();
+        t.is_empty() || t.starts_with(prefix)
+    });
+    let pfx = format!("{prefix} ");
+    let mut delta: i64 = 0;
+    for &ls in starts.iter().rev() {
+        let le = line_end(content, ls);
+        let line = &content[ls..le];
+        let indent = line.len() - line.trim_start().len();
+        if all {
+            let after = &line[indent..];
+            if after.starts_with(prefix) {
+                let mut rm = prefix.len();
+                if after[prefix.len()..].starts_with(' ') {
+                    rm += 1;
+                }
+                content.replace_range(ls + indent..ls + indent + rm, "");
+                delta -= rm as i64;
+            }
+        } else if !line[indent..].is_empty() {
+            content.insert_str(ls + indent, &pfx);
+            delta += pfx.len() as i64;
+        }
+    }
+    let nc0 = byte_to_char(content, first);
+    let nc1 = byte_to_char(content, (((be as i64) + delta).max(first as i64) as usize).min(content.len()));
+    set_cursor(ctx, id, nc0, nc1);
+}
+fn cur_line_bounds(content: &str, r: CCursorRange) -> (usize, usize, usize) {
+    let b = char_to_byte(content, r.as_sorted_char_range().start);
+    let ls = content[..b].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let le = content[ls..].find('\n').map(|o| ls + o).unwrap_or(content.len());
+    (ls, le, b - ls) // 行首字节、行尾字节(不含\n)、列内字节偏移
+}
+fn apply_delete_line(content: &mut String, r: CCursorRange, ctx: &egui::Context, id: egui::Id) {
+    let (ls, le, _) = cur_line_bounds(content, r);
+    if le < content.len() {
+        content.replace_range(ls..le + 1, "");
+    } else if ls > 0 {
+        content.replace_range(ls - 1..le, "");
+    } else {
+        content.replace_range(ls..le, "");
+    }
+    let nc = byte_to_char(content, ls.min(content.len()));
+    set_cursor(ctx, id, nc, nc);
+}
+fn apply_dup_line(content: &mut String, r: CCursorRange, down: bool, ctx: &egui::Context, id: egui::Id) {
+    let (ls, le, col) = cur_line_bounds(content, r);
+    let line = content[ls..le].to_string();
+    if down {
+        content.insert_str(le, &format!("\n{line}"));
+        let nc = byte_to_char(content, le + 1 + col);
+        set_cursor(ctx, id, nc, nc);
+    } else {
+        content.insert_str(ls, &format!("{line}\n"));
+        let nc = byte_to_char(content, ls + col);
+        set_cursor(ctx, id, nc, nc);
+    }
+}
+fn apply_move_line(content: &mut String, r: CCursorRange, up: bool, ctx: &egui::Context, id: egui::Id) {
+    let (ls, le, col) = cur_line_bounds(content, r);
+    if up {
+        if ls == 0 {
+            return;
+        }
+        let prev_ls = content[..ls - 1].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let prev = content[prev_ls..ls - 1].to_string();
+        let cur = content[ls..le].to_string();
+        content.replace_range(prev_ls..le, &format!("{cur}\n{prev}"));
+        let nc = byte_to_char(content, (prev_ls + col).min(content.len()));
+        set_cursor(ctx, id, nc, nc);
+    } else {
+        if le >= content.len() {
+            return;
+        }
+        let next_le = content[le + 1..].find('\n').map(|o| le + 1 + o).unwrap_or(content.len());
+        let cur = content[ls..le].to_string();
+        let next = content[le + 1..next_le].to_string();
+        content.replace_range(ls..next_le, &format!("{next}\n{cur}"));
+        let nc = byte_to_char(content, (ls + next.len() + 1 + col).min(content.len()));
+        set_cursor(ctx, id, nc, nc);
+    }
 }
 
 fn replace_char_range(text: &mut String, c0: usize, c1: usize, rep: &str) {
