@@ -1750,6 +1750,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ui.add_space(8.0);
                     ui.label(RichText::new(&ed.status).color(Palette::TEXT_DIM).size(11.0));
                 }
+                if ed.msel.len() > 1 {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("{} 光标", ed.msel.len())).color(Palette::ACCENT).size(11.0));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
@@ -1834,11 +1838,23 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         let max_top = (total + pad_rows).saturating_sub(visible.saturating_sub(2));
         let cl = v_line_of(ed, ed.vcaret);
         if let Some(tl) = ed.pending_scroll.take() {
+            // 跳转/定位：居中
             let tt = tl.saturating_sub(visible / 2);
             force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
-        } else if moved && (cl < ed.vlast_top || cl + 2 >= ed.vlast_top + ed.vlast_vis.max(1)) {
-            let tt = cl.saturating_sub(visible / 4);
-            force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
+        } else if moved {
+            // 键盘移动：只在越界时「一行」地滚（不要整屏跳）
+            let top = ed.vlast_top;
+            let vis = ed.vlast_vis.max(3);
+            let tt = if cl < top {
+                cl // 光标在视口上方 → 滚到刚好露出该行（一行）
+            } else if cl + 2 >= top + vis {
+                (cl + 3).saturating_sub(vis) // 光标在视口下方 → 滚到该行刚好在底部附近（一行）
+            } else {
+                top // 已在可视区 → 不滚
+            };
+            if tt != top {
+                force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
+            }
         }
         if moved {
             let (ls2, _) = v_line_range(ed, cl);
