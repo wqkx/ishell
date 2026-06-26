@@ -655,13 +655,18 @@ impl Terminal {
 
         let font = FontId::monospace(self.font_size);
         // 以字符 'M' 的宽高度量单元格尺寸
-        let (char_w, glyph_h) = ui.ctx().fonts_mut(|f| {
+        let (char_w_raw, glyph_h) = ui.ctx().fonts_mut(|f| {
             let w = f.glyph_width(&font, 'M');
             let h = f.row_height(&font);
             (w, h)
         });
+        // 把单元格宽高吸附到「整数物理像素」：否则逐格 col*char_w 累积非整数像素位置，
+        // 等宽/中文字形采样落在像素缝里 → 发虚（mac Retina 尤其明显）。
+        let ppp = ui.ctx().pixels_per_point();
+        let snap = |v: f32| ((v * ppp).round().max(1.0)) / ppp;
+        let char_w = snap(char_w_raw);
         // 行高 = 字形高度 × 1.2，避免上下两行过挤；字形在行内纵向居中
-        let char_h = glyph_h * 1.2;
+        let char_h = snap(glyph_h * 1.2);
         let cell = Vec2::new(char_w, char_h);
 
         let avail = ui.available_size();
@@ -806,7 +811,8 @@ impl Terminal {
 
         let sel = self.ordered_selection();
         let screen = self.parser.screen();
-        let origin = rect.min;
+        // origin 也吸附到物理像素网格，使每个单元格都落在整数像素上（配合上面 char_w/char_h 吸附）
+        let origin = egui::pos2((rect.min.x * ppp).round() / ppp, (rect.min.y * ppp).round() / ppp);
 
         // 可见行中的链接：用于悬停下划线 + 点击打开（鼠标上报模式下让位给 TUI）
         let mut link_rects: Vec<(Rect, String)> = Vec::new();
