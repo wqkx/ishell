@@ -1129,61 +1129,58 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             } else {
                 Vec::new()
             };
+            // 水平可视列窗口：每行只对窗口内片段做高亮 + 布局（开销 O(可视列)，与行长无关）。
+            // 这样超长行（日志/JSON/CSV 等）不再每帧整行 tokenize + layout，根治「某些大文件拖到底卡顿」。
+            let first_col = ((clip.left() - text_x).max(0.0) / char_w) as usize;
+            let cols_vis = (clip.width() / char_w).ceil() as usize + 8; // 视口列数 + 余量（CJK 偏宽，余量足够）
+            let accent = Palette::ACCENT;
             for k in 0..visible {
                 let i = top_line + k;
                 if i >= total {
                     break;
                 }
                 let (ls, le) = v_line_range(ed, i);
-                let line = ed.content[ls..le].to_string();
-                let y = clip.top() + k as f32 * row_h; // 视口相对，坐标始终小
-                // 逐可见行做语法高亮（按行 tokenize，仅可见行，开销小）
+                let line_full: &str = &ed.content[ls..le]; // 切片，不整行拷贝（超长行整行 to_string 也很贵）
+                let y = clip.top() + k as f32 * row_h;
+                // 仅取窗口片段（char_to_byte 至多遍历到 last_col 个字符）
+                let seg_a = char_to_byte(line_full, first_col);
+                let seg_b = char_to_byte(line_full, first_col + cols_vis);
+                let seg = &line_full[seg_a..seg_b];
+                let seg_x = text_x + first_col as f32 * char_w;
                 let galley = {
-                    let mut job = highlight::highlight(&line, &lang, fsize, &[]);
+                    let mut job = highlight::highlight(seg, &lang, fsize, &[]);
                     job.wrap.max_width = f32::INFINITY;
                     ui.ctx().fonts_mut(|f| f.layout_job(job))
                 };
-                // 选区/查找当前项高亮：半透明珊瑚色，比未选中匹配的灰更醒目、仍能看清字符
+                // 行内字节偏移 → 屏幕 x（窗口外钳制到窗口边缘，超出部分本就不可见）
+                let x_of = |lb: usize| -> f32 { seg_x + galley.pos_from_cursor(CCursor::new(byte_to_char(seg, lb.clamp(seg_a, seg_b) - seg_a))).left() };
+                // 选区/查找当前项高亮：半透明珊瑚色
                 if let Some((sa, sb)) = sel {
                     if sb > ls && sa <= le {
-                        let a_in = sa.clamp(ls, le);
-                        let b_in = sb.clamp(ls, le);
-                        let ax = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, a_in - ls))).left();
-                        let bx = if sb > le {
-                            galley.rect.right() + char_w * 0.5
-                        } else {
-                            galley.pos_from_cursor(CCursor::new(byte_to_char(&line, b_in - ls))).left()
-                        };
-                        let r = egui::Rect::from_min_max(egui::pos2(text_x + ax, y), egui::pos2(text_x + bx, y + row_h));
-                        let a = Palette::ACCENT;
-                        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 60));
+                        let ax = x_of(sa.clamp(ls, le) - ls);
+                        let bx = if sb > le { clip.right() } else { x_of(sb.clamp(ls, le) - ls) };
+                        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(ax, y), egui::pos2(bx, y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 60));
                     }
                 }
                 // 行号
                 painter.text(egui::pos2(origin.x + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
                 // 正文
-                painter.galley(egui::pos2(text_x, y), galley.clone(), Palette::TEXT);
+                painter.galley(egui::pos2(seg_x, y), galley.clone(), Palette::TEXT);
                 // 查找命中高亮（半透明灰），跳过「当前项」(=选区)避免叠灰盖字。
                 for &(ma, mb) in &vis_matches {
                     if sel == Some((ma, mb)) {
                         continue;
                     }
                     if ma < le && mb > ls {
-                        let a_in = ma.clamp(ls, le);
-                        let b_in = mb.clamp(ls, le);
-                        let hx0 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, a_in - ls))).left();
-                        let hx1 = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, b_in - ls))).left();
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(text_x + hx0, y), egui::pos2(text_x + hx1, y + row_h)),
-                            2.0,
-                            egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56),
-                        );
+                        let hx0 = x_of(ma.clamp(ls, le) - ls);
+                        let hx1 = x_of(mb.clamp(ls, le) - ls);
+                        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(hx0, y), egui::pos2(hx1, y + row_h)), 2.0, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56));
                     }
                 }
                 // 光标
                 if focused && ed.vcaret >= ls && ed.vcaret <= le {
-                    let cx = galley.pos_from_cursor(CCursor::new(byte_to_char(&line, ed.vcaret - ls))).left();
-                    painter.vline(text_x + cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
+                    let cx = x_of(ed.vcaret - ls);
+                    painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
                 }
             }
             // 行号分割线
@@ -1197,10 +1194,15 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     let k = ((pos.y - clip.top()) / row_h).floor().max(0.0) as usize;
                     let li = (top_line + k).min(total.saturating_sub(1));
                     let (ls, le) = v_line_range(ed, li);
-                    let line = ed.content[ls..le].to_string();
-                    let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(line.clone(), mono.clone(), Palette::TEXT));
-                    let cc = g.cursor_from_pos(egui::vec2(pos.x - text_x, 0.0)).index;
-                    let b = ls + char_to_byte(&line, cc);
+                    // 同样只布局窗口片段（避免在超长行上拖拽选择时每帧整行 layout）
+                    let line_full: &str = &ed.content[ls..le];
+                    let seg_a = char_to_byte(line_full, first_col);
+                    let seg_b = char_to_byte(line_full, first_col + cols_vis);
+                    let seg = line_full[seg_a..seg_b].to_string();
+                    let seg_x = text_x + first_col as f32 * char_w;
+                    let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(seg.clone(), mono.clone(), Palette::TEXT));
+                    let cc = g.cursor_from_pos(egui::vec2(pos.x - seg_x, 0.0)).index;
+                    let b = ls + seg_a + char_to_byte(&seg, cc);
                     if resp.drag_started() {
                         ed.vsel = Some(b);
                     } else if resp.dragged() {
