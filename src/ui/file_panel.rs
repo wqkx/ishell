@@ -1639,10 +1639,15 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
         match dialog {
             Dialog::NewDir { name } => {
                 modal(&ctx, crate::i18n::tr("新建目录", "New folder"), |ui| {
-                    ui.text_edit_singleline(name);
+                    let resp = ui.text_edit_singleline(name);
+                    // 打开即自动聚焦输入框（无其它控件占焦时抓取），可直接输入
+                    if ui.memory(|m| m.focused().is_none()) {
+                        resp.request_focus();
+                    }
+                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
-                        if dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) && !name.trim().is_empty() {
+                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
                             actions.push(FileAction::Mkdir(join_path(&cwd, name.trim())));
                             close = true;
                         }
@@ -1650,14 +1655,21 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                             close = true;
                         }
                     });
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
                 });
             }
             Dialog::NewFile { name } => {
                 modal(&ctx, crate::i18n::tr("新建文件", "New file"), |ui| {
-                    ui.text_edit_singleline(name);
+                    let resp = ui.text_edit_singleline(name);
+                    if ui.memory(|m| m.focused().is_none()) {
+                        resp.request_focus();
+                    }
+                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
-                        if dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) && !name.trim().is_empty() {
+                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
                             actions.push(FileAction::CreateFile(join_path(&cwd, name.trim())));
                             close = true;
                         }
@@ -1665,6 +1677,9 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                             close = true;
                         }
                     });
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
                 });
             }
             Dialog::Upload { local } => {
