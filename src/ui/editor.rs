@@ -1748,7 +1748,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 }
                 if ed.msel.len() > 1 {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(format!("{} 光标", ed.msel.len())).color(Palette::ACCENT).size(11.0));
+                    let n = ed.msel.len();
+                    let label = match crate::i18n::current() {
+                        crate::i18n::Lang::En => format!("{n} cursors"),
+                        _ => format!("{n} 光标"),
+                    };
+                    ui.label(RichText::new(label).color(Palette::ACCENT).size(11.0));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
