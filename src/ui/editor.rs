@@ -75,6 +75,15 @@ pub struct Editor {
     vlines: Vec<usize>,
     /// 最长行字节数（缓存，随 vlines 一起算，避免每帧全行扫描）
     vmax: usize,
+    /// 自动换行（word-wrap）开关：开启时长行折行显示、无横向滚动
+    wrap: bool,
+    /// 内容版本号（每次 v_recompute +1，用于失效换行行数缓存）
+    vver: u64,
+    /// 换行缓存：vrow_pre[i] = 第 i 逻辑行之前的累计视觉行数；末元素为总视觉行数
+    vrow_pre: Vec<u32>,
+    /// 换行缓存对应的列宽与版本（不匹配则重算 vrow_pre）
+    vrow_cols: usize,
+    vrow_ver: u64,
     /// 上下移动时保持的目标列（字符数；None 表示用当前列）
     vgoal_col: Option<usize>,
     /// 选区锚点（Some 时 [anchor, caret] 为选区）
@@ -142,6 +151,11 @@ impl Editor {
             vcaret: 0,
             vlines: Vec::new(),
             vmax: 0,
+            wrap: false,
+            vver: 0,
+            vrow_pre: Vec::new(),
+            vrow_cols: 0,
+            vrow_ver: u64::MAX,
             vgoal_col: None,
             vsel: None,
             vundo: Vec::new(),
@@ -744,7 +758,62 @@ fn v_line_range(ed: &Editor, i: usize) -> (usize, usize) {
 fn v_sel_range(ed: &Editor) -> Option<(usize, usize)> {
     ed.vsel.map(|a| (a.min(ed.vcaret), a.max(ed.vcaret))).filter(|(a, b)| a < b)
 }
+// ——— 自动换行（word-wrap）视觉行映射 ———
+/// 某逻辑行按 cols 列折行后的视觉行数（按字符数近似，CJK 暂按 1 列计）。
+fn line_vrows(chars: usize, cols: usize) -> u32 {
+    (chars / cols + if chars % cols != 0 { 1 } else { 0 }).max(1) as u32
+}
+/// 同步换行行数前缀和缓存（列宽或内容变化时重算）。
+fn v_wrap_sync(ed: &mut Editor, cols: usize) {
+    let cols = cols.max(1);
+    if ed.vrow_cols == cols && ed.vrow_ver == ed.vver && ed.vrow_pre.len() == ed.vlines.len() + 1 {
+        return;
+    }
+    let n = ed.vlines.len();
+    let mut pre = Vec::with_capacity(n + 1);
+    let mut acc = 0u32;
+    pre.push(0);
+    for i in 0..n {
+        let (s, e) = v_line_range(ed, i);
+        let chars = ed.content[s..e].chars().count();
+        acc = acc.saturating_add(line_vrows(chars, cols));
+        pre.push(acc);
+    }
+    ed.vrow_pre = pre;
+    ed.vrow_cols = cols;
+    ed.vrow_ver = ed.vver;
+}
+/// 总视觉行数（换行模式）。
+fn v_total_vrows(ed: &Editor) -> usize {
+    ed.vrow_pre.last().copied().unwrap_or(0) as usize
+}
+/// 视觉行号 → (逻辑行, 段内序号)。
+fn v_line_of_vrow(ed: &Editor, vrow: usize) -> (usize, usize) {
+    let v = vrow as u32;
+    let line = ed.vrow_pre.partition_point(|&p| p <= v).saturating_sub(1).min(ed.vlines.len().saturating_sub(1));
+    let seg = vrow - ed.vrow_pre.get(line).copied().unwrap_or(0) as usize;
+    (line, seg)
+}
+/// 字节偏移 → (视觉行, 段内列)。
+fn v_vpos_of_byte(ed: &Editor, byte: usize, cols: usize) -> (usize, usize) {
+    let cols = cols.max(1);
+    let line = v_line_of(ed, byte);
+    let (ls, _) = v_line_range(ed, line);
+    let col = ed.content[ls..byte.max(ls)].chars().count();
+    let base = ed.vrow_pre.get(line).copied().unwrap_or(0) as usize;
+    (base + col / cols, col % cols)
+}
+/// (视觉行, 段内列) → 字节偏移（钳到行尾）。
+fn v_byte_of_vpos(ed: &Editor, vrow: usize, vcol: usize, cols: usize) -> usize {
+    let cols = cols.max(1);
+    let (line, seg) = v_line_of_vrow(ed, vrow);
+    let (ls, le) = v_line_range(ed, line);
+    let line_chars = ed.content[ls..le].chars().count();
+    let col = (seg * cols + vcol).min(line_chars);
+    ls + char_to_byte(&ed.content[ls..le], col)
+}
 fn v_recompute(ed: &mut Editor) {
+    ed.vver = ed.vver.wrapping_add(1); // 内容变更 → 换行行数缓存失效
     ed.vlines = compute_line_starts(&ed.content);
     // 最长行字节数（含尾行）——缓存，渲染时直接用，避免每帧扫全部行
     ed.vmax = ed
@@ -861,6 +930,17 @@ fn v_move_v(ed: &mut Editor, delta: isize, shift: bool) {
     }
     if !shift {
         ed.vsel = None;
+    }
+    // 换行模式：按「视觉行」上下移动（保持视觉列）
+    if ed.wrap && ed.vrow_cols > 0 && !ed.vrow_pre.is_empty() {
+        let cols = ed.vrow_cols;
+        let (vrow, vcol) = v_vpos_of_byte(ed, ed.vcaret, cols);
+        let goal = ed.vgoal_col.unwrap_or(vcol);
+        ed.vgoal_col = Some(goal);
+        let total = v_total_vrows(ed);
+        let target = (vrow as isize + delta).clamp(0, total.saturating_sub(1) as isize) as usize;
+        ed.vcaret = v_byte_of_vpos(ed, target, goal, cols);
+        return;
     }
     let line = v_line_of(ed, ed.vcaret);
     let (ls, _) = v_line_range(ed, line);
@@ -1741,6 +1821,17 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                             }
                         }
                     });
+                    // 自动换行开关：开启时长行折行、无横向滚动
+                    ui.add_space(6.0);
+                    let wrap_col = if ed.wrap { Palette::ACCENT } else { Palette::TEXT_DIM };
+                    if ui
+                        .add(egui::Label::new(RichText::new(crate::i18n::tr("换行", "Wrap")).color(wrap_col).size(11.0)).sense(egui::Sense::click()))
+                        .on_hover_text(crate::i18n::tr("点击切换自动换行", "Toggle word wrap"))
+                        .clicked()
+                    {
+                        ed.wrap = !ed.wrap;
+                        ed.vgoal_col = None; // 列语义改变，重置目标列
+                    }
                 });
                 if !ed.status.is_empty() {
                     ui.add_space(8.0);
@@ -1824,13 +1915,24 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let total = ed.vlines.len();
     let digits = total.max(1).to_string().len();
     let gutter_w = (digits as f32 + 1.5) * char_w;
-    let content_w = gutter_w + (ed.vmax as f32 + 2.0) * char_w;
-    // 内容高度封顶在 f32 安全区：大文件行数巨大时 (总行数×行高) 可达数百万像素，拖到最底部时
-    // vp 偏移的 f32 精度只剩约 0.5px，导致抖动/卡顿。封顶后改按「行号」虚拟化、用视口相对坐标绘制，
-    // 纵向坐标始终很小、不再丢精度。
-    // 末尾额外留 3 行空白：可滚到最后一行之下，避免底部横向滚动条遮住最后一行、也便于操作。
+    // 自动换行：按视口宽度算每行可容纳列数，并同步「视觉行前缀和」缓存（列宽/内容变化才重算）
+    let view_w_pre = if ed.vlast_vieww > 0.0 { ed.vlast_vieww } else { ui.available_width() };
+    let wrap_cols = (((view_w_pre - gutter_w) / char_w) as i64).max(1) as usize;
+    if ed.wrap {
+        v_wrap_sync(ed, wrap_cols);
+    }
+    let wrap = ed.wrap;
+    // 「滚动行」数：换行模式按视觉行总数虚拟化，否则按逻辑行数
+    let nrows = if wrap { v_total_vrows(ed) } else { total };
+    // 内容高度封顶在 f32 安全区：行数巨大时坐标会丢精度 → 封顶后按「行号」虚拟化、用视口相对坐标绘制。
+    // 末尾额外留 3 行空白：可滚到最后一行之下，避免底部横向滚动条遮住最后一行。
     let pad_rows = 3usize;
-    let content_h = ((total + pad_rows) as f32 * row_h).min(2_000_000.0);
+    let content_w = if wrap {
+        gutter_w + (wrap_cols as f32 + 1.0) * char_w // 换行模式无横向滚动
+    } else {
+        gutter_w + (ed.vmax as f32 + 2.0) * char_w
+    };
+    let content_h = ((nrows + pad_rows) as f32 * row_h).min(2_000_000.0);
 
     // —— 用「设置滚动偏移」可靠地让视角跟随光标（scroll_to_rect 在本虚拟容器里不生效）——
     // 用上一帧度量判断光标是否已在可视区，越界才强制滚动；普通滚动不受影响。
@@ -1841,20 +1943,21 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         let view_w = if ed.vlast_vieww > 0.0 { ed.vlast_vieww } else { ui.available_width() };
         let visible = (view_h / row_h).ceil() as usize + 2;
         let max_off = (content_h - view_h).max(1.0);
-        let max_top = (total + pad_rows).saturating_sub(visible.saturating_sub(2));
-        let cl = v_line_of(ed, ed.vcaret);
+        let max_top = (nrows + pad_rows).saturating_sub(visible.saturating_sub(2));
+        let caret_row = if wrap { v_vpos_of_byte(ed, ed.vcaret, wrap_cols).0 } else { v_line_of(ed, ed.vcaret) };
         if let Some(tl) = ed.pending_scroll.take() {
-            // 跳转/定位：居中
-            let tt = tl.saturating_sub(visible / 2);
+            // 跳转/定位：居中（换行模式把逻辑行转成其首个视觉行）
+            let tl_row = if wrap { ed.vrow_pre.get(tl).copied().unwrap_or(0) as usize } else { tl };
+            let tt = tl_row.saturating_sub(visible / 2);
             force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
         } else if moved {
             // 键盘移动：只在越界时「一行」地滚（不要整屏跳）
             let top = ed.vlast_top;
             let vis = ed.vlast_vis.max(3);
-            let tt = if cl < top {
-                cl // 光标在视口上方 → 滚到刚好露出该行（一行）
-            } else if cl + 2 >= top + vis {
-                (cl + 3).saturating_sub(vis) // 光标在视口下方 → 滚到该行刚好在底部附近（一行）
+            let tt = if caret_row < top {
+                caret_row // 光标在视口上方 → 滚到刚好露出该行（一行）
+            } else if caret_row + 2 >= top + vis {
+                (caret_row + 3).saturating_sub(vis) // 光标在视口下方 → 滚到该行刚好在底部附近（一行）
             } else {
                 top // 已在可视区 → 不滚
             };
@@ -1862,8 +1965,8 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
             }
         }
-        if moved {
-            let (ls2, _) = v_line_range(ed, cl);
+        if moved && !wrap {
+            let (ls2, _) = v_line_range(ed, caret_row);
             let cx = gutter_w + ed.content[ls2..ed.vcaret].chars().count() as f32 * char_w; // 光标在内容坐标里的 x
             if cx < ed.vlast_hoff + gutter_w + char_w {
                 force_h = Some((cx - gutter_w - char_w * 2.0).max(0.0));
@@ -1900,11 +2003,14 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let max_off = (content_h - view_h).max(1.0);
             let frac = (vp.min.y / max_off).clamp(0.0, 1.0);
             let visible = (view_h / row_h).ceil() as usize + 2;
-            let max_top = (total + pad_rows).saturating_sub(visible.saturating_sub(2)); // 最大首行号（含末尾留白）
-            let top_line = ((frac * max_top as f32).round() as usize).min(max_top);
+            let max_top = (nrows + pad_rows).saturating_sub(visible.saturating_sub(2)); // 最大首「行」号（视觉行/逻辑行）
+            let top_row = ((frac * max_top as f32).round() as usize).min(max_top);
+            // 首/末可见逻辑行（换行模式由视觉行换算；用于查找命中的可视范围）
+            let first_line = if wrap { v_line_of_vrow(ed, top_row).0 } else { top_row };
+            let last_line = if wrap { v_line_of_vrow(ed, (top_row + visible).min(nrows.saturating_sub(1))).0 + 1 } else { (top_row + visible).min(total) };
             let text_x = origin.x + gutter_w;
             // 记录本帧滚动度量，供下一帧「跟随光标」判断与施加偏移
-            ed.vlast_top = top_line;
+            ed.vlast_top = top_row;
             ed.vlast_vis = visible;
             ed.vlast_voff = vp.min.y;
             ed.vlast_hoff = vp.min.x;
@@ -1947,8 +2053,8 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let brackets = if focused { bracket_match(&ed.content, ed.vcaret) } else { None }; // 括号匹配高亮
             // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
             let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
-                let vis_a = ed.vlines.get(top_line).copied().unwrap_or(0);
-                let vis_b = ed.vlines.get((top_line + visible).min(total)).copied().unwrap_or(ed.content.len());
+                let vis_a = ed.vlines.get(first_line).copied().unwrap_or(0);
+                let vis_b = ed.vlines.get(last_line.min(total)).copied().unwrap_or(ed.content.len());
                 let mlo = ed.find_matches.partition_point(|&(s, _)| s < vis_a);
                 let mhi = ed.find_matches.partition_point(|&(s, _)| s < vis_b);
                 ed.find_matches[mlo..mhi].to_vec()
@@ -1961,19 +2067,31 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let cols_vis = (clip.width() / char_w).ceil() as usize + 8; // 视口列数 + 余量（CJK 偏宽，余量足够）
             let accent = Palette::ACCENT;
             for k in 0..visible {
-                let i = top_line + k;
+                let row = top_row + k;
+                if row >= nrows {
+                    break;
+                }
+                // 视觉行 → 逻辑行 i / 起始列 col0 / 本行列数 ncols / 绘制起点 gx / 是否首段
+                let (i, col0, ncols, gx, is_first) = if wrap {
+                    let (li, seg) = v_line_of_vrow(ed, row);
+                    (li, seg * wrap_cols, wrap_cols, text_x, seg == 0)
+                } else {
+                    (row, first_col, cols_vis, text_x + first_col as f32 * char_w, true)
+                };
                 if i >= total {
                     break;
                 }
                 let (ls, le) = v_line_range(ed, i);
-                let line_full: &str = &ed.content[ls..le]; // 切片，不整行拷贝（超长行整行 to_string 也很贵）
+                let line_full: &str = &ed.content[ls..le]; // 切片，不整行拷贝
                 let y = clip.top() + k as f32 * row_h;
+                let col_of = |b: usize| -> usize { byte_to_char(line_full, b.saturating_sub(ls).min(line_full.len())) };
+                let in_win = |c: usize| c >= col0 && c <= col0 + ncols;
                 // 当前行高亮（极淡）：聚焦且无选区时，给光标所在行铺一层很淡的底
                 if focused && sels.is_empty() && i == caret_line {
                     painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.right(), y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10));
                 }
-                // 缩进参考线：在各缩进层级之间画很淡的竖线
-                {
+                // 缩进参考线（仅首段画）：在各缩进层级之间画很淡的竖线
+                if is_first {
                     let mut lead = 0usize;
                     for c in line_full.chars() {
                         match c {
@@ -1990,10 +2108,11 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     }
                 }
                 // 仅取窗口片段（char_to_byte 至多遍历到 last_col 个字符）
-                let seg_a = char_to_byte(line_full, first_col);
-                let seg_b = char_to_byte(line_full, first_col + cols_vis);
+                let seg_a = char_to_byte(line_full, col0);
+                let seg_b = char_to_byte(line_full, col0 + ncols);
                 let seg = &line_full[seg_a..seg_b];
-                let seg_x = text_x + first_col as f32 * char_w;
+                let seg_x = gx;
+                let seg_right = gx + ncols as f32 * char_w;
                 let galley = {
                     let mut job = highlight::highlight(seg, &lang, fsize, &[]);
                     job.wrap.max_width = f32::INFINITY;
@@ -2005,8 +2124,11 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 for &(sa, sb) in &sels {
                     if sb > sa && sb > ls && sa <= le {
                         let ax = x_of(sa.clamp(ls, le) - ls);
-                        let bx = if sb > le { clip.right() } else { x_of(sb.clamp(ls, le) - ls) };
-                        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(ax, y), egui::pos2(bx, y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 60));
+                        // 选区越过本段末尾(含跨到下一视觉行/下一逻辑行) → 填到本段右缘
+                        let bx = if sb >= ls + seg_b { seg_right } else { x_of(sb.clamp(ls, le) - ls) };
+                        if bx > ax {
+                            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(ax, y), egui::pos2(bx, y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 60));
+                        }
                     }
                 }
                 // 正文
@@ -2014,7 +2136,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 // 括号匹配：给光标相邻括号及其匹配括号描边
                 if let Some((ba, bb)) = brackets {
                     for &bp in &[ba, bb] {
-                        if bp >= ls && bp < le {
+                        if bp >= ls && bp < le && in_win(col_of(bp)) {
                             let bx0 = x_of(bp - ls);
                             let bx1 = x_of(bp + 1 - ls);
                             painter.rect_stroke(egui::Rect::from_min_max(egui::pos2(bx0, y), egui::pos2(bx1, y + row_h)), 2.0, egui::Stroke::new(1.0, Palette::ACCENT), egui::StrokeKind::Inside);
@@ -2026,22 +2148,24 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     if sels.contains(&(ma, mb)) {
                         continue;
                     }
-                    if ma < le && mb > ls {
+                    if ma < ls + seg_b && mb > ls + seg_a {
                         let hx0 = x_of(ma.clamp(ls, le) - ls);
                         let hx1 = x_of(mb.clamp(ls, le) - ls);
-                        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(hx0, y), egui::pos2(hx1, y + row_h)), 2.0, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56));
+                        if hx1 > hx0 {
+                            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(hx0, y), egui::pos2(hx1, y + row_h)), 2.0, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 56));
+                        }
                     }
                 }
                 // 光标（多选时每个选区末尾各画一个）
                 if focused {
                     for &cp in &carets {
-                        if cp >= ls && cp <= le {
+                        if cp >= ls && cp <= le && in_win(col_of(cp)) {
                             let cx = x_of(cp - ls);
                             painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
                         }
                     }
                     // 在主光标处上报 IME 输入区：激活输入法 + 定位候选框（否则虚拟编辑器无法输入中文）
-                    if ed.vcaret >= ls && ed.vcaret <= le {
+                    if ed.vcaret >= ls && ed.vcaret <= le && in_win(col_of(ed.vcaret)) {
                         let cx = x_of(ed.vcaret - ls);
                         let irect = egui::Rect::from_min_size(egui::pos2(cx, y), egui::vec2(1.0, row_h));
                         ui.ctx().output_mut(|o| o.ime = Some(egui::output::IMEOutput { rect: irect, cursor_rect: irect }));
@@ -2049,7 +2173,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 }
                 // 行号列固定在左侧：最后画（铺底盖住横向滚到下面的正文）+ 右对齐行号
                 painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.left() + gutter_w, y + row_h)), 0.0, bg);
-                painter.text(egui::pos2(clip.left() + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
+                if is_first {
+                    painter.text(egui::pos2(clip.left() + gutter_w - char_w * 0.7, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), Palette::TEXT_DIM);
+                }
             }
             // 行号分割线（固定在左侧行号列右缘）
             painter.vline(clip.left() + gutter_w - 3.0, clip.top()..=clip.bottom(), egui::Stroke::new(1.0, Palette::BORDER));
@@ -2061,14 +2187,20 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 if let Some(pos) = resp.interact_pointer_pos() {
                     ed.msel.clear(); // 点击退出多选
                     let k = ((pos.y - clip.top()) / row_h).floor().max(0.0) as usize;
-                    let li = (top_line + k).min(total.saturating_sub(1));
+                    let row = (top_row + k).min(nrows.saturating_sub(1));
+                    let (li, c0, nc, gx) = if wrap {
+                        let (l, seg) = v_line_of_vrow(ed, row);
+                        (l, seg * wrap_cols, wrap_cols, text_x)
+                    } else {
+                        (row.min(total.saturating_sub(1)), first_col, cols_vis, text_x + first_col as f32 * char_w)
+                    };
                     let (ls, le) = v_line_range(ed, li);
                     // 同样只布局窗口片段（避免在超长行上拖拽选择时每帧整行 layout）
                     let line_full: &str = &ed.content[ls..le];
-                    let seg_a = char_to_byte(line_full, first_col);
-                    let seg_b = char_to_byte(line_full, first_col + cols_vis);
+                    let seg_a = char_to_byte(line_full, c0);
+                    let seg_b = char_to_byte(line_full, c0 + nc);
                     let seg = line_full[seg_a..seg_b].to_string();
-                    let seg_x = text_x + first_col as f32 * char_w;
+                    let seg_x = gx;
                     let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(seg.clone(), mono.clone(), Palette::TEXT));
                     let cc = g.cursor_from_pos(egui::vec2(pos.x - seg_x, 0.0)).index;
                     let b = ls + seg_a + char_to_byte(&seg, cc);
