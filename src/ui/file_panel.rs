@@ -806,6 +806,15 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
 
     // 空白区域右键 -> 新建文件/目录（仅覆盖列表区域，避免遮挡上方路径栏）
     let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("filelist_bg"), Sense::click());
+    // 点击列表空白 → 让出当前(终端)焦点：终端仅在被点击时夺焦，让焦后 focused()=None，
+    // ↑/↓/Enter 即作用于文件列表而非被终端的焦点锁吞掉。
+    if bg.clicked() {
+        ui.memory_mut(|m| {
+            if let Some(f) = m.focused() {
+                m.surrender_focus(f);
+            }
+        });
+    }
     // 注意：bg 几何上覆盖整个列表，dnd_release_payload 用 contains_pointer 判定并「取走」载荷，
     // 若在此处先检查会把本应落到文件夹行的拖放抢走。故放到表格之后、仅当无行接收时再兜底。
     let mut bg_new_dir = false;
@@ -855,6 +864,52 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         toggle_favorite(state, state.cwd.clone());
     }
 
+    // —— 键盘导航：↑/↓ 移动选中行、Enter 打开/进入目录（与 Ctrl+A/Delete 同一聚焦门：无文本框聚焦时生效）——
+    let mut focus_list = false; // 本帧是否有行被点击 → 表外为文件列表夺取键盘焦点
+    let mut scroll_to_row: Option<usize> = None;
+    let kbd_nav = state.renaming.is_none()
+        && state.path_edit.is_none()
+        && state.dialog.is_none()
+        && ui.ctx().memory(|m| m.focused().is_none());
+    if kbd_nav && !entries.is_empty() {
+        let n = entries.len();
+        let cur = state
+            .anchor
+            .filter(|&a| a < n)
+            .or_else(|| state.selected.iter().min().copied())
+            .unwrap_or(0)
+            .min(n - 1);
+        let (down, up, enter) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if down || up {
+            let nc = if down { (cur + 1).min(n - 1) } else { cur.saturating_sub(1) };
+            state.selected.clear();
+            state.selected.insert(nc);
+            state.anchor = Some(nc);
+            scroll_to_row = Some(nc);
+        } else if enter {
+            if let Some(e) = entries.get(cur) {
+                let full = join_path(&cwd, &e.name);
+                if e.is_dir {
+                    navigate = Some(full);
+                } else if is_image_path(&e.name) {
+                    open_image = Some(full);
+                } else if !is_text_path(&e.name) {
+                    confirm_text = Some((full, e.size));
+                } else if e.size > 4 * 1024 * 1024 {
+                    confirm_open = Some((full, e.size));
+                } else {
+                    open_file = Some(full);
+                }
+            }
+        }
+    }
+
     egui::Frame::new()
         .inner_margin(egui::Margin { left: 6, right: 2, top: 0, bottom: 0 })
         .show(ui, |ui| {
@@ -866,7 +921,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(110);
     // 拖拽悬停高亮用独立图层绘制：TableBuilder 闭包内 ui 已被可变借用，不能再取 ui.painter()
     let dnd_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("file_dnd_hl")));
-    TableBuilder::new(ui)
+    let mut tbl = TableBuilder::new(ui)
         // 按目录区分滚动状态：进入子目录/切换目录后从顶部开始，不沿用上个目录的滚动位置
         .id_salt(&cwd)
         .striped(true)
@@ -878,8 +933,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         .column(Column::auto().at_least(140.0))
         .column(Column::auto().at_least(96.0))
         // owner 列用 auto 而非 remainder：列表填不满时右侧留白，便于右键空白处操作当前文件夹
-        .column(Column::auto().at_least(120.0))
-        .header(22.0, |mut h| {
+        .column(Column::auto().at_least(120.0));
+    // 键盘移动选中行时滚动到该行
+    if let Some(r) = scroll_to_row {
+        tbl = tbl.scroll_to_row(r, Some(egui::Align::Center));
+    }
+    tbl.header(22.0, |mut h| {
             let (cur, desc) = (state.sort_key, state.sort_desc);
             // 可排序表头：点击切换排序键/方向，激活列显示升降箭头
             for (k, label) in [
@@ -974,6 +1033,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     // 整行交互：点击选择 / 延时重命名、双击进目录或打开、右键菜单
                     let r = row.response();
                     if r.clicked() {
+                        focus_list = true; // 点击行 → 文件列表夺取键盘焦点（表外应用，避免借用冲突）
                         let was_sole = state.selected.len() == 1
                             && state.selected.contains(&i)
                             && state.renaming.is_none();
@@ -1043,6 +1103,14 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
             }
         });
     });
+    // 行被点击 → 让出终端焦点，使方向键导航文件列表（表格借用结束后再操作 ui，避免借用冲突）
+    if focus_list {
+        ui.memory_mut(|m| {
+            if let Some(f) = m.focused() {
+                m.surrender_focus(f);
+            }
+        });
+    }
 
     // 拖拽预览：拖动中在指针旁画一个跟手的小标签（单项显示名称，多项显示数量），
     // 给「文件正被拖动」一个明确的视觉反馈。

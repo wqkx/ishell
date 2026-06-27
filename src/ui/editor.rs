@@ -1759,6 +1759,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
                     ui.add_space(10.0);
+                    // 光标位置 Ln:Col（主光标，1 基；列按字符计）
+                    let cl = v_line_of(ed, ed.vcaret);
+                    let (lsx, _) = v_line_range(ed, cl);
+                    let col = ed.content[lsx..ed.vcaret.min(ed.content.len())].chars().count() + 1;
+                    ui.label(RichText::new(format!("Ln {}, Col {}", cl + 1, col)).color(Palette::TEXT_DIM).size(11.0));
+                    ui.add_space(10.0);
                     // 行尾：点击切换 LF/CRLF
                     let eol_txt = match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" };
                     if ui.add(egui::Label::new(RichText::new(eol_txt).color(Palette::TEXT_DIM).size(11.0)).sense(egui::Sense::click())).on_hover_text(crate::i18n::tr("点击切换行尾 LF/CRLF", "Click to toggle LF/CRLF")).clicked() {
