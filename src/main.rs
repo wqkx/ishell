@@ -31,6 +31,11 @@ fn load_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // 尽早加载界面语言：窗口标题等在 App::new 之前创建，需要语言已就位才能本地化（App::new 再设一次无妨）。
+    if let Some(code) = store::load_lang() {
+        i18n::set(i18n::Lang::from_code(&code));
+    }
+
     // 强制 X11（XWayland）：Wayland 下 winit 类应用 fcitx/输入法常失效（与 Chrome/Electron 同病），
     // 清空 WAYLAND_DISPLAY 让 winit 退回 X11（其 XIM 输入法正常）。须在 eframe/winit 初始化前。
     // 由持久化设置或环境变量 ISHELL_X11 开启；仅 Linux 有意义。
@@ -51,7 +56,7 @@ fn main() -> eframe::Result<()> {
         egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title("iShell — Rust SSH 客户端")
+            .with_title(i18n::tr("iShell — Rust SSH 客户端", "iShell — Rust SSH Client"))
             // app_id 必须与 Linux 桌面项 ishell.desktop 的基名/StartupWMClass 完全一致，
             // GNOME 等用它匹配 .desktop 取图标（不读窗口内嵌 _NET_WM_ICON）；统一小写避免大小写匹配失败
             .with_app_id("ishell")

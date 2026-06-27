@@ -661,6 +661,38 @@ impl ConnectForm {
             ui.label(RichText::new(err).color(Palette::DANGER));
         }
 
+        // 凭据安全透明度：密码/口令始终加密存储；如实展示「主密钥存哪」，钥匙串不可用时给出警示。
+        {
+            use egui_phosphor::regular as eicon;
+            let (ic, txt, col) = if store::key_perms_were_loose() {
+                (
+                    eicon::WARNING_CIRCLE,
+                    crate::i18n::tr("本地 key 文件权限曾过宽，已自动收紧为 0600", "Local key file perms were too open; tightened to 0600"),
+                    Palette::DANGER,
+                )
+            } else {
+                match store::key_storage() {
+                    store::KeyStorage::Keychain => (
+                        eicon::LOCK_KEY,
+                        crate::i18n::tr("密码已加密，主密钥存于系统钥匙串", "Passwords encrypted; master key in system keychain"),
+                        Palette::TEXT_DIM,
+                    ),
+                    store::KeyStorage::LocalFile => (
+                        eicon::LOCK_KEY,
+                        crate::i18n::tr("密码已加密；系统钥匙串不可用，主密钥存于本地文件 (0600)", "Encrypted; keychain unavailable — master key in local file (0600)"),
+                        Palette::WARN,
+                    ),
+                    store::KeyStorage::None => (
+                        eicon::WARNING_CIRCLE,
+                        crate::i18n::tr("加密不可用，密码将以明文保存", "Encryption unavailable — passwords stored in plaintext"),
+                        Palette::DANGER,
+                    ),
+                }
+            };
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("{ic}  {txt}")).color(col).size(11.0));
+        }
+
         ui.add_space(10.0);
         // 右对齐、主操作（连接）置最右（macOS 习惯）；保存/返回为次级幽灵按钮
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -670,7 +702,11 @@ impl ConnectForm {
                     .wrap_mode(egui::TextWrapMode::Extend),
             ).clicked() {
                 match self.build() {
-                    Ok(cfg) => *result = Some(cfg),
+                    Ok(cfg) => {
+                        // 直接点「连接」也默认保存到快速连接（新建即落库，下次免重填；编辑则更新原条目）
+                        self.save_current();
+                        *result = Some(cfg);
+                    }
                     Err(e) => self.error = Some(e),
                 }
             }

@@ -197,6 +197,54 @@ pub fn is_text_path(name: &str) -> bool {
     !binary
 }
 
+/// 「打开 / 进入」一个条目的意图——把目录、图片、文本、大文件确认、断链等分支统一，
+/// 供双击与回车两处共用，避免逻辑分叉。
+enum OpenIntent {
+    /// 进入目录（普通目录或指向目录的软链；后者用「规范目标路径」以便正确加载与显示面包屑）
+    Navigate(String),
+    /// 看图工具打开
+    Image(String),
+    /// 非文本后缀：弹确认框（路径, 大小）
+    ConfirmText(String, u64),
+    /// 大文本文件：弹确认框（路径, 大小）
+    ConfirmLarge(String, u64),
+    /// 直接以文本编辑器打开
+    Text(String),
+    /// 断链：目标不存在，提示用户
+    Broken,
+}
+
+/// 据条目类型决定双击/回车的行为。软链已由 worker 跟随解析（link_dir / link_target）：
+/// - 指向目录 → 进入其规范目标；
+/// - 指向文件 → 按链接名后缀走图片/文本/大文件分支（worker 读取时自动跟随到目标）；
+/// - 断链 → Broken。
+fn open_intent(e: &FileEntry, full: &str) -> OpenIntent {
+    // 目录，或指向目录的软链 → 进入。软链优先用解析出的规范目标路径，
+    // 否则（理论上 link_dir=true 必有 target）回退到链接自身路径。
+    if e.is_dir || e.link_dir {
+        let dest = if e.is_link {
+            e.link_target.clone().unwrap_or_else(|| full.to_string())
+        } else {
+            full.to_string()
+        };
+        return OpenIntent::Navigate(dest);
+    }
+    // 断链：是链接却没解析出目标
+    if e.is_link && e.link_target.is_none() {
+        return OpenIntent::Broken;
+    }
+    // 文件（含指向文件的软链）：按名称后缀分流
+    if is_image_path(&e.name) {
+        OpenIntent::Image(full.to_string())
+    } else if !is_text_path(&e.name) {
+        OpenIntent::ConfirmText(full.to_string(), e.size)
+    } else if e.size > 4 * 1024 * 1024 {
+        OpenIntent::ConfirmLarge(full.to_string(), e.size)
+    } else {
+        OpenIntent::Text(full.to_string())
+    }
+}
+
 impl FilePanelState {
     /// 收到目录列表后由 App 调用：写入缓存并清除 loading；首次自动设为 cwd。
     pub fn on_listing(&mut self, path: String, entries: Vec<FileEntry>) {
@@ -801,6 +849,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let mut rename_commit: Option<(String, String)> = None;
     let mut cancel_rename = false;
     let mut drop_move: Option<(Vec<String>, String)> = None; // 拖拽释放到某文件夹 -> (srcs, dest_dir)
+    let mut broken_link = false; // 双击断链 -> 表后统一提示
     let now = ui.input(|i| i.time);
     let (mod_ctrl, mod_shift) = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
 
@@ -895,16 +944,15 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         } else if enter {
             if let Some(e) = entries.get(cur) {
                 let full = join_path(&cwd, &e.name);
-                if e.is_dir {
-                    navigate = Some(full);
-                } else if is_image_path(&e.name) {
-                    open_image = Some(full);
-                } else if !is_text_path(&e.name) {
-                    confirm_text = Some((full, e.size));
-                } else if e.size > 4 * 1024 * 1024 {
-                    confirm_open = Some((full, e.size));
-                } else {
-                    open_file = Some(full);
+                match open_intent(e, &full) {
+                    OpenIntent::Navigate(p) => navigate = Some(p),
+                    OpenIntent::Image(p) => open_image = Some(p),
+                    OpenIntent::ConfirmText(p, sz) => confirm_text = Some((p, sz)),
+                    OpenIntent::ConfirmLarge(p, sz) => confirm_open = Some((p, sz)),
+                    OpenIntent::Text(p) => open_file = Some(p),
+                    OpenIntent::Broken => actions.push(FileAction::Status(
+                        crate::i18n::tr("断链：目标不存在", "Broken link: target missing").into(),
+                    )),
                 }
             }
         }
@@ -1001,8 +1049,11 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                 }
                             }
                         } else {
-                            let icon_col = if e.is_dir {
+                            // 图标着色：目录/指向目录的软链=强调色；断链=危险色；其它软链=警示色；普通文件=弱色
+                            let icon_col = if e.is_dir || e.link_dir {
                                 Palette::ACCENT
+                            } else if e.is_link && e.link_target.is_none() {
+                                Palette::DANGER
                             } else if e.is_link {
                                 Palette::WARN
                             } else {
@@ -1010,11 +1061,31 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             };
                             ui.spacing_mut().item_spacing.x = 5.0;
                             ui.label(RichText::new(file_icon(e)).color(icon_col));
-                            ui.label(RichText::new(&e.name).color(Palette::TEXT));
+                            // 名称：单行显示，超出由列 clip(true) 裁剪；悬停给出完整名称——应对超长 / 特殊字符 / emoji
+                            let name_resp = ui.label(RichText::new(&e.name).color(Palette::TEXT));
+                            // 软链：紧跟暗色「→ 目标」，让指向一目了然；断链显示红色「断链」
+                            if e.is_link {
+                                match &e.link_target {
+                                    Some(t) => {
+                                        ui.label(RichText::new(format!("→ {t}")).color(Palette::TEXT_DIM).size(11.0));
+                                    }
+                                    None => {
+                                        ui.label(RichText::new(crate::i18n::tr("→ 断链", "→ broken")).color(Palette::DANGER).size(11.0));
+                                    }
+                                }
+                            }
+                            // 悬停 tooltip：完整名称（+ 链接目标 / 断链说明）
+                            let tip = match (e.is_link, &e.link_target) {
+                                (true, Some(t)) => format!("{}\n→ {t}", e.name),
+                                (true, None) => format!("{}\n{}", e.name, crate::i18n::tr("断链（目标不存在）", "broken link (target missing)")),
+                                _ => e.name.clone(),
+                            };
+                            name_resp.on_hover_text(tip);
                         }
                     });
                     row.col(|ui| {
-                        let s = if e.is_dir { "-".to_string() } else { fmt_bytes(e.size as f64) };
+                        // 目录与「指向目录的软链」不显示字节大小；文件型软链的 size 已由 worker 改为目标大小
+                        let s = if e.is_dir || e.link_dir { "-".to_string() } else { fmt_bytes(e.size as f64) };
                         ui.label(RichText::new(s).color(Palette::TEXT_DIM));
                     });
                     row.col(|ui| {
@@ -1046,19 +1117,14 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     }
                     if r.double_clicked() {
                         state.pending_rename = None;
-                        if e.is_dir {
-                            navigate = Some(full.clone());
-                        } else if is_image_path(&e.name) {
-                            // 图片文件 -> 看图工具
-                            open_image = Some(full.clone());
-                        } else if !is_text_path(&e.name) {
-                            // 非文本后缀：先按后缀判断打不开 → 弹确认框问是否用文本编辑器强开
-                            confirm_text = Some((full.clone(), e.size));
-                        } else if e.size > 4 * 1024 * 1024 {
-                            // 大文本文件先确认（虚拟化编辑器可承载）
-                            confirm_open = Some((full.clone(), e.size));
-                        } else {
-                            open_file = Some(full.clone());
+                        // 双击：目录进入、图片看图、文本编辑、大/非文本确认、指向目录的软链跟随进入、断链提示
+                        match open_intent(e, &full) {
+                            OpenIntent::Navigate(p) => navigate = Some(p),
+                            OpenIntent::Image(p) => open_image = Some(p),
+                            OpenIntent::ConfirmText(p, sz) => confirm_text = Some((p, sz)),
+                            OpenIntent::ConfirmLarge(p, sz) => confirm_open = Some((p, sz)),
+                            OpenIntent::Text(p) => open_file = Some(p),
+                            OpenIntent::Broken => broken_link = true,
                         }
                     }
                     if r.secondary_clicked() {
@@ -1188,6 +1254,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         state.renaming = None;
     } else if cancel_rename {
         state.renaming = None;
+    }
+    // 双击断链：目标不存在，提示用户（不进入、不打开）
+    if broken_link {
+        actions.push(FileAction::Status(
+            crate::i18n::tr("断链：目标不存在", "Broken link: target missing").into(),
+        ));
     }
     // 双击打开文本文件
     if let Some(p) = open_file {

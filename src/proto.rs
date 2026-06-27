@@ -271,4 +271,9 @@ pub struct FileEntry {
     /// 权限位（八进制低位），用于展示 rwx 字符串
     pub perm: u32,
     pub owner: String,
+    /// 符号链接跟随解析出的「规范目标绝对路径」。仅 `is_link` 时尝试填充：
+    /// 解析成功（目标存在）为 `Some`，断链 / 未解析为 `None`。
+    pub link_target: Option<String>,
+    /// 该符号链接最终指向一个目录（用于「跟随进入」判定与图标着色）。
+    pub link_dir: bool,
 }

@@ -151,6 +151,33 @@ fn keychain_set_key(k: &[u8; 32]) -> bool {
 /// 进程内缓存的主密钥（仅加载一次，避免反复访问钥匙串）。
 static MASTER_KEY: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
 
+/// 主密钥的存放方式——用于向用户**透明展示**所存密码的保护级别。
+/// 注意：无论哪种方式，密码本身都已用 ChaCha20Poly1305 加密；差异在于「主密钥存哪」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyStorage {
+    /// 系统钥匙串（最佳：受 OS 登录态/钥匙串口令保护）
+    Keychain,
+    /// 本地 0600 文件（钥匙串不可用时的回退：能读到该文件者可解密）
+    LocalFile,
+    /// 无可用密钥（加密不可用）
+    None,
+}
+static KEY_STORAGE: std::sync::OnceLock<KeyStorage> = std::sync::OnceLock::new();
+/// 本地 key 文件读取时权限是否曾比 0600 宽松（已自动收紧；用于提醒曾存在暴露风险）。
+static KEY_PERMS_LOOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 主密钥的存放方式（首次查询会触发密钥加载/创建）。供 UI 展示安全级别。
+pub fn key_storage() -> KeyStorage {
+    load_or_create_key();
+    KEY_STORAGE.get().copied().unwrap_or(KeyStorage::None)
+}
+
+/// 本地 key 文件权限是否曾过宽（group/other 可访问），现已自动收紧为 0600。
+pub fn key_perms_were_loose() -> bool {
+    load_or_create_key();
+    KEY_PERMS_LOOSE.get().copied().unwrap_or(false)
+}
+
 /// 取（或创建）加密主密钥。优先系统钥匙串；不可用时回退到本地 `key` 文件（0600）。
 fn load_or_create_key() -> Option<[u8; 32]> {
     *MASTER_KEY.get_or_init(compute_master_key)
@@ -159,16 +186,22 @@ fn load_or_create_key() -> Option<[u8; 32]> {
 fn compute_master_key() -> Option<[u8; 32]> {
     // 1) 系统钥匙串优先
     if let Some(k) = keychain_get_key() {
+        let _ = KEY_STORAGE.set(KeyStorage::Keychain);
         return Some(k);
     }
     let path = config_dir()?.join("key");
     // 2) 迁移：旧 key 文件 → 钥匙串；确认可读回后删除明文文件
     if let Ok(bytes) = std::fs::read(&path) {
         if bytes.len() == 32 {
+            // 权限校验：本地 key 文件应为 0600；过宽（group/other 可访问）则记录并立即收紧
+            check_key_perms(&path);
             let mut k = [0u8; 32];
             k.copy_from_slice(&bytes);
             if keychain_set_key(&k) && keychain_get_key() == Some(k) {
                 let _ = std::fs::remove_file(&path);
+                let _ = KEY_STORAGE.set(KeyStorage::Keychain);
+            } else {
+                let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
             }
             return Some(k);
         }
@@ -177,17 +210,34 @@ fn compute_master_key() -> Option<[u8; 32]> {
     let mut k = [0u8; 32];
     getrandom::getrandom(&mut k).ok()?;
     if keychain_set_key(&k) {
+        let _ = KEY_STORAGE.set(KeyStorage::Keychain);
         return Some(k);
     }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if std::fs::write(&path, k).is_err() {
+        let _ = KEY_STORAGE.set(KeyStorage::None);
         return None;
     }
     restrict_perms(&path);
+    let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
     Some(k)
 }
+
+/// 校验本地 key 文件权限：若 group/other 有任何位（过宽），记录并收紧为 0600。
+#[cfg(unix)]
+fn check_key_perms(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.permissions().mode() & 0o077 != 0 {
+            let _ = KEY_PERMS_LOOSE.set(true);
+            restrict_perms(path);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn check_key_perms(_path: &std::path::Path) {}
 
 #[cfg(unix)]
 fn restrict_perms(path: &std::path::Path) {

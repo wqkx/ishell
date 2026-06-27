@@ -99,6 +99,36 @@ enum XferSpec {
     Upload { local: String, remote_dir: String },
 }
 
+/// 传输列表的状态筛选。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XferFilter {
+    All,
+    Active,
+    Done,
+    Failed,
+}
+
+/// 本地端口预占用探测（添加端口转发前）：仅当明确 `AddrInUse` 才判为占用；
+/// 其它错误（如 bind 地址非本机网卡）返回 false——不武断拦截，交给 worker 实际绑定决定。
+fn local_port_in_use(host: &str, port: u16) -> bool {
+    let h = if host.trim().is_empty() { "127.0.0.1" } else { host };
+    match std::net::TcpListener::bind((h, port)) {
+        Ok(_) => false, // 立即 drop 释放，worker 随后真正绑定
+        Err(e) => e.kind() == std::io::ErrorKind::AddrInUse,
+    }
+}
+
+/// 把秒数格式化为紧凑时长（用于传输 ETA）：`45s` / `3m20s` / `1h2m`。
+fn fmt_dur(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// UI 侧的一条传输记录。
 struct Transfer {
     id: u64,
@@ -516,6 +546,8 @@ pub struct App {
     connect_form: ConnectForm,
     /// 默认下载目录（可在传输窗中修改，持久化）
     download_dir: std::path::PathBuf,
+    /// 传输列表的状态筛选（全部 / 进行中 / 已完成 / 失败）
+    xfer_filter: XferFilter,
     /// 传输进度浮窗是否显示
     show_transfers: bool,
     /// 传输浮窗刚打开（本帧跳过"点击外部关闭"判定）
@@ -551,8 +583,14 @@ pub struct App {
     show_forwards: bool,
     /// 转发浮窗刚打开（本帧跳过"点击外部关闭"判定）
     fwd_just_opened: bool,
+    /// 待删除确认的转发 id（行内二次确认：点垃圾桶先武装，确认后才删）
+    fwd_confirm_del: Option<u64>,
     /// 新增转发表单
     fwd_form: ForwardForm,
+    /// 正在编辑的转发 id（Some=编辑模式，按钮变「保存」，提交时先删旧再加新）
+    fwd_editing: Option<u64>,
+    /// 转发表单的内联校验错误（端口占用/参数无效等），红字显示在表单下方
+    fwd_error: Option<String>,
     /// 命令广播栏是否显示 + 输入内容
     show_broadcast: bool,
     broadcast_input: String,
@@ -606,6 +644,8 @@ struct ProcPopup {
     exe: String,
     /// 最近一次复制的时刻（ctx 时间，秒），用于短暂显示「已复制」
     copied_t: Option<f64>,
+    /// 是否处于「强制结束」二次确认态：kill 按钮先置此标志，确认后才真正下发 KillProc
+    confirm_kill: bool,
 }
 
 /// UI 侧的一条端口转发记录。
@@ -614,6 +654,10 @@ struct ForwardEntry {
     label: String,
     status: String,
     ok: bool,
+    /// 结构化参数：用于「编辑」时把该条回填到表单，以及本地端口占用检测。
+    bind_host: String,
+    bind_port: u16,
+    kind: crate::proto::ForwardKind,
 }
 
 /// "新增转发"表单状态。
@@ -749,6 +793,7 @@ impl App {
             next_uid: 0,
             connect_form: form,
             download_dir: crate::store::load_download_dir().map(std::path::PathBuf::from).unwrap_or_else(downloads_dir),
+            xfer_filter: XferFilter::All,
             show_transfers: false,
             xfer_just_opened: false,
             toast: None,
@@ -767,7 +812,10 @@ impl App {
             trim_after: None,
             show_forwards: false,
             fwd_just_opened: false,
+            fwd_confirm_del: None,
             fwd_form: ForwardForm::default(),
+            fwd_editing: None,
+            fwd_error: None,
             show_broadcast: false,
             broadcast_input: String::new(),
             conflict_policy: crate::store::load_conflict_policy().map(|s| ConflictPolicy::from_str(&s)).unwrap_or(ConflictPolicy::Overwrite),
@@ -924,6 +972,9 @@ impl App {
                     label: "127.0.0.1:18022 → 127.0.0.1:22".into(),
                     status: crate::i18n::tr("启动中 …", "Starting …").into(),
                     ok: true,
+                    bind_host: "127.0.0.1".into(),
+                    bind_port: 18022,
+                    kind: ForwardKind::Local { remote_host: "127.0.0.1".into(), remote_port: 22 },
                 });
                 let _ = s.cmd_tx.send(UiCommand::AddForward(ForwardSpec {
                     id,
@@ -947,6 +998,7 @@ impl App {
                 cwd: "/home/e5-1/sim/run1".into(),
                 exe: "/opt/gromacs/bin/gmx".into(),
                 copied_t: None,
+                confirm_kill: false,
             });
         }
 
@@ -1844,6 +1896,7 @@ impl eframe::App for App {
                         pid, name: p.name.clone(), cpu: p.cpu, mem: p.mem, pos,
                         cmd: String::new(), cwd: String::new(), exe: String::new(),
                         copied_t: None,
+                        confirm_kill: false,
                     });
                 }
                 let _ = s.cmd_tx.send(UiCommand::ProcDetail(pid));
@@ -3219,9 +3272,12 @@ impl App {
             None => return,
         };
         let mut close = false;
-        let mut kill = false;
+        let mut kill = false; // 真正下发 KillProc（仅二次确认后置 true）
+        let mut arm_kill = false; // 点击「强制结束」按钮 → 进入确认态
+        let mut cancel_kill = false; // 确认态里点「取消」→ 退回
         let mut copy_target: Option<String> = None;
         let copied_t = self.proc_popup.as_ref().and_then(|p| p.copied_t);
+        let confirm_kill = self.proc_popup.as_ref().map(|p| p.confirm_kill).unwrap_or(false);
         let now = ctx.input(|i| i.time);
         let win = egui::Window::new("proc_popup")
             .title_bar(false)
@@ -3290,8 +3346,26 @@ impl App {
                     }
                 }
                 ui.separator();
-                if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::SKULL, crate::i18n::tr("强制结束 (kill -9)", "Kill (-9)"))).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
-                    kill = true;
+                if !confirm_kill {
+                    // 第一步：仅「武装」确认，不立即结束
+                    if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::SKULL, crate::i18n::tr("强制结束 (kill -9)", "Kill (-9)"))).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
+                        arm_kill = true;
+                    }
+                } else {
+                    // 第二步：二次确认（破坏性、不可撤销）——确认 / 取消
+                    ui.label(RichText::new(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("确定强制结束 PID {pid}（{name}）？此操作不可撤销。"),
+                        crate::i18n::Lang::En => format!("Kill PID {pid} ({name})? This cannot be undone."),
+                    }).color(Palette::TEXT).size(12.0));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::SKULL, crate::i18n::tr("确认结束", "Confirm"))).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
+                            kill = true;
+                        }
+                        if ui.button(crate::i18n::tr("取消", "Cancel")).clicked() {
+                            cancel_kill = true;
+                        }
+                    });
                 }
             });
 
@@ -3310,12 +3384,24 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
         }
+        // 进入/退出「强制结束」确认态（不关窗）
+        if arm_kill {
+            if let Some(p) = &mut self.proc_popup {
+                p.confirm_kill = true;
+            }
+        }
+        if cancel_kill {
+            if let Some(p) = &mut self.proc_popup {
+                p.confirm_kill = false;
+            }
+        }
         if kill {
             if let Some(s) = self.active.and_then(|i| self.sessions.get(i)) {
                 let _ = s.cmd_tx.send(UiCommand::KillProc(pid));
             }
             self.proc_popup = None;
-        } else if close || (outside && !self.proc_popup_just_opened) {
+        } else if close || (outside && !self.proc_popup_just_opened && !arm_kill) {
+            // 注：arm_kill 当帧不因「点到按钮算窗外」而误关（按钮在窗内，理论上 outside=false，这里再加一道保险）
             self.proc_popup = None;
         }
         self.proc_popup_just_opened = false;
@@ -3330,7 +3416,12 @@ impl App {
         }
         let idx = self.active.filter(|&i| i < self.sessions.len());
         let mut add_spec: Option<ForwardSpec> = None;
-        let mut remove_id: Option<u64> = None;
+        let mut remove_id: Option<u64> = None; // 确认后真正删除
+        let mut arm_del: Option<u64> = None; // 点垃圾桶 → 进入该行确认态
+        let mut cancel_del = false; // 确认态点取消
+        let mut edit_id: Option<u64> = None; // 点铅笔 → 把该条回填表单进入编辑
+        let mut cancel_edit = false; // 编辑态点「取消编辑」
+        let confirm_del = self.fwd_confirm_del; // 本帧处于确认态的转发 id（快照）
         let mut close_win = false;
 
         let win = egui::Window::new("forward_win")
@@ -3357,7 +3448,9 @@ impl App {
                     return;
                 };
 
-                // 新增表单（分段按钮代替下拉，避免点击下拉被判为窗口外而自动关闭）
+                // 新增/编辑表单（分段按钮代替下拉，避免点击下拉被判为窗口外而自动关闭）
+                let editing = self.fwd_editing; // 快照：编辑态决定按钮文案与提交语义
+                let fwd_error = self.fwd_error.clone(); // 快照：内联错误（避免与 f 的可变借用冲突）
                 let f = &mut self.fwd_form;
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut f.kind, 0usize, crate::i18n::tr("本地转发", "Local"));
@@ -3378,23 +3471,38 @@ impl App {
                     });
                 }
                 ui.add_space(4.0);
-                if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::PLUS, crate::i18n::tr("添加转发", "Add forward"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
-                    if let Ok(lp) = f.local_port.trim().parse::<u16>() {
-                        let kind = if f.kind == 0 {
-                            match f.target_port.trim().parse::<u16>() {
-                                Ok(tp) if !f.target_host.trim().is_empty() => {
-                                    Some(ForwardKind::Local { remote_host: f.target_host.trim().to_string(), remote_port: tp })
+                ui.horizontal(|ui| {
+                    let (btn_icon, btn_label) = if editing.is_some() {
+                        (icon::CHECK, crate::i18n::tr("保存修改", "Save"))
+                    } else {
+                        (icon::PLUS, crate::i18n::tr("添加转发", "Add forward"))
+                    };
+                    if ui.add(egui::Button::new(RichText::new(format!("{}  {}", btn_icon, btn_label)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                        if let Ok(lp) = f.local_port.trim().parse::<u16>() {
+                            let kind = if f.kind == 0 {
+                                match f.target_port.trim().parse::<u16>() {
+                                    Ok(tp) if !f.target_host.trim().is_empty() => {
+                                        Some(ForwardKind::Local { remote_host: f.target_host.trim().to_string(), remote_port: tp })
+                                    }
+                                    _ => None,
                                 }
-                                _ => None,
+                            } else {
+                                Some(ForwardKind::Dynamic)
+                            };
+                            if let Some(kind) = kind {
+                                let bind = if f.bind.trim().is_empty() { "127.0.0.1".into() } else { f.bind.trim().to_string() };
+                                add_spec = Some(ForwardSpec { id: 0, bind_host: bind, bind_port: lp, kind });
                             }
-                        } else {
-                            Some(ForwardKind::Dynamic)
-                        };
-                        if let Some(kind) = kind {
-                            let bind = if f.bind.trim().is_empty() { "127.0.0.1".into() } else { f.bind.trim().to_string() };
-                            add_spec = Some(ForwardSpec { id: 0, bind_host: bind, bind_port: lp, kind });
                         }
                     }
+                    // 编辑态：提供「取消编辑」退回新增态
+                    if editing.is_some() && ui.button(crate::i18n::tr("取消编辑", "Cancel")).clicked() {
+                        cancel_edit = true;
+                    }
+                });
+                // 内联错误（端口占用 / 参数无效）
+                if let Some(err) = &fwd_error {
+                    ui.label(RichText::new(err).color(Palette::DANGER).size(11.0));
                 }
 
                 ui.separator();
@@ -3408,8 +3516,22 @@ impl App {
                             ui.painter().circle_filled(dot.center(), 4.0, if fwd.ok { Palette::OK } else { Palette::DANGER });
                             ui.label(RichText::new(&fwd.label).size(12.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add(egui::Button::new(RichText::new(icon::TRASH).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("删除", "Delete")).clicked() {
-                                    remove_id = Some(fwd.id);
+                                if confirm_del == Some(fwd.id) {
+                                    // 行内二次确认：确认（红勾）/ 取消（X）
+                                    if ui.add(egui::Button::new(RichText::new(icon::CHECK).size(12.0).color(Palette::DANGER)).frame(false)).on_hover_text(crate::i18n::tr("确认删除", "Confirm delete")).clicked() {
+                                        remove_id = Some(fwd.id);
+                                    }
+                                    if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("取消", "Cancel")).clicked() {
+                                        cancel_del = true;
+                                    }
+                                } else {
+                                    if ui.add(egui::Button::new(RichText::new(icon::TRASH).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("删除", "Delete")).clicked() {
+                                        arm_del = Some(fwd.id);
+                                    }
+                                    // 编辑：把该条参数回填表单
+                                    if ui.add(egui::Button::new(RichText::new(icon::PENCIL_SIMPLE).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("编辑", "Edit")).clicked() {
+                                        edit_id = Some(fwd.id);
+                                    }
                                 }
                             });
                         });
@@ -3419,10 +3541,21 @@ impl App {
                 }
             });
 
+        // 行内删除确认态的进入/退出
+        if let Some(id) = arm_del {
+            self.fwd_confirm_del = Some(id);
+        }
+        if cancel_del || remove_id.is_some() {
+            self.fwd_confirm_del = None;
+        }
+
         // 点击窗口外部自动隐藏（打开当帧除外）
         let clicked_outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
         if close_win || (clicked_outside && !self.fwd_just_opened) {
             self.show_forwards = false;
+            self.fwd_confirm_del = None; // 关窗时复位确认态，避免下次打开仍处于「确认删除」
+            self.fwd_editing = None; // 复位编辑态与内联错误
+            self.fwd_error = None;
         }
         self.fwd_just_opened = false;
 
@@ -3430,23 +3563,94 @@ impl App {
             Some(i) => i,
             None => return,
         };
-        if let Some(mut spec) = add_spec {
-            if let Some(s) = self.sessions.get_mut(idx) {
-                let id = s.next_forward;
-                s.next_forward += 1;
-                spec.id = id;
-                let label = match &spec.kind {
-                    ForwardKind::Local { remote_host, remote_port } => {
-                        format!("{}:{} → {}:{}", spec.bind_host, spec.bind_port, remote_host, remote_port)
-                    }
-                    ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
-                };
-                s.forwards.push(ForwardEntry { id, label, status: crate::i18n::tr("启动中 …", "Starting …").into(), ok: true });
-                let _ = s.cmd_tx.send(UiCommand::AddForward(spec));
-            }
+        // 取消编辑：复位编辑态与表单
+        if cancel_edit {
+            self.fwd_editing = None;
+            self.fwd_error = None;
             self.fwd_form.local_port.clear();
             self.fwd_form.target_host.clear();
             self.fwd_form.target_port.clear();
+            self.fwd_just_opened = true;
+        }
+        // 进入编辑：把选中转发的参数回填表单
+        if let Some(id) = edit_id {
+            if let Some(fwd) = self.sessions.get(idx).and_then(|s| s.forwards.iter().find(|f| f.id == id)) {
+                let (bh, bp, kind) = (fwd.bind_host.clone(), fwd.bind_port, fwd.kind.clone());
+                let form = &mut self.fwd_form;
+                form.bind = bh;
+                form.local_port = bp.to_string();
+                match kind {
+                    ForwardKind::Local { remote_host, remote_port } => {
+                        form.kind = 0;
+                        form.target_host = remote_host;
+                        form.target_port = remote_port.to_string();
+                    }
+                    ForwardKind::Dynamic => {
+                        form.kind = 1;
+                        form.target_host.clear();
+                        form.target_port.clear();
+                    }
+                }
+                self.fwd_editing = Some(id);
+                self.fwd_error = None;
+            }
+            self.fwd_just_opened = true; // 点编辑不算窗外点击
+        }
+        // 添加 / 保存：先做本地端口占用 + 重复校验，通过才发起（编辑则先删旧再加新）
+        if let Some(mut spec) = add_spec {
+            let editing = self.fwd_editing;
+            // 与现有转发重复（排除正在编辑的那条），或本机端口已被占用
+            let dup = self.sessions.get(idx).map_or(false, |s| {
+                s.forwards
+                    .iter()
+                    .any(|f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host && Some(f.id) != editing)
+            });
+            // 编辑且端口与原值相同时跳过 OS 探测：那个端口正被「被编辑的转发」自身监听着，会误报占用
+            let same_as_editing = editing
+                .and_then(|id| self.sessions.get(idx).and_then(|s| s.forwards.iter().find(|f| f.id == id)))
+                .map_or(false, |f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host);
+            if dup || (!same_as_editing && local_port_in_use(&spec.bind_host, spec.bind_port)) {
+                self.fwd_error = Some(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("本地端口 {} 已被占用", spec.bind_port),
+                    crate::i18n::Lang::En => format!("Local port {} is already in use", spec.bind_port),
+                });
+                self.fwd_just_opened = true;
+            } else {
+                // 编辑模式：先删旧转发（移除记录 + 通知 worker 关闭监听）
+                if let Some(old) = editing {
+                    if let Some(s) = self.sessions.get_mut(idx) {
+                        s.forwards.retain(|f| f.id != old);
+                        let _ = s.cmd_tx.send(UiCommand::RemoveForward(old));
+                    }
+                }
+                if let Some(s) = self.sessions.get_mut(idx) {
+                    let id = s.next_forward;
+                    s.next_forward += 1;
+                    spec.id = id;
+                    let label = match &spec.kind {
+                        ForwardKind::Local { remote_host, remote_port } => {
+                            format!("{}:{} → {}:{}", spec.bind_host, spec.bind_port, remote_host, remote_port)
+                        }
+                        ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
+                    };
+                    s.forwards.push(ForwardEntry {
+                        id,
+                        label,
+                        status: crate::i18n::tr("启动中 …", "Starting …").into(),
+                        ok: true,
+                        bind_host: spec.bind_host.clone(),
+                        bind_port: spec.bind_port,
+                        kind: spec.kind.clone(),
+                    });
+                    let _ = s.cmd_tx.send(UiCommand::AddForward(spec));
+                }
+                self.fwd_editing = None;
+                self.fwd_error = None;
+                self.fwd_form.local_port.clear();
+                self.fwd_form.target_host.clear();
+                self.fwd_form.target_port.clear();
+                self.fwd_just_opened = true;
+            }
         }
         if let Some(id) = remove_id {
             if let Some(s) = self.sessions.get_mut(idx) {
@@ -3498,6 +3702,8 @@ impl App {
         let Some(idx) = self.active else { return };
         let mut close_win = false;
         let mut clear = false;
+        let mut cancel_all = false;
+        let mut retry_all = false;
         let mut pick_dir = false;
         let mut cancel_id: Option<u64> = None;
         let mut toggle_err: Option<u64> = None;
@@ -3557,15 +3763,66 @@ impl App {
                 });
                 ui.separator();
 
+                // 状态筛选：紧凑的 frameless 文字 chips（带计数），仅在有任务时显示——
+                // 避免空列表时占位、也避免大按钮 + 多余分隔线让顶部拥挤。
+                // 先在借用 s 之前算各状态计数（借用随即结束），再据此渲染并允许改 self.xfer_filter。
+                let counts = self
+                    .sessions
+                    .get(idx)
+                    .map(|s| {
+                        let active = s.transfers.iter().filter(|t| t.ok.is_none()).count();
+                        let done = s.transfers.iter().filter(|t| t.ok == Some(true)).count();
+                        let failed = s.transfers.iter().filter(|t| t.ok == Some(false)).count();
+                        (s.transfers.len(), active, done, failed)
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+                if counts.0 > 0 {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 9.0;
+                        for (f, zh, en, n) in [
+                            (XferFilter::All, "全部", "All", counts.0),
+                            (XferFilter::Active, "进行中", "Active", counts.1),
+                            (XferFilter::Done, "已完成", "Done", counts.2),
+                            (XferFilter::Failed, "失败", "Failed", counts.3),
+                        ] {
+                            let on = self.xfer_filter == f;
+                            // 激活=强调色加粗；有失败时「失败」用危险色；其余弱色
+                            let col = if on {
+                                Palette::ACCENT
+                            } else if matches!(f, XferFilter::Failed) && n > 0 {
+                                Palette::DANGER
+                            } else {
+                                Palette::TEXT_DIM
+                            };
+                            let mut rt = RichText::new(format!("{} {}", crate::i18n::tr(zh, en), n)).size(11.0).color(col);
+                            if on {
+                                rt = rt.strong();
+                            }
+                            if ui.add(egui::Button::new(rt).frame(false).small()).clicked() {
+                                self.xfer_filter = f;
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+                let filter = self.xfer_filter;
+
                 let Some(s) = self.sessions.get(idx) else { return };
                 if s.transfers.is_empty() {
                     ui.add_space(6.0);
                     ui.label(RichText::new(crate::i18n::tr("暂无传输任务", "No transfers")).color(Palette::TEXT_DIM).size(12.0));
                 }
                 let mut open_dir: Option<String> = None;
+                let mut shown = 0usize; // 当前筛选下实际展示的条数（用于「无匹配」提示）
                 // 列表过长时滚动：约 8 条高度封顶，其余可滚动查看
                 egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true]).show(ui, |ui| {
-                for t in s.transfers.iter().rev().take(50) {
+                for t in s.transfers.iter().rev().filter(|t| match filter {
+                    XferFilter::All => true,
+                    XferFilter::Active => t.ok.is_none(),
+                    XferFilter::Done => t.ok == Some(true),
+                    XferFilter::Failed => t.ok == Some(false),
+                }).take(50) {
+                    shown += 1;
                     // 下载=绿色，上传=珊瑚橙，颜色区分方向
                     let (dir_icon, dir_col) = match t.dir {
                         crate::proto::TransferDir::Download => (icon::DOWNLOAD_SIMPLE, Palette::OK),
@@ -3666,6 +3923,11 @@ impl App {
                             let mut detail = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
                             if t.speed > 0.0 {
                                 detail.push_str(&format!("  ·  {}", crate::ui::fmt_rate(t.speed)));
+                                // ETA：剩余字节 / 当前速度（仅未暂停、有剩余、速度有效时）
+                                if !t.paused && t.total > t.done {
+                                    let eta = ((t.total - t.done) as f64 / t.speed).round() as u64;
+                                    detail.push_str(&format!("  ·  {} {}", crate::i18n::tr("剩余", "ETA"), fmt_dur(eta)));
+                                }
                             }
                             ui.label(RichText::new(detail).size(10.0).color(Palette::TEXT_DIM));
                         }
@@ -3695,21 +3957,76 @@ impl App {
                     });
                     ui.add_space(4.0);
                 }
+                // 有任务但当前筛选下一条都没有：给出「无匹配」提示，避免看着像空列表
+                if shown == 0 && !s.transfers.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(crate::i18n::tr("该筛选下暂无任务", "No transfers match this filter")).color(Palette::TEXT_DIM).size(12.0));
+                }
                 });
                 if let Some(p) = open_dir {
                     open_containing_folder(&p);
                 }
                 if !s.transfers.is_empty() {
                     ui.separator();
-                    if ui.button(crate::i18n::tr("清除已完成", "Clear done")).clicked() {
-                        clear = true;
-                    }
+                    // 批量操作：仅在对应状态存在时显示，避免无意义按钮
+                    let any_active = s.transfers.iter().any(|t| t.ok.is_none());
+                    let any_failed = s.transfers.iter().any(|t| t.ok == Some(false) && t.spec.is_some());
+                    let any_done = s.transfers.iter().any(|t| t.ok.is_some());
+                    ui.horizontal(|ui| {
+                        if any_active && ui.button(crate::i18n::tr("全部取消", "Cancel all")).clicked() {
+                            cancel_all = true;
+                        }
+                        if any_failed && ui.button(crate::i18n::tr("重试失败", "Retry failed")).clicked() {
+                            retry_all = true;
+                        }
+                        if any_done && ui.button(crate::i18n::tr("清除已完成", "Clear done")).clicked() {
+                            clear = true;
+                        }
+                    });
                 }
             });
         if clear {
             if let Some(s) = self.sessions.get_mut(idx) {
                 s.transfers.retain(|t| t.ok.is_none());
             }
+        }
+        // 全部取消：对所有进行中的任务下发取消
+        if cancel_all {
+            if let Some(s) = self.sessions.get(idx) {
+                let ids: Vec<u64> = s.transfers.iter().filter(|t| t.ok.is_none()).map(|t| t.id).collect();
+                for id in ids {
+                    let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
+                }
+            }
+            self.xfer_just_opened = true;
+        }
+        // 重试全部失败：对每个有重发规格的失败任务重新发起（续传语义，覆盖）
+        if retry_all {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                let targets: Vec<(u64, XferSpec)> = s
+                    .transfers
+                    .iter()
+                    .filter(|t| t.ok == Some(false))
+                    .filter_map(|t| t.spec.clone().map(|sp| (t.id, sp)))
+                    .collect();
+                for (id, spec) in targets {
+                    match spec {
+                        XferSpec::Download { remote, local } => {
+                            let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy: ConflictPolicy::Overwrite });
+                        }
+                        XferSpec::Upload { local, remote_dir } => {
+                            let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy: ConflictPolicy::Overwrite });
+                        }
+                    }
+                    if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+                        t.ok = None;
+                        t.paused = false;
+                        t.show_err = false;
+                        t.message = crate::i18n::tr("重试中 …", "Retrying …").into();
+                    }
+                }
+            }
+            self.xfer_just_opened = true;
         }
         // 取消传输：向 worker 发送取消指令
         if let Some(id) = cancel_id {

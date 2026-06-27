@@ -14,6 +14,9 @@ fn term_theme() -> &'static std::sync::atomic::AtomicU8 {
     F.get_or_init(|| std::sync::atomic::AtomicU8::new(crate::store::load_term_theme()))
 }
 
+/// 回看缓冲行数（固定默认，不做配置以免右键菜单过重；够覆盖常见回看需求）。
+const DEFAULT_SCROLLBACK: usize = 5000;
+
 pub struct Terminal {
     parser: vt100::Parser,
     cols: u16,
@@ -76,6 +79,14 @@ struct Find {
     hits: Vec<usize>, // 命中行的绝对行号（顶部为 0）
     cur: usize,
     focus: bool,
+    /// 区分大小写（默认否 = 不区分）
+    case: bool,
+    /// 按正则匹配（默认否 = 字面子串）
+    regex: bool,
+    /// 全字匹配（用 \b 词边界包裹）
+    word: bool,
+    /// 正则无效时为 true（查找栏标红提示）
+    bad_re: bool,
 }
 
 enum FindAction {
@@ -83,6 +94,22 @@ enum FindAction {
     Search,
     Step(i32),
     Close,
+}
+
+/// 据查找选项编译匹配器：字面子串也统一转成正则，以便复用大小写/全字逻辑。
+/// 返回 None 表示正则无效（仅可能发生在 regex 模式）。
+fn build_search_regex(f: &Find) -> Option<regex::Regex> {
+    if f.query.is_empty() {
+        return None;
+    }
+    // 非正则模式：转义用户输入，按字面匹配
+    let pat = if f.regex { f.query.clone() } else { regex::escape(&f.query) };
+    // 全字：用词边界包裹（对字面与正则都适用）
+    let pat = if f.word { format!(r"\b(?:{pat})\b") } else { pat };
+    regex::RegexBuilder::new(&pat)
+        .case_insensitive(!f.case)
+        .build()
+        .ok()
 }
 
 /// 前缀历史搜索状态：记住起始前缀与当前命中位置。
@@ -194,7 +221,7 @@ const TERM_THEMES: &[(&str, &str)] = &[
 impl Terminal {
     pub fn new() -> Self {
         Self {
-            parser: vt100::Parser::new(24, 80, 5000),
+            parser: vt100::Parser::new(24, 80, DEFAULT_SCROLLBACK),
             cols: 80,
             rows: 24,
             scrollback: 0,
@@ -360,23 +387,31 @@ impl Terminal {
         out
     }
 
-    /// 重新执行搜索（查询变化时）。
+    /// 重新执行搜索（查询/选项变化时）。支持大小写、正则、全字三种选项。
     fn run_search(&mut self) {
-        let q = match &self.find {
-            Some(f) if !f.query.is_empty() => f.query.clone(),
-            _ => {
-                if let Some(f) = &mut self.find {
-                    f.hits.clear();
-                }
-                self.search_hl = None;
-                return;
+        // 空查询：清空命中与高亮
+        let empty = self.find.as_ref().map_or(true, |f| f.query.is_empty());
+        if empty {
+            if let Some(f) = &mut self.find {
+                f.hits.clear();
+                f.bad_re = false;
             }
+            self.search_hl = None;
+            return;
+        }
+        // 编译匹配器（字面子串也走 regex，统一处理大小写/全字）
+        let re = self.find.as_ref().and_then(build_search_regex);
+        if let Some(f) = &mut self.find {
+            f.bad_re = re.is_none(); // 正则无效 → 标红、不改命中
+        }
+        let Some(re) = re else {
+            return;
         };
         let lines = self.collect_lines();
         let hits: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.contains(&q))
+            .filter(|(_, l)| re.is_match(l))
             .map(|(i, _)| i)
             .collect();
         if let Some(f) = &mut self.find {
@@ -418,6 +453,28 @@ impl Terminal {
         // 屏幕行 = 绝对行号 - 窗口起始行号
         let win_start = sb.saturating_sub(self.scrollback);
         self.search_hl = line_idx.checked_sub(win_start).map(|r| r as u16);
+    }
+
+    /// 据当前命中行与当前回滚位置，重算高亮所在的屏幕行（不移动视口）。
+    /// 用于手动滚动后让高亮「跟随」命中行：仍在视口内则继续高亮，滚出视口则不画。
+    fn recompute_search_hl(&mut self) {
+        let line_idx = match &self.find {
+            Some(f) if !f.hits.is_empty() => f.hits[f.cur.min(f.hits.len() - 1)],
+            _ => {
+                self.search_hl = None;
+                return;
+            }
+        };
+        // 探测总可回滚行数（set MAX 读回再还原，仅改偏移不重排，开销很小）
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let sb = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(self.scrollback);
+        let win_start = sb.saturating_sub(self.scrollback);
+        // 仅当命中行落在当前可视窗口内（0..rows）才高亮
+        self.search_hl = match line_idx.checked_sub(win_start) {
+            Some(r) if (r as u16) < self.rows => Some(r as u16),
+            _ => None,
+        };
     }
 
     /// 选区按阅读顺序的 (起, 止)（含两端）。
@@ -465,6 +522,35 @@ impl Terminal {
 
     fn has_selection(&self) -> bool {
         matches!((self.sel_anchor, self.sel_cursor), (Some(a), Some(b)) if a != b)
+    }
+
+    /// 双击选词：返回 (row, col) 处「单词」的列区间 [c0, c1]（含两端）；点在空白/纯符号上返回 None。
+    /// 词字符 = 字母数字（含 CJK）+ 常见路径/标识符符号；宽字符续格并入，避免 CJK 选词在半格处断开。
+    fn word_range_at(&self, row: u16, col: u16) -> Option<(u16, u16)> {
+        let screen = self.parser.screen();
+        let is_word = |c: u16| -> bool {
+            match screen.cell(row, c) {
+                Some(cell) => {
+                    if cell.is_wide_continuation() {
+                        return true; // 宽字符（CJK）右半格，并入左侧词
+                    }
+                    cell.contents().chars().next().is_some_and(|ch| ch.is_alphanumeric() || "_-./~".contains(ch))
+                }
+                None => false,
+            }
+        };
+        if !is_word(col) {
+            return None;
+        }
+        let mut c0 = col;
+        while c0 > 0 && is_word(c0 - 1) {
+            c0 -= 1;
+        }
+        let mut c1 = col;
+        while c1 + 1 < self.cols && is_word(c1 + 1) {
+            c1 += 1;
+        }
+        Some((c0, c1))
     }
 
     fn clear_selection(&mut self) {
@@ -524,7 +610,7 @@ impl Terminal {
             if let Some(pos) = find_sub(bytes, b"\x1b[3J") {
                 let (before, after) = bytes.split_at(pos + 4);
                 self.parser.process(before);
-                self.parser = vt100::Parser::new(self.rows, self.cols, 5000);
+                self.parser = vt100::Parser::new(self.rows, self.cols, DEFAULT_SCROLLBACK);
                 self.scrollback = 0;
                 self.parser.process(after);
                 self.ensure_cursor_after_alt();
@@ -562,14 +648,20 @@ impl Terminal {
             self.rows = rows;
             self.parser.screen_mut().set_size(rows, cols);
         } else {
+            let prev_sb = self.scrollback;
             let data = self.serialize_buffer();
-            let mut np = vt100::Parser::new(rows, cols, 5000);
+            let mut np = vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK);
             np.process(&data);
             self.parser = np;
             self.cols = cols;
             self.rows = rows;
-            self.scrollback = 0;
-            // 屏幕坐标已变，清掉可能错位的选区/搜索高亮
+            // 保留回看位置（按新缓冲的最大可回看行数钳制），避免 resize 一律跳回底部
+            self.parser.screen_mut().set_scrollback(usize::MAX);
+            let max_sb = self.parser.screen().scrollback();
+            let nb = prev_sb.min(max_sb);
+            self.parser.screen_mut().set_scrollback(nb);
+            self.scrollback = nb;
+            // 选区/搜索高亮跨回流坐标会错位 → 清掉（回看位置仍保留）
             self.sel_anchor = None;
             self.sel_cursor = None;
             self.search_hl = None;
@@ -607,12 +699,29 @@ impl Terminal {
                         action = FindAction::Step(1);
                         resp.request_focus();
                     }
-                    let cnt = if f.hits.is_empty() {
-                        "0/0".to_string()
-                    } else {
-                        format!("{}/{}", f.cur + 1, f.hits.len())
+                    // 选项开关：Aa=区分大小写、.*=正则、\b=全字。切换即重搜。
+                    let tgl = |ui: &mut egui::Ui, on: &mut bool, label: &str, tip: &str| -> bool {
+                        let col = if *on { crate::theme::Palette::ACCENT } else { crate::theme::Palette::TEXT_DIM };
+                        let clicked = ui
+                            .add(egui::Button::new(egui::RichText::new(label).size(12.0).color(col)).frame(false).min_size(egui::vec2(20.0, 18.0)))
+                            .on_hover_text(tip)
+                            .clicked();
+                        if clicked {
+                            *on = !*on;
+                        }
+                        clicked
                     };
-                    ui.label(egui::RichText::new(cnt).color(crate::theme::Palette::TEXT_DIM).size(11.0));
+                    if tgl(ui, &mut f.case, "Aa", crate::i18n::tr("区分大小写", "Match case")) { action = FindAction::Search; }
+                    if tgl(ui, &mut f.regex, ".*", crate::i18n::tr("正则表达式", "Regex")) { action = FindAction::Search; }
+                    if tgl(ui, &mut f.word, "\\b", crate::i18n::tr("全字匹配", "Whole word")) { action = FindAction::Search; }
+                    let (cnt, cnt_col) = if f.bad_re {
+                        (crate::i18n::tr("正则错误", "bad regex").to_string(), crate::theme::Palette::DANGER)
+                    } else if f.hits.is_empty() {
+                        ("0/0".to_string(), crate::theme::Palette::TEXT_DIM)
+                    } else {
+                        (format!("{}/{}", f.cur + 1, f.hits.len()), crate::theme::Palette::TEXT_DIM)
+                    };
+                    ui.label(egui::RichText::new(cnt).color(cnt_col).size(11.0));
                     if ui.button(icon::CARET_UP).on_hover_text(crate::i18n::tr("上一个", "Prev")).clicked() {
                         action = FindAction::Step(-1);
                     }
@@ -742,10 +851,10 @@ impl Terminal {
                     }
                 } else {
                     let lines = (scroll / char_h).round() as i64;
-                    let nb = (self.scrollback as i64 + lines).clamp(0, 5000) as usize;
+                    let nb = (self.scrollback as i64 + lines).clamp(0, DEFAULT_SCROLLBACK as i64) as usize;
                     self.scrollback = nb;
                     self.parser.screen_mut().set_scrollback(nb);
-                    self.search_hl = None; // 手动滚动后高亮失效
+                    self.recompute_search_hl(); // 手动滚动：高亮跟随命中行（滚出视口才消失）
                 }
             }
         }
@@ -824,13 +933,28 @@ impl Terminal {
                     let nb = (((1.0 - f) * max_sb as f32).round() as usize).min(max_sb);
                     self.scrollback = nb;
                     self.parser.screen_mut().set_scrollback(nb);
-                    self.search_hl = None;
+                    self.recompute_search_hl(); // 拖滚动条：高亮跟随命中行
                 }
             }
             if resp.drag_stopped() {
                 self.sb_dragging = false;
             }
-            if resp.clicked() && !self.sb_dragging {
+            // 三击选整行 / 双击选词 / 单击清选区（本地选择模式）
+            if resp.triple_clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let (r, _) = cell_at(p);
+                    self.sel_anchor = Some((r, 0));
+                    self.sel_cursor = Some((r, self.cols.saturating_sub(1)));
+                }
+            } else if resp.double_clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let (r, c) = cell_at(p);
+                    if let Some((c0, c1)) = self.word_range_at(r, c) {
+                        self.sel_anchor = Some((r, c0));
+                        self.sel_cursor = Some((r, c1));
+                    }
+                }
+            } else if resp.clicked() && !self.sb_dragging {
                 self.clear_selection();
             }
         }
@@ -996,6 +1120,7 @@ impl Terminal {
         // Ctrl+C/X/V 转成这些事件而不再下发按键）。这里只处理右键菜单。
         let mut do_copy = false;
         let mut do_paste = false;
+        let mut do_find = false;
         let mut start_log = false;
         resp.context_menu(|ui| {
             ui.set_min_width(170.0); // 菜单宽度足些，看着舒服
@@ -1008,6 +1133,12 @@ impl Terminal {
             }
             if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
                 do_paste = true;
+                ui.close();
+            }
+            ui.separator();
+            // 查找终端内容（等价快捷键 Ctrl+Shift+F；放菜单里更易发现、且不受桌面快捷键占用影响）
+            if ui.button(format!("{}  {}", egui_phosphor::regular::MAGNIFYING_GLASS, crate::i18n::tr("查找…  (Ctrl+Shift+F)", "Find…  (Ctrl+Shift+F)"))).clicked() {
+                do_find = true;
                 ui.close();
             }
             ui.separator();
@@ -1073,6 +1204,13 @@ impl Terminal {
         if do_paste {
             if let Some(t) = self.read_clipboard() {
                 out.extend_from_slice(t.as_bytes());
+            }
+        }
+        // 右键菜单「查找」：无则打开并聚焦输入框，已开则把焦点定位到输入框
+        if do_find {
+            match &mut self.find {
+                Some(f) => f.focus = true,
+                None => self.find = Some(Find { focus: true, ..Default::default() }),
             }
         }
         // 复制/粘贴（尤其右键菜单）后焦点会丢失，重新聚焦终端，免得还要再点一下
@@ -1619,7 +1757,19 @@ fn highlight_colors(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<Option<C
     out
 }
 
-/// 在一行里查找 http(s) 链接，返回 (起列, 止列(含), url)。列号按屏幕单元格计。
+/// 可点击 URL 的匹配正则（一次性编译）：常见协议 + 裸 `www.`。
+/// 末尾在 `find_row_urls` 里再统一裁掉句读符号（. , ; : ! ? ) ] }）。
+fn url_regex() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // (?i) 协议不区分大小写；正文取到空白或明显分隔符为止
+        regex::Regex::new(r#"(?i)(?:(?:https?|ftps?|ssh|sftp|file)://|www\.)[^\s"'<>`|]+"#).unwrap()
+    })
+}
+
+/// 在一行里查找链接，返回 (起列, 止列(含), url)。列号按屏幕单元格计。
+/// 支持 http(s)/ftp(s)/ssh/sftp/file 协议与裸 `www.`（后者自动补 https://）。
 fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, String)> {
     // 逐字符记录 (起始列, 字符)；宽字符续格跳过
     let mut chars: Vec<(u16, char)> = Vec::new();
@@ -1634,34 +1784,27 @@ fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, 
         col += if wide { 2 } else { 1 };
     }
     let text: String = chars.iter().map(|(_, c)| *c).collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
     let mut urls = Vec::new();
-    let mut byte = 0usize;
-    while let Some(rel) = text[byte..].find("http") {
-        let start = byte + rel;
-        let rest = &text[start..];
-        if rest.starts_with("http://") || rest.starts_with("https://") {
-            // 扩展到空白或明显的分隔符为止
-            let mut end = start;
-            for (k, ch) in rest.char_indices() {
-                if ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '`' | '|') {
-                    break;
-                }
-                end = start + k + ch.len_utf8();
-            }
-            let url = text[start..end]
-                .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '!' | '?'))
-                .to_string();
-            let ulen = url.chars().count();
-            if ulen > 0 {
-                let start_char = text[..start].chars().count();
-                let sc = chars[start_char.min(chars.len() - 1)].0;
-                let ec = chars[(start_char + ulen - 1).min(chars.len() - 1)].0;
-                urls.push((sc, ec, url));
-            }
-            byte = end;
-        } else {
-            byte = start + 4;
+    for m in url_regex().find_iter(&text) {
+        // 裁掉常见的尾随句读（URL 紧跟逗号/句号/右括号等时不应纳入）
+        let trimmed = m.as_str().trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '!' | '?'));
+        let ulen = trimmed.chars().count();
+        if ulen == 0 {
+            continue;
         }
+        let start_char = text[..m.start()].chars().count();
+        let sc = chars[start_char.min(chars.len() - 1)].0;
+        let ec = chars[(start_char + ulen - 1).min(chars.len() - 1)].0;
+        // 裸 www. 补全协议，便于浏览器直接打开
+        let url = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("www.") {
+            format!("https://{trimmed}")
+        } else {
+            trimmed.to_string()
+        };
+        urls.push((sc, ec, url));
     }
     urls
 }
@@ -1769,6 +1912,23 @@ mod tests {
         let mut p = vt100::Parser::new(2, 80, 0);
         p.process(b"plain text httpsomething not a url");
         assert!(find_row_urls(p.screen(), 0, 80).is_empty());
+    }
+
+    #[test]
+    fn detect_more_schemes() {
+        let mut p = vt100::Parser::new(2, 120, 0);
+        p.process(b"ftp://h/f sftp://h/x ssh://u@h file:///etc/hosts www.rust-lang.org");
+        let got: Vec<String> = find_row_urls(p.screen(), 0, 120).into_iter().map(|(_, _, u)| u).collect();
+        assert_eq!(
+            got,
+            vec![
+                "ftp://h/f".to_string(),
+                "sftp://h/x".to_string(),
+                "ssh://u@h".to_string(),
+                "file:///etc/hosts".to_string(),
+                "https://www.rust-lang.org".to_string(), // 裸 www. 自动补 https
+            ]
+        );
     }
 
     #[test]
