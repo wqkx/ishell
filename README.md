@@ -168,6 +168,10 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: stored encrypted with ChaCha20-Poly1305; the key lives locally at `~/.config/ishell/key` (0600). This is at-rest encryption.
 
+## 📄 License
+
+[MIT](LICENSE) — a permissive license. Do whatever you want; just keep the copyright notice.
+
 ---
 
 <div align="center">

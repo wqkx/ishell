@@ -168,6 +168,10 @@ cargo run --release
 - **主机密钥校验**：known_hosts 校验，未知主机首次连接弹窗确认 SHA256 指纹（TOFU）并写入；密钥改变则拒绝告警。
 - **保存密码加密**：以 ChaCha20-Poly1305 加密落盘，密钥存于本地 `~/.config/ishell/key`（0600）；属 at-rest 加密。
 
+## 📄 许可证
+
+[MIT](LICENSE) —— 宽松许可证。随意使用/修改/分发/商用，保留版权声明即可。
+
 ---
 
 <div align="center">
