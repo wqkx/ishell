@@ -65,6 +65,8 @@ pub struct ConnectForm {
     /// 正在编辑的原始连接标识 (name, host)；None=新建。
     /// 用它定位原记录，这样即使改了 host/名称也能更新原条目而非新增。
     editing: Option<(String, String)>,
+    /// 进入表单后下一帧自动聚焦「主机」输入框（一次性）
+    focus_host: bool,
 }
 
 impl Default for ConnectForm {
@@ -99,6 +101,7 @@ impl Default for ConnectForm {
             notice: None,
             import_candidates: None,
             editing: None,
+            focus_host: false,
         }
     }
 }
@@ -117,6 +120,7 @@ impl ConnectForm {
         self.open = true;
         self.mode = Mode::Form;
         self.reset_form();
+        self.focus_host = true;
     }
 
     /// 自检：打开导入选择对话框（仅供截图）。
@@ -301,6 +305,7 @@ impl ConnectForm {
                 {
                     self.reset_form();
                     self.mode = Mode::Form;
+                    self.focus_host = true;
                 }
                 // 从 ~/.ssh/config 导入
                 if ui
@@ -441,6 +446,7 @@ impl ConnectForm {
             if let Some(i) = edit_idx {
                 self.load_saved(i);
                 self.mode = Mode::Form;
+                self.focus_host = true;
             }
             if let Some(i) = del_idx {
                 self.confirm_delete = Some(i);
@@ -520,7 +526,11 @@ impl ConnectForm {
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("主机", "Host"));
-                ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(f32::INFINITY));
+                let host_resp = ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(f32::INFINITY));
+                if self.focus_host {
+                    host_resp.request_focus(); // 进入表单后自动聚焦主机框
+                    self.focus_host = false;
+                }
                 ui.end_row();
 
                 ui.label(crate::i18n::tr("端口", "Port"));

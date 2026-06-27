@@ -2006,7 +2006,11 @@ impl App {
                 for (i, (prompt, echo)) in kp.prompts.iter().enumerate() {
                     ui.label(prompt);
                     // echo=false 的提示（如密码/验证码）做遮蔽
-                    ui.add(egui::TextEdit::singleline(&mut kp.answers[i]).desired_width(200.0).password(!echo));
+                    let r = ui.add(egui::TextEdit::singleline(&mut kp.answers[i]).desired_width(200.0).password(!echo));
+                    // 打开即聚焦第一个输入框，可直接输入验证码
+                    if i == 0 && ui.memory(|m| m.focused().is_none()) {
+                        r.request_focus();
+                    }
                     ui.end_row();
                 }
             });

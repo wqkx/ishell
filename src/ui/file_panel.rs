@@ -1655,9 +1655,6 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                             close = true;
                         }
                     });
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        close = true;
-                    }
                 });
             }
             Dialog::NewFile { name } => {
@@ -1677,15 +1674,20 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                             close = true;
                         }
                     });
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        close = true;
-                    }
                 });
             }
             Dialog::Upload { local } => {
                 modal(&ctx, crate::i18n::tr("上传", "Upload"), |ui| {
                     ui.label(RichText::new(crate::i18n::tr("本地文件/文件夹路径（也可拖拽到文件区）", "Local file/folder path (or drag onto the panel)")).size(12.0).color(Palette::TEXT_DIM));
-                    ui.text_edit_singleline(local);
+                    let resp = ui.text_edit_singleline(local);
+                    if ui.memory(|m| m.focused().is_none()) {
+                        resp.request_focus();
+                    }
+                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if submit && !local.trim().is_empty() {
+                        actions.push(FileAction::Upload { local: local.trim().to_string(), remote_dir: cwd.clone() });
+                        close = true;
+                    }
                     ui.add_space(6.0);
                     // 原生选择器：选文件（可多选）/ 选文件夹（整个上传）
                     button_row(ui, 118.0, 2, |ui| {
@@ -1737,10 +1739,14 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
             }
             Dialog::Rename { path, name } => {
                 modal(&ctx, crate::i18n::tr("重命名", "Rename"), |ui| {
-                    ui.text_edit_singleline(name);
+                    let resp = ui.text_edit_singleline(name);
+                    if ui.memory(|m| m.focused().is_none()) {
+                        resp.request_focus();
+                    }
+                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
-                        if dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) && !name.trim().is_empty() {
+                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
                             let parent = parent_of(path);
                             actions.push(FileAction::Rename { from: path.clone(), to: join_path(&parent, name.trim()) });
                             close = true;
@@ -1862,6 +1868,10 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                 });
             }
         }
+    }
+    // 统一：任意弹框按 Esc 取消
+    if state.dialog.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        close = true;
     }
     if close {
         state.dialog = None;
