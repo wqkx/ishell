@@ -873,7 +873,9 @@ fn rebuild_matches(ed: &mut Editor) {
     ed.find_case.hash(&mut h);
     ed.find_word.hash(&mut h);
     ed.find_regex.hash(&mut h);
-    ed.content.len().hash(&mut h);
+    // 用内容版本号 vver（每次编辑 +1）而非 content.len()：否则「等长编辑/替换」后 sig 不变、
+    // find_matches 不重算却已失效，导致「替换」改到错误字节范围、可损坏内容。
+    ed.vver.hash(&mut h);
     let sig = h.finish();
     if sig == ed.find_sig {
         return;

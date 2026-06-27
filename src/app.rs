@@ -245,6 +245,20 @@ impl Session {
                         t.paused = false;
                         t.message = crate::i18n::tr("续传中 …", "Resuming …").into();
                     }
+                    // 断线前建立的端口转发：用新通道重建（沿用原 id/配置）。首次连接时 forwards 为空，无操作。
+                    let readd: Vec<crate::proto::ForwardSpec> = self
+                        .forwards
+                        .iter()
+                        .map(|f| crate::proto::ForwardSpec {
+                            id: f.id,
+                            bind_host: f.bind_host.clone(),
+                            bind_port: f.bind_port,
+                            kind: f.kind.clone(),
+                        })
+                        .collect();
+                    for spec in readd {
+                        let _ = self.cmd_tx.send(UiCommand::AddForward(spec));
+                    }
                 }
                 WorkerEvent::Disconnected(reason) => {
                     self.connected = false;
@@ -1128,19 +1142,30 @@ impl App {
         let cfg = s.cfg.clone();
         let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg);
         let Some(s) = self.sessions.get_mut(idx) else { return };
-        s.cmd_tx = cmd_tx;
+        let title = s.title.clone();
+        s.cmd_tx = cmd_tx.clone();
         s.evt_rx = evt_rx;
         s.hostkey_tx = hostkey_tx;
         s.connected = false;
         s.initialized = false;
         s.terminal = Terminal::new();
         s.sysinfo = None;
-        s.forwards.clear();
+        // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建
+        for f in &mut s.forwards {
+            f.ok = true;
+            f.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
+        }
         s.pending_hostkey = None;
         s.kbd_prompt = None;
         s.reconnect_at = None;
         s.restore_cwd = true; // 重连成功后尝试 cd 回 last_cwd（保留不清空）
         s.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
+        // M1：刷新该会话已打开编辑器标签的 cmd_tx——旧句柄随 worker 失效，否则重连后保存静默丢失。
+        if let Ok(mut es) = self.editor_state.lock() {
+            for t in es.tabs.iter_mut().filter(|t| t.server == title) {
+                t.cmd_tx = cmd_tx.clone();
+            }
+        }
     }
 
     /// 拖动排序：把会话从 `from` 移动到放置目标 `to` 处。
@@ -1179,7 +1204,14 @@ impl App {
         if self.sessions.is_empty() {
             self.active = None;
         } else {
-            self.active = Some(idx.min(self.sessions.len() - 1));
+            // 据「关闭项」与「当前 active」的相对位置正确调整，避免关闭非激活标签时误切会话：
+            // 关在 active 左侧 → active 左移一位；关在右侧 → 不变；关的正是 active（或无 active）→ 落到邻近项。
+            let new_len = self.sessions.len();
+            self.active = Some(match self.active {
+                Some(a) if a > idx => a - 1,
+                Some(a) if a < idx => a,
+                _ => idx.min(new_len - 1),
+            });
         }
     }
 
@@ -2402,7 +2434,7 @@ impl App {
             });
         if send && !self.broadcast_input.trim().is_empty() {
             let mut bytes = self.broadcast_input.clone().into_bytes();
-            bytes.push(b'\n');
+            bytes.push(b'\r'); // 用 CR（Enter）提交，与其它终端输入一致；\n 在多数行规程下不会执行命令
             for s in self.sessions.iter().filter(|s| s.connected) {
                 let _ = s.cmd_tx.send(UiCommand::TerminalInput(bytes.clone()));
             }

@@ -1739,7 +1739,10 @@ fn highlight_colors(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<Option<C
         col += if wide { 2 } else { 1 };
     }
     let text: String = chars.iter().map(|(_, c)| *c).collect();
-    let lower = text.to_lowercase();
+    // 用 ASCII 小写：保持字节长度 1:1，使 `lower` 的字节偏移在 `text` 上同样有效——
+    // 避免 to_lowercase() 改变长度（如 İ→i̇、ẞ→ß）后 text[..start] 落到非字符边界而 panic。
+    // 关键字（HL_RULES）均为 ASCII，ASCII 折叠已足够。
+    let lower = text.to_ascii_lowercase();
     let mut out = vec![None; cols as usize];
     for (kw, color) in HL_RULES {
         let mut from = 0;

@@ -216,13 +216,37 @@ fn compute_master_key() -> Option<[u8; 32]> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if std::fs::write(&path, k).is_err() {
+    // 原子创建并落 0600：经 0600 临时文件写入 + rename 到位，消除「先 write(默认 umask 0644) 再 chmod」
+    // 的暴露窗口——该文件是解密全部已存密码的主密钥。
+    if write_key_file(&path, &k).is_err() {
         let _ = KEY_STORAGE.set(KeyStorage::None);
         return None;
     }
-    restrict_perms(&path);
     let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
     Some(k)
+}
+
+/// 以 0600 原子写入主密钥文件：写 0600 临时文件后 rename 覆盖到位（rename 保留临时文件权限）。
+#[cfg(unix)]
+fn write_key_file(path: &std::path::Path, k: &[u8; 32]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp); // 清理可能的同名残留，确保 create_new 成功
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // 全新创建：mode 在此刻生效，无 0644 窗口
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(k)?;
+        let _ = f.sync_all();
+    }
+    std::fs::rename(&tmp, path)
+}
+#[cfg(not(unix))]
+fn write_key_file(path: &std::path::Path, k: &[u8; 32]) -> std::io::Result<()> {
+    std::fs::write(path, k)
 }
 
 /// 校验本地 key 文件权限：若 group/other 有任何位（过宽），记录并收紧为 0600。
