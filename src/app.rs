@@ -605,6 +605,8 @@ pub struct App {
     fwd_editing: Option<u64>,
     /// 转发表单的内联校验错误（端口占用/参数无效等），红字显示在表单下方
     fwd_error: Option<String>,
+    /// 上一帧活动会话的 uid——切换会话时复位「跨会话易串台」的临时 UI 态（转发确认/编辑、进程弹窗）
+    active_uid_prev: Option<u64>,
     /// 命令广播栏是否显示 + 输入内容
     show_broadcast: bool,
     broadcast_input: String,
@@ -660,6 +662,8 @@ struct ProcPopup {
     copied_t: Option<f64>,
     /// 是否处于「强制结束」二次确认态：kill 按钮先置此标志，确认后才真正下发 KillProc
     confirm_kill: bool,
+    /// 打开弹窗时所属会话的 uid——kill 据此定位会话，避免切会话后误 kill 别的主机
+    uid: u64,
 }
 
 /// UI 侧的一条端口转发记录。
@@ -699,7 +703,10 @@ impl Default for ForwardForm {
 /// 一个编辑器标签（含来源服务器，用于回写）。
 struct EditorTab {
     editor: crate::ui::editor::Editor,
+    /// 所属会话标题（仅用于标签显示）
     server: String,
+    /// 所属会话稳定唯一 id（身份匹配用：保存/冲突/去重，避免同名会话串台）
+    uid: u64,
     cmd_tx: UnboundedSender<UiCommand>,
     /// 该编辑器固定的 TextEdit Id（关闭时据此清理 egui 状态/撤销历史）
     text_id: egui::Id,
@@ -747,7 +754,10 @@ impl EditorState {
 
 /// 看图工具的一个标签页（一张已加载的图片）。
 struct ImageTab {
+    /// 所属会话标题（仅显示）
     server: String,
+    /// 所属会话稳定唯一 id（身份匹配用）
+    uid: u64,
     path: String,
     tex: egui::TextureHandle,
     /// 原始字节（用于「另存为」，保留源格式/质量）
@@ -830,6 +840,7 @@ impl App {
             fwd_form: ForwardForm::default(),
             fwd_editing: None,
             fwd_error: None,
+            active_uid_prev: None,
             show_broadcast: false,
             broadcast_input: String::new(),
             conflict_policy: crate::store::load_conflict_policy().map(|s| ConflictPolicy::from_str(&s)).unwrap_or(ConflictPolicy::Overwrite),
@@ -901,7 +912,7 @@ impl App {
         }
         // 自检：注入演示编辑器内容（截图核对代码高亮 + 多标签）
         if std::env::var("ISHELL_DEMO_EDIT").is_ok() {
-            if let Some((server, tx)) = app.sessions.first().map(|s| (s.title.clone(), s.cmd_tx.clone())) {
+            if let Some((server, uid, tx)) = app.sessions.first().map(|s| (s.title.clone(), s.uid, s.cmd_tx.clone())) {
                 let code = "use std::io;\n\n// 示例：读取并打印\nfn main() {\n    let mut s = String::new();\n    io::stdin().read_line(&mut s).unwrap();\n    let n: i32 = s.trim().parse().unwrap_or(0);\n    for i in 0..n {\n        println!(\"line {}\", i);\n    }\n}\n".to_string();
                 let t1 = app.alloc_editor_id();
                 // 大文件（>1MB）→ 只读模式，核对「改为可编辑」按钮
@@ -912,6 +923,7 @@ impl App {
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/home/e5-1/demo.rs".into(), code),
                     server: server.clone(),
+                    uid,
                     cmd_tx: tx.clone(),
                     text_id: t1,
                     load_id: None,
@@ -922,6 +934,7 @@ impl App {
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
                     server: server.clone(),
+                    uid,
                     cmd_tx: tx.clone(),
                     text_id: t2,
                     load_id: None,
@@ -932,6 +945,7 @@ impl App {
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
                     server,
+                    uid,
                     cmd_tx: tx,
                     text_id: t3,
                     load_id: None,
@@ -945,7 +959,7 @@ impl App {
 
         // 自检：看图工具——合成一张彩色渐变图打开
         if std::env::var("ISHELL_DEMO_IMG").is_ok() {
-            if let Some(server) = app.sessions.first().map(|s| s.title.clone()) {
+            if let Some((server, uid)) = app.sessions.first().map(|s| (s.title.clone(), s.uid)) {
                 let (w, h) = (240usize, 160usize);
                 let mut px = vec![0u8; w * h * 4];
                 for y in 0..h {
@@ -965,6 +979,7 @@ impl App {
                 }
                 app.image_tabs.push(ImageTab {
                     server,
+                    uid,
                     path: "/home/e5-1/pic/gradient.png".into(),
                     tex,
                     data,
@@ -1013,6 +1028,7 @@ impl App {
                 exe: "/opt/gromacs/bin/gmx".into(),
                 copied_t: None,
                 confirm_kill: false,
+                uid: app.sessions.first().map(|s| s.uid).unwrap_or(0),
             });
         }
 
@@ -1142,7 +1158,7 @@ impl App {
         let cfg = s.cfg.clone();
         let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg);
         let Some(s) = self.sessions.get_mut(idx) else { return };
-        let title = s.title.clone();
+        let uid = s.uid;
         s.cmd_tx = cmd_tx.clone();
         s.evt_rx = evt_rx;
         s.hostkey_tx = hostkey_tx;
@@ -1162,7 +1178,7 @@ impl App {
         s.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
         // M1：刷新该会话已打开编辑器标签的 cmd_tx——旧句柄随 worker 失效，否则重连后保存静默丢失。
         if let Ok(mut es) = self.editor_state.lock() {
-            for t in es.tabs.iter_mut().filter(|t| t.server == title) {
+            for t in es.tabs.iter_mut().filter(|t| t.uid == uid) {
                 t.cmd_tx = cmd_tx.clone();
             }
         }
@@ -1640,14 +1656,26 @@ impl eframe::App for App {
             ui.ctx().set_zoom_factor(ui_zoom());
         }
 
+        // 活动会话切换时，复位「跨会话易串台」的临时 UI 态：转发的删除确认/编辑、进程详情弹窗
+        // （否则 Ctrl+Tab 切走后，转发窗按 id 的确认/编辑可能命中新会话同 id 的另一条；进程弹窗显示陈旧）。
+        let cur_active_uid = self.active.and_then(|i| self.sessions.get(i)).map(|s| s.uid);
+        if cur_active_uid != self.active_uid_prev {
+            self.active_uid_prev = cur_active_uid;
+            self.fwd_confirm_del = None;
+            self.fwd_editing = None;
+            self.fwd_error = None;
+            self.proc_popup = None;
+        }
+
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
-        let mut new_placeholders: Vec<(u64, String, String, UnboundedSender<UiCommand>)> = Vec::new(); // id, path, server, tx
+        // 身份用会话 uid（稳定唯一），title 仅作显示——避免同名会话（默认 title=用户名）串台。
+        let mut new_placeholders: Vec<(u64, String, String, u64, UnboundedSender<UiCommand>)> = Vec::new(); // id, path, title, uid, tx
         let mut filled: Vec<(u64, String, String, String, crate::proto::Eol, u32)> = Vec::new(); // id, path, content, encoding, eol, mtime
         let mut load_progress: Vec<(u64, u64, u64)> = Vec::new();
         let mut load_fail: Vec<u64> = Vec::new();
-        let mut new_images: Vec<(String, Vec<u8>, String)> = Vec::new();
-        let mut saved: Vec<(String, String, u32)> = Vec::new(); // server, path, mtime
-        let mut conflicts: Vec<(String, String)> = Vec::new(); // server, path
+        let mut new_images: Vec<(String, Vec<u8>, String, u64)> = Vec::new(); // path, data, title, uid
+        let mut saved: Vec<(u64, String, u32)> = Vec::new(); // uid, path, mtime
+        let mut conflicts: Vec<(u64, String)> = Vec::new(); // uid, path
         for s in &mut self.sessions {
             s.drain_events();
             if s.connected && !s.initialized {
@@ -1655,16 +1683,16 @@ impl eframe::App for App {
                 s.init_files();
             }
             for (id, path) in s.pending_placeholder.drain(..) {
-                new_placeholders.push((id, path, s.title.clone(), s.cmd_tx.clone()));
+                new_placeholders.push((id, path, s.title.clone(), s.uid, s.cmd_tx.clone()));
             }
             for (id, path, content, encoding, eol, mtime) in s.pending_open.drain(..) {
                 filled.push((id, path, content, encoding, eol, mtime));
             }
             for (path, mtime) in s.pending_saved.drain(..) {
-                saved.push((s.title.clone(), path, mtime));
+                saved.push((s.uid, path, mtime));
             }
             for path in s.pending_conflict.drain(..) {
-                conflicts.push((s.title.clone(), path));
+                conflicts.push((s.uid, path));
             }
             for p in s.pending_load_progress.drain(..) {
                 load_progress.push(p);
@@ -1673,15 +1701,15 @@ impl eframe::App for App {
                 load_fail.push(id);
             }
             for (path, data) in s.pending_image.drain(..) {
-                new_images.push((path, data, s.title.clone()));
+                new_images.push((path, data, s.title.clone(), s.uid));
             }
         }
         // 跨服务器中转任务推进（下载完→上传，上传完→剪切则删源）
         self.process_relays();
-        for (path, data, server) in new_images {
+        for (path, data, server, uid) in new_images {
             self.image_focus = true; // 打开/切换后聚焦看图窗口
-            // 同一服务器同一图片已打开则切到该标签
-            if let Some(i) = self.image_tabs.iter().position(|t| t.server == server && t.path == path) {
+            // 同一会话同一图片已打开则切到该标签（身份用 uid，不用可能重名的 title）
+            if let Some(i) = self.image_tabs.iter().position(|t| t.uid == uid && t.path == path) {
                 self.active_image = i;
                 continue;
             }
@@ -1694,6 +1722,7 @@ impl eframe::App for App {
                     let tex = ui.ctx().load_texture(name, color, egui::TextureOptions::LINEAR);
                     self.image_tabs.push(ImageTab {
                         server,
+                        uid,
                         path,
                         tex,
                         data,
@@ -1705,7 +1734,7 @@ impl eframe::App for App {
                 }
                 Err(e) => {
                     let msg = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("图片解码失败：{e}"), crate::i18n::Lang::En => format!("Decode failed: {e}") };
-                    if let Some(sess) = self.sessions.iter_mut().find(|s| s.title == server) {
+                    if let Some(sess) = self.sessions.iter_mut().find(|s| s.uid == uid) {
                         sess.status = msg;
                     }
                 }
@@ -1721,14 +1750,14 @@ impl eframe::App for App {
             }
             let mut ed = self.editor_state.lock().unwrap();
             // 1) 新建占位标签（同服务器同文件已打开则切过去）
-            for ((id, path, server, tx), tid) in new_placeholders.into_iter().zip(ph_ids) {
+            for ((id, path, server, uid, tx), tid) in new_placeholders.into_iter().zip(ph_ids) {
                 ed.focus = true;
-                if let Some(i) = ed.tabs.iter().position(|t| t.server == server && t.editor.path == path) {
+                if let Some(i) = ed.tabs.iter().position(|t| t.uid == uid && t.editor.path == path) {
                     ed.active = i;
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -1763,14 +1792,14 @@ impl eframe::App for App {
         // 保存成功 → 更新对应标签 mtime（避免下次保存误判）；外部改动冲突 → 置标志，编辑器弹横幅。
         if !saved.is_empty() || !conflicts.is_empty() {
             let mut ed = self.editor_state.lock().unwrap();
-            for (server, path, mtime) in saved {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.server == server && t.editor.path == path) {
+            for (uid, path, mtime) in saved {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.editor.set_mtime(mtime);
                     t.save_conflict = false;
                 }
             }
-            for (server, path) in conflicts {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.server == server && t.editor.path == path) {
+            for (uid, path) in conflicts {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.save_conflict = true;
                 }
             }
@@ -1929,6 +1958,7 @@ impl eframe::App for App {
                         cmd: String::new(), cwd: String::new(), exe: String::new(),
                         copied_t: None,
                         confirm_kill: false,
+                        uid: s.uid,
                     });
                 }
                 let _ = s.cmd_tx.send(UiCommand::ProcDetail(pid));
@@ -3083,7 +3113,7 @@ impl App {
                                     .map(|t| {
                                         let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
                                         (
-                                            egui::Id::new((&t.server, &t.path)).value(),
+                                            egui::Id::new((t.uid, &t.path)).value(),
                                             format!("{} {}·{}", icon::IMAGE, t.server, fname),
                                             t.path.clone(),
                                             -1.0, // 图片标签无下载进度条
@@ -3428,8 +3458,10 @@ impl App {
             }
         }
         if kill {
-            if let Some(s) = self.active.and_then(|i| self.sessions.get(i)) {
-                let _ = s.cmd_tx.send(UiCommand::KillProc(pid));
+            // 发往「打开弹窗时所属会话」(uid)，而非当前 active——避免 Ctrl+Tab 切走后误 kill 别的主机
+            let target = self.proc_popup.as_ref().and_then(|p| self.session_idx_by_uid(p.uid));
+            if let Some(i) = target {
+                let _ = self.sessions[i].cmd_tx.send(UiCommand::KillProc(pid));
             }
             self.proc_popup = None;
         } else if close || (outside && !self.proc_popup_just_opened && !arm_kill) {
@@ -3632,7 +3664,7 @@ impl App {
         if let Some(mut spec) = add_spec {
             let editing = self.fwd_editing;
             // 与现有转发重复（排除正在编辑的那条），或本机端口已被占用
-            let dup = self.sessions.get(idx).map_or(false, |s| {
+            let dup = self.sessions.get(idx).is_some_and(|s| {
                 s.forwards
                     .iter()
                     .any(|f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host && Some(f.id) != editing)
@@ -3640,7 +3672,7 @@ impl App {
             // 编辑且端口与原值相同时跳过 OS 探测：那个端口正被「被编辑的转发」自身监听着，会误报占用
             let same_as_editing = editing
                 .and_then(|id| self.sessions.get(idx).and_then(|s| s.forwards.iter().find(|f| f.id == id)))
-                .map_or(false, |f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host);
+                .is_some_and(|f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host);
             if dup || (!same_as_editing && local_port_in_use(&spec.bind_host, spec.bind_port)) {
                 self.fwd_error = Some(match crate::i18n::current() {
                     crate::i18n::Lang::Zh => format!("本地端口 {} 已被占用", spec.bind_port),

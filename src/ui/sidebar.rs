@@ -177,7 +177,7 @@ fn section(ui: &mut egui::Ui, icon: &str, title: &str) {
 fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(RichText::new(format!("{k}")).color(Palette::TEXT_DIM).size(12.0));
+        ui.label(RichText::new(k.to_string()).color(Palette::TEXT_DIM).size(12.0));
         ui.label(RichText::new(v).color(Palette::TEXT).size(12.0));
     });
 }
@@ -187,7 +187,7 @@ fn kv_copy(ui: &mut egui::Ui, k: &str, v: &str) {
     let id = ui.id().with(("kv_copy", k));
     let now = ui.input(|i| i.time);
     let flash: Option<f64> = ui.ctx().data(|d| d.get_temp(id));
-    let copied = flash.map_or(false, |t| now - t < 1.2);
+    let copied = flash.is_some_and(|t| now - t < 1.2);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         ui.label(RichText::new(k).color(Palette::TEXT_DIM).size(12.0));

@@ -364,7 +364,7 @@ impl Terminal {
                     if idx < lines.len() {
                         continue;
                     }
-                    lines.push(serialize_row(screen, r as u16, cols as u16));
+                    lines.push(serialize_row(screen, r as u16, cols));
                 }
             }
             if off == 0 {
@@ -390,7 +390,7 @@ impl Terminal {
     /// 重新执行搜索（查询/选项变化时）。支持大小写、正则、全字三种选项。
     fn run_search(&mut self) {
         // 空查询：清空命中与高亮
-        let empty = self.find.as_ref().map_or(true, |f| f.query.is_empty());
+        let empty = self.find.as_ref().is_none_or(|f| f.query.is_empty());
         if empty {
             if let Some(f) = &mut self.find {
                 f.hits.clear();
@@ -506,7 +506,7 @@ impl Terminal {
                     continue;
                 }
                 let ch = cell.contents();
-                line.push_str(if ch.is_empty() { " " } else { &ch });
+                line.push_str(if ch.is_empty() { " " } else { ch });
             }
             out.push_str(line.trim_end());
             if row != er {
@@ -852,8 +852,10 @@ impl Terminal {
                 } else {
                     let lines = (scroll / char_h).round() as i64;
                     let nb = (self.scrollback as i64 + lines).clamp(0, DEFAULT_SCROLLBACK as i64) as usize;
-                    self.scrollback = nb;
                     self.parser.screen_mut().set_scrollback(nb);
+                    // 回读 vt100 按「实际历史行数」钳制后的真实值：否则 self.scrollback 可能远超真实历史，
+                    // 之后要空滚很多步才重新移动视口（「死滚动」）。
+                    self.scrollback = self.parser.screen().scrollback();
                     self.recompute_search_hl(); // 手动滚动：高亮跟随命中行（滚出视口才消失）
                 }
             }
@@ -1102,7 +1104,7 @@ impl Terminal {
             let pos_frac = 1.0 - (self.scrollback as f32 / max_sb as f32);
             let handle_top = sb_track.top() + (sb_track.height() - handle_h) * pos_frac;
             let handle = Rect::from_min_size(egui::pos2(sb_track.left() + 1.0, handle_top), Vec2::new(sb_w - 2.0, handle_h));
-            let hovered = hover_pos.map_or(false, |p| sb_track.contains(p));
+            let hovered = hover_pos.is_some_and(|p| sb_track.contains(p));
             let col = if self.sb_dragging {
                 egui::Color32::from_gray(110)
             } else if hovered {
@@ -1793,7 +1795,7 @@ fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, 
     let mut urls = Vec::new();
     for m in url_regex().find_iter(&text) {
         // 裁掉常见的尾随句读（URL 紧跟逗号/句号/右括号等时不应纳入）
-        let trimmed = m.as_str().trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '!' | '?'));
+        let trimmed = m.as_str().trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '!', '?']);
         let ulen = trimmed.chars().count();
         if ulen == 0 {
             continue;

@@ -537,7 +537,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                 }
                 // 复制路径：点击后短暂显示绿色对勾，再恢复
                 let now = ui.input(|i| i.time);
-                let copied = state.copy_flash.map_or(false, |t| now - t < 1.1);
+                let copied = state.copy_flash.is_some_and(|t| now - t < 1.1);
                 let (ci, ctip, ccol) = if copied {
                     (icon::CHECK, crate::i18n::tr("已复制", "Copied"), Palette::OK)
                 } else {

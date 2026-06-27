@@ -875,7 +875,23 @@ async fn exec_status(handle: &Handle<ClientHandler>, cmd: &str) -> anyhow::Resul
 /// 生成 n 字节的随机十六进制串（用于临时文件名，避免可预测路径被 symlink 抢占）。
 fn rand_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
-    let _ = getrandom::getrandom(&mut b);
+    if getrandom::getrandom(&mut b).is_err() {
+        // getrandom 失败（极罕见）：用 pid + 单调计数器 + 栈地址(ASLR) 混出非常量回退，
+        // 避免退化为固定全零名——临时文件名靠它防 /tmp 共享目录上的可预测 symlink 抢占。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let mut x = (std::process::id() as u64)
+            ^ CTR.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+            ^ (&b as *const _ as u64);
+        for byte in b.iter_mut() {
+            // splitmix64 扩展
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            *byte = ((z ^ (z >> 31)) & 0xff) as u8;
+        }
+    }
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -1744,8 +1760,15 @@ async fn read_image_file(
     sftp: &russh_sftp::client::SftpSession,
     path: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    let data = sftp.read(path).await?;
     let limit = 32 * 1024 * 1024;
+    // 先按元数据判大小再读，避免远端超大文件在限制检查前被整体读入内存（OOM/DoS）。
+    if let Some(sz) = sftp.metadata(path).await.ok().and_then(|m| m.size) {
+        if sz > limit as u64 {
+            anyhow::bail!("{}", match crate::i18n::current() { crate::i18n::Lang::Zh => format!("图片过大（>{}MB）", limit / 1024 / 1024), crate::i18n::Lang::En => format!("Image too large (>{}MB)", limit / 1024 / 1024) });
+        }
+    }
+    let data = sftp.read(path).await?;
+    // 兜底：元数据不可用时，读后再判一次
     if data.len() > limit {
         anyhow::bail!("{}", match crate::i18n::current() { crate::i18n::Lang::Zh => format!("图片过大（>{}MB）", limit / 1024 / 1024), crate::i18n::Lang::En => format!("Image too large (>{}MB)", limit / 1024 / 1024) });
     }

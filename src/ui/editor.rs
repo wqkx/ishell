@@ -263,7 +263,7 @@ fn v_sel_range(ed: &Editor) -> Option<(usize, usize)> {
 // ——— 自动换行（word-wrap）视觉行映射 ———
 /// 某逻辑行按 cols 列折行后的视觉行数（按字符数近似，CJK 暂按 1 列计）。
 fn line_vrows(chars: usize, cols: usize) -> u32 {
-    (chars / cols + if chars % cols != 0 { 1 } else { 0 }).max(1) as u32
+    (chars / cols + if !chars.is_multiple_of(cols) { 1 } else { 0 }).max(1) as u32
 }
 /// 同步换行行数前缀和缓存（列宽或内容变化时重算）。
 fn v_wrap_sync(ed: &mut Editor, cols: usize) {
@@ -582,7 +582,7 @@ fn v_multi_replace(ed: &mut Editor, text: &str) {
     ranges.sort_by_key(|r| r.0);
     let mut clean: Vec<(usize, usize)> = Vec::new();
     for (s, e) in ranges {
-        if clean.last().map_or(false, |l| s < l.1) {
+        if clean.last().is_some_and(|l| s < l.1) {
             continue; // 跳过重叠
         }
         clean.push((s, e));
@@ -1412,7 +1412,15 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 ed.pending_scroll = Some(v_line_of(ed, b));
             }
             FindOut::ReplaceOne(a, b) => {
-                let rep = ed.replace.clone();
+                // 与「全部替换」保持一致：正则模式下展开捕获组（$1 等），字面模式直接用替换串。
+                let rep: String = if ed.find_regex {
+                    match build_find_regex(&ed.find, ed.find_case, ed.find_word, ed.find_regex) {
+                        Some(re) => re.replace(&ed.content[a..b], ed.replace.as_str()).into_owned(),
+                        None => ed.replace.clone(),
+                    }
+                } else {
+                    ed.replace.clone()
+                };
                 v_apply(ed, a, b - a, &rep);
                 ed.pending_scroll = Some(v_line_of(ed, ed.vcaret));
             }
@@ -1575,7 +1583,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let sels: Vec<(usize, usize)> = if !ed.msel.is_empty() { ed.msel.clone() } else { v_sel_range(ed).into_iter().collect() };
             let carets: Vec<usize> = if !ed.msel.is_empty() { ed.msel.iter().map(|&(_, e)| e).collect() } else { vec![ed.vcaret] };
             let caret_line = v_line_of(ed, ed.vcaret); // 当前行高亮
-            let unit_cols = match ed.indent { Indent::Spaces(n) => (n as usize).max(1), Indent::Tab => 4 }; // 缩进参考线步长
+            let unit_cols = match ed.indent { Indent::Spaces(n) => n.max(1), Indent::Tab => 4 }; // 缩进参考线步长
             let brackets = if focused { bracket_match(&ed.content, ed.vcaret) } else { None }; // 括号匹配高亮
             // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
             let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
