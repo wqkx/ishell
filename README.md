@@ -6,8 +6,6 @@
 
 System monitor · interactive terminal · SFTP file manager · port forwarding · jump hosts — all in one window
 
-**⚡ High performance · low resource usage** — native Rust + GPU rendering: a single binary, fast startup, low memory/CPU footprint
-
 **English** · [中文](README.zh-CN.md)
 
 [![Release](https://img.shields.io/github/v/release/wqkx/ishell?display_name=tag)](https://github.com/wqkx/ishell/releases)
@@ -18,16 +16,16 @@ System monitor · interactive terminal · SFTP file manager · port forwarding �
 
 </div>
 
-## ✨ Overview
+## Why iShell
 
-iShell puts everything you need for daily SSH work in a single window — live system info on the left,
-an interactive terminal in the center, and an SFTP file manager at the bottom-right. It leans toward:
+Everything you need for daily SSH work in **one window** — and it stays out of your way.
 
-- **High performance, low resource usage (the core)** — pure Rust + a GPU immediate-mode UI (egui): a single binary, fast startup, low memory/CPU footprint, no runtime deps or background services.
-- **A pure-Rust SSH stack (russh + ring)** — no dependency on the system OpenSSH / PuTTY; consistent behavior across platforms.
-- **One codebase, three platforms** — Linux / macOS / Windows share the same code and UI.
-- **Multilingual** — English / 中文, switchable from the right-click menu.
-- **A clean, modern light UI** — warm theme, optional dark terminal, no toolbar clutter.
+- ⚡ **Fast & lightweight** — pure Rust + GPU immediate-mode UI. A single binary (~8–12 MB), instant startup, **~0% idle CPU**, **~80 MB RAM**. No Electron / JVM / Python, no daemon, no runtime deps.
+- 🎯 **Refined user experience** — a clean, warm light theme; smooth drag-to-reorder tabs; no toolbar clutter; English / 中文 switchable on the fly; sensible defaults so it just works.
+- 📁 **Effortless file operations** — multi-select rubber-band, batch delete/download, server-side copy/move, **resumable** transfers that **auto-resume after reconnect**, and folder **compress-download** (tar.gz) for thousands of small files.
+- 🔗 **Terminal ↔ files, linked** — "open this dir in terminal" from the file list, "reveal the terminal's current dir in the file list" the other way, and the working directory is **restored on reconnect** (OSC 7).
+- 🧰 **Complete feature set** — agent auth & forwarding, jump hosts, port forwarding + SOCKS5, command broadcast & snippets, live CPU/GPU/net/disk/process monitoring with `kill -9`.
+- ✍️ **A genuinely powerful editor** — a virtualized code editor that opens in its own window: **multi-cursor (Ctrl+D)**, syntax highlighting, find & replace, encoding/EOL auto-detect, Chinese IME, and it stays fast on huge files.
 
 ## ⚙️ Footprint
 
@@ -59,6 +57,11 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 - **Prefix + Up/Down** per-session history search
 - Dark / light terminal toggle; full CJK / IME input
 
+**Terminal ↔ files integration**
+- **File list → terminal**: right-click a folder → "Open in terminal" (or "Open current dir in terminal") `cd`s that session there
+- **Terminal → file list**: right-click the terminal → "Show current dir in the file list" jumps the SFTP panel to the shell's current directory (via OSC 7, with a one-time consent prompt if the shell doesn't emit it)
+- **Working dir restored on reconnect**, so a dropped session comes back where you left it
+
 **Tunneling & batch**
 - **Port forwarding**: local forward + dynamic SOCKS5 proxy
 - **Jump host / ProxyJump**: reach internal targets through a bastion
@@ -66,14 +69,23 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 - **Command snippets**: save frequent commands, send to the current session terminal in one click (optional auto-Enter), persisted
 
 **Files & transfers**
-- SFTP: tree + list, **name filter**, **click a header to sort by name / size / time** (size & time default to descending), drag-and-drop upload, **"open this dir in terminal"**, chmod / rename / copy path, optional default download folder
+- SFTP: tree + list, **name filter**, **click a header to sort by name / size / time** (size & time default to descending), drag-and-drop upload, chmod / rename / copy path, optional default download folder
 - **Multi-select batch ops**: Ctrl/Shift + rubber-band select; **batch delete** (Delete key / toolbar, recursive for folders), **batch download**
 - **Remote copy / move**: right-click "Copy / Cut" + "Paste here", done entirely on the server (multi-select, recursive)
 - **Resumable transfers**: byte-level resume + auto-retry on transient errors; **auto-resume after reconnect** with a pause/resume/retry queue
 - **Folder compress-download**: tar.gz on the server, single-file parallel download, pure-Rust unpack — fast for many small files
 - **Concurrent transfers** (up to 6 per server; independent across servers), cancellable mid-transfer
-- **Tabbed text editor** (its own OS window): **line numbers**, syntax highlighting, find & replace, large-file read-only virtualization (switchable to editable)
 - **Lightweight image viewer** (its own OS window): double-click a `png / jpg / gif / bmp` — zoom / pan / fit / 1:1 / save-as
+
+**Built-in code editor** (its own OS window, tabbed)
+- **Unified virtualized editor** — renders only the visible lines, so even huge files open instantly and stay smooth at low memory; every file uses the same full-featured editor
+- **Multi-cursor (Ctrl+D)** — accumulate selections of the same word, then **type / delete / move them all at once** (VS Code-style)
+- **Syntax highlighting**, current-line highlight, **bracket matching**, indent guides, auto-close brackets
+- **Find & replace** (regex / case / whole-word, match highlighting), **Go to line** (Ctrl+G), word & document navigation
+- **Comment toggle**, duplicate / move / delete line, undo / redo
+- **Encoding auto-detect** (UTF-8 / GBK / … via chardetng) and **EOL (LF / CRLF)** detection — both **clickable in the status bar to switch**, with safe re-encoding on save
+- **External-change detection** — guards against overwriting a file edited on the server since you opened it
+- Full **Chinese IME** input, double-click word select, fixed line-number gutter, download-progress tabs
 
 **Monitoring**
 - Live monitor: CPU / memory / swap, **GPU (NVIDIA / AMD / Intel)**, network graph, disks, top processes (click for details + kill -9)
@@ -92,7 +104,7 @@ an interactive terminal in the center, and an SFTP file manager at the bottom-ri
 |---|---|
 | ![](docs/screenshots/gpu.png) | ![](docs/screenshots/proc.png) |
 
-| Tabbed editor — line numbers, large-file read-only (switchable), opens in its own window |
+| Code editor — multi-cursor, syntax highlighting, find & replace, opens in its own window |
 |---|
 | ![](docs/screenshots/edit.png) |
 
@@ -141,6 +153,7 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 - The **frontend (egui, synchronous immediate mode)** and the **backend (tokio SSH worker, async)** are decoupled via channels.
 - Each session = one independent worker task: an interactive shell channel, an SFTP channel, and a system-info probe every 2 s.
 - The terminal keeps its screen model in `vt100`; egui renders it line-by-line with per-span color, and keyboard events are encoded back as ANSI sequences.
+- The code editor renders only visible lines over a virtualized scroll area, so file size barely affects memory or latency.
 
 | Concern | Choice |
 |---|---|
