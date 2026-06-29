@@ -18,7 +18,8 @@ echo '===CPU==='; grep '^cpu' /proc/stat 2>/dev/null
 echo '===MEM==='; grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo 2>/dev/null
 echo '===NET==='; cat /proc/net/dev 2>/dev/null
 echo '===DISK==='; df -kP 2>/dev/null
-echo '===PROC==='; ps -eo pid,%cpu,%mem,comm --sort=-%cpu 2>/dev/null | head -n 41
+echo '===SYSCONF==='; echo "$(getconf CLK_TCK 2>/dev/null) $(getconf PAGESIZE 2>/dev/null)"
+echo '===PROC==='; awk '{ pid=$1; s=$0; o=index(s,"("); c=0; for(i=length(s);i>0;i--){ if(substr(s,i,1)==")"){c=i;break} } comm=substr(s,o+1,c-o-1); rest=substr(s,c+2); n=split(rest,f," "); print pid, (f[12]+f[13]), f[22], comm }' /proc/[0-9]*/stat 2>/dev/null | sort -k2 -rn | head -n 200
 echo '===GPU==='
 nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null
 for d in /sys/class/drm/card[0-9]*/device; do [ -r "$d/gpu_busy_percent" ] || continue; v=$(cat "$d/vendor" 2>/dev/null); case "$v" in 0x1002) vn="AMD GPU";; 0x8086) vn="Intel GPU";; *) vn="GPU";; esac; busy=$(cat "$d/gpu_busy_percent" 2>/dev/null || echo 0); used=$(cat "$d/mem_info_vram_used" 2>/dev/null || echo 0); total=$(cat "$d/mem_info_vram_total" 2>/dev/null || echo 0); idx=$(basename "$(dirname "$d")" | tr -dc 0-9); echo "$idx, $vn, ${busy:-0}, $((${used:-0}/1048576)), $((${total:-0}/1048576))"; done 2>/dev/null
@@ -34,6 +35,8 @@ pub struct SysSampler {
     prev_cpu: HashMap<String, CpuTicks>,
     /// 每网卡上次累计字节 (rx, tx)
     prev_net: HashMap<String, (u64, u64)>,
+    /// 每进程上次累计 CPU tick (utime+stime)，用于按采样间隔算瞬时 CPU%（与 htop 一致）
+    prev_proc: HashMap<u32, u64>,
     prev_instant: Option<std::time::Instant>,
 }
 
@@ -46,6 +49,13 @@ impl SysSampler {
     pub fn parse(&mut self, raw: &str) -> SysInfo {
         let sections = split_sections(raw);
         let mut info = SysInfo::default();
+        // 采样间隔（秒）：用于进程瞬时 CPU% 的 tick 差分；首次或过短则为 0（该帧进程 CPU 显示 0）
+        let now = std::time::Instant::now();
+        let dt = self
+            .prev_instant
+            .map(|p| (now - p).as_secs_f64())
+            .filter(|&d| d > 0.05)
+            .unwrap_or(0.0);
 
         if let Some(s) = sections.get("HOST") {
             info.hostname = s.trim().to_string();
@@ -85,14 +95,50 @@ impl SysSampler {
             info.disks = parse_disk(s);
         }
         if let Some(s) = sections.get("PROC") {
-            info.procs = parse_proc(s);
+            // CLK_TCK 与页大小（默认 100 ticks/s、4KiB 页）
+            let (clk_tck, page_kb) = parse_sysconf(sections.get("SYSCONF").map(|s| s.as_str()));
+            info.procs = self.parse_proc_delta(s, dt, info.mem_total_kb, clk_tck, page_kb);
         }
         if let Some(s) = sections.get("GPU") {
             info.gpus = parse_gpu(s);
         }
 
-        self.prev_instant = Some(std::time::Instant::now());
+        self.prev_instant = Some(now);
         info
+    }
+
+    /// 解析进程段（每行 `pid (utime+stime)ticks rss_pages comm…`），按 tick 差分算**瞬时** CPU%
+    /// （与 htop 一致，多核可超 100%）；内存% 由 rss 页数 × 页大小 / 总内存换算。返回按 CPU 降序的前若干个。
+    fn parse_proc_delta(&mut self, raw: &str, dt: f64, mem_total_kb: u64, clk_tck: f64, page_kb: u64) -> Vec<ProcInfo> {
+        let mut cur: HashMap<u32, u64> = HashMap::new();
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(pid_s), Some(tick_s), Some(rss_s)) = (it.next(), it.next(), it.next()) else { continue };
+            let Ok(pid) = pid_s.parse::<u32>() else { continue };
+            let ticks: u64 = tick_s.parse().unwrap_or(0);
+            let rss_pages: u64 = rss_s.parse().unwrap_or(0);
+            let name = it.collect::<Vec<_>>().join(" ");
+            // 瞬时 CPU%：Δtick / CLK_TCK = CPU 秒；/ dt 秒 × 100 = 百分比（32 核满载 → 3200%）
+            let cpu = if dt > 0.0 {
+                self.prev_proc.get(&pid).map_or(0.0, |&prev| {
+                    (ticks.saturating_sub(prev) as f64 / clk_tck.max(1.0) / dt * 100.0) as f32
+                })
+            } else {
+                0.0
+            };
+            let mem = if mem_total_kb > 0 {
+                (rss_pages.saturating_mul(page_kb) as f32) / mem_total_kb as f32 * 100.0
+            } else {
+                0.0
+            };
+            cur.insert(pid, ticks);
+            out.push(ProcInfo { pid, name, cpu, mem });
+        }
+        self.prev_proc = cur; // 仅保留本次见到的进程，自动淘汰已退出的 pid
+        out.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(40);
+        out
     }
 
     fn parse_cpu(&mut self, raw: &str, info: &mut SysInfo) {
@@ -256,23 +302,13 @@ fn parse_disk(raw: &str) -> Vec<DiskInfo> {
     out
 }
 
-fn parse_proc(raw: &str) -> Vec<ProcInfo> {
-    let mut out = Vec::new();
-    for line in raw.lines().skip(1) {
-        // PID %CPU %MEM COMMAND
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 {
-            continue;
-        }
-        let Ok(pid) = cols[0].parse::<u32>() else { continue };
-        out.push(ProcInfo {
-            pid,
-            cpu: cols[1].parse().unwrap_or(0.0),
-            mem: cols[2].parse().unwrap_or(0.0),
-            name: cols[3..].join(" "),
-        });
-    }
-    out
+/// 解析 `===SYSCONF===` 段："CLK_TCK PAGESIZE"（如 "100 4096"）。
+/// 返回 (每秒 tick 数, 页大小 KiB)；缺失/异常回退到 (100, 4)。
+fn parse_sysconf(raw: Option<&str>) -> (f64, u64) {
+    let mut it = raw.unwrap_or("").split_whitespace();
+    let clk = it.next().and_then(|v| v.parse::<f64>().ok()).filter(|&v| v > 0.0).unwrap_or(100.0);
+    let page_bytes = it.next().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(4096);
+    (clk, (page_bytes / 1024).max(1))
 }
 
 /// 解析 nvidia-smi CSV：index, name, util.gpu, mem.used, mem.total（均无单位）。

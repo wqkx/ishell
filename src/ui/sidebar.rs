@@ -351,9 +351,10 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
         let mem_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w, 0.0), rect.right_bottom());
         p.text(mem_rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.mem),
             egui::FontId::proportional(11.0), usage_color(proc.mem));
-        // CPU%（中右）
+        // CPU%（中右）：可超 100%（多核），大值去小数以适配列宽
         let cpu_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w + cpu_w, 0.0), egui::pos2(rect.right() - mem_w, rect.bottom()));
-        p.text(cpu_rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.cpu),
+        let cpu_txt = if proc.cpu >= 100.0 { format!("{:.0}", proc.cpu) } else { format!("{:.1}", proc.cpu) };
+        p.text(cpu_rect.right_center(), egui::Align2::RIGHT_CENTER, cpu_txt,
             egui::FontId::proportional(11.0), usage_color(proc.cpu));
         // 名称（中间，截断）
         let name_rect = Rect::from_min_max(
