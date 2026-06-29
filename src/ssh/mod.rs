@@ -1776,6 +1776,23 @@ async fn read_image_file(
 }
 
 /// 执行一次 SFTP 写类操作，结果以 [`WorkerEvent::OpDone`]/`Error` 上报。
+/// 完整覆盖写一个远端文件：`CREATE | WRITE | TRUNCATE` 打开 → write_all → flush → **shutdown**。
+///
+/// 不用 russh-sftp 的便捷 `sftp.write()`——它只用 `OpenFlags::WRITE`：既不 `TRUNCATE`（内容变短时
+/// 残留旧文件尾部）、也不关闭句柄（部分 SFTP 服务端要 CLOSE 才落盘 → 出现「保存了却没变化」）。
+/// 与上传路径（`upload`）用的收尾方式一致。
+async fn sftp_overwrite(sftp: &russh_sftp::client::SftpSession, path: &str, data: &[u8]) -> anyhow::Result<()> {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::AsyncWriteExt;
+    let mut f = sftp
+        .open_with_flags(path, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE)
+        .await?;
+    f.write_all(data).await?;
+    f.flush().await?;
+    f.shutdown().await?;
+    Ok(())
+}
+
 async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, sink: &UiSink) {
     let result: anyhow::Result<(String, Option<String>)> = match cmd {
         UiCommand::Mkdir(path) => {
@@ -1787,10 +1804,9 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
         }
         UiCommand::CreateFile(path) => {
             let parent = remote_parent(&path);
-            sftp.write(&path, b"")
+            sftp_overwrite(sftp, &path, b"")
                 .await
                 .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已创建文件：{path}"), crate::i18n::Lang::En => format!("Created file: {path}") }, Some(parent)))
-                .map_err(Into::into)
         }
         UiCommand::Chmod { path, mode } => {
             let parent = remote_parent(&path);
@@ -1829,13 +1845,15 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 };
                 let enc = encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
                 let (bytes, _, _) = enc.encode(&text);
-                match sftp.write(&path, bytes.as_ref()).await {
+                // 用 CREATE|WRITE|TRUNCATE + flush + shutdown 完整覆盖写（见 sftp_overwrite 注释）；
+                // 旧实现用 sftp.write() 仅 OpenFlags::WRITE，会残留旧尾且部分服务端不落盘。
+                match sftp_overwrite(sftp, &path, bytes.as_ref()).await {
                     Ok(_) => {
                         let nm = sftp.metadata(&path).await.ok().and_then(|m| m.mtime).unwrap_or(0);
                         sink.send(WorkerEvent::FileSaved { path: path.clone(), mtime: nm });
                         Ok((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存：{path}"), crate::i18n::Lang::En => format!("Saved: {path}") }, None))
                     }
-                    Err(e) => Err(e.into()),
+                    Err(e) => Err(e),
                 }
             }
         }

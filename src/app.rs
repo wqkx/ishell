@@ -447,6 +447,11 @@ impl Session {
 static SIDEBAR_COLLAPSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static FILES_COLLAPSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ZOOM_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0 哨兵=未初始化(按 1.0)
+/// 「关于」弹框是否显示（右键菜单触发；自由函数态，与折叠/缩放一致用全局）。
+static ABOUT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn about_open() -> bool { ABOUT_OPEN.load(std::sync::atomic::Ordering::Relaxed) }
+fn set_about_open(v: bool) { ABOUT_OPEN.store(v, std::sync::atomic::Ordering::Relaxed); }
 
 fn sidebar_collapsed() -> bool { SIDEBAR_COLLAPSED.load(std::sync::atomic::Ordering::Relaxed) }
 fn set_sidebar_collapsed(v: bool) { SIDEBAR_COLLAPSED.store(v, std::sync::atomic::Ordering::Relaxed); }
@@ -539,7 +544,63 @@ pub fn view_context_menu(resp: &egui::Response) {
                 ui.close();
             }
         }
+
+        // —— 关于 ——
+        ui.separator();
+        if ui.button(format!("{}  {}", egui_phosphor::regular::INFO, crate::i18n::tr("关于 iShell", "About iShell"))).clicked() {
+            set_about_open(true);
+            ui.close();
+        }
     });
+}
+
+/// 「关于」弹框：软件名 / 版本 / 主页 / 发布 / 许可 / 技术栈。版本号取自 Cargo.toml（编译期内嵌）。
+fn about_window(ctx: &egui::Context) {
+    if !about_open() {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new(crate::i18n::tr("关于 iShell", "About iShell"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .open(&mut open) // 标题栏 X 关闭
+        .show(ctx, |ui| {
+            ui.set_width(330.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space(4.0);
+                ui.label(RichText::new("iShell").size(28.0).strong().color(Palette::ACCENT));
+                ui.label(RichText::new(crate::i18n::tr("现代化 Rust SSH 客户端", "A modern Rust SSH client")).size(12.0).color(Palette::TEXT_DIM));
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("{} {}", crate::i18n::tr("版本", "Version"), env!("CARGO_PKG_VERSION"))).size(13.0).strong());
+                ui.add_space(6.0);
+            });
+            ui.separator();
+            ui.add_space(6.0);
+            egui::Grid::new("about_grid").num_columns(2).spacing([12.0, 7.0]).show(ui, |ui| {
+                ui.label(RichText::new(crate::i18n::tr("项目主页", "Repository")).color(Palette::TEXT_DIM));
+                ui.hyperlink_to("github.com/wqkx/ishell", "https://github.com/wqkx/ishell");
+                ui.end_row();
+                ui.label(RichText::new(crate::i18n::tr("下载发布", "Releases")).color(Palette::TEXT_DIM));
+                ui.hyperlink_to(crate::i18n::tr("最新版本与各平台包", "Latest & platform builds"), "https://github.com/wqkx/ishell/releases");
+                ui.end_row();
+                ui.label(RichText::new(crate::i18n::tr("许可", "License")).color(Palette::TEXT_DIM));
+                ui.label("MIT");
+                ui.end_row();
+                ui.label(RichText::new(crate::i18n::tr("技术栈", "Built with")).color(Palette::TEXT_DIM));
+                ui.label("Rust · egui/eframe · russh");
+                ui.end_row();
+            });
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                if ui.add(egui::Button::new(crate::i18n::tr("关闭", "Close")).min_size(egui::vec2(80.0, 0.0))).clicked() {
+                    set_about_open(false);
+                }
+            });
+        });
+    if !open {
+        set_about_open(false);
+    }
 }
 
 pub struct App {
@@ -2006,6 +2067,9 @@ impl eframe::App for App {
 
         // 进程详情小窗
         self.proc_popup_window(&ctx);
+
+        // 「关于」弹框（右键菜单触发）
+        about_window(&ctx);
 
         // GPU 详情小窗
         self.gpu_popup_window(&ctx);
