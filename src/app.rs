@@ -559,8 +559,14 @@ fn about_window(ctx: &egui::Context) {
     if !about_open() {
         return;
     }
+    let ver = env!("CARGO_PKG_VERSION"); // 编译期内嵌的 Cargo.toml 版本
     let mut open = true;
-    egui::Window::new(crate::i18n::tr("关于 iShell", "About iShell"))
+    // 版本号同时放进标题，确保一定可见
+    let title = match crate::i18n::current() {
+        crate::i18n::Lang::Zh => format!("关于 iShell  ·  v{ver}"),
+        crate::i18n::Lang::En => format!("About iShell  ·  v{ver}"),
+    };
+    egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -572,7 +578,8 @@ fn about_window(ctx: &egui::Context) {
                 ui.label(RichText::new("iShell").size(28.0).strong().color(Palette::ACCENT));
                 ui.label(RichText::new(crate::i18n::tr("现代化 Rust SSH 客户端", "A modern Rust SSH client")).size(12.0).color(Palette::TEXT_DIM));
                 ui.add_space(8.0);
-                ui.label(RichText::new(format!("{} {}", crate::i18n::tr("版本", "Version"), env!("CARGO_PKG_VERSION"))).size(13.0).strong());
+                // 版本行：强调色加大，显式着色，确保醒目可见
+                ui.label(RichText::new(format!("{} {ver}", crate::i18n::tr("版本", "Version"))).size(16.0).strong().color(Palette::ACCENT));
                 ui.add_space(6.0);
             });
             ui.separator();
