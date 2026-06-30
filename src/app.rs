@@ -118,6 +118,15 @@ fn local_port_in_use(host: &str, port: u16) -> bool {
     }
 }
 
+/// 取远端路径的所在目录：去尾斜杠后截到最后一个 `/`；根下或无斜杠返回 `/`。
+fn parent_dir(path: &str) -> String {
+    let t = path.trim_end_matches('/');
+    match t.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(i) => t[..i].to_string(),
+    }
+}
+
 /// 把秒数格式化为紧凑时长（用于传输 ETA）：`45s` / `3m20s` / `1h2m`。
 fn fmt_dur(secs: u64) -> String {
     if secs >= 3600 {
@@ -153,6 +162,23 @@ struct Transfer {
     /// 上次采样的已传字节数与时刻（用于计算速度）
     last_done: u64,
     last_t: Option<std::time::Instant>,
+    /// 进行中的阶段提示（如「打包中…」「解包中…」「等待源端…」「直传中…」）；非空时在详情行替代字节读数
+    note: String,
+    /// 排队等待态（如跨服务器中转的目标端，正等源端下载完成）：显示「等待」而非进度数字
+    queued: bool,
+    /// 模式徽标（如「直传」）：显示在文件大小之后，标注传输方式；空串不显示
+    tag: String,
+}
+
+impl Transfer {
+    /// 新建一条「进行中」的传输记录（note/queued 默认空，speed 等计量字段归零）。
+    fn new(id: u64, name: String, dir: crate::proto::TransferDir, total: u64, local: Option<String>, spec: Option<XferSpec>) -> Self {
+        Transfer {
+            id, name, dir, spec, paused: false, done: 0, total, ok: None, local,
+            message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
+            note: String::new(), queued: false, tag: String::new(),
+        }
+    }
 }
 
 /// App 级文件剪贴板（跨 tab 共享）。
@@ -168,16 +194,46 @@ struct FileClip {
 }
 
 /// 待确认的粘贴计划（剪切，或跨服务器复制/剪切，执行前二次确认）。
+#[derive(Clone)]
 struct PendingPaste {
     items: Vec<(String, bool)>,
     is_cut: bool,
-    /// 源与目标是否不同服务器（需经本地中转）
+    /// 源与目标是否不同服务器（需经本地中转或直传）
     cross: bool,
     src_uid: u64,
     dest_uid: u64,
+    /// 源目录（被复制/剪切项的所在目录，用于确认弹框展示）
+    src_dir: String,
     dest_dir: String,
     src_label: String,
     dest_label: String,
+    /// 跨服务器时是否走「直传」（true=源主机直推目标；false=经本地中转）。一级确认后才据传输方式设定。
+    direct: bool,
+}
+
+/// 直传任务追踪（App 侧）：源会话里一条直传传输（id）的归属与善后信息。
+/// 成功 → 剪切则删源 + 刷新目标目录；失败 → 弹「转中转」提醒。
+struct DirectJob {
+    /// 源会话里的传输 id（真实数据通路在此）
+    id: u64,
+    /// 目标会话里的「镜像」进度行 id（直传数据不经 B，App 据源端进度同步显示）
+    mir_id: u64,
+    src_uid: u64,
+    dest_uid: u64,
+    /// 源目录（回退中转确认弹框展示用）
+    src_dir: String,
+    dest_dir: String,
+    is_cut: bool,
+    /// 原始条目（失败回退中转、或剪切删源时用）
+    items: Vec<(String, bool)>,
+    src_label: String,
+    dest_label: String,
+}
+
+/// 直传失败后，等待用户确认「转中转」的计划 + 失败原因。
+struct DirectFallback {
+    plan: PendingPaste,
+    reason: String,
 }
 
 /// 跨服务器中转任务：源会话下载到本地临时 → 目标会话上传 →（剪切则删源）。
@@ -190,6 +246,8 @@ struct Relay {
     is_cut: bool,
     tmp: std::path::PathBuf,
     phase: RelayPhase,
+    /// 目标会话里预占的上传传输 id（粘贴时即登记「等待」占位行，源端下载完才真正发起上传）
+    up_id: u64,
 }
 
 /// 中转任务阶段：保存对应会话里的传输 id，用于轮询完成状态。
@@ -304,6 +362,10 @@ impl Session {
                 WorkerEvent::DirListing { path, entries } => {
                     self.files.on_listing(path, entries);
                 }
+                WorkerEvent::DirListFailed { path, message } => {
+                    self.status = message;
+                    self.files.on_list_failed(path);
+                }
                 WorkerEvent::ProcDetail { pid, cmd, cwd, exe } => {
                     self.proc_detail = Some((pid, cmd, cwd, exe));
                 }
@@ -353,12 +415,14 @@ impl Session {
                         t.name = name;
                         t.total = total;
                         t.dir = dir;
+                        // worker 已真正开传：清除「等待」占位态
+                        t.queued = false;
                         // 冲突重命名后，worker 上报的是最终本地路径；更新它，使「打开所在文件夹」定位到重命名后的文件
                         if local.is_some() {
                             t.local = local;
                         }
                     } else {
-                        self.transfers.push(Transfer { id, name, dir, spec: None, paused: false, done: 0, total, ok: None, local, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                        self.transfers.push(Transfer::new(id, name, dir, total, local, None));
                     }
                 }
                 WorkerEvent::TransferProgress { id, done } => {
@@ -383,9 +447,16 @@ impl Session {
                         t.done = done;
                     }
                 }
+                WorkerEvent::TransferNote { id, note } => {
+                    if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
+                        t.note = note;
+                    }
+                }
                 WorkerEvent::TransferDone { id, ok, message, refresh_dir } => {
                     let connected = self.connected;
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
+                        t.note = String::new();
+                        t.queued = false;
                         if !ok && !connected && t.spec.is_some() {
                             // 断线引起的失败：转为暂停，等重连续传
                             t.paused = true;
@@ -690,6 +761,12 @@ pub struct App {
     relays: Vec<Relay>,
     /// 中转临时目录去重计数
     relay_seq: u64,
+    /// 粘贴确认弹框里「直传/中转」互斥选择的当前值（true=直传，默认）；每次打开确认时复位为直传
+    confirm_direct: bool,
+    /// 进行中的直传任务追踪（成功删源/刷新；失败弹回退）
+    direct_jobs: Vec<DirectJob>,
+    /// 直传失败、待确认「转中转」的计划 + 原因
+    pending_direct_fallback: Option<DirectFallback>,
     /// 命令片段库（snippets）窗口 + 数据 + 编辑缓冲
     show_snippets: bool,
     /// 片段浮窗刚打开（本帧跳过"点击外部关闭"判定）
@@ -916,6 +993,9 @@ impl App {
             pending_paste: None,
             relays: Vec::new(),
             relay_seq: 0,
+            confirm_direct: true,
+            direct_jobs: Vec::new(),
+            pending_direct_fallback: None,
             show_snippets: false,
             snip_just_opened: false,
             snippets: crate::store::load_snippets(),
@@ -1130,12 +1210,18 @@ impl App {
         if std::env::var("ISHELL_DEMO_XFER").is_ok() {
             if let Some(s) = app.sessions.first_mut() {
                 use crate::proto::TransferDir::*;
-                s.transfers.push(Transfer { id: 1, name: "backup.tar.gz".into(), dir: Download, spec: None, paused: false, done: 73_400_320, total: 104_857_600, ok: None, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
-                s.transfers.push(Transfer { id: 2, name: "deploy.sh".into(), dir: Upload, spec: None, paused: false, done: 2048, total: 2048, ok: Some(true), local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
-                s.transfers.push(Transfer { id: 3, name: "huge.bin".into(), dir: Download, spec: None, paused: false, done: 1024, total: 2048, ok: Some(true), local: Some("/root/Downloads/huge.bin".into()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                let mut demo = |id, name: &str, dir, done, total, ok, local: Option<String>| {
+                    let mut t = Transfer::new(id, name.into(), dir, total, local, None);
+                    t.done = done;
+                    t.ok = ok;
+                    s.transfers.push(t);
+                };
+                demo(1, "backup.tar.gz", Download, 73_400_320, 104_857_600, None, None);
+                demo(2, "deploy.sh", Upload, 2048, 2048, Some(true), None);
+                demo(3, "huge.bin", Download, 1024, 2048, Some(true), Some("/root/Downloads/huge.bin".into()));
                 // 自检：再塞一批，验证滚动
                 for i in 4..16u64 {
-                    s.transfers.push(Transfer { id: i, name: format!("file_{i}.dat"), dir: Download, spec: None, paused: false, done: i * 1000, total: 20000, ok: if i % 3 == 0 { Some(true) } else { None }, local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None });
+                    demo(i, &format!("file_{i}.dat"), Download, i * 1000, 20000, if i % 3 == 0 { Some(true) } else { None }, None);
                 }
             }
             app.show_transfers = true;
@@ -1358,12 +1444,10 @@ impl App {
                     None => {
                         let id = s.next_xfer;
                         s.next_xfer += 1;
-                        s.transfers.push(Transfer {
-                            id, name, dir: crate::proto::TransferDir::Download,
-                            spec: Some(XferSpec::Download { remote: remote.clone(), local: local.clone() }), paused: false,
-                            done: 0, total: 0, ok: None,
-                            local: Some(local.clone()), message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
-                        });
+                        s.transfers.push(Transfer::new(
+                            id, name, crate::proto::TransferDir::Download, 0, Some(local.clone()),
+                            Some(XferSpec::Download { remote: remote.clone(), local: local.clone() }),
+                        ));
                         let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy });
                     }
                 }
@@ -1399,12 +1483,10 @@ impl App {
                     None => {
                         let id = s.next_xfer;
                         s.next_xfer += 1;
-                        s.transfers.push(Transfer {
-                            id, name, dir: crate::proto::TransferDir::Upload,
-                            spec: Some(XferSpec::Upload { local: local.clone(), remote_dir: remote_dir.clone() }), paused: false,
-                            done: 0, total: 0, ok: None,
-                            local: None, message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
-                        });
+                        s.transfers.push(Transfer::new(
+                            id, name, crate::proto::TransferDir::Upload, 0, None,
+                            Some(XferSpec::Upload { local: local.clone(), remote_dir: remote_dir.clone() }),
+                        ));
                         let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy });
                     }
                 }
@@ -1472,6 +1554,20 @@ impl App {
         self.sessions.iter().position(|s| s.uid == uid)
     }
 
+    /// 与指定会话「同一台服务器」（host:port 相同）的所有会话下标，活动会话排在最前。
+    /// 用于把多个标签页对同一服务器的传输任务汇总到同一个传输列表里。
+    fn same_server_idxs(&self, idx: usize) -> Vec<usize> {
+        let Some(base) = self.sessions.get(idx) else { return Vec::new() };
+        let (host, port) = (base.cfg.host.clone(), base.cfg.port);
+        let mut out = vec![idx];
+        for (i, s) in self.sessions.iter().enumerate() {
+            if i != idx && s.cfg.host == host && s.cfg.port == port {
+                out.push(i);
+            }
+        }
+        out
+    }
+
     /// 复制 / 剪切选中项到 App 级剪贴板（跨 tab 共享）。
     fn set_clip(&mut self, idx: usize, items: Vec<(String, bool)>, is_cut: bool) {
         let (uid, host, port, label) = match self.sessions.get(idx) {
@@ -1495,19 +1591,23 @@ impl App {
         let Some(clip) = self.file_clip.as_ref() else { return };
         let Some(dest) = self.sessions.get(idx) else { return };
         let cross = clip.src_host != dest.cfg.host || clip.src_port != dest.cfg.port;
+        let src_dir = clip.items.first().map(|(p, _)| parent_dir(p)).unwrap_or_default();
         let plan = PendingPaste {
             items: clip.items.clone(),
             is_cut: clip.is_cut,
             cross,
             src_uid: clip.src_uid,
             dest_uid: dest.uid,
+            src_dir,
             dest_dir,
             src_label: clip.src_label.clone(),
             dest_label: dest.title.clone(),
+            direct: false, // 传输方式由确认弹框里的互斥选择决定
         };
-        // 仅「跨服务器」需执行前确认（重操作、经本地中转）；同机无论复制还是移动都直接执行——
+        // 仅「跨服务器」需执行前确认（重操作 + 选直传/中转）；同机无论复制还是移动都直接执行——
         // 同机移动是原子 mv，源在目标写成功前不会丢，无需二次确认。
         if plan.cross {
+            self.confirm_direct = true; // 每次打开确认默认「直传」
             self.pending_paste = Some(plan);
         } else {
             self.execute_paste(plan);
@@ -1516,6 +1616,7 @@ impl App {
 
     /// 真正执行粘贴：同机服务器端 cp/mv；跨机建中转任务（下载→上传）。
     fn execute_paste(&mut self, plan: PendingPaste) {
+        let is_cut = plan.is_cut; // 提前取出：plan 在直传分支会被移动
         if !plan.cross {
             let srcs: Vec<String> = plan.items.iter().map(|(p, _)| p.clone()).collect();
             if let Some(di) = self.session_idx_by_uid(plan.dest_uid) {
@@ -1529,8 +1630,10 @@ impl App {
                     (false, crate::i18n::Lang::En) => format!("Copying {n} …"),
                 };
             }
+        } else if plan.direct {
+            self.execute_direct(plan);
         } else {
-            // 跨服务器：源会话与目标会话都须在线
+            // 跨服务器中转：源会话与目标会话都须在线
             let Some(di) = self.session_idx_by_uid(plan.dest_uid) else { return };
             let Some(si) = self.session_idx_by_uid(plan.src_uid) else {
                 self.sessions[di].status = crate::i18n::tr("源会话已关闭，无法跨服务器粘贴", "Source session closed; cannot paste across servers").into();
@@ -1553,6 +1656,17 @@ impl App {
                     let _ = s.cmd_tx.send(UiCommand::Download { id, remote: src_path.clone(), local: tmp.to_string_lossy().into_owned(), policy: ConflictPolicy::Overwrite });
                     id
                 };
+                // 在目标会话预占一条「等待」上传占位行：源端下载期间 B 也有可见状态
+                let up_id = {
+                    let s = &mut self.sessions[di];
+                    let id = s.next_xfer;
+                    s.next_xfer += 1;
+                    let mut t = Transfer::new(id, base.clone(), crate::proto::TransferDir::Upload, 0, None, None);
+                    t.queued = true;
+                    t.note = crate::i18n::tr("等待源端下载…", "Waiting for source download…").into();
+                    s.transfers.push(t);
+                    id
+                };
                 self.relays.push(Relay {
                     src_path: src_path.clone(),
                     is_dir: *is_dir,
@@ -1562,6 +1676,7 @@ impl App {
                     is_cut: plan.is_cut,
                     tmp,
                     phase: RelayPhase::Down(dlid),
+                    up_id,
                 });
             }
             self.show_transfers = true;
@@ -1575,7 +1690,7 @@ impl App {
             };
         }
         // 剪切粘贴后清空剪贴板（复制保留，便于多次粘贴）
-        if plan.is_cut {
+        if is_cut {
             self.file_clip = None;
         }
     }
@@ -1596,6 +1711,24 @@ impl App {
     fn transfer_ok(&self, uid: u64, id: u64) -> Option<bool> {
         let si = self.session_idx_by_uid(uid)?;
         self.sessions[si].transfers.iter().find(|t| t.id == id).and_then(|t| t.ok)
+    }
+
+    /// 查询某会话某传输的 (已传, 总量)（用于把源端下载进度反映到目标端「等待」行）。
+    fn transfer_done_total(&self, uid: u64, id: u64) -> Option<(u64, u64)> {
+        let si = self.session_idx_by_uid(uid)?;
+        self.sessions[si].transfers.iter().find(|t| t.id == id).map(|t| (t.done, t.total))
+    }
+
+    /// 把目标会话里预占的「等待」上传占位行标记为失败（源端下载失败/源会话关闭时）。
+    fn fail_placeholder(&mut self, dest_uid: u64, up_id: u64, msg: &str) {
+        if let Some(di) = self.session_idx_by_uid(dest_uid) {
+            if let Some(t) = self.sessions[di].transfers.iter_mut().find(|t| t.id == up_id) {
+                t.ok = Some(false);
+                t.queued = false;
+                t.note = String::new();
+                t.message = msg.to_string();
+            }
+        }
     }
 
     /// 推进跨服务器中转任务：下载完成→发起上传；上传完成→（剪切则删源）+ 清理临时。
@@ -1621,20 +1754,42 @@ impl App {
                 }
             };
             match step {
-                Step::Wait => i += 1,
+                Step::Wait => {
+                    // 仍在下载：把源端进度实时反映到目标端「等待」占位行的提示上
+                    if let RelayPhase::Down(dlid) = self.relays[i].phase {
+                        let (src_uid, dest_uid, up_id) = (self.relays[i].src_uid, self.relays[i].dest_uid, self.relays[i].up_id);
+                        if let Some((done, total)) = self.transfer_done_total(src_uid, dlid) {
+                            let note = if total > 0 {
+                                let pct = (done as f64 / total as f64 * 100.0).round() as u32;
+                                match crate::i18n::current() {
+                                    crate::i18n::Lang::Zh => format!("等待源端下载 {pct}%…"),
+                                    crate::i18n::Lang::En => format!("Waiting for source {pct}%…"),
+                                }
+                            } else {
+                                crate::i18n::tr("等待源端下载…", "Waiting for source download…").into()
+                            };
+                            if let Some(di) = self.session_idx_by_uid(dest_uid) {
+                                if let Some(t) = self.sessions[di].transfers.iter_mut().find(|t| t.id == up_id && t.queued) {
+                                    t.note = note;
+                                }
+                            }
+                        }
+                    }
+                    i += 1;
+                }
                 Step::ToUpload => {
                     let dest_uid = self.relays[i].dest_uid;
                     let tmp = self.relays[i].tmp.to_string_lossy().into_owned();
                     let dest_dir = self.relays[i].dest_dir.clone();
+                    let up_id = self.relays[i].up_id;
                     if let Some(di) = self.session_idx_by_uid(dest_uid) {
-                        let upid = {
-                            let s = &mut self.sessions[di];
-                            let id = s.next_xfer;
-                            s.next_xfer += 1;
-                            let _ = s.cmd_tx.send(UiCommand::Upload { id, local: tmp, remote_dir: dest_dir, policy: ConflictPolicy::Overwrite });
-                            id
-                        };
-                        self.relays[i].phase = RelayPhase::Up(upid);
+                        // 复用粘贴时预占的 up_id：worker 的 TransferStart 会把占位行就地转为进行中
+                        let _ = self.sessions[di].cmd_tx.send(UiCommand::Upload { id: up_id, local: tmp, remote_dir: dest_dir, policy: ConflictPolicy::Overwrite });
+                        if let Some(t) = self.sessions[di].transfers.iter_mut().find(|t| t.id == up_id) {
+                            t.queued = false;
+                            t.note = String::new();
+                        }
+                        self.relays[i].phase = RelayPhase::Up(up_id);
                         i += 1;
                     } else {
                         let (t, d) = (self.relays[i].tmp.clone(), self.relays[i].is_dir);
@@ -1660,11 +1815,232 @@ impl App {
                     self.relays.remove(i);
                 }
                 Step::Failed => {
+                    // 若在下载阶段失败：目标端占位行还停在「等待」，标记其失败避免空挂
+                    if let RelayPhase::Down(_) = self.relays[i].phase {
+                        let (dest_uid, up_id) = (self.relays[i].dest_uid, self.relays[i].up_id);
+                        self.fail_placeholder(dest_uid, up_id, crate::i18n::tr("源端下载失败", "Source download failed"));
+                    }
                     let (t, d) = (self.relays[i].tmp.clone(), self.relays[i].is_dir);
                     Self::cleanup_relay_tmp(&t, d);
                     self.relays.remove(i);
                 }
             }
+        }
+    }
+
+    /// 执行跨服务器「直传」：据目标会话配置构造 DirectSpec，交源会话 worker 在源主机上
+    /// 直接 rsync/scp 推到目标主机。仅目标为「无口令密钥」认证时可用；否则立即弹「转中转」。
+    fn execute_direct(&mut self, plan: PendingPaste) {
+        let Some(si) = self.session_idx_by_uid(plan.src_uid) else {
+            if let Some(di) = self.session_idx_by_uid(plan.dest_uid) {
+                self.sessions[di].status = crate::i18n::tr("源会话已关闭，无法直传", "Source session closed; cannot direct-transfer").into();
+            }
+            return;
+        };
+        let Some(di) = self.session_idx_by_uid(plan.dest_uid) else { return };
+        // 目标主机连接参数
+        let dest_cfg = self.sessions[di].cfg.clone();
+        // 仅支持「无口令密钥」认证的目标：取私钥本地路径
+        let key_path = match &dest_cfg.auth {
+            crate::proto::AuthMethod::KeyFile { path, passphrase } if passphrase.as_deref().map(|s| s.is_empty()).unwrap_or(true) => path.clone(),
+            _ => {
+                // 直传不可用（密码/agent/交互/口令密钥）：直接进入「转中转」提醒
+                self.pending_direct_fallback = Some(DirectFallback {
+                    plan: PendingPaste { direct: false, ..plan.clone() },
+                    reason: crate::i18n::tr(
+                        "目标会话非「无口令密钥」认证，无法直传。",
+                        "Target session is not passphrase-less key auth; direct transfer unavailable.",
+                    ).into(),
+                });
+                return;
+            }
+        };
+        let n = plan.items.len();
+        let first = plan.items.first().map(|(p, _)| p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p).to_string()).unwrap_or_default();
+        let label = if n > 1 { format!("{first} +{}", n - 1) } else { first };
+        let tag = crate::i18n::tr("直传", "Direct").to_string();
+        // 源会话（A）：真实数据通路所在行。total 由 worker 的 du 估算后回填（字节计）
+        let id = {
+            let s = &mut self.sessions[si];
+            let id = s.next_xfer;
+            s.next_xfer += 1;
+            let mut t = Transfer::new(id, label.clone(), crate::proto::TransferDir::Upload, 0, None, None);
+            t.tag = tag.clone();
+            s.transfers.push(t);
+            id
+        };
+        // 目标会话（B）：镜像进度行（直传不经 B，App 据源端进度同步显示），方向取「接收=下载」绿色
+        let mir_id = {
+            let s = &mut self.sessions[di];
+            let mid = s.next_xfer;
+            s.next_xfer += 1;
+            let mut t = Transfer::new(mid, label.clone(), crate::proto::TransferDir::Download, 0, None, None);
+            t.tag = tag.clone();
+            s.transfers.push(t);
+            mid
+        };
+        let spec = crate::proto::DirectSpec {
+            id,
+            srcs: plan.items.iter().map(|(p, _)| p.clone()).collect(),
+            dest_user: dest_cfg.username.clone(),
+            dest_host: dest_cfg.host.clone(),
+            dest_port: dest_cfg.port,
+            dest_dir: plan.dest_dir.clone(),
+            key_path,
+            label: label.clone(),
+        };
+        let _ = self.sessions[si].cmd_tx.send(UiCommand::DirectTransfer(Box::new(spec)));
+        self.direct_jobs.push(DirectJob {
+            id,
+            mir_id,
+            src_uid: plan.src_uid,
+            dest_uid: plan.dest_uid,
+            src_dir: plan.src_dir.clone(),
+            dest_dir: plan.dest_dir.clone(),
+            is_cut: plan.is_cut,
+            items: plan.items.clone(),
+            src_label: plan.src_label.clone(),
+            dest_label: plan.dest_label.clone(),
+        });
+        self.show_transfers = true;
+        self.xfer_just_opened = true;
+        self.sessions[si].status = match (plan.is_cut, crate::i18n::current()) {
+            (true, crate::i18n::Lang::Zh) => format!("跨服务器移动 {n} 项（直传）…"),
+            (false, crate::i18n::Lang::Zh) => format!("跨服务器复制 {n} 项（直传）…"),
+            (true, crate::i18n::Lang::En) => format!("Cross-server move {n} (direct) …"),
+            (false, crate::i18n::Lang::En) => format!("Cross-server copy {n} (direct) …"),
+        };
+        // 目标会话（B）也给一句状态（其传输浮窗里有镜像进度行）
+        self.sessions[di].status = match (plan.is_cut, crate::i18n::current()) {
+            (_, crate::i18n::Lang::Zh) => format!("正从源主机直传 {n} 项到此目录…"),
+            (_, crate::i18n::Lang::En) => format!("Direct transfer of {n} item(s) into this folder…"),
+        };
+    }
+
+    /// 收尾直传在目标端（B）的镜像进度行：标记完成/失败；完成时进度拉满。
+    fn finish_mirror(sessions: &mut [Session], job: &DirectJob, ok: bool, msg: &str) {
+        if let Some(s) = sessions.iter_mut().find(|s| s.uid == job.dest_uid) {
+            if let Some(t) = s.transfers.iter_mut().find(|t| t.id == job.mir_id) {
+                t.ok = Some(ok);
+                t.message = msg.to_string();
+                if ok {
+                    t.done = t.total;
+                }
+            }
+        }
+    }
+
+    /// 推进直传任务：源会话上的直传传输完成 → 剪切则删源 + 刷新目标目录；失败 → 弹「转中转」提醒。
+    fn process_direct_jobs(&mut self) {
+        let mut i = 0;
+        while i < self.direct_jobs.len() {
+            let (src_uid, sid, dest_uid, mir_id) = {
+                let j = &self.direct_jobs[i];
+                (j.src_uid, j.id, j.dest_uid, j.mir_id)
+            };
+            let status = match self.transfer_ok(src_uid, sid) {
+                Some(ok) => Some(ok),
+                None if self.session_idx_by_uid(src_uid).is_none() => Some(false),
+                None => None,
+            };
+            match status {
+                None => {
+                    // 进行中：把源端（A）的真实进度同步到目标端（B）的镜像行
+                    if let Some((done, total)) = self.transfer_done_total(src_uid, sid) {
+                        if let Some(didx) = self.session_idx_by_uid(dest_uid) {
+                            if let Some(t) = self.sessions[didx].transfers.iter_mut().find(|t| t.id == mir_id && t.ok.is_none()) {
+                                t.total = total;
+                                t.done = done;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                Some(true) => {
+                    let job = self.direct_jobs.remove(i);
+                    // 目标端镜像行收尾为「完成」
+                    Self::finish_mirror(&mut self.sessions, &job, true, crate::i18n::tr("直传完成", "Direct transfer done"));
+                    // 剪切：直传成功后删源
+                    if job.is_cut {
+                        if let Some(sidx) = self.session_idx_by_uid(job.src_uid) {
+                            let paths: Vec<String> = job.items.iter().map(|(p, _)| p.clone()).collect();
+                            let _ = self.sessions[sidx].cmd_tx.send(UiCommand::DeleteMany { paths });
+                        }
+                    }
+                    // 刷新目标目录（直传不经目标会话，需主动让其重列目录）
+                    if let Some(didx) = self.session_idx_by_uid(job.dest_uid) {
+                        let _ = self.sessions[didx].cmd_tx.send(UiCommand::ListDir(job.dest_dir.clone()));
+                    }
+                }
+                Some(false) => {
+                    // 用户主动取消的不弹回退（与真失败区分）
+                    let canceled = self.session_idx_by_uid(src_uid)
+                        .and_then(|sidx| self.sessions[sidx].transfers.iter().find(|t| t.id == sid))
+                        .map(|t| t.message == crate::i18n::tr("已取消", "Canceled"))
+                        .unwrap_or(false);
+                    let job = self.direct_jobs.remove(i);
+                    // 目标端镜像行收尾为「失败/取消」
+                    Self::finish_mirror(&mut self.sessions, &job, false,
+                        if canceled { crate::i18n::tr("已取消", "Canceled") } else { crate::i18n::tr("直传失败", "Direct failed") });
+                    // 失败：弹「转中转」提醒，确认后走中转链路
+                    if !canceled && self.session_idx_by_uid(job.src_uid).is_some() && self.session_idx_by_uid(job.dest_uid).is_some() {
+                        self.pending_direct_fallback = Some(DirectFallback {
+                            plan: PendingPaste {
+                                items: job.items,
+                                is_cut: job.is_cut,
+                                cross: true,
+                                src_uid: job.src_uid,
+                                dest_uid: job.dest_uid,
+                                src_dir: job.src_dir,
+                                dest_dir: job.dest_dir,
+                                src_label: job.src_label,
+                                dest_label: job.dest_label,
+                                direct: false,
+                            },
+                            reason: crate::i18n::tr("直传失败（源主机无法直推到目标主机）。", "Direct transfer failed (source cannot push to target).").into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// 直传失败后的「必须改用中转」提醒弹框。
+    fn direct_fallback_dialog(&mut self, ctx: &egui::Context) {
+        let Some(fb) = self.pending_direct_fallback.as_ref() else { return };
+        let mut go = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("direct_fallback")).show(ctx, |ui| {
+            dialog_body(ui, |ui| {
+            ui.label(RichText::new(crate::i18n::tr("直传未成功，必须改用中转", "Direct transfer failed — relay is required")).size(16.0).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new(&fb.reason).color(Palette::DANGER).size(11.0));
+            ui.add_space(6.0);
+            // 源主机 + 源目录 → 目标主机 + 目标目录
+            ui.label(RichText::new(format!("{}  →  {}", fb.plan.src_label, fb.plan.dest_label)).color(Palette::TEXT).size(12.0).strong());
+            ui.label(RichText::new(format!("{}  →  {}", fb.plan.src_dir, fb.plan.dest_dir)).monospace().size(11.0).color(Palette::TEXT_DIM));
+            ui.add_space(6.0);
+            ui.label(RichText::new(crate::i18n::tr("将改为经本地「下载→上传」中转，较慢但最通用。", "Will switch to local download→upload relay; slower but most compatible.")).color(Palette::TEXT_DIM).size(11.0));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let bw = 110.0;
+                let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                if dialog_button(ui, crate::i18n::tr("改用中转", "Use relay"), Some(Palette::OK), bw) {
+                    go = true;
+                }
+                if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
+                    cancel = true;
+                }
+            });
+            });
+        });
+        if go {
+            if let Some(fb) = self.pending_direct_fallback.take() {
+                self.execute_paste(fb.plan);
+            }
+        } else if cancel {
+            self.pending_direct_fallback = None;
         }
     }
 }
@@ -1774,6 +2150,8 @@ impl eframe::App for App {
         }
         // 跨服务器中转任务推进（下载完→上传，上传完→剪切则删源）
         self.process_relays();
+        // 跨服务器直传任务推进（完成则删源/刷新；失败则弹「转中转」）
+        self.process_direct_jobs();
         for (path, data, server, uid) in new_images {
             self.image_focus = true; // 打开/切换后聚焦看图窗口
             // 同一会话同一图片已打开则切到该标签（身份用 uid，不用可能重名的 title）
@@ -2096,8 +2474,10 @@ impl eframe::App for App {
         // 关闭活动标签二次确认
         self.close_tab_dialog(&ctx);
 
-        // 粘贴二次确认（剪切 / 跨服务器）
+        // 粘贴确认（跨服务器：含「直传/中转」互斥选择）
         self.paste_confirm_dialog(&ctx);
+        // 直传失败后的「必须改用中转」提醒
+        self.direct_fallback_dialog(&ctx);
 
         // 命令片段库
         self.snippets_window(&ctx);
@@ -2233,49 +2613,82 @@ impl App {
         let Some(plan) = self.pending_paste.as_ref() else { return };
         let mut go = false;
         let mut cancel = false;
+        // 互斥选择的本地镜像（plan 已不可变借用 self，不能再借 self.confirm_direct）
+        let mut direct = self.confirm_direct;
+        let cross = plan.cross;
         egui::Modal::new(egui::Id::new("paste_confirm")).show(ctx, |ui| {
-            ui.set_width(420.0);
-            let n = plan.items.len();
-            let title = match (plan.is_cut, crate::i18n::current()) {
-                (true, crate::i18n::Lang::Zh) => format!("确认移动 {n} 项？"),
-                (false, crate::i18n::Lang::Zh) => format!("确认复制 {n} 项？"),
-                (true, crate::i18n::Lang::En) => format!("Move {n} item(s)?"),
-                (false, crate::i18n::Lang::En) => format!("Copy {n} item(s)?"),
-            };
-            ui.label(RichText::new(title).size(16.0).strong());
-            ui.add_space(6.0);
-            ui.label(RichText::new(format!("{}  →  {}", plan.src_label, plan.dest_label)).color(Palette::TEXT_DIM).size(12.0));
-            ui.label(RichText::new(&plan.dest_dir).monospace().size(11.0).color(Palette::TEXT_DIM));
-            if plan.cross {
+            dialog_body(ui, |ui| {
+                let n = plan.items.len();
+                let title = match (plan.is_cut, crate::i18n::current()) {
+                    (true, crate::i18n::Lang::Zh) => format!("确认移动 {n} 项？"),
+                    (false, crate::i18n::Lang::Zh) => format!("确认复制 {n} 项？"),
+                    (true, crate::i18n::Lang::En) => format!("Move {n} item(s)?"),
+                    (false, crate::i18n::Lang::En) => format!("Copy {n} item(s)?"),
+                };
+                ui.label(RichText::new(title).size(16.0).strong());
+                ui.add_space(8.0);
+                // 源主机 + 源目录
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(crate::i18n::tr("源", "From")).size(11.0).color(Palette::TEXT_DIM));
+                    ui.label(RichText::new(&plan.src_label).size(12.0).strong().color(Palette::TEXT));
+                });
+                ui.label(RichText::new(&plan.src_dir).monospace().size(11.0).color(Palette::TEXT_DIM));
                 ui.add_space(4.0);
-                ui.label(RichText::new(crate::i18n::tr("跨服务器：经本地中转「下载→上传」，大文件较慢。", "Cross-server: relayed via local download→upload; large files are slower.")).color(Palette::WARN).size(11.0));
-            }
-            if plan.is_cut {
-                ui.add_space(4.0);
-                ui.label(RichText::new(crate::i18n::tr("剪切为移动：复制成功后会从源删除，不可恢复。", "Cut = move: source is deleted after a successful copy. Irreversible.")).color(Palette::DANGER).size(11.0));
-            }
-            // 列出名称（最多 8 个）
-            ui.add_space(4.0);
-            let shown: Vec<String> = plan.items.iter().take(8).map(|(p, _)| p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p).to_string()).collect();
-            let more = if n > 8 { format!(" … (+{})", n - 8) } else { String::new() };
-            ui.label(RichText::new(format!("{}{}", shown.join("、"), more)).color(Palette::TEXT_DIM).size(11.0));
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let bw = 96.0;
-                let total = bw * 2.0 + ui.spacing().item_spacing.x;
-                ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                let confirm_label = if plan.is_cut { crate::i18n::tr("移动", "Move") } else { crate::i18n::tr("复制", "Copy") };
-                let confirm_col = if plan.is_cut { Palette::DANGER } else { Palette::ACCENT };
-                if dialog_button(ui, confirm_label, Some(confirm_col), bw) {
-                    go = true;
+                // 目标主机 + 粘贴目录
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(crate::i18n::tr("目标", "To")).size(11.0).color(Palette::TEXT_DIM));
+                    ui.label(RichText::new(&plan.dest_label).size(12.0).strong().color(Palette::TEXT));
+                });
+                ui.label(RichText::new(&plan.dest_dir).monospace().size(11.0).color(Palette::TEXT_DIM));
+                if plan.cross {
+                    ui.add_space(8.0);
+                    // 「直传 / 中转」互斥选择（默认直传）
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("方式", "Method")).size(11.0).color(Palette::TEXT_DIM));
+                        ui.selectable_value(&mut direct, true, RichText::new(crate::i18n::tr("直传", "Direct")).size(12.0));
+                        ui.selectable_value(&mut direct, false, RichText::new(crate::i18n::tr("中转", "Relay")).size(12.0));
+                    });
+                    let hint = if direct {
+                        crate::i18n::tr("源主机直推目标，数据不经本地（需目标会话为「无口令密钥」认证）。", "Source pushes straight to target, bypassing local (target must use a passphrase-less key).")
+                    } else {
+                        crate::i18n::tr("经本地「下载→上传」中转，最通用，大文件较慢。", "Relayed via local download→upload; most compatible, slower for large files.")
+                    };
+                    ui.label(RichText::new(hint).color(Palette::TEXT_DIM).size(11.0));
                 }
-                if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
-                    cancel = true;
+                if plan.is_cut {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(crate::i18n::tr("剪切为移动：复制成功后会从源删除，不可恢复。", "Cut = move: source is deleted after a successful copy. Irreversible.")).color(Palette::DANGER).size(11.0));
                 }
+                // 列出名称（最多 8 个）
+                ui.add_space(6.0);
+                let shown: Vec<String> = plan.items.iter().take(8).map(|(p, _)| p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p).to_string()).collect();
+                let more = if n > 8 { format!(" … (+{})", n - 8) } else { String::new() };
+                ui.label(RichText::new(format!("{}{}", shown.join("、"), more)).color(Palette::TEXT_DIM).size(11.0));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let bw = 96.0;
+                    let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                    ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                    let confirm_label = if plan.is_cut { crate::i18n::tr("移动", "Move") } else { crate::i18n::tr("复制", "Copy") };
+                    let confirm_col = if plan.is_cut { Palette::DANGER } else { Palette::ACCENT };
+                    if dialog_button(ui, confirm_label, Some(confirm_col), bw) {
+                        go = true;
+                    }
+                    if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
+                        cancel = true;
+                    }
+                });
             });
         });
+        // 记住本帧的互斥选择（跨帧保持，直到下次打开确认复位为直传）
+        if cross {
+            self.confirm_direct = direct;
+        }
         if go {
-            if let Some(plan) = self.pending_paste.take() {
+            if let Some(mut plan) = self.pending_paste.take() {
+                if plan.cross {
+                    plan.direct = direct; // 直传 / 中转 取自弹框里的互斥选择
+                }
                 self.execute_paste(plan);
             }
         } else if cancel {
@@ -3835,16 +4248,19 @@ impl App {
             return;
         }
         let Some(idx) = self.active else { return };
+        // 同一服务器（host:port）的所有会话：把它们的传输任务汇总到同一个列表里展示
+        let server_idxs = self.same_server_idxs(idx);
         let mut close_win = false;
         let mut clear = false;
         let mut cancel_all = false;
         let mut retry_all = false;
         let mut pick_dir = false;
-        let mut cancel_id: Option<u64> = None;
-        let mut toggle_err: Option<u64> = None;
-        let mut remove_id: Option<u64> = None;
-        let mut delete_id: Option<(u64, String)> = None;
-        let mut resume_id: Option<u64> = None;
+        // 动作均以 (会话 uid, 传输 id) 标识，确保多标签同服务器时路由到正确的会话 worker
+        let mut cancel_id: Option<(u64, u64)> = None;
+        let mut toggle_err: Option<(u64, u64)> = None;
+        let mut remove_id: Option<(u64, u64)> = None;
+        let mut delete_id: Option<(u64, u64, String)> = None;
+        let mut resume_id: Option<(u64, u64)> = None;
         let mut cycle_policy = false;
         let dl_dir = self.download_dir.to_string_lossy().into_owned();
         // 冲突策略短标签（中/英）+ 按策略区分的图标，用于标题栏按钮显示
@@ -3901,16 +4317,17 @@ impl App {
                 // 状态筛选：紧凑的 frameless 文字 chips（带计数），仅在有任务时显示——
                 // 避免空列表时占位、也避免大按钮 + 多余分隔线让顶部拥挤。
                 // 先在借用 s 之前算各状态计数（借用随即结束），再据此渲染并允许改 self.xfer_filter。
-                let counts = self
-                    .sessions
-                    .get(idx)
-                    .map(|s| {
-                        let active = s.transfers.iter().filter(|t| t.ok.is_none()).count();
-                        let done = s.transfers.iter().filter(|t| t.ok == Some(true)).count();
-                        let failed = s.transfers.iter().filter(|t| t.ok == Some(false)).count();
-                        (s.transfers.len(), active, done, failed)
-                    })
-                    .unwrap_or((0, 0, 0, 0));
+                let counts = server_idxs.iter().filter_map(|&i| self.sessions.get(i)).fold(
+                    (0usize, 0usize, 0usize, 0usize),
+                    |(tot, act, dn, fl), s| {
+                        (
+                            tot + s.transfers.len(),
+                            act + s.transfers.iter().filter(|t| t.ok.is_none()).count(),
+                            dn + s.transfers.iter().filter(|t| t.ok == Some(true)).count(),
+                            fl + s.transfers.iter().filter(|t| t.ok == Some(false)).count(),
+                        )
+                    },
+                );
                 if counts.0 > 0 {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 9.0;
@@ -3942,8 +4359,14 @@ impl App {
                 }
                 let filter = self.xfer_filter;
 
-                let Some(s) = self.sessions.get(idx) else { return };
-                if s.transfers.is_empty() {
+                // 汇总同服务器所有会话的传输（活动会话在前，各自新→旧），元素为 (会话 uid, &Transfer)
+                let items: Vec<(u64, &Transfer)> = server_idxs
+                    .iter()
+                    .filter_map(|&i| self.sessions.get(i))
+                    .flat_map(|s| s.transfers.iter().rev().map(move |t| (s.uid, t)))
+                    .collect();
+                let total_len = items.len();
+                if total_len == 0 {
                     ui.add_space(6.0);
                     ui.label(RichText::new(crate::i18n::tr("暂无传输任务", "No transfers")).color(Palette::TEXT_DIM).size(12.0));
                 }
@@ -3951,7 +4374,7 @@ impl App {
                 let mut shown = 0usize; // 当前筛选下实际展示的条数（用于「无匹配」提示）
                 // 列表过长时滚动：约 8 条高度封顶，其余可滚动查看
                 egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true]).show(ui, |ui| {
-                for t in s.transfers.iter().rev().filter(|t| match filter {
+                for (uid, t) in items.iter().copied().filter(|(_, t)| match filter {
                     XferFilter::All => true,
                     XferFilter::Active => t.ok.is_none(),
                     XferFilter::Done => t.ok == Some(true),
@@ -3988,14 +4411,14 @@ impl App {
                                             .on_hover_text(crate::i18n::tr("点击查看失败原因", "Click for reason"))
                                             .clicked()
                                         {
-                                            toggle_err = Some(t.id);
+                                            toggle_err = Some((uid, t.id));
                                         }
                                         if t.spec.is_some()
                                             && ui.add(egui::Button::new(RichText::new(icon::ARROW_CLOCKWISE).color(Palette::ACCENT).size(13.0)).frame(false))
                                                 .on_hover_text(crate::i18n::tr("重试", "Retry"))
                                                 .clicked()
                                         {
-                                            resume_id = Some(t.id);
+                                            resume_id = Some((uid, t.id));
                                         }
                                     }
                                     None if t.paused => {
@@ -4004,8 +4427,14 @@ impl App {
                                             .on_hover_text(crate::i18n::tr("续传", "Resume"))
                                             .clicked()
                                         {
-                                            resume_id = Some(t.id);
+                                            resume_id = Some((uid, t.id));
                                         }
+                                    }
+                                    None if t.queued => {
+                                        // 等待态（中转目标端，正等源端下载）：时钟图标 + 转圈，不提供取消（受中转任务管控）
+                                        ui.label(RichText::new(icon::CLOCK).color(Palette::TEXT_DIM).size(13.0))
+                                            .on_hover_text(crate::i18n::tr("等待中", "Waiting"));
+                                        ui.spinner();
                                     }
                                     None => {
                                         // 进行中：取消按钮 + 转圈
@@ -4013,7 +4442,7 @@ impl App {
                                             .on_hover_text(crate::i18n::tr("取消", "Cancel"))
                                             .clicked()
                                         {
-                                            cancel_id = Some(t.id);
+                                            cancel_id = Some((uid, t.id));
                                         }
                                         ui.spinner();
                                     }
@@ -4036,11 +4465,16 @@ impl App {
                             let rect = bar_resp.rect;
                             let p = ui.painter_at(rect);
                             let font = egui::FontId::proportional(10.0);
-                            // 大小靠左
+                            // 大小靠左；有模式徽标（如「直传」）时显示在文件大小之后
+                            let left_label = if t.tag.is_empty() {
+                                crate::ui::fmt_bytes(t.total as f64)
+                            } else {
+                                format!("{} · {}", crate::ui::fmt_bytes(t.total as f64), t.tag)
+                            };
                             p.text(
                                 egui::pos2(rect.left() + 6.0, rect.center().y),
                                 egui::Align2::LEFT_CENTER,
-                                crate::ui::fmt_bytes(t.total as f64),
+                                left_label,
                                 font.clone(),
                                 egui::Color32::WHITE,
                             );
@@ -4055,16 +4489,26 @@ impl App {
                         }
                         // 进行中才显示详情行（已传/总量 + 实时速度）；完成后不再单独一行
                         if t.ok.is_none() {
-                            let mut detail = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
-                            if t.speed > 0.0 {
-                                detail.push_str(&format!("  ·  {}", crate::ui::fmt_rate(t.speed)));
-                                // ETA：剩余字节 / 当前速度（仅未暂停、有剩余、速度有效时）
-                                if !t.paused && t.total > t.done {
-                                    let eta = ((t.total - t.done) as f64 / t.speed).round() as u64;
-                                    detail.push_str(&format!("  ·  {} {}", crate::i18n::tr("剩余", "ETA"), fmt_dur(eta)));
+                            // 有阶段提示（打包/解包/等待/直传）时优先显示提示，替代字节读数——
+                            // 这些阶段没有逐字节进度，显示「0 B / 0 B」会误导。
+                            if !t.note.is_empty() {
+                                ui.label(RichText::new(&t.note).size(10.0).color(Palette::TEXT_DIM));
+                            } else {
+                                let mut detail = format!("{} / {}", crate::ui::fmt_bytes(t.done as f64), crate::ui::fmt_bytes(t.total as f64));
+                                // 模式徽标（如「直传」）紧跟在文件大小之后
+                                if !t.tag.is_empty() {
+                                    detail.push_str(&format!("  ·  {}", t.tag));
                                 }
+                                if t.speed > 0.0 {
+                                    detail.push_str(&format!("  ·  {}", crate::ui::fmt_rate(t.speed)));
+                                    // ETA：剩余字节 / 当前速度（仅未暂停、有剩余、速度有效时）
+                                    if !t.paused && t.total > t.done {
+                                        let eta = ((t.total - t.done) as f64 / t.speed).round() as u64;
+                                        detail.push_str(&format!("  ·  {} {}", crate::i18n::tr("剩余", "ETA"), fmt_dur(eta)));
+                                    }
+                                }
+                                ui.label(RichText::new(detail).size(10.0).color(Palette::TEXT_DIM));
                             }
-                            ui.label(RichText::new(detail).size(10.0).color(Palette::TEXT_DIM));
                         }
                         // 失败且已展开：显示失败原因
                         if t.ok == Some(false) && t.show_err && !t.message.is_empty() {
@@ -4080,12 +4524,12 @@ impl App {
                             }
                         }
                         if ui.button(crate::i18n::tr("删除记录", "Remove from list")).clicked() {
-                            remove_id = Some(t.id);
+                            remove_id = Some((uid, t.id));
                             ui.close();
                         }
                         if let Some(local) = &t.local {
                             if ui.button(RichText::new(crate::i18n::tr("删除文件并移除记录", "Delete file & remove")).color(Palette::DANGER)).clicked() {
-                                delete_id = Some((t.id, local.clone()));
+                                delete_id = Some((uid, t.id, local.clone()));
                                 ui.close();
                             }
                         }
@@ -4093,7 +4537,7 @@ impl App {
                     ui.add_space(4.0);
                 }
                 // 有任务但当前筛选下一条都没有：给出「无匹配」提示，避免看着像空列表
-                if shown == 0 && !s.transfers.is_empty() {
+                if shown == 0 && total_len > 0 {
                     ui.add_space(6.0);
                     ui.label(RichText::new(crate::i18n::tr("该筛选下暂无任务", "No transfers match this filter")).color(Palette::TEXT_DIM).size(12.0));
                 }
@@ -4101,12 +4545,12 @@ impl App {
                 if let Some(p) = open_dir {
                     open_containing_folder(&p);
                 }
-                if !s.transfers.is_empty() {
+                if total_len > 0 {
                     ui.separator();
                     // 批量操作：仅在对应状态存在时显示，避免无意义按钮
-                    let any_active = s.transfers.iter().any(|t| t.ok.is_none());
-                    let any_failed = s.transfers.iter().any(|t| t.ok == Some(false) && t.spec.is_some());
-                    let any_done = s.transfers.iter().any(|t| t.ok.is_some());
+                    let any_active = items.iter().any(|(_, t)| t.ok.is_none());
+                    let any_failed = items.iter().any(|(_, t)| t.ok == Some(false) && t.spec.is_some());
+                    let any_done = items.iter().any(|(_, t)| t.ok.is_some());
                     ui.horizontal(|ui| {
                         if any_active && ui.button(crate::i18n::tr("全部取消", "Cancel all")).clicked() {
                             cancel_all = true;
@@ -4121,58 +4565,65 @@ impl App {
                 }
             });
         if clear {
-            if let Some(s) = self.sessions.get_mut(idx) {
-                s.transfers.retain(|t| t.ok.is_none());
+            for &i in &server_idxs {
+                if let Some(s) = self.sessions.get_mut(i) {
+                    s.transfers.retain(|t| t.ok.is_none());
+                }
             }
         }
-        // 全部取消：对所有进行中的任务下发取消
+        // 全部取消：对同服务器所有会话里进行中的任务下发取消
         if cancel_all {
-            if let Some(s) = self.sessions.get(idx) {
-                let ids: Vec<u64> = s.transfers.iter().filter(|t| t.ok.is_none()).map(|t| t.id).collect();
-                for id in ids {
-                    let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
+            for &i in &server_idxs {
+                if let Some(s) = self.sessions.get(i) {
+                    let ids: Vec<u64> = s.transfers.iter().filter(|t| t.ok.is_none()).map(|t| t.id).collect();
+                    for id in ids {
+                        let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
+                    }
                 }
             }
             self.xfer_just_opened = true;
         }
-        // 重试全部失败：对每个有重发规格的失败任务重新发起（续传语义，覆盖）
+        // 重试全部失败：对同服务器各会话每个有重发规格的失败任务重新发起（续传语义，覆盖）
         if retry_all {
-            if let Some(s) = self.sessions.get_mut(idx) {
-                let targets: Vec<(u64, XferSpec)> = s
-                    .transfers
-                    .iter()
-                    .filter(|t| t.ok == Some(false))
-                    .filter_map(|t| t.spec.clone().map(|sp| (t.id, sp)))
-                    .collect();
-                for (id, spec) in targets {
-                    match spec {
-                        XferSpec::Download { remote, local } => {
-                            let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy: ConflictPolicy::Overwrite });
+            for &i in &server_idxs {
+                if let Some(s) = self.sessions.get_mut(i) {
+                    let targets: Vec<(u64, XferSpec)> = s
+                        .transfers
+                        .iter()
+                        .filter(|t| t.ok == Some(false))
+                        .filter_map(|t| t.spec.clone().map(|sp| (t.id, sp)))
+                        .collect();
+                    for (id, spec) in targets {
+                        match spec {
+                            XferSpec::Download { remote, local } => {
+                                let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy: ConflictPolicy::Overwrite });
+                            }
+                            XferSpec::Upload { local, remote_dir } => {
+                                let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy: ConflictPolicy::Overwrite });
+                            }
                         }
-                        XferSpec::Upload { local, remote_dir } => {
-                            let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy: ConflictPolicy::Overwrite });
+                        if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+                            t.ok = None;
+                            t.paused = false;
+                            t.show_err = false;
+                            t.message = crate::i18n::tr("重试中 …", "Retrying …").into();
                         }
-                    }
-                    if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
-                        t.ok = None;
-                        t.paused = false;
-                        t.show_err = false;
-                        t.message = crate::i18n::tr("重试中 …", "Retrying …").into();
                     }
                 }
             }
             self.xfer_just_opened = true;
         }
-        // 取消传输：向 worker 发送取消指令
-        if let Some(id) = cancel_id {
-            if let Some(s) = self.sessions.get(idx) {
+        // 取消传输：路由到该任务所属会话的 worker
+        if let Some((uid, id)) = cancel_id {
+            if let Some(s) = self.session_idx_by_uid(uid).and_then(|i| self.sessions.get(i)) {
                 let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
             }
             self.xfer_just_opened = true; // 避免点击被当作窗外点击而关窗
         }
         // 续传/重试：按重发规格重新发起，底层据已有字节自动续传
-        if let Some(id) = resume_id {
-            if let Some(s) = self.sessions.get_mut(idx) {
+        if let Some((uid, id)) = resume_id {
+            if let Some(i) = self.session_idx_by_uid(uid) {
+                let s = &mut self.sessions[i];
                 if let Some(spec) = s.transfers.iter().find(|t| t.id == id).and_then(|t| t.spec.clone()) {
                     match spec {
                         XferSpec::Download { remote, local } => { let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy: ConflictPolicy::Overwrite }); }
@@ -4189,26 +4640,26 @@ impl App {
             self.xfer_just_opened = true;
         }
         // 切换失败原因展开
-        if let Some(id) = toggle_err {
-            if let Some(s) = self.sessions.get_mut(idx) {
-                if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+        if let Some((uid, id)) = toggle_err {
+            if let Some(i) = self.session_idx_by_uid(uid) {
+                if let Some(t) = self.sessions[i].transfers.iter_mut().find(|t| t.id == id) {
                     t.show_err = !t.show_err;
                 }
             }
             self.xfer_just_opened = true;
         }
         // 删除记录（仅移除列表项）
-        if let Some(id) = remove_id {
-            if let Some(s) = self.sessions.get_mut(idx) {
-                s.transfers.retain(|t| t.id != id);
+        if let Some((uid, id)) = remove_id {
+            if let Some(i) = self.session_idx_by_uid(uid) {
+                self.sessions[i].transfers.retain(|t| t.id != id);
             }
             self.xfer_just_opened = true;
         }
         // 删除文件并移除记录
-        if let Some((id, path)) = delete_id {
+        if let Some((uid, id, path)) = delete_id {
             let _ = std::fs::remove_file(&path);
-            if let Some(s) = self.sessions.get_mut(idx) {
-                s.transfers.retain(|t| t.id != id);
+            if let Some(i) = self.session_idx_by_uid(uid) {
+                self.sessions[i].transfers.retain(|t| t.id != id);
             }
             self.xfer_just_opened = true;
         }
@@ -4401,6 +4852,17 @@ impl App {
             self.reconnect_session(idx);
         }
     }
+}
+
+/// 弹框内容统一包裹：固定宽度 + 内边距，避免文字直接贴到窗口边缘不美观。
+fn dialog_body<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(420.0);
+            add(ui)
+        })
+        .inner
 }
 
 /// 扁平按钮（无边框、悬停高亮），用于标签栏等处。

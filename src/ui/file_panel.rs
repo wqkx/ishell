@@ -23,6 +23,8 @@ pub struct FilePanelState {
     pub expanded: HashSet<String>,
     /// 正在加载的目录
     pub loading: HashSet<String>,
+    /// 列目录失败（无效/无权限）的路径集合：路径栏据此在最右侧显示「路径无效」标识
+    pub nav_error: HashSet<String>,
     /// 右栏当前选中的行索引（支持多选）
     pub selected: HashSet<usize>,
     /// 区间选择的锚点行
@@ -249,10 +251,19 @@ impl FilePanelState {
     /// 收到目录列表后由 App 调用：写入缓存并清除 loading；首次自动设为 cwd。
     pub fn on_listing(&mut self, path: String, entries: Vec<FileEntry>) {
         self.loading.remove(&path);
+        self.nav_error.remove(&path); // 列出成功 → 清除该路径的「无效」标记
         self.listings.insert(path.clone(), entries);
         if self.cwd.is_empty() {
             self.cwd = path;
         }
+    }
+
+    /// 列目录失败（无效/无权限路径）由 App 调用：标记该路径无效，并写入空列表占位
+    /// 以避免每帧重复发起 List 请求（与空目录区分仅靠 nav_error）。
+    pub fn on_list_failed(&mut self, path: String) {
+        self.loading.remove(&path);
+        self.nav_error.insert(path.clone());
+        self.listings.insert(path, Vec::new());
     }
 }
 
@@ -494,7 +505,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     // 工具栏：扁平图标条（带浅色背景）
     use egui_phosphor::regular as icon;
     let mut bc_nav: Option<String> = None;
-    let mut paste_here = false; // 工具栏/菜单粘贴触发（has_clip 由 App 传入）
+    let mut paste_here = false; // 右键菜单「粘贴到此目录」触发（has_clip 由 App 传入）
     // 弹簧式拖拽导航：本帧拖拽悬停的目标目录（Up 按钮的上一层 / 某文件夹），统一计时跳转
     let mut spring_target: Option<String> = None;
     // 拖到「上级目录」按钮上释放的移动（与文件夹落点统一在表格后处理，便于记录撤销）
@@ -528,13 +539,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     state.selected.clear();
                 }
                 handle_up_drag(ui, state, &up_resp, &mut up_move, &mut spring_target);
-                // 上传 / 删除已从工具栏移除：上传走拖拽或空白处右键菜单，删除走右键菜单或 Delete 键
-                // 粘贴：剪贴板有内容时显示（内容/数量由 App 持有）
-                if has_clip
-                    && tool_btn_color(ui, icon::CLIPBOARD_TEXT, crate::i18n::tr("粘贴到此目录", "Paste here"), Palette::ACCENT)
-                {
-                    paste_here = true;
-                }
+                // 上传 / 删除 / 粘贴均不放工具栏：上传走拖拽或空白处右键菜单，删除走右键菜单或 Delete 键，
+                // 粘贴走空白处右键菜单「粘贴到此目录」（保持工具栏精简）
                 // 复制路径：点击后短暂显示绿色对勾，再恢复
                 let now = ui.input(|i| i.time);
                 let copied = state.copy_flash.is_some_and(|t| now - t < 1.1);
@@ -620,6 +626,15 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
 
                 ui.add_space(4.0);
                 ui.separator();
+                // 路径栏最右侧：当前目录列举失败（无效/无权限路径）时显示「路径无效」标识
+                let path_err = state.nav_error.contains(&state.cwd) && !state.loading.contains(&state.cwd);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                  if path_err {
+                      ui.add(egui::Label::new(RichText::new(icon::WARNING_CIRCLE).color(Palette::DANGER).size(15.0)).sense(Sense::hover()))
+                          .on_hover_text(crate::i18n::tr("路径无效或无法访问", "Invalid or inaccessible path"));
+                      ui.add_space(3.0);
+                  }
+                  ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if state.path_edit.is_some() {
                     // 路径编辑模式：回车跳转、Esc 或点击别处退出
                     let mut go: Option<String> = None;
@@ -726,6 +741,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                         }
                     }
                 }
+                  }); // 内层 left_to_right（面包屑/编辑框）
+                }); // 外层 right_to_left（右侧无效标识）
             });
         });
     ui.add_space(2.0);

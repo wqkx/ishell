@@ -93,6 +93,10 @@ pub enum UiCommand {
     Rename { from: String, to: String },
     /// 远端批量复制 / 移动到目标目录（经 shell 执行 cp -a / mv）
     CopyMove { srcs: Vec<String>, dest_dir: String, do_move: bool },
+    /// 跨主机「直传」：在源主机上直接用 rsync/scp 把 srcs 推到目标主机 dest（数据不经本地）。
+    /// 仅目标为「无口令密钥」认证时可用；key_path 为本地（本进程可直接读）的 B 私钥路径，
+    /// worker 会临时上传到源主机 /tmp（0600）供 ssh 使用、用完即删。失败由上层提示转中转。
+    DirectTransfer(Box<DirectSpec>),
     /// 键盘交互认证：用户对服务器提示的逐项回答（顺序与 prompts 一致）
     KbdResponse(Vec<String>),
     /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制。id 关联占位标签的下载进度
@@ -112,6 +116,24 @@ pub enum UiCommand {
     RemoveForward(u64),
     /// 主动断开
     Disconnect,
+}
+
+/// 跨主机直传的目标主机参数（由 UI 据目标会话配置构造，交源会话 worker 执行）。
+#[derive(Clone, Debug)]
+pub struct DirectSpec {
+    /// 源会话里登记的传输 id（进度/完成事件回到源会话）
+    pub id: u64,
+    /// 源主机上的待传绝对路径
+    pub srcs: Vec<String>,
+    pub dest_user: String,
+    pub dest_host: String,
+    pub dest_port: u16,
+    /// 目标主机上的目标目录
+    pub dest_dir: String,
+    /// 本地 B 私钥文件路径（worker 同进程可直接读，再临时投放到源主机）
+    pub key_path: String,
+    /// 展示名（首个条目名 + 数量），用于传输行标题
+    pub label: String,
 }
 
 /// 端口转发类型。
@@ -148,6 +170,8 @@ pub enum WorkerEvent {
     SysInfo(Box<SysInfo>),
     /// 目录列表结果
     DirListing { path: String, entries: Vec<FileEntry> },
+    /// 目录列举失败（无效/无权限路径）：UI 据此在路径栏标记该路径无效，并清除 loading
+    DirListFailed { path: String, message: String },
     /// 未知主机请 UI 确认指纹（TOFU）；changed=true 表示主机密钥**已变更**（更危险）
     HostKeyPrompt { host: String, fingerprint: String, changed: bool },
     /// 键盘交互认证：服务器下发一组提示，请 UI 收集回答后回 `KbdResponse`
@@ -172,6 +196,9 @@ pub enum WorkerEvent {
     TransferStart { id: u64, name: String, total: u64, dir: TransferDir, local: Option<String> },
     /// 传输进度（已完成字节）
     TransferProgress { id: u64, done: u64 },
+    /// 传输阶段提示（如「打包中…」「解包中…」「直传中…」）；空串表示清除提示。
+    /// 在传输进行中（ok=None）于详情行替代字节读数显示，让长耗时的非传输阶段对用户可见。
+    TransferNote { id: u64, note: String },
     /// 传输结束
     TransferDone { id: u64, ok: bool, message: String, refresh_dir: Option<String> },
     /// 进程详情返回
