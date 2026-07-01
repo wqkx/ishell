@@ -1097,8 +1097,36 @@ async fn download_dir_compressed(
     Ok(())
 }
 
+/// 把一组路径用 POSIX 单引号转义后空格拼接（末尾带一个空格），用于安全嵌入 shell 命令。
+fn join_quoted(items: &[String]) -> String {
+    let mut s = String::new();
+    for p in items {
+        s.push_str(&sh_quote(p));
+        s.push(' ');
+    }
+    s
+}
+
+/// 直传临时私钥目录的清理守卫：无论正常返回、`?` 早退，还是被取消（future 被 drop），
+/// Drop 时都异步清除源主机上的临时私钥目录——避免目标主机私钥残留在源主机（凭据泄露）。
+/// 取消路径下本函数栈已被展开，无法 `.await`，故 detach 一个清理任务到当前运行时。
+struct TmpKeyGuard {
+    handle: Arc<Handle<ClientHandler>>,
+    dir: String,
+}
+
+impl Drop for TmpKeyGuard {
+    fn drop(&mut self) {
+        let handle = self.handle.clone();
+        let d = sh_quote(&self.dir);
+        tokio::spawn(async move {
+            let _ = exec_status(&handle, &format!("shred -uf {d}/key 2>/dev/null; rm -rf {d}")).await;
+        });
+    }
+}
+
 /// 跨主机「直传」：在源主机上用 rsync（无则 scp）把 srcs 直接推到目标主机，数据不经本地。
-/// 目标认证仅支持「无口令密钥」：把 B 私钥临时投放到源主机 /tmp（0600），传完即删。
+/// 目标认证仅支持「无口令密钥」：把 B 私钥临时投放到源主机 0700 私有目录，传完/取消即清（见 TmpKeyGuard）。
 /// 任一步失败都回报失败，由上层弹「转中转」提醒。
 async fn direct_transfer(
     handle: Arc<Handle<ClientHandler>>,
@@ -1132,11 +1160,7 @@ async fn direct_transfer(
 
 /// 用 du 估算一组源路径的总字节（grand total 行）；失败返回 0（进度条退化为不确定）。
 async fn direct_total_bytes(handle: &Handle<ClientHandler>, srcs: &[String]) -> u64 {
-    let mut q = String::new();
-    for p in srcs {
-        q.push_str(&sh_quote(p));
-        q.push(' ');
-    }
+    let q = join_quoted(srcs);
     // -s 汇总、-b 字节、-c 末尾输出 total 行；取 total 行的首列
     let out = exec_capture(handle, &format!("du -sbc -- {q}2>/dev/null | tail -1")).await.unwrap_or_default();
     out.split_whitespace().next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0)
@@ -1154,47 +1178,48 @@ async fn direct_transfer_inner(
         crate::i18n::Lang::Zh => format!("读取目标私钥失败：{e}"),
         crate::i18n::Lang::En => format!("Read target key failed: {e}"),
     }))?;
-    // 2) 临时投放到源主机 /tmp（随机名 + 立即 chmod 600，避免被同机其他用户读取）
-    let tmp_key = format!("/tmp/.ishell_key_{}_{}", spec.id, rand_hex(8));
+    // 2) 先建 0700 私有目录（mkdir -m 700 在创建时即定权，杜绝「写入→改权」之间的可读窗口），
+    //    密钥放其中。TmpKeyGuard 保证正常/失败/取消(future 被 drop) 各路径都清理该目录。
+    let tmp_dir = format!("/tmp/.ishell_kd_{}_{}", spec.id, rand_hex(8));
+    if !matches!(exec_status(handle, &format!("mkdir -m 700 {}", sh_quote(&tmp_dir))).await, Ok((0, _))) {
+        anyhow::bail!("{}", match crate::i18n::current() {
+            crate::i18n::Lang::Zh => "创建临时密钥目录失败".to_string(),
+            crate::i18n::Lang::En => "Create temp key dir failed".to_string(),
+        });
+    }
+    let _key_guard = TmpKeyGuard { handle: handle.clone(), dir: tmp_dir.clone() };
+    let tmp_key = format!("{tmp_dir}/key");
     sftp_overwrite(sftp, &tmp_key, &key_bytes).await.map_err(|e| anyhow::anyhow!("{}", match crate::i18n::current() {
         crate::i18n::Lang::Zh => format!("投放临时密钥失败：{e}"),
         crate::i18n::Lang::En => format!("Place temp key failed: {e}"),
     }))?;
-    let _ = exec_status(handle, &format!("chmod 600 {}", sh_quote(&tmp_key))).await;
+    let _ = exec_status(handle, &format!("chmod 600 {}", sh_quote(&tmp_key))).await; // 纵深防御（目录已 700）
 
     // 3) 拼接源路径与目标
-    let mut srcs = String::new();
-    for p in &spec.srcs {
-        srcs.push_str(&sh_quote(p));
-        srcs.push(' ');
-    }
+    let srcs = join_quoted(&spec.srcs);
     // 目标强制以 "/" 结尾，令 rsync/scp 把源放「入目录」而非改名
     let dest = sh_quote(&format!("{}@{}:{}/", spec.dest_user, spec.dest_host, spec.dest_dir));
-    // 非交互 ssh 选项：禁用 B 的主机密钥校验与 known_hosts（直传为便捷功能，opt-in）
+    // 非交互 ssh 选项：用 accept-new（TOFU：首次记录、之后校验源主机上的 known_hosts），
+    // 比 StrictHostKeyChecking=no 安全——重复直传能发现目标主机密钥被替换（MITM）。
     let ssh_opt = format!(
-        "ssh -p {} -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=15",
+        "ssh -p {} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15",
         spec.dest_port, sh_quote(&tmp_key)
     );
 
-    // 4) 优先 rsync（可解析百分比进度、可续传）；缺失则回退 scp（仅 spinner）
+    // 4) 优先 rsync（可解析进度、可续传）；缺失则回退 scp（仅 spinner）
     let has_rsync = matches!(exec_status(handle, "command -v rsync >/dev/null 2>&1").await, Ok((0, _)));
     let cmd = if has_rsync {
         format!("rsync -a --info=progress2 -e {} -- {}{}", sh_quote(&ssh_opt), srcs, dest)
     } else {
         // scp 用大写 -P 指定端口；其余 ssh 选项同样适用
         format!(
-            "scp -P {} -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=15 -r -- {}{}",
+            "scp -P {} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -r -- {}{}",
             spec.dest_port, sh_quote(&tmp_key), srcs, dest
         )
     };
 
-    let run = exec_direct_progress(handle, &cmd, spec.id, sink, cancel).await;
-
-    // 5) 无论成败，清除源主机上的临时私钥（shred 优先，回退 rm）
-    let q = sh_quote(&tmp_key);
-    let _ = exec_status(handle, &format!("shred -u {q} 2>/dev/null || rm -f {q}")).await;
-
-    let (code, err) = run?;
+    // 临时私钥的清理交由 _key_guard 在作用域结束（含取消时的 future drop）异步完成
+    let (code, err) = exec_direct_progress(handle, &cmd, spec.id, sink, cancel).await?;
     if code != 0 {
         let reason = err.trim();
         anyhow::bail!("{}", match crate::i18n::current() {

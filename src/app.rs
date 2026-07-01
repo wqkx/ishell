@@ -228,6 +228,8 @@ struct DirectJob {
     items: Vec<(String, bool)>,
     src_label: String,
     dest_label: String,
+    /// 用户主动取消（经取消按钮标记）：失败收尾时据此跳过「转中转」提醒，避免误弹
+    cancelled: bool,
 }
 
 /// 直传失败后，等待用户确认「转中转」的计划 + 失败原因。
@@ -765,8 +767,8 @@ pub struct App {
     confirm_direct: bool,
     /// 进行中的直传任务追踪（成功删源/刷新；失败弹回退）
     direct_jobs: Vec<DirectJob>,
-    /// 直传失败、待确认「转中转」的计划 + 原因
-    pending_direct_fallback: Option<DirectFallback>,
+    /// 直传失败、待确认「转中转」的计划 + 原因（队列：多个失败依次弹，避免同帧互相覆盖）
+    pending_direct_fallback: Vec<DirectFallback>,
     /// 命令片段库（snippets）窗口 + 数据 + 编辑缓冲
     show_snippets: bool,
     /// 片段浮窗刚打开（本帧跳过"点击外部关闭"判定）
@@ -995,7 +997,7 @@ impl App {
             relay_seq: 0,
             confirm_direct: true,
             direct_jobs: Vec::new(),
-            pending_direct_fallback: None,
+            pending_direct_fallback: Vec::new(),
             show_snippets: false,
             snip_just_opened: false,
             snippets: crate::store::load_snippets(),
@@ -1713,6 +1715,22 @@ impl App {
         self.sessions[si].transfers.iter().find(|t| t.id == id).and_then(|t| t.ok)
     }
 
+    /// 取消目标解析：若 (uid,id) 命中某直传任务（源行或目标镜像行），标记该任务「已取消」
+    /// 并返回源端真实传输 (src_uid, id)；否则原样返回。使镜像行的取消也能真正生效，
+    /// 且用 cancelled 标记替代脆弱的取消文案比对（见 process_direct_jobs）。
+    fn cancel_target(&mut self, uid: u64, id: u64) -> (u64, u64) {
+        if let Some(j) = self
+            .direct_jobs
+            .iter_mut()
+            .find(|j| (j.src_uid == uid && j.id == id) || (j.dest_uid == uid && j.mir_id == id))
+        {
+            j.cancelled = true;
+            (j.src_uid, j.id)
+        } else {
+            (uid, id)
+        }
+    }
+
     /// 查询某会话某传输的 (已传, 总量)（用于把源端下载进度反映到目标端「等待」行）。
     fn transfer_done_total(&self, uid: u64, id: u64) -> Option<(u64, u64)> {
         let si = self.session_idx_by_uid(uid)?;
@@ -1845,7 +1863,7 @@ impl App {
             crate::proto::AuthMethod::KeyFile { path, passphrase } if passphrase.as_deref().map(|s| s.is_empty()).unwrap_or(true) => path.clone(),
             _ => {
                 // 直传不可用（密码/agent/交互/口令密钥）：直接进入「转中转」提醒
-                self.pending_direct_fallback = Some(DirectFallback {
+                self.pending_direct_fallback.push(DirectFallback {
                     plan: PendingPaste { direct: false, ..plan.clone() },
                     reason: crate::i18n::tr(
                         "目标会话非「无口令密钥」认证，无法直传。",
@@ -1901,6 +1919,7 @@ impl App {
             items: plan.items.clone(),
             src_label: plan.src_label.clone(),
             dest_label: plan.dest_label.clone(),
+            cancelled: false,
         });
         self.show_transfers = true;
         self.xfer_just_opened = true;
@@ -1973,18 +1992,16 @@ impl App {
                     }
                 }
                 Some(false) => {
-                    // 用户主动取消的不弹回退（与真失败区分）
-                    let canceled = self.session_idx_by_uid(src_uid)
-                        .and_then(|sidx| self.sessions[sidx].transfers.iter().find(|t| t.id == sid))
-                        .map(|t| t.message == crate::i18n::tr("已取消", "Canceled"))
-                        .unwrap_or(false);
                     let job = self.direct_jobs.remove(i);
+                    // 用户主动取消（取消按钮已置 job.cancelled）不弹回退；据此与真失败区分，
+                    // 不再靠比对本地化的「已取消」文案（脆弱：worker 可能回报「直传失败（码 -1）」）。
+                    let cancelled = job.cancelled;
                     // 目标端镜像行收尾为「失败/取消」
                     Self::finish_mirror(&mut self.sessions, &job, false,
-                        if canceled { crate::i18n::tr("已取消", "Canceled") } else { crate::i18n::tr("直传失败", "Direct failed") });
-                    // 失败：弹「转中转」提醒，确认后走中转链路
-                    if !canceled && self.session_idx_by_uid(job.src_uid).is_some() && self.session_idx_by_uid(job.dest_uid).is_some() {
-                        self.pending_direct_fallback = Some(DirectFallback {
+                        if cancelled { crate::i18n::tr("已取消", "Canceled") } else { crate::i18n::tr("直传失败", "Direct failed") });
+                    // 真失败：入队「转中转」提醒，确认后走中转链路（队列避免多任务同帧互相覆盖）
+                    if !cancelled && self.session_idx_by_uid(job.src_uid).is_some() && self.session_idx_by_uid(job.dest_uid).is_some() {
+                        self.pending_direct_fallback.push(DirectFallback {
                             plan: PendingPaste {
                                 items: job.items,
                                 is_cut: job.is_cut,
@@ -2007,7 +2024,7 @@ impl App {
 
     /// 直传失败后的「必须改用中转」提醒弹框。
     fn direct_fallback_dialog(&mut self, ctx: &egui::Context) {
-        let Some(fb) = self.pending_direct_fallback.as_ref() else { return };
+        let Some(fb) = self.pending_direct_fallback.first() else { return };
         let mut go = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::new("direct_fallback")).show(ctx, |ui| {
@@ -2036,11 +2053,14 @@ impl App {
             });
         });
         if go {
-            if let Some(fb) = self.pending_direct_fallback.take() {
+            if !self.pending_direct_fallback.is_empty() {
+                let fb = self.pending_direct_fallback.remove(0);
                 self.execute_paste(fb.plan);
             }
         } else if cancel {
-            self.pending_direct_fallback = None;
+            if !self.pending_direct_fallback.is_empty() {
+                self.pending_direct_fallback.remove(0);
+            }
         }
     }
 }
@@ -4523,14 +4543,18 @@ impl App {
                                 ui.close();
                             }
                         }
-                        if ui.button(crate::i18n::tr("删除记录", "Remove from list")).clicked() {
-                            remove_id = Some((uid, t.id));
-                            ui.close();
-                        }
-                        if let Some(local) = &t.local {
-                            if ui.button(RichText::new(crate::i18n::tr("删除文件并移除记录", "Delete file & remove")).color(Palette::DANGER)).clicked() {
-                                delete_id = Some((uid, t.id, local.clone()));
+                        // 仅「已完成/失败」的行可移除；进行中/等待中的行移除会让其追踪任务
+                        // （直传 DirectJob / 中转 Relay）永久卡住 poll 不存在的 id，故不提供
+                        if t.ok.is_some() {
+                            if ui.button(crate::i18n::tr("删除记录", "Remove from list")).clicked() {
+                                remove_id = Some((uid, t.id));
                                 ui.close();
+                            }
+                            if let Some(local) = &t.local {
+                                if ui.button(RichText::new(crate::i18n::tr("删除文件并移除记录", "Delete file & remove")).color(Palette::DANGER)).clicked() {
+                                    delete_id = Some((uid, t.id, local.clone()));
+                                    ui.close();
+                                }
                             }
                         }
                     });
@@ -4573,12 +4597,16 @@ impl App {
         }
         // 全部取消：对同服务器所有会话里进行中的任务下发取消
         if cancel_all {
-            for &i in &server_idxs {
-                if let Some(s) = self.sessions.get(i) {
-                    let ids: Vec<u64> = s.transfers.iter().filter(|t| t.ok.is_none()).map(|t| t.id).collect();
-                    for id in ids {
-                        let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
-                    }
+            // 跳过 queued 占位行（worker 未登记）；镜像行经 cancel_target 转到源端真实传输
+            let raw: Vec<(u64, u64)> = server_idxs
+                .iter()
+                .filter_map(|&i| self.sessions.get(i))
+                .flat_map(|s| s.transfers.iter().filter(|t| t.ok.is_none() && !t.queued).map(move |t| (s.uid, t.id)))
+                .collect();
+            for (uid, id) in raw {
+                let (tu, ti) = self.cancel_target(uid, id);
+                if let Some(s) = self.session_idx_by_uid(tu).and_then(|i| self.sessions.get(i)) {
+                    let _ = s.cmd_tx.send(UiCommand::CancelTransfer(ti));
                 }
             }
             self.xfer_just_opened = true;
@@ -4613,10 +4641,11 @@ impl App {
             }
             self.xfer_just_opened = true;
         }
-        // 取消传输：路由到该任务所属会话的 worker
+        // 取消传输：镜像行/源行都经 cancel_target 路由到源端真实传输并标记 cancelled
         if let Some((uid, id)) = cancel_id {
-            if let Some(s) = self.session_idx_by_uid(uid).and_then(|i| self.sessions.get(i)) {
-                let _ = s.cmd_tx.send(UiCommand::CancelTransfer(id));
+            let (tu, ti) = self.cancel_target(uid, id);
+            if let Some(s) = self.session_idx_by_uid(tu).and_then(|i| self.sessions.get(i)) {
+                let _ = s.cmd_tx.send(UiCommand::CancelTransfer(ti));
             }
             self.xfer_just_opened = true; // 避免点击被当作窗外点击而关窗
         }

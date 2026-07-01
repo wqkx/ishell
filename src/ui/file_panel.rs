@@ -263,6 +263,10 @@ impl FilePanelState {
     pub fn on_list_failed(&mut self, path: String) {
         self.loading.remove(&path);
         self.nav_error.insert(path.clone());
+        // 首次列举（cwd 尚空）即失败时也要落 cwd，否则文件区一片空白且无法显示无效标识
+        if self.cwd.is_empty() {
+            self.cwd = path.clone();
+        }
         self.listings.insert(path, Vec::new());
     }
 }
