@@ -23,6 +23,9 @@ pub struct FilePanelState {
     pub expanded: HashSet<String>,
     /// 正在加载的目录
     pub loading: HashSet<String>,
+    /// 各加载中目录的 (首次请求时刻, 已发请求次数)，用于弱网下超时重试。
+    /// 惰性登记：任何进入 loading 的路径首帧被打上时间戳，随 loading 移除而清理。
+    pub load_at: HashMap<String, (f64, u32)>,
     /// 列目录失败（无效/无权限）的路径集合：路径栏据此在最右侧显示「路径无效」标识
     pub nav_error: HashSet<String>,
     /// 右栏当前选中的行索引（支持多选）
@@ -95,6 +98,11 @@ impl FilePanelState {
         }
     }
 }
+
+/// 列目录请求多久无响应即判定超时并重发（秒）。弱网下 SFTP 请求可能长时间挂起。
+const LIST_TIMEOUT: f64 = 6.0;
+/// 单个目录最多请求次数（含首次）；超过仍无响应则放弃并让用户手动刷新。
+const LIST_MAX_TRIES: u32 = 3;
 
 /// 拖拽悬停多久后自动进入目标目录（秒）
 const UP_DWELL: f64 = 0.8;
@@ -269,6 +277,19 @@ impl FilePanelState {
         }
         self.listings.insert(path, Vec::new());
     }
+
+    /// 手动刷新指定目录：清缓存/无效标记/重试计时并重新发起 List（重试次数从头计）。
+    /// 返回是否已发起（空路径不发）。调用方负责把返回的 List 动作推入队列。
+    fn refresh_dir(&mut self, path: &str) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        self.listings.remove(path);
+        self.nav_error.remove(path);
+        self.load_at.remove(path); // 重置超时计时，让手动刷新获得完整重试预算
+        self.loading.insert(path.to_string());
+        true
+    }
 }
 
 #[allow(deprecated)] // egui::popup_below_widget/toggle_popup 在 0.34 仍稳定可用（收藏夹弹窗）
@@ -307,6 +328,49 @@ pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Ve
         sync_tree(state, &mut actions);
         state.synced_cwd = state.cwd.clone();
         state.filter.clear(); // 切目录后清空过滤
+    }
+
+    // 弱网超时重试：List 请求可能长时间无响应（既不成功也不报错），loading 会一直卡住、
+    // 转圈不出列表。此处对仍在 loading 的目录做超时判定：超时且未达上限则重发请求；
+    // 达上限仍无响应则放弃——可见目录标记「无效」让用户手动刷新，隐藏目录静默丢弃待重访再拉。
+    {
+        let now = ui.input(|i| i.time);
+        // 清理已完成（不在 loading）的登记；随后为新进入 loading 的目录打首帧时间戳。
+        state.load_at.retain(|k, _| state.loading.contains(k));
+        let loading_now: Vec<String> = state.loading.iter().cloned().collect();
+        if !loading_now.is_empty() {
+            // 持续请求重绘，保证即便无输入事件也能推进超时判定。
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let mut retry: Vec<String> = Vec::new();
+        let mut give_up: Vec<String> = Vec::new();
+        for p in &loading_now {
+            let (t0, att) = *state.load_at.entry(p.clone()).or_insert((now, 1));
+            if state.listings.contains_key(p) {
+                continue; // 已有数据（预取叠加等），不必超时
+            }
+            if now - t0 >= LIST_TIMEOUT {
+                if att < LIST_MAX_TRIES {
+                    retry.push(p.clone());
+                } else {
+                    give_up.push(p.clone());
+                }
+            }
+        }
+        for p in retry {
+            let att = state.load_at.get(&p).map(|v| v.1).unwrap_or(1);
+            state.load_at.insert(p.clone(), (now, att + 1)); // 重置计时、累加次数
+            actions.push(FileAction::List(p));
+        }
+        for p in give_up {
+            state.loading.remove(&p);
+            state.load_at.remove(&p);
+            // 仅当前可见目录落「无效」占位；隐藏目录不污染缓存，重访时再拉。
+            if p == state.cwd && !state.listings.contains_key(&p) {
+                state.nav_error.insert(p.clone());
+                state.listings.insert(p, Vec::new());
+            }
+        }
     }
 
     // 左侧目录树（自带浅色卡片，与右侧留出空隙）
@@ -522,9 +586,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         .outer_margin(egui::Margin { left: 8, right: 0, top: 2, bottom: 2 })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if tool_btn(ui, icon::ARROW_CLOCKWISE, crate::i18n::tr("刷新", "Refresh")) && !state.cwd.is_empty() {
-                    state.listings.remove(&state.cwd);
-                    state.loading.insert(state.cwd.clone());
+                if tool_btn(ui, icon::ARROW_CLOCKWISE, crate::i18n::tr("刷新", "Refresh")) && state.refresh_dir(&state.cwd.clone()) {
                     actions.push(FileAction::List(state.cwd.clone()));
                 }
                 // 返回上一个目录（浏览器式后退，可连续返回；区别于「上级目录」=parent）
@@ -662,7 +724,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             out.response.request_focus();
                         }
                         let resp = &out.response;
-                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        // 用 consume_key「吃掉」回车事件：否则同一帧内文件列表的键盘处理器
+                        // 会再次响应这次回车，误打开当前选中行（进入子目录 / 用编辑器打开文件）。
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
                             let t = buf.trim();
                             if !t.is_empty() {
                                 go = Some(t.to_string());
@@ -892,7 +956,14 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let mut bg_upload = false;
     let mut bg_cd = false;
     let mut bg_fav = false;
+    let mut bg_refresh = false;
     bg.context_menu(|ui| {
+        if !state.cwd.is_empty()
+            && ui.button(format!("{}  {}", icon::ARROW_CLOCKWISE, crate::i18n::tr("刷新", "Refresh"))).clicked()
+        {
+            bg_refresh = true;
+            ui.close();
+        }
         if ui.button(format!("{}  {}", icon::FOLDER_PLUS, crate::i18n::tr("新建文件夹", "New folder"))).clicked() {
             bg_new_dir = true;
             ui.close();
@@ -932,6 +1003,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     });
     if bg_fav {
         toggle_favorite(state, state.cwd.clone());
+    }
+    if bg_refresh && state.refresh_dir(&cwd) {
+        actions.push(FileAction::List(cwd.clone()));
     }
 
     // —— 键盘导航：↑/↓ 移动选中行、Enter 打开/进入目录（与 Ctrl+A/Delete 同一聚焦门：无文本框聚焦时生效）——
