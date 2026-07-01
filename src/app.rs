@@ -496,9 +496,10 @@ impl Session {
     }
 
     /// 刷新指定目录的列表（操作/传输完成后调用）。
+    /// 静默刷新：不先移除旧列表——否则当前目录会瞬间变「加载中…」造成闪动。保留旧列表可见，
+    /// 待 `ListDir` 返回时由 `on_listing` 原地覆盖（回填新建条目的 owner/权限/mtime 等真实元数据）。
     fn refresh_dir(&mut self, dir: Option<String>) {
         if let Some(dir) = dir {
-            self.files.listings.remove(&dir);
             self.files.loading.insert(dir.clone());
             let _ = self.cmd_tx.send(UiCommand::ListDir(dir));
         }

@@ -280,15 +280,46 @@ impl FilePanelState {
 
     /// 手动刷新指定目录：清缓存/无效标记/重试计时并重新发起 List（重试次数从头计）。
     /// 返回是否已发起（空路径不发）。调用方负责把返回的 List 动作推入队列。
+    ///
+    /// 一并清掉「直接子目录」的缓存：列目录时渲染会顺带预取各直接子目录（命中缓存则跳过），
+    /// 若不清子目录缓存，刷新后子目录仍是旧数据，随后跳转进去（有缓存即不再刷新）会看到陈旧内容。
+    /// 故刷新时连带失效子目录，让预取重新一次性拉取，令「有缓存即不刷新」的跳转始终基于最新数据。
     fn refresh_dir(&mut self, path: &str) -> bool {
         if path.is_empty() {
             return false;
         }
-        self.listings.remove(path);
-        self.nav_error.remove(path);
+        // 移除该目录与其所有直接子目录的缓存/无效标记（孙级不动：进入子目录时其渲染会再预取）
+        self.listings.retain(|k, _| k != path && parent_of(k) != path);
+        self.nav_error.retain(|k| k != path && parent_of(k) != path);
         self.load_at.remove(path); // 重置超时计时，让手动刷新获得完整重试预算
         self.loading.insert(path.to_string());
         true
+    }
+
+    /// 新建目录/文件后，乐观地把新条目插入当前目录列表并标记选中——避免整目录刷新造成闪动。
+    /// owner/精确权限/mtime 等元数据留待随后的静默刷新回填；若远端创建失败，刷新会把它移除。
+    fn insert_new(&mut self, dir: &str, name: &str, is_dir: bool) {
+        let list = self.listings.entry(dir.to_string()).or_default();
+        if list.iter().any(|e| e.name == name) {
+            return; // 同名已存在：不重复插入，交由远端报错
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        list.push(FileEntry {
+            name: name.to_string(),
+            is_dir,
+            is_link: false,
+            size: 0,
+            mtime: now,
+            perm: if is_dir { 0o755 } else { 0o644 },
+            owner: String::new(),
+            link_target: None,
+            link_dir: false,
+        });
+        // 刷新渲染时按名选中新条目（与上传后高亮一致）
+        self.pending_select = Some((dir.to_string(), std::iter::once(name.to_string()).collect()));
     }
 }
 
@@ -1868,6 +1899,7 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
     let mut close = false;
     let mut clear_sel = false; // 批量删除确认后清空选中，避免残留的陈旧行索引
     let mut undo_confirmed = false; // 撤销移动确认框点了「撤销」
+    let mut new_item: Option<(String, bool)> = None; // 新建目录/文件：(名称, 是否目录)，延后到借用结束再乐观插入
     let cwd = state.cwd.clone();
 
     if let Some(dialog) = &mut state.dialog {
@@ -1884,6 +1916,7 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                     button_row(ui, 72.0, 2, |ui| {
                         if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
                             actions.push(FileAction::Mkdir(join_path(&cwd, name.trim())));
+                            new_item = Some((name.trim().to_string(), true));
                             close = true;
                         }
                         if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
@@ -1903,6 +1936,7 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
                     button_row(ui, 72.0, 2, |ui| {
                         if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
                             actions.push(FileAction::CreateFile(join_path(&cwd, name.trim())));
+                            new_item = Some((name.trim().to_string(), false));
                             close = true;
                         }
                         if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
@@ -2110,6 +2144,10 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
     }
     if close {
         state.dialog = None;
+    }
+    // 乐观插入新建的目录/文件（借用已结束）：即时出现在列表中并选中，无需等整目录刷新。
+    if let Some((name, is_dir)) = new_item {
+        state.insert_new(&cwd, &name, is_dir);
     }
     if clear_sel {
         state.selected.clear();
