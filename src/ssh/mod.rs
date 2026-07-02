@@ -20,6 +20,10 @@ use sysinfo::{SysSampler, PROBE_CMD};
 /// 同一会话同时进行的最大传输数（不同会话各自独立）。
 const MAX_CONCURRENT_XFER: usize = 6;
 
+/// russh-sftp 每请求超时（秒）。默认 10s 对弱网大目录略紧，放宽到 20s；通道真死时会以
+/// 「sender dropped / session closed」快速报错，不会被此超时拖满。
+const SFTP_REQUEST_TIMEOUT_SECS: u64 = 20;
+
 /// 待执行/进行中的传输任务描述。
 enum PendingXfer {
     Download { id: u64, remote: String, local: String, policy: ConflictPolicy },
@@ -307,13 +311,22 @@ pub async fn run(
     };
 
     // 2) SFTP 通道（Arc 共享，供并发任务使用，避免阻塞主循环）
-    let sftp = match open_sftp(&handle).await {
+    let mut sftp = match open_sftp(&handle).await {
         Ok(s) => Some(Arc::new(s)),
         Err(e) => {
             sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }));
             None
         }
     };
+    // SFTP 会话「假死」自愈：弱网下底层通道被扰动后，russh-sftp 的请求可能永久挂起（既不返回
+    // 也不报错），且本会话不会自愈——后续所有列目录/读取都卡死、界面一直转圈。为此引入：
+    //   · sftp_gen  ：会话代号。热替换会话时自增，用于忽略「上一代」会话迟到的死亡上报；
+    //   · dead 通道 ：某个 SFTP 操作超时（判定为假死）时上报其所属代号，触发主循环重连；
+    //   · new 通道  ：后台重连任务把新会话（或失败 None）回送主循环热替换。
+    let mut sftp_gen: u64 = 0;
+    let (sftp_dead_tx, mut sftp_dead_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let (sftp_new_tx, mut sftp_new_rx) = tokio::sync::mpsc::unbounded_channel::<Option<russh_sftp::client::SftpSession>>();
+    let mut sftp_reconnecting = false;
 
     // 3) 系统信息采集任务（独立 handle 克隆，互不阻塞）
     let probe_handle = handle.clone();
@@ -360,6 +373,30 @@ pub async fn run(
                     }
                 }
             }
+            // SFTP 操作上报会话假死：仅当上报的是「当前代」会话、且未在重连时，才后台重开一条
+            // SFTP 通道（去重，避免多任务同时上报引发重连风暴）。开通/失败均经 sftp_new_rx 回送。
+            Some(dead_gen) = sftp_dead_rx.recv() => {
+                if dead_gen == sftp_gen && !sftp_reconnecting {
+                    sftp_reconnecting = true;
+                    let h = handle.clone();
+                    let tx = sftp_new_tx.clone();
+                    tokio::spawn(async move {
+                        let fresh = match tokio::time::timeout(Duration::from_secs(15), open_sftp(&h)).await {
+                            Ok(Ok(s)) => Some(s),
+                            _ => None, // 超时或失败：回送 None，主循环解锁重连位，下个操作会再次触发
+                        };
+                        let _ = tx.send(fresh);
+                    });
+                }
+            }
+            // 重连结果回送：成功则热替换会话并自增代号（旧会话的迟到死亡上报据此被忽略）。
+            Some(fresh) = sftp_new_rx.recv() => {
+                sftp_reconnecting = false;
+                if let Some(s) = fresh {
+                    sftp = Some(Arc::new(s));
+                    sftp_gen += 1;
+                }
+            }
             msg = shell.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
@@ -391,15 +428,28 @@ pub async fn run(
                         if let Some(sftp) = &sftp {
                             let sftp = sftp.clone();
                             let s = sink.clone();
+                            // 该操作发起时的会话代号 + 死亡上报句柄：会话层错误即判定假死并上报，触发重连。
+                            let gen = sftp_gen;
+                            let dead_tx = sftp_dead_tx.clone();
                             tokio::spawn(async move {
+                                // russh-sftp 自带每请求超时（见 open_sftp 的 set_timeout），弱网下请求要么
+                                // 成功、要么返回错误，不会永久挂起——故不再叠加外层 timeout（那会抢在其前面
+                                // 误杀「慢但能成」的列举）。据错误类型区分：路径级错误（Status，如不存在/无权限）
+                                // 只回失败；会话级错误（超时/通道关闭/IO）判为假死，上报代号触发 SFTP 重连。
                                 match list_dir(&sftp, &path).await {
                                     Ok((canon, entries)) => {
                                         s.send(WorkerEvent::DirListing { path: canon, entries });
                                     }
                                     Err(e) => {
-                                        // 列举失败（无效/无权限路径）：回送失败事件，UI 标记该路径无效并清除 loading
+                                        use russh_sftp::client::error::Error as SftpErr;
+                                        // 路径级错误（Status：不存在/无权限）不可重试；其余（超时/通道关闭/IO）为
+                                        // 会话级错误 → 可重试并触发 SFTP 重连。
+                                        let retryable = !matches!(e, SftpErr::Status(_));
+                                        if retryable {
+                                            let _ = dead_tx.send(gen);
+                                        }
                                         let message = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("读取目录失败：{e}"), crate::i18n::Lang::En => format!("List dir failed: {e}") };
-                                        s.send(WorkerEvent::DirListFailed { path, message });
+                                        s.send(WorkerEvent::DirListFailed { path, message, retryable });
                                     }
                                 }
                             });
@@ -847,6 +897,9 @@ async fn open_sftp(
     let channel = handle.channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
     let sftp = russh_sftp::client::SftpSession::new(channel.into_stream()).await?;
+    // 放宽每请求超时（默认 10s）：弱网下大目录列举/元数据往返较慢，给足时间避免误判失败；
+    // 通道真死时 russh-sftp 会以「sender dropped / session closed」快速报错，不受此超时拖累。
+    sftp.set_timeout(SFTP_REQUEST_TIMEOUT_SECS);
     Ok(sftp)
 }
 
@@ -927,7 +980,7 @@ fn extract_tar_gz(path: &std::path::Path, dest: &std::path::Path) -> anyhow::Res
 async fn list_dir(
     sftp: &Arc<russh_sftp::client::SftpSession>,
     path: &str,
-) -> anyhow::Result<(String, Vec<FileEntry>)> {
+) -> Result<(String, Vec<FileEntry>), russh_sftp::client::error::Error> {
     let canon = sftp.canonicalize(path).await.unwrap_or_else(|_| path.to_string());
     let dir = sftp.read_dir(&canon).await?;
     let mut entries = Vec::new();

@@ -873,11 +873,16 @@ impl Terminal {
         let sb_track = Rect::from_min_max(egui::pos2(rect.right() - sb_w, rect.top()), rect.max);
 
         if report_mouse {
-            // 转发鼠标按键/移动给远端
+            // 转发鼠标按键/移动给远端。注意：这些事件取自全局输入队列（未经 egui 分层命中），
+            // 故须自行判定终端是否为该点最上层——否则弹窗（如「新建连接」）盖在终端上时，
+            // 在弹窗内点击/双击会被透传到背后的鼠标上报程序（vim/tmux/htop）。
+            let term_layer = resp.layer_id;
+            let ctx = ui.ctx().clone();
+            let on_top = |pos: egui::Pos2| rect.contains(pos) && ctx.layer_id_at(pos) == Some(term_layer);
             let events = ui.input(|i| i.events.clone());
             for ev in &events {
                 match ev {
-                    egui::Event::PointerButton { pos, button, pressed, modifiers } if rect.contains(*pos) => {
+                    egui::Event::PointerButton { pos, button, pressed, modifiers } if on_top(*pos) => {
                         let (r, c) = cell_at(*pos);
                         let base = match button {
                             egui::PointerButton::Primary => 0u8,
@@ -900,7 +905,7 @@ impl Terminal {
                             }
                         }
                     }
-                    egui::Event::PointerMoved(pos) if rect.contains(*pos) => {
+                    egui::Event::PointerMoved(pos) if on_top(*pos) => {
                         let motion = mmode == vt100::MouseProtocolMode::AnyMotion
                             || (mmode == vt100::MouseProtocolMode::ButtonMotion && self.held_btn.is_some());
                         if motion {

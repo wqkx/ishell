@@ -170,8 +170,9 @@ pub enum WorkerEvent {
     SysInfo(Box<SysInfo>),
     /// 目录列表结果
     DirListing { path: String, entries: Vec<FileEntry> },
-    /// 目录列举失败（无效/无权限路径）：UI 据此在路径栏标记该路径无效，并清除 loading
-    DirListFailed { path: String, message: String },
+    /// 目录列举失败。`retryable`=true 表示会话级错误（弱网/SFTP 通道重连中），UI 应保留
+    /// loading 并稍后自动重试；=false 表示路径级错误（不存在/无权限），UI 标记该路径无效。
+    DirListFailed { path: String, message: String, retryable: bool },
     /// 未知主机请 UI 确认指纹（TOFU）；changed=true 表示主机密钥**已变更**（更危险）
     HostKeyPrompt { host: String, fingerprint: String, changed: bool },
     /// 键盘交互认证：服务器下发一组提示，请 UI 收集回答后回 `KbdResponse`

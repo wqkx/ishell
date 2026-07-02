@@ -364,9 +364,9 @@ impl Session {
                 WorkerEvent::DirListing { path, entries } => {
                     self.files.on_listing(path, entries);
                 }
-                WorkerEvent::DirListFailed { path, message } => {
+                WorkerEvent::DirListFailed { path, message, retryable } => {
                     self.status = message;
-                    self.files.on_list_failed(path);
+                    self.files.on_list_failed(path, retryable);
                 }
                 WorkerEvent::ProcDetail { pid, cmd, cwd, exe } => {
                     self.proc_detail = Some((pid, cmd, cwd, exe));
@@ -864,6 +864,10 @@ struct EditorTab {
     load_total: u64,
     /// 保存时检测到文件被外部修改 → 显示冲突横幅
     save_conflict: bool,
+    /// 保存动画起始时刻（ctx 时间，秒）：驱动标签底部珊瑚线「绿扫→珊瑚扫」表示已保存；None=无动画
+    save_at: Option<f64>,
+    /// 保存进行中（已发 WriteFile、未收到结果）：大文件保存耗时较长，期间屏蔽再次保存
+    saving: bool,
 }
 
 /// 编辑器窗口的共享状态（主窗口与 deferred viewport 回调共用，见 App::editor_state）。
@@ -1079,8 +1083,10 @@ impl App {
                     text_id: t1,
                     load_id: None,
                     load_done: 0,
-                    load_total: 0,
-                    save_conflict: false,
+            load_total: 0,
+            save_conflict: false,
+            save_at: None,
+            saving: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
@@ -1090,8 +1096,10 @@ impl App {
                     text_id: t2,
                     load_id: None,
                     load_done: 0,
-                    load_total: 0,
-                    save_conflict: false,
+            load_total: 0,
+            save_conflict: false,
+            save_at: None,
+            saving: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
@@ -1101,8 +1109,10 @@ impl App {
                     text_id: t3,
                     load_id: None,
                     load_done: 0,
-                    load_total: 0,
-                    save_conflict: false,
+            load_total: 0,
+            save_conflict: false,
+            save_at: None,
+            saving: false,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -2224,7 +2234,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -2261,13 +2271,15 @@ impl eframe::App for App {
             let mut ed = self.editor_state.lock().unwrap();
             for (uid, path, mtime) in saved {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
-                    t.editor.set_mtime(mtime);
+                    t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
                     t.save_conflict = false;
+                    t.saving = false; // 保存完成，解锁再次保存
                 }
             }
             for (uid, path) in conflicts {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.save_conflict = true;
+                    t.saving = false; // 冲突也算本次保存结束，解锁（用户可在横幅选择覆盖）
                 }
             }
             ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
@@ -3330,21 +3342,44 @@ impl App {
                                 toggle_find = true;
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let labels: Vec<(u64, String, String, f32)> = ed
+                                // 保存动画每半程时长（秒）：绿扫 0→1、珊瑚扫回 1→2，合计 2×
+                                const SAVE_ANIM_HALF: f64 = 0.32;
+                                let now = ui.input(|i| i.time);
+                                let mut any_saving = false;
+                                let labels: Vec<(u64, String, String, f32, f32)> = ed
                                     .tabs
                                     .iter()
                                     .map(|t| {
                                         let dirty = if t.editor.dirty() { " ●" } else { "" };
                                         // 加载中 → 进度 [0,1]，驱动 tab 上珊瑚色进度条；否则 -1（不画）
                                         let prog = if t.load_id.is_some() { (t.load_done as f32 / t.load_total.max(1) as f32).clamp(0.0, 1.0) } else { -1.0 };
+                                        // 保存动画进度：0→1 绿色从左扫到右，1→2 珊瑚色从左扫回；≥2 结束（-1 不画）
+                                        let save = match t.save_at {
+                                            Some(t0) => {
+                                                let v = ((now - t0) / SAVE_ANIM_HALF) as f32;
+                                                if v >= 2.0 { -1.0 } else { any_saving = true; v.max(0.0) }
+                                            }
+                                            None => -1.0,
+                                        };
                                         (
                                             t.text_id.value(),
                                             format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty),
                                             t.editor.path.clone(),
                                             prog,
+                                            save,
                                         )
                                     })
                                     .collect();
+                                // 动画进行中：持续重绘推进；结束的标签清掉起始时刻
+                                if any_saving {
+                                    ui.ctx().request_repaint();
+                                } else {
+                                    for t in ed.tabs.iter_mut() {
+                                        if t.save_at.map_or(false, |t0| now - t0 >= 2.0 * SAVE_ANIM_HALF) {
+                                            t.save_at = None;
+                                        }
+                                    }
+                                }
                                 let active = ed.active;
                                 // 解引用为 &mut EditorState，借用检查器才允许同时可变借用多个不相交字段
                                 let edm: &mut EditorState = &mut ed;
@@ -3399,6 +3434,7 @@ impl App {
                                                 force: true,
                                             });
                                             tab.save_conflict = false;
+                                            tab.saving = true; // 覆盖保存进行中，屏蔽再次保存直至结果返回
                                         }
                                     });
                                 });
@@ -3415,18 +3451,26 @@ impl App {
             }
             if do_save {
                 let active = ed.active;
-                if let Some(tab) = ed.tabs.get(active) {
-                    let _ = tab.cmd_tx.send(UiCommand::WriteFile {
-                        path: tab.editor.path.clone(),
-                        content: tab.editor.content.clone(),
-                        encoding: tab.editor.encoding().to_string(),
-                        eol: tab.editor.eol(),
-                        expect_mtime: tab.editor.mtime(),
-                        force: false,
-                    });
-                }
-                if let Some(tab) = ed.tabs.get_mut(active) {
-                    tab.editor.mark_saved();
+                // 仅在「有改动」且「上次保存已完成」时才真正保存：无改动不触发也不放动画；
+                // 保存进行中（大文件耗时）屏蔽再次保存，避免用旧 mtime 重复写入被误判为外部改动。
+                let should = ed.tabs.get(active).map_or(false, |t| t.editor.dirty() && !t.saving);
+                if should {
+                    if let Some(tab) = ed.tabs.get(active) {
+                        let _ = tab.cmd_tx.send(UiCommand::WriteFile {
+                            path: tab.editor.path.clone(),
+                            content: tab.editor.content.clone(),
+                            encoding: tab.editor.encoding().to_string(),
+                            eol: tab.editor.eol(),
+                            expect_mtime: tab.editor.mtime(),
+                            force: false,
+                        });
+                    }
+                    if let Some(tab) = ed.tabs.get_mut(active) {
+                        tab.editor.mark_saved();
+                        tab.saving = true; // 标记保存进行中，收到 FileSaved/Conflict 前屏蔽再次保存
+                        // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画
+                        tab.save_at = Some(vctx.input(|i| i.time));
+                    }
                 }
             }
             if let Some(i) = close_tab {
@@ -3612,7 +3656,7 @@ impl App {
                                 do_fit = true;
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let labels: Vec<(u64, String, String, f32)> = self
+                                let labels: Vec<(u64, String, String, f32, f32)> = self
                                     .image_tabs
                                     .iter()
                                     .map(|t| {
@@ -3622,6 +3666,7 @@ impl App {
                                             format!("{} {}·{}", icon::IMAGE, t.server, fname),
                                             t.path.clone(),
                                             -1.0, // 图片标签无下载进度条
+                                            -1.0, // 图片标签无保存动画
                                         )
                                     })
                                     .collect();
@@ -4920,7 +4965,7 @@ fn draggable_tabs(
     total_w: &mut f32,
     active: usize,
     want_scroll: bool,
-    labels: &[(u64, String, String, f32)],
+    labels: &[(u64, String, String, f32, f32)],
 ) -> (Option<usize>, Option<usize>, Option<(usize, usize)>) {
     let mut to_activate = None;
     let mut to_close = None;
@@ -4945,7 +4990,7 @@ fn draggable_tabs(
             let ctx = ui.ctx().clone();
             let font = egui::FontId::proportional(12.0);
             let mut acc = 0.0f32;
-            for (i, (uid, text, tip, prog)) in labels.iter().enumerate() {
+            for (i, (uid, text, tip, prog, save)) in labels.iter().enumerate() {
                 let selected = active == i;
                 let title_w = ctx.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), Palette::TEXT).rect.width());
                 let w = title_w + 16.0 + 22.0; // 左内边距 + 文本 + 右侧关闭区
@@ -4976,7 +5021,22 @@ fn draggable_tabs(
                 let p = ui.painter();
                 let fill = if dragging_this { Palette::ACCENT_SOFT } else if selected { Palette::PANEL_2 } else { egui::Color32::TRANSPARENT };
                 p.rect_filled(tab_rect, 6, fill);
-                if *prog >= 0.0 {
+                if *save >= 0.0 {
+                    // 保存动画：底部整条珊瑚线上，先绿色从左扫到右（save 0→1，「保存中」），
+                    // 再珊瑚色从左扫回覆盖绿色（save 1→2，「已保存」）。
+                    let y = tab_rect.bottom() - 1.0;
+                    let coral = Palette::ACCENT;
+                    let green = egui::Color32::from_rgb(46, 200, 120);
+                    if *save <= 1.0 {
+                        let x = tab_rect.left() + tab_rect.width() * *save;
+                        p.hline(tab_rect.left()..=tab_rect.right(), y, egui::Stroke::new(2.0, coral));
+                        p.hline(tab_rect.left()..=x, y, egui::Stroke::new(2.0, green));
+                    } else {
+                        let x = tab_rect.left() + tab_rect.width() * (*save - 1.0);
+                        p.hline(tab_rect.left()..=tab_rect.right(), y, egui::Stroke::new(2.0, green));
+                        p.hline(tab_rect.left()..=x, y, egui::Stroke::new(2.0, coral));
+                    }
+                } else if *prog >= 0.0 {
                     // 加载中：底部珊瑚线从左到右随下载进度增长（替代选中态整条下划线）
                     let w_done = (tab_rect.width() * prog.clamp(0.0, 1.0)).max(0.0);
                     p.hline(tab_rect.left()..=(tab_rect.left() + w_done), tab_rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));

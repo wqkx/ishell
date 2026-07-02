@@ -44,6 +44,8 @@ pub struct FilePanelState {
     pub synced_cwd: String,
     /// 当前弹出的对话框
     pub dialog: Option<Dialog>,
+    /// 对话框输入框的 IME 组字范围（字节位，绕开 egui Commit 门自绘 IME 用），跨帧维护
+    pub dialog_ime: Option<(usize, usize)>,
     /// 列表排序键 + 是否降序
     pub sort_key: SortKey,
     pub sort_desc: bool,
@@ -99,10 +101,11 @@ impl FilePanelState {
     }
 }
 
-/// 列目录请求多久无响应即判定超时并重发（秒）。弱网下 SFTP 请求可能长时间挂起。
+/// 列目录请求多久无响应即判定超时并重发（秒）。弱网下每次重发给 SFTP 会话重连留出恢复时间。
 const LIST_TIMEOUT: f64 = 6.0;
-/// 单个目录最多请求次数（含首次）；超过仍无响应则放弃并让用户手动刷新。
-const LIST_MAX_TRIES: u32 = 3;
+/// 单个目录最多请求次数（含首次）；超过仍无响应则放弃并让用户手动刷新。弱网需较大预算，
+/// 让后台 SFTP 重连有足够时间恢复（≈ LIST_TIMEOUT × LIST_MAX_TRIES 秒）。
+const LIST_MAX_TRIES: u32 = 10;
 
 /// 拖拽悬停多久后自动进入目标目录（秒）
 const UP_DWELL: f64 = 0.8;
@@ -268,14 +271,23 @@ impl FilePanelState {
 
     /// 列目录失败（无效/无权限路径）由 App 调用：标记该路径无效，并写入空列表占位
     /// 以避免每帧重复发起 List 请求（与空目录区分仅靠 nav_error）。
-    pub fn on_list_failed(&mut self, path: String) {
-        self.loading.remove(&path);
-        self.nav_error.insert(path.clone());
-        // 首次列举（cwd 尚空）即失败时也要落 cwd，否则文件区一片空白且无法显示无效标识
+    pub fn on_list_failed(&mut self, path: String, retryable: bool) {
+        // 首次列举（cwd 尚空）即失败时也要落 cwd，否则文件区一片空白且无法显示状态
         if self.cwd.is_empty() {
             self.cwd = path.clone();
         }
-        self.listings.insert(path, Vec::new());
+        if retryable {
+            // 会话级错误（弱网/SFTP 通道重连中）：保留 loading，交给重试循环稍后自动重发；
+            // 不落「无效」、不动已有列表——待重连恢复后某次重试即可成功，界面持续转圈+重试提示。
+            self.loading.insert(path);
+            return;
+        }
+        // 路径级错误（不存在/无权限）：清 loading、落「无效」占位（不覆盖已有非空列表）
+        self.loading.remove(&path);
+        if self.listings.get(&path).map_or(true, |v| v.is_empty()) {
+            self.nav_error.insert(path.clone());
+            self.listings.insert(path, Vec::new());
+        }
     }
 
     /// 手动刷新指定目录：清缓存/无效标记/重试计时并重新发起 List（重试次数从头计）。
@@ -853,9 +865,16 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     ui.separator();
 
     if state.loading.contains(&state.cwd) && !state.listings.contains_key(&state.cwd) {
+        // 已重试过（att>1）即视为弱网，给出「网络较慢，正在重试」提示，避免看似卡死无反馈
+        let slow = state.load_at.get(&state.cwd).map(|v| v.1 > 1).unwrap_or(false);
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label(RichText::new(crate::i18n::tr("加载中 …", "Loading …")).color(Palette::TEXT_DIM));
+            let msg = if slow {
+                crate::i18n::tr("网络较慢，正在重试 …", "Slow network, retrying …")
+            } else {
+                crate::i18n::tr("加载中 …", "Loading …")
+            };
+            ui.label(RichText::new(msg).color(Palette::TEXT_DIM));
         });
         return;
     }
@@ -1901,17 +1920,18 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
     let mut undo_confirmed = false; // 撤销移动确认框点了「撤销」
     let mut new_item: Option<(String, bool)> = None; // 新建目录/文件：(名称, 是否目录)，延后到借用结束再乐观插入
     let cwd = state.cwd.clone();
+    // 取出对话框 IME 组字状态到本地（避免与 &mut state.dialog 借用冲突），末尾写回
+    let mut ime = state.dialog_ime.take();
 
     if let Some(dialog) = &mut state.dialog {
         match dialog {
             Dialog::NewDir { name } => {
                 modal(&ctx, crate::i18n::tr("新建目录", "New folder"), |ui| {
-                    let resp = ui.text_edit_singleline(name);
+                    let (resp, submit) = ime_singleline(ui, "new_dir_name", name, &mut ime);
                     // 打开即自动聚焦输入框（无其它控件占焦时抓取），可直接输入
                     if ui.memory(|m| m.focused().is_none()) {
                         resp.request_focus();
                     }
-                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
@@ -1927,11 +1947,10 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
             }
             Dialog::NewFile { name } => {
                 modal(&ctx, crate::i18n::tr("新建文件", "New file"), |ui| {
-                    let resp = ui.text_edit_singleline(name);
+                    let (resp, submit) = ime_singleline(ui, "new_file_name", name, &mut ime);
                     if ui.memory(|m| m.focused().is_none()) {
                         resp.request_focus();
                     }
-                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
@@ -1948,11 +1967,10 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
             Dialog::Upload { local } => {
                 modal(&ctx, crate::i18n::tr("上传", "Upload"), |ui| {
                     ui.label(RichText::new(crate::i18n::tr("本地文件/文件夹路径（也可拖拽到文件区）", "Local file/folder path (or drag onto the panel)")).size(12.0).color(Palette::TEXT_DIM));
-                    let resp = ui.text_edit_singleline(local);
+                    let (resp, submit) = ime_singleline(ui, "upload_local_path", local, &mut ime);
                     if ui.memory(|m| m.focused().is_none()) {
                         resp.request_focus();
                     }
-                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if submit && !local.trim().is_empty() {
                         actions.push(FileAction::Upload { local: local.trim().to_string(), remote_dir: cwd.clone() });
                         close = true;
@@ -2145,6 +2163,8 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
     if close {
         state.dialog = None;
     }
+    // 写回 IME 组字状态（对话框已关则清空，避免下次打开残留旧组字范围）
+    state.dialog_ime = if close { None } else { ime };
     // 乐观插入新建的目录/文件（借用已结束）：即时出现在列表中并选中，无需等整目录刷新。
     if let Some((name, is_dir)) = new_item {
         state.insert_new(&cwd, &name, is_dir);
@@ -2222,6 +2242,104 @@ fn modal(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     // 注：原此处有「开着对话框就低频轮询重绘」的输入法 workaround，已移除——
     // 它同样修不了 X11/XIM 的提交延迟，却让对话框打开期间持续重绘。egui 会在
     // 收到按键/IME 事件时反应式重绘，对话框输入正常。
+}
+
+/// 单行输入框 + 自绘 IME：绕开 egui 0.34 `TextEdit` 的 Commit 门——fcitx(X11) 只发
+/// `Ime(Commit)`、不发 `Enabled`/`Preedit`，egui 的 `ime_cursor_range` 门永假导致「中文只能
+/// 输一次」（同 editor.rs 的修法，见 memory `ime-secondary-window-fix`）。本函数在 TextEdit
+/// 渲染前抽走并自行落地 Ime 事件，绕开坏门；同时用键盘事件可靠检测回车提交。
+/// 返回 (response, 本帧是否回车提交)。`preedit` 为跨帧维护的组字字节范围。
+fn ime_singleline(
+    ui: &mut egui::Ui,
+    id_src: &str,
+    buf: &mut String,
+    preedit: &mut Option<(usize, usize)>,
+) -> (egui::Response, bool) {
+    let id = egui::Id::new(id_src);
+    let focused = ui.ctx().memory(|m| m.focused() == Some(id));
+    if focused {
+        // 抽取并移除本帧 Ime 事件，改由本函数写入 buf，egui TextEdit 便看不到、坏门不触发
+        let ime: Vec<egui::ImeEvent> = ui.input_mut(|i| {
+            let evs: Vec<egui::ImeEvent> = i
+                .events
+                .iter()
+                .filter_map(|e| if let egui::Event::Ime(ev) = e { Some(ev.clone()) } else { None })
+                .collect();
+            i.events.retain(|e| !matches!(e, egui::Event::Ime(_)));
+            evs
+        });
+        if !ime.is_empty() {
+            // 载入 TextEdit 光标（字符位）→ 字节位；缺省落到末尾
+            let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+            let caret_char = st
+                .cursor
+                .char_range()
+                .map(|r| r.primary.index)
+                .unwrap_or_else(|| buf.chars().count());
+            let mut caret = byte_of_char(buf, caret_char);
+            for ev in ime {
+                match ev {
+                    egui::ImeEvent::Preedit(t) => {
+                        if t == "\n" || t == "\r" {
+                            continue;
+                        }
+                        // 组字为临时预览：替换上一段 preedit 范围
+                        let (s, e) = preedit.take().unwrap_or((caret, caret));
+                        let (s, e) = (s.min(buf.len()), e.min(buf.len()));
+                        buf.replace_range(s..e, &t);
+                        caret = s + t.len();
+                        *preedit = if t.is_empty() { None } else { Some((s, caret)) };
+                    }
+                    egui::ImeEvent::Commit(t) => {
+                        if t == "\n" || t == "\r" {
+                            continue;
+                        }
+                        if let Some((s, e)) = preedit.take() {
+                            let (s, e) = (s.min(buf.len()), e.min(buf.len()));
+                            buf.replace_range(s..e, "");
+                            caret = s;
+                        }
+                        let at = caret.min(buf.len());
+                        buf.insert_str(at, &t);
+                        caret = at + t.len();
+                    }
+                    egui::ImeEvent::Enabled => {}
+                    egui::ImeEvent::Disabled => {
+                        if let Some((s, e)) = preedit.take() {
+                            let (s, e) = (s.min(buf.len()), e.min(buf.len()));
+                            buf.replace_range(s..e, "");
+                            caret = s;
+                        }
+                    }
+                }
+            }
+            // 字节位 → 字符位写回光标，使 TextEdit 本帧按新内容/新光标渲染
+            let cc = egui::text::CCursor::new(char_of_byte(buf, caret));
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(cc)));
+            st.store(ui.ctx(), id);
+        }
+    }
+    let out = egui::TextEdit::singleline(buf).id(id).desired_width(f32::INFINITY).show(ui);
+    let resp = out.response.response; // TextEditOutput.response 是 AtomLayoutResponse，取其内层 Response
+    // 回车提交：egui 单行不消费回车事件（`lost_focus()+key_pressed(Enter)` 官方惯用法），
+    // 聚焦或本帧刚失焦时读到回车即视为提交，比单看 lost_focus 更可靠。
+    let enter = (resp.has_focus() || resp.lost_focus())
+        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    (resp, enter)
+}
+
+/// 字符位 → 字节偏移（越界回退到串尾）。
+fn byte_of_char(s: &str, ch: usize) -> usize {
+    s.char_indices().map(|(b, _)| b).chain(std::iter::once(s.len())).nth(ch).unwrap_or(s.len())
+}
+
+/// 字节偏移 → 字符位（非字符边界时向下取整，避免切片 panic）。
+fn char_of_byte(s: &str, b: usize) -> usize {
+    let mut b = b.min(s.len());
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    s[..b].chars().count()
 }
 
 /// rwx 九宫格复选框，直接修改 mode。
