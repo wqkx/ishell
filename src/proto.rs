@@ -183,8 +183,12 @@ pub enum WorkerEvent {
     FileOpened { id: u64, path: String, content: String, encoding: String, eol: Eol, mtime: u32 },
     /// 保存成功（携带新的 mtime，编辑器据此更新，避免下次保存误判为外部改动）
     FileSaved { path: String, mtime: u32 },
+    /// 保存写入进度（驱动编辑器标签的「珊瑚→绿」保存动画，跟随实际上传速度）
+    FileSaveProgress { path: String, done: u64, total: u64 },
     /// 保存时检测到文件已被外部修改（未写入）；UI 提示用户是否覆盖
     FileSaveConflict { path: String },
+    /// 打开时发现文件实际大小超限（列表里的旧大小已过时）：请 UI 弹「打开大文件」确认，可强制打开
+    FileTooLarge { id: u64, path: String, size: u64 },
     /// 文本文件下载进度（驱动占位标签上的珊瑚色进度条）
     FileLoadProgress { id: u64, done: u64, total: u64 },
     /// 文本文件打开失败（移除占位标签 + 提示）

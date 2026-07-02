@@ -54,7 +54,11 @@ struct Session {
     pending_open: Vec<(u64, String, String, String, crate::proto::Eol, u32)>,
     /// 保存成功回报的新 mtime（path, mtime）/ 外部改动冲突（path）
     pending_saved: Vec<(String, u32)>,
+    /// 保存写入进度（path, done, total）——驱动编辑器标签「珊瑚→绿」保存动画
+    pending_save_progress: Vec<(String, u64, u64)>,
     pending_conflict: Vec<String>,
+    /// 打开时发现实际超限（id, path, size）——移除占位标签 + 弹「打开大文件」确认
+    pending_too_large: Vec<(u64, String, u64)>,
     /// 待新建的占位编辑器标签（id, path）——双击打开时立即建，显示文件名 + 进度条
     pending_placeholder: Vec<(u64, String)>,
     /// 文件下载进度（id, done, total），驱动占位标签进度条
@@ -391,6 +395,12 @@ impl Session {
                 }
                 WorkerEvent::FileSaved { path, mtime } => {
                     self.pending_saved.push((path, mtime));
+                }
+                WorkerEvent::FileSaveProgress { path, done, total } => {
+                    self.pending_save_progress.push((path, done, total));
+                }
+                WorkerEvent::FileTooLarge { id, path, size } => {
+                    self.pending_too_large.push((id, path, size));
                 }
                 WorkerEvent::FileSaveConflict { path } => {
                     self.pending_conflict.push(path);
@@ -868,6 +878,11 @@ struct EditorTab {
     save_at: Option<f64>,
     /// 保存进行中（已发 WriteFile、未收到结果）：大文件保存耗时较长，期间屏蔽再次保存
     saving: bool,
+    /// 保存写入进度（done/total 字节）：驱动绿扫跟随实际上传速度
+    save_done: u64,
+    save_total: u64,
+    /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
+    save_done_at: Option<f64>,
 }
 
 /// 编辑器窗口的共享状态（主窗口与 deferred viewport 回调共用，见 App::editor_state）。
@@ -1087,6 +1102,9 @@ impl App {
             save_conflict: false,
             save_at: None,
             saving: false,
+            save_done: 0,
+            save_total: 0,
+            save_done_at: None,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
@@ -1100,6 +1118,9 @@ impl App {
             save_conflict: false,
             save_at: None,
             saving: false,
+            save_done: 0,
+            save_total: 0,
+            save_done_at: None,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
@@ -1113,6 +1134,9 @@ impl App {
             save_conflict: false,
             save_at: None,
             saving: false,
+            save_done: 0,
+            save_total: 0,
+            save_done_at: None,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -1295,7 +1319,9 @@ impl App {
             proc_sort_mem: false,
             pending_open: Vec::new(),
             pending_saved: Vec::new(),
+            pending_save_progress: Vec::new(),
             pending_conflict: Vec::new(),
+            pending_too_large: Vec::new(),
             pending_placeholder: Vec::new(),
             pending_load_progress: Vec::new(),
             pending_load_fail: Vec::new(),
@@ -2150,7 +2176,9 @@ impl eframe::App for App {
         let mut load_fail: Vec<u64> = Vec::new();
         let mut new_images: Vec<(String, Vec<u8>, String, u64)> = Vec::new(); // path, data, title, uid
         let mut saved: Vec<(u64, String, u32)> = Vec::new(); // uid, path, mtime
+        let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
         let mut conflicts: Vec<(u64, String)> = Vec::new(); // uid, path
+        let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
         for s in &mut self.sessions {
             s.drain_events();
             if s.connected && !s.initialized {
@@ -2166,8 +2194,14 @@ impl eframe::App for App {
             for (path, mtime) in s.pending_saved.drain(..) {
                 saved.push((s.uid, path, mtime));
             }
+            for (path, done, total) in s.pending_save_progress.drain(..) {
+                save_progress.push((s.uid, path, done, total));
+            }
             for path in s.pending_conflict.drain(..) {
                 conflicts.push((s.uid, path));
+            }
+            for (id, path, size) in s.pending_too_large.drain(..) {
+                too_large.push((s.uid, id, path, size));
             }
             for p in s.pending_load_progress.drain(..) {
                 load_progress.push(p);
@@ -2177,6 +2211,14 @@ impl eframe::App for App {
             }
             for (path, data) in s.pending_image.drain(..) {
                 new_images.push((path, data, s.title.clone(), s.uid));
+            }
+        }
+        // 打开时发现文件实际超限：移除占位标签（复用 load_fail 移除逻辑），并在对应会话的文件面板
+        // 弹「打开大文件」确认，确认后走 force=true 重新打开（列表里的旧大小已过时，双击前无法预判）。
+        for (uid, id, path, size) in too_large {
+            load_fail.push(id);
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.uid == uid) {
+                s.files.dialog = Some(file_panel::Dialog::ConfirmOpenLarge { path, size });
             }
         }
         // 跨服务器中转任务推进（下载完→上传，上传完→剪切则删源）
@@ -2234,7 +2276,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -2267,8 +2309,14 @@ impl eframe::App for App {
             ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
         // 保存成功 → 更新对应标签 mtime（避免下次保存误判）；外部改动冲突 → 置标志，编辑器弹横幅。
-        if !saved.is_empty() || !conflicts.is_empty() {
+        if !saved.is_empty() || !conflicts.is_empty() || !save_progress.is_empty() {
             let mut ed = self.editor_state.lock().unwrap();
+            for (uid, path, done, total) in save_progress {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                    t.save_done = done;
+                    t.save_total = total;
+                }
+            }
             for (uid, path, mtime) in saved {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
@@ -2280,6 +2328,8 @@ impl eframe::App for App {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.save_conflict = true;
                     t.saving = false; // 冲突也算本次保存结束，解锁（用户可在横幅选择覆盖）
+                    t.save_at = None; // 冲突未写入：中止「已保存」动画
+                    t.save_done_at = None;
                 }
             }
             ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
@@ -3342,43 +3392,64 @@ impl App {
                                 toggle_find = true;
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                // 保存动画每半程时长（秒）：绿扫 0→1、珊瑚扫回 1→2，合计 2×
-                                const SAVE_ANIM_HALF: f64 = 0.32;
+                                // 保存动画：珊瑚线上先「绿扫」(save 0→1) 跟随实际上传进度、再「珊瑚扫回」
+                                // (save 1→2) 表示已保存。绿扫速度 = min(实际写入进度, 限速)，限速下每段
+                                // 至少耗时 MIN_SWEEP（最快动画，避免小文件瞬移）。
+                                const MIN_SWEEP: f64 = 0.32;
                                 let now = ui.input(|i| i.time);
                                 let mut any_saving = false;
+                                // 先做可变推进：计算各标签的 save 值 [0,2] / -1，并驱动阶段切换与结束清理
+                                let mut saves: Vec<f32> = Vec::with_capacity(ed.tabs.len());
+                                for t in ed.tabs.iter_mut() {
+                                    let save = match (t.save_at, t.save_done_at) {
+                                        (Some(t0), None) => {
+                                            // 绿扫阶段：实际进度（写完但无 total 时视为 1）与限速取小
+                                            let actual = if t.save_total > 0 {
+                                                (t.save_done as f64 / t.save_total as f64).clamp(0.0, 1.0)
+                                            } else if !t.saving { 1.0 } else { 0.0 };
+                                            let g = actual.min(((now - t0) / MIN_SWEEP).clamp(0.0, 1.0));
+                                            if !t.saving && g >= 1.0 {
+                                                t.save_done_at = Some(now); // 写完且绿扫满 → 转珊瑚扫回
+                                            }
+                                            any_saving = true;
+                                            g as f32
+                                        }
+                                        (Some(_), Some(td)) => {
+                                            let c = ((now - td) / MIN_SWEEP).clamp(0.0, 1.0);
+                                            if c >= 1.0 {
+                                                t.save_at = None; // 动画结束，清理
+                                                t.save_done_at = None;
+                                                t.save_done = 0;
+                                                t.save_total = 0;
+                                                -1.0
+                                            } else {
+                                                any_saving = true;
+                                                (1.0 + c) as f32
+                                            }
+                                        }
+                                        _ => -1.0,
+                                    };
+                                    saves.push(save);
+                                }
                                 let labels: Vec<(u64, String, String, f32, f32)> = ed
                                     .tabs
                                     .iter()
-                                    .map(|t| {
+                                    .enumerate()
+                                    .map(|(i, t)| {
                                         let dirty = if t.editor.dirty() { " ●" } else { "" };
                                         // 加载中 → 进度 [0,1]，驱动 tab 上珊瑚色进度条；否则 -1（不画）
                                         let prog = if t.load_id.is_some() { (t.load_done as f32 / t.load_total.max(1) as f32).clamp(0.0, 1.0) } else { -1.0 };
-                                        // 保存动画进度：0→1 绿色从左扫到右，1→2 珊瑚色从左扫回；≥2 结束（-1 不画）
-                                        let save = match t.save_at {
-                                            Some(t0) => {
-                                                let v = ((now - t0) / SAVE_ANIM_HALF) as f32;
-                                                if v >= 2.0 { -1.0 } else { any_saving = true; v.max(0.0) }
-                                            }
-                                            None => -1.0,
-                                        };
                                         (
                                             t.text_id.value(),
                                             format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty),
                                             t.editor.path.clone(),
                                             prog,
-                                            save,
+                                            saves[i],
                                         )
                                     })
                                     .collect();
-                                // 动画进行中：持续重绘推进；结束的标签清掉起始时刻
                                 if any_saving {
-                                    ui.ctx().request_repaint();
-                                } else {
-                                    for t in ed.tabs.iter_mut() {
-                                        if t.save_at.map_or(false, |t0| now - t0 >= 2.0 * SAVE_ANIM_HALF) {
-                                            t.save_at = None;
-                                        }
-                                    }
+                                    ui.ctx().request_repaint(); // 动画进行中：持续重绘推进
                                 }
                                 let active = ed.active;
                                 // 解引用为 &mut EditorState，借用检查器才允许同时可变借用多个不相交字段
@@ -3468,8 +3539,11 @@ impl App {
                     if let Some(tab) = ed.tabs.get_mut(active) {
                         tab.editor.mark_saved();
                         tab.saving = true; // 标记保存进行中，收到 FileSaved/Conflict 前屏蔽再次保存
-                        // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画
+                        // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画（重置进度，跟随本次写入）
                         tab.save_at = Some(vctx.input(|i| i.time));
+                        tab.save_done_at = None;
+                        tab.save_done = 0;
+                        tab.save_total = 0;
                     }
                 }
             }

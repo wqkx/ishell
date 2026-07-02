@@ -1963,7 +1963,13 @@ async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, f
         crate::i18n::Lang::En => format!("File too large (>{}MB)", limit / 1024 / 1024),
     };
     if total as usize > limit {
-        sink.send(WorkerEvent::FileLoadFailed { id, message: too_large() });
+        // 非 force 超限：列表里的旧大小可能已过时（小文件被写大），交 UI 弹确认可强制打开；
+        // force 时仍超（>128MB）才真正失败。
+        if !force {
+            sink.send(WorkerEvent::FileTooLarge { id, path: path.to_string(), size: total });
+        } else {
+            sink.send(WorkerEvent::FileLoadFailed { id, message: too_large() });
+        }
         return;
     }
     // 分块读入内存（与 download_small 一致：128KB 一块），每累计 ~256KB 上报一次进度
@@ -2053,6 +2059,30 @@ async fn sftp_overwrite(sftp: &russh_sftp::client::SftpSession, path: &str, data
     Ok(())
 }
 
+/// 同 `sftp_overwrite`，但分块写入并逐块上报 `FileSaveProgress`，驱动编辑器「珊瑚→绿」保存动画
+/// 跟随实际上传速度。小文件瞬间写完，动画由 UI 侧限速兜底（不会瞬移）。
+async fn sftp_overwrite_progress(sftp: &russh_sftp::client::SftpSession, path: &str, data: &[u8], sink: &UiSink) -> anyhow::Result<()> {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::AsyncWriteExt;
+    const CHUNK: usize = 256 * 1024;
+    let total = data.len() as u64;
+    sink.send(WorkerEvent::FileSaveProgress { path: path.to_string(), done: 0, total });
+    let mut f = sftp
+        .open_with_flags(path, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE)
+        .await?;
+    let mut off = 0usize;
+    while off < data.len() {
+        let end = (off + CHUNK).min(data.len());
+        f.write_all(&data[off..end]).await?;
+        off = end;
+        sink.send(WorkerEvent::FileSaveProgress { path: path.to_string(), done: off as u64, total });
+    }
+    f.flush().await?;
+    f.shutdown().await?;
+    sink.send(WorkerEvent::FileSaveProgress { path: path.to_string(), done: total, total });
+    Ok(())
+}
+
 async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, sink: &UiSink) {
     let result: anyhow::Result<(String, Option<String>)> = match cmd {
         UiCommand::Mkdir(path) => {
@@ -2107,7 +2137,7 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 let (bytes, _, _) = enc.encode(&text);
                 // 用 CREATE|WRITE|TRUNCATE + flush + shutdown 完整覆盖写（见 sftp_overwrite 注释）；
                 // 旧实现用 sftp.write() 仅 OpenFlags::WRITE，会残留旧尾且部分服务端不落盘。
-                match sftp_overwrite(sftp, &path, bytes.as_ref()).await {
+                match sftp_overwrite_progress(sftp, &path, bytes.as_ref(), sink).await {
                     Ok(_) => {
                         let nm = sftp.metadata(&path).await.ok().and_then(|m| m.mtime).unwrap_or(0);
                         sink.send(WorkerEvent::FileSaved { path: path.clone(), mtime: nm });
