@@ -499,6 +499,15 @@ pub async fn run(
                             });
                         }
                     }
+                    Some(UiCommand::TailFile { path, offset }) => {
+                        if let Some(sftp) = &sftp {
+                            let sftp = sftp.clone();
+                            let s = sink.clone();
+                            tokio::spawn(async move {
+                                tail_file(&sftp, &path, offset, &s).await;
+                            });
+                        }
+                    }
                     Some(UiCommand::ReadImage { path }) => {
                         if let Some(sftp) = &sftp {
                             let sftp = sftp.clone();
@@ -1950,6 +1959,57 @@ fn decode_text(data: &[u8]) -> (String, String) {
 
 /// 分块读取远程文本文件并上报进度（驱动占位标签上的珊瑚色进度条），与下载文件一致地分块读取。
 /// 非 force 时限制 4MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB 且跳过二进制检查。
+/// 跟随读取（tail -f）：从 offset 读到文件末尾（单次 ≤512KB）。
+/// offset=u64::MAX 只返回当前大小（跟随开启时的初始化，相当于 `tail -f -n 0`）；
+/// 文件变小（截断/轮转）时回报 truncated 并把 offset 重置为新大小。
+async fn tail_file(sftp: &russh_sftp::client::SftpSession, path: &str, offset: u64, sink: &UiSink) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let size = match sftp.metadata(path).await {
+        Ok(m) => m.size.unwrap_or(0),
+        Err(_) => {
+            // 瞬时错误（弱网等）：offset 原样返回，UI 下一轮重试
+            sink.send(WorkerEvent::FileTail { path: path.to_string(), data: Vec::new(), offset, truncated: false });
+            return;
+        }
+    };
+    if offset == u64::MAX {
+        sink.send(WorkerEvent::FileTail { path: path.to_string(), data: Vec::new(), offset: size, truncated: false });
+        return;
+    }
+    if size < offset {
+        sink.send(WorkerEvent::FileTail { path: path.to_string(), data: Vec::new(), offset: size, truncated: true });
+        return;
+    }
+    if size == offset {
+        sink.send(WorkerEvent::FileTail { path: path.to_string(), data: Vec::new(), offset, truncated: false });
+        return;
+    }
+    let want = (size - offset).min(512 * 1024) as usize;
+    let res: anyhow::Result<Vec<u8>> = async {
+        let mut f = sftp.open(path).await?;
+        f.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut buf = vec![0u8; want];
+        let mut read = 0usize;
+        while read < want {
+            let n = f.read(&mut buf[read..]).await?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        buf.truncate(read);
+        Ok(buf)
+    }
+    .await;
+    match res {
+        Ok(data) => {
+            let n = data.len() as u64;
+            sink.send(WorkerEvent::FileTail { path: path.to_string(), data, offset: offset + n, truncated: false });
+        }
+        Err(_) => sink.send(WorkerEvent::FileTail { path: path.to_string(), data: Vec::new(), offset, truncated: false }),
+    }
+}
+
 async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, force: bool, id: u64, sink: &UiSink) {
     use tokio::io::AsyncReadExt;
     let limit = if force { 128 * 1024 * 1024 } else { 4 * 1024 * 1024 };

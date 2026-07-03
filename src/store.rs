@@ -523,6 +523,38 @@ pub fn save_file_cols(cols: &[f32; 5]) {
     }
 }
 
+fn cursors_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("cursors.json"))
+}
+
+/// 读取某文件（键 = "server|path"）上次的光标行（0 基）。
+pub fn load_cursor_line(key: &str) -> Option<usize> {
+    let s = std::fs::read_to_string(cursors_path()?).ok()?;
+    let list: Vec<(String, usize)> = serde_json::from_str(&s).ok()?;
+    list.iter().rev().find(|(k, _)| k == key).map(|(_, l)| *l)
+}
+
+/// 记录某文件的光标行；按最近使用保序，最多保留 500 条。
+pub fn save_cursor_line(key: &str, line: usize) {
+    let Some(p) = cursors_path() else { return };
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut list: Vec<(String, usize)> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    list.retain(|(k, _)| k != key);
+    list.push((key.to_string(), line));
+    if list.len() > 500 {
+        let cut = list.len() - 500;
+        list.drain(..cut);
+    }
+    if let Ok(s) = serde_json::to_string(&list) {
+        let _ = std::fs::write(p, s);
+    }
+}
+
 // ---------- 读写 ----------
 
 /// 读取已保存连接列表（内存中为明文密码）。

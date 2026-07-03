@@ -32,41 +32,38 @@ impl Indent {
     }
 }
 
-fn gcd(a: usize, b: usize) -> usize {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
-    }
-}
-
-/// 自动探测文件缩进：Tab 占多数→Tab；否则取各行前导空格数的最大公约数作为缩进宽度。
+/// 自动探测文件缩进：Tab 占多数→Tab；否则取「相邻非空行缩进增量」的众数
+/// （同票偏好 4）。较旧的 gcd 法会被对齐用的 2 空格行把 4 空格文件误判成 2。
 pub fn detect_indent(text: &str) -> Indent {
     let mut tabs = 0usize;
     let mut space_lines = 0usize;
-    let mut g = 0usize;
+    let mut counts = [0usize; 9]; // 增量 1..=8 的出现次数
+    let mut prev = 0usize;
     for line in text.lines() {
         if line.starts_with('\t') {
             tabs += 1;
             continue;
         }
         let lead = line.bytes().take_while(|b| *b == b' ').count();
+        if lead == line.len() {
+            continue; // 空白行不参与
+        }
         if lead > 0 {
             space_lines += 1;
-            if lead % 2 == 0 {
-                g = gcd(g, lead);
-            }
         }
+        if lead > prev && lead - prev <= 8 {
+            counts[lead - prev] += 1;
+        }
+        prev = lead;
     }
     if tabs > 0 && tabs >= space_lines {
         return Indent::Tab;
     }
-    match g {
-        0 => Indent::Spaces(4), // 没有可判定的缩进，默认 4
-        2 => Indent::Spaces(2),
-        n if n % 4 == 0 => Indent::Spaces(4),
-        n => Indent::Spaces(n.max(2)),
+    let best = (1..=8).max_by_key(|&d| (counts[d], usize::from(d == 4))).unwrap_or(4);
+    if counts[best] == 0 {
+        return Indent::Spaces(4); // 没有可判定的缩进，默认 4
     }
+    Indent::Spaces(best)
 }
 
 /// 语言规格：注释/字符串风格 + 关键字集。
@@ -120,6 +117,33 @@ const KW_SH: &[&str] = &["if","then","else","elif","fi","case","esac","for","whi
 const KW_RUBY: &[&str] = &["alias","and","begin","break","case","class","def","defined?","do","else","elsif","end","ensure","false","for","if","in","module","next","nil","not","or","redo","rescue","retry","return","self","super","then","true","undef","unless","until","when","while","yield"];
 const KW_SQL: &[&str] = &["select","from","where","insert","into","values","update","set","delete","create","table","drop","alter","add","primary","key","foreign","references","join","left","right","inner","outer","on","group","by","order","having","limit","offset","and","or","not","null","as","distinct","count","sum","avg","min","max","index","view","union","all","like","between","in","exists","case","when","then","else","end"];
 const KW_LUA: &[&str] = &["and","break","do","else","elseif","end","false","for","function","goto","if","in","local","nil","not","or","repeat","return","then","true","until","while"];
+
+// —— 常见内置名（补全候选用；高亮不使用，避免满屏关键字色）——
+const BI_PY: &[&str] = &["print","len","range","zip","enumerate","dict","list","set","tuple","str","int","float","bool","open","input","sorted","reversed","sum","min","max","abs","round","map","filter","any","all","isinstance","issubclass","super","type","getattr","setattr","hasattr","repr","hash","id","iter","next","format","bytes","bytearray","frozenset","vars","dir","exec","eval","Exception","ValueError","TypeError","KeyError","IndexError","RuntimeError","StopIteration","__init__","__main__","__name__","self"];
+const BI_RUST: &[&str] = &["String","Vec","Option","Some","None","Result","Ok","Err","Box","Rc","Arc","RefCell","Cell","HashMap","HashSet","BTreeMap","VecDeque","Cow","println","eprintln","format","vec","panic","assert","assert_eq","todo","unimplemented","unwrap","expect","clone","into","from","iter","collect","default","Default","Clone","Copy","Debug","PartialEq","Send","Sync","usize","isize"];
+const BI_JS: &[&str] = &["console","Math","JSON","Promise","Object","Array","String","Number","Boolean","Map","Set","Symbol","Error","Date","RegExp","parseInt","parseFloat","isNaN","setTimeout","setInterval","clearTimeout","fetch","document","window","require","module","exports","length","push","pop","slice","splice","join","split","filter","reduce","forEach","includes","indexOf","toString","async","await"];
+const BI_GO: &[&str] = &["fmt","len","cap","make","new","append","copy","delete","panic","recover","error","string","int","int64","float64","bool","byte","rune","uint","Println","Printf","Sprintf","Errorf","context","strings","strconv","errors","time"];
+const BI_C: &[&str] = &["printf","sprintf","fprintf","scanf","malloc","calloc","realloc","free","memcpy","memset","strlen","strcmp","strcpy","strcat","std","string","vector","map","set","pair","make_pair","shared_ptr","unique_ptr","cout","cerr","cin","endl","size_t","nullptr_t","int32_t","int64_t","uint32_t","uint64_t","NULL"];
+const BI_JAVA: &[&str] = &["System","String","Integer","Long","Double","Boolean","Object","List","ArrayList","Map","HashMap","Set","HashSet","Optional","Stream","Exception","RuntimeException","println","valueOf","toString","equals","hashCode","length","size"];
+const BI_SH: &[&str] = &["grep","sed","awk","cut","sort","uniq","head","tail","cat","find","xargs","curl","wget","chmod","chown","mkdir","touch","printf","test","dirname","basename","sleep","kill","wait","source","command","which"];
+const BI_LUA: &[&str] = &["print","pairs","ipairs","tostring","tonumber","type","table","string","math","io","os","require","insert","remove","concat","format","gsub","match","gmatch","setmetatable","getmetatable","pcall","error","assert","select","unpack"];
+
+/// 补全候选：该语言的关键字 + 常见内置名（缓冲词之外的静态补充）。
+pub fn completion_words(ext: &str) -> impl Iterator<Item = &'static str> {
+    let lang = lang_for(ext);
+    let builtins: &[&str] = match ext {
+        "py" | "pyw" => BI_PY,
+        "rs" => BI_RUST,
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "vue" => BI_JS,
+        "go" => BI_GO,
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cu" => BI_C,
+        "java" | "kt" | "kts" | "swift" | "scala" => BI_JAVA,
+        "sh" | "bash" | "zsh" | "fish" => BI_SH,
+        "lua" => BI_LUA,
+        _ => &[],
+    };
+    lang.keywords.iter().copied().chain(builtins.iter().copied())
+}
 
 fn lang_for(ext: &str) -> Lang {
     let cl: &[char] = &['"', '\'', '`'];
@@ -569,6 +593,18 @@ mod tests {
         let segs = tokenize(src, &lang);
         let num = segs.iter().find(|(_, _, t)| *t == Tok::Num).unwrap();
         assert_eq!(&src[num.0..num.1], "1e-5");
+    }
+
+    #[test]
+    fn detect_indent_4_with_alignment_lines() {
+        // 4 空格缩进文件，夹杂 2/6 空格的对齐行（旧 gcd 法会误判成 2）
+        let src = "def f():\n    x = 1\n    y = (a +\n      b)\n    if x:\n        z = 2\n";
+        assert_eq!(detect_indent(src), Indent::Spaces(4));
+        // 纯 2 空格文件仍判 2
+        let src2 = "def f():\n  x = 1\n  if x:\n    y = 2\n";
+        assert_eq!(detect_indent(src2), Indent::Spaces(2));
+        // Tab 文件
+        assert_eq!(detect_indent("a:\n\tb\n\tc\n"), Indent::Tab);
     }
 
     #[test]

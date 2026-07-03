@@ -56,6 +56,8 @@ struct Session {
     pending_saved: Vec<(String, u32)>,
     /// 保存写入进度（path, done, total）——驱动编辑器标签「珊瑚→绿」保存动画
     pending_save_progress: Vec<(String, u64, u64)>,
+    /// 跟随读取返回：(路径, 新增字节, 新 offset, 是否截断/轮转)
+    pending_tail: Vec<(String, Vec<u8>, u64, bool)>,
     pending_conflict: Vec<String>,
     /// 打开时发现实际超限（id, path, size）——移除占位标签 + 弹「打开大文件」确认
     pending_too_large: Vec<(u64, String, u64)>,
@@ -398,6 +400,9 @@ impl Session {
                 }
                 WorkerEvent::FileSaveProgress { path, done, total } => {
                     self.pending_save_progress.push((path, done, total));
+                }
+                WorkerEvent::FileTail { path, data, offset, truncated } => {
+                    self.pending_tail.push((path, data, offset, truncated));
                 }
                 WorkerEvent::FileTooLarge { id, path, size } => {
                     self.pending_too_large.push((id, path, size));
@@ -881,6 +886,12 @@ struct EditorTab {
     /// 保存写入进度（done/total 字节）：驱动绿扫跟随实际上传速度
     save_done: u64,
     save_total: u64,
+    /// 跟随模式（tail -f）状态：下次读取的字节偏移（u64::MAX=待初始化）、
+    /// 是否有在途请求、上次轮询时刻。注意：跟随期间**不更新 mtime**——外部对文件
+    /// 中间的修改无法检测，保留旧 mtime 让保存走冲突确认，避免静默覆盖他人修改。
+    tail_offset: u64,
+    tail_pending: bool,
+    tail_last: f64,
     /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
     save_done_at: Option<f64>,
 }
@@ -1105,6 +1116,9 @@ impl App {
             save_done: 0,
             save_total: 0,
             save_done_at: None,
+            tail_offset: u64::MAX,
+            tail_pending: false,
+            tail_last: 0.0,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
@@ -1121,6 +1135,9 @@ impl App {
             save_done: 0,
             save_total: 0,
             save_done_at: None,
+            tail_offset: u64::MAX,
+            tail_pending: false,
+            tail_last: 0.0,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
@@ -1137,6 +1154,9 @@ impl App {
             save_done: 0,
             save_total: 0,
             save_done_at: None,
+            tail_offset: u64::MAX,
+            tail_pending: false,
+            tail_last: 0.0,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -1320,6 +1340,7 @@ impl App {
             pending_open: Vec::new(),
             pending_saved: Vec::new(),
             pending_save_progress: Vec::new(),
+            pending_tail: Vec::new(),
             pending_conflict: Vec::new(),
             pending_too_large: Vec::new(),
             pending_placeholder: Vec::new(),
@@ -2179,6 +2200,7 @@ impl eframe::App for App {
         let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
         let mut conflicts: Vec<(u64, String)> = Vec::new(); // uid, path
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
+        let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
         for s in &mut self.sessions {
             s.drain_events();
             if s.connected && !s.initialized {
@@ -2196,6 +2218,9 @@ impl eframe::App for App {
             }
             for (path, done, total) in s.pending_save_progress.drain(..) {
                 save_progress.push((s.uid, path, done, total));
+            }
+            for (path, data, offset, truncated) in s.pending_tail.drain(..) {
+                tails.push((s.uid, path, data, offset, truncated));
             }
             for path in s.pending_conflict.drain(..) {
                 conflicts.push((s.uid, path));
@@ -2219,6 +2244,48 @@ impl eframe::App for App {
             load_fail.push(id);
             if let Some(s) = self.sessions.iter_mut().find(|s| s.uid == uid) {
                 s.files.dialog = Some(file_panel::Dialog::ConfirmOpenLarge { path, size });
+            }
+        }
+        // 跟随模式（tail -f）：应用增量 + 定时轮询下一次读取。
+        // 注意：跟随期间不更新 tab 的 mtime——外部对文件「中间」的修改无法检测，
+        // 保留旧 mtime 让保存必走冲突确认流程，避免静默覆盖他人修改。
+        {
+            let now = self.ctx.input(|i| i.time);
+            let mut edst = self.editor_state.lock().unwrap();
+            let mut any_follow = false;
+            for (uid, path, data, offset, truncated) in tails {
+                if let Some(t) = edst.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                    t.tail_pending = false;
+                    t.tail_offset = offset;
+                    if !t.editor.follow {
+                        continue; // 已关闭跟随：丢弃迟到的数据
+                    }
+                    if truncated {
+                        t.editor.append_tail(&crate::i18n::tr("\n--- 文件被截断/轮转，以下为新内容 ---\n", "\n--- file truncated/rotated, new content follows ---\n"));
+                    }
+                    if !data.is_empty() {
+                        // 按标签已知编码解码（块边界的多字节字符属可接受的边缘情况），行尾统一 LF
+                        let enc = encoding_rs::Encoding::for_label(t.editor.encoding().as_bytes()).unwrap_or(encoding_rs::UTF_8);
+                        let (cow, _, _) = enc.decode(&data);
+                        let txt = cow.replace("\r\n", "\n");
+                        t.editor.append_tail(&txt);
+                    }
+                }
+            }
+            for t in edst.tabs.iter_mut() {
+                if t.editor.follow {
+                    any_follow = true;
+                    if !t.tail_pending && t.tail_offset != u64::MAX && now - t.tail_last > 1.0 {
+                        t.tail_pending = true;
+                        t.tail_last = now;
+                        let _ = t.cmd_tx.send(UiCommand::TailFile { path: t.editor.path.clone(), offset: t.tail_offset });
+                    }
+                }
+            }
+            if any_follow {
+                // 维持轮询节奏 + 唤醒编辑器窗口显示新内容
+                self.ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                self.ctx.request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
             }
         }
         // 跨服务器中转任务推进（下载完→上传，上传完→剪切则删源）
@@ -2276,7 +2343,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0 });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -2287,11 +2354,15 @@ impl eframe::App for App {
                     t.load_total = total;
                 }
             }
-            // 3) 内容就位：占位标签变为可编辑、填入内容
+            // 3) 内容就位：占位标签变为可编辑、填入内容；恢复上次光标位置
             for (id, path, content, encoding, eol, mtime) in filled {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+                    let key = format!("{}|{}", t.server, path);
                     let mut editor = crate::ui::editor::Editor::new(path, content);
                     editor.set_meta(encoding, eol, mtime);
+                    if let Some(line) = crate::store::load_cursor_line(&key) {
+                        editor.restore_line(line);
+                    }
                     t.editor = editor;
                     t.load_id = None;
                 }
@@ -3373,6 +3444,7 @@ impl App {
             let mut activate: Option<usize> = None;
             let mut do_save = false;
             let mut toggle_find = false;
+            let mut toggle_follow = false;
             // 标签栏：左侧可拖动重排的标签（仿主窗口，带跟手+缓动），右侧「保存 / 查找」
             egui::Panel::top("editor_tabs")
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
@@ -3520,11 +3592,39 @@ impl App {
             if let Some(i) = activate {
                 ed.active = i;
             }
+            // 状态栏「跟随」按钮请求（editor.rs 置位，这里消费——初始化命令需要 cmd_tx）
+            {
+                let active = ed.active;
+                if let Some(t) = ed.tabs.get_mut(active) {
+                    if t.editor.follow_req {
+                        t.editor.follow_req = false;
+                        toggle_follow = true;
+                    }
+                }
+            }
+            // 跟随开关：开启要求文件无未保存修改（跟随=查看模式；退出后保存仍走 mtime 冲突确认）
+            if toggle_follow {
+                let now = vctx.input(|i| i.time);
+                let active = ed.active;
+                if let Some(t) = ed.tabs.get_mut(active) {
+                    if t.editor.follow {
+                        t.editor.follow = false;
+                    } else if !t.editor.dirty() && t.load_id.is_none() {
+                        t.editor.follow = true;
+                        t.tail_offset = u64::MAX;
+                        t.tail_pending = true;
+                        t.tail_last = now;
+                        // 初始化：只取当前文件大小（相当于 tail -f -n 0），此后每 ~1s 增量拉取
+                        let _ = t.cmd_tx.send(UiCommand::TailFile { path: t.editor.path.clone(), offset: u64::MAX });
+                    }
+                }
+            }
             if do_save {
                 let active = ed.active;
                 // 仅在「有改动」且「上次保存已完成」时才真正保存：无改动不触发也不放动画；
-                // 保存进行中（大文件耗时）屏蔽再次保存，避免用旧 mtime 重复写入被误判为外部改动。
-                let should = ed.tabs.get(active).map_or(false, |t| t.editor.dirty() && !t.saving);
+                // 保存进行中（大文件耗时）屏蔽再次保存，避免用旧 mtime 重复写入被误判为外部改动；
+                // 跟随模式（tail -f）期间禁止保存——外部持续写入，本地内容无权威性。
+                let should = ed.tabs.get(active).map_or(false, |t| t.editor.dirty() && !t.saving && !t.editor.follow);
                 if should {
                     if let Some(tab) = ed.tabs.get(active) {
                         let _ = tab.cmd_tx.send(UiCommand::WriteFile {
@@ -3554,6 +3654,8 @@ impl App {
                 } else {
                     if i < ed.tabs.len() {
                         let closed = ed.tabs.remove(i);
+                        // 记住光标位置（下次打开恢复）
+                        crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line());
                         // 清除该编辑器在 egui 内存中的 TextEdit 状态（含撤销历史的文本快照）
                         vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
                     }
@@ -3605,6 +3707,7 @@ impl App {
                     if decision == 1 || decision == 2 {
                         if ti < ed.tabs.len() {
                             let closed = ed.tabs.remove(ti);
+                            crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line());
                             vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
                         }
                         if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {

@@ -101,6 +101,9 @@ pub enum UiCommand {
     KbdResponse(Vec<String>),
     /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制。id 关联占位标签的下载进度
     ReadFile { id: u64, path: String, force: bool },
+    /// 跟随读取（tail -f）：从 offset 读到文件末尾（单次上限 512KB）。
+    /// offset = u64::MAX 表示初始化——只返回当前文件大小、不读数据。
+    TailFile { path: String, offset: u64 },
     /// 读取图片文件原始字节（用于看图工具打开）
     ReadImage { path: String },
     /// 写回文本文件内容（保存）。content 为内部 LF 文本，worker 按 eol 还原行尾、按 encoding 编码后写入。
@@ -189,6 +192,9 @@ pub enum WorkerEvent {
     FileSaveConflict { path: String },
     /// 打开时发现文件实际大小超限（列表里的旧大小已过时）：请 UI 弹「打开大文件」确认，可强制打开
     FileTooLarge { id: u64, path: String, size: u64 },
+    /// 跟随读取返回：data 为新增原始字节（可能为空）；offset 为下次读取起点；
+    /// truncated = 文件被截断/轮转（此时 offset 已重置为新大小）
+    FileTail { path: String, data: Vec<u8>, offset: u64, truncated: bool },
     /// 文本文件下载进度（驱动占位标签上的珊瑚色进度条）
     FileLoadProgress { id: u64, done: u64, total: u64 },
     /// 文本文件打开失败（移除占位标签 + 提示）

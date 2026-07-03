@@ -100,12 +100,21 @@ pub struct Editor {
     /// 已折叠区域（按 header 行号升序，互不重叠）：(header 行, 区域末行)，
     /// 隐藏 header+1..=末行。内容一旦编辑即整体清空（行号会漂移，v1 从简）。
     folds: Vec<(usize, usize)>,
-    /// 折叠状态版本（切换折叠 +1，用于失效视觉行缓存）。
+    /// 折叠状态版本（切换/重映射折叠 +1，用于失效视觉行缓存）。
     fold_ver: u64,
-    /// 折叠对应的内容版本（vver 变化则清空折叠）。
-    fold_cver: u64,
     /// 视觉行缓存所对应的折叠版本。
     vrow_fver: u64,
+    /// 缓冲词补全弹窗：(候选词, 选中项, 触发前缀的字节长)。None = 未打开。
+    complete: Option<(Vec<String>, usize, usize)>,
+    /// 缓冲词表（去重排序）+ 其内容版本（编辑后按需重建）。
+    words: Vec<String>,
+    words_ver: u64,
+    /// 主光标屏幕坐标（渲染循环记录，供补全弹窗定位到光标下方）。
+    caret_px: Option<egui::Pos2>,
+    /// 跟随模式（tail -f）：追加远端新增内容并滚到底；开启期间常规修改输入被忽略。
+    pub follow: bool,
+    /// 状态栏「跟随」按钮被点击（app 层消费：切换跟随并发送初始化命令）。
+    pub follow_req: bool,
 }
 
 /// 一次编辑操作：把 content[at..at+removed.len()] 由 removed 换成 inserted。
@@ -181,8 +190,13 @@ impl Editor {
             hl_ver: u64::MAX,
             folds: Vec::new(),
             fold_ver: 0,
-            fold_cver: 0,
             vrow_fver: u64::MAX,
+            complete: None,
+            words: Vec::new(),
+            words_ver: u64::MAX,
+            caret_px: None,
+            follow: false,
+            follow_req: false,
         }
     }
     /// 切换查找栏（供窗口标签栏的「查找」按钮调用）；打开时请求聚焦查找框。
@@ -200,6 +214,34 @@ impl Editor {
     }
     pub fn filename(&self) -> String {
         self.path.trim_end_matches('/').rsplit('/').next().unwrap_or(&self.path).to_string()
+    }
+    /// 当前光标所在逻辑行（0 基），供「记住光标位置」持久化。
+    pub fn caret_line(&self) -> usize {
+        v_line_of(self, self.vcaret)
+    }
+    /// 恢复上次的光标行：光标置行首并滚动到该行（行号越界则忽略）。
+    pub fn restore_line(&mut self, line: usize) {
+        if line == 0 || line >= self.vlines.len() {
+            return;
+        }
+        self.vcaret = self.vlines[line];
+        self.pending_scroll = Some(line);
+    }
+    /// 跟随模式追加远端新增文本：不进撤销栈、orig 同步（保持“未修改”状态）。
+    /// 仅当光标位于文末且无选区时才推进光标并滚到底（less +F 语义）——
+    /// 用户正在拖选/查看历史时只追加不滚动，选区在尾部追加下字节偏移天然稳定。
+    pub fn append_tail(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let at_end = self.vcaret >= self.content.len() && self.vsel.is_none() && self.msel.is_empty();
+        self.content.push_str(text);
+        self.orig.push_str(text);
+        v_recompute(self);
+        if at_end {
+            self.vcaret = self.content.len();
+            self.pending_scroll = Some(self.vlines.len().saturating_sub(1));
+        }
     }
     pub fn set_loading(&mut self, v: bool) {
         self.loading = v;
@@ -361,6 +403,114 @@ fn v_fold_region(ed: &Editor, line: usize, unit: usize) -> Option<(usize, usize)
     }
     (end > line).then_some((line, end))
 }
+// ——— 缓冲词补全 ———
+/// 重建词表（内容版本变化时）：提取长度 3..=48、以字母/下划线开头的标识符，去重排序。
+/// 超大文件跳过重建（沿用旧表），避免每次按键付全文扫描成本。
+fn v_build_words(ed: &mut Editor) {
+    if ed.words_ver == ed.vver {
+        return;
+    }
+    ed.words_ver = ed.vver;
+    if ed.content.len() > 2 * 1024 * 1024 {
+        return;
+    }
+    let words: Vec<String> = {
+        let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for w in ed.content.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if (3..=48).contains(&w.len()) && (w.as_bytes()[0].is_ascii_alphabetic() || w.starts_with('_')) {
+                set.insert(w);
+            }
+        }
+        let mut v: Vec<String> = set.into_iter().map(str::to_string).collect();
+        v.sort_unstable();
+        v
+    };
+    ed.words = words;
+}
+/// 光标前的词前缀（ASCII 标识符字符），返回 (字节长, 前缀)；不足 2 字符返回 None。
+fn v_word_prefix(ed: &Editor) -> Option<(usize, String)> {
+    let b = ed.vcaret.min(ed.content.len());
+    let bytes = ed.content.as_bytes();
+    let mut start = b;
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let prefix = &ed.content[start..b];
+    (prefix.len() >= 2 && (bytes[start].is_ascii_alphabetic() || prefix.starts_with('_'))).then(|| (prefix.len(), prefix.to_string()))
+}
+/// 按光标前缀打开/刷新补全弹窗；无候选则关闭。
+/// 候选 = 缓冲区单词（优先）+ 该语言关键字/常见内置名（补足），去重、至多 8 条。
+fn v_complete_refresh(ed: &mut Editor) {
+    let Some((plen, prefix)) = v_word_prefix(ed) else {
+        ed.complete = None;
+        return;
+    };
+    v_build_words(ed);
+    let mut items: Vec<String> = ed.words.iter().filter(|w| w.starts_with(&prefix) && w.as_str() != prefix).take(8).cloned().collect();
+    if items.len() < 8 {
+        for w in highlight::completion_words(&ed.language) {
+            if w.starts_with(prefix.as_str()) && w != prefix && !items.iter().any(|x| x == w) {
+                items.push(w.to_string());
+                if items.len() >= 8 {
+                    break;
+                }
+            }
+        }
+    }
+    ed.complete = if items.is_empty() { None } else { Some((items, 0, plen)) };
+}
+/// 接受补全候选：把候选词剩余部分插入光标处。
+fn v_complete_accept(ed: &mut Editor, idx: usize) {
+    if let Some((items, _, plen)) = ed.complete.take() {
+        if let Some(w) = items.get(idx) {
+            let suffix = w[plen..].to_string();
+            if !suffix.is_empty() {
+                v_insert(ed, &suffix);
+            }
+        }
+    }
+}
+
+/// 内容替换（content[at..at+removed_len] → inserted）**之前**调用：按行数增量平移
+/// 折叠区间；行结构未变（无换行增删）时折叠原样保留；与编辑行重叠的折叠保守展开。
+fn v_remap_folds(ed: &mut Editor, at: usize, removed_len: usize, inserted: &str) {
+    if ed.folds.is_empty() {
+        return;
+    }
+    let added = inserted.matches('\n').count() as isize;
+    let l0 = v_line_of(ed, at.min(ed.content.len()));
+    let l1 = v_line_of(ed, (at + removed_len).min(ed.content.len()));
+    let removed = (l1 - l0) as isize;
+    if added == 0 && removed == 0 {
+        return; // 行结构未变（行内编辑），折叠不动
+    }
+    let delta = added - removed;
+    let mut changed = false;
+    ed.folds.retain_mut(|f| {
+        if l1 < f.0 {
+            // 编辑完全在折叠之前 → 区间平移
+            if delta != 0 {
+                f.0 = (f.0 as isize + delta).max(0) as usize;
+                f.1 = (f.1 as isize + delta).max(0) as usize;
+                changed = true;
+            }
+            true
+        } else if l0 > f.1 {
+            true // 完全在折叠之后，不受影响
+        } else {
+            changed = true;
+            false // 与折叠区间（含 header 行）重叠 → 展开
+        }
+    });
+    if changed {
+        ed.fold_ver = ed.fold_ver.wrapping_add(1);
+    }
+}
 /// 切换某 header 行的折叠状态。
 fn v_toggle_fold(ed: &mut Editor, line: usize, unit: usize) {
     if let Some(idx) = ed.folds.iter().position(|&(h, _)| h == line) {
@@ -424,6 +574,7 @@ fn v_recompute(ed: &mut Editor) {
 }
 /// 把 content[at..at+removed_len] 替换为 inserted，并记录一条可撤销操作（连续输入会合并）。
 fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: &str) {
+    v_remap_folds(ed, at, removed_len, inserted);
     let caret_before = ed.vcaret;
     let removed = ed.content[at..at + removed_len].to_string();
     ed.content.replace_range(at..at + removed_len, inserted);
@@ -546,6 +697,7 @@ fn v_delete_fwd(ed: &mut Editor) {
 fn v_undo(ed: &mut Editor) {
     if let Some(op) = ed.vundo.pop() {
         let end = op.at + op.inserted.len();
+        v_remap_folds(ed, op.at, op.inserted.len(), &op.removed);
         ed.content.replace_range(op.at..end, &op.removed);
         ed.vcaret = op.caret_before.min(ed.content.len());
         ed.vsel = None;
@@ -557,6 +709,7 @@ fn v_undo(ed: &mut Editor) {
 fn v_redo(ed: &mut Editor) {
     if let Some(op) = ed.vredo.pop() {
         let end = op.at + op.removed.len();
+        v_remap_folds(ed, op.at, op.removed.len(), &op.inserted);
         ed.content.replace_range(op.at..end, &op.inserted);
         ed.vcaret = op.caret_after.min(ed.content.len());
         ed.vsel = None;
@@ -1249,21 +1402,15 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         }
     }
 
-    // 折叠维护：内容编辑后行号漂移，v1 直接清空（诚实优于错位）；
-    // 跳转/查找把光标放进隐藏行时，自动展开所在折叠
+    // 折叠维护：编辑时区间已由 v_remap_folds 平移/展开；
+    // 这里只处理跳转/查找把光标放进隐藏行的情况——自动展开所在折叠
     if !ed.folds.is_empty() {
-        if ed.fold_cver != ed.vver {
-            ed.folds.clear();
+        let cl = v_line_of(ed, ed.vcaret);
+        if v_line_hidden(ed, cl) {
+            ed.folds.retain(|&(h, e)| !(cl > h && cl <= e));
             ed.fold_ver = ed.fold_ver.wrapping_add(1);
-        } else {
-            let cl = v_line_of(ed, ed.vcaret);
-            if v_line_hidden(ed, cl) {
-                ed.folds.retain(|&(h, e)| !(cl > h && cl <= e));
-                ed.fold_ver = ed.fold_ver.wrapping_add(1);
-            }
         }
     }
-    ed.fold_cver = ed.vver;
 
     let mut mono = egui::TextStyle::Monospace.resolve(ui.style());
     // 字号对齐到整数物理像素：让 hinting 网格与像素对齐，分数缩放（zoom/HiDPI）下笔画更锐
@@ -1346,9 +1493,56 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         // 已自绘处理，移除 Ime 事件，避免主循环重复处理
         ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
     }
+    if !focused {
+        ed.complete = None; // 失焦关闭补全弹窗
+    }
     if focused {
+        let vver0 = ed.vver;
+        let caret0 = ed.vcaret;
+        let mut typed = false; // 本帧是否有字符输入（补全的触发条件）
         let events = ui.input(|i| i.events.clone());
         for ev in events {
+            // 补全弹窗打开时优先消费导航键：↑↓ 选择、Enter/Tab 接受、Esc 关闭
+            if ed.complete.is_some() {
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = &ev {
+                    let n = ed.complete.as_ref().map(|(v, _, _)| v.len()).unwrap_or(0).max(1);
+                    match key {
+                        egui::Key::ArrowDown if !modifiers.any() => {
+                            if let Some((_, sel, _)) = &mut ed.complete {
+                                *sel = (*sel + 1) % n;
+                            }
+                            continue;
+                        }
+                        egui::Key::ArrowUp if !modifiers.any() => {
+                            if let Some((_, sel, _)) = &mut ed.complete {
+                                *sel = (*sel + n - 1) % n;
+                            }
+                            continue;
+                        }
+                        egui::Key::Enter | egui::Key::Tab if !modifiers.any() => {
+                            let sel = ed.complete.as_ref().map(|(_, s, _)| *s).unwrap_or(0);
+                            v_complete_accept(ed, sel);
+                            continue;
+                        }
+                        egui::Key::Escape => {
+                            ed.complete = None;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // 跟随模式：只读——吞掉常规修改输入（导航/复制/查找仍可用）
+            if ed.follow {
+                match &ev {
+                    egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(_) | egui::Event::Cut => continue,
+                    egui::Event::Key { key: egui::Key::Backspace | egui::Key::Delete | egui::Key::Enter | egui::Key::Tab, pressed: true, .. } => continue,
+                    _ => {}
+                }
+            }
+            if matches!(&ev, egui::Event::Text(t) if !t.is_empty()) {
+                typed = true;
+            }
             // 多光标模式（msel 非空）：编辑/复制作用于全部选区；移动等其它键退出多选、走常规
             if !ed.msel.is_empty() {
                 let mut handled = true;
@@ -1501,6 +1695,13 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             }
         }
         ed.vcaret = ed.vcaret.min(ed.content.len());
+        // 补全触发/维护：有字符输入 →（重新）打开；其它编辑（如退格）→ 按新前缀刷新；
+        // 纯光标移动 → 关闭（避免弹窗脱离输入上下文）
+        if typed || (ed.complete.is_some() && ed.vver != vver0) {
+            v_complete_refresh(ed);
+        } else if ed.complete.is_some() && ed.vcaret != caret0 {
+            ed.complete = None;
+        }
     }
     // 真正判断光标是否移动（仅此情况才让视角跟随；无移动时自由滚动、绝不拉回）
     let moved = ed.vcaret != prev_caret;
@@ -1520,10 +1721,11 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                     v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
-                    ui.menu_button(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label()), |ui| {
+                    // 字号与状态栏其它项一致（11），否则默认按钮字号显得突兀地大
+                    ui.menu_button(RichText::new(format!("{} {}", crate::i18n::tr("缩进", "Indent"), ed.indent.label())).size(11.0).color(Palette::TEXT_DIM), |ui| {
                         ui.set_min_width(120.0);
                         for ind in [Indent::Spaces(2), Indent::Spaces(4), Indent::Tab] {
-                            if ui.selectable_label(ed.indent == ind, ind.label()).clicked() {
+                            if ui.selectable_label(ed.indent == ind, RichText::new(ind.label()).size(12.0)).clicked() {
                                 ed.indent = ind;
                                 ui.close();
                             }
@@ -1562,6 +1764,19 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
+                    ui.add_space(10.0);
+                    // 跟随（tail -f）：↧ 图标，开启时珊瑚色；点击由 app 层切换（需发起 SFTP 命令）
+                    let f_col = if ed.follow { Palette::ACCENT } else { Palette::TEXT_DIM };
+                    if ui
+                        .add(egui::Label::new(RichText::new(format!("{} {}", egui_phosphor::regular::ARROW_LINE_DOWN, crate::i18n::tr("跟随", "Follow"))).color(f_col).size(11.0)).sense(egui::Sense::click()))
+                        .on_hover_text(crate::i18n::tr(
+                            "跟随文件末尾（tail -f）：自动追加新内容并滚到底，开启期间只读。\n拖选/查看历史时暂停滚动，Ctrl+End 回到底部恢复跟随。",
+                            "Follow file tail (tail -f): auto-append & scroll, read-only while on.\nScrolling pauses while selecting/browsing; Ctrl+End resumes.",
+                        ))
+                        .clicked()
+                    {
+                        ed.follow_req = true;
+                    }
                     ui.add_space(10.0);
                     // 光标位置 Ln:Col（主光标，1 基；列按字符计）
                     let cl = v_line_of(ed, ed.vcaret);
@@ -1775,6 +1990,36 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let carets: Vec<usize> = if !ed.msel.is_empty() { ed.msel.iter().map(|&(_, e)| e).collect() } else { vec![ed.vcaret] };
             let caret_line = v_line_of(ed, ed.vcaret); // 当前行高亮
             let unit_cols = match ed.indent { Indent::Spaces(n) => n.max(1), Indent::Tab => 4 }; // 缩进参考线步长
+            // 活动缩进线（VSCode 风格）：光标所在代码块对应的那条竖线高亮。
+            // (列, 起始行, 结束行)：列 = 光标行缩进的上一级；范围 = 向上下延伸「更深缩进或空白」的行
+            let active_guide: Option<(usize, usize, usize)> = {
+                let resolve = |l: usize| -> Option<usize> {
+                    v_lead(ed, l, unit_cols).or_else(|| {
+                        let up = (0..l).rev().take(400).find_map(|x| v_lead(ed, x, unit_cols));
+                        let down = ((l + 1)..total).take(400).find_map(|x| v_lead(ed, x, unit_cols));
+                        match (up, down) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            _ => None,
+                        }
+                    })
+                };
+                resolve(caret_line).and_then(|lead| {
+                    let col = (lead.saturating_sub(1) / unit_cols) * unit_cols;
+                    if col == 0 {
+                        return None; // 顶层代码没有外层块
+                    }
+                    let deeper = |l: usize| v_lead(ed, l, unit_cols).map(|d| d > col).unwrap_or(true);
+                    let mut lo = caret_line;
+                    while lo > 0 && lo > caret_line.saturating_sub(2000) && deeper(lo - 1) {
+                        lo -= 1;
+                    }
+                    let mut hi = caret_line;
+                    while hi + 1 < total && hi < caret_line + 2000 && deeper(hi + 1) {
+                        hi += 1;
+                    }
+                    Some((col, lo, hi))
+                })
+            };
             let brackets = if focused { bracket_match(&ed.content, ed.vcaret) } else { None }; // 括号匹配高亮
             // 可视区内的查找匹配（克隆出来，避免后续可变借用 ed 冲突）
             let vis_matches: Vec<(usize, usize)> = if ed.show_find && !ed.find.is_empty() {
@@ -1786,6 +2031,21 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             } else {
                 Vec::new()
             };
+            // 双击选词后的「相同词」淡高亮（仅常见代码类型）：当前选区恰为一个完整词时，
+            // 可见行内该词的其它出现处铺一层比查找更淡的底色（VSCode occurrence 风格）
+            let occ_word: Option<String> = if highlight::lint_enabled(&ed.language) && ed.msel.is_empty() {
+                v_sel_range(ed).and_then(|(a, b)| {
+                    let w = &ed.content[a..b];
+                    let is_w = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                    let ok = (2..=64).contains(&(b - a))
+                        && w.chars().all(is_w)
+                        && (a == 0 || !is_w(ed.content[..a].chars().next_back().unwrap()))
+                        && (b >= ed.content.len() || !is_w(ed.content[b..].chars().next().unwrap()));
+                    ok.then(|| w.to_string())
+                })
+            } else {
+                None
+            };
             // 水平可视列窗口：每行只对窗口内片段做高亮 + 布局（开销 O(可视列)，与行长无关）。
             // 这样超长行（日志/JSON/CSV 等）不再每帧整行 tokenize + layout，根治「某些大文件拖到底卡顿」。
             let first_col = ((clip.left() - text_x).max(0.0) / char_w) as usize;
@@ -1794,6 +2054,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             // 折叠箭头：悬停行号列时显示可折叠箭头；点击在循环后统一应用（避免借用冲突）
             let gutter_hover = ui.input(|inp| inp.pointer.hover_pos()).is_some_and(|p| clip.contains(p) && p.x < clip.left() + gutter_w);
             let mut fold_click: Option<usize> = None;
+            let mut caret_px_frame: Option<egui::Pos2> = None; // 主光标屏幕坐标（补全弹窗定位）
             for k in 0..visible {
                 let row = top_row + k;
                 if row >= nrows {
@@ -1848,8 +2109,25 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     let mut col = unit_cols;
                     while col < lead {
                         let gx = text_x + col as f32 * char_w;
-                        painter.vline(gx, y..=(y + row_h), egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30)));
+                        // 光标所在块的那条竖线用强调色高亮（活动缩进线）
+                        let active = active_guide.is_some_and(|(ac, lo, hi)| col == ac && i >= lo && i <= hi);
+                        let stroke = if active {
+                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 150))
+                        } else {
+                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30))
+                        };
+                        painter.vline(gx, y..=(y + row_h), stroke);
                         col += unit_cols;
+                    }
+                    // 本行画线上限（lead）不及活动列时（块内/块尾空行），单独补画活动线保证贯穿
+                    if let Some((ac, lo, hi)) = active_guide {
+                        if i >= lo && i <= hi && ac >= lead && ac > 0 {
+                            painter.vline(
+                                text_x + ac as f32 * char_w,
+                                y..=(y + row_h),
+                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 150)),
+                            );
+                        }
                     }
                 }
                 // 仅取窗口片段（char_to_byte 至多遍历到 last_col 个字符）
@@ -1881,6 +2159,35 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 };
                 // 行内字节偏移 → 屏幕 x（窗口外钳制到窗口边缘，超出部分本就不可见）
                 let x_of = |lb: usize| -> f32 { seg_x + galley.pos_from_cursor(CCursor::new(byte_to_char(seg, lb.clamp(seg_a, seg_b) - seg_a))).left() };
+                // 相同词淡高亮（先画，衬在选区/查找高亮之下）：淡暖灰，比查找命中更轻
+                if let Some(wd) = &occ_word {
+                    if line_full.len() <= 10_000 {
+                        let isw = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+                        let bytes = line_full.as_bytes();
+                        let mut from = 0usize;
+                        while let Some(p) = line_full[from..].find(wd.as_str()) {
+                            let s0 = from + p;
+                            let e0 = s0 + wd.len();
+                            from = e0;
+                            // 全词匹配 + 跳过选区本体
+                            if (s0 > 0 && isw(bytes[s0 - 1])) || (e0 < bytes.len() && isw(bytes[e0])) {
+                                continue;
+                            }
+                            if sels.iter().any(|&(sa, sb)| sa == ls + s0 && sb == ls + e0) {
+                                continue;
+                            }
+                            let ax = x_of(s0);
+                            let bx = x_of(e0);
+                            if bx > ax {
+                                painter.rect_filled(
+                                    egui::Rect::from_min_max(egui::pos2(ax, y), egui::pos2(bx, y + row_h)),
+                                    2.0,
+                                    egui::Color32::from_rgba_unmultiplied(0x6b, 0x63, 0x50, 34),
+                                );
+                            }
+                        }
+                    }
+                }
                 // 选区/查找当前项高亮：半透明珊瑚色（多选时画全部）
                 for &(sa, sb) in &sels {
                     if sb > sa && sb > ls && sa <= le {
@@ -1930,6 +2237,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         let cx = x_of(ed.vcaret - ls);
                         let irect = egui::Rect::from_min_size(egui::pos2(cx, y), egui::vec2(1.0, row_h));
                         ui.ctx().output_mut(|o| o.ime = Some(egui::output::IMEOutput { rect: irect, cursor_rect: irect }));
+                        caret_px_frame = Some(egui::pos2(cx, y + row_h));
                     }
                 }
                 // 折叠 header：行尾画「⋯ N」胶囊提示（点击展开）
@@ -1986,6 +2294,44 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 v_toggle_fold(ed, l, unit_cols);
                 ui.ctx().request_repaint();
             }
+            // 补全弹窗（VSCode 风格）：对齐前缀起点、紧贴编辑行正下方；下方空间不足时
+            // 翻到行上方——永不遮挡正在编辑的那一行。扁平卡片：细边框、无浮动大阴影。
+            ed.caret_px = caret_px_frame;
+            let mut accept_click: Option<usize> = None;
+            if let (Some((items, sel, plen)), Some(cpos)) = (&ed.complete, ed.caret_px) {
+                let item_h = 20.0f32;
+                let pop_h = items.len() as f32 * item_h + 10.0;
+                // x 对齐前缀起点（前缀为 ASCII，字节数=字符数），并夹在视口内
+                let mut pos = egui::pos2(cpos.x - *plen as f32 * char_w - 6.0, cpos.y + 1.0);
+                pos.x = pos.x.clamp(clip.left() + gutter_w, (clip.right() - 268.0).max(clip.left()));
+                if pos.y + pop_h > clip.bottom() {
+                    pos.y = cpos.y - row_h - pop_h - 1.0; // 放到编辑行上方
+                }
+                egui::Area::new(text_id.with("complete"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos)
+                    .constrain(false)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(Palette::PANEL)
+                            .stroke(egui::Stroke::new(1.0, Palette::BORDER))
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(4, 4))
+                            .show(ui, |ui| {
+                                ui.set_min_width(260.0);
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                                for (idx, w) in items.iter().enumerate() {
+                                    if ui.selectable_label(idx == *sel, egui::RichText::new(w).monospace().size(12.5)).clicked() {
+                                        accept_click = Some(idx);
+                                    }
+                                }
+                            });
+                    });
+            }
+            if let Some(idx) = accept_click {
+                v_complete_accept(ed, idx);
+            }
             // 行号分割线（固定在左侧行号列右缘）
             painter.vline(clip.left() + gutter_w - 3.0, clip.top()..=clip.bottom(), egui::Stroke::new(1.0, Palette::BORDER));
 
@@ -2039,6 +2385,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ui.memory_mut(|m| m.request_focus(text_id));
                 }
                 if let Some(pos) = resp.interact_pointer_pos() {
+                    ed.complete = None; // 任何正文点击/拖拽都关闭补全弹窗
                     // 坐标 → 内容字节位（行号 = top_line + 视口内行偏移；
                     // 只布局窗口片段，避免在超长行上拖拽选择时每帧整行 layout）
                     let ctx = ui.ctx().clone();
@@ -2068,8 +2415,22 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     } else {
                         None
                     };
-                    ed.msel.clear(); // 点击退出多选
-                    if resp.triple_clicked() {
+                    let alt_click = resp.clicked() && ui.input(|inp| inp.modifiers.alt);
+                    if !alt_click {
+                        ed.msel.clear(); // 普通点击退出多选
+                    }
+                    if alt_click {
+                        // Alt+单击：在点击处添加一个光标（并入多选集合）
+                        if ed.msel.is_empty() {
+                            ed.msel.push((ed.vcaret, ed.vcaret));
+                        }
+                        if !ed.msel.iter().any(|&(_, e)| e == b) {
+                            ed.msel.push((b, b));
+                            ed.msel.sort_by_key(|&(s, _)| s);
+                        }
+                        ed.vcaret = b;
+                        ed.vsel = None;
+                    } else if resp.triple_clicked() {
                         // 三击选中当前逻辑行（含行尾换行符，与主流编辑器一致）
                         let li = ed.vlines.partition_point(|&p| p <= b).saturating_sub(1);
                         let (ls, le) = v_line_range(ed, li);
