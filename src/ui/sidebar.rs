@@ -53,10 +53,7 @@ pub fn show(
         // 适度行距（与快速连接列表一致的舒展感）
         ui.spacing_mut().item_spacing.y = 3.5;
         let Some(info) = info else {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(tr("等待系统信息 …", "Waiting for system info …")).color(Palette::TEXT_DIM));
-            });
+            crate::ui::empty_state(ui, icon::CLOCK, tr("等待系统信息 …", "Waiting for system info …"), true);
             return;
         };
 
@@ -73,7 +70,8 @@ pub fn show(
         ui.add_space(6.0);
 
         // —— CPU / 内存 / 交换：单行对齐，无小标题 ——
-        meter_row(ui, "CPU", info.cpu_percent, &format!("{:.0}%", info.cpu_percent));
+        // 百分比按 3 位补齐：等宽字体下数值跳动不引起宽度抖动
+        meter_row(ui, "CPU", info.cpu_percent, &format!("{:>3.0}%", info.cpu_percent));
         meter_row(
             ui,
             tr("内存", "Mem"),
@@ -236,12 +234,14 @@ fn meter_row(ui: &mut egui::Ui, label: &str, percent: f32, detail: &str) {
         rect.left_top() + Vec2::new(label_w, 2.0),
         rect.right_bottom() - Vec2::new(0.0, 2.0),
     );
+    // 关键指标要醒目：暖灰轨道 + 近实色语义填充（磁盘那种淡染只适合背景信息）
     p.rect_filled(bar, 2.0, Palette::TRACK);
     let mut fill = bar;
-    fill.set_width((bar.width() * percent / 100.0).max(2.0));
-    p.rect_filled(fill, 2.0, usage_color(percent));
+    fill.set_width((bar.width() * percent / 100.0).max(3.0));
+    let c = usage_color(percent);
+    p.rect_filled(fill, 2.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 190));
     p.text(
-        bar.right_center() - Vec2::new(5.0, 0.0),
+        bar.right_center() - Vec2::new(6.0, 0.0),
         egui::Align2::RIGHT_CENTER,
         detail,
         egui::FontId::monospace(11.0),
@@ -261,17 +261,19 @@ fn gpu_meter(ui: &mut egui::Ui, percent: f32, count: usize) -> egui::Response {
     p.text(rect.left_center() + Vec2::new(1.0, 0.0), egui::Align2::LEFT_CENTER, "GPU",
         egui::FontId::proportional(12.0), Palette::TEXT);
     let bar = Rect::from_min_max(rect.left_top() + Vec2::new(label_w, 2.0), rect.right_bottom() - Vec2::new(0.0, 2.0));
+    // 与 meter_row 同款：暖灰轨道 + 近实色填充
     p.rect_filled(bar, 2.0, Palette::TRACK);
     let mut fill = bar;
-    fill.set_width((bar.width() * percent / 100.0).max(2.0));
-    p.rect_filled(fill, 2.0, usage_color(percent));
+    fill.set_width((bar.width() * percent / 100.0).max(3.0));
+    let c = usage_color(percent);
+    p.rect_filled(fill, 2.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 190));
     let detail = if count > 1 {
         match crate::i18n::current() {
-            crate::i18n::Lang::Zh => format!("{count} 卡  {percent:.0}%"),
-            crate::i18n::Lang::En => format!("x{count}  {percent:.0}%"),
+            crate::i18n::Lang::Zh => format!("{count} 卡  {percent:>3.0}%"),
+            crate::i18n::Lang::En => format!("x{count}  {percent:>3.0}%"),
         }
     } else {
-        format!("{percent:.0}%")
+        format!("{percent:>3.0}%")
     };
     p.text(bar.right_center() - Vec2::new(5.0, 0.0), egui::Align2::RIGHT_CENTER, detail,
         egui::FontId::monospace(11.0), Palette::TEXT);
@@ -281,7 +283,7 @@ fn gpu_meter(ui: &mut egui::Ui, percent: f32, count: usize) -> egui::Response {
 
 /// 上/下行速率小卡：与折线图画布同风格（圆角 + 细边框），左图标（曲线同色）、右等宽速率值。
 fn rate_chip(p: &egui::Painter, rect: Rect, icon: &str, color: Color32, rate: &str) {
-    p.rect_filled(rect, 4.0, Palette::PANEL_2);
+    p.rect_filled(rect, 4.0, Palette::CARD);
     p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Palette::BORDER), egui::StrokeKind::Inside);
     p.text(
         rect.left_center() + Vec2::new(7.0, 0.0),
@@ -303,14 +305,16 @@ fn rate_chip(p: &egui::Painter, rect: Rect, icon: &str, color: Color32, rate: &s
 /// 使用量为从左铺入的极淡色染，文字浮于其上（磁盘多时依然轻盈统一）。
 fn disk_row(ui: &mut egui::Ui, mount: &str, percent: f32, detail: &str) {
     let percent = percent.clamp(0.0, 100.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
+    // 悬停显示完整挂载点与使用率（长路径被截断时仍可读全）
+    resp.on_hover_text(format!("{mount}\n{} {percent:.0}%", tr("已用", "Used")));
     let p = ui.painter_at(rect);
 
-    p.rect_filled(rect, 4.0, Palette::PANEL_2);
-    // 使用量：从左侧淡染（低透明度，仅作暗示，不压文字）
+    p.rect_filled(rect, 4.0, Palette::CARD);
+    // 使用量：从右侧淡染（与原版方向一致；低透明度，仅作暗示，不压文字）
     let c = usage_color(percent);
-    let mut fill = rect;
-    fill.set_width((rect.width() * percent / 100.0).max(3.0));
+    let w = (rect.width() * percent / 100.0).max(3.0);
+    let fill = Rect::from_min_max(egui::pos2(rect.right() - w, rect.top()), rect.right_bottom());
     p.rect_filled(fill, 4.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 36));
     p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Palette::BORDER), egui::StrokeKind::Inside);
 
@@ -337,12 +341,13 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
     let cpu_w = 44.0;
     let mem_w = 44.0;
 
-    // 表头：PID | 名称 | CPU% | 内存%（CPU%/内存% 可点击排序）
+    // 表头：PID | 名称 | CPU% | 内存%（CPU%/内存% 可点击排序）；轻底色带与卡片风格呼应
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 15.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), egui::Sense::hover());
         let p = ui.painter_at(rect);
-        p.text(rect.left_center(), egui::Align2::LEFT_CENTER, "PID",
+        p.rect_filled(rect, 3.0, Palette::CARD);
+        p.text(rect.left_center() + Vec2::new(4.0, 0.0), egui::Align2::LEFT_CENTER, "PID",
             egui::FontId::proportional(10.5), Palette::TEXT_DIM);
         p.text(rect.left_center() + Vec2::new(pid_w, 0.0), egui::Align2::LEFT_CENTER, tr("名称", "Name"),
             egui::FontId::proportional(10.5), Palette::TEXT_DIM);
@@ -351,7 +356,7 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
         let cpu_col = if !*sort_mem { Palette::ACCENT } else { Palette::TEXT_DIM };
         let mem_col = if *sort_mem { Palette::ACCENT } else { Palette::TEXT_DIM };
         p.text(cpu_rect.right_center(), egui::Align2::RIGHT_CENTER, "CPU%", egui::FontId::proportional(10.5), cpu_col);
-        p.text(mem_rect.right_center(), egui::Align2::RIGHT_CENTER, tr("内存%", "Mem%"), egui::FontId::proportional(10.5), mem_col);
+        p.text(mem_rect.right_center() - Vec2::new(4.0, 0.0), egui::Align2::RIGHT_CENTER, tr("内存%", "Mem%"), egui::FontId::proportional(10.5), mem_col);
         if ui.interact(cpu_rect, ui.id().with("sort_cpu"), egui::Sense::click()).clicked() {
             *sort_mem = false;
         }
@@ -378,23 +383,27 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
         }
         crate::app::view_context_menu(&resp);
         let p = ui.painter_at(rect);
-        p.text(rect.left_center(), egui::Align2::LEFT_CENTER, proc.pid.to_string(),
+        p.text(rect.left_center() + Vec2::new(4.0, 0.0), egui::Align2::LEFT_CENTER, proc.pid.to_string(),
             egui::FontId::proportional(11.0), Palette::TEXT_DIM);
-        // 内存%（最右）
+        // 内存%（最右）：等宽防抖；正常值安静灰、偏高才用语义警示色
         let mem_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w, 0.0), rect.right_bottom());
-        p.text(mem_rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.mem),
-            egui::FontId::proportional(11.0), usage_color(proc.mem));
+        p.text(mem_rect.right_center() - Vec2::new(4.0, 0.0), egui::Align2::RIGHT_CENTER, format!("{:.1}", proc.mem),
+            egui::FontId::monospace(11.0), proc_num_color(proc.mem));
         // CPU%（中右）：可超 100%（多核），大值去小数以适配列宽
         let cpu_rect = Rect::from_min_max(rect.right_top() - Vec2::new(mem_w + cpu_w, 0.0), egui::pos2(rect.right() - mem_w, rect.bottom()));
         let cpu_txt = if proc.cpu >= 100.0 { format!("{:.0}", proc.cpu) } else { format!("{:.1}", proc.cpu) };
         p.text(cpu_rect.right_center(), egui::Align2::RIGHT_CENTER, cpu_txt,
-            egui::FontId::proportional(11.0), usage_color(proc.cpu));
+            egui::FontId::monospace(11.0), proc_num_color(proc.cpu));
         // 名称（中间，截断）
         let name_rect = Rect::from_min_max(
             rect.left_top() + Vec2::new(pid_w, 0.0),
             rect.right_bottom() - Vec2::new(cpu_w + mem_w, 0.0),
         );
         let name = truncate_to(proc.name.as_str(), name_rect.width());
+        // 名称被截断时悬停显示完整命令名
+        if name.ends_with('…') {
+            resp.on_hover_text(&proc.name);
+        }
         ui.painter_at(name_rect).text(
             name_rect.left_center(),
             egui::Align2::LEFT_CENTER,
@@ -402,6 +411,15 @@ fn proc_table(ui: &mut egui::Ui, info: &SysInfo, sort_mem: &mut bool, proc_click
             egui::FontId::proportional(11.0),
             Palette::TEXT,
         );
+    }
+}
+
+/// 进程数值取色：正常时安静（暗灰），偏高（≥60%）才用语义警示色，避免满屏彩色小字。
+fn proc_num_color(pct: f32) -> Color32 {
+    if pct >= 60.0 {
+        usage_color(pct)
+    } else {
+        Palette::TEXT_DIM
     }
 }
 

@@ -49,6 +49,9 @@ pub struct FilePanelState {
     /// 列表排序键 + 是否降序
     pub sort_key: SortKey,
     pub sort_desc: bool,
+    /// 列表五列宽度（名称/大小/修改时间/权限/所有者）。全 0 表示未初始化，
+    /// 首帧惰性从配置载入（egui_extras 内建 TableState 私有不可读，故自管 + 持久化）。
+    pub col_w: [f32; 5],
     /// 按名称过滤当前目录列表（不区分大小写子串匹配）
     pub filter: String,
     /// 「复制路径」按钮的成功反馈时刻（短暂显示对勾）
@@ -106,6 +109,9 @@ const LIST_TIMEOUT: f64 = 6.0;
 /// 单个目录最多请求次数（含首次）；超过仍无响应则放弃并让用户手动刷新。弱网需较大预算，
 /// 让后台 SFTP 重连有足够时间恢复（≈ LIST_TIMEOUT × LIST_MAX_TRIES 秒）。
 const LIST_MAX_TRIES: u32 = 10;
+
+/// 文件列表默认列宽（名称/大小/修改时间/权限/所有者）
+const DEFAULT_COLS: [f32; 5] = [220.0, 80.0, 140.0, 96.0, 120.0];
 
 /// 拖拽悬停多久后自动进入目标目录（秒）
 const UP_DWELL: f64 = 0.8;
@@ -696,7 +702,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                 egui::popup_below_widget(ui, pop_id, &star, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                     ui.set_min_width(280.0);
                     if state.favorites.is_empty() {
-                        ui.label(RichText::new(crate::i18n::tr("暂无收藏，右键文件夹/空白处可加入", "No favorites — right-click to add")).color(Palette::TEXT_DIM).size(12.0));
+                        crate::ui::empty_state(ui, egui_phosphor::regular::STAR, crate::i18n::tr("暂无收藏，右键文件夹/空白处可加入", "No favorites — right-click to add"), false);
                     } else {
                         egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                             for (i, p) in state.favorites.iter().enumerate() {
@@ -1103,42 +1109,74 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         }
     }
 
+    // 表头列宽拖拽产生的 (列号, 本帧位移)；在 Frame 闭包外声明，闭包结束后统一应用并落盘
+    let mut col_drag: Option<(usize, f32)> = None;
+    let mut col_drag_done = false;
+
     egui::Frame::new()
         .inner_margin(egui::Margin { left: 6, right: 2, top: 0, bottom: 0 })
         .show(ui, |ui| {
     // 滚动条滑块用灰度（非浮动），尤其拖动(active)时用深灰——否则默认拖动时偏白看不见
     ui.spacing_mut().scroll.floating = false;
     ui.spacing_mut().scroll.foreground_color = false;
-    ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(190);
-    ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_gray(150);
-    ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(110);
+    ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_rgb(193, 188, 175);
+    ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_rgb(154, 148, 134);
+    ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_rgb(114, 109, 97);
     // 拖拽悬停高亮用独立图层绘制：TableBuilder 闭包内 ui 已被可变借用，不能再取 ui.painter()
     let dnd_painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("file_dnd_hl")));
+    // 列宽自管（Column::exact + 表头自绘拖拽）：内建 resizable 的 TableState 私有且按
+    // id_salt(cwd) 隔离，既不能跨目录共享也无法持久化；自管后列宽全局一致并写入配置。
+    if state.col_w.iter().all(|w| *w <= 0.0) {
+        state.col_w = crate::store::load_file_cols().unwrap_or(DEFAULT_COLS);
+    }
+    let colw = state.col_w;
     let mut tbl = TableBuilder::new(ui)
         // 按目录区分滚动状态：进入子目录/切换目录后从顶部开始，不沿用上个目录的滚动位置
         .id_salt(&cwd)
         .striped(true)
-        .resizable(true)
+        .resizable(false)
         .sense(Sense::click_and_drag())
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::auto().at_least(190.0).clip(true))
-        .column(Column::auto().at_least(80.0))
-        .column(Column::auto().at_least(140.0))
-        .column(Column::auto().at_least(96.0))
-        // owner 列用 auto 而非 remainder：列表填不满时右侧留白，便于右键空白处操作当前文件夹
-        .column(Column::auto().at_least(120.0));
+        .column(Column::exact(colw[0]).clip(true))
+        .column(Column::exact(colw[1]).clip(true))
+        .column(Column::exact(colw[2]).clip(true))
+        .column(Column::exact(colw[3]).clip(true))
+        // owner 列不用 remainder：列表填不满时右侧留白，便于右键空白处操作当前文件夹
+        .column(Column::exact(colw[4]).clip(true));
     // 键盘移动选中行时滚动到该行
     if let Some(r) = scroll_to_row {
         tbl = tbl.scroll_to_row(r, Some(egui::Align::Center));
     }
     tbl.header(22.0, |mut h| {
             let (cur, desc) = (state.sort_key, state.sort_desc);
+            // 列宽拖拽热区：贴在表头列右缘，悬停/拖动时显示竖线并给出双向箭头光标
+            let mut resize_handle = |ui: &mut egui::Ui, idx: usize| {
+                let r = ui.max_rect();
+                let hr = egui::Rect::from_min_max(
+                    egui::pos2(r.right() - 2.0, r.top() - 3.0),
+                    egui::pos2(r.right() + 4.0, r.bottom() + 3.0),
+                );
+                let resp = ui.interact(hr, ui.id().with(("colw", idx)), Sense::drag());
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    ui.painter().vline(r.right() + 1.0, hr.y_range(), egui::Stroke::new(2.0, Palette::ACCENT.gamma_multiply(0.6)));
+                }
+                if resp.dragged() {
+                    col_drag = Some((idx, resp.drag_delta().x));
+                }
+                if resp.drag_stopped() {
+                    col_drag_done = true;
+                }
+            };
             // 可排序表头：点击切换排序键/方向，激活列显示升降箭头
-            for (k, label) in [
+            for (idx, (k, label)) in [
                 (SortKey::Name, crate::i18n::tr("名称", "Name")),
                 (SortKey::Size, crate::i18n::tr("大小", "Size")),
                 (SortKey::Mtime, crate::i18n::tr("修改时间", "Modified")),
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 h.col(|ui| {
                     let arrow = if cur == k {
                         if desc { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_UP }
@@ -1152,12 +1190,14 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     {
                         sort_click = Some(k);
                     }
+                    resize_handle(ui, idx);
                 });
             }
             // 不可排序：权限 / 所有者
-            for t in [crate::i18n::tr("权限", "Perm"), crate::i18n::tr("所有者", "Owner")] {
+            for (idx, t) in [crate::i18n::tr("权限", "Perm"), crate::i18n::tr("所有者", "Owner")].into_iter().enumerate() {
                 h.col(|ui| {
                     ui.label(RichText::new(t).strong().color(Palette::TEXT_DIM));
+                    resize_handle(ui, 3 + idx);
                 });
             }
         })
@@ -1345,6 +1385,14 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
             painter.galley(rect.min + pad, galley, egui::Color32::WHITE);
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
+    }
+
+    // 应用表头列宽拖拽；松手时写入配置（重启恢复）
+    if let Some((i, dx)) = col_drag {
+        state.col_w[i] = (state.col_w[i] + dx).clamp(40.0, 800.0);
+    }
+    if col_drag_done {
+        crate::store::save_file_cols(&state.col_w);
     }
 
     // 表头点击排序：同列切升/降；换列时按列性质选默认方向——

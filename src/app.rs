@@ -2812,7 +2812,7 @@ impl App {
 
                 if self.snippets.is_empty() {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(crate::i18n::tr("暂无片段，在下方新增", "No snippets; add one below")).color(Palette::TEXT_DIM).size(12.0));
+                    crate::ui::empty_state(ui, egui_phosphor::regular::CODE, crate::i18n::tr("暂无片段，在下方新增", "No snippets; add one below"), false);
                 }
                 // 列表：点名称即发送到当前会话终端；右侧编辑 / 删除（无边框图标，风格统一）
                 egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
@@ -3911,7 +3911,8 @@ impl App {
             .resizable(false)
             .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
             .show(ctx, |ui| {
-                ui.set_max_width(300.0);
+                // 同进程详情窗：定宽使标题行/分割线与内容同宽对齐
+                ui.set_width(300.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{}  {}", icon::CPU, crate::i18n::tr("GPU 详情", "GPU"))).strong().size(13.0).color(Palette::TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3921,23 +3922,24 @@ impl App {
                     });
                 });
                 ui.separator();
+                // 自绘条（与侧栏 meter_row 同款）：暖灰轨道 + 近实色填充，文字浮于条上
+                let bar_line = |ui: &mut egui::Ui, pct: f32, color: egui::Color32, text: String| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 14.0), Sense::hover());
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect, 2.0, Palette::TRACK);
+                    let mut fill = rect;
+                    fill.set_width((rect.width() * (pct / 100.0).clamp(0.0, 1.0)).max(3.0));
+                    p.rect_filled(fill, 2.0, egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 190));
+                    p.text(rect.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, text,
+                        egui::FontId::proportional(10.0), Palette::TEXT);
+                };
                 for g in &gpus {
                     ui.label(RichText::new(format!("GPU{} {}", g.index, g.name)).size(12.0).color(Palette::TEXT));
                     let mem_pct = if g.mem_total_mb > 0 { g.mem_used_mb as f32 / g.mem_total_mb as f32 * 100.0 } else { 0.0 };
-                    ui.add(
-                        egui::ProgressBar::new((g.util / 100.0).clamp(0.0, 1.0))
-                            .fill(crate::ui::usage_color(g.util))
-                            .text(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("使用率 {:.0}%", g.util), crate::i18n::Lang::En => format!("Util {:.0}%", g.util) }).size(10.0))
-                            .desired_height(12.0)
-                            .corner_radius(2.0),
-                    );
-                    ui.add(
-                        egui::ProgressBar::new((mem_pct / 100.0).clamp(0.0, 1.0))
-                            .fill(Palette::ACCENT)
-                            .text(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("显存 {}/{} MB", g.mem_used_mb, g.mem_total_mb), crate::i18n::Lang::En => format!("VRAM {}/{} MB", g.mem_used_mb, g.mem_total_mb) }).size(10.0))
-                            .desired_height(12.0)
-                            .corner_radius(2.0),
-                    );
+                    bar_line(ui, g.util, crate::ui::usage_color(g.util),
+                        match crate::i18n::current() { crate::i18n::Lang::Zh => format!("使用率 {:.0}%", g.util), crate::i18n::Lang::En => format!("Util {:.0}%", g.util) });
+                    bar_line(ui, mem_pct, Palette::ACCENT,
+                        match crate::i18n::current() { crate::i18n::Lang::Zh => format!("显存 {}/{} MB", g.mem_used_mb, g.mem_total_mb), crate::i18n::Lang::En => format!("VRAM {}/{} MB", g.mem_used_mb, g.mem_total_mb) });
                     ui.add_space(5.0);
                 }
             });
@@ -3971,7 +3973,9 @@ impl App {
             .resizable(false)
             .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
             .show(ctx, |ui| {
-                ui.set_max_width(320.0);
+                // 固定内容宽度：自适应收缩窗口里，先布局的标题行/分割线取的是「当时估计宽度」，
+                // 会被后续更宽的行（长命令）撑开而不跟随；定宽让所有行按同一宽度对齐
+                ui.set_width(320.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{}  {}", icon::CPU, name)).strong().size(13.0).color(Palette::TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4196,7 +4200,7 @@ impl App {
                 ui.separator();
                 if let Some(s) = self.sessions.get(idx) {
                     if s.forwards.is_empty() {
-                        ui.label(RichText::new(crate::i18n::tr("暂无转发任务", "No forwards")).color(Palette::TEXT_DIM).size(12.0));
+                        crate::ui::empty_state(ui, egui_phosphor::regular::ARROWS_LEFT_RIGHT, crate::i18n::tr("暂无转发任务", "No forwards"), false);
                     }
                     for fwd in &s.forwards {
                         ui.horizontal(|ui| {
@@ -4508,7 +4512,7 @@ impl App {
                 let total_len = items.len();
                 if total_len == 0 {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(crate::i18n::tr("暂无传输任务", "No transfers")).color(Palette::TEXT_DIM).size(12.0));
+                    crate::ui::empty_state(ui, egui_phosphor::regular::DOWNLOAD_SIMPLE, crate::i18n::tr("暂无传输任务", "No transfers"), false);
                 }
                 let mut open_dir: Option<String> = None;
                 let mut shown = 0usize; // 当前筛选下实际展示的条数（用于「无匹配」提示）
@@ -4683,7 +4687,7 @@ impl App {
                 // 有任务但当前筛选下一条都没有：给出「无匹配」提示，避免看着像空列表
                 if shown == 0 && total_len > 0 {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(crate::i18n::tr("该筛选下暂无任务", "No transfers match this filter")).color(Palette::TEXT_DIM).size(12.0));
+                    crate::ui::empty_state(ui, egui_phosphor::regular::MAGNIFYING_GLASS, crate::i18n::tr("该筛选下暂无任务", "No transfers match this filter"), false);
                 }
                 });
                 if let Some(p) = open_dir {

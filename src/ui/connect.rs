@@ -341,10 +341,12 @@ impl ConnectForm {
 
         egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
             if self.saved.is_empty() {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(crate::i18n::tr("还没有保存的连接，点击右上角「新建」", "No saved connections. Click \"New\" top-right.")).color(Palette::TEXT_DIM));
-                });
+                crate::ui::empty_state(
+                    ui,
+                    egui_phosphor::regular::PLUGS,
+                    crate::i18n::tr("还没有保存的连接，点击右上角「新建」", "No saved connections. Click \"New\" top-right."),
+                    true,
+                );
                 return;
             }
             // 过滤

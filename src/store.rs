@@ -499,6 +499,30 @@ pub fn save_zoom(zoom: f32) {
     }
 }
 
+fn file_cols_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("file_cols"))
+}
+
+/// 读取文件面板列宽（名称/大小/修改时间/权限/所有者，空格分隔）；未设置或格式不符则 None。
+pub fn load_file_cols() -> Option<[f32; 5]> {
+    let s = std::fs::read_to_string(file_cols_path()?).ok()?;
+    let v: Vec<f32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    let arr: [f32; 5] = v.try_into().ok()?;
+    // 夹到合理范围，防止手改文件出现 0/负数把列挤没
+    Some(arr.map(|w| w.clamp(40.0, 800.0)))
+}
+
+/// 保存文件面板列宽。
+pub fn save_file_cols(cols: &[f32; 5]) {
+    if let Some(p) = file_cols_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let s = cols.map(|w| format!("{w:.0}")).join(" ");
+        let _ = std::fs::write(p, s);
+    }
+}
+
 // ---------- 读写 ----------
 
 /// 读取已保存连接列表（内存中为明文密码）。

@@ -1516,9 +1516,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         ui.spacing_mut().scroll.floating = false;
         ui.spacing_mut().scroll.foreground_color = false;
         ui.visuals_mut().extreme_bg_color = bg;
-        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(202);
-        ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_gray(168);
-        ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(140);
+        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_rgb(205, 200, 188);
+        ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_rgb(172, 166, 152);
+        ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_rgb(144, 138, 124);
         let mut sa = egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id);
         if let Some(v) = force_v {
             sa = sa.vertical_scroll_offset(v);

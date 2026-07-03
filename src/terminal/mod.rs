@@ -994,12 +994,13 @@ impl Terminal {
             let y = origin.y + row as f32 * char_h;
             // 先绘制该行的背景块（处理非默认底色）
             paint_row_backgrounds(&painter, screen, row, self.cols, origin, cell, &tc);
-            // 搜索命中行高亮（整行淡黄底）
+            // 搜索命中行高亮（整行淡黄底，取主题 WARN 色保持一致）
             if self.search_hl == Some(row) {
+                let w = crate::theme::Palette::WARN;
                 painter.rect_filled(
                     Rect::from_min_max(egui::pos2(origin.x, y), egui::pos2(rect.right(), y + char_h)),
                     0.0,
-                    Color32::from_rgba_unmultiplied(0xc2, 0x8e, 0x3c, 90),
+                    Color32::from_rgba_unmultiplied(w.r(), w.g(), w.b(), 90),
                 );
             }
             // 选区高亮（半透明，文字仍可见）
@@ -1110,12 +1111,13 @@ impl Terminal {
             let handle_top = sb_track.top() + (sb_track.height() - handle_h) * pos_frac;
             let handle = Rect::from_min_size(egui::pos2(sb_track.left() + 1.0, handle_top), Vec2::new(sb_w - 2.0, handle_h));
             let hovered = hover_pos.is_some_and(|p| sb_track.contains(p));
+            // 暖灰滑块，与全局暖色调一致
             let col = if self.sb_dragging {
-                egui::Color32::from_gray(110)
+                egui::Color32::from_rgb(114, 109, 97)
             } else if hovered {
-                egui::Color32::from_gray(140)
+                egui::Color32::from_rgb(144, 138, 124)
             } else {
-                egui::Color32::from_gray(175)
+                egui::Color32::from_rgb(179, 173, 159)
             };
             painter.rect_filled(handle, 3.0, col);
         }

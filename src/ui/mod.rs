@@ -32,6 +32,24 @@ pub fn fmt_rate(bps: f64) -> String {
     format!("{}/s", fmt_bytes(bps))
 }
 
+/// 空态提示：图标 + 灰字，统一各面板「无内容」的样式。
+/// `centered`：面板级空态（垂直留白 + 居中竖排）；否则为列表内的一行横排。
+pub fn empty_state(ui: &mut egui::Ui, icon: &str, text: &str, centered: bool) {
+    if centered {
+        ui.add_space(18.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new(icon).color(Palette::TEXT_DIM).size(20.0));
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(text).color(Palette::TEXT_DIM).size(12.0));
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(icon).color(Palette::TEXT_DIM).size(13.0));
+            ui.label(egui::RichText::new(text).color(Palette::TEXT_DIM).size(12.0));
+        });
+    }
+}
+
 /// 根据使用率取色：低=绿、中=黄、高=红。
 pub fn usage_color(percent: f32) -> Color32 {
     if percent >= 85.0 {
@@ -50,8 +68,8 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, s
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     // 卡片式画布：圆角 + 细边框，与全局控件风格一致；底边框即 0 基线。
-    // 底色用亮一档的 PANEL_2（骨白），与象牙白面板层级更协调
-    painter.rect_filled(rect, 4.0, Palette::PANEL_2);
+    // 底色用暖奶油 CARD，贴合全局暖色调
+    painter.rect_filled(rect, 4.0, Palette::CARD);
     painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Palette::BORDER), egui::StrokeKind::Inside);
 
     // 1px 横线对齐物理像素中心，避免高 DPI 下发虚

@@ -25,7 +25,8 @@ pub const FS_TITLE: f32 = 16.0;
 /// 主题色板：参考 **Claude / Anthropic** 官网风格——暖米白底 + Claude 珊瑚橙强调色。
 pub struct Palette;
 impl Palette {
-    /// 窗口背景（暖米白，最底层画布）
+    /// 窗口背景（暖米白，最底层画布）。注意：底色保持低饱和的克制灰调，
+    /// 太黄/太花会淹没前景信息——暖色感交给强调色与小元素，不靠大面积底色。
     pub const BG: Color32 = Color32::from_rgb(0xec, 0xe9, 0xe1);
     /// 面板背景（象牙白卡片，较画布更亮以拉开层级）
     pub const PANEL: Color32 = Color32::from_rgb(0xfd, 0xfc, 0xf9);
@@ -33,6 +34,8 @@ impl Palette {
     pub const PANEL_2: Color32 = Color32::from_rgb(0xf4, 0xf1, 0xea);
     /// 进度条轨道 / 悬停底（暖灰）
     pub const TRACK: Color32 = Color32::from_rgb(0xe7, 0xe2, 0xd6);
+    /// 信息卡片底（暖奶油：介于 PANEL_2 与 TRACK 之间，用于折线图/速率卡/磁盘卡等）
+    pub const CARD: Color32 = Color32::from_rgb(0xef, 0xea, 0xdc);
     /// 分隔线 / 边框（调浅一档，少用硬边框、多靠柔影分区，更显轻盈）
     pub const BORDER: Color32 = Color32::from_rgb(0xdc, 0xd7, 0xc9);
     /// 主强调色（Claude 珊瑚橙，略加饱和让主操作更活泼）
