@@ -66,6 +66,8 @@ pub fn apply(ctx: &egui::Context) {
     style.visuals = egui::Visuals::light();
     let v = &mut style.visuals;
     v.dark_mode = false;
+    // 文本渲染沿用浅色默认 Linear coverage→alpha。「增实」曲线（TwoCoverageMinusCoverageSq）
+    // 实测浅底上颜色过深且无助于清晰度，已回退。
     v.override_text_color = Some(Palette::TEXT);
     v.panel_fill = Palette::BG;
     v.window_fill = Palette::PANEL;
