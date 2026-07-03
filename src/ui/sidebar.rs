@@ -117,10 +117,11 @@ pub fn show(
                 .map(|n| (n.rx_bps, n.tx_bps))
                 .unwrap_or((info.net_rx_bps, info.net_tx_bps))
         };
-        // 网卡选择（单独一行，右对齐，按钮大小合理）
+        // 网卡选择（单独一行，右对齐；压缩内边距，视觉更轻盈）
         ui.horizontal(|ui| {
             ui.label(RichText::new(tr("网卡", "NIC")).color(Palette::TEXT_DIM).size(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
                 let cur = if selected_nic.is_empty() { tr("全部", "All").to_string() } else { selected_nic.clone() };
                 egui::ComboBox::from_id_salt("nic_sel")
                     .selected_text(RichText::new(cur).size(12.0))
@@ -133,22 +134,31 @@ pub fn show(
                     });
             });
         });
-        // 上下行速率（图标 + 文字，对齐）
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(icon::ARROW_DOWN).color(Palette::OK).size(13.0));
-            ui.label(RichText::new(fmt_rate(rx)).color(Palette::TEXT).size(12.0).monospace());
-            ui.add_space(12.0);
-            ui.label(RichText::new(icon::ARROW_UP).color(Palette::ACCENT).size(13.0));
-            ui.label(RichText::new(fmt_rate(tx)).color(Palette::TEXT).size(12.0).monospace());
-        });
+        // 上下行速率：左右两枚等宽小卡，与折线图同风格；图标色即曲线颜色（兼作图例）
+        {
+            let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), egui::Sense::hover());
+            let p = ui.painter_at(row);
+            let gap = 4.0;
+            let half = (row.width() - gap) / 2.0;
+            let left = Rect::from_min_size(row.min, Vec2::new(half, row.height()));
+            let right = Rect::from_min_size(egui::pos2(row.min.x + half + gap, row.top()), Vec2::new(half, row.height()));
+            rate_chip(&p, left, icon::ARROW_DOWN, Palette::NET_DOWN, &fmt_rate(rx));
+            rate_chip(&p, right, icon::ARROW_UP, Palette::NET_UP, &fmt_rate(tx));
+        }
         net_sparkline(ui, &hist.down_slice(), &hist.up_slice(), 76.0, NetHistory::CAP);
         ui.add_space(6.0);
 
-        // —— 磁盘：每行一个，右起进度条 + 文字同行 ——
+        // —— 磁盘：每行一张轻卡片 ——
         section(ui, icon::HARD_DRIVES, tr("磁盘", "Disk"));
-        for d in &info.disks {
-            // 显示 df 的真实可用空间（已扣除 root 预留块），而非 total-used
-            disk_row(ui, &d.mount, d.percent, &format!("{}/{}", fmt_kb(d.avail_kb), fmt_kb(d.total_kb)));
+        // 显示 df 的真实可用空间（已扣除 root 预留块），而非 total-used。
+        // 「可用/总量」按本机磁盘的最大字符宽补齐（等宽字体）：各行的 "/" 与数值右缘
+        // 上下对齐，列宽随实际数据自适应，不为极端长度付出固定大留白。
+        let avails: Vec<String> = info.disks.iter().map(|d| fmt_kb(d.avail_kb)).collect();
+        let totals: Vec<String> = info.disks.iter().map(|d| fmt_kb(d.total_kb)).collect();
+        let aw = avails.iter().map(|s| s.len()).max().unwrap_or(0);
+        let tw = totals.iter().map(|s| s.len()).max().unwrap_or(0);
+        for (i, d) in info.disks.iter().enumerate() {
+            disk_row(ui, &d.mount, d.percent, &format!("{:>aw$}/{:>tw$}", avails[i], totals[i]));
         }
     });
 }
@@ -269,28 +279,51 @@ fn gpu_meter(ui: &mut egui::Ui, percent: f32, count: usize) -> egui::Response {
     resp
 }
 
-/// 磁盘单行：浅色底，使用量从右侧填充；左挂载点、右「可用/总量」。
+/// 上/下行速率小卡：与折线图画布同风格（圆角 + 细边框），左图标（曲线同色）、右等宽速率值。
+fn rate_chip(p: &egui::Painter, rect: Rect, icon: &str, color: Color32, rate: &str) {
+    p.rect_filled(rect, 4.0, Palette::PANEL_2);
+    p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Palette::BORDER), egui::StrokeKind::Inside);
+    p.text(
+        rect.left_center() + Vec2::new(7.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        icon,
+        egui::FontId::proportional(12.0),
+        color,
+    );
+    p.text(
+        rect.right_center() - Vec2::new(7.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        rate,
+        egui::FontId::monospace(11.0),
+        Palette::TEXT,
+    );
+}
+
+/// 磁盘单行：与速率小卡/折线图同一卡片语言——骨白底 + 细边框，
+/// 使用量为从左铺入的极淡色染，文字浮于其上（磁盘多时依然轻盈统一）。
 fn disk_row(ui: &mut egui::Ui, mount: &str, percent: f32, detail: &str) {
     let percent = percent.clamp(0.0, 100.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::hover());
     let p = ui.painter_at(rect);
 
-    p.rect_filled(rect, 2.0, Palette::TRACK);
-    // 使用量：从右侧起填充（半透明，柔和不刺眼）
-    let w = rect.width() * percent / 100.0;
-    let used = Rect::from_min_max(egui::pos2(rect.right() - w, rect.top()), rect.right_bottom());
+    p.rect_filled(rect, 4.0, Palette::PANEL_2);
+    // 使用量：从左侧淡染（低透明度，仅作暗示，不压文字）
     let c = usage_color(percent);
-    p.rect_filled(used, 2.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 90));
+    let mut fill = rect;
+    fill.set_width((rect.width() * percent / 100.0).max(3.0));
+    p.rect_filled(fill, 4.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 36));
+    p.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Palette::BORDER), egui::StrokeKind::Inside);
 
     p.text(
-        rect.left_center() + Vec2::new(6.0, 0.0),
+        rect.left_center() + Vec2::new(7.0, 0.0),
         egui::Align2::LEFT_CENTER,
         mount,
         egui::FontId::proportional(12.0),
         Palette::TEXT,
     );
+    // 用整数字号（非整数字号行高取整会让文字视觉偏上），与挂载点同基线居中
     p.text(
-        rect.right_center() - Vec2::new(6.0, 0.0),
+        rect.right_center() - Vec2::new(7.0, 0.0),
         egui::Align2::RIGHT_CENTER,
         detail,
         egui::FontId::monospace(11.0),

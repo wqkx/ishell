@@ -49,25 +49,32 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, s
     let desired = Vec2::new(ui.available_width(), height);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Palette::TRACK);
+    // 卡片式画布：圆角 + 细边框，与全局控件风格一致；底边框即 0 基线。
+    // 底色用亮一档的 PANEL_2（骨白），与象牙白面板层级更协调
+    painter.rect_filled(rect, 4.0, Palette::PANEL_2);
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Palette::BORDER), egui::StrokeKind::Inside);
 
-    // 绘图区贴近左/上边界；顶线贴住上边界，另两条线把区域三等分
+    // 1px 横线对齐物理像素中心，避免高 DPI 下发虚
+    let ppp = painter.ctx().pixels_per_point();
+    let snap = |y: f32| ((y * ppp).floor() + 0.5) / ppp;
+
+    // 绘图区：左右留白与底部基线留白相当；顶线贴住画布上沿（仅让出 1px 边框）
     let plot = Rect::from_min_max(
-        egui::pos2(rect.left() + 2.0, rect.top() + 2.0),
-        egui::pos2(rect.right() - 4.0, rect.bottom() - 6.0),
+        egui::pos2(rect.left() + 6.0, snap(rect.top() + 1.0)),
+        egui::pos2(rect.right() - 6.0, snap(rect.bottom() - 4.0)),
     );
 
     let raw_max = down.iter().chain(up.iter()).cloned().fold(0.0_f64, f64::max);
     let max = nice_ceiling(raw_max.max(1024.0)); // 至少 1KB，向上取整到“整”刻度
 
     // 三条水平虚线（frac = 1, 2/3, 1/3，把绘图区分三块），刻度值贴在各自线下方
-    let grid_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0xb6, 0xb0, 0xa0));
+    let grid_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0xc6, 0xc0, 0xb0));
     for frac in [1.0_f32, 2.0 / 3.0, 1.0 / 3.0] {
-        let y = plot.bottom() - plot.height() * frac;
+        let y = snap(plot.bottom() - plot.height() * frac);
         dashed_hline(&painter, plot.left(), plot.right(), y, grid_stroke);
         let val = max * frac as f64;
         painter.text(
-            egui::pos2(plot.left() + 2.0, y + 1.0),
+            egui::pos2(plot.left() + 2.0, y + 2.0),
             egui::Align2::LEFT_TOP,
             fmt_rate_compact(val),
             egui::FontId::monospace(9.0),
@@ -93,7 +100,7 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, s
             })
             .collect();
         // 线下半透明填充（逐段四边形，避免凹多边形填充问题）
-        let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 48);
+        let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40);
         for w in pts.windows(2) {
             let quad = vec![
                 w[0],
@@ -105,8 +112,8 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, s
         }
         painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, color)));
     };
-    draw(down, Palette::OK); // 下载
-    draw(up, Palette::ACCENT); // 上传
+    draw(down, Palette::NET_DOWN); // 下载
+    draw(up, Palette::NET_UP); // 上传
 }
 
 /// 紧凑速率（刻度用）：如 "60K"、"1.2M"。
@@ -139,7 +146,7 @@ fn nice_ceiling(v: f64) -> f64 {
 
 /// 绘制一条水平虚线。
 fn dashed_hline(painter: &egui::Painter, x0: f32, x1: f32, y: f32, stroke: egui::Stroke) {
-    let (dash, gap) = (4.0, 3.0);
+    let (dash, gap) = (3.0, 3.0);
     let mut x = x0;
     while x < x1 {
         let xe = (x + dash).min(x1);

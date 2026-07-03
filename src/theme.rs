@@ -44,6 +44,9 @@ impl Palette {
     pub const TEXT_DIM: Color32 = Color32::from_rgb(0x54, 0x51, 0x4a);
     /// 语义色（柔和暖调，较前略提明度/饱和更清亮）
     pub const OK: Color32 = Color32::from_rgb(0x5e, 0x94, 0x57);
+    /// 网络曲线专用色（较语义色更柔和低饱和，浅底上不刺眼）：下行鼠尾草绿 / 上行柔珊瑚
+    pub const NET_DOWN: Color32 = Color32::from_rgb(0x76, 0xa2, 0x67);
+    pub const NET_UP: Color32 = Color32::from_rgb(0xdf, 0x8a, 0x66);
     pub const WARN: Color32 = Color32::from_rgb(0xcc, 0x94, 0x38);
     pub const DANGER: Color32 = Color32::from_rgb(0xcb, 0x5a, 0x4d);
     /// 终端背景（比面板更深一些的暖灰）与默认前景
