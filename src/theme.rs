@@ -186,6 +186,38 @@ fn install_fonts(ctx: &egui::Context) {
     // Phosphor 图标字体（按钮/文件类型图标）
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
+    // 等宽主字体：内嵌 JetBrains Mono（OFL 许可）。egui 内置的 Hack 笔画偏细、
+    // 灰度抗锯齿下发虚；JetBrains Mono 笔画厚实、hinting 佳，全平台观感一致。
+    fonts.font_data.insert(
+        "jbmono".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))),
+    );
+    fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "jbmono".to_owned());
+
+    // UI 比例字体：egui 默认是 Ubuntu-Light（细体，浅底上发灰）。
+    // Linux/Windows 换成系统常规字重 sans；中文仍回退到下方 cjk 字体。
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        let sans: &[&str] = &[
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ];
+        #[cfg(windows)]
+        let sans: &[&str] = &["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"];
+        for p in sans {
+            if let Ok(data) = std::fs::read(p) {
+                fonts.font_data.insert("ui_sans".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(data)));
+                fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "ui_sans".to_owned());
+                log::info!("UI 字体：{p}");
+                break;
+            }
+        }
+    }
+
     // 系统中文字体（作为各字体族的后备）。
     // 逐个候选读取，并**校验该字面确实能渲染汉字「中」**——避免选到一个不含 CJK 字形的
     // 字面（如 macOS 上字体集合的家族名被本地化为「苹方-简」时旧逻辑按 "SC" 匹配会落空），
@@ -215,41 +247,23 @@ fn install_fonts(ctx: &egui::Context) {
         log::warn!("未找到系统中文字体，中文可能显示为方块");
     }
 
-    // 仅 macOS：用系统字体（SF Pro / SF Mono，原生且常规字重）做 UI/终端主字体，
-    // 替掉偏细的默认 Ubuntu-Light/Hack，减轻「字体发虚」；其它平台保持不变。
+    // 仅 macOS：UI 比例字体用系统 SF Pro（原生且常规字重）；等宽已统一为内嵌 JetBrains Mono。
     // 拉丁字形走系统字体，中文仍回退到上面的 cjk 字体。
     #[cfg(target_os = "macos")]
     {
-        let groups: [(&str, &[&str], egui::FontFamily); 2] = [
-            (
-                "mac_ui",
-                &[
-                    "/System/Library/Fonts/SFNS.ttf",
-                    "/System/Library/Fonts/SFNSText.ttf",
-                    "/System/Library/Fonts/SFNSDisplay.ttf",
-                    "/System/Library/Fonts/Supplemental/Helvetica.ttc",
-                    "/System/Library/Fonts/Supplemental/Arial.ttf",
-                ],
-                egui::FontFamily::Proportional,
-            ),
-            (
-                "mac_mono",
-                &[
-                    "/System/Library/Fonts/SFNSMono.ttf",
-                    "/System/Library/Fonts/Menlo.ttc",
-                    "/System/Library/Fonts/Supplemental/Courier New.ttf",
-                ],
-                egui::FontFamily::Monospace,
-            ),
+        let paths = [
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/SFNSText.ttf",
+            "/System/Library/Fonts/SFNSDisplay.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
         ];
-        for (name, paths, family) in groups {
-            for p in paths {
-                if let Ok(data) = std::fs::read(p) {
-                    fonts.font_data.insert(name.to_owned(), std::sync::Arc::new(egui::FontData::from_owned(data)));
-                    fonts.families.entry(family.clone()).or_default().insert(0, name.to_owned());
-                    log::info!("mac 字体：{family:?} ← {p}");
-                    break;
-                }
+        for p in paths {
+            if let Ok(data) = std::fs::read(p) {
+                fonts.font_data.insert("mac_ui".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(data)));
+                fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "mac_ui".to_owned());
+                log::info!("mac 字体：Proportional ← {p}");
+                break;
             }
         }
     }
