@@ -249,6 +249,19 @@ fn write_key_file(path: &std::path::Path, k: &[u8; 32]) -> std::io::Result<()> {
     std::fs::write(path, k)
 }
 
+/// 原子写文本文件：写同目录临时文件 → fsync → rename 替换。进程崩溃/断电时
+/// 目标要么是旧内容、要么是新内容，绝不出现截断的半截 JSON（配置数据完整性）。
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("ishell-tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        let _ = f.sync_all();
+    }
+    std::fs::rename(&tmp, path)
+}
+
 /// 校验本地 key 文件权限：若 group/other 有任何位（过宽），记录并收紧为 0600。
 #[cfg(unix)]
 fn check_key_perms(path: &std::path::Path) {
@@ -618,7 +631,7 @@ pub fn save(list: &[SavedConnection]) {
         })
         .collect();
     if let Ok(json) = serde_json::to_string_pretty(&encrypted) {
-        if std::fs::write(&path, json).is_ok() {
+        if write_atomic(&path, &json).is_ok() {
             restrict_perms(&path);
         }
     }
@@ -823,7 +836,7 @@ pub fn save_snippets(list: &[Snippet]) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string_pretty(list) {
-        let _ = std::fs::write(&path, json);
+        let _ = write_atomic(&path, &json);
     }
 }
 
@@ -860,7 +873,7 @@ pub fn save_favorites(server: &str, list: &[String]) {
         map.insert(server.to_string(), list.to_vec());
     }
     if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(&path, json);
+        let _ = write_atomic(&path, &json);
     }
 }
 

@@ -790,9 +790,9 @@ struct EditorTab {
     /// 跟随模式跨块解码缓冲：上一块末尾不完整的多字节字符原始字节，与下一块拼接
     ///（否则 UTF-8/GBK 字符跨 512KB 分块边界会变替换字符并永久丢失原始字节）
     tail_carry: Vec<u8>,
-    /// 发出保存时的内容版本号：FileSaved 到达且版本一致才 mark_saved
-    ///（期间用户又编辑 → 版本不匹配 → dirty 保持，不误报「已保存」）
-    save_ver: u64,
+    /// 发出保存时的修订签名 (vver, 编码, 行尾)：FileSaved 到达且签名一致才 mark_saved/关闭
+    ///（期间正文/编码/行尾任一变化 → 签名不匹配 → 保持 dirty、不关闭，不误报「已保存」）
+    save_rev: (u64, String, crate::proto::Eol),
     /// 「保存并关闭」：等待 FileSaved 确认后再移除标签（失败/冲突则留下标签）
     close_on_saved: bool,
     /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
@@ -934,7 +934,7 @@ impl App {
             pending_paste: None,
             relays: Vec::new(),
             relay_seq: 0,
-            confirm_direct: true,
+            confirm_direct: false,
             direct_jobs: Vec::new(),
             pending_direct_fallback: Vec::new(),
             show_snippets: false,
@@ -1029,7 +1029,7 @@ impl App {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
-            save_ver: 0,
+            save_rev: (0, String::new(), crate::proto::Eol::Lf),
             close_on_saved: false,
                 });
                 ed.tabs.push(EditorTab {
@@ -1052,7 +1052,7 @@ impl App {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
-            save_ver: 0,
+            save_rev: (0, String::new(), crate::proto::Eol::Lf),
             close_on_saved: false,
                 });
                 ed.tabs.push(EditorTab {
@@ -1075,7 +1075,7 @@ impl App {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
-            save_ver: 0,
+            save_rev: (0, String::new(), crate::proto::Eol::Lf),
             close_on_saved: false,
                 });
                 ed.active = 1; // 默认显示大文件标签
@@ -1605,7 +1605,7 @@ impl App {
         // 仅「跨服务器」需执行前确认（重操作 + 选直传/中转）；同机无论复制还是移动都直接执行——
         // 同机移动是原子 mv，源在目标写成功前不会丢，无需二次确认。
         if plan.cross {
-            self.confirm_direct = true; // 每次打开确认默认「直传」
+            self.confirm_direct = false; // 每次打开确认默认「中转」(更安全，直传会暴露私钥)
             self.pending_paste = Some(plan);
         } else {
             self.execute_paste(plan);
@@ -2348,7 +2348,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None, tail_carry: Vec::new(), save_ver: 0, close_on_saved: false });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None, tail_carry: Vec::new(), save_rev: (0, String::new(), crate::proto::Eol::Lf), close_on_saved: false });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -2523,13 +2523,17 @@ impl eframe::App for App {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
                     t.save_conflict = false;
                     t.saving = false; // 保存完成，解锁再次保存
-                    // 服务器已确认写入：仅当内容版本与发出保存时一致才清 dirty
-                    //（保存期间用户又编辑 → 新改动相对远端仍是脏的，不能误标已保存）
-                    if t.editor.version() == t.save_ver {
+                    // 服务器已确认写入：仅当修订签名（正文+编码+行尾）与发出保存时完全一致才算已保存
+                    //（保存期间用户又编辑、或切了编码/行尾 → 远端并非该状态，不能清 dirty，也不能关闭）
+                    let unchanged = t.editor.save_rev() == t.save_rev;
+                    if unchanged {
                         t.editor.mark_saved();
-                    }
-                    if t.close_on_saved {
-                        close_after_save.push((uid, t.editor.path.clone()));
+                        if t.close_on_saved {
+                            close_after_save.push((uid, t.editor.path.clone()));
+                        }
+                    } else {
+                        // 保存期间又改了：撤销「保存并关闭」，保留脏标签交用户重新保存
+                        t.close_on_saved = false;
                     }
                 }
             }
@@ -2963,12 +2967,17 @@ impl App {
                         ui.selectable_value(&mut direct, true, RichText::new(crate::i18n::tr("直传", "Direct")).size(12.0));
                         ui.selectable_value(&mut direct, false, RichText::new(crate::i18n::tr("中转", "Relay")).size(12.0));
                     });
-                    let hint = if direct {
-                        crate::i18n::tr("源主机直推目标，数据不经本地（需目标会话为「无口令密钥」认证）。", "Source pushes straight to target, bypassing local (target must use a passphrase-less key).")
+                    if direct {
+                        ui.label(RichText::new(crate::i18n::tr("源主机直推目标，数据不经本地（需目标会话为「无口令密钥」认证）。", "Source pushes straight to target, bypassing local (target must use a passphrase-less key).")).color(Palette::TEXT_DIM).size(11.0));
+                        // 安全警示：直传需把目标服务器的私钥临时投放到源服务器，源服务器 root/
+                        // 同用户进程/被入侵时都可能读取该私钥。默认走中转即为规避此风险。
+                        ui.label(RichText::new(crate::i18n::tr(
+                            "⚠ 安全：直传会把目标服务器私钥临时上传到源服务器，源服务器可读取该私钥。仅在完全信任源服务器时使用。",
+                            "⚠ Security: direct mode uploads the target's private key to the source server, which can read it. Use only if you fully trust the source server.",
+                        )).color(Palette::DANGER).size(11.0));
                     } else {
-                        crate::i18n::tr("经本地「下载→上传」中转，最通用，大文件较慢。", "Relayed via local download→upload; most compatible, slower for large files.")
-                    };
-                    ui.label(RichText::new(hint).color(Palette::TEXT_DIM).size(11.0));
+                        ui.label(RichText::new(crate::i18n::tr("经本地「下载→上传」中转，最通用、最安全，大文件较慢。", "Relayed via local download→upload; most compatible & safest, slower for large files.")).color(Palette::TEXT_DIM).size(11.0));
+                    }
                 }
                 if plan.is_cut {
                     ui.add_space(4.0);
@@ -3823,7 +3832,7 @@ impl App {
                     if let Some(tab) = ed.tabs.get_mut(active) {
                         // 不在此处 mark_saved：只有收到服务器 FileSaved 确认（且版本一致）
                         // 才清 dirty——发送失败/远端写失败时标签必须仍是「未保存」
-                        tab.save_ver = tab.editor.version();
+                        tab.save_rev = tab.editor.save_rev();
                         tab.saving = true; // 保存进行中，收到 FileSaved/Conflict/Failed 前屏蔽再次保存
                         // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画（重置进度，跟随本次写入）
                         tab.save_at = Some(vctx.input(|i| i.time));
@@ -3888,7 +3897,7 @@ impl App {
                         if let Some(t) = ed.tabs.get_mut(ti) {
                             if !t.saving {
                                 let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone(), encoding: t.editor.encoding().to_string(), eol: t.editor.eol(), expect_mtime: t.editor.mtime(), force: false });
-                                t.save_ver = t.editor.version();
+                                t.save_rev = t.editor.save_rev();
                                 t.saving = true;
                                 t.save_at = Some(vctx.input(|i| i.time));
                                 t.save_done_at = None;

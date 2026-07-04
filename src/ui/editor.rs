@@ -239,6 +239,11 @@ impl Editor {
     pub fn version(&self) -> u64 {
         self.vver
     }
+    /// 保存修订签名 = (正文版本, 编码, 行尾)。保存确认据此判断「是否仍是当时发出去的那份」：
+    /// 只有内容、编码、行尾都未变才算已保存——单独切换编码/行尾也不会被旧的成功事件误标干净。
+    pub fn save_rev(&self) -> (u64, String, crate::proto::Eol) {
+        (self.vver, self.encoding.clone(), self.eol)
+    }
     pub fn filename(&self) -> String {
         self.path.trim_end_matches('/').rsplit('/').next().unwrap_or(&self.path).to_string()
     }

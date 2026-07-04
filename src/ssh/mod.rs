@@ -736,7 +736,12 @@ pub async fn run(
                                 handle_fs_op(&sftp, cmd, &s).await;
                             });
                         } else {
-                            sink.send(WorkerEvent::Error(crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into()));
+                            // SFTP 未就绪：WriteFile 必须回专用失败事件，否则编辑器永久停在 saving=true。
+                            if let UiCommand::WriteFile { path, .. } = &cmd {
+                                sink.send(WorkerEvent::FileSaveFailed { path: path.clone(), message: crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into() });
+                            } else {
+                                sink.send(WorkerEvent::Error(crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into()));
+                            }
                         }
                     }
                     Some(UiCommand::ProcDetail(pid)) => {
@@ -1929,11 +1934,24 @@ async fn download_file(
 
 /// 下载完成收尾：临时数据文件原子替换到目标（先删已存在目标，Windows rename 不覆盖）。
 fn finish_download(data_part: &std::path::Path, lpath: &std::path::Path) -> anyhow::Result<()> {
-    if lpath.exists() {
-        std::fs::remove_file(lpath)?;
+    if !lpath.exists() {
+        // 目标不存在：直接换入
+        std::fs::rename(data_part, lpath)?;
+        return Ok(());
     }
-    std::fs::rename(data_part, lpath)?;
-    Ok(())
+    // 覆盖已有：备份 → 换入 → 删备份；换入失败则还原备份，原文件绝不丢失。
+    let bak = lpath.with_extension(format!("ishell-bak-{}", rand_hex(6)));
+    std::fs::rename(lpath, &bak)?; // 原文件安全存于 bak
+    match std::fs::rename(data_part, lpath) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&bak);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::rename(&bak, lpath); // 换入失败：还原原文件
+            Err(e.into())
+        }
+    }
 }
 
 /// 小文件顺序下载；失败时回退本次已计入的进度字节，便于上层整体重试不重复计数。
@@ -2353,53 +2371,65 @@ async fn sftp_overwrite(sftp: &russh_sftp::client::SftpSession, path: &str, data
     Ok(())
 }
 
-/// 同 `sftp_overwrite`，但分块写入并逐块上报 `FileSaveProgress`，驱动编辑器「珊瑚→绿」保存动画
-/// 跟随实际上传速度。小文件瞬间写完，动画由 UI 侧限速兜底（不会瞬移）。
-async fn sftp_overwrite_progress(sftp: &russh_sftp::client::SftpSession, path: &str, data: &[u8], sink: &UiSink) -> anyhow::Result<()> {
-    use russh_sftp::protocol::OpenFlags;
-    use tokio::io::AsyncWriteExt;
-    const CHUNK: usize = 256 * 1024;
-    let total = data.len() as u64;
-    sink.send(WorkerEvent::FileSaveProgress { path: path.to_string(), done: 0, total });
-    let mut f = sftp
-        .open_with_flags(path, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE)
-        .await?;
-    let mut off = 0usize;
-    while off < data.len() {
-        let end = (off + CHUNK).min(data.len());
-        f.write_all(&data[off..end]).await?;
-        off = end;
-        sink.send(WorkerEvent::FileSaveProgress { path: path.to_string(), done: off as u64, total });
-    }
-    f.flush().await?;
-    f.shutdown().await?;
-    sink.send(WorkerEvent::FileSaveProgress { path: path.to_string(), done: total, total });
-    Ok(())
-}
-
-/// 原子保存：写同目录临时文件（分块 + 进度）→ rename 到目标。
-/// 目标已存在使 rename 失败（SFTP v3 不覆盖）时，remove 目标后重试 rename——
-/// 危险窗口从「整个写入过程」缩小到毫秒级，且临时文件已完整落盘，任何一步失败
-/// 都不会破坏原文件（失败时清理临时文件；rename 阶段失败则保留 tmp 供恢复）。
+/// 事务性保存：先把新内容完整写入同目录临时文件，再用「备份原文件 → 换入新文件」的
+/// 序列替换，全程**任何一步失败原文件都不丢失**（始终存在于 path 或 path.bak）。
+/// 特殊情形：
+/// - **符号链接**：直接写穿到链接目标（open 跟随链接），不做替换——否则会把链接换成普通文件。
+/// - **权限**：把原文件的权限位复制到临时文件，避免保存可执行脚本丢失执行位。
 async fn sftp_write_atomic(sftp: &russh_sftp::client::SftpSession, path: &str, data: &[u8], sink: &UiSink) -> anyhow::Result<()> {
+    // 目标是符号链接 → 直写目标（保留链接语义）
+    let is_symlink = sftp.symlink_metadata(path).await.map(|m| m.is_symlink()).unwrap_or(false);
+    if is_symlink {
+        return sftp_overwrite_progress_to(sftp, path, path, data, sink).await;
+    }
+
+    // 原文件权限（用于回填临时文件）；不存在则用默认（新建）
+    let orig_perm = sftp.metadata(path).await.ok().and_then(|m| m.permissions);
+
     let tmp = format!("{path}.ishell-tmp-{}", rand_hex(6));
-    // 进度以目标路径上报（UI 按 path 匹配标签动画）
     if let Err(e) = sftp_overwrite_progress_to(sftp, &tmp, path, data, sink).await {
-        let _ = sftp.remove_file(&tmp).await; // 写失败：清理残留临时文件
+        let _ = sftp.remove_file(&tmp).await; // 写失败：清理临时文件，原文件未动
         return Err(e);
     }
+    // 权限回填到临时文件（保存前继承原文件的 mode）
+    if let Some(mode) = orig_perm {
+        let _ = sftp
+            .set_metadata(&tmp, russh_sftp::protocol::FileAttributes { permissions: Some(mode), ..Default::default() })
+            .await;
+    }
+
+    let target_exists = sftp.try_exists(path).await.unwrap_or(true);
+    if !target_exists {
+        // 目标不存在（新建保存）：直接换入
+        return sftp.rename(&tmp, path).await.map_err(|e| {
+            anyhow::anyhow!(match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("重命名失败（数据已保存在 {tmp}）：{e}"),
+                crate::i18n::Lang::En => format!("rename failed (data at {tmp}): {e}"),
+            })
+        });
+    }
+
+    // 覆盖已有文件：备份 → 换入 → 删备份。原文件始终在 path 或 bak，绝不凭空消失。
+    let bak = format!("{path}.ishell-bak-{}", rand_hex(6));
+    sftp.rename(path, &bak).await.map_err(|e| {
+        anyhow::anyhow!(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("备份原文件失败（原文件完好）：{e}"),
+            crate::i18n::Lang::En => format!("backup failed (original intact): {e}"),
+        })
+    })?;
     match sftp.rename(&tmp, path).await {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            // SFTP v3 rename 不覆盖已存在目标：删除目标后重试（毫秒级窗口）
-            sftp.remove_file(path).await.map_err(|e| anyhow::anyhow!("remove old: {e}"))?;
-            match sftp.rename(&tmp, path).await {
-                Ok(_) => Ok(()),
-                Err(e) => Err(anyhow::anyhow!(match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("重命名失败（数据已完整保存在 {tmp}）：{e}"),
-                    crate::i18n::Lang::En => format!("rename failed (data saved at {tmp}): {e}"),
-                })),
-            }
+        Ok(_) => {
+            let _ = sftp.remove_file(&bak).await; // 换入成功，清理备份
+            Ok(())
+        }
+        Err(e) => {
+            // 换入失败：把备份还原为原文件，保证原数据不丢
+            let _ = sftp.rename(&bak, path).await;
+            let _ = sftp.remove_file(&tmp).await;
+            Err(anyhow::anyhow!(match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("替换失败，已还原原文件：{e}"),
+                crate::i18n::Lang::En => format!("replace failed, original restored: {e}"),
+            }))
         }
     }
 }
@@ -2435,14 +2465,18 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 .map_err(Into::into)
         }
         UiCommand::CreateFile(path) => {
-            // 独占语义：同名文件必须报错，绝不能被 TRUNCATE 清空（旧实现的数据破坏 bug）
+            // 服务端原子独占创建（O_CREAT|O_EXCL）：同名文件由服务器直接拒绝，
+            // 杜绝「先 try_exists 再 TRUNCATE 创建」的检查—执行竞态（期间被别的进程建文件、
+            // 或 try_exists 因网络/权限失败误判不存在，都会清空已有文件）。
+            use russh_sftp::protocol::OpenFlags;
             let parent = remote_parent(&path);
-            if sftp.try_exists(&path).await.unwrap_or(false) {
-                Err(anyhow::anyhow!(crate::i18n::tr("同名文件已存在", "File already exists")))
-            } else {
-                sftp_overwrite(sftp, &path, b"")
-                    .await
-                    .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已创建文件：{path}"), crate::i18n::Lang::En => format!("Created file: {path}") }, Some(parent)))
+            match sftp.open_with_flags(&path, OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE).await {
+                Ok(mut f) => {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = f.shutdown().await;
+                    Ok((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已创建文件：{path}"), crate::i18n::Lang::En => format!("Created file: {path}") }, Some(parent)))
+                }
+                Err(_) => Err(anyhow::anyhow!(crate::i18n::tr("同名文件已存在或无法创建", "File exists or cannot be created"))),
             }
         }
         UiCommand::Chmod { path, mode } => {
@@ -2481,9 +2515,15 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                     crate::proto::Eol::Lf => content,
                 };
                 let enc = encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
-                let (bytes, _, _) = enc.encode(&text);
-                // 用 CREATE|WRITE|TRUNCATE + flush + shutdown 完整覆盖写（见 sftp_overwrite 注释）；
-                // 旧实现用 sftp.write() 仅 OpenFlags::WRITE，会残留旧尾且部分服务端不落盘。
+                // 第三个返回值 had_unmappable=true 表示有字符无法用目标编码表示（被替换为
+                // 数字字符引用等），保存不再静默——提示用户该编码丢失了字符。
+                let (bytes, _, had_unmappable) = enc.encode(&text);
+                if had_unmappable {
+                    sink.send(WorkerEvent::Status(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("⚠ 部分字符无法用 {encoding} 编码，已按替代形式写入：{path}"),
+                        crate::i18n::Lang::En => format!("⚠ Some chars aren't representable in {encoding}; written as substitutions: {path}"),
+                    }));
+                }
                 match sftp_write_atomic(sftp, &path, bytes.as_ref(), sink).await {
                     Ok(_) => {
                         let nm = sftp.metadata(&path).await.ok().and_then(|m| m.mtime).unwrap_or(0);
