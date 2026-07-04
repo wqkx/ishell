@@ -461,7 +461,11 @@ fn tokenize_with_state(text: &str, lang: &Lang, state: LineState) -> Vec<(usize,
 /// 分词整行是为了跨行/行内状态正确；布局只做窗口，超长行不付整行 layout 成本。
 pub fn highlight_segment(line: &str, win: Range<usize>, ext: &str, font_size: f32, errors: &[Range<usize>], state: LineState) -> LayoutJob {
     let lang = lang_for(ext);
-    let toks = tokenize_with_state(line, &lang, state);
+    // 只分词到窗口右界即可：窗口之后的 token 在下方 `s.min(win.end)` 全被裁掉、纯属浪费。
+    // 超长行（日志/JSON/minified）只在左侧可见时，此举把每帧整行分词降为「仅可见前缀」，
+    // 根治「拖到底部有超长行时卡顿一下」。win.end 已是字符边界（调用方 char_to_byte 得到）。
+    let scan_end = win.end.min(line.len());
+    let toks = tokenize_with_state(&line[..scan_end], &lang, state);
     let font = FontId::monospace(font_size);
     let mut job = LayoutJob::default();
     for (s, e, tok) in toks {

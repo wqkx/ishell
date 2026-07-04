@@ -781,7 +781,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                           .on_hover_text(crate::i18n::tr("路径无效或无法访问", "Invalid or inaccessible path"));
                       ui.add_space(3.0);
                   }
-                  let bar_ir = ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                  ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if state.path_edit.is_some() {
                     // 路径编辑模式：回车跳转、Esc 或点击别处退出
                     let mut go: Option<String> = None;
@@ -864,7 +864,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     let cwd_s = state.cwd.clone();
                     let mut enter_edit = false;
                     let mut nav_click: Option<String> = None;
-                    egui::ScrollArea::horizontal()
+                    let bc_resp = egui::ScrollArea::horizontal()
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .auto_shrink([false, false])
                         .stick_to_right(true) // 路径过长时默认展示末尾（当前目录）
@@ -877,6 +877,10 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                 } else if root.clicked() {
                                     nav_click = Some("/".into());
                                 }
+                                // 合并所有面包屑元素的响应，供整条路径栏统一挂右键菜单：
+                                // egui 中子控件会「吃掉」次级（右键）点击，父容器响应收不到，
+                                // 故必须把菜单挂在各元素响应的并集上，右键才能在整条路径上都生效。
+                                let mut combined = root;
                                 let mut acc = String::new();
                                 for seg in cwd_s.split('/').filter(|s| !s.is_empty()) {
                                     ui.label(RichText::new("›").color(Palette::TEXT_DIM));
@@ -891,17 +895,49 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                     } else if r.clicked() {
                                         nav_click = Some(here);
                                     }
+                                    combined = combined | r;
                                 }
-                                // 末尾空白：双击也进入编辑
+                                // 末尾空白：双击进入编辑；也并入右键菜单区
                                 let rest = ui.available_size_before_wrap();
                                 if rest.x > 8.0 {
                                     let (_, resp) = ui.allocate_exact_size(rest, Sense::click());
                                     if resp.double_clicked() {
                                         enter_edit = true;
                                     }
+                                    combined = combined | resp;
                                 }
-                            });
-                        });
+                                combined
+                            })
+                            .inner
+                        })
+                        .inner;
+                    // 面包屑右键菜单：复制 / 粘贴（填入编辑框） / 粘贴并转到（直接跳转）。
+                    bc_resp.context_menu(|ui| {
+                        ui.set_min_width(140.0);
+                        if ui.button(crate::i18n::tr("复制", "Copy")).clicked() {
+                            ui.ctx().copy_text(state.cwd.clone());
+                            ui.close();
+                        }
+                        if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
+                            if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                                let t = t.trim();
+                                if !t.is_empty() {
+                                    state.path_edit = Some(t.to_string());
+                                    state.path_edit_focus = true;
+                                }
+                            }
+                            ui.close();
+                        }
+                        if ui.button(crate::i18n::tr("粘贴并转到", "Paste & go")).clicked() {
+                            if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                                let t = t.trim();
+                                if !t.is_empty() {
+                                    bc_nav = Some(t.to_string());
+                                }
+                            }
+                            ui.close();
+                        }
+                    });
                     if enter_edit {
                         state.path_edit = Some(state.cwd.clone());
                         state.path_edit_focus = true;
@@ -920,38 +956,6 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     }
                 }
                   }); // 内层 left_to_right（面包屑/编辑框）
-                  // 面包屑（非编辑态）右键：复制当前路径 / 粘贴系统剪贴板路径并跳转。
-                  // 挂在整条路径栏上，右键也不会漏到文件列表把选中清掉。
-                  if state.path_edit.is_none() {
-                      bar_ir.response.interact(egui::Sense::click()).context_menu(|ui| {
-                          ui.set_min_width(140.0);
-                          if ui.button(crate::i18n::tr("复制", "Copy")).clicked() {
-                              ui.ctx().copy_text(state.cwd.clone());
-                              ui.close();
-                          }
-                          // 粘贴：把剪贴板路径填入编辑框（进入编辑态、全选），由用户回车确认跳转
-                          if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
-                              if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
-                                  let t = t.trim();
-                                  if !t.is_empty() {
-                                      state.path_edit = Some(t.to_string());
-                                      state.path_edit_focus = true;
-                                  }
-                              }
-                              ui.close();
-                          }
-                          // 粘贴并转到：直接跳转到剪贴板路径
-                          if ui.button(crate::i18n::tr("粘贴并转到", "Paste & go")).clicked() {
-                              if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
-                                  let t = t.trim();
-                                  if !t.is_empty() {
-                                      bc_nav = Some(t.to_string());
-                                  }
-                              }
-                              ui.close();
-                          }
-                      });
-                  }
                 }); // 外层 right_to_left（右侧无效标识）
             });
         });
