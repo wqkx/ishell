@@ -199,6 +199,8 @@ pub enum WorkerEvent {
     FileSaveProgress { path: String, done: u64, total: u64 },
     /// 保存时检测到文件已被外部修改（未写入）；UI 提示用户是否覆盖
     FileSaveConflict { path: String },
+    /// 保存失败（网络/权限/磁盘等）：标签保持未保存状态并提示
+    FileSaveFailed { path: String, message: String },
     /// 打开时发现文件实际大小超限（列表里的旧大小已过时）：请 UI 弹「打开大文件」确认，可强制打开
     FileTooLarge { id: u64, path: String, size: u64 },
     /// 跟随读取返回：data 为新增原始字节（可能为空）；offset 为下次读取起点；

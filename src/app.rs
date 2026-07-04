@@ -67,6 +67,8 @@ struct Session {
     /// 文档原始字节返回：(占位标签 id, 字节)
     pending_doc: Vec<(u64, Vec<u8>)>,
     pending_conflict: Vec<String>,
+    /// 保存失败（网络/权限等）：(路径, 原因)
+    pending_save_failed: Vec<(String, String)>,
     /// 打开时发现实际超限（id, path, size）——移除占位标签 + 弹「打开大文件」确认
     pending_too_large: Vec<(u64, String, u64)>,
     /// 待新建的占位编辑器标签（id, path）——双击打开时立即建，显示文件名 + 进度条
@@ -426,6 +428,9 @@ impl Session {
                 }
                 WorkerEvent::FileTooLarge { id, path, size } => {
                     self.pending_too_large.push((id, path, size));
+                }
+                WorkerEvent::FileSaveFailed { path, message } => {
+                    self.pending_save_failed.push((path, message));
                 }
                 WorkerEvent::FileSaveConflict { path } => {
                     self.pending_conflict.push(path);
@@ -958,6 +963,14 @@ struct EditorTab {
     tail_last: f64,
     /// Some = 文档标签（PDF/Word 查看器）；None = 常规文本编辑器
     doc: Option<DocKind>,
+    /// 跟随模式跨块解码缓冲：上一块末尾不完整的多字节字符原始字节，与下一块拼接
+    ///（否则 UTF-8/GBK 字符跨 512KB 分块边界会变替换字符并永久丢失原始字节）
+    tail_carry: Vec<u8>,
+    /// 发出保存时的内容版本号：FileSaved 到达且版本一致才 mark_saved
+    ///（期间用户又编辑 → 版本不匹配 → dirty 保持，不误报「已保存」）
+    save_ver: u64,
+    /// 「保存并关闭」：等待 FileSaved 确认后再移除标签（失败/冲突则留下标签）
+    close_on_saved: bool,
     /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
     save_done_at: Option<f64>,
 }
@@ -1429,6 +1442,9 @@ impl App {
             tail_pending: false,
             tail_last: 0.0,
             doc: None,
+            tail_carry: Vec::new(),
+            save_ver: 0,
+            close_on_saved: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
@@ -1449,6 +1465,9 @@ impl App {
             tail_pending: false,
             tail_last: 0.0,
             doc: None,
+            tail_carry: Vec::new(),
+            save_ver: 0,
+            close_on_saved: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
@@ -1469,6 +1488,9 @@ impl App {
             tail_pending: false,
             tail_last: 0.0,
             doc: None,
+            tail_carry: Vec::new(),
+            save_ver: 0,
+            close_on_saved: false,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -1658,6 +1680,7 @@ impl App {
             pending_pdf_search: Vec::new(),
             pending_doc: Vec::new(),
             pending_conflict: Vec::new(),
+            pending_save_failed: Vec::new(),
             pending_too_large: Vec::new(),
             pending_placeholder: Vec::new(),
             pending_load_progress: Vec::new(),
@@ -2031,12 +2054,25 @@ impl App {
             for (src_path, is_dir) in &plan.items {
                 let base = src_path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("item").to_string();
                 self.relay_seq += 1;
+                // 中转临时目录：加入密码学随机段防 /tmp 可预测路径被 symlink 抢占；
+                // Unix 下目录权限收紧为 0700，避免同机其他用户读取中转内容
+                let mut rnd = [0u8; 8];
+                let _ = getrandom::getrandom(&mut rnd);
+                let rnd_hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
                 let tmp = std::env::temp_dir()
                     .join("ishell-relay")
-                    .join(format!("{}-{}", std::process::id(), self.relay_seq))
+                    .join(format!("{}-{}-{}", std::process::id(), self.relay_seq, rnd_hex))
                     .join(&base);
                 if let Some(parent) = tmp.parent() {
                     let _ = std::fs::create_dir_all(parent);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                        if let Some(root) = parent.parent() {
+                            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+                        }
+                    }
                 }
                 let dlid = {
                     let s = &mut self.sessions[si];
@@ -2528,6 +2564,7 @@ impl eframe::App for App {
         let mut saved: Vec<(u64, String, u32)> = Vec::new(); // uid, path, mtime
         let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
         let mut conflicts: Vec<(u64, String)> = Vec::new(); // uid, path
+        let mut save_failed: Vec<(u64, String, String)> = Vec::new(); // uid, path, message
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
         let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
         let mut pdf_infos: Vec<(u64, u32)> = Vec::new(); // 占位 id, 页数
@@ -2557,6 +2594,9 @@ impl eframe::App for App {
             }
             for path in s.pending_conflict.drain(..) {
                 conflicts.push((s.uid, path));
+            }
+            for (path, msg) in s.pending_save_failed.drain(..) {
+                save_failed.push((s.uid, path, msg));
             }
             for (id, path, size) in s.pending_too_large.drain(..) {
                 too_large.push((s.uid, id, path, size));
@@ -2609,11 +2649,27 @@ impl eframe::App for App {
                         t.editor.append_tail(&crate::i18n::tr("\n--- 文件被截断/轮转，以下为新内容 ---\n", "\n--- file truncated/rotated, new content follows ---\n"));
                     }
                     if !data.is_empty() {
-                        // 按标签已知编码解码（块边界的多字节字符属可接受的边缘情况），行尾统一 LF
+                        // 跨块解码：与上一块留下的不完整尾字节拼接；UTF-8 时把本块末尾
+                        // 不完整的多字节序列留到下一块（跨块字符不再变 �）
+                        let mut bytes = std::mem::take(&mut t.tail_carry);
+                        bytes.extend_from_slice(&data);
                         let enc = encoding_rs::Encoding::for_label(t.editor.encoding().as_bytes()).unwrap_or(encoding_rs::UTF_8);
-                        let (cow, _, _) = enc.decode(&data);
-                        let txt = cow.replace("\r\n", "\n");
-                        t.editor.append_tail(&txt);
+                        if enc == encoding_rs::UTF_8 {
+                            let valid = match std::str::from_utf8(&bytes) {
+                                Ok(_) => bytes.len(),
+                                Err(e) => e.valid_up_to(),
+                            };
+                            // 仅当截断发生在末尾 ≤3 字节内才视为「不完整序列」暂存；
+                            // 中间的真实坏字节照常替换输出，避免 carry 死循环
+                            if bytes.len() - valid <= 3 && valid < bytes.len() {
+                                t.tail_carry = bytes.split_off(valid);
+                            }
+                        }
+                        if !bytes.is_empty() {
+                            let (cow, _, _) = enc.decode(&bytes);
+                            let txt = cow.replace("\r\n", "\n");
+                            t.editor.append_tail(&txt);
+                        }
                     }
                 }
             }
@@ -2701,7 +2757,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None, tail_carry: Vec::new(), save_ver: 0, close_on_saved: false });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -2862,7 +2918,7 @@ impl eframe::App for App {
             ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
         // 保存成功 → 更新对应标签 mtime（避免下次保存误判）；外部改动冲突 → 置标志，编辑器弹横幅。
-        if !saved.is_empty() || !conflicts.is_empty() || !save_progress.is_empty() {
+        if !saved.is_empty() || !conflicts.is_empty() || !save_progress.is_empty() || !save_failed.is_empty() {
             let mut ed = self.editor_state.lock().unwrap();
             for (uid, path, done, total) in save_progress {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
@@ -2870,11 +2926,20 @@ impl eframe::App for App {
                     t.save_total = total;
                 }
             }
+            let mut close_after_save: Vec<(u64, String)> = Vec::new();
             for (uid, path, mtime) in saved {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
                     t.save_conflict = false;
                     t.saving = false; // 保存完成，解锁再次保存
+                    // 服务器已确认写入：仅当内容版本与发出保存时一致才清 dirty
+                    //（保存期间用户又编辑 → 新改动相对远端仍是脏的，不能误标已保存）
+                    if t.editor.version() == t.save_ver {
+                        t.editor.mark_saved();
+                    }
+                    if t.close_on_saved {
+                        close_after_save.push((uid, t.editor.path.clone()));
+                    }
                 }
             }
             for (uid, path) in conflicts {
@@ -2883,6 +2948,29 @@ impl eframe::App for App {
                     t.saving = false; // 冲突也算本次保存结束，解锁（用户可在横幅选择覆盖）
                     t.save_at = None; // 冲突未写入：中止「已保存」动画
                     t.save_done_at = None;
+                    t.close_on_saved = false; // 「保存并关闭」遇冲突：保留标签，交用户处理
+                }
+            }
+            for (uid, path, message) in save_failed {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                    t.saving = false; // 失败：解锁重试；dirty 未被清，标签仍显示未保存
+                    t.save_at = None; // 中止保存动画
+                    t.save_done_at = None;
+                    t.close_on_saved = false; // 保留标签
+                }
+                self.toast = Some((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("保存失败：{message}"), crate::i18n::Lang::En => format!("Save failed: {message}") }, ui.input(|i| i.time)));
+            }
+            // 「保存并关闭」：确认成功后移除标签
+            for (uid, path) in close_after_save {
+                if let Some(i) = ed.tabs.iter().position(|t| t.uid == uid && t.editor.path == path) {
+                    let closed = ed.tabs.remove(i);
+                    if closed.doc.is_none() {
+                        crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line());
+                    }
+                    if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
+                        ed.active = ed.tabs.len() - 1;
+                    }
+                    ed.trim_request = true;
                 }
             }
             ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
@@ -3479,11 +3567,13 @@ impl App {
         self.snip_just_opened = false;
     }
 
-    /// 关闭窗口前确认（仍有会话时）。
+    /// 关闭窗口前确认（仍有会话，或编辑器有未保存修改时——后者即使会话已全部关闭
+    /// 也必须拦截，否则未保存内容会随主窗口静默丢失）。
     fn handle_close(&mut self, ctx: &egui::Context) {
+        let dirty_tabs = self.editor_state.lock().map(|ed| ed.tabs.iter().filter(|t| t.editor.dirty()).count()).unwrap_or(0);
         if ctx.input(|i| i.viewport().close_requested())
             && !self.allow_close
-            && !self.sessions.is_empty()
+            && (!self.sessions.is_empty() || dirty_tabs > 0)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_close_confirm = true;
@@ -3495,7 +3585,12 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new(crate::i18n::tr("确认退出", "Quit?")).size(16.0).strong());
                         ui.add_space(6.0);
-                        ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("还有 {} 个会话处于连接中", self.sessions.len()), crate::i18n::Lang::En => format!("{} session(s) still connected", self.sessions.len()) });
+                        if !self.sessions.is_empty() {
+                            ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("还有 {} 个会话处于连接中", self.sessions.len()), crate::i18n::Lang::En => format!("{} session(s) still connected", self.sessions.len()) });
+                        }
+                        if dirty_tabs > 0 {
+                            ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("编辑器有 {dirty_tabs} 个文件未保存，退出将丢失修改"), crate::i18n::Lang::En => format!("{dirty_tabs} file(s) have unsaved changes; quitting discards them") }).color(Palette::DANGER));
+                        }
                         ui.label(crate::i18n::tr("确定退出 iShell 吗？", "Quit iShell?"));
                     });
                     ui.add_space(12.0);
@@ -4135,8 +4230,10 @@ impl App {
                         });
                     }
                     if let Some(tab) = ed.tabs.get_mut(active) {
-                        tab.editor.mark_saved();
-                        tab.saving = true; // 标记保存进行中，收到 FileSaved/Conflict 前屏蔽再次保存
+                        // 不在此处 mark_saved：只有收到服务器 FileSaved 确认（且版本一致）
+                        // 才清 dirty——发送失败/远端写失败时标签必须仍是「未保存」
+                        tab.save_ver = tab.editor.version();
+                        tab.saving = true; // 保存进行中，收到 FileSaved/Conflict/Failed 前屏蔽再次保存
                         // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画（重置进度，跟随本次写入）
                         tab.save_at = Some(vctx.input(|i| i.time));
                         tab.save_done_at = None;
@@ -4195,14 +4292,22 @@ impl App {
                 });
                 if decision != 0 {
                     if decision == 1 {
-                        if let Some(t) = ed.tabs.get(ti) {
-                            let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone(), encoding: t.editor.encoding().to_string(), eol: t.editor.eol(), expect_mtime: t.editor.mtime(), force: false });
-                        }
+                        // 保存并关闭：发出保存后**不立即关闭**——等 FileSaved 确认才移除标签；
+                        // 失败/冲突则保留标签（否则本地修改的唯一副本会随标签一起消失）
                         if let Some(t) = ed.tabs.get_mut(ti) {
-                            t.editor.mark_saved();
+                            if !t.saving {
+                                let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone(), encoding: t.editor.encoding().to_string(), eol: t.editor.eol(), expect_mtime: t.editor.mtime(), force: false });
+                                t.save_ver = t.editor.version();
+                                t.saving = true;
+                                t.save_at = Some(vctx.input(|i| i.time));
+                                t.save_done_at = None;
+                                t.save_done = 0;
+                                t.save_total = 0;
+                            }
+                            t.close_on_saved = true;
                         }
                     }
-                    if decision == 1 || decision == 2 {
+                    if decision == 2 {
                         if ti < ed.tabs.len() {
                             let closed = ed.tabs.remove(ti);
                             if closed.doc.is_none() { crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line()); }

@@ -453,6 +453,14 @@ pub async fn run(
                                     }
                                 }
                             });
+                        } else {
+                            // SFTP 未就绪（首次初始化失败等）：回报可重试失败——UI 保持自动重试，
+                            // 而不是静默吞掉后永久停在「加载中」
+                            sink.send(WorkerEvent::DirListFailed {
+                                path,
+                                message: crate::i18n::tr("SFTP 未就绪", "SFTP not ready").into(),
+                                retryable: true,
+                            });
                         }
                     }
                     // 传输：独立任务（独立 SFTP 通道），不阻塞交互 shell
@@ -497,6 +505,9 @@ pub async fn run(
                             tokio::spawn(async move {
                                 read_file_chunked(&sftp, &path, force, id, &s).await;
                             });
+                        } else {
+                            // SFTP 未就绪：移除占位标签并提示（否则永久「下载中」）
+                            sink.send(WorkerEvent::FileLoadFailed { id, message: crate::i18n::tr("SFTP 未就绪", "SFTP not ready").into() });
                         }
                     }
                     Some(UiCommand::TailFile { path, offset }) => {
@@ -657,6 +668,8 @@ pub async fn run(
                                     Err(e) => s.send(WorkerEvent::FileLoadFailed { id, message: e.to_string() }),
                                 }
                             });
+                        } else {
+                            sink.send(WorkerEvent::FileLoadFailed { id, message: crate::i18n::tr("SFTP 未就绪", "SFTP not ready").into() });
                         }
                     }
                     Some(UiCommand::ReadImage { path }) => {
@@ -747,8 +760,19 @@ pub async fn run(
                         let h = handle.clone();
                         let s = sink.clone();
                         tokio::spawn(async move {
-                            let _ = exec_capture(&h, &format!("kill -9 {pid}")).await;
-                            s.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已发送 kill -9 {pid}"), crate::i18n::Lang::En => format!("Sent kill -9 {pid}") }));
+                            // 检查退出码：权限不足 / PID 不存在时如实反馈，而非一律「已发送」
+                            let msg = match exec_status(&h, &format!("kill -9 {pid}")).await {
+                                Ok((0, _)) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已结束进程 {pid}"), crate::i18n::Lang::En => format!("Killed {pid}") },
+                                Ok((_, err)) => {
+                                    let e = err.trim();
+                                    match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("结束进程失败：{}", if e.is_empty() { "权限不足或进程不存在" } else { e }),
+                                        crate::i18n::Lang::En => format!("Kill failed: {}", if e.is_empty() { "permission denied or no such process" } else { e }),
+                                    }
+                                }
+                                Err(e) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("结束进程失败：{e}"), crate::i18n::Lang::En => format!("Kill failed: {e}") },
+                            };
+                            s.send(WorkerEvent::Status(msg));
                         });
                     }
                     Some(UiCommand::AddForward(spec)) => {
@@ -1308,7 +1332,7 @@ async fn download_dir_compressed(
             }
         })
     };
-    let dl = download_file(sftp, &tmp_remote, &local_tgz, size, cancel, &done).await;
+    let dl = download_file(sftp, &tmp_remote, &local_tgz, size, 0, cancel, &done).await; // 临时打包文件不跨次续传（mtime=0）
     stop.store(true, Ordering::Relaxed);
     let _ = prog.await;
     // 清理远端临时包（无论成败）
@@ -1661,7 +1685,7 @@ async fn download(
 
         let result = async {
             for (rpath, lpath, size) in files {
-                download_file(&sftp, &rpath, &lpath, size, &cancel, &done).await?;
+                download_file(&sftp, &rpath, &lpath, size, sftp.metadata(&rpath).await.ok().and_then(|m| m.mtime).unwrap_or(0), &cancel, &done).await?;
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -1708,32 +1732,49 @@ fn part_path(lpath: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
+/// 下载数据的临时文件路径：`<local>.ishellpart.data`。
+/// 数据先写这里，全部完成后 rename 到目标——成功前绝不动目标文件；
+/// 取消/失败只留 part 文件，目标（若原本存在）保持完好。
+fn data_part_path(lpath: &std::path::Path) -> std::path::PathBuf {
+    let mut p = lpath.as_os_str().to_os_string();
+    p.push(".ishellpart.data");
+    std::path::PathBuf::from(p)
+}
+
 /// 容纳 n 个分段标志位所需的字节数。
 fn bitmap_len(n_chunks: u64) -> usize {
     n_chunks.div_ceil(8) as usize
 }
 
 /// 下载单个文件：大文件按偏移并发分段读取，定位写入本地，显著提升高延迟链路吞吐。
+/// 数据全程写 `<local>.ishellpart.data`，完整后原子 rename 到目标——成功前不动目标文件。
+/// `remote_mtime` 参与断点校验（0 = 不允许跨次续传，如临时打包文件）。
 async fn download_file(
     sftp: &Arc<russh_sftp::client::SftpSession>,
     rpath: &str,
     lpath: &std::path::Path,
     size: u64,
+    remote_mtime: u32,
     cancel: &Arc<AtomicBool>,
     done: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = lpath.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    let data_part = data_part_path(lpath);
 
-    // 小文件（或大小未知）：单流顺序读取；瞬时失败整体重试（重新建文件）。
+    // 小文件（或大小未知）：单流顺序读取；瞬时失败整体重试（重新建临时文件）。
     if size <= DL_CHUNK {
         let mut attempt = 0u32;
         loop {
-            match download_small(sftp, rpath, lpath, cancel, done).await {
-                Ok(()) => return Ok(()),
+            match download_small(sftp, rpath, &data_part, cancel, done).await {
+                Ok(()) => {
+                    finish_download(&data_part, lpath)?;
+                    return Ok(());
+                }
                 Err(e) => {
                     if cancel.load(Ordering::Relaxed) || attempt >= XFER_RETRIES {
+                        let _ = std::fs::remove_file(&data_part);
                         return Err(e);
                     }
                     attempt += 1;
@@ -1748,23 +1789,23 @@ async fn download_file(
     let n_chunks = size.div_ceil(DL_CHUNK);
     let part = part_path(lpath);
 
-    // 能否续传：sidecar 存在且记录大小一致、本地文件仍在 → 沿用已完成位图
-    let resume_bm: Option<Vec<u8>> = if lpath.exists() {
+    // 能否续传：sidecar 存在、记录的大小与远端 mtime 均一致、临时数据文件仍在。
+    // 绑定 mtime：远端文件内容变化但大小不变时，旧分段不能复用（否则拼出混合损坏文件）。
+    let resume_bm: Option<Vec<u8>> = if data_part.exists() && remote_mtime != 0 {
         std::fs::read(&part).ok().and_then(|d| {
-            if d.len() == 8 + bitmap_len(n_chunks) && u64::from_le_bytes(d[0..8].try_into().unwrap()) == size {
-                Some(d[8..].to_vec())
-            } else {
-                None
-            }
+            let ok = d.len() == 12 + bitmap_len(n_chunks)
+                && u64::from_le_bytes(d[0..8].try_into().unwrap()) == size
+                && u32::from_le_bytes(d[8..12].try_into().unwrap()) == remote_mtime;
+            ok.then(|| d[12..].to_vec())
         })
     } else {
         None
     };
 
     let out = if resume_bm.is_some() {
-        Arc::new(std::fs::OpenOptions::new().read(true).write(true).open(lpath)?) // 续传：保留已写分段
+        Arc::new(std::fs::OpenOptions::new().read(true).write(true).open(&data_part)?) // 续传：保留已写分段
     } else {
-        let f = std::fs::File::create(lpath)?;
+        let f = std::fs::File::create(&data_part)?;
         f.set_len(size)?;
         Arc::new(f)
     };
@@ -1784,13 +1825,14 @@ async fn download_file(
     if pre > 0 {
         done.fetch_add(pre, Ordering::Relaxed);
     }
-    // sidecar 句柄（写头部 + 预留位图区，保留续传位）
+    // sidecar 句柄（写头部 size+mtime + 预留位图区，保留续传位）
     let part_file = {
         let f = std::fs::File::create(&part)?;
-        f.set_len(8 + bitmap_len(n_chunks) as u64)?;
+        f.set_len(12 + bitmap_len(n_chunks) as u64)?;
         pwrite(&f, &size.to_le_bytes(), 0)?;
+        pwrite(&f, &remote_mtime.to_le_bytes(), 8)?;
         if let Some(b) = &resume_bm {
-            pwrite(&f, b, 8)?;
+            pwrite(&f, b, 12)?;
         }
         Arc::new(std::sync::Mutex::new(f))
     };
@@ -1847,7 +1889,7 @@ async fn download_file(
                         }
                     }
                     if let Ok(g) = part_file.lock() {
-                        let _ = pwrite(&g, &[b], 8 + byte_i as u64);
+                        let _ = pwrite(&g, &[b], 12 + byte_i as u64);
                     }
                 }
                 Ok::<(), anyhow::Error>(())
@@ -1867,10 +1909,11 @@ async fn download_file(
         }
         if chunk_done.iter().all(|b| b.load(Ordering::Relaxed)) {
             let _ = std::fs::remove_file(&part); // 完成则清理断点文件
-            return Ok(());
+            break;
         }
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&part); // 用户取消则不保留断点
+            let _ = std::fs::remove_file(&data_part); // 数据临时文件一并清理，目标文件从未被动过
             anyhow::bail!("canceled");
         }
         if attempt >= XFER_RETRIES {
@@ -1879,6 +1922,18 @@ async fn download_file(
         attempt += 1;
         tokio::time::sleep(xfer_backoff(attempt)).await;
     }
+    drop(out); // 关闭数据句柄后再 rename（Windows 需要）
+    finish_download(&data_part, lpath)?;
+    Ok(())
+}
+
+/// 下载完成收尾：临时数据文件原子替换到目标（先删已存在目标，Windows rename 不覆盖）。
+fn finish_download(data_part: &std::path::Path, lpath: &std::path::Path) -> anyhow::Result<()> {
+    if lpath.exists() {
+        std::fs::remove_file(lpath)?;
+    }
+    std::fs::rename(data_part, lpath)?;
+    Ok(())
 }
 
 /// 小文件顺序下载；失败时回退本次已计入的进度字节，便于上层整体重试不重复计数。
@@ -2012,7 +2067,7 @@ async fn upload(
         for (lpath, rpath, sz) in files {
             let mut attempt = 0u32;
             loop {
-                match upload_file_once(sftp, &lpath, &rpath, &cancel, done_base, id, sink, &last).await {
+                match upload_file_once(sftp, &lpath, &rpath, &cancel, done_base, id, sink, &last, attempt > 0).await {
                     Ok(()) => break,
                     Err(e) => {
                         if cancel.load(Ordering::Relaxed) || attempt >= XFER_RETRIES {
@@ -2054,14 +2109,22 @@ async fn upload_file_once(
     id: u64,
     sink: &UiSink,
     last: &AtomicU64,
+    allow_resume: bool,
 ) -> anyhow::Result<()> {
     use russh_sftp::protocol::OpenFlags;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
     let local_size = tokio::fs::metadata(lpath).await.map(|m| m.len()).unwrap_or(0);
-    // 远端已存在的字节数作为续传起点（仅当不超过本地大小才续传，否则从头覆盖）
-    let remote_size = sftp.metadata(rpath).await.ok().and_then(|m| m.size).unwrap_or(0);
-    let start = if remote_size > 0 && remote_size <= local_size { remote_size } else { 0 };
+    // 续传只允许发生在**本次传输的失败重试**（allow_resume）：此时远端内容必然是
+    // 本进程刚写入的本地前缀，按大小续写安全。首次尝试一律 TRUNCATE 从 0 全量写——
+    // 盲按「远端大小 ≤ 本地大小」续传会把无关同名文件误判为已传前缀
+    //（大小恰好相等时一个字节不写就报成功；远端较小时保留错误前缀再续尾部）。
+    let start = if allow_resume {
+        let remote_size = sftp.metadata(rpath).await.ok().and_then(|m| m.size).unwrap_or(0);
+        if remote_size > 0 && remote_size <= local_size { remote_size } else { 0 }
+    } else {
+        0
+    };
 
     // 续传(start>0)保留已传字节；从头(start==0)则 TRUNCATE 覆盖，避免残留旧尾部
     let flags = if start > 0 {
@@ -2314,6 +2377,54 @@ async fn sftp_overwrite_progress(sftp: &russh_sftp::client::SftpSession, path: &
     Ok(())
 }
 
+/// 原子保存：写同目录临时文件（分块 + 进度）→ rename 到目标。
+/// 目标已存在使 rename 失败（SFTP v3 不覆盖）时，remove 目标后重试 rename——
+/// 危险窗口从「整个写入过程」缩小到毫秒级，且临时文件已完整落盘，任何一步失败
+/// 都不会破坏原文件（失败时清理临时文件；rename 阶段失败则保留 tmp 供恢复）。
+async fn sftp_write_atomic(sftp: &russh_sftp::client::SftpSession, path: &str, data: &[u8], sink: &UiSink) -> anyhow::Result<()> {
+    let tmp = format!("{path}.ishell-tmp-{}", rand_hex(6));
+    // 进度以目标路径上报（UI 按 path 匹配标签动画）
+    if let Err(e) = sftp_overwrite_progress_to(sftp, &tmp, path, data, sink).await {
+        let _ = sftp.remove_file(&tmp).await; // 写失败：清理残留临时文件
+        return Err(e);
+    }
+    match sftp.rename(&tmp, path).await {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            // SFTP v3 rename 不覆盖已存在目标：删除目标后重试（毫秒级窗口）
+            sftp.remove_file(path).await.map_err(|e| anyhow::anyhow!("remove old: {e}"))?;
+            match sftp.rename(&tmp, path).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("重命名失败（数据已完整保存在 {tmp}）：{e}"),
+                    crate::i18n::Lang::En => format!("rename failed (data saved at {tmp}): {e}"),
+                })),
+            }
+        }
+    }
+}
+
+/// 分块写 `write_path` 并以 `report_path` 上报保存进度。
+async fn sftp_overwrite_progress_to(sftp: &russh_sftp::client::SftpSession, write_path: &str, report_path: &str, data: &[u8], sink: &UiSink) -> anyhow::Result<()> {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::AsyncWriteExt;
+    const CHUNK: usize = 256 * 1024;
+    let total = data.len() as u64;
+    sink.send(WorkerEvent::FileSaveProgress { path: report_path.to_string(), done: 0, total });
+    let mut f = sftp.open_with_flags(write_path, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE).await?;
+    let mut off = 0usize;
+    while off < data.len() {
+        let end = (off + CHUNK).min(data.len());
+        f.write_all(&data[off..end]).await?;
+        off = end;
+        sink.send(WorkerEvent::FileSaveProgress { path: report_path.to_string(), done: off as u64, total });
+    }
+    f.flush().await?;
+    f.shutdown().await?;
+    sink.send(WorkerEvent::FileSaveProgress { path: report_path.to_string(), done: total, total });
+    Ok(())
+}
+
 async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, sink: &UiSink) {
     let result: anyhow::Result<(String, Option<String>)> = match cmd {
         UiCommand::Mkdir(path) => {
@@ -2324,10 +2435,15 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 .map_err(Into::into)
         }
         UiCommand::CreateFile(path) => {
+            // 独占语义：同名文件必须报错，绝不能被 TRUNCATE 清空（旧实现的数据破坏 bug）
             let parent = remote_parent(&path);
-            sftp_overwrite(sftp, &path, b"")
-                .await
-                .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已创建文件：{path}"), crate::i18n::Lang::En => format!("Created file: {path}") }, Some(parent)))
+            if sftp.try_exists(&path).await.unwrap_or(false) {
+                Err(anyhow::anyhow!(crate::i18n::tr("同名文件已存在", "File already exists")))
+            } else {
+                sftp_overwrite(sftp, &path, b"")
+                    .await
+                    .map(|_| (match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已创建文件：{path}"), crate::i18n::Lang::En => format!("Created file: {path}") }, Some(parent)))
+            }
         }
         UiCommand::Chmod { path, mode } => {
             let parent = remote_parent(&path);
@@ -2368,13 +2484,17 @@ async fn handle_fs_op(sftp: &russh_sftp::client::SftpSession, cmd: UiCommand, si
                 let (bytes, _, _) = enc.encode(&text);
                 // 用 CREATE|WRITE|TRUNCATE + flush + shutdown 完整覆盖写（见 sftp_overwrite 注释）；
                 // 旧实现用 sftp.write() 仅 OpenFlags::WRITE，会残留旧尾且部分服务端不落盘。
-                match sftp_overwrite_progress(sftp, &path, bytes.as_ref(), sink).await {
+                match sftp_write_atomic(sftp, &path, bytes.as_ref(), sink).await {
                     Ok(_) => {
                         let nm = sftp.metadata(&path).await.ok().and_then(|m| m.mtime).unwrap_or(0);
                         sink.send(WorkerEvent::FileSaved { path: path.clone(), mtime: nm });
                         Ok((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存：{path}"), crate::i18n::Lang::En => format!("Saved: {path}") }, None))
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        // 专用失败事件（带路径）：UI 据此复位 saving、保留 dirty，不再只有匿名 Error
+                        sink.send(WorkerEvent::FileSaveFailed { path: path.clone(), message: e.to_string() });
+                        Ok((String::new(), None))
+                    }
                 }
             }
         }

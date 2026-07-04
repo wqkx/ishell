@@ -26,9 +26,11 @@ cargo build --release
 
 ## 用 GitHub Actions 自动产出（无需本机有对应系统）
 
-仓库自带工作流，推 `v*` 标签或在 Actions 页手动 Run：
-- `.github/workflows/macos.yml` → `ishell-aarch64-apple-darwin` / `ishell-x86_64-apple-darwin`
-- `.github/workflows/windows.yml` → `ishell-windows-x86_64`（ishell.exe）
+仓库自带工作流 `.github/workflows/release.yml`，推 `v*` 标签或在 Actions 页手动 Run，
+一次产出全部平台：
+- Linux：`ishell-linux-x86_64`（裸二进制 + 带图标/desktop 的 tar.gz）
+- macOS：`ishell-macos-aarch64` / `ishell-macos-x86_64`（另附 .app 包）
+- Windows：`ishell-windows-x86_64.exe`
 
 产物在该次运行的 **Artifacts** 下载。
 

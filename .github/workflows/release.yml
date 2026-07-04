@@ -45,6 +45,15 @@ jobs:
         shell: bash
         run: rm -f .cargo/config.toml
 
+      # 发布门禁：单测必须通过才允许出包（数据路径回归的最后防线）。
+      # Clippy 暂为观测性运行（存量警告 ~35 个，清零后改为 -D warnings 硬门禁）。
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --target ${{ matrix.target }}
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 

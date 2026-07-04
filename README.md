@@ -72,7 +72,7 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 - SFTP: tree + list, **name filter**, **click a header to sort by name / size / time** (size & time default to descending), drag-and-drop upload, chmod / rename / copy path, optional default download folder
 - **Multi-select batch ops**: Ctrl/Shift + rubber-band select; **batch delete** (Delete key / toolbar, recursive for folders), **batch download**
 - **Remote copy / move**: right-click "Copy / Cut" + "Paste here", done entirely on the server (multi-select, recursive)
-- **Resumable transfers**: byte-level resume + auto-retry on transient errors; **auto-resume after reconnect** with a pause/resume/retry queue
+- **Resumable downloads**: chunk-bitmap resume bound to remote size+mtime, auto-retry on transient errors and **auto-resume after reconnect**; transfers can be cancelled or retried (no manual pause)
 - **Folder compress-download**: tar.gz on the server, single-file parallel download, pure-Rust unpack — fast for many small files
 - **Concurrent transfers** (up to 6 per server; independent across servers), cancellable mid-transfer
 - **Lightweight image viewer** (its own OS window): double-click a `png / jpg / gif / bmp` — zoom / pan / fit / 1:1 / save-as

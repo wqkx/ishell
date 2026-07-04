@@ -282,6 +282,22 @@ impl FilePanelState {
     pub fn on_listing(&mut self, path: String, entries: Vec<FileEntry>) {
         self.loading.remove(&path);
         self.nav_error.remove(&path); // 列出成功 → 清除该路径的「无效」标记
+        // 选择防错位：行选择存的是「排序后行索引」，刷新后条目集或排序键字段一旦变化，
+        // 旧索引可能指向另一个文件——随后的删除/复制会作用于错误目标。
+        // 条目完全一致才保留选择，否则一律清空（保守正确）。
+        if path == self.cwd {
+            let same = self.listings.get(&path).is_some_and(|old| {
+                old.len() == entries.len()
+                    && old
+                        .iter()
+                        .zip(entries.iter())
+                        .all(|(a, b)| a.name == b.name && a.size == b.size && a.mtime == b.mtime && a.is_dir == b.is_dir)
+            });
+            if !same {
+                self.selected.clear();
+                self.anchor = None;
+            }
+        }
         self.listings.insert(path.clone(), entries);
         if self.cwd.is_empty() {
             self.cwd = path;

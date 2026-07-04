@@ -55,8 +55,12 @@ pub struct Editor {
     vscroll_nudge: Option<(f32, f32)>,
     /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
     encoding: String,
+    /// 打开/上次保存时的编码（编码切换计入 dirty）
+    orig_encoding: String,
     /// 原文件行尾风格（内部统一 LF，保存时还原）
     eol: crate::proto::Eol,
+    /// 打开/上次保存时的行尾（行尾切换计入 dirty）
+    orig_eol: crate::proto::Eol,
     /// 打开/上次保存时的远端 mtime（外部改动检测）
     mtime: u32,
     /// 所有匹配（字节范围）缓存 + 缓存签名（变化时重算）
@@ -168,7 +172,9 @@ impl Editor {
             vlast_viewh: 0.0,
             vscroll_nudge: None,
             encoding: "UTF-8".into(),
+            orig_encoding: "UTF-8".into(),
             eol: crate::proto::Eol::Lf,
+            orig_eol: crate::proto::Eol::Lf,
             mtime: 0,
             find_matches: Vec::new(),
             find_sig: 0,
@@ -210,10 +216,19 @@ impl Editor {
         }
     }
     pub fn dirty(&self) -> bool {
-        self.content != self.orig
+        // 内容、编码、行尾任一与打开/上次保存时不同都算「有改动」——
+        // 仅切换 GBK/UTF-8 或 LF/CRLF 也必须能保存、关闭时也要警告
+        self.content != self.orig || self.encoding != self.orig_encoding || self.eol != self.orig_eol
     }
     pub fn mark_saved(&mut self) {
         self.orig = self.content.clone();
+        self.orig_encoding = self.encoding.clone();
+        self.orig_eol = self.eol;
+    }
+    /// 内容版本号（每次编辑 +1）。保存流程用它防竞态：发出保存后用户又编辑，
+    /// 服务器确认到达时版本不匹配则不能清 dirty。
+    pub fn version(&self) -> u64 {
+        self.vver
     }
     pub fn filename(&self) -> String {
         self.path.trim_end_matches('/').rsplit('/').next().unwrap_or(&self.path).to_string()
@@ -250,7 +265,9 @@ impl Editor {
         self.loading = v;
     }
     pub fn set_meta(&mut self, encoding: String, eol: crate::proto::Eol, mtime: u32) {
+        self.orig_encoding = encoding.clone();
         self.encoding = encoding;
+        self.orig_eol = eol;
         self.eol = eol;
         self.mtime = mtime;
     }
@@ -2537,4 +2554,26 @@ fn char_to_byte(s: &str, c: usize) -> usize {
 /// 字节偏移 → 字符下标。
 fn byte_to_char(s: &str, b: usize) -> usize {
     s[..b.min(s.len())].chars().count()
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    #[test]
+    fn encoding_and_eol_changes_are_dirty() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "hello\n".into());
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        assert!(!ed.dirty());
+        // 仅切换编码 → dirty
+        ed.set_encoding("GBK".into());
+        assert!(ed.dirty());
+        ed.mark_saved();
+        assert!(!ed.dirty());
+        // 仅切换行尾 → dirty
+        ed.set_eol(crate::proto::Eol::Crlf);
+        assert!(ed.dirty());
+        ed.mark_saved();
+        assert!(!ed.dirty());
+    }
 }

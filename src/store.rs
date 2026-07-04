@@ -300,23 +300,26 @@ pub fn encrypt_secret(plain: &str) -> String {
     }
 }
 
-/// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回；解密失败返回空串。
+/// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回。
+/// 解密失败（含罕见的「明文密码恰好以 enc:v1: 开头」被误判为密文）时**返回原串**——
+/// 当明文用会导致一次登录失败，但绝不把已存密码静默变成空串。
 pub fn decrypt_secret(s: &str) -> String {
     let Some(rest) = s.strip_prefix(ENC_PREFIX) else {
         return s.to_string();
     };
-    let Some(c) = cipher() else { return String::new() };
+    let fallback = || s.to_string();
+    let Some(c) = cipher() else { return fallback() };
     let Ok(blob) = STANDARD.decode(rest) else {
-        return String::new();
+        return fallback();
     };
     if blob.len() < 12 {
-        return String::new();
+        return fallback();
     }
     let (nonce, ct) = blob.split_at(12);
     c.decrypt(Nonce::from_slice(nonce), ct)
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default()
+        .unwrap_or_else(fallback)
 }
 
 // ---------- 默认下载目录设置 ----------
