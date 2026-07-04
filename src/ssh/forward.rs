@@ -32,17 +32,30 @@ pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, 
         ForwardKind::Local { remote_host, remote_port } => format!("{bind} → {remote_host}:{remote_port}"),
         ForwardKind::Dynamic => format!("SOCKS5 {bind}"),
     };
-    sink.send(WorkerEvent::ForwardStatus { id: spec.id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("监听中  {label}"), crate::i18n::Lang::En => format!("Listening  {label}") } });
+    // 绑定到非回环地址：同网段任何主机都能使用此转发（SOCKS5 无认证时即开放代理）——
+    // 在状态里明确警示，让「对外开放」是一个知情决定
+    let open_warn = if spec.bind_host != "127.0.0.1" && spec.bind_host != "localhost" && spec.bind_host != "::1" {
+        crate::i18n::tr("（警告：绑定非回环地址，局域网内他人可使用此转发）", " (WARNING: bound to non-loopback; others on the network can use it)")
+    } else {
+        ""
+    };
+    sink.send(WorkerEvent::ForwardStatus { id: spec.id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("监听中  {label}{open_warn}"), crate::i18n::Lang::En => format!("Listening  {label}{open_warn}") } });
 
+    // 并发连接上限：防异常客户端把本机拖入无界任务/文件句柄增长
+    let permits = Arc::new(tokio::sync::Semaphore::new(128));
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => break,
         };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            continue; // 超限：直接丢弃新连接（客户端得到 RST/EOF）
+        };
         let handle = handle.clone();
         let kind = spec.kind.clone();
         tokio::spawn(async move {
             let _ = handle_conn(handle, kind, sock, peer).await;
+            drop(permit);
         });
     }
 }
@@ -82,9 +95,18 @@ async fn handle_conn(
     Ok(())
 }
 
+/// SOCKS5 握手总超时：恶意/异常客户端不发数据时不长期占用连接。
+const SOCKS5_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 完成 SOCKS5 方法协商并解析 CONNECT 请求，返回目标 (host, port)。
-/// 不发送最终响应（由调用方在通道建立后回复）。
+/// 不发送最终响应（由调用方在通道建立后回复）。整个握手包在超时内。
 async fn socks5_negotiate(sock: &mut TcpStream) -> anyhow::Result<(String, u16)> {
+    tokio::time::timeout(SOCKS5_HANDSHAKE_TIMEOUT, socks5_negotiate_inner(sock))
+        .await
+        .map_err(|_| anyhow::anyhow!("{}", crate::i18n::tr("SOCKS5 握手超时", "SOCKS5 handshake timeout")))?
+}
+
+async fn socks5_negotiate_inner(sock: &mut TcpStream) -> anyhow::Result<(String, u16)> {
     // 问候：VER, NMETHODS, METHODS...
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
@@ -93,6 +115,12 @@ async fn socks5_negotiate(sock: &mut TcpStream) -> anyhow::Result<(String, u16)>
     }
     let mut methods = vec![0u8; head[1] as usize];
     sock.read_exact(&mut methods).await?;
+    // RFC 1928：只有客户端声明支持 0x00（无认证）才可选它；否则必须回 0xFF 并断开，
+    // 不能无条件替客户端拍板
+    if !methods.contains(&0x00) {
+        let _ = sock.write_all(&[0x05, 0xFF]).await;
+        anyhow::bail!("{}", crate::i18n::tr("客户端不支持无认证方式", "Client offers no acceptable auth method"));
+    }
     sock.write_all(&[0x05, 0x00]).await?; // 选择「无认证」
 
     // 请求：VER, CMD, RSV, ATYP, ADDR, PORT

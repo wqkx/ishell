@@ -1656,12 +1656,24 @@ fn encode_mouse(enc: vt100::MouseProtocolEncoding, cb: u8, col: u16, row: u16, p
 
 /// 用系统默认浏览器打开 URL。
 fn open_url(url: &str) {
+    // 终端输出内容不可信：先做 scheme 白名单（避免 file:// 打开本地任意文件、
+    // 或恶意注册协议触发任意处理器）；裸 www. 补 https。
+    let normalized = if url.to_ascii_lowercase().starts_with("www.") { format!("https://{url}") } else { url.to_string() };
+    let lower = normalized.to_ascii_lowercase();
+    const ALLOWED: [&str; 4] = ["http://", "https://", "ftp://", "ftps://"];
+    if !ALLOWED.iter().any(|p| lower.starts_with(p)) {
+        log::warn!("拒绝打开非白名单 scheme 的 URL：{url}");
+        return;
+    }
+    let url = normalized.as_str();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
+    // Windows：不经 cmd（`cmd /C start` 会解释 URL 中的 & ^ 等元字符，恶意 URL 可
+    // 触发本地命令）；rundll32 的 FileProtocolHandler 以单参数接收 URL，无 shell 解释。
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
 }
 
 /// 解析 OSC 7（`ESC ] 7 ; file://host/path BEL|ST`），返回最后一个上报的本地路径。
@@ -1775,8 +1787,11 @@ fn url_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // (?i) 协议不区分大小写；正文取到空白或明显分隔符为止
-        regex::Regex::new(r#"(?i)(?:(?:https?|ftps?|ssh|sftp|file)://|www\.)[^\s"'<>`|]+"#).unwrap()
+        // (?i) 协议不区分大小写；正文取到空白或明显分隔符为止。
+        // 只识别可安全交给浏览器的 scheme（与 open_url 白名单一致）：
+        // ssh/sftp/file 等不再高亮——点击它们会触发本地协议处理器，终端输出不可信。
+        // \b 防子串误匹配（如 sftp:// 中间的 ftp://）
+        regex::Regex::new(r#"(?i)\b(?:(?:https?|ftps?)://|www\.)[^\s"'<>`|]+"#).unwrap()
     })
 }
 
@@ -1931,13 +1946,12 @@ mod tests {
         let mut p = vt100::Parser::new(2, 120, 0);
         p.process(b"ftp://h/f sftp://h/x ssh://u@h file:///etc/hosts www.rust-lang.org");
         let got: Vec<String> = find_row_urls(p.screen(), 0, 120).into_iter().map(|(_, _, u)| u).collect();
+        // 安全收窄：仅 http/https/ftp/ftps 与裸 www.（ssh/sftp/file 会触发本地协议
+        // 处理器，终端输出不可信，不再识别为可点击链接）
         assert_eq!(
             got,
             vec![
                 "ftp://h/f".to_string(),
-                "sftp://h/x".to_string(),
-                "ssh://u@h".to_string(),
-                "file:///etc/hosts".to_string(),
                 "https://www.rust-lang.org".to_string(), // 裸 www. 自动补 https
             ]
         );

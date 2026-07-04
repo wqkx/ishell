@@ -286,8 +286,20 @@ struct KbdPrompt {
 
 impl Session {
     /// 排空后台事件，更新本地状态。
-    fn drain_events(&mut self) {
-        while let Ok(ev) = self.evt_rx.try_recv() {
+    /// 排空 worker 事件，带每帧预算：终端数据 ≤2MB、事件 ≤512 条/帧。
+    /// 超出预算的事件留在队列、下一帧继续（返回 true 表示还有积压需要重绘）——
+    /// 远端持续大量输出时 UI 仍按帧渲染，不会被「全量排空循环」饿死。
+    fn drain_events(&mut self) -> bool {
+        let mut term_budget: usize = 2 * 1024 * 1024;
+        let mut evt_budget: usize = 512;
+        loop {
+            if evt_budget == 0 || term_budget == 0 {
+                return true; // 预算耗尽且可能仍有积压
+            }
+            let Ok(ev) = self.evt_rx.try_recv() else {
+                return false;
+            };
+            evt_budget -= 1;
             match ev {
                 WorkerEvent::Status(s) => self.status = s,
                 WorkerEvent::Connected => {
@@ -358,6 +370,7 @@ impl Session {
                     }
                 }
                 WorkerEvent::TerminalData(bytes) => {
+                    term_budget = term_budget.saturating_sub(bytes.len());
                     self.terminal.feed(&bytes);
                     if let Some(c) = self.terminal.cwd() {
                         self.last_cwd = c.to_string();
@@ -2571,8 +2584,10 @@ impl eframe::App for App {
         let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
         let mut pdf_searches: Vec<(u64, String, Vec<(u32, String)>, Option<String>)> = Vec::new();
         let mut new_docs: Vec<(u64, Vec<u8>)> = Vec::new(); // 占位 id, docx 字节
+        let mut evt_backlog = false;
         for s in &mut self.sessions {
-            s.drain_events();
+            // 事件积压未排空（每帧预算保护渲染）时安排下一帧继续消化
+            evt_backlog |= s.drain_events();
             if s.connected && !s.initialized {
                 s.initialized = true;
                 s.init_files();
@@ -2622,6 +2637,9 @@ impl eframe::App for App {
             for x in s.pending_doc.drain(..) {
                 new_docs.push(x);
             }
+        }
+        if evt_backlog {
+            self.ctx.request_repaint();
         }
         // 打开时发现文件实际超限：移除占位标签（复用 load_fail 移除逻辑），并在对应会话的文件面板
         // 弹「打开大文件」确认，确认后走 force=true 重新打开（列表里的旧大小已过时，双击前无法预判）。

@@ -624,7 +624,9 @@ fn draw_node(
         font,
         color,
     );
-    if resp.clicked() {
+    // 双击的第二次点击同帧也报 clicked：若不排除，双击 = toggle 两次（展开又收起，
+    // 还可能重复发起列目录）。排除后双击效果 = 首击的 toggle + 导航，与单击展开态一致。
+    if resp.clicked() && !resp.double_clicked() {
         toggles.push(path.to_string());
     }
     if resp.double_clicked() {
