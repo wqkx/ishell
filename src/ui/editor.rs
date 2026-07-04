@@ -98,6 +98,12 @@ pub struct Editor {
     /// 上次计算 lint 时的内容版本号（vver）；不一致才重算，避免逐帧 tokenize。
     lint_ver: u64,
     /// 各行行首的跨行高亮状态（docstring/块注释延续）；随 hl_ver 缓存。
+    /// 每逻辑行前导缩进列宽（Tab 按 unit 列计）；-1 = 空白行。按 vver+unit 缓存，
+    /// 让缩进线/粘性作用域行/折叠判定的按行探测从「切片+扫描」降为 O(1) 数组查表
+    ///（否则拖动大文件时每帧的反复缩进扫描会明显卡顿）。
+    leads: Vec<i32>,
+    leads_ver: u64,
+    leads_unit: usize,
     hl_states: Vec<highlight::LineState>,
     /// 上次计算 hl_states 时的内容版本号；u64::MAX 表示未算过。
     hl_ver: u64,
@@ -194,6 +200,9 @@ impl Editor {
             lint_ranges: Vec::new(),
             lint_msg: None,
             lint_ver: u64::MAX,
+            leads: Vec::new(),
+            leads_ver: u64::MAX,
+            leads_unit: 0,
             hl_states: Vec::new(),
             hl_ver: u64::MAX,
             folds: Vec::new(),
@@ -382,8 +391,43 @@ fn v_line_hidden(ed: &Editor, line: usize) -> bool {
     let idx = ed.folds.partition_point(|&(h, _)| h < line);
     idx > 0 && ed.folds[idx - 1].1 >= line
 }
-/// 行的前导空白宽度（Tab 按 unit 列计）；空白行返回 None。
+/// 重建每行缩进列宽缓存（内容版本或缩进单位变化时）。O(总字符数)，仅编辑/切换缩进时付出。
+fn v_sync_leads(ed: &mut Editor, unit: usize) {
+    if ed.leads_ver == ed.vver && ed.leads_unit == unit && ed.leads.len() == ed.vlines.len() {
+        return;
+    }
+    let n = ed.vlines.len();
+    let mut leads = Vec::with_capacity(n);
+    for i in 0..n {
+        let (a, b) = v_line_range(ed, i);
+        let mut lead = 0i32;
+        let mut blank = true;
+        for c in ed.content[a..b].chars() {
+            match c {
+                ' ' => lead += 1,
+                '\t' => lead += unit as i32,
+                _ => {
+                    blank = false;
+                    break;
+                }
+            }
+        }
+        leads.push(if blank { -1 } else { lead });
+    }
+    ed.leads = leads;
+    ed.leads_ver = ed.vver;
+    ed.leads_unit = unit;
+}
+/// 行的前导缩进列宽（Tab 按 unit 列计）；空白行返回 None。O(1) 查缓存
+///（缓存由 v_sync_leads 在每帧渲染前用当前 unit 同步；未命中则回退实时扫描）。
 fn v_lead(ed: &Editor, line: usize, unit: usize) -> Option<usize> {
+    if ed.leads_ver == ed.vver && ed.leads_unit == unit {
+        return match ed.leads.get(line) {
+            Some(&-1) | None => None,
+            Some(&v) => Some(v as usize),
+        };
+    }
+    // 回退：缓存未同步（理论上不发生，v_sync_leads 每帧先跑）
     let (a, b) = v_line_range(ed, line);
     let mut lead = 0usize;
     for c in ed.content[a..b].chars() {
@@ -1424,6 +1468,14 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         }
     }
 
+    // 每行缩进列宽缓存：缩进线/粘性作用域行/折叠判定的按行探测据此做 O(1) 查表，
+    // 避免拖动大文件时每帧反复切片扫描缩进造成的卡顿。
+    let unit_cols_now = match ed.indent {
+        Indent::Spaces(n) => n.max(1),
+        Indent::Tab => 4,
+    };
+    v_sync_leads(ed, unit_cols_now);
+
     // 折叠维护：编辑时区间已由 v_remap_folds 平移/展开；
     // 这里只处理跳转/查找把光标放进隐藏行的情况——自动展开所在折叠
     if !ed.folds.is_empty() {
@@ -1884,7 +1936,11 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     let wrap = ed.wrap;
     // 「滚动行」数 = 视觉行总数（已扣除折叠隐藏的行）
     let nrows = v_total_vrows(ed);
-    // 内容高度封顶在 f32 安全区：行数巨大时坐标会丢精度 → 封顶后按「行号」虚拟化、用视口相对坐标绘制。
+    // 内容高度封顶在 f32 安全区：行数巨大时坐标会丢精度 → 封顶后按「行号」虚拟化。
+    // 注意：字形按 clip 相对坐标绘制（不用绝对 content 坐标），故此上限只影响滚动条映射，
+    // 不影响字形精度。上限越高，拖动滚动条时「每像素跨的行数」越少、越接近逐行平滑，
+    // 大文件拖到底不再一下跳过整屏而卡顿。取 12M（约 66 万行处才开始压缩），且 12M×2(HiDPI)
+    // =24M 仅用于滚动条位置（非字形），远在可接受范围。
     // 末尾额外留 3 行空白：可滚到最后一行之下，避免底部横向滚动条遮住最后一行。
     let pad_rows = 3usize;
     let content_w = if wrap {
@@ -1892,7 +1948,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     } else {
         gutter_w + (ed.vmax as f32 + 2.0) * char_w
     };
-    let content_h = ((nrows + pad_rows) as f32 * row_h).min(2_000_000.0);
+    let content_h = ((nrows + pad_rows) as f32 * row_h).min(12_000_000.0);
 
     // —— 用「设置滚动偏移」可靠地让视角跟随光标（scroll_to_rect 在本虚拟容器里不生效）——
     // 用上一帧度量判断光标是否已在可视区，越界才强制滚动；普通滚动不受影响。
