@@ -808,12 +808,23 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                         // 右键菜单：复制当前路径文本 / 粘贴系统剪贴板并跳转
                         //（否则右键只是把光标移过去、清掉选中，且无复制粘贴项）。
                         let menu = resp.context_menu(|ui| {
-                            ui.set_min_width(120.0);
+                            ui.set_min_width(140.0);
                             if ui.button(crate::i18n::tr("复制", "Copy")).clicked() {
                                 ui.ctx().copy_text(buf.clone());
                                 ui.close();
                             }
-                            if ui.button(crate::i18n::tr("粘贴并跳转", "Paste & go")).clicked() {
+                            // 粘贴：替换编辑框内容为剪贴板路径（停留在编辑态，由用户回车确认）
+                            if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
+                                if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                                    let t = t.trim();
+                                    if !t.is_empty() {
+                                        *buf = t.to_string();
+                                    }
+                                }
+                                ui.close();
+                            }
+                            // 粘贴并转到：直接跳转到剪贴板路径
+                            if ui.button(crate::i18n::tr("粘贴并转到", "Paste & go")).clicked() {
                                 if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
                                     let t = t.trim();
                                     if !t.is_empty() {
@@ -913,12 +924,24 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                   // 挂在整条路径栏上，右键也不会漏到文件列表把选中清掉。
                   if state.path_edit.is_none() {
                       bar_ir.response.interact(egui::Sense::click()).context_menu(|ui| {
-                          ui.set_min_width(120.0);
-                          if ui.button(crate::i18n::tr("复制路径", "Copy path")).clicked() {
+                          ui.set_min_width(140.0);
+                          if ui.button(crate::i18n::tr("复制", "Copy")).clicked() {
                               ui.ctx().copy_text(state.cwd.clone());
                               ui.close();
                           }
-                          if ui.button(crate::i18n::tr("粘贴并跳转", "Paste & go")).clicked() {
+                          // 粘贴：把剪贴板路径填入编辑框（进入编辑态、全选），由用户回车确认跳转
+                          if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
+                              if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                                  let t = t.trim();
+                                  if !t.is_empty() {
+                                      state.path_edit = Some(t.to_string());
+                                      state.path_edit_focus = true;
+                                  }
+                              }
+                              ui.close();
+                          }
+                          // 粘贴并转到：直接跳转到剪贴板路径
+                          if ui.button(crate::i18n::tr("粘贴并转到", "Paste & go")).clicked() {
                               if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
                                   let t = t.trim();
                                   if !t.is_empty() {
@@ -937,6 +960,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         // 规范化：去掉末尾多余的 "/"（否则与 worker 返回的规范路径不匹配，无法进入）
         state.cwd = normalize_path(&p);
         state.selected.clear();
+        // 跳到未缓存的路径（如「粘贴并转到」到一个此前没进过的目录）：本帧 sync_tree 已在改 cwd 前
+        // 跑过、不会再列举它，若不在此显式发起 List，会卡在空白/不加载。命中缓存则无需重复请求。
+        if !state.listings.contains_key(&state.cwd) && !state.loading.contains(&state.cwd) {
+            state.loading.insert(state.cwd.clone());
+            actions.push(FileAction::List(state.cwd.clone()));
+        }
     }
     ui.separator();
 

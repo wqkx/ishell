@@ -2056,12 +2056,16 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
 
             // —— 自绘竖向滚动条（右缘细条）：拖动/点击按行号定位 ed.vtop ——
             // 先于正文交互注册并处理，命中滚动条时不把点击透传成「定位光标」。
-            let sb_w = 9.0f32;
+            let sb_w = 12.0f32; // 轨道稍宽，便于拖动命中
             let sb_track = egui::Rect::from_min_max(egui::pos2(clip.right() - sb_w, clip.top()), clip.right_bottom());
             let total_rows = (nrows + pad_rows).max(1);
             let show_vsb = max_top > 0;
             let mut vsb_hit = false;
+            // 滑块几何/配色留到正文绘制之后再画（否则被后绘的字形盖住）。
+            let mut vsb_thumb: Option<(egui::Rect, egui::Color32)> = None;
             if show_vsb {
+                // 滚动条交互必须先于正文 resp 注册、且正文交互区要避开这条右缘（见下 area），
+                // 否则同层里后注册、覆盖更广的正文会「盖」在滚动条上，把拖动事件抢走 → 点不到。
                 let sb_resp = ui.interact(sb_track, text_id.with("vsb"), egui::Sense::click_and_drag());
                 let thumb_h = (sb_track.height() * (visible as f32 / total_rows as f32)).clamp(24.0, sb_track.height());
                 if sb_resp.dragged() || sb_resp.clicked() {
@@ -2073,22 +2077,26 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     }
                 }
                 vsb_hit = sb_resp.hovered() || sb_resp.dragged();
-                // 绘制轨道（透明）+ 滑块
                 let top_now = ed.vtop.min(max_top);
                 let frac = top_now as f32 / max_top as f32;
                 let thumb_y = sb_track.top() + (sb_track.height() - thumb_h) * frac;
-                let thumb = egui::Rect::from_min_size(egui::pos2(sb_track.left() + 1.5, thumb_y), egui::vec2(sb_w - 3.0, thumb_h));
+                let thumb = egui::Rect::from_min_size(egui::pos2(sb_track.left() + 2.5, thumb_y), egui::vec2(sb_w - 5.0, thumb_h));
                 let col = if vsb_hit {
                     egui::Color32::from_rgb(144, 138, 124)
                 } else {
                     egui::Color32::from_rgb(179, 173, 159)
                 };
-                ui.painter().rect_filled(thumb, 3.0, col);
+                vsb_thumb = Some((thumb, col));
             }
 
-            // 交互区取「可视视口」(clip)：内层 ui 被 set_width(content_w) 限成内容宽度，若按 content_w 取交互区，
-            // 短行右侧的空白会落在区外、点击不到（光标不动）。用 clip 覆盖整个视口，短行右侧空白也能点击定位到行末。
-            let area = clip;
+            // 交互区取「可视视口」(clip)，但避开右缘滚动条条带（否则正文交互覆盖滚动条、抢走其拖动事件）。
+            // 内层 ui 被 set_width(content_w) 限成内容宽度，若按 content_w 取交互区，短行右侧空白会落在区外、
+            // 点击不到；用 clip（减去滚动条宽）覆盖视口，短行右侧空白也能点击定位到行末。
+            let area = if show_vsb {
+                egui::Rect::from_min_max(clip.min, egui::pos2(clip.right() - sb_w, clip.bottom()))
+            } else {
+                clip
+            };
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
             // 右键弹菜单时选区可能被折叠/失焦：在右键按下这一帧冻结当前选区，供菜单复制/剪切/粘贴使用
             if ui.input(|i| i.pointer.secondary_pressed()) {
@@ -2469,6 +2477,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             }
             // 行号分割线（固定在左侧行号列右缘）
             painter.vline(clip.left() + gutter_w - 3.0, clip.top()..=clip.bottom(), egui::Stroke::new(1.0, Palette::BORDER));
+            // 自绘竖向滚动条滑块：正文之后再画，确保浮在字形之上、不被盖住
+            if let Some((thumb, col)) = vsb_thumb {
+                painter.rect_filled(thumb, 3.0, col);
+            }
 
             // ——— 粘性作用域行（sticky scroll）———
             // 顶部固定显示首个可见行的外层作用域链（按缩进推导，至多 3 行），点击跳转
