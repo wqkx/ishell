@@ -1,6 +1,6 @@
 [package]
 name = "ishell"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 license = "MIT"
 description = "现代化 Rust SSH 客户端，仿 FinalShell 布局（系统信息 + 终端 + SFTP 文件管理）"
@@ -56,6 +56,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # 文件夹压缩下载：远端 tar.gz 打包后下载，本地用纯 Rust 解包（不依赖系统 tar）
 tar = "0.4"
 flate2 = "1"
+
+# Word(docx) 查看器：zip 容器 + XML 拉流解析（纯 Rust、轻量；PDF 走远端 poppler 不占体积）
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
 
 # 工具
 anyhow = "1"

@@ -106,6 +106,15 @@ pub enum UiCommand {
     TailFile { path: String, offset: u64 },
     /// 读取图片文件原始字节（用于看图工具打开）
     ReadImage { path: String },
+    /// 查询 PDF 页数（远端 pdfinfo）。id 关联编辑器窗口的占位标签；
+    /// 未装 poppler 等失败走 FileLoadFailed（移除占位 + 提示）。
+    PdfInfo { id: u64, path: String },
+    /// 渲染 PDF 单页为 PNG（远端 pdftoppm 输出到 stdout）
+    PdfPage { path: String, page: u32, dpi: u32 },
+    /// PDF 全文查找（远端 pdftotext，按换页符定位页码；不分大小写）
+    PdfSearch { path: String, query: String },
+    /// 读取文档原始字节（docx 查看器）。id 关联占位标签，进度复用 FileLoadProgress。
+    ReadDoc { id: u64, path: String },
     /// 写回文本文件内容（保存）。content 为内部 LF 文本，worker 按 eol 还原行尾、按 encoding 编码后写入。
     /// expect_mtime≠0 且与远端当前 mtime 不一致且 !force 时，判定外部已改动、拒绝写入并回报冲突。
     WriteFile { path: String, content: String, encoding: String, eol: Eol, expect_mtime: u32, force: bool },
@@ -195,6 +204,14 @@ pub enum WorkerEvent {
     /// 跟随读取返回：data 为新增原始字节（可能为空）；offset 为下次读取起点；
     /// truncated = 文件被截断/轮转（此时 offset 已重置为新大小）
     FileTail { path: String, data: Vec<u8>, offset: u64, truncated: bool },
+    /// PDF 页数查询成功（失败走 FileLoadFailed）。id 与占位标签对应。
+    PdfInfo { id: u64, path: String, pages: u32 },
+    /// PDF 单页渲染结果（PNG 字节；空表示该页渲染失败）
+    PdfPage { path: String, page: u32, data: Vec<u8> },
+    /// PDF 查找结果：命中 (页码, 该页首个命中行片段)；message=失败原因（如缺 pdftotext）
+    PdfSearch { path: String, query: String, hits: Vec<(u32, String)>, message: Option<String> },
+    /// 文档原始字节已读取（docx 查看器）。id 与占位标签对应。
+    DocOpened { id: u64, path: String, data: Vec<u8> },
     /// 文本文件下载进度（驱动占位标签上的珊瑚色进度条）
     FileLoadProgress { id: u64, done: u64, total: u64 },
     /// 文本文件打开失败（移除占位标签 + 提示）

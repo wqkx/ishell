@@ -58,6 +58,14 @@ struct Session {
     pending_save_progress: Vec<(String, u64, u64)>,
     /// 跟随读取返回：(路径, 新增字节, 新 offset, 是否截断/轮转)
     pending_tail: Vec<(String, Vec<u8>, u64, bool)>,
+    /// PDF 页数查询返回：(占位标签 id, 页数)
+    pending_pdf_info: Vec<(u64, u32)>,
+    /// PDF 单页 PNG 返回：(路径, 页码, PNG 字节)
+    pending_pdf_page: Vec<(String, u32, Vec<u8>)>,
+    /// PDF 查找返回：(路径, 命中列表, 失败消息)
+    pending_pdf_search: Vec<(String, Vec<(u32, String)>, Option<String>)>,
+    /// 文档原始字节返回：(占位标签 id, 字节)
+    pending_doc: Vec<(u64, Vec<u8>)>,
     pending_conflict: Vec<String>,
     /// 打开时发现实际超限（id, path, size）——移除占位标签 + 弹「打开大文件」确认
     pending_too_large: Vec<(u64, String, u64)>,
@@ -404,6 +412,18 @@ impl Session {
                 WorkerEvent::FileTail { path, data, offset, truncated } => {
                     self.pending_tail.push((path, data, offset, truncated));
                 }
+                WorkerEvent::PdfInfo { id, path: _, pages } => {
+                    self.pending_pdf_info.push((id, pages));
+                }
+                WorkerEvent::PdfPage { path, page, data } => {
+                    self.pending_pdf_page.push((path, page, data));
+                }
+                WorkerEvent::PdfSearch { path, query: _, hits, message } => {
+                    self.pending_pdf_search.push((path, hits, message));
+                }
+                WorkerEvent::DocOpened { id, path: _, data } => {
+                    self.pending_doc.push((id, data));
+                }
                 WorkerEvent::FileTooLarge { id, path, size } => {
                     self.pending_too_large.push((id, path, size));
                 }
@@ -746,6 +766,9 @@ pub struct App {
     img_tab_drag: Option<usize>,
     img_grab_dx: f32,
     img_total_w: f32,
+    /// docx 后台解析结果通道：(占位标签 id, 解析结果)
+    doc_parse_tx: std::sync::mpsc::Sender<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)>,
+    doc_parse_rx: std::sync::mpsc::Receiver<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)>,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
@@ -864,6 +887,47 @@ impl Default for ForwardForm {
 }
 
 /// 一个编辑器标签（含来源服务器，用于回写）。
+/// 文档标签内容（PDF / Word）：挂在 EditorTab 上，Some 时该标签渲染文档查看器
+/// 而非文本编辑器；占位/进度/失败/关闭全部复用编辑器标签框架。
+enum DocKind {
+    /// PDF：远端 poppler 逐页渲染为 PNG，本地页缓存 + 前后预取
+    Pdf {
+        /// 总页数（就位时已知，恒 >0）
+        pages: u32,
+        /// 当前页（1 基）
+        cur: u32,
+        /// 缩放；0 = 适应窗口宽
+        zoom: f32,
+        /// 页缓存（小 LRU：按插入序淘汰最旧）
+        cache: Vec<(u32, egui::TextureHandle, egui::Vec2)>,
+        /// 在途渲染请求的页码
+        pending: std::collections::HashSet<u32>,
+        /// 上次滚动连续翻页时刻（冷却 0.3s，防滚轮惯性连环翻页）
+        flip_at: f64,
+        /// 全文查找：输入、开关、命中 (页码, 片段)、当前命中序号、在途标志、失败消息
+        search: String,
+        search_open: bool,
+        hits: Vec<(u32, String)>,
+        hit_sel: usize,
+        searching: bool,
+        search_msg: Option<String>,
+    },
+    /// Word(docx)：本地解析的重排阅读视图
+    Docx {
+        doc: crate::ui::docx::Doc,
+        /// 内嵌图片纹理（media 名 → 纹理）
+        images: std::collections::HashMap<String, egui::TextureHandle>,
+        /// 各内容块上一帧实测高度（视口裁剪用：屏幕外块直接占位跳过渲染）
+        heights: Vec<f32>,
+        /// 本地查找：输入、开关、命中块索引、当前命中序号、待滚动目标块
+        search: String,
+        search_open: bool,
+        hits: Vec<usize>,
+        hit_sel: usize,
+        scroll_to: Option<usize>,
+    },
+}
+
 struct EditorTab {
     editor: crate::ui::editor::Editor,
     /// 所属会话标题（仅用于标签显示）
@@ -892,6 +956,8 @@ struct EditorTab {
     tail_offset: u64,
     tail_pending: bool,
     tail_last: f64,
+    /// Some = 文档标签（PDF/Word 查看器）；None = 常规文本编辑器
+    doc: Option<DocKind>,
     /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
     save_done_at: Option<f64>,
 }
@@ -948,6 +1014,245 @@ struct ImageTab {
     offset: egui::Vec2,
 }
 
+/// PDF / Word 文档视图（编辑器窗口的文档标签内容区）。
+/// PDF：底部工具栏（与编辑器状态栏同款）+ 单页视图；滚动到页底继续滚自动翻下页。
+/// Word：重排阅读视图，块高度缓存 + 视口裁剪（长文档只渲染可见部分）。
+fn doc_view(ui: &mut egui::Ui, tab: &mut EditorTab) {
+    use egui_phosphor::regular as icon;
+    let path = tab.editor.path.clone();
+    let fname = tab.editor.filename();
+    let tab_cmd = tab.cmd_tx.clone();
+    let Some(doc) = tab.doc.as_mut() else { return };
+    match doc {
+        DocKind::Pdf { pages, cur, zoom, cache, pending, flip_at, search, search_open, hits, hit_sel, searching, search_msg } => {
+            // Ctrl+F 打开/关闭查找；Esc 关闭
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+                *search_open = !*search_open;
+            }
+            if *search_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                *search_open = false;
+            }
+            // 查找条（顶部，VSCode 风格小浮条）
+            if *search_open {
+                egui::Panel::top(ui.id().with("pdf_find"))
+                    .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::symmetric(8, 4)))
+                    .show_inside(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(egui::TextEdit::singleline(search).desired_width(220.0).hint_text(crate::i18n::tr("查找（回车搜索全文）", "Find (Enter to search)")));
+                            let go = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            // searching 期间不重复发送（大 PDF 提取全文需数秒，连按回车会排队多个任务）
+                            if go && !search.trim().is_empty() && !*searching {
+                                *searching = true;
+                                *search_msg = None;
+                                hits.clear();
+                                let _ = tab_cmd.send(UiCommand::PdfSearch { path: path.clone(), query: search.trim().to_string() });
+                            }
+                            if *searching {
+                                ui.spinner();
+                            } else if let Some(msg) = search_msg {
+                                ui.label(RichText::new(msg.as_str()).color(Palette::DANGER).size(11.5));
+                            } else if !hits.is_empty() {
+                                // 上一个/下一个命中（跳页）
+                                if ui.button(RichText::new(egui_phosphor::regular::CARET_UP).size(12.0)).clicked() {
+                                    *hit_sel = (*hit_sel + hits.len() - 1) % hits.len();
+                                    *cur = hits[*hit_sel].0.clamp(1, *pages);
+                                }
+                                if ui.button(RichText::new(egui_phosphor::regular::CARET_DOWN).size(12.0)).clicked() {
+                                    *hit_sel = (*hit_sel + 1) % hits.len();
+                                    *cur = hits[*hit_sel].0.clamp(1, *pages);
+                                }
+                                let (pg, snippet) = &hits[*hit_sel];
+                                ui.label(RichText::new(format!("{}/{} · P{}", *hit_sel + 1, hits.len(), pg)).monospace().size(11.5).color(Palette::TEXT));
+                                ui.label(RichText::new(snippet.as_str()).color(Palette::TEXT_DIM).size(11.5));
+                            } else if !search.trim().is_empty() {
+                                ui.label(RichText::new(crate::i18n::tr("无结果", "No results")).color(Palette::TEXT_DIM).size(11.5));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new(RichText::new(egui_phosphor::regular::X).size(11.0)).frame(false)).clicked() {
+                                    *search_open = false;
+                                }
+                            });
+                        });
+                    });
+            }
+            // 底部工具栏（样式/位置对齐编辑器状态栏）
+            egui::Panel::bottom(ui.id().with("pdf_status"))
+                .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin { left: 8, right: 8, top: 2, bottom: 2 }))
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let dim = Palette::TEXT_DIM;
+                        let click_lbl = |ui: &mut egui::Ui, s: String, tip: &str| {
+                            ui.add(egui::Label::new(RichText::new(s).size(11.5).color(dim)).sense(egui::Sense::click())).on_hover_text(tip.to_string()).clicked()
+                        };
+                        if click_lbl(ui, icon::CARET_UP.to_string(), &crate::i18n::tr("上一页 (PageUp/←)", "Prev (PageUp/←)")) {
+                            *cur = cur.saturating_sub(1).max(1);
+                        }
+                        ui.label(RichText::new(format!("{cur} / {pages}")).monospace().size(11.0).color(Palette::TEXT));
+                        if click_lbl(ui, icon::CARET_DOWN.to_string(), &crate::i18n::tr("下一页 (PageDown/→)", "Next (PageDown/→)")) {
+                            *cur = (*cur + 1).min(*pages);
+                        }
+                        ui.add_space(12.0);
+                        if click_lbl(ui, "−".into(), &crate::i18n::tr("缩小", "Zoom out")) {
+                            let z = if *zoom <= 0.0 { 1.0 } else { *zoom };
+                            *zoom = (z / 1.2).max(0.25);
+                        }
+                        if click_lbl(ui, "+".into(), &crate::i18n::tr("放大", "Zoom in")) {
+                            let z = if *zoom <= 0.0 { 1.0 } else { *zoom };
+                            *zoom = (z * 1.2).min(4.0);
+                        }
+                        if click_lbl(ui, crate::i18n::tr("适宽", "Fit").into(), &crate::i18n::tr("适应窗口宽度", "Fit width")) {
+                            *zoom = 0.0;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(&fname).color(dim).size(11.0)).on_hover_text(&path);
+                        });
+                    });
+                });
+            // 键盘翻页
+            if ui.input(|i| i.key_pressed(egui::Key::PageUp) || i.key_pressed(egui::Key::ArrowLeft)) {
+                *cur = cur.saturating_sub(1).max(1);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::PageDown) || i.key_pressed(egui::Key::ArrowRight)) {
+                *cur = (*cur + 1).min(*pages);
+            }
+            // 请求当前页 ± 1（缺页且不在途才发）
+            for p in [*cur, cur.saturating_sub(1), *cur + 1] {
+                if p >= 1 && p <= *pages && !cache.iter().any(|(cp, _, _)| *cp == p) && !pending.contains(&p) {
+                    pending.insert(p);
+                    let _ = tab.cmd_tx.send(UiCommand::PdfPage { path: path.clone(), page: p, dpi: 120 });
+                }
+            }
+            // 页面内容：每页独立滚动状态（id_salt 页码 → 翻页自动回顶）
+            let out = egui::ScrollArea::both().id_salt(*cur).auto_shrink([false, false]).show(ui, |ui| {
+                if let Some((_, tex, size)) = cache.iter().find(|(p, _, _)| *p == *cur) {
+                    let avail_w = ui.available_width();
+                    let w = if *zoom <= 0.0 { (avail_w - 18.0).min(size.x * 2.0).max(64.0) } else { size.x * *zoom };
+                    let h = w / size.x * size.y;
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(8.0);
+                        ui.add(egui::Image::new((tex.id(), egui::vec2(w, h))));
+                        ui.add_space(8.0);
+                    });
+                } else {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(crate::i18n::tr("渲染中 …", "Rendering …")).color(Palette::TEXT_DIM).size(12.0));
+                    });
+                }
+            });
+            // 滚动连续翻页：页底继续下滚 → 下页；页顶继续上滚 → 上页（0.3s 冷却防惯性连翻）
+            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            let now = ui.input(|i| i.time);
+            if now - *flip_at > 0.3 && scroll_y.abs() > 0.5 {
+                let at_bottom = out.state.offset.y + out.inner_rect.height() >= out.content_size.y - 2.0;
+                let at_top = out.state.offset.y <= 0.5;
+                if scroll_y < 0.0 && at_bottom && *cur < *pages {
+                    *cur += 1;
+                    *flip_at = now;
+                } else if scroll_y > 0.0 && at_top && *cur > 1 && out.content_size.y > out.inner_rect.height() + 2.0 {
+                    // 仅当本页确实滚过（非单屏页）才向上翻，避免与「页底下滚」对称触发时抖动
+                    *cur -= 1;
+                    *flip_at = now;
+                } else if scroll_y > 0.0 && at_top && *cur > 1 && out.state.offset.y <= 0.0 && out.content_size.y <= out.inner_rect.height() {
+                    *cur -= 1;
+                    *flip_at = now;
+                }
+            }
+        }
+        DocKind::Docx { doc, images, heights, search, search_open, hits, hit_sel, scroll_to } => {
+            // Ctrl+F 打开/关闭查找；Esc 关闭
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+                *search_open = !*search_open;
+            }
+            if *search_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                *search_open = false;
+            }
+            if *search_open {
+                egui::Panel::top(ui.id().with("docx_find"))
+                    .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::symmetric(8, 4)))
+                    .show_inside(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(egui::TextEdit::singleline(search).desired_width(220.0).hint_text(crate::i18n::tr("查找", "Find")));
+                            // 本地即时搜索：输入变化即重算命中块
+                            if resp.changed() {
+                                hits.clear();
+                                *hit_sel = 0;
+                                let q = search.trim().to_lowercase();
+                                if !q.is_empty() {
+                                    for (bi, b) in doc.blocks.iter().enumerate() {
+                                        if crate::ui::docx::block_text(b).to_lowercase().contains(&q) {
+                                            hits.push(bi);
+                                            if hits.len() >= 500 {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(&b0) = hits.first() {
+                                    *scroll_to = Some(b0);
+                                }
+                            }
+                            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if !hits.is_empty() {
+                                let mut jump = false;
+                                if ui.button(RichText::new(egui_phosphor::regular::CARET_UP).size(12.0)).clicked() {
+                                    *hit_sel = (*hit_sel + hits.len() - 1) % hits.len();
+                                    jump = true;
+                                }
+                                if ui.button(RichText::new(egui_phosphor::regular::CARET_DOWN).size(12.0)).clicked() || enter {
+                                    *hit_sel = (*hit_sel + 1) % hits.len();
+                                    jump = true;
+                                }
+                                if jump {
+                                    *scroll_to = Some(hits[*hit_sel]);
+                                }
+                                ui.label(RichText::new(format!("{}/{}", *hit_sel + 1, hits.len())).monospace().size(11.5).color(Palette::TEXT));
+                            } else if !search.trim().is_empty() {
+                                ui.label(RichText::new(crate::i18n::tr("无结果", "No results")).color(Palette::TEXT_DIM).size(11.5));
+                            }
+                            if enter {
+                                resp.request_focus(); // 回车跳转后焦点留在查找框，可连续回车
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new(RichText::new(egui_phosphor::regular::X).size(11.0)).frame(false)).clicked() {
+                                    *search_open = false;
+                                }
+                            });
+                        });
+                    });
+            }
+            egui::Panel::bottom(ui.id().with("docx_status"))
+                .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin { left: 8, right: 8, top: 2, bottom: 2 }))
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("阅读视图", "Reading view")).color(Palette::TEXT_DIM).size(11.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(&fname).color(Palette::TEXT_DIM).size(11.0)).on_hover_text(&path);
+                        });
+                    });
+                });
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_viewport(ui, |ui, vp| {
+                // 左对齐内容列 + 两侧留白居中（不能用 vertical_centered——它会把每个
+                // 控件水平居中，段落对齐全部错乱）。宽度取整以稳定布局缓存。
+                let avail = ui.available_width();
+                let maxw = avail.min(820.0).floor();
+                let pad = ((avail - maxw) / 2.0).max(0.0).floor();
+                let hilite = if *search_open { hits.get(*hit_sel).copied() } else { None };
+                ui.horizontal_top(|ui| {
+                    ui.add_space(pad);
+                    ui.vertical(|ui| {
+                        ui.set_width(maxw);
+                        ui.add_space(16.0);
+                        crate::ui::docx::render_virtual(ui, doc, images, heights, vp, hilite, scroll_to);
+                        ui.add_space(28.0);
+                    });
+                });
+            });
+        }
+    }
+}
+
 /// 自检截图状态。
 struct Shot {
     path: String,
@@ -958,6 +1263,8 @@ struct Shot {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::apply(&cc.egui_ctx);
+        // docx 后台解析结果通道（解析/纹理解码在工作线程，UI 不冻结）
+        let (doc_parse_tx, doc_parse_rx) = std::sync::mpsc::channel();
         // 载入已保存的界面缩放到全局视图状态
         init_view_state();
         // 载入已保存语言（默认中文）
@@ -1010,6 +1317,8 @@ impl App {
             img_tab_drag: None,
             img_grab_dx: 0.0,
             img_total_w: 0.0,
+            doc_parse_tx,
+            doc_parse_rx,
             next_editor_id: 0,
             trim_after: None,
             show_forwards: false,
@@ -1119,6 +1428,7 @@ impl App {
             tail_offset: u64::MAX,
             tail_pending: false,
             tail_last: 0.0,
+            doc: None,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
@@ -1138,6 +1448,7 @@ impl App {
             tail_offset: u64::MAX,
             tail_pending: false,
             tail_last: 0.0,
+            doc: None,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
@@ -1157,6 +1468,7 @@ impl App {
             tail_offset: u64::MAX,
             tail_pending: false,
             tail_last: 0.0,
+            doc: None,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -1341,6 +1653,10 @@ impl App {
             pending_saved: Vec::new(),
             pending_save_progress: Vec::new(),
             pending_tail: Vec::new(),
+            pending_pdf_info: Vec::new(),
+            pending_pdf_page: Vec::new(),
+            pending_pdf_search: Vec::new(),
+            pending_doc: Vec::new(),
             pending_conflict: Vec::new(),
             pending_too_large: Vec::new(),
             pending_placeholder: Vec::new(),
@@ -1583,6 +1899,19 @@ impl App {
             FileAction::OpenImage { path } => {
                 s.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开中：{path} …"), crate::i18n::Lang::En => format!("Opening: {path} …") };
                 let _ = s.cmd_tx.send(UiCommand::ReadImage { path });
+            }
+            FileAction::OpenPdf { path } => {
+                // 与文本打开同构：先建占位标签（珊瑚线进度条），PdfInfo 就位后填充 PDF 视图
+                let id = s.next_xfer;
+                s.next_xfer += 1;
+                s.pending_placeholder.push((id, path.clone()));
+                let _ = s.cmd_tx.send(UiCommand::PdfInfo { id, path });
+            }
+            FileAction::OpenDocx { path } => {
+                let id = s.next_xfer;
+                s.next_xfer += 1;
+                s.pending_placeholder.push((id, path.clone()));
+                let _ = s.cmd_tx.send(UiCommand::ReadDoc { id, path });
             }
             FileAction::Move { srcs, dest_dir } => {
                 // 同会话内拖拽移动：直接走远端 mv（CopyMove 的 do_move 分支）
@@ -2201,6 +2530,10 @@ impl eframe::App for App {
         let mut conflicts: Vec<(u64, String)> = Vec::new(); // uid, path
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
         let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
+        let mut pdf_infos: Vec<(u64, u32)> = Vec::new(); // 占位 id, 页数
+        let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
+        let mut pdf_searches: Vec<(u64, String, Vec<(u32, String)>, Option<String>)> = Vec::new();
+        let mut new_docs: Vec<(u64, Vec<u8>)> = Vec::new(); // 占位 id, docx 字节
         for s in &mut self.sessions {
             s.drain_events();
             if s.connected && !s.initialized {
@@ -2236,6 +2569,18 @@ impl eframe::App for App {
             }
             for (path, data) in s.pending_image.drain(..) {
                 new_images.push((path, data, s.title.clone(), s.uid));
+            }
+            for x in s.pending_pdf_info.drain(..) {
+                pdf_infos.push(x);
+            }
+            for (path, page, data) in s.pending_pdf_page.drain(..) {
+                pdf_pages.push((s.uid, path, page, data));
+            }
+            for (path, hits, message) in s.pending_pdf_search.drain(..) {
+                pdf_searches.push((s.uid, path, hits, message));
+            }
+            for x in s.pending_doc.drain(..) {
+                new_docs.push(x);
             }
         }
         // 打开时发现文件实际超限：移除占位标签（复用 load_fail 移除逻辑），并在对应会话的文件面板
@@ -2327,7 +2672,20 @@ impl eframe::App for App {
             }
         }
         // 编辑器标签：立即建占位（loading）→ 进度更新 → 内容就位 → 失败移除。
-        let opened_editor = !new_placeholders.is_empty() || !filled.is_empty() || !load_progress.is_empty() || !load_fail.is_empty();
+        // PDF / Word 文档标签完整复用该框架（占位/进度/失败路径相同，就位时填充 doc 内容）。
+        // docx 后台解析结果先收集（mpsc 无 peek；必须与其它事件一起纳入触发条件，
+        // 否则「解析完成」那帧若无其它编辑器事件，下方块不执行 → 永远停在「渲染中」）
+        let parsed: Vec<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)> =
+            self.doc_parse_rx.try_iter().collect();
+        let opened_editor = !new_placeholders.is_empty()
+            || !filled.is_empty()
+            || !load_progress.is_empty()
+            || !load_fail.is_empty()
+            || !pdf_infos.is_empty()
+            || !pdf_pages.is_empty()
+            || !new_docs.is_empty()
+            || !pdf_searches.is_empty()
+            || !parsed.is_empty();
         if opened_editor {
             // 占位标签的 text_id 先在锁外分配（alloc_editor_id 借用 self）
             let mut ph_ids: Vec<egui::Id> = Vec::with_capacity(new_placeholders.len());
@@ -2343,7 +2701,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0 });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -2365,6 +2723,130 @@ impl eframe::App for App {
                     }
                     t.editor = editor;
                     t.load_id = None;
+                }
+            }
+            // 3.5) 文档就位：占位标签变为 PDF / Word 查看器
+            for (id, pages) in pdf_infos {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+                    t.doc = Some(DocKind::Pdf {
+                        pages,
+                        cur: 1,
+                        zoom: 0.0,
+                        cache: Vec::new(),
+                        pending: std::collections::HashSet::new(),
+                        flip_at: 0.0,
+                        search: String::new(),
+                        search_open: false,
+                        hits: Vec::new(),
+                        hit_sel: 0,
+                        searching: false,
+                        search_msg: None,
+                    });
+                    t.load_id = None;
+                }
+            }
+            // docx 下载完成 → 后台线程解析 + 解码纹理（ctx.load_texture 线程安全），
+            // UI 不冻结；占位文案切换为「渲染中 …」。结果经 doc_parse 通道回来装配。
+            for (id, data) in new_docs {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+                    t.editor.loading_note = Some(crate::i18n::tr("渲染中 …", "Rendering …").into());
+                    // 进度条置满（下载已完成）
+                    t.load_done = t.load_total.max(1);
+                    t.load_total = t.load_total.max(1);
+                    let ctx2 = ui.ctx().clone();
+                    let tx = self.doc_parse_tx.clone();
+                    let uid = t.uid;
+                    let tpath = t.editor.path.clone();
+                    std::thread::spawn(move || {
+                        let res = match crate::ui::docx::parse(&data) {
+                            Ok(mut doc) => {
+                                let mut images = std::collections::HashMap::new();
+                                // 图片纹理上限 100 张：图海文档防内存/显存失控
+                                for (name, bytes) in doc.media.iter().take(100) {
+                                    if let Ok(mut img) = image::load_from_memory(bytes) {
+                                        // 大图降采样到 ≤1600px：相机原图直接建纹理动辄几十 MB，
+                                        // 阅读视图用不到原始分辨率（这是 docx 内存高的大头）
+                                        if img.width() > 1600 || img.height() > 1600 {
+                                            img = img.thumbnail(1600, 1600);
+                                        }
+                                        let rgba = img.to_rgba8();
+                                        let size = [rgba.width() as usize, rgba.height() as usize];
+                                        let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                                        images.insert(name.clone(), ctx2.load_texture(format!("docx:{uid}:{tpath}:{name}"), color, egui::TextureOptions::LINEAR));
+                                    }
+                                }
+                                doc.media = Vec::new(); // 原始字节释放（内存大头）
+                                Ok((doc, images))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let _ = tx.send((id, res));
+                        ctx2.request_repaint();
+                        ctx2.request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+                    });
+                }
+            }
+            // 后台解析完成 → 装配文档标签
+            for (id, res) in parsed {
+                match res {
+                    Ok((doc, images)) => {
+                        if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+                            let n = doc.blocks.len();
+                            t.doc = Some(DocKind::Docx {
+                                doc,
+                                images,
+                                heights: vec![0.0; n],
+                                search: String::new(),
+                                search_open: false,
+                                hits: Vec::new(),
+                                hit_sel: 0,
+                                scroll_to: None,
+                            });
+                            t.load_id = None;
+                            t.editor.loading_note = None;
+                        }
+                    }
+                    Err(e) => {
+                        self.toast = Some((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("文档解析失败：{e}"), crate::i18n::Lang::En => format!("Doc parse failed: {e}") }, ui.input(|i| i.time)));
+                        load_fail.push(id);
+                    }
+                }
+            }
+            // PDF 查找结果 → 命中列表（跳到首个命中页）
+            for (uid, path, hits_in, message) in pdf_searches {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                    if let Some(DocKind::Pdf { hits, hit_sel, searching, search_msg, cur, pages, .. }) = &mut t.doc {
+                        *searching = false;
+                        *search_msg = message;
+                        *hits = hits_in;
+                        *hit_sel = 0;
+                        if let Some((p, _)) = hits.first() {
+                            *cur = (*p).clamp(1, *pages);
+                        }
+                    }
+                }
+            }
+            // PDF 页渲染结果 → 页缓存
+            for (uid, path, page, data) in pdf_pages {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                    if let Some(DocKind::Pdf { cache, pending, .. }) = &mut t.doc {
+                        pending.remove(&page);
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if let Ok(img) = image::load_from_memory(&data) {
+                            let rgba = img.to_rgba8();
+                            let size = [rgba.width() as usize, rgba.height() as usize];
+                            let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                            let tex = ui.ctx().load_texture(format!("pdf:{uid}:{path}:{page}"), color, egui::TextureOptions::LINEAR);
+                            cache.retain(|(p, _, _)| *p != page);
+                            cache.push((page, tex, egui::vec2(size[0] as f32, size[1] as f32)));
+                            // 小 LRU：只留最近 6 页（控制内存）
+                            while cache.len() > 6 {
+                                let _ = cache.remove(0);
+                            }
+                        }
+                    }
                 }
             }
             // 4) 失败：移除对应占位标签
@@ -3456,7 +3938,9 @@ impl App {
                         ui.set_min_height(28.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // 居中要点：不在子布局再 set_min_height（与主窗口 top_tabs 一致）。
-                            if ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                            // 文档标签（PDF/Word 查看器）只读，不显示保存按钮
+                            let is_doc = ed.tabs.get(ed.active).map(|t| t.doc.is_some()).unwrap_or(false);
+                            if !is_doc && ui.add(egui::Button::new(RichText::new(format!("{}  {}", icon::FLOPPY_DISK, crate::i18n::tr("保存", "Save"))).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                                 do_save = true;
                             }
                             // 查找：采用主窗口右侧按钮（flat_button）样式
@@ -3511,9 +3995,15 @@ impl App {
                                         let dirty = if t.editor.dirty() { " ●" } else { "" };
                                         // 加载中 → 进度 [0,1]，驱动 tab 上珊瑚色进度条；否则 -1（不画）
                                         let prog = if t.load_id.is_some() { (t.load_done as f32 / t.load_total.max(1) as f32).clamp(0.0, 1.0) } else { -1.0 };
+                                        // 图标按内容类型：PDF / Word 文档标签与文本编辑区分
+                                        let ic = match &t.doc {
+                                            Some(DocKind::Pdf { .. }) => icon::FILE_CODE,
+                                            Some(DocKind::Docx { .. }) => icon::CLIPBOARD_TEXT,
+                                            None => icon::FILE_CODE,
+                                        };
                                         (
                                             t.text_id.value(),
-                                            format!("{} {}·{}{}", icon::FILE_CODE, t.server, t.editor.filename(), dirty),
+                                            format!("{} {}·{}{}", ic, t.server, t.editor.filename(), dirty),
                                             t.editor.path.clone(),
                                             prog,
                                             saves[i],
@@ -3547,7 +4037,13 @@ impl App {
             if toggle_find {
                 let active = ed.active;
                 if let Some(t) = ed.tabs.get_mut(active) {
-                    t.editor.toggle_find();
+                    match &mut t.doc {
+                        // PDF 标签：查找按钮打开 PDF 全文查找条（远端 pdftotext）
+                        Some(DocKind::Pdf { search_open, .. }) => *search_open = !*search_open,
+                        // Word 标签：本地即时查找条
+                        Some(DocKind::Docx { search_open, .. }) => *search_open = !*search_open,
+                        None => t.editor.toggle_find(),
+                    }
                 }
             }
 
@@ -3583,7 +4079,9 @@ impl App {
                                 });
                             });
                         }
-                        if crate::ui::editor::content(ui, &mut tab.editor, tid) {
+                        if tab.doc.is_some() {
+                            doc_view(ui, tab); // PDF / Word 文档视图（复用编辑器标签框架）
+                        } else if crate::ui::editor::content(ui, &mut tab.editor, tid) {
                             do_save = true;
                         }
                     }
@@ -3655,7 +4153,7 @@ impl App {
                     if i < ed.tabs.len() {
                         let closed = ed.tabs.remove(i);
                         // 记住光标位置（下次打开恢复）
-                        crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line());
+                        if closed.doc.is_none() { crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line()); }
                         // 清除该编辑器在 egui 内存中的 TextEdit 状态（含撤销历史的文本快照）
                         vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
                     }
@@ -3707,7 +4205,7 @@ impl App {
                     if decision == 1 || decision == 2 {
                         if ti < ed.tabs.len() {
                             let closed = ed.tabs.remove(ti);
-                            crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line());
+                            if closed.doc.is_none() { crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line()); }
                             vctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
                         }
                         if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
@@ -5173,7 +5671,26 @@ fn draggable_tabs(
             let mut acc = 0.0f32;
             for (i, (uid, text, tip, prog, save)) in labels.iter().enumerate() {
                 let selected = active == i;
-                let title_w = ctx.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), Palette::TEXT).rect.width());
+                // 标签文本最大宽度约束：超长文件名截断加 …（完整名走悬停提示），
+                // 否则一个长名字会把整个标签栏/窗口撑得很长
+                const TAB_TEXT_MAX: f32 = 190.0;
+                let mut text_show = text.clone();
+                let mut title_w = ctx.fonts_mut(|f| f.layout_no_wrap(text_show.clone(), font.clone(), Palette::TEXT).rect.width());
+                if title_w > TAB_TEXT_MAX {
+                    // 先按比例粗截，再逐步收敛（至多几次布局，成本可忽略）
+                    let chars: Vec<char> = text.chars().collect();
+                    let mut keep = ((chars.len() as f32) * TAB_TEXT_MAX / title_w) as usize;
+                    loop {
+                        keep = keep.clamp(4, chars.len());
+                        text_show = chars.iter().take(keep).collect::<String>() + "…";
+                        title_w = ctx.fonts_mut(|f| f.layout_no_wrap(text_show.clone(), font.clone(), Palette::TEXT).rect.width());
+                        if title_w <= TAB_TEXT_MAX || keep <= 4 {
+                            break;
+                        }
+                        keep -= 2;
+                    }
+                }
+                let truncated = text_show.len() != text.len();
                 let w = title_w + 16.0 + 22.0; // 左内边距 + 文本 + 右侧关闭区
                 let target = acc;
                 if selected && want_scroll {
@@ -5196,6 +5713,8 @@ fn draggable_tabs(
                 // 拖动期间不弹路径提示（避免拖着拖着冒出悬停 tooltip）
                 if dragging_tab.is_none() && !tip.is_empty() {
                     resp = resp.on_hover_text(tip.as_str());
+                } else if dragging_tab.is_none() && truncated {
+                    resp = resp.on_hover_text(text.as_str()); // 被截断且无路径提示 → 悬停显示完整名
                 }
                 let close_rect = egui::Rect::from_center_size(egui::pos2(tab_rect.right() - 12.0, tab_rect.center().y), egui::vec2(16.0, 16.0));
                 let close_resp = ui.interact(close_rect, egui::Id::new(("dtabclose", *uid)), Sense::click());
@@ -5225,7 +5744,7 @@ fn draggable_tabs(
                     p.hline(tab_rect.left()..=tab_rect.right(), tab_rect.bottom() - 1.0, egui::Stroke::new(2.0, Palette::ACCENT));
                 }
                 let tcolor = if selected { Palette::TEXT } else { Palette::TEXT_DIM };
-                p.text(egui::pos2(tab_rect.left() + 8.0, tab_rect.center().y), egui::Align2::LEFT_CENTER, text, font.clone(), tcolor);
+                p.text(egui::pos2(tab_rect.left() + 8.0, tab_rect.center().y), egui::Align2::LEFT_CENTER, &text_show, font.clone(), tcolor);
                 let xcolor = if close_resp.hovered() { Palette::DANGER } else { Palette::TEXT_DIM };
                 p.text(close_rect.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::X, egui::FontId::proportional(11.0), xcolor);
                 if close_resp.clicked() {

@@ -115,6 +115,8 @@ pub struct Editor {
     pub follow: bool,
     /// 状态栏「跟随」按钮被点击（app 层消费：切换跟随并发送初始化命令）。
     pub follow_req: bool,
+    /// 占位（loading）状态下的自定义文案（None = 「下载中 …」）。
+    pub loading_note: Option<String>,
 }
 
 /// 一次编辑操作：把 content[at..at+removed.len()] 由 removed 换成 inserted。
@@ -197,6 +199,7 @@ impl Editor {
             caret_px: None,
             follow: false,
             follow_req: false,
+            loading_note: None,
         }
     }
     /// 切换查找栏（供窗口标签栏的「查找」按钮调用）；打开时请求聚焦查找框。
@@ -276,6 +279,7 @@ impl Editor {
 pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
 
     // 下载中占位：只显示文件名、不可编辑（进度由标签栏的珊瑚色进度条体现）。
+    // 文案可被覆盖（文档标签下载完转后台解析时显示「渲染中 …」）。
     if ed.loading {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::from_rgb(252, 252, 250)))
@@ -284,7 +288,8 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     ui.add_space(ui.available_height() * 0.4);
                     ui.label(RichText::new(ed.filename()).size(16.0).color(Palette::TEXT));
                     ui.add_space(6.0);
-                    ui.label(RichText::new(crate::i18n::tr("下载中 …", "Downloading …")).size(12.0).color(Palette::TEXT_DIM));
+                    let note = ed.loading_note.clone().unwrap_or_else(|| crate::i18n::tr("下载中 …", "Downloading …").into());
+                    ui.label(RichText::new(note).size(12.0).color(Palette::TEXT_DIM));
                 });
             });
         return false;

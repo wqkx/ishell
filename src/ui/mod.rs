@@ -1,6 +1,7 @@
 //! UI 子模块：左侧系统信息栏、右下文件面板、连接对话框，以及通用绘制辅助。
 
 pub mod connect;
+pub mod docx;
 pub mod editor;
 pub mod file_panel;
 pub mod highlight;

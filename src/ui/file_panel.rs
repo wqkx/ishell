@@ -174,6 +174,10 @@ pub enum FileAction {
     OpenFile { path: String, force: bool },
     /// 双击图片文件 -> 打开看图工具
     OpenImage { path: String },
+    /// 双击 PDF -> 打开 PDF 查看器（远端 poppler 渲染）
+    OpenPdf { path: String },
+    /// 双击 Word(docx) -> 打开文档查看器（本地解析）
+    OpenDocx { path: String },
     /// 在终端 cd 到该目录并聚焦终端
     CdTerminal(String),
     /// 直接设置状态栏文案（用于撤销等即时提示）
@@ -223,6 +227,10 @@ enum OpenIntent {
     Navigate(String),
     /// 看图工具打开
     Image(String),
+    /// PDF 查看器打开（远端 poppler 渲染）
+    Pdf(String),
+    /// Word(docx) 查看器打开（本地解析）
+    Docx(String),
     /// 非文本后缀：弹确认框（路径, 大小）
     ConfirmText(String, u64),
     /// 大文本文件：弹确认框（路径, 大小）
@@ -253,8 +261,13 @@ fn open_intent(e: &FileEntry, full: &str) -> OpenIntent {
         return OpenIntent::Broken;
     }
     // 文件（含指向文件的软链）：按名称后缀分流
+    let lower = e.name.to_lowercase();
     if is_image_path(&e.name) {
         OpenIntent::Image(full.to_string())
+    } else if lower.ends_with(".pdf") {
+        OpenIntent::Pdf(full.to_string())
+    } else if lower.ends_with(".docx") {
+        OpenIntent::Docx(full.to_string())
     } else if !is_text_path(&e.name) {
         OpenIntent::ConfirmText(full.to_string(), e.size)
     } else if e.size > 4 * 1024 * 1024 {
@@ -985,6 +998,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     let mut rclick: Option<usize> = None; // 本帧被右键的行
     let mut open_file: Option<String> = None; // 双击文本文件
     let mut open_image: Option<String> = None; // 双击图片文件
+    let mut open_pdf: Option<String> = None; // 双击 PDF 文件
+    let mut open_docx: Option<String> = None; // 双击 Word(docx) 文件
     let mut confirm_open: Option<(String, u64)> = None; // 大文本文件待确认
     let mut confirm_text: Option<(String, u64)> = None; // 非文本后缀，待确认是否强开
     let mut rename_commit: Option<(String, String)> = None;
@@ -1098,6 +1113,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                 match open_intent(e, &full) {
                     OpenIntent::Navigate(p) => navigate = Some(p),
                     OpenIntent::Image(p) => open_image = Some(p),
+                    OpenIntent::Pdf(p) => open_pdf = Some(p),
+                    OpenIntent::Docx(p) => open_docx = Some(p),
                     OpenIntent::ConfirmText(p, sz) => confirm_text = Some((p, sz)),
                     OpenIntent::ConfirmLarge(p, sz) => confirm_open = Some((p, sz)),
                     OpenIntent::Text(p) => open_file = Some(p),
@@ -1306,6 +1323,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                         match open_intent(e, &full) {
                             OpenIntent::Navigate(p) => navigate = Some(p),
                             OpenIntent::Image(p) => open_image = Some(p),
+                            OpenIntent::Pdf(p) => open_pdf = Some(p),
+                            OpenIntent::Docx(p) => open_docx = Some(p),
                             OpenIntent::ConfirmText(p, sz) => confirm_text = Some((p, sz)),
                             OpenIntent::ConfirmLarge(p, sz) => confirm_open = Some((p, sz)),
                             OpenIntent::Text(p) => open_file = Some(p),
@@ -1458,9 +1477,15 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     if let Some(p) = open_file {
         actions.push(FileAction::OpenFile { path: p, force: false });
     }
-    // 双击打开图片
+    // 双击打开图片 / PDF / Word
     if let Some(p) = open_image {
         actions.push(FileAction::OpenImage { path: p });
+    }
+    if let Some(p) = open_pdf {
+        actions.push(FileAction::OpenPdf { path: p });
+    }
+    if let Some(p) = open_docx {
+        actions.push(FileAction::OpenDocx { path: p });
     }
     if let Some((p, size)) = confirm_open {
         state.dialog = Some(Dialog::ConfirmOpenLarge { path: p, size });
