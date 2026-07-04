@@ -1949,6 +1949,7 @@ fn finish_download(data_part: &std::path::Path, lpath: &std::path::Path) -> anyh
         }
         Err(e) => {
             let _ = std::fs::rename(&bak, lpath); // 换入失败：还原原文件
+            let _ = std::fs::remove_file(data_part); // 清理未换入的临时数据文件，避免残留
             Err(e.into())
         }
     }
@@ -2371,22 +2372,28 @@ async fn sftp_overwrite(sftp: &russh_sftp::client::SftpSession, path: &str, data
     Ok(())
 }
 
-/// 事务性保存：先把新内容完整写入同目录临时文件，再用「备份原文件 → 换入新文件」的
-/// 序列替换，全程**任何一步失败原文件都不丢失**（始终存在于 path 或 path.bak）。
+/// 事务性保存：先把新内容完整写入同目录临时文件，再用「换入」替换目标，
+/// 全程**任何一步失败原文件都不丢失**（始终存在于 目标 或 目标.bak）。
 /// 特殊情形：
-/// - **符号链接**：直接写穿到链接目标（open 跟随链接），不做替换——否则会把链接换成普通文件。
+/// - **符号链接**：解析到真实目标后在其上做同样的事务替换，链接语义保留、且仍然原子；
+///   仅当链接损坏（无法解析）时退回直写（非原子，罕见）。
 /// - **权限**：把原文件的权限位复制到临时文件，避免保存可执行脚本丢失执行位。
 async fn sftp_write_atomic(sftp: &russh_sftp::client::SftpSession, path: &str, data: &[u8], sink: &UiSink) -> anyhow::Result<()> {
-    // 目标是符号链接 → 直写目标（保留链接语义）
+    // 符号链接 → 解析到真实目标，替换发生在目标上（链接不变）；损坏链接才退回直写。
     let is_symlink = sftp.symlink_metadata(path).await.map(|m| m.is_symlink()).unwrap_or(false);
-    if is_symlink {
-        return sftp_overwrite_progress_to(sftp, path, path, data, sink).await;
-    }
+    let target = if is_symlink {
+        match sftp.canonicalize(path).await {
+            Ok(real) => real,
+            Err(_) => return sftp_overwrite_progress_to(sftp, path, path, data, sink).await,
+        }
+    } else {
+        path.to_string()
+    };
 
-    // 原文件权限（用于回填临时文件）；不存在则用默认（新建）
-    let orig_perm = sftp.metadata(path).await.ok().and_then(|m| m.permissions);
+    // 一次 metadata：既取权限、也据 Ok/Err 判断目标是否已存在（省去额外的 try_exists 往返）。
+    let orig_perm = sftp.metadata(&target).await.ok().and_then(|m| m.permissions);
 
-    let tmp = format!("{path}.ishell-tmp-{}", rand_hex(6));
+    let tmp = format!("{target}.ishell-tmp-{}", rand_hex(6));
     if let Err(e) = sftp_overwrite_progress_to(sftp, &tmp, path, data, sink).await {
         let _ = sftp.remove_file(&tmp).await; // 写失败：清理临时文件，原文件未动
         return Err(e);
@@ -2398,37 +2405,43 @@ async fn sftp_write_atomic(sftp: &russh_sftp::client::SftpSession, path: &str, d
             .await;
     }
 
-    let target_exists = sftp.try_exists(path).await.unwrap_or(true);
-    if !target_exists {
-        // 目标不存在（新建保存）：直接换入
-        return sftp.rename(&tmp, path).await.map_err(|e| {
-            anyhow::anyhow!(match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("重命名失败（数据已保存在 {tmp}）：{e}"),
-                crate::i18n::Lang::En => format!("rename failed (data at {tmp}): {e}"),
-            })
-        });
+    // 先尝试直接换入：SFTP v3 rename 目标不存在时成功（新建保存）——不必先探测存在性，
+    // 也就不会因 try_exists 的瞬时错误把新文件误判为已存在而走错分支。
+    if sftp.rename(&tmp, &target).await.is_ok() {
+        return Ok(());
     }
 
-    // 覆盖已有文件：备份 → 换入 → 删备份。原文件始终在 path 或 bak，绝不凭空消失。
-    let bak = format!("{path}.ishell-bak-{}", rand_hex(6));
-    sftp.rename(path, &bak).await.map_err(|e| {
-        anyhow::anyhow!(match crate::i18n::current() {
-            crate::i18n::Lang::Zh => format!("备份原文件失败（原文件完好）：{e}"),
-            crate::i18n::Lang::En => format!("backup failed (original intact): {e}"),
-        })
-    })?;
-    match sftp.rename(&tmp, path).await {
+    // 直接换入失败（多半因目标已存在，v3 rename 不覆盖）→ 备份 → 换入 → 删备份。
+    // 原文件始终在 target 或 bak，绝不凭空消失。
+    let bak = format!("{target}.ishell-bak-{}", rand_hex(6));
+    if let Err(e) = sftp.rename(&target, &bak).await {
+        // 备份也失败：清理 tmp，原文件未动（仍在 target 或本就不存在）
+        let _ = sftp.remove_file(&tmp).await;
+        return Err(anyhow::anyhow!(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("保存失败（原文件未改动，新内容在 {tmp}）：{e}"),
+            crate::i18n::Lang::En => format!("save failed (original unchanged, new content at {tmp}): {e}"),
+        }));
+    }
+    match sftp.rename(&tmp, &target).await {
         Ok(_) => {
             let _ = sftp.remove_file(&bak).await; // 换入成功，清理备份
             Ok(())
         }
         Err(e) => {
-            // 换入失败：把备份还原为原文件，保证原数据不丢
-            let _ = sftp.rename(&bak, path).await;
+            // 换入失败：把备份还原为原文件；只有还原确实成功才说「已还原」，
+            // 否则如实告知原文件仍在 bak，避免误导恢复。
+            let restored = sftp.rename(&bak, &target).await.is_ok();
             let _ = sftp.remove_file(&tmp).await;
-            Err(anyhow::anyhow!(match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("替换失败，已还原原文件：{e}"),
-                crate::i18n::Lang::En => format!("replace failed, original restored: {e}"),
+            Err(anyhow::anyhow!(if restored {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("替换失败，已还原原文件：{e}"),
+                    crate::i18n::Lang::En => format!("replace failed, original restored: {e}"),
+                }
+            } else {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("替换失败且未能还原，原文件在 {bak}：{e}"),
+                    crate::i18n::Lang::En => format!("replace failed and not restored; original is at {bak}: {e}"),
+                }
             }))
         }
     }

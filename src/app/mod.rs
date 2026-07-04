@@ -70,6 +70,8 @@ struct Session {
     pending_conflict: Vec<String>,
     /// 保存失败（网络/权限等）：(路径, 原因)
     pending_save_failed: Vec<(String, String)>,
+    /// 需要在 App 层弹 toast 的警告（如编码丢字）；Session 无 toast/ctx，经此转交
+    pending_warn: Vec<String>,
     /// 打开时发现实际超限（id, path, size）——移除占位标签 + 弹「打开大文件」确认
     pending_too_large: Vec<(u64, String, u64)>,
     /// 待新建的占位编辑器标签（id, path）——双击打开时立即建，显示文件名 + 进度条
@@ -275,7 +277,13 @@ impl Session {
             };
             evt_budget -= 1;
             match ev {
-                WorkerEvent::Status(s) => self.status = s,
+                WorkerEvent::Status(s) => {
+                    // ⚠ 前缀的警告（如编码丢字）转交 App 层弹顶部 toast，避免只写状态栏被后续消息滚走
+                    if s.starts_with('⚠') {
+                        self.pending_warn.push(s.clone());
+                    }
+                    self.status = s;
+                }
                 WorkerEvent::Connected => {
                     self.connected = true;
                     self.was_connected = true;
@@ -1267,6 +1275,7 @@ impl App {
             pending_doc: Vec::new(),
             pending_conflict: Vec::new(),
             pending_save_failed: Vec::new(),
+            pending_warn: Vec::new(),
             pending_too_large: Vec::new(),
             pending_placeholder: Vec::new(),
             pending_load_progress: Vec::new(),
@@ -2151,6 +2160,7 @@ impl eframe::App for App {
         let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
         let mut conflicts: Vec<(u64, String)> = Vec::new(); // uid, path
         let mut save_failed: Vec<(u64, String, String)> = Vec::new(); // uid, path, message
+        let mut warns: Vec<String> = Vec::new(); // 需弹 toast 的警告
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
         let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
         let mut pdf_infos: Vec<(u64, u32)> = Vec::new(); // 占位 id, 页数
@@ -2183,6 +2193,9 @@ impl eframe::App for App {
             for path in s.pending_conflict.drain(..) {
                 conflicts.push((s.uid, path));
             }
+            for w in s.pending_warn.drain(..) {
+                warns.push(w);
+            }
             for (path, msg) in s.pending_save_failed.drain(..) {
                 save_failed.push((s.uid, path, msg));
             }
@@ -2213,6 +2226,10 @@ impl eframe::App for App {
         }
         if evt_backlog {
             self.ctx.request_repaint();
+        }
+        // 警告（如编码丢字）弹顶部 toast
+        if let Some(w) = warns.into_iter().next_back() {
+            self.toast = Some((w, self.ctx.input(|i| i.time)));
         }
         // 打开时发现文件实际超限：移除占位标签（复用 load_fail 移除逻辑），并在对应会话的文件面板
         // 弹「打开大文件」确认，确认后走 force=true 重新打开（列表里的旧大小已过时，双击前无法预判）。
@@ -2531,9 +2548,19 @@ impl eframe::App for App {
                         if t.close_on_saved {
                             close_after_save.push((uid, t.editor.path.clone()));
                         }
-                    } else {
-                        // 保存期间又改了：撤销「保存并关闭」，保留脏标签交用户重新保存
-                        t.close_on_saved = false;
+                    } else if t.close_on_saved {
+                        // 保存期间内容又变了但用户要「保存并关闭」：用最新内容再存一次，
+                        // 存完（届时签名一致）再关闭；否则「保存并关闭」会静默不生效。
+                        let _ = t.cmd_tx.send(UiCommand::WriteFile {
+                            path: t.editor.path.clone(),
+                            content: t.editor.content.clone(),
+                            encoding: t.editor.encoding().to_string(),
+                            eol: t.editor.eol(),
+                            expect_mtime: t.editor.mtime(),
+                            force: false,
+                        });
+                        t.save_rev = t.editor.save_rev();
+                        t.saving = true; // 重新进入保存中（close_on_saved 保持，收到确认后关闭）
                     }
                 }
             }

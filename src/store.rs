@@ -249,17 +249,29 @@ fn write_key_file(path: &std::path::Path, k: &[u8; 32]) -> std::io::Result<()> {
     std::fs::write(path, k)
 }
 
-/// 原子写文本文件：写同目录临时文件 → fsync → rename 替换。进程崩溃/断电时
-/// 目标要么是旧内容、要么是新内容，绝不出现截断的半截 JSON（配置数据完整性）。
+/// 原子写文本文件：写同目录唯一命名的临时文件 → fsync 文件 → rename 替换 →
+/// best-effort fsync 父目录。进程崩溃/断电时目标要么旧内容、要么新内容，不出现半截 JSON。
+/// 临时名带 pid + 单调计数，避免与并发写/前次崩溃残留的临时文件互相覆盖。
 fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("ishell-tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let uniq = format!("ishell-tmp.{}.{}", std::process::id(), CTR.fetch_add(1, Ordering::Relaxed));
+    let tmp = path.with_extension(uniq);
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
         let _ = f.sync_all();
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // 目录项持久化：rename 后 fsync 父目录，断电时新名不至于丢失（Unix；其它平台 no-op）
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// 校验本地 key 文件权限：若 group/other 有任何位（过宽），记录并收紧为 0600。
