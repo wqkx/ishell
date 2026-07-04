@@ -44,14 +44,18 @@ pub struct Editor {
     msel: Vec<(usize, usize)>,
     /// 虚拟编辑器自绘 IME：当前组字(预编辑)文本在 content 中的字节范围；无则 None
     vime_preedit: Option<(usize, usize)>,
-    /// 上一帧滚动度量（用于本帧用「设置滚动偏移」方式可靠跟随光标；scroll_to_rect 在本容器不生效）
+    /// 自绘竖向滚动：当前首个可见「视觉行」号（我们自己维护，不经 egui 像素滚动条）。
+    /// 这样竖向定位按行号，与内容像素高度彻底解耦——大文件拖到底不再有 egui 边界结算卡顿。
+    vtop: usize,
+    /// 滚轮/触控板的亚行像素累加器（凑够一行才移动 vtop，保持与旧版一致的整行滚动手感）
+    vscroll_accum: f32,
+    /// 上一帧滚动度量（横向仍用 egui；vlast_top/vlast_vis 供跟随光标判断）
     vlast_top: usize,
     vlast_vis: usize,
-    vlast_voff: f32,
     vlast_hoff: f32,
     vlast_vieww: f32,
     vlast_viewh: f32,
-    /// 拖选到边缘时下一帧要施加的滚动增量 (水平, 垂直)
+    /// 拖选到边缘时下一帧要施加的滚动增量 (水平像素, 垂直行数)
     vscroll_nudge: Option<(f32, f32)>,
     /// 原文件字符编码（保存时按此编码回写，避免破坏 GBK 等非 UTF-8 文件）
     encoding: String,
@@ -170,9 +174,10 @@ impl Editor {
             pending_scroll: None,
             msel: Vec::new(),
             vime_preedit: None,
+            vtop: 0,
+            vscroll_accum: 0.0,
             vlast_top: 0,
             vlast_vis: 1,
-            vlast_voff: 0.0,
             vlast_hoff: 0.0,
             vlast_vieww: 0.0,
             vlast_viewh: 0.0,
@@ -1948,27 +1953,23 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     } else {
         gutter_w + (ed.vmax as f32 + 2.0) * char_w
     };
-    let content_h = ((nrows + pad_rows) as f32 * row_h).min(12_000_000.0);
-
-    // —— 用「设置滚动偏移」可靠地让视角跟随光标（scroll_to_rect 在本虚拟容器里不生效）——
-    // 用上一帧度量判断光标是否已在可视区，越界才强制滚动；普通滚动不受影响。
-    let mut force_v: Option<f32> = None;
+    // —— 竖向滚动完全自绘：位置是「首个可见视觉行」ed.vtop（行号），与内容像素高度解耦。
+    // 横向仍交给 egui ScrollArea（用 force_h 施加跟随光标的横向偏移）。
+    // 用上一帧度量判断光标是否已在可视区，越界才滚一行；普通滚动不受影响。
     let mut force_h: Option<f32> = None;
     {
         let view_h = if ed.vlast_viewh > 0.0 { ed.vlast_viewh } else { ui.available_height() };
         let view_w = if ed.vlast_vieww > 0.0 { ed.vlast_vieww } else { ui.available_width() };
         let visible = (view_h / row_h).ceil() as usize + 2;
-        let max_off = (content_h - view_h).max(1.0);
         let max_top = (nrows + pad_rows).saturating_sub(visible.saturating_sub(2));
         let caret_row = v_vpos_of_byte(ed, ed.vcaret, eff_cols).0;
         if let Some(tl) = ed.pending_scroll.take() {
             // 跳转/定位：居中（逻辑行 → 其首个视觉行）
             let tl_row = ed.vrow_pre.get(tl).copied().unwrap_or(0) as usize;
-            let tt = tl_row.saturating_sub(visible / 2);
-            force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
+            ed.vtop = tl_row.saturating_sub(visible / 2).min(max_top);
         } else if moved {
             // 键盘移动：只在越界时「一行」地滚（不要整屏跳）
-            let top = ed.vlast_top;
+            let top = ed.vtop;
             let vis = ed.vlast_vis.max(3);
             let tt = if caret_row < top {
                 caret_row // 光标在视口上方 → 滚到刚好露出该行（一行）
@@ -1977,9 +1978,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             } else {
                 top // 已在可视区 → 不滚
             };
-            if tt != top {
-                force_v = Some((tt as f32 / max_top.max(1) as f32) * max_off);
-            }
+            ed.vtop = tt.min(max_top);
         }
         if moved && !wrap {
             let (ls2, _) = v_line_range(ed, v_line_of(ed, ed.vcaret));
@@ -1990,10 +1989,13 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 force_h = Some((cx - view_w + char_w * 3.0).max(0.0));
             }
         }
+        // 拖选到边缘的自动滚动：dv 为行数增量；dh 仍为横向像素
         if let Some((dh, dv)) = ed.vscroll_nudge.take() {
-            force_v = Some((force_v.unwrap_or(ed.vlast_voff) + dv).clamp(0.0, max_off));
+            let nv = (ed.vtop as f32 + dv).clamp(0.0, max_top as f32);
+            ed.vtop = nv as usize;
             force_h = Some((force_h.unwrap_or(ed.vlast_hoff) + dh).max(0.0));
         }
+        ed.vtop = ed.vtop.min(max_top); // 内容变短后钳制
     }
 
     egui::Frame::new().fill(bg).show(ui, |ui| {
@@ -2003,24 +2005,34 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
         ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_rgb(205, 200, 188);
         ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_rgb(172, 166, 152);
         ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_rgb(144, 138, 124);
-        let mut sa = egui::ScrollArea::both().auto_shrink([false, false]).id_salt(text_id);
-        if let Some(v) = force_v {
-            sa = sa.vertical_scroll_offset(v);
-        }
+        // 横向交给 egui；竖向自绘（下面按 ed.vtop 渲染 + 自画滚动条）。
+        let mut sa = egui::ScrollArea::horizontal().auto_shrink([false, false]).id_salt(text_id);
         if let Some(h) = force_h {
             sa = sa.horizontal_scroll_offset(h);
         }
         sa.show_viewport(ui, |ui, vp| {
+            let vh = ui.available_height();
             ui.set_width(content_w);
-            ui.set_height(content_h);
-            let origin = ui.min_rect().min; // 横向滚动用其 x；纵向改用 clip + 行号映射避免大坐标丢精度
+            ui.set_height(vh); // 竖向不用 egui 滚动：内容恰好占满视口高度
+            let origin = ui.min_rect().min;
             let clip = ui.clip_rect();
             let view_h = clip.height();
-            let max_off = (content_h - view_h).max(1.0);
-            let frac = (vp.min.y / max_off).clamp(0.0, 1.0);
             let visible = (view_h / row_h).ceil() as usize + 2;
-            let max_top = (nrows + pad_rows).saturating_sub(visible.saturating_sub(2)); // 最大首「行」号（视觉行/逻辑行）
-            let top_row = ((frac * max_top as f32).round() as usize).min(max_top);
+            let max_top = (nrows + pad_rows).saturating_sub(visible.saturating_sub(2)); // 最大首行号
+            // 竖向滚轮/触控板：pointer 在编辑区上时按行推进 ed.vtop（亚行像素累加，凑够一行才动）
+            if ui.rect_contains_pointer(clip) {
+                let sy = ui.input(|i| i.smooth_scroll_delta.y);
+                if sy != 0.0 {
+                    ed.vscroll_accum -= sy; // 滚轮上(sy>0)→内容上移→vtop 减小
+                    let steps = (ed.vscroll_accum / row_h).trunc();
+                    if steps != 0.0 {
+                        ed.vscroll_accum -= steps * row_h;
+                        ed.vtop = (ed.vtop as f32 + steps).clamp(0.0, max_top as f32) as usize;
+                    }
+                }
+            }
+            let top_row = ed.vtop.min(max_top);
+            ed.vtop = top_row;
             // 首/末可见逻辑行（由视觉行换算；用于查找命中的可视范围）
             let first_line = v_line_of_vrow(ed, top_row).0;
             let last_line = v_line_of_vrow(ed, (top_row + visible).min(nrows.saturating_sub(1))).0 + 1;
@@ -2028,10 +2040,41 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             // 记录本帧滚动度量，供下一帧「跟随光标」判断与施加偏移
             ed.vlast_top = top_row;
             ed.vlast_vis = visible;
-            ed.vlast_voff = vp.min.y;
             ed.vlast_hoff = vp.min.x;
             ed.vlast_vieww = clip.width();
             ed.vlast_viewh = view_h;
+
+            // —— 自绘竖向滚动条（右缘细条）：拖动/点击按行号定位 ed.vtop ——
+            // 先于正文交互注册并处理，命中滚动条时不把点击透传成「定位光标」。
+            let sb_w = 9.0f32;
+            let sb_track = egui::Rect::from_min_max(egui::pos2(clip.right() - sb_w, clip.top()), clip.right_bottom());
+            let total_rows = (nrows + pad_rows).max(1);
+            let show_vsb = max_top > 0;
+            let mut vsb_hit = false;
+            if show_vsb {
+                let sb_resp = ui.interact(sb_track, text_id.with("vsb"), egui::Sense::click_and_drag());
+                let thumb_h = (sb_track.height() * (visible as f32 / total_rows as f32)).clamp(24.0, sb_track.height());
+                if sb_resp.dragged() || sb_resp.clicked() {
+                    if let Some(p) = sb_resp.interact_pointer_pos() {
+                        // 让指针对准滑块中心：行号 = (指针 - 半个滑块) / 可移动轨道 × max_top
+                        let f = ((p.y - sb_track.top() - thumb_h / 2.0) / (sb_track.height() - thumb_h).max(1.0)).clamp(0.0, 1.0);
+                        ed.vtop = (f * max_top as f32).round() as usize;
+                        ui.ctx().request_repaint();
+                    }
+                }
+                vsb_hit = sb_resp.hovered() || sb_resp.dragged();
+                // 绘制轨道（透明）+ 滑块
+                let top_now = ed.vtop.min(max_top);
+                let frac = top_now as f32 / max_top as f32;
+                let thumb_y = sb_track.top() + (sb_track.height() - thumb_h) * frac;
+                let thumb = egui::Rect::from_min_size(egui::pos2(sb_track.left() + 1.5, thumb_y), egui::vec2(sb_w - 3.0, thumb_h));
+                let col = if vsb_hit {
+                    egui::Color32::from_rgb(144, 138, 124)
+                } else {
+                    egui::Color32::from_rgb(179, 173, 159)
+                };
+                ui.painter().rect_filled(thumb, 3.0, col);
+            }
 
             // 交互区取「可视视口」(clip)：内层 ui 被 set_width(content_w) 限成内容宽度，若按 content_w 取交互区，
             // 短行右侧的空白会落在区外、点击不到（光标不动）。用 clip 覆盖整个视口，短行右侧空白也能点击定位到行末。
@@ -2458,7 +2501,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             }
 
             // 点击 / 双击 / 三击 / 拖拽定位光标与选区（行号 = top_line + 视口内行偏移）
-            if resp.clicked() || resp.drag_started() || resp.dragged() || resp.double_clicked() || resp.triple_clicked() {
+            if !vsb_hit && (resp.clicked() || resp.drag_started() || resp.dragged() || resp.double_clicked() || resp.triple_clicked()) {
                 if resp.clicked() || resp.drag_started() || resp.double_clicked() || resp.triple_clicked() {
                     ui.memory_mut(|m| m.request_focus(text_id));
                 }
@@ -2542,10 +2585,11 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             // 这里只处理拖选到边缘：记录滚动增量，下一帧施加（持续自动滚动）。
             if resp.dragged() {
                 if let Some(pos) = resp.interact_pointer_pos() {
+                    // dv 为「行数」增量（自绘竖向滚动按行号推进）
                     let dv = if pos.y < clip.top() + row_h {
-                        -row_h * 2.0
+                        -2.0
                     } else if pos.y > clip.bottom() - row_h {
-                        row_h * 2.0
+                        2.0
                     } else {
                         0.0
                     };
