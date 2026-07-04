@@ -18,7 +18,7 @@ impl App {
             None => return,
         };
         let n = items.len();
-        self.file_clip = Some(FileClip { items, is_cut, src_uid: uid, src_host: host, src_port: port, src_label: label });
+        self.xfer.file_clip = Some(FileClip { items, is_cut, src_uid: uid, src_host: host, src_port: port, src_label: label });
         if let Some(s) = self.sessions.get_mut(idx) {
             s.status = match (is_cut, crate::i18n::current()) {
                 (true, crate::i18n::Lang::Zh) => format!("已剪切 {n} 项（粘贴时移动）"),
@@ -31,7 +31,7 @@ impl App {
 
     /// 粘贴到目标目录：同机直接 cp/mv；剪切或跨服务器需先二次确认。
     pub(super) fn start_paste(&mut self, idx: usize, dest_dir: String) {
-        let Some(clip) = self.file_clip.as_ref() else { return };
+        let Some(clip) = self.xfer.file_clip.as_ref() else { return };
         let Some(dest) = self.sessions.get(idx) else { return };
         let cross = clip.src_host != dest.cfg.host || clip.src_port != dest.cfg.port;
         let src_dir = clip.items.first().map(|(p, _)| parent_dir(p)).unwrap_or_default();
@@ -50,8 +50,8 @@ impl App {
         // 仅「跨服务器」需执行前确认（重操作 + 选直传/中转）；同机无论复制还是移动都直接执行——
         // 同机移动是原子 mv，源在目标写成功前不会丢，无需二次确认。
         if plan.cross {
-            self.confirm_direct = false; // 每次打开确认默认「中转」(更安全，直传会暴露私钥)
-            self.pending_paste = Some(plan);
+            self.xfer.confirm_direct = false; // 每次打开确认默认「中转」(更安全，直传会暴露私钥)
+            self.xfer.pending_paste = Some(plan);
         } else {
             self.execute_paste(plan);
         }
@@ -84,7 +84,7 @@ impl App {
             };
             for (src_path, is_dir) in &plan.items {
                 let base = src_path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("item").to_string();
-                self.relay_seq += 1;
+                self.xfer.relay_seq += 1;
                 // 中转临时目录：加入密码学随机段防 /tmp 可预测路径被 symlink 抢占；
                 // Unix 下目录权限收紧为 0700，避免同机其他用户读取中转内容
                 let mut rnd = [0u8; 8];
@@ -92,7 +92,7 @@ impl App {
                 let rnd_hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
                 let tmp = std::env::temp_dir()
                     .join("ishell-relay")
-                    .join(format!("{}-{}-{}", std::process::id(), self.relay_seq, rnd_hex))
+                    .join(format!("{}-{}-{}", std::process::id(), self.xfer.relay_seq, rnd_hex))
                     .join(&base);
                 if let Some(parent) = tmp.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -123,7 +123,7 @@ impl App {
                     s.transfers.push(t);
                     id
                 };
-                self.relays.push(Relay {
+                self.xfer.relays.push(Relay {
                     src_path: src_path.clone(),
                     is_dir: *is_dir,
                     src_uid: plan.src_uid,
@@ -147,7 +147,7 @@ impl App {
         }
         // 剪切粘贴后清空剪贴板（复制保留，便于多次粘贴）
         if is_cut {
-            self.file_clip = None;
+            self.xfer.file_clip = None;
         }
     }
 
@@ -173,8 +173,7 @@ impl App {
     /// 并返回源端真实传输 (src_uid, id)；否则原样返回。使镜像行的取消也能真正生效，
     /// 且用 cancelled 标记替代脆弱的取消文案比对（见 process_direct_jobs）。
     pub(super) fn cancel_target(&mut self, uid: u64, id: u64) -> (u64, u64) {
-        if let Some(j) = self
-            .direct_jobs
+        if let Some(j) = self.xfer.direct_jobs
             .iter_mut()
             .find(|j| (j.src_uid == uid && j.id == id) || (j.dest_uid == uid && j.mir_id == id))
         {
@@ -206,10 +205,10 @@ impl App {
     /// 推进跨服务器中转任务：下载完成→发起上传；上传完成→（剪切则删源）+ 清理临时。
     pub(super) fn process_relays(&mut self) {
         let mut i = 0;
-        while i < self.relays.len() {
+        while i < self.xfer.relays.len() {
             enum Step { Wait, ToUpload, Done, Failed }
             let step = {
-                let r = &self.relays[i];
+                let r = &self.xfer.relays[i];
                 match r.phase {
                     RelayPhase::Down(id) => match self.transfer_ok(r.src_uid, id) {
                         Some(true) => Step::ToUpload,
@@ -228,8 +227,8 @@ impl App {
             match step {
                 Step::Wait => {
                     // 仍在下载：把源端进度实时反映到目标端「等待」占位行的提示上
-                    if let RelayPhase::Down(dlid) = self.relays[i].phase {
-                        let (src_uid, dest_uid, up_id) = (self.relays[i].src_uid, self.relays[i].dest_uid, self.relays[i].up_id);
+                    if let RelayPhase::Down(dlid) = self.xfer.relays[i].phase {
+                        let (src_uid, dest_uid, up_id) = (self.xfer.relays[i].src_uid, self.xfer.relays[i].dest_uid, self.xfer.relays[i].up_id);
                         if let Some((done, total)) = self.transfer_done_total(src_uid, dlid) {
                             let note = if total > 0 {
                                 let pct = (done as f64 / total as f64 * 100.0).round() as u32;
@@ -250,10 +249,10 @@ impl App {
                     i += 1;
                 }
                 Step::ToUpload => {
-                    let dest_uid = self.relays[i].dest_uid;
-                    let tmp = self.relays[i].tmp.to_string_lossy().into_owned();
-                    let dest_dir = self.relays[i].dest_dir.clone();
-                    let up_id = self.relays[i].up_id;
+                    let dest_uid = self.xfer.relays[i].dest_uid;
+                    let tmp = self.xfer.relays[i].tmp.to_string_lossy().into_owned();
+                    let dest_dir = self.xfer.relays[i].dest_dir.clone();
+                    let up_id = self.xfer.relays[i].up_id;
                     if let Some(di) = self.session_idx_by_uid(dest_uid) {
                         // 复用粘贴时预占的 up_id：worker 的 TransferStart 会把占位行就地转为进行中
                         let _ = self.sessions[di].cmd_tx.send(UiCommand::Upload { id: up_id, local: tmp, remote_dir: dest_dir, policy: ConflictPolicy::Overwrite });
@@ -261,21 +260,21 @@ impl App {
                             t.queued = false;
                             t.note = String::new();
                         }
-                        self.relays[i].phase = RelayPhase::Up(up_id);
+                        self.xfer.relays[i].phase = RelayPhase::Up(up_id);
                         i += 1;
                     } else {
-                        let (t, d) = (self.relays[i].tmp.clone(), self.relays[i].is_dir);
+                        let (t, d) = (self.xfer.relays[i].tmp.clone(), self.xfer.relays[i].is_dir);
                         Self::cleanup_relay_tmp(&t, d);
-                        self.relays.remove(i);
+                        self.xfer.relays.remove(i);
                     }
                 }
                 Step::Done => {
                     let (t, d, is_cut, src_uid, src_path) = (
-                        self.relays[i].tmp.clone(),
-                        self.relays[i].is_dir,
-                        self.relays[i].is_cut,
-                        self.relays[i].src_uid,
-                        self.relays[i].src_path.clone(),
+                        self.xfer.relays[i].tmp.clone(),
+                        self.xfer.relays[i].is_dir,
+                        self.xfer.relays[i].is_cut,
+                        self.xfer.relays[i].src_uid,
+                        self.xfer.relays[i].src_path.clone(),
                     );
                     // 剪切：上传成功后才删源（安全）
                     if is_cut {
@@ -284,17 +283,17 @@ impl App {
                         }
                     }
                     Self::cleanup_relay_tmp(&t, d);
-                    self.relays.remove(i);
+                    self.xfer.relays.remove(i);
                 }
                 Step::Failed => {
                     // 若在下载阶段失败：目标端占位行还停在「等待」，标记其失败避免空挂
-                    if let RelayPhase::Down(_) = self.relays[i].phase {
-                        let (dest_uid, up_id) = (self.relays[i].dest_uid, self.relays[i].up_id);
+                    if let RelayPhase::Down(_) = self.xfer.relays[i].phase {
+                        let (dest_uid, up_id) = (self.xfer.relays[i].dest_uid, self.xfer.relays[i].up_id);
                         self.fail_placeholder(dest_uid, up_id, crate::i18n::tr("源端下载失败", "Source download failed"));
                     }
-                    let (t, d) = (self.relays[i].tmp.clone(), self.relays[i].is_dir);
+                    let (t, d) = (self.xfer.relays[i].tmp.clone(), self.xfer.relays[i].is_dir);
                     Self::cleanup_relay_tmp(&t, d);
-                    self.relays.remove(i);
+                    self.xfer.relays.remove(i);
                 }
             }
         }
@@ -317,7 +316,7 @@ impl App {
             crate::proto::AuthMethod::KeyFile { path, passphrase } if passphrase.as_deref().map(|s| s.is_empty()).unwrap_or(true) => path.clone(),
             _ => {
                 // 直传不可用（密码/agent/交互/口令密钥）：直接进入「转中转」提醒
-                self.pending_direct_fallback.push(DirectFallback {
+                self.xfer.pending_direct_fallback.push(DirectFallback {
                     plan: PendingPaste { direct: false, ..plan.clone() },
                     reason: crate::i18n::tr(
                         "目标会话非「无口令密钥」认证，无法直传。",
@@ -362,7 +361,7 @@ impl App {
             label: label.clone(),
         };
         let _ = self.sessions[si].cmd_tx.send(UiCommand::DirectTransfer(Box::new(spec)));
-        self.direct_jobs.push(DirectJob {
+        self.xfer.direct_jobs.push(DirectJob {
             id,
             mir_id,
             src_uid: plan.src_uid,
@@ -406,9 +405,9 @@ impl App {
     /// 推进直传任务：源会话上的直传传输完成 → 剪切则删源 + 刷新目标目录；失败 → 弹「转中转」提醒。
     pub(super) fn process_direct_jobs(&mut self) {
         let mut i = 0;
-        while i < self.direct_jobs.len() {
+        while i < self.xfer.direct_jobs.len() {
             let (src_uid, sid, dest_uid, mir_id) = {
-                let j = &self.direct_jobs[i];
+                let j = &self.xfer.direct_jobs[i];
                 (j.src_uid, j.id, j.dest_uid, j.mir_id)
             };
             let status = match self.transfer_ok(src_uid, sid) {
@@ -430,7 +429,7 @@ impl App {
                     i += 1;
                 }
                 Some(true) => {
-                    let job = self.direct_jobs.remove(i);
+                    let job = self.xfer.direct_jobs.remove(i);
                     // 目标端镜像行收尾为「完成」
                     Self::finish_mirror(&mut self.sessions, &job, true, crate::i18n::tr("直传完成", "Direct transfer done"));
                     // 剪切：直传成功后删源
@@ -446,7 +445,7 @@ impl App {
                     }
                 }
                 Some(false) => {
-                    let job = self.direct_jobs.remove(i);
+                    let job = self.xfer.direct_jobs.remove(i);
                     // 用户主动取消（取消按钮已置 job.cancelled）不弹回退；据此与真失败区分，
                     // 不再靠比对本地化的「已取消」文案（脆弱：worker 可能回报「直传失败（码 -1）」）。
                     let cancelled = job.cancelled;
@@ -455,7 +454,7 @@ impl App {
                         if cancelled { crate::i18n::tr("已取消", "Canceled") } else { crate::i18n::tr("直传失败", "Direct failed") });
                     // 真失败：入队「转中转」提醒，确认后走中转链路（队列避免多任务同帧互相覆盖）
                     if !cancelled && self.session_idx_by_uid(job.src_uid).is_some() && self.session_idx_by_uid(job.dest_uid).is_some() {
-                        self.pending_direct_fallback.push(DirectFallback {
+                        self.xfer.pending_direct_fallback.push(DirectFallback {
                             plan: PendingPaste {
                                 items: job.items,
                                 is_cut: job.is_cut,
@@ -478,7 +477,7 @@ impl App {
 
     /// 直传失败后的「必须改用中转」提醒弹框。
     pub(super) fn direct_fallback_dialog(&mut self, ctx: &egui::Context) {
-        let Some(fb) = self.pending_direct_fallback.first() else { return };
+        let Some(fb) = self.xfer.pending_direct_fallback.first() else { return };
         let mut go = false;
         let mut cancel = false;
         egui::Modal::new(egui::Id::new("direct_fallback")).show(ctx, |ui| {
@@ -507,13 +506,13 @@ impl App {
             });
         });
         if go {
-            if !self.pending_direct_fallback.is_empty() {
-                let fb = self.pending_direct_fallback.remove(0);
+            if !self.xfer.pending_direct_fallback.is_empty() {
+                let fb = self.xfer.pending_direct_fallback.remove(0);
                 self.execute_paste(fb.plan);
             }
         } else if cancel {
-            if !self.pending_direct_fallback.is_empty() {
-                self.pending_direct_fallback.remove(0);
+            if !self.xfer.pending_direct_fallback.is_empty() {
+                self.xfer.pending_direct_fallback.remove(0);
             }
         }
     }

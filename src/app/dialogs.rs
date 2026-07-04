@@ -129,11 +129,11 @@ impl App {
 
     /// 粘贴二次确认：剪切（移动/删源）或跨服务器（重操作）执行前弹窗确认。
     pub(super) fn paste_confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(plan) = self.pending_paste.as_ref() else { return };
+        let Some(plan) = self.xfer.pending_paste.as_ref() else { return };
         let mut go = false;
         let mut cancel = false;
-        // 互斥选择的本地镜像（plan 已不可变借用 self，不能再借 self.confirm_direct）
-        let mut direct = self.confirm_direct;
+        // 互斥选择的本地镜像（plan 已不可变借用 self，不能再借 self.xfer.confirm_direct）
+        let mut direct = self.xfer.confirm_direct;
         let cross = plan.cross;
         egui::Modal::new(egui::Id::new("paste_confirm")).show(ctx, |ui| {
             dialog_body(ui, |ui| {
@@ -206,23 +206,23 @@ impl App {
         });
         // 记住本帧的互斥选择（跨帧保持，直到下次打开确认复位为直传）
         if cross {
-            self.confirm_direct = direct;
+            self.xfer.confirm_direct = direct;
         }
         if go {
-            if let Some(mut plan) = self.pending_paste.take() {
+            if let Some(mut plan) = self.xfer.pending_paste.take() {
                 if plan.cross {
                     plan.direct = direct; // 直传 / 中转 取自弹框里的互斥选择
                 }
                 self.execute_paste(plan);
             }
         } else if cancel {
-            self.pending_paste = None;
+            self.xfer.pending_paste = None;
         }
     }
 
     /// 命令片段库：列出片段（一键发送到活动会话终端）+ 新增/编辑/删除，落盘持久化。
     pub(super) fn snippets_window(&mut self, ctx: &egui::Context) {
-        if !self.show_snippets {
+        if !self.snip.show {
             return;
         }
         use egui_phosphor::regular as icon;
@@ -251,13 +251,13 @@ impl App {
                 });
                 ui.separator();
 
-                if self.snippets.is_empty() {
+                if self.snip.list.is_empty() {
                     ui.add_space(4.0);
                     crate::ui::empty_state(ui, egui_phosphor::regular::CODE, crate::i18n::tr("暂无片段，在下方新增", "No snippets; add one below"), false);
                 }
                 // 列表：点名称即发送到当前会话终端；右侧编辑 / 删除（无边框图标，风格统一）
                 egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, sn) in self.snippets.iter().enumerate() {
+                    for (i, sn) in self.snip.list.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(icon::PAPER_PLANE_TILT).color(Palette::ACCENT).size(13.0));
                             let label = if sn.name.trim().is_empty() { sn.command.clone() } else { sn.name.clone() };
@@ -286,68 +286,68 @@ impl App {
                 });
 
                 ui.separator();
-                let editing = self.snip_editing.is_some();
+                let editing = self.snip.editing.is_some();
                 ui.label(RichText::new(if editing { crate::i18n::tr("编辑片段", "Edit snippet") } else { crate::i18n::tr("新增片段", "New snippet") }).strong().size(12.0));
                 ui.add_space(2.0);
                 egui::Grid::new("snip_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label(crate::i18n::tr("名称", "Name"));
-                    ui.add(egui::TextEdit::singleline(&mut self.snip_name).desired_width(210.0).hint_text(crate::i18n::tr("可选，便于识别", "Optional label")));
+                    ui.add(egui::TextEdit::singleline(&mut self.snip.name).desired_width(210.0).hint_text(crate::i18n::tr("可选，便于识别", "Optional label")));
                     ui.end_row();
                     ui.label(crate::i18n::tr("命令", "Command"));
-                    ui.add(egui::TextEdit::multiline(&mut self.snip_cmd).desired_width(210.0).desired_rows(2));
+                    ui.add(egui::TextEdit::multiline(&mut self.snip.cmd).desired_width(210.0).desired_rows(2));
                     ui.end_row();
                 });
-                ui.checkbox(&mut self.snip_run, crate::i18n::tr("发送后自动回车执行", "Press Enter after sending"));
+                ui.checkbox(&mut self.snip.run, crate::i18n::tr("发送后自动回车执行", "Press Enter after sending"));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.add(egui::Button::new(RichText::new(if editing { crate::i18n::tr("保存", "Save") } else { crate::i18n::tr("添加", "Add") }).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                         save_now = true;
                     }
                     if editing && ui.button(crate::i18n::tr("取消编辑", "Cancel")).clicked() {
-                        self.snip_editing = None;
-                        self.snip_name.clear();
-                        self.snip_cmd.clear();
-                        self.snip_run = true;
+                        self.snip.editing = None;
+                        self.snip.name.clear();
+                        self.snip.cmd.clear();
+                        self.snip.run = true;
                     }
                 });
             });
         // 闭包外处理，避免与 self 的借用冲突
         if let Some(i) = edit {
-            if let Some(sn) = self.snippets.get(i) {
-                self.snip_editing = Some(i);
-                self.snip_name = sn.name.clone();
-                self.snip_cmd = sn.command.clone();
-                self.snip_run = sn.run;
+            if let Some(sn) = self.snip.list.get(i) {
+                self.snip.editing = Some(i);
+                self.snip.name = sn.name.clone();
+                self.snip.cmd = sn.command.clone();
+                self.snip.run = sn.run;
             }
         }
         if let Some(i) = delete {
-            if i < self.snippets.len() {
-                self.snippets.remove(i);
+            if i < self.snip.list.len() {
+                self.snip.list.remove(i);
                 changed = true;
-                if self.snip_editing == Some(i) {
-                    self.snip_editing = None;
-                    self.snip_name.clear();
-                    self.snip_cmd.clear();
-                    self.snip_run = true;
+                if self.snip.editing == Some(i) {
+                    self.snip.editing = None;
+                    self.snip.name.clear();
+                    self.snip.cmd.clear();
+                    self.snip.run = true;
                 }
             }
         }
         if save_now {
-            let cmd = self.snip_cmd.trim().to_string();
+            let cmd = self.snip.cmd.trim().to_string();
             if !cmd.is_empty() {
-                let sn = crate::store::Snippet { name: self.snip_name.trim().to_string(), command: cmd, run: self.snip_run };
-                match self.snip_editing.take() {
-                    Some(i) if i < self.snippets.len() => self.snippets[i] = sn,
-                    _ => self.snippets.push(sn),
+                let sn = crate::store::Snippet { name: self.snip.name.trim().to_string(), command: cmd, run: self.snip.run };
+                match self.snip.editing.take() {
+                    Some(i) if i < self.snip.list.len() => self.snip.list[i] = sn,
+                    _ => self.snip.list.push(sn),
                 }
-                self.snip_name.clear();
-                self.snip_cmd.clear();
-                self.snip_run = true;
+                self.snip.name.clear();
+                self.snip.cmd.clear();
+                self.snip.run = true;
                 changed = true;
             }
         }
         if changed {
-            crate::store::save_snippets(&self.snippets);
+            crate::store::save_snippets(&self.snip.list);
         }
         if let Some((cmd, run)) = send_cmd {
             if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
@@ -361,10 +361,10 @@ impl App {
         }
         // 点击窗口外部自动隐藏（打开当帧除外），或点 X 关闭
         let clicked_outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
-        if close_win || (clicked_outside && !self.snip_just_opened) {
-            self.show_snippets = false;
+        if close_win || (clicked_outside && !self.snip.just_opened) {
+            self.snip.show = false;
         }
-        self.snip_just_opened = false;
+        self.snip.just_opened = false;
     }
 
     /// 关闭窗口前确认（仍有会话，或编辑器有未保存修改时——后者即使会话已全部关闭

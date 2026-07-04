@@ -176,6 +176,43 @@ impl Transfer {
     }
 }
 
+/// 文件传输子系统的聚合状态（剪贴板 / 待确认粘贴 / 跨服务器中转 / 直传）。
+/// 从 App 抽出的内聚字段组，配套 transfers.rs 里的方法。
+#[derive(Default)]
+struct Transfers {
+    /// 文件剪贴板（跨 tab 共享）：复制/剪切的源项
+    file_clip: Option<FileClip>,
+    /// 待确认的粘贴（剪切 或 跨服务器：执行前二次确认）
+    pending_paste: Option<PendingPaste>,
+    /// 跨服务器中转任务（下载→上传→可选删源）
+    relays: Vec<Relay>,
+    /// 中转临时目录去重计数
+    relay_seq: u64,
+    /// 粘贴确认弹框里「直传/中转」互斥选择的当前值（false=中转，默认更安全）
+    confirm_direct: bool,
+    /// 进行中的直传任务追踪（成功删源/刷新；失败弹回退）
+    direct_jobs: Vec<DirectJob>,
+    /// 直传失败、待确认「转中转」的计划 + 原因（队列：多个失败依次弹，避免同帧互相覆盖）
+    pending_direct_fallback: Vec<DirectFallback>,
+}
+
+/// 命令片段库状态（从 App 抽出的内聚字段组）。
+#[derive(Default)]
+struct Snippets {
+    /// 片段浮窗是否显示
+    show: bool,
+    /// 浮窗刚打开（本帧跳过"点击外部关闭"判定）
+    just_opened: bool,
+    /// 片段数据
+    list: Vec<crate::store::Snippet>,
+    /// 正在编辑的片段索引（None = 新建）
+    editing: Option<usize>,
+    /// 编辑表单缓冲
+    name: String,
+    cmd: String,
+    run: bool,
+}
+
 /// App 级文件剪贴板（跨 tab 共享）。
 struct FileClip {
     /// (绝对路径, 是否目录)
@@ -595,17 +632,8 @@ pub struct App {
     /// 无法借用 &mut self）与主 update() 共享。改 deferred 是为根治 macOS 多窗口闪烁
     /// （immediate viewport 与主窗口同帧渲染、强耦合焦点，触发 Stage Manager 不停重拍）。
     editor_state: Arc<Mutex<EditorState>>,
-    /// 看图工具：已打开的图片标签
-    image_tabs: Vec<ImageTab>,
-    active_image: usize,
-    /// 一次性请求：新开/切换后把看图窗口置前并聚焦
-    image_focus: bool,
-    /// 上次渲染时的激活看图标签（用于侦测切换后滚到可视区）
-    image_shown: usize,
-    /// 看图标签拖动重排状态（仿主窗口）
-    img_tab_drag: Option<usize>,
-    img_grab_dx: f32,
-    img_total_w: f32,
+    /// 看图工具状态（标签、激活项、聚焦请求、拖动重排）
+    image: ImageView,
     /// docx 后台解析结果通道：(占位标签 id, 解析结果)
     doc_parse_tx: std::sync::mpsc::Sender<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)>,
     doc_parse_rx: std::sync::mpsc::Receiver<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)>,
@@ -634,30 +662,10 @@ pub struct App {
     // 以便侧栏背景层与各子控件共用同一右键菜单。
     /// 传输冲突策略（目标已存在时；默认覆盖）
     conflict_policy: ConflictPolicy,
-    /// 文件剪贴板（跨 tab 共享）：复制/剪切的源项
-    file_clip: Option<FileClip>,
-    /// 待确认的粘贴（剪切 或 跨服务器：执行前二次确认）
-    pending_paste: Option<PendingPaste>,
-    /// 跨服务器中转任务（下载→上传→可选删源）
-    relays: Vec<Relay>,
-    /// 中转临时目录去重计数
-    relay_seq: u64,
-    /// 粘贴确认弹框里「直传/中转」互斥选择的当前值（true=直传，默认）；每次打开确认时复位为直传
-    confirm_direct: bool,
-    /// 进行中的直传任务追踪（成功删源/刷新；失败弹回退）
-    direct_jobs: Vec<DirectJob>,
-    /// 直传失败、待确认「转中转」的计划 + 原因（队列：多个失败依次弹，避免同帧互相覆盖）
-    pending_direct_fallback: Vec<DirectFallback>,
-    /// 命令片段库（snippets）窗口 + 数据 + 编辑缓冲
-    show_snippets: bool,
-    /// 片段浮窗刚打开（本帧跳过"点击外部关闭"判定）
-    snip_just_opened: bool,
-    snippets: Vec<crate::store::Snippet>,
-    /// 正在编辑的片段索引（None = 新建）+ 表单缓冲
-    snip_editing: Option<usize>,
-    snip_name: String,
-    snip_cmd: String,
-    snip_run: bool,
+    /// 文件传输/复制粘贴/跨服务器中转与直传的聚合状态（从 App 抽出的内聚字段组）
+    xfer: Transfers,
+    /// 命令片段库（窗口开关 + 数据 + 编辑表单缓冲）
+    snip: Snippets,
     /// 进程详情小窗
     proc_popup: Option<ProcPopup>,
     proc_popup_just_opened: bool,
@@ -825,7 +833,8 @@ impl EditorTab {
     fn is_conflict(&self) -> bool {
         matches!(self.save, SaveState::Conflict)
     }
-    /// 用户是否要求「保存成功后关闭标签」（仅在保存中有意义）。
+    /// 用户是否要求「保存成功后关闭标签」（仅在保存中有意义）。FSM 不变式，测试覆盖。
+    #[allow(dead_code)]
     fn wants_close(&self) -> bool {
         matches!(self.save, SaveState::Saving { close_after: true, .. })
     }
@@ -876,6 +885,23 @@ impl EditorState {
 }
 
 /// 看图工具的一个标签页（一张已加载的图片）。
+/// 看图工具窗口状态（从 App 抽出的内聚字段组）。
+#[derive(Default)]
+struct ImageView {
+    /// 已打开的图片标签
+    tabs: Vec<ImageTab>,
+    /// 当前激活标签下标
+    active: usize,
+    /// 一次性请求：新开/切换后把看图窗口置前并聚焦
+    focus: bool,
+    /// 上次渲染时的激活标签（用于侦测切换后滚到可视区）
+    shown: usize,
+    /// 标签拖动重排状态（仿主窗口）
+    tab_drag: Option<usize>,
+    grab_dx: f32,
+    total_w: f32,
+}
+
 struct ImageTab {
     /// 所属会话标题（仅显示）
     server: String,
@@ -951,13 +977,7 @@ impl App {
             pending_close_tab: None,
             allow_close: false,
             editor_state: Arc::new(Mutex::new(EditorState::default())),
-            image_tabs: Vec::new(),
-            active_image: 0,
-            image_focus: false,
-            image_shown: 0,
-            img_tab_drag: None,
-            img_grab_dx: 0.0,
-            img_total_w: 0.0,
+            image: ImageView::default(),
             doc_parse_tx,
             doc_parse_rx,
             next_editor_id: 0,
@@ -972,20 +992,8 @@ impl App {
             show_broadcast: false,
             broadcast_input: String::new(),
             conflict_policy: crate::store::load_conflict_policy().map(|s| ConflictPolicy::from_str(&s)).unwrap_or(ConflictPolicy::Overwrite),
-            file_clip: None,
-            pending_paste: None,
-            relays: Vec::new(),
-            relay_seq: 0,
-            confirm_direct: false,
-            direct_jobs: Vec::new(),
-            pending_direct_fallback: Vec::new(),
-            show_snippets: false,
-            snip_just_opened: false,
-            snippets: crate::store::load_snippets(),
-            snip_editing: None,
-            snip_name: String::new(),
-            snip_cmd: String::new(),
-            snip_run: true,
+            xfer: Transfers::default(),
+            snip: Snippets { list: crate::store::load_snippets(), run: true, ..Default::default() },
             proc_popup: None,
             proc_popup_just_opened: false,
             gpu_popup: None,
@@ -1135,7 +1143,7 @@ impl App {
                 if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, px) {
                     let _ = image::DynamicImage::ImageRgba8(buf).write_to(&mut std::io::Cursor::new(&mut data), image::ImageFormat::Png);
                 }
-                app.image_tabs.push(ImageTab {
+                app.image.tabs.push(ImageTab {
                     server,
                     uid,
                     path: "/home/e5-1/pic/gradient.png".into(),
@@ -1821,10 +1829,10 @@ impl eframe::App for App {
         // 跨服务器直传任务推进（完成则删源/刷新；失败则弹「转中转」）
         self.process_direct_jobs();
         for (path, data, server, uid) in new_images {
-            self.image_focus = true; // 打开/切换后聚焦看图窗口
+            self.image.focus = true; // 打开/切换后聚焦看图窗口
             // 同一会话同一图片已打开则切到该标签（身份用 uid，不用可能重名的 title）
-            if let Some(i) = self.image_tabs.iter().position(|t| t.uid == uid && t.path == path) {
-                self.active_image = i;
+            if let Some(i) = self.image.tabs.iter().position(|t| t.uid == uid && t.path == path) {
+                self.image.active = i;
                 continue;
             }
             match image::load_from_memory(&data) {
@@ -1834,7 +1842,7 @@ impl eframe::App for App {
                     let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
                     let name = format!("img:{server}:{path}");
                     let tex = ui.ctx().load_texture(name, color, egui::TextureOptions::LINEAR);
-                    self.image_tabs.push(ImageTab {
+                    self.image.tabs.push(ImageTab {
                         server,
                         uid,
                         path,
@@ -1844,7 +1852,7 @@ impl eframe::App for App {
                         zoom: 0.0,
                         offset: egui::Vec2::ZERO,
                     });
-                    self.active_image = self.image_tabs.len() - 1;
+                    self.image.active = self.image.tabs.len() - 1;
                 }
                 Err(e) => {
                     let msg = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("图片解码失败：{e}"), crate::i18n::Lang::En => format!("Decode failed: {e}") };
@@ -2480,9 +2488,9 @@ impl App {
                             self.show_broadcast = !self.show_broadcast;
                         }
                         if flat_button(ui, &RichText::new(format!("{} {}", icon::CODE, crate::i18n::tr("片段", "Snip"))), crate::i18n::tr("命令片段库：保存常用命令一键发送到终端", "Command snippets: save & send common commands")) {
-                            self.show_snippets = !self.show_snippets;
-                            if self.show_snippets {
-                                self.snip_just_opened = true;
+                            self.snip.show = !self.snip.show;
+                            if self.snip.show {
+                                self.snip.just_opened = true;
                             }
                         }
                         // 折叠监控栏/文件栏的开关已移到左侧监控栏右键菜单，避免右上角按钮过多
@@ -2687,7 +2695,7 @@ impl App {
     fn right_body(&mut self, root: &mut egui::Ui, idx: usize) {
         // 右下文件操作区（可拖动调整高度）
         let mut file_actions: Vec<FileAction> = Vec::new();
-        let has_clip = self.file_clip.is_some();
+        let has_clip = self.xfer.file_clip.is_some();
         if !files_collapsed() {
             egui::Panel::bottom("files")
                 .resizable(true)

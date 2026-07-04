@@ -15,18 +15,17 @@ impl App {
     #[allow(deprecated)] // 同 editor_window：viewport 内用 Panel::show(ctx) 渲染根 UI
     pub(super) fn image_window(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
-        if self.image_tabs.is_empty() {
+        if self.image.tabs.is_empty() {
             return;
         }
-        if self.active_image >= self.image_tabs.len() {
-            self.active_image = self.image_tabs.len() - 1;
+        if self.image.active >= self.image.tabs.len() {
+            self.image.active = self.image.tabs.len() - 1;
         }
 
         // 独立 OS 窗口（immediate viewport）：与主窗口分离，原生关闭按钮即可关闭。
         let vid = egui::ViewportId::from_hash_of("ishell_image");
-        let title = self
-            .image_tabs
-            .get(self.active_image)
+        let title = self.image.tabs
+            .get(self.image.active)
             .map(|t| {
                 let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
                 match crate::i18n::current() {
@@ -44,17 +43,17 @@ impl App {
 
         ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
             // 新开/切换图片后把本窗口置前并聚焦
-            if self.image_focus {
+            if self.image.focus {
                 vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                self.image_focus = false;
+                self.image.focus = false;
             }
             // Ctrl+Tab / Ctrl+Shift+Tab 切换看图标签
-            let n = self.image_tabs.len();
+            let n = self.image.tabs.len();
             if n > 1 {
                 if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)) {
-                    self.active_image = (self.active_image + n - 1) % n;
+                    self.image.active = (self.image.active + n - 1) % n;
                 } else if vctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
-                    self.active_image = (self.active_image + 1) % n;
+                    self.image.active = (self.image.active + 1) % n;
                 }
             }
             let mut close_tab: Option<usize> = None;
@@ -69,7 +68,7 @@ impl App {
                 .frame(egui::Frame::new().fill(Palette::BG).inner_margin(egui::Margin::symmetric(8, 4)))
                 .show(vctx, |ui| {
                     ui.style_mut().interaction.tooltip_delay = 0.5; // 悬停 0.5s 显示完整路径
-                    let want_scroll = self.active_image != self.image_shown;
+                    let want_scroll = self.image.active != self.image.shown;
                     ui.horizontal(|ui| {
                         ui.set_min_height(28.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -84,8 +83,7 @@ impl App {
                                 do_fit = true;
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let labels: Vec<(u64, String, String, f32, f32)> = self
-                                    .image_tabs
+                                let labels: Vec<(u64, String, String, f32, f32)> = self.image.tabs
                                     .iter()
                                     .map(|t| {
                                         let fname = t.path.rsplit('/').next().unwrap_or(t.path.as_str());
@@ -98,8 +96,8 @@ impl App {
                                         )
                                     })
                                     .collect();
-                                let active = self.active_image;
-                                let (act, cls, reord) = draggable_tabs(ui, &mut self.img_tab_drag, &mut self.img_grab_dx, &mut self.img_total_w, active, want_scroll, &labels);
+                                let active = self.image.active;
+                                let (act, cls, reord) = draggable_tabs(ui, &mut self.image.tab_drag, &mut self.image.grab_dx, &mut self.image.total_w, active, want_scroll, &labels);
                                 if let Some(a) = act {
                                     activate = Some(a);
                                 }
@@ -107,22 +105,22 @@ impl App {
                                     close_tab = Some(c);
                                 }
                                 if let Some((from, to)) = reord {
-                                    if from < self.image_tabs.len() && to < self.image_tabs.len() {
-                                        self.image_tabs.swap(from, to);
-                                        self.active_image = if self.active_image == from { to } else if self.active_image == to { from } else { self.active_image };
+                                    if from < self.image.tabs.len() && to < self.image.tabs.len() {
+                                        self.image.tabs.swap(from, to);
+                                        self.image.active = if self.image.active == from { to } else if self.image.active == to { from } else { self.image.active };
                                     }
                                 }
                             });
                         });
                     });
-                    self.image_shown = self.active_image;
+                    self.image.shown = self.image.active;
                 });
 
             // 底部状态栏（仿编辑器：贴窗口左右/底边；左侧尺寸/缩放，右侧文件名）
             egui::Panel::bottom("image_status")
                 .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin { left: 8, right: 8, top: 2, bottom: 2 }))
                 .show(vctx, |ui| {
-                    if let Some(t) = self.image_tabs.get(self.active_image) {
+                    if let Some(t) = self.image.tabs.get(self.image.active) {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("{}×{}", t.size.x as i32, t.size.y as i32)).color(Palette::TEXT_DIM).size(11.0));
                             if t.zoom > 0.0 {
@@ -141,7 +139,7 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(0))
                 .show(vctx, |ui| {
-                    if let Some(t) = self.image_tabs.get_mut(self.active_image) {
+                    if let Some(t) = self.image.tabs.get_mut(self.image.active) {
                         let avail = ui.available_size();
                         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
                         let painter = ui.painter_at(rect);
@@ -180,24 +178,24 @@ impl App {
                 });
 
             if let Some(i) = activate {
-                self.active_image = i;
+                self.image.active = i;
             }
             // 应用标签栏按钮（在标签栏闭包外执行，避免与遍历 image_tabs 的不可变借用冲突）
-            let active = self.active_image;
+            let active = self.image.active;
             if do_fit {
-                if let Some(t) = self.image_tabs.get_mut(active) {
+                if let Some(t) = self.image.tabs.get_mut(active) {
                     t.zoom = 0.0;
                     t.offset = egui::Vec2::ZERO;
                 }
             }
             if do_one {
-                if let Some(t) = self.image_tabs.get_mut(active) {
+                if let Some(t) = self.image.tabs.get_mut(active) {
                     t.zoom = 1.0;
                     t.offset = egui::Vec2::ZERO;
                 }
             }
             if do_save_as {
-                if let Some(t) = self.image_tabs.get(active) {
+                if let Some(t) = self.image.tabs.get(active) {
                     if !t.data.is_empty() {
                         let fname = t.path.rsplit('/').next().unwrap_or("image").to_string();
                         let data = t.data.clone();
@@ -214,9 +212,9 @@ impl App {
             let nav_delta = vctx.input(|i| {
                 i.key_pressed(egui::Key::ArrowRight) as i32 - i.key_pressed(egui::Key::ArrowLeft) as i32
             });
-            if nav_delta != 0 && !self.image_tabs.is_empty() {
-                let n = self.image_tabs.len() as i32;
-                self.active_image = (self.active_image as i32 + nav_delta).rem_euclid(n) as usize;
+            if nav_delta != 0 && !self.image.tabs.is_empty() {
+                let n = self.image.tabs.len() as i32;
+                self.image.active = (self.image.active as i32 + nav_delta).rem_euclid(n) as usize;
             }
             if let Some(msg) = save_msg {
                 if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
@@ -224,19 +222,19 @@ impl App {
                 }
             }
             if let Some(i) = close_tab {
-                if i < self.image_tabs.len() {
-                    self.image_tabs.remove(i); // 丢弃 TextureHandle 即释放 GPU 纹理
+                if i < self.image.tabs.len() {
+                    self.image.tabs.remove(i); // 丢弃 TextureHandle 即释放 GPU 纹理
                 }
-                if self.active_image >= self.image_tabs.len() && !self.image_tabs.is_empty() {
-                    self.active_image = self.image_tabs.len() - 1;
+                if self.image.active >= self.image.tabs.len() && !self.image.tabs.is_empty() {
+                    self.image.active = self.image.tabs.len() - 1;
                 }
                 self.trim_after = Some(4);
             }
 
             // 原生关闭按钮 → 关闭看图工具（清空全部图片）
             if vctx.input(|i| i.viewport().close_requested()) {
-                self.image_tabs.clear();
-                self.active_image = 0;
+                self.image.tabs.clear();
+                self.image.active = 0;
                 self.trim_after = Some(4);
             }
         });
