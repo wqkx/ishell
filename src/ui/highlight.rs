@@ -180,6 +180,20 @@ fn lang_for(ext: &str) -> Lang {
     }
 }
 
+/// 是否为已识别的「代码/结构化」文件：决定编辑器是否显示缩进对齐线、折叠、粘性作用域等
+/// 依赖缩进结构的辅助功能。未知扩展名（当作纯文本，如 txt/log/md）返回 false。
+pub fn is_code(ext: &str) -> bool {
+    matches!(
+        ext,
+        "rs" | "py" | "pyw" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+            | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cu"
+            | "go" | "java" | "kt" | "kts" | "swift" | "scala"
+            | "sh" | "bash" | "zsh" | "fish" | "rb" | "php" | "sql" | "lua"
+            | "toml" | "ini" | "cfg" | "conf" | "yaml" | "yml"
+            | "html" | "xml" | "svg" | "vue" | "css" | "scss" | "less" | "json"
+    )
+}
+
 /// 扫描普通引号字符串，返回结束字节位（含收尾引号）。
 /// `raw` 时不处理 `\` 转义（Python r"…"）；非反引号串遇换行即结束，避免漏闭合时染色整篇。
 fn scan_str(text: &str, start: usize, quote: char, raw: bool) -> usize {

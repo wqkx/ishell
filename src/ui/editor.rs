@@ -2016,7 +2016,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     // horizontal ScrollArea 不做竖向裁剪 → 会继承父 ui 的 clip（含底部状态栏区域）。
     // 记录「可用区底部」（Panel::bottom 已把它抬到状态栏之上），进 closure 后据此把 clip 夹到状态栏之上。
     let content_bottom = ui.available_rect_before_wrap().bottom();
-    egui::Frame::new().fill(bg).show(ui, |ui| {
+    // 用 CentralPanel（而非裸 Frame）承载正文：它会把 ScrollArea 视口（含 egui 自绘的横向滚动条）
+    // 限定在「底部状态栏之上」的剩余区域内，否则 horizontal ScrollArea 会把视口铺到状态栏上、遮挡之。
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(bg)).show_inside(ui, |ui| {
         ui.spacing_mut().scroll.floating = false;
         ui.spacing_mut().scroll.foreground_color = false;
         ui.visuals_mut().extreme_bg_color = bg;
@@ -2119,9 +2121,13 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             let carets: Vec<usize> = if !ed.msel.is_empty() { ed.msel.iter().map(|&(_, e)| e).collect() } else { vec![ed.vcaret] };
             let caret_line = v_line_of(ed, ed.vcaret); // 当前行高亮
             let unit_cols = match ed.indent { Indent::Spaces(n) => n.max(1), Indent::Tab => 4 }; // 缩进参考线步长
+            // 纯文本（未识别的扩展名）不显示缩进对齐线 / 折叠 / 粘性作用域等依赖缩进结构的代码辅助
+            let show_code_aids = highlight::is_code(&ed.language);
             // 活动缩进线（VSCode 风格）：光标所在代码块对应的那条竖线高亮。
             // (列, 起始行, 结束行)：列 = 光标行缩进的上一级；范围 = 向上下延伸「更深缩进或空白」的行
-            let active_guide: Option<(usize, usize, usize)> = {
+            let active_guide: Option<(usize, usize, usize)> = if !show_code_aids {
+                None
+            } else {
                 let resolve = |l: usize| -> Option<usize> {
                     v_lead(ed, l, unit_cols).or_else(|| {
                         let up = (0..l).rev().take(400).find_map(|x| v_lead(ed, x, unit_cols));
@@ -2209,9 +2215,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 if focused && sels.is_empty() && i == caret_line {
                     painter.rect_filled(egui::Rect::from_min_max(egui::pos2(clip.left(), y), egui::pos2(clip.right(), y + row_h)), 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10));
                 }
-                // 缩进参考线（仅首段画）：在各缩进层级之间画淡竖线；
+                // 缩进参考线（仅首段画、仅代码文件）：在各缩进层级之间画淡竖线；
                 // 空白行取上下最近非空行缩进的较小值，使缩进线跨空行连续（同 VSCode）
-                if is_first {
+                if is_first && show_code_aids {
                     let lead_of = |l: usize| -> Option<usize> {
                         let (a, b) = v_line_range(ed, l);
                         let mut lead = 0usize;
@@ -2393,9 +2399,9 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     // 括号不匹配的行：行号标红（lint）
                     let num_col = if ed.lint_lines.contains(&i) { Palette::DANGER } else { Palette::TEXT_DIM };
                     painter.text(egui::pos2(clip.left() + gutter_w - char_w * 2.0, y), egui::Align2::RIGHT_TOP, (i + 1).to_string(), mono.clone(), num_col);
-                    // 折叠箭头：已折叠恒显 ▸（强调色）；可折叠仅悬停行号列时显 ▾（弱色）
+                    // 折叠箭头（仅代码文件）：已折叠恒显 ▸（强调色）；可折叠仅悬停行号列时显 ▾（弱色）
                     let folded = folded_end.is_some();
-                    if folded || (gutter_hover && v_foldable(ed, i, unit_cols)) {
+                    if show_code_aids && (folded || (gutter_hover && v_foldable(ed, i, unit_cols))) {
                         let arect = egui::Rect::from_min_size(
                             egui::pos2(clip.left() + gutter_w - char_w * 1.8, y),
                             egui::vec2(char_w * 1.5, row_h),
@@ -2466,7 +2472,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
 
             // ——— 粘性作用域行（sticky scroll）———
             // 顶部固定显示首个可见行的外层作用域链（按缩进推导，至多 3 行），点击跳转
-            let sticky: Vec<usize> = if top_row > 0 && first_line > 0 {
+            let sticky: Vec<usize> = if show_code_aids && top_row > 0 && first_line > 0 {
                 let mut chain: Vec<usize> = Vec::new();
                 let mut min_lead = v_lead(ed, first_line, unit_cols).unwrap_or(usize::MAX);
                 let lo = first_line.saturating_sub(3000);

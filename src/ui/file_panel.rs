@@ -781,7 +781,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                           .on_hover_text(crate::i18n::tr("路径无效或无法访问", "Invalid or inaccessible path"));
                       ui.add_space(3.0);
                   }
-                  ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                  let bar_ir = ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if state.path_edit.is_some() {
                     // 路径编辑模式：回车跳转、Esc 或点击别处退出
                     let mut go: Option<String> = None;
@@ -805,6 +805,24 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             out.response.request_focus();
                         }
                         let resp = &out.response;
+                        // 右键菜单：复制当前路径文本 / 粘贴系统剪贴板并跳转
+                        //（否则右键只是把光标移过去、清掉选中，且无复制粘贴项）。
+                        let menu = resp.context_menu(|ui| {
+                            ui.set_min_width(120.0);
+                            if ui.button(crate::i18n::tr("复制", "Copy")).clicked() {
+                                ui.ctx().copy_text(buf.clone());
+                                ui.close();
+                            }
+                            if ui.button(crate::i18n::tr("粘贴并跳转", "Paste & go")).clicked() {
+                                if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                                    let t = t.trim();
+                                    if !t.is_empty() {
+                                        go = Some(t.to_string());
+                                    }
+                                }
+                                ui.close();
+                            }
+                        });
                         // 用 consume_key「吃掉」回车事件：否则同一帧内文件列表的键盘处理器
                         // 会再次响应这次回车，误打开当前选中行（进入子目录 / 用编辑器打开文件）。
                         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
@@ -815,8 +833,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             done = true;
                         } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             done = true;
-                        } else if resp.lost_focus() || resp.clicked_elsewhere() {
-                            // 点击别处 -> 退出编辑模式
+                        } else if menu.is_none() && (resp.lost_focus() || resp.clicked_elsewhere()) {
+                            // 点击别处 -> 退出编辑模式（右键菜单打开期间不退出，否则菜单一开就消失）
                             done = true;
                         }
                     }
@@ -891,6 +909,26 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     }
                 }
                   }); // 内层 left_to_right（面包屑/编辑框）
+                  // 面包屑（非编辑态）右键：复制当前路径 / 粘贴系统剪贴板路径并跳转。
+                  // 挂在整条路径栏上，右键也不会漏到文件列表把选中清掉。
+                  if state.path_edit.is_none() {
+                      bar_ir.response.interact(egui::Sense::click()).context_menu(|ui| {
+                          ui.set_min_width(120.0);
+                          if ui.button(crate::i18n::tr("复制路径", "Copy path")).clicked() {
+                              ui.ctx().copy_text(state.cwd.clone());
+                              ui.close();
+                          }
+                          if ui.button(crate::i18n::tr("粘贴并跳转", "Paste & go")).clicked() {
+                              if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                                  let t = t.trim();
+                                  if !t.is_empty() {
+                                      bc_nav = Some(t.to_string());
+                                  }
+                              }
+                              ui.close();
+                          }
+                      });
+                  }
                 }); // 外层 right_to_left（右侧无效标识）
             });
         });
