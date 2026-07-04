@@ -148,9 +148,9 @@ impl App {
                                             // 绿扫阶段：实际进度（写完但无 total 时视为 1）与限速取小
                                             let actual = if t.save_total > 0 {
                                                 (t.save_done as f64 / t.save_total as f64).clamp(0.0, 1.0)
-                                            } else if !t.saving { 1.0 } else { 0.0 };
+                                            } else if !t.is_saving() { 1.0 } else { 0.0 };
                                             let g = actual.min(((now - t0) / MIN_SWEEP).clamp(0.0, 1.0));
-                                            if !t.saving && g >= 1.0 {
+                                            if !t.is_saving() && g >= 1.0 {
                                                 t.save_done_at = Some(now); // 写完且绿扫满 → 转珊瑚扫回
                                             }
                                             any_saving = true;
@@ -241,13 +241,13 @@ impl App {
                     if let Some(tab) = ed.tabs.get_mut(active) {
                         let tid = tab.text_id;
                         // 外部改动冲突横幅：保存被拒后提示，可覆盖或取消
-                        if tab.save_conflict {
+                        if tab.is_conflict() {
                             egui::Frame::new().fill(egui::Color32::from_rgb(255, 244, 220)).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(format!("{}  {}", egui_phosphor::regular::WARNING, crate::i18n::tr("文件已被外部修改，未保存", "File changed externally; not saved"))).color(Palette::TEXT).size(12.0));
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if ui.button(crate::i18n::tr("取消", "Cancel")).clicked() {
-                                            tab.save_conflict = false;
+                                            tab.save = super::SaveState::Idle; // 取消冲突横幅，回到空闲（保留 dirty）
                                         }
                                         if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("覆盖保存", "Overwrite")).color(egui::Color32::WHITE)).fill(Palette::DANGER)).clicked() {
                                             let _ = tab.cmd_tx.send(UiCommand::WriteFile {
@@ -258,8 +258,7 @@ impl App {
                                                 expect_mtime: tab.editor.mtime(),
                                                 force: true,
                                             });
-                                            tab.save_conflict = false;
-                                            tab.saving = true; // 覆盖保存进行中，屏蔽再次保存直至结果返回
+                                            tab.begin_save(false); // 覆盖保存进行中，屏蔽再次保存直至结果返回
                                         }
                                     });
                                 });
@@ -308,7 +307,7 @@ impl App {
                 // 仅在「有改动」且「上次保存已完成」时才真正保存：无改动不触发也不放动画；
                 // 保存进行中（大文件耗时）屏蔽再次保存，避免用旧 mtime 重复写入被误判为外部改动；
                 // 跟随模式（tail -f）期间禁止保存——外部持续写入，本地内容无权威性。
-                let should = ed.tabs.get(active).map_or(false, |t| t.editor.dirty() && !t.saving && !t.editor.follow);
+                let should = ed.tabs.get(active).map_or(false, |t| t.editor.dirty() && !t.is_saving() && !t.editor.follow);
                 if should {
                     if let Some(tab) = ed.tabs.get(active) {
                         let _ = tab.cmd_tx.send(UiCommand::WriteFile {
@@ -321,10 +320,9 @@ impl App {
                         });
                     }
                     if let Some(tab) = ed.tabs.get_mut(active) {
-                        // 不在此处 mark_saved：只有收到服务器 FileSaved 确认（且版本一致）
+                        // 不在此处 mark_saved：只有收到服务器 FileSaved 确认（且签名一致）
                         // 才清 dirty——发送失败/远端写失败时标签必须仍是「未保存」
-                        tab.save_rev = tab.editor.save_rev();
-                        tab.saving = true; // 保存进行中，收到 FileSaved/Conflict/Failed 前屏蔽再次保存
+                        tab.begin_save(false); // 保存进行中，收到 FileSaved/Conflict/Failed 前屏蔽再次保存
                         // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画（重置进度，跟随本次写入）
                         tab.save_at = Some(vctx.input(|i| i.time));
                         tab.save_done_at = None;
@@ -386,16 +384,16 @@ impl App {
                         // 保存并关闭：发出保存后**不立即关闭**——等 FileSaved 确认才移除标签；
                         // 失败/冲突则保留标签（否则本地修改的唯一副本会随标签一起消失）
                         if let Some(t) = ed.tabs.get_mut(ti) {
-                            if !t.saving {
+                            if !t.is_saving() {
                                 let _ = t.cmd_tx.send(UiCommand::WriteFile { path: t.editor.path.clone(), content: t.editor.content.clone(), encoding: t.editor.encoding().to_string(), eol: t.editor.eol(), expect_mtime: t.editor.mtime(), force: false });
-                                t.save_rev = t.editor.save_rev();
-                                t.saving = true;
+                                t.begin_save(true); // 保存中，且完成后关闭
                                 t.save_at = Some(vctx.input(|i| i.time));
                                 t.save_done_at = None;
                                 t.save_done = 0;
                                 t.save_total = 0;
+                            } else {
+                                t.request_close_on_saved(); // 已在保存中：标记完成后关闭（当前在途保存确认时处理）
                             }
-                            t.close_on_saved = true;
                         }
                     }
                     if decision == 2 {

@@ -768,6 +768,19 @@ enum DocKind {
     },
 }
 
+/// 编辑器保存流程的类型化状态机，取代旧的 saving/save_conflict/close_on_saved/save_rev
+/// 布尔量组合——那些组合能表达非法状态（如「保存中且冲突」）。此枚举保证任一时刻
+/// 至多处于一个合法状态。保存进度/动画字段（save_at 等）是展示层，另行保留。
+enum SaveState {
+    /// 空闲：无在途保存、无未决冲突。
+    Idle,
+    /// 已发出 WriteFile、等待结果。rev=发出时的修订签名 (vver, 编码, 行尾)，
+    /// 收到 FileSaved 且签名一致才算已保存；close_after=完成后是否关闭标签。
+    Saving { rev: (u64, String, crate::proto::Eol), close_after: bool },
+    /// 检测到外部改动（未写入），显示冲突横幅，等用户选择覆盖/取消。
+    Conflict,
+}
+
 struct EditorTab {
     editor: crate::ui::editor::Editor,
     /// 所属会话标题（仅用于标签显示）
@@ -781,12 +794,10 @@ struct EditorTab {
     load_id: Option<u64>,
     load_done: u64,
     load_total: u64,
-    /// 保存时检测到文件被外部修改 → 显示冲突横幅
-    save_conflict: bool,
+    /// 保存流程状态机（见 SaveState）。
+    save: SaveState,
     /// 保存动画起始时刻（ctx 时间，秒）：驱动标签底部珊瑚线「绿扫→珊瑚扫」表示已保存；None=无动画
     save_at: Option<f64>,
-    /// 保存进行中（已发 WriteFile、未收到结果）：大文件保存耗时较长，期间屏蔽再次保存
-    saving: bool,
     /// 保存写入进度（done/total 字节）：驱动绿扫跟随实际上传速度
     save_done: u64,
     save_total: u64,
@@ -801,13 +812,33 @@ struct EditorTab {
     /// 跟随模式跨块解码缓冲：上一块末尾不完整的多字节字符原始字节，与下一块拼接
     ///（否则 UTF-8/GBK 字符跨 512KB 分块边界会变替换字符并永久丢失原始字节）
     tail_carry: Vec<u8>,
-    /// 发出保存时的修订签名 (vver, 编码, 行尾)：FileSaved 到达且签名一致才 mark_saved/关闭
-    ///（期间正文/编码/行尾任一变化 → 签名不匹配 → 保持 dirty、不关闭，不误报「已保存」）
-    save_rev: (u64, String, crate::proto::Eol),
-    /// 「保存并关闭」：等待 FileSaved 确认后再移除标签（失败/冲突则留下标签）
-    close_on_saved: bool,
     /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
     save_done_at: Option<f64>,
+}
+
+impl EditorTab {
+    /// 保存进行中（已发 WriteFile、未收到结果）——期间屏蔽再次保存。
+    fn is_saving(&self) -> bool {
+        matches!(self.save, SaveState::Saving { .. })
+    }
+    /// 存在未决的外部改动冲突（显示横幅）。
+    fn is_conflict(&self) -> bool {
+        matches!(self.save, SaveState::Conflict)
+    }
+    /// 用户是否要求「保存成功后关闭标签」（仅在保存中有意义）。
+    fn wants_close(&self) -> bool {
+        matches!(self.save, SaveState::Saving { close_after: true, .. })
+    }
+    /// 进入「保存中」：记录发出时的修订签名与是否保存后关闭。
+    fn begin_save(&mut self, close_after: bool) {
+        self.save = SaveState::Saving { rev: self.editor.save_rev(), close_after };
+    }
+    /// 若处于保存中，标记「完成后关闭」（用于保存进行时用户点『保存并关闭』）。
+    fn request_close_on_saved(&mut self) {
+        if let SaveState::Saving { close_after, .. } = &mut self.save {
+            *close_after = true;
+        }
+    }
 }
 
 /// 编辑器窗口的共享状态（主窗口与 deferred viewport 回调共用，见 App::editor_state）。
@@ -1029,9 +1060,8 @@ impl App {
                     load_id: None,
                     load_done: 0,
             load_total: 0,
-            save_conflict: false,
+            save: SaveState::Idle,
             save_at: None,
-            saving: false,
             save_done: 0,
             save_total: 0,
             save_done_at: None,
@@ -1040,8 +1070,6 @@ impl App {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
-            save_rev: (0, String::new(), crate::proto::Eol::Lf),
-            close_on_saved: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/var/log/huge.log".into(), big),
@@ -1052,9 +1080,8 @@ impl App {
                     load_id: None,
                     load_done: 0,
             load_total: 0,
-            save_conflict: false,
+            save: SaveState::Idle,
             save_at: None,
-            saving: false,
             save_done: 0,
             save_total: 0,
             save_done_at: None,
@@ -1063,8 +1090,6 @@ impl App {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
-            save_rev: (0, String::new(), crate::proto::Eol::Lf),
-            close_on_saved: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
@@ -1075,9 +1100,8 @@ impl App {
                     load_id: None,
                     load_done: 0,
             load_total: 0,
-            save_conflict: false,
+            save: SaveState::Idle,
             save_at: None,
-            saving: false,
             save_done: 0,
             save_total: 0,
             save_done_at: None,
@@ -1086,8 +1110,6 @@ impl App {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
-            save_rev: (0, String::new(), crate::proto::Eol::Lf),
-            close_on_saved: false,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -1862,7 +1884,7 @@ impl eframe::App for App {
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save_conflict: false, save_at: None, saving: false, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None, tail_carry: Vec::new(), save_rev: (0, String::new(), crate::proto::Eol::Lf), close_on_saved: false });
+                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save: SaveState::Idle, save_at: None, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None, tail_carry: Vec::new() });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -2035,17 +2057,20 @@ impl eframe::App for App {
             for (uid, path, mtime) in saved {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
-                    t.save_conflict = false;
-                    t.saving = false; // 保存完成，解锁再次保存
-                    // 服务器已确认写入：仅当修订签名（正文+编码+行尾）与发出保存时完全一致才算已保存
+                    // 取出本次保存发出时的签名与关闭意图（Saving 状态里）；非 Saving 则忽略这条确认。
+                    let (sent_rev, close_after) = match &t.save {
+                        SaveState::Saving { rev, close_after } => (rev.clone(), *close_after),
+                        _ => continue,
+                    };
+                    // 仅当修订签名（正文+编码+行尾）与发出保存时完全一致才算已保存
                     //（保存期间用户又编辑、或切了编码/行尾 → 远端并非该状态，不能清 dirty，也不能关闭）
-                    let unchanged = t.editor.save_rev() == t.save_rev;
-                    if unchanged {
+                    if t.editor.save_rev() == sent_rev {
+                        t.save = SaveState::Idle;
                         t.editor.mark_saved();
-                        if t.close_on_saved {
+                        if close_after {
                             close_after_save.push((uid, t.editor.path.clone()));
                         }
-                    } else if t.close_on_saved {
+                    } else if close_after {
                         // 保存期间内容又变了但用户要「保存并关闭」：用最新内容再存一次，
                         // 存完（届时签名一致）再关闭；否则「保存并关闭」会静默不生效。
                         let _ = t.cmd_tx.send(UiCommand::WriteFile {
@@ -2056,26 +2081,26 @@ impl eframe::App for App {
                             expect_mtime: t.editor.mtime(),
                             force: false,
                         });
-                        t.save_rev = t.editor.save_rev();
-                        t.saving = true; // 重新进入保存中（close_on_saved 保持，收到确认后关闭）
+                        t.begin_save(true); // 重新进入保存中，保持关闭意图
+                    } else {
+                        // 保存成功但内容已变、无关闭意图：解锁，保留 dirty 交用户再存
+                        t.save = SaveState::Idle;
                     }
                 }
             }
             for (uid, path) in conflicts {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
-                    t.save_conflict = true;
-                    t.saving = false; // 冲突也算本次保存结束，解锁（用户可在横幅选择覆盖）
+                    // 冲突：进入 Conflict（未写入，保留 dirty）；「保存并关闭」意图自然丢弃，交用户处理
+                    t.save = SaveState::Conflict;
                     t.save_at = None; // 冲突未写入：中止「已保存」动画
                     t.save_done_at = None;
-                    t.close_on_saved = false; // 「保存并关闭」遇冲突：保留标签，交用户处理
                 }
             }
             for (uid, path, message) in save_failed {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
-                    t.saving = false; // 失败：解锁重试；dirty 未被清，标签仍显示未保存
+                    t.save = SaveState::Idle; // 失败：解锁重试；dirty 未被清，标签仍显示未保存；关闭意图丢弃
                     t.save_at = None; // 中止保存动画
                     t.save_done_at = None;
-                    t.close_on_saved = false; // 保留标签
                 }
                 self.toast = Some((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("保存失败：{message}"), crate::i18n::Lang::En => format!("Save failed: {message}") }, ui.input(|i| i.time)));
             }
@@ -2808,3 +2833,53 @@ impl App {
 
 
 
+
+#[cfg(test)]
+mod save_fsm_tests {
+    use super::*;
+
+    fn tab() -> EditorTab {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        EditorTab {
+            editor: crate::ui::editor::Editor::new("/t.txt".into(), "hi\n".into()),
+            server: String::new(),
+            uid: 1,
+            cmd_tx: tx,
+            text_id: egui::Id::new(0u8),
+            load_id: None,
+            load_done: 0,
+            load_total: 0,
+            save: SaveState::Idle,
+            save_at: None,
+            save_done: 0,
+            save_total: 0,
+            tail_offset: u64::MAX,
+            tail_pending: false,
+            tail_last: 0.0,
+            doc: None,
+            tail_carry: Vec::new(),
+            save_done_at: None,
+        }
+    }
+
+    #[test]
+    fn save_state_transitions() {
+        let mut t = tab();
+        // 初始：空闲
+        assert!(!t.is_saving() && !t.is_conflict() && !t.wants_close());
+        // 进入保存中（无关闭意图）
+        t.begin_save(false);
+        assert!(t.is_saving() && !t.is_conflict() && !t.wants_close());
+        // 保存中追加「完成后关闭」意图
+        t.request_close_on_saved();
+        assert!(t.wants_close());
+        // 非保存中调用 request_close_on_saved 无效（不产生非法状态）
+        t.save = SaveState::Idle;
+        t.request_close_on_saved();
+        assert!(!t.wants_close() && !t.is_saving());
+        // 冲突：与 saving 互斥，且不携带关闭意图
+        t.begin_save(true);
+        t.save = SaveState::Conflict;
+        assert!(t.is_conflict() && !t.is_saving() && !t.wants_close());
+    }
+}
