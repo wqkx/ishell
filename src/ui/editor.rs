@@ -1995,9 +1995,27 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             ed.vtop = nv as usize;
             force_h = Some((force_h.unwrap_or(ed.vlast_hoff) + dh).max(0.0));
         }
+        // 竖向滚轮/触控板：pointer 在编辑区上时按行推进 ed.vtop，并「消费」掉竖向滚动量——
+        // 必须在进入 ScrollArea 之前吃掉，否则 horizontal ScrollArea 会把竖向滚轮转译成横向滚动（左右抖动）。
+        if ui.rect_contains_pointer(ui.available_rect_before_wrap()) {
+            let sy = ui.input(|i| i.smooth_scroll_delta.y);
+            if sy != 0.0 {
+                ed.vscroll_accum -= sy; // 滚轮上(sy>0)→内容上移→vtop 减小
+                let steps = (ed.vscroll_accum / row_h).trunc();
+                if steps != 0.0 {
+                    ed.vscroll_accum -= steps * row_h;
+                    ed.vtop = (ed.vtop as f32 + steps).clamp(0.0, max_top as f32) as usize;
+                }
+                // 吃掉竖向分量（横向 .x 保留给 egui 做横向滚动）；ScrollArea 读的就是 smooth_scroll_delta
+                ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+            }
+        }
         ed.vtop = ed.vtop.min(max_top); // 内容变短后钳制
     }
 
+    // horizontal ScrollArea 不做竖向裁剪 → 会继承父 ui 的 clip（含底部状态栏区域）。
+    // 记录「可用区底部」（Panel::bottom 已把它抬到状态栏之上），进 closure 后据此把 clip 夹到状态栏之上。
+    let content_bottom = ui.available_rect_before_wrap().bottom();
     egui::Frame::new().fill(bg).show(ui, |ui| {
         ui.spacing_mut().scroll.floating = false;
         ui.spacing_mut().scroll.foreground_color = false;
@@ -2011,26 +2029,16 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             sa = sa.horizontal_scroll_offset(h);
         }
         sa.show_viewport(ui, |ui, vp| {
-            let vh = ui.available_height();
             ui.set_width(content_w);
-            ui.set_height(vh); // 竖向不用 egui 滚动：内容恰好占满视口高度
             let origin = ui.min_rect().min;
-            let clip = ui.clip_rect();
+            // horizontal 模式不竖向裁剪，手动把 clip 夹到底部状态栏之上（否则正文/滚动条画到状态栏上、且抢其点击）。
+            let clip_full = ui.clip_rect();
+            let clip = egui::Rect::from_min_max(clip_full.min, egui::pos2(clip_full.max.x, clip_full.max.y.min(content_bottom)));
+            ui.set_clip_rect(clip);
+            ui.set_height((clip.bottom() - origin.y).max(row_h)); // 内容高度限到视口，横向滚动条落在状态栏之上
             let view_h = clip.height();
             let visible = (view_h / row_h).ceil() as usize + 2;
             let max_top = (nrows + pad_rows).saturating_sub(visible.saturating_sub(2)); // 最大首行号
-            // 竖向滚轮/触控板：pointer 在编辑区上时按行推进 ed.vtop（亚行像素累加，凑够一行才动）
-            if ui.rect_contains_pointer(clip) {
-                let sy = ui.input(|i| i.smooth_scroll_delta.y);
-                if sy != 0.0 {
-                    ed.vscroll_accum -= sy; // 滚轮上(sy>0)→内容上移→vtop 减小
-                    let steps = (ed.vscroll_accum / row_h).trunc();
-                    if steps != 0.0 {
-                        ed.vscroll_accum -= steps * row_h;
-                        ed.vtop = (ed.vtop as f32 + steps).clamp(0.0, max_top as f32) as usize;
-                    }
-                }
-            }
             let top_row = ed.vtop.min(max_top);
             ed.vtop = top_row;
             // 首/末可见逻辑行（由视觉行换算；用于查找命中的可视范围）
