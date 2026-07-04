@@ -672,14 +672,16 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                 // 返回上一个目录（浏览器式后退，可连续返回；区别于「上级目录」=parent）
                 let back_enabled = !state.nav_history.is_empty();
                 let back_col = if back_enabled { Palette::TEXT } else { Palette::TEXT_DIM };
-                if tool_btn_color(ui, icon::ARROW_LEFT, crate::i18n::tr("返回上一个目录", "Back"), back_col) && back_enabled {
+                // 后退用「弧形返回箭头」、上级用「上到横线箭头」——两者形态迥异，一眼可分，
+                // 不再是相近的左箭头/上箭头。
+                if tool_btn_color(ui, icon::ARROW_ARC_LEFT, crate::i18n::tr("返回上一个目录", "Back"), back_col) && back_enabled {
                     if let Some(prev) = state.nav_history.pop() {
                         state.nav_pending_back = true;
                         state.cwd = prev;
                         state.selected.clear();
                     }
                 }
-                let up_resp = tool_btn_resp(ui, icon::ARROW_UP, crate::i18n::tr("上级目录", "Up"), Palette::TEXT);
+                let up_resp = tool_btn_resp(ui, icon::ARROW_LINE_UP, crate::i18n::tr("上级目录", "Up"), Palette::TEXT);
                 if up_resp.clicked() && !state.cwd.is_empty() {
                     state.cwd = parent_of(&state.cwd);
                     state.selected.clear();

@@ -354,21 +354,19 @@ impl App {
                 kv(ui, "CPU", format!("{cpu:.1}%"));
                 kv(ui, crate::i18n::tr("内存", "Mem"), format!("{mem:.1}%"));
                 // 程序 / 目录：值可双击复制
+                // 长路径/命令用 .wrap() 折行到固定宽度，避免撑宽窗口（否则标题行的关闭键、
+                // 分割线是按初始 320 宽布局的，不会跟随被撑宽的窗口）。
                 if !exe.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(crate::i18n::tr("程序", "Exe")).color(Palette::TEXT_DIM).size(12.0));
-                        if ui.add(egui::Label::new(RichText::new(&exe).color(Palette::TEXT).size(12.0).monospace()).sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
-                            copy_target = Some(exe.clone());
-                        }
-                    });
+                    ui.label(RichText::new(crate::i18n::tr("程序", "Exe")).color(Palette::TEXT_DIM).size(12.0));
+                    if ui.add(egui::Label::new(RichText::new(&exe).color(Palette::TEXT).size(12.0).monospace()).wrap().sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
+                        copy_target = Some(exe.clone());
+                    }
                 }
                 if !cwd.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(crate::i18n::tr("目录", "Dir")).color(Palette::TEXT_DIM).size(12.0));
-                        if ui.add(egui::Label::new(RichText::new(&cwd).color(Palette::TEXT).size(12.0).monospace()).sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
-                            copy_target = Some(cwd.clone());
-                        }
-                    });
+                    ui.label(RichText::new(crate::i18n::tr("目录", "Dir")).color(Palette::TEXT_DIM).size(12.0));
+                    if ui.add(egui::Label::new(RichText::new(&cwd).color(Palette::TEXT).size(12.0).monospace()).wrap().sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
+                        copy_target = Some(cwd.clone());
+                    }
                 }
                 // 命令：可双击复制
                 if cmd.is_empty() {
@@ -376,7 +374,7 @@ impl App {
                 } else {
                     ui.add_space(2.0);
                     ui.label(RichText::new(crate::i18n::tr("命令", "Command")).color(Palette::TEXT_DIM).size(12.0));
-                    if ui.add(egui::Label::new(RichText::new(&cmd).size(11.5).monospace().color(Palette::TEXT)).sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
+                    if ui.add(egui::Label::new(RichText::new(&cmd).size(11.5).monospace().color(Palette::TEXT)).wrap().sense(egui::Sense::click())).on_hover_text(tip).double_clicked() {
                         copy_target = Some(cmd.clone());
                     }
                 }
