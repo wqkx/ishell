@@ -601,14 +601,8 @@ pub struct App {
     ctx: egui::Context,
     sessions: Vec<Session>,
     active: Option<usize>,
-    /// 正在拖拽排序的标签源索引
-    dragging_tab: Option<usize>,
-    /// 拖拽起点在标签内的横向抓取偏移（让被拖标签跟手而不跳到光标处）
-    tab_grab_dx: f32,
-    /// 标签条总宽缓存（用于撑出横向滚动内容宽度）
-    tab_total_w: f32,
-    /// 请求把激活标签滚动到可视区（新建/点击/Ctrl+Tab 切换时置位）
-    scroll_to_active: bool,
+    /// 主窗口会话标签条的拖拽重排 + 滚动状态
+    tabbar: TabBar,
     /// 会话唯一 id 计数器（标签滑动动画用）
     next_uid: u64,
     connect_form: ConnectForm,
@@ -641,18 +635,8 @@ pub struct App {
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
     trim_after: Option<u32>,
-    /// 端口转发管理窗口是否显示
-    show_forwards: bool,
-    /// 转发浮窗刚打开（本帧跳过"点击外部关闭"判定）
-    fwd_just_opened: bool,
-    /// 待删除确认的转发 id（行内二次确认：点垃圾桶先武装，确认后才删）
-    fwd_confirm_del: Option<u64>,
-    /// 新增转发表单
-    fwd_form: ForwardForm,
-    /// 正在编辑的转发 id（Some=编辑模式，按钮变「保存」，提交时先删旧再加新）
-    fwd_editing: Option<u64>,
-    /// 转发表单的内联校验错误（端口占用/参数无效等），红字显示在表单下方
-    fwd_error: Option<String>,
+    /// 端口转发管理窗口 UI 状态（开关 / 表单 / 编辑 / 删除确认 / 校验错误）
+    fwd: ForwardUi,
     /// 上一帧活动会话的 uid——切换会话时复位「跨会话易串台」的临时 UI 态（转发确认/编辑、进程弹窗）
     active_uid_prev: Option<u64>,
     /// 命令广播栏是否显示 + 输入内容
@@ -666,12 +650,8 @@ pub struct App {
     xfer: Transfers,
     /// 命令片段库（窗口开关 + 数据 + 编辑表单缓冲）
     snip: Snippets,
-    /// 进程详情小窗
-    proc_popup: Option<ProcPopup>,
-    proc_popup_just_opened: bool,
-    /// GPU 详情小窗（仅记录弹出位置，数据每帧从活动会话取）
-    gpu_popup: Option<egui::Pos2>,
-    gpu_popup_just_opened: bool,
+    /// 进程/GPU 详情小窗状态
+    popups: Popups,
     /// 自检：每帧注入假 GPU 数据并保持详情窗打开（仅截图核对用）
     demo_gpu: bool,
     /// 自检：注入网络曲线波形（仅截图核对密度用）
@@ -710,6 +690,23 @@ struct ForwardEntry {
     bind_host: String,
     bind_port: u16,
     kind: crate::proto::ForwardKind,
+}
+
+/// 端口转发管理窗口的 UI 状态（从 App 抽出的内聚字段组）。
+#[derive(Default)]
+struct ForwardUi {
+    /// 管理窗口是否显示
+    show: bool,
+    /// 浮窗刚打开（本帧跳过"点击外部关闭"判定）
+    just_opened: bool,
+    /// 待删除确认的转发 id（行内二次确认）
+    confirm_del: Option<u64>,
+    /// 新增/编辑转发表单
+    form: ForwardForm,
+    /// 正在编辑的转发 id（Some=编辑模式）
+    editing: Option<u64>,
+    /// 表单内联校验错误（端口占用/参数无效等）
+    error: Option<String>,
 }
 
 /// "新增转发"表单状态。
@@ -885,6 +882,30 @@ impl EditorState {
 }
 
 /// 看图工具的一个标签页（一张已加载的图片）。
+/// 主窗口会话标签条的拖拽重排 + 滚动状态（从 App 抽出的内聚字段组）。
+#[derive(Default)]
+struct TabBar {
+    /// 正在拖拽排序的标签源索引
+    drag: Option<usize>,
+    /// 拖拽起点在标签内的横向抓取偏移（让被拖标签跟手而不跳到光标处）
+    grab_dx: f32,
+    /// 标签条总宽缓存（用于撑出横向滚动内容宽度）
+    total_w: f32,
+    /// 请求把激活标签滚动到可视区（新建/点击/Ctrl+Tab 切换时置位）
+    scroll_to_active: bool,
+}
+
+/// 进程/GPU 详情小窗状态（从 App 抽出的内聚字段组）。
+#[derive(Default)]
+struct Popups {
+    /// 进程详情小窗
+    proc: Option<ProcPopup>,
+    proc_just_opened: bool,
+    /// GPU 详情小窗（仅记录弹出位置，数据每帧从活动会话取）
+    gpu: Option<egui::Pos2>,
+    gpu_just_opened: bool,
+}
+
 /// 看图工具窗口状态（从 App 抽出的内聚字段组）。
 #[derive(Default)]
 struct ImageView {
@@ -962,10 +983,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             sessions: Vec::new(),
             active: None,
-            dragging_tab: None,
-            tab_grab_dx: 0.0,
-            tab_total_w: 1.0,
-            scroll_to_active: false,
+            tabbar: TabBar { total_w: 1.0, ..Default::default() },
             next_uid: 0,
             connect_form: form,
             download_dir: crate::store::load_download_dir().map(std::path::PathBuf::from).unwrap_or_else(downloads_dir),
@@ -982,22 +1000,14 @@ impl App {
             doc_parse_rx,
             next_editor_id: 0,
             trim_after: None,
-            show_forwards: false,
-            fwd_just_opened: false,
-            fwd_confirm_del: None,
-            fwd_form: ForwardForm::default(),
-            fwd_editing: None,
-            fwd_error: None,
+            fwd: ForwardUi::default(),
             active_uid_prev: None,
             show_broadcast: false,
             broadcast_input: String::new(),
             conflict_policy: crate::store::load_conflict_policy().map(|s| ConflictPolicy::from_str(&s)).unwrap_or(ConflictPolicy::Overwrite),
             xfer: Transfers::default(),
             snip: Snippets { list: crate::store::load_snippets(), run: true, ..Default::default() },
-            proc_popup: None,
-            proc_popup_just_opened: false,
-            gpu_popup: None,
-            gpu_popup_just_opened: false,
+            popups: Popups::default(),
             demo_gpu: std::env::var("ISHELL_DEMO_GPU").is_ok(),
             demo_net: std::env::var("ISHELL_DEMO_NET").is_ok(),
             shot,
@@ -1178,12 +1188,12 @@ impl App {
                     kind: ForwardKind::Local { remote_host: "127.0.0.1".into(), remote_port: 22 },
                 }));
             }
-            app.show_forwards = true;
+            app.fwd.show = true;
         }
 
         // 自检：进程详情小窗
         if std::env::var("ISHELL_DEMO_PROC").is_ok() {
-            app.proc_popup = Some(ProcPopup {
+            app.popups.proc = Some(ProcPopup {
                 pid: 1234,
                 name: "gromacs_mpi".into(),
                 cpu: 98.5,
@@ -1330,7 +1340,7 @@ impl App {
             osc7_pending_reveal: false,
         });
         self.active = Some(self.sessions.len() - 1);
-        self.scroll_to_active = true; // 新建标签后滚动到可视区
+        self.tabbar.scroll_to_active = true; // 新建标签后滚动到可视区
     }
 
     /// 重连指定会话：用原配置重启 worker，重置连接相关状态，保留标签/目录等。
@@ -1421,7 +1431,7 @@ impl App {
         let cur = self.active.unwrap_or(0) as i32;
         let next = (cur + delta).rem_euclid(n as i32) as usize;
         self.active = Some(next);
-        self.scroll_to_active = true; // 切换后滚动到可视区
+        self.tabbar.scroll_to_active = true; // 切换后滚动到可视区
         if let Some(s) = self.sessions.get_mut(next) {
             s.terminal.request_focus();
         }
@@ -1670,10 +1680,10 @@ impl eframe::App for App {
         let cur_active_uid = self.active.and_then(|i| self.sessions.get(i)).map(|s| s.uid);
         if cur_active_uid != self.active_uid_prev {
             self.active_uid_prev = cur_active_uid;
-            self.fwd_confirm_del = None;
-            self.fwd_editing = None;
-            self.fwd_error = None;
-            self.proc_popup = None;
+            self.fwd.confirm_del = None;
+            self.fwd.editing = None;
+            self.fwd.error = None;
+            self.popups.proc = None;
         }
 
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
@@ -2195,15 +2205,15 @@ impl eframe::App for App {
                     ];
                 }
             }
-            self.gpu_popup = Some(egui::pos2(130.0, 130.0));
-            self.gpu_popup_just_opened = true;
+            self.popups.gpu = Some(egui::pos2(130.0, 130.0));
+            self.popups.gpu_just_opened = true;
         }
 
         // 进程详情返回 -> 填充小窗
         if let Some(idx) = self.active {
             let detail = self.sessions.get_mut(idx).and_then(|s| s.proc_detail.take());
             if let Some((pid, cmd, cwd, exe)) = detail {
-                if let Some(pp) = &mut self.proc_popup {
+                if let Some(pp) = &mut self.popups.proc {
                     if pp.pid == pid {
                         pp.cmd = cmd;
                         pp.cwd = cwd;
@@ -2286,13 +2296,13 @@ impl eframe::App for App {
                 let _ = s.cmd_tx.send(UiCommand::ProcDetail(pid));
             }
             if let Some(pp) = popup {
-                self.proc_popup = Some(pp);
-                self.proc_popup_just_opened = true;
+                self.popups.proc = Some(pp);
+                self.popups.proc_just_opened = true;
             }
         }
         if let Some(pos) = gpu_click {
-            self.gpu_popup = Some(pos);
-            self.gpu_popup_just_opened = true;
+            self.popups.gpu = Some(pos);
+            self.popups.gpu_just_opened = true;
         }
 
         // Ctrl+Tab / Ctrl+Shift+Tab 切换会话标签（consume 以免终端把 Tab 发往远端）
@@ -2479,9 +2489,9 @@ impl App {
                             format!("{} {}", icon::ARROWS_LEFT_RIGHT, crate::i18n::tr("转发", "Fwd"))
                         };
                         if flat_button(ui, &RichText::new(flabel), crate::i18n::tr("端口转发管理", "Port forwarding")) {
-                            self.show_forwards = !self.show_forwards;
-                            if self.show_forwards {
-                                self.fwd_just_opened = true;
+                            self.fwd.show = !self.fwd.show;
+                            if self.fwd.show {
+                                self.fwd.just_opened = true;
                             }
                         }
                         if flat_button(ui, &RichText::new(format!("{} {}", icon::MEGAPHONE, crate::i18n::tr("群发", "Bcast"))), crate::i18n::tr("向所有已连接会话广播命令", "Broadcast to all connected sessions")) {
@@ -2513,11 +2523,11 @@ impl App {
                             let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
                             let mut drag_w = 0.0f32; // 被拖标签宽度，用于算其跟手中心
                             // 先取出标量字段，避免在借用 self.sessions 的循环里再借 self
-                            let dragging_tab = self.dragging_tab;
+                            let dragging_tab = self.tabbar.drag;
                             let active = self.active;
-                            let grab_dx = self.tab_grab_dx;
-                            let total_w_cache = self.tab_total_w;
-                            let want_scroll = self.scroll_to_active; // 本帧是否需把激活标签滚到可视区
+                            let grab_dx = self.tabbar.grab_dx;
+                            let total_w_cache = self.tabbar.total_w;
+                            let want_scroll = self.tabbar.scroll_to_active; // 本帧是否需把激活标签滚到可视区
                             let out = egui::ScrollArea::horizontal()
                                 .auto_shrink([false, false])
                                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -2595,8 +2605,8 @@ impl App {
                                     acc // 返回总宽
                                 });
                             let total_w = out.inner.max(1.0);
-                            self.tab_total_w = total_w;
-                            self.scroll_to_active = false; // 滚动请求一次性消费
+                            self.tabbar.total_w = total_w;
+                            self.tabbar.scroll_to_active = false; // 滚动请求一次性消费
                             // 溢出渐隐：提示左右还有被隐藏的标签
                             let off = out.state.offset.x;
                             let vw = out.inner_rect.width();
@@ -2608,19 +2618,19 @@ impl App {
                             }
                             // 应用拖拽状态（循环外，避免与 self.sessions 借用冲突）
                             if let Some(g) = new_grab {
-                                self.tab_grab_dx = g;
+                                self.tabbar.grab_dx = g;
                             }
                             if let Some(f) = drag_start {
-                                self.dragging_tab = Some(f);
+                                self.tabbar.drag = Some(f);
                             }
                             // 拖动过程中：用「被拖标签的跟手中心」与相邻标签「目标槽中心」比较，
                             // 越过相邻标签中点才换位（单帧只移一位）。换位后邻居中心移到另一侧，
                             // 判定条件自然失效，避免抓取点偏移（grab_dx）导致的来回抖动。
-                            if let Some(from) = self.dragging_tab {
+                            if let Some(from) = self.tabbar.drag {
                                 if ui.input(|i| i.pointer.any_down()) {
                                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                                         // 被拖标签跟手中心（屏幕横坐标），与绘制时的跟手位口径一致
-                                        let drag_center = pos.x - self.tab_grab_dx + drag_w / 2.0;
+                                        let drag_center = pos.x - self.tabbar.grab_dx + drag_w / 2.0;
                                         let mut to = from;
                                         // 向左：越过左邻目标槽中心
                                         if from > 0 {
@@ -2640,11 +2650,11 @@ impl App {
                                         }
                                         if to != from {
                                             reorder = Some((from, to));
-                                            self.dragging_tab = Some(to);
+                                            self.tabbar.drag = Some(to);
                                         }
                                     }
                                 } else {
-                                    self.dragging_tab = None; // 松手：被拖标签从跟手位缓动回目标槽
+                                    self.tabbar.drag = None; // 松手：被拖标签从跟手位缓动回目标槽
                                 }
                             }
                         });
@@ -2654,7 +2664,7 @@ impl App {
                     }
                     if let Some(i) = to_activate {
                         self.active = Some(i);
-                        self.scroll_to_active = true; // 点击的标签若被遮挡则滚到可视区
+                        self.tabbar.scroll_to_active = true; // 点击的标签若被遮挡则滚到可视区
                         if let Some(s) = self.sessions.get_mut(i) {
                             s.terminal.request_focus(); // 点击标签后焦点切到终端
                         }

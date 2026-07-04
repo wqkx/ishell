@@ -243,7 +243,7 @@ impl App {
     /// GPU 详情小窗：每块 GPU 使用率 + 显存；点击窗口外任意处或点 X 关闭（不随鼠标移开关闭）。
     pub(super) fn gpu_popup_window(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
-        let Some(pos) = self.gpu_popup else { return };
+        let Some(pos) = self.popups.gpu else { return };
         // 取活动会话的 GPU 列表（克隆，避免借用冲突）
         let gpus = self
             .active
@@ -252,7 +252,7 @@ impl App {
             .map(|si| si.gpus.clone())
             .unwrap_or_default();
         if gpus.is_empty() {
-            self.gpu_popup = None;
+            self.popups.gpu = None;
             return;
         }
         let mut close = false;
@@ -298,16 +298,16 @@ impl App {
 
         // 点击窗口外任意处或点 X 关闭（打开当帧除外）；不再因鼠标移开而关闭
         let outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
-        if close || (outside && !self.gpu_popup_just_opened) {
-            self.gpu_popup = None;
+        if close || (outside && !self.popups.gpu_just_opened) {
+            self.popups.gpu = None;
         }
-        self.gpu_popup_just_opened = false;
+        self.popups.gpu_just_opened = false;
     }
 
     /// 进程详情小窗：显示资源/目录/命令 + 强制结束；点击外部关闭。
     pub(super) fn proc_popup_window(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
-        let (pid, name, cpu, mem, pos, cmd, cwd, exe) = match &self.proc_popup {
+        let (pid, name, cpu, mem, pos, cmd, cwd, exe) = match &self.popups.proc {
             Some(p) => (p.pid, p.name.clone(), p.cpu, p.mem, p.pos, p.cmd.clone(), p.cwd.clone(), p.exe.clone()),
             None => return,
         };
@@ -316,8 +316,8 @@ impl App {
         let mut arm_kill = false; // 点击「强制结束」按钮 → 进入确认态
         let mut cancel_kill = false; // 确认态里点「取消」→ 退回
         let mut copy_target: Option<String> = None;
-        let copied_t = self.proc_popup.as_ref().and_then(|p| p.copied_t);
-        let confirm_kill = self.proc_popup.as_ref().map(|p| p.confirm_kill).unwrap_or(false);
+        let copied_t = self.popups.proc.as_ref().and_then(|p| p.copied_t);
+        let confirm_kill = self.popups.proc.as_ref().map(|p| p.confirm_kill).unwrap_or(false);
         let now = ctx.input(|i| i.time);
         let win = egui::Window::new("proc_popup")
             .title_bar(false)
@@ -415,7 +415,7 @@ impl App {
         // 双击复制 -> 写剪贴板并记录时间（显示「已复制」）
         if let Some(v) = copy_target {
             ctx.copy_text(v);
-            if let Some(p) = &mut self.proc_popup {
+            if let Some(p) = &mut self.popups.proc {
                 p.copied_t = Some(now);
             }
             ctx.request_repaint();
@@ -428,34 +428,34 @@ impl App {
         }
         // 进入/退出「强制结束」确认态（不关窗）
         if arm_kill {
-            if let Some(p) = &mut self.proc_popup {
+            if let Some(p) = &mut self.popups.proc {
                 p.confirm_kill = true;
             }
         }
         if cancel_kill {
-            if let Some(p) = &mut self.proc_popup {
+            if let Some(p) = &mut self.popups.proc {
                 p.confirm_kill = false;
             }
         }
         if kill {
             // 发往「打开弹窗时所属会话」(uid)，而非当前 active——避免 Ctrl+Tab 切走后误 kill 别的主机
-            let target = self.proc_popup.as_ref().and_then(|p| self.session_idx_by_uid(p.uid));
+            let target = self.popups.proc.as_ref().and_then(|p| self.session_idx_by_uid(p.uid));
             if let Some(i) = target {
                 let _ = self.sessions[i].cmd_tx.send(UiCommand::KillProc(pid));
             }
-            self.proc_popup = None;
-        } else if close || (outside && !self.proc_popup_just_opened && !arm_kill) {
+            self.popups.proc = None;
+        } else if close || (outside && !self.popups.proc_just_opened && !arm_kill) {
             // 注：arm_kill 当帧不因「点到按钮算窗外」而误关（按钮在窗内，理论上 outside=false，这里再加一道保险）
-            self.proc_popup = None;
+            self.popups.proc = None;
         }
-        self.proc_popup_just_opened = false;
+        self.popups.proc_just_opened = false;
     }
 
     /// 端口转发管理浮窗（右上角弹出，样式与传输浮窗一致）。
     pub(super) fn forward_window(&mut self, ctx: &egui::Context) {
         use crate::proto::{ForwardKind, ForwardSpec};
         use egui_phosphor::regular as icon;
-        if !self.show_forwards {
+        if !self.fwd.show {
             return;
         }
         let idx = self.active.filter(|&i| i < self.sessions.len());
@@ -465,7 +465,7 @@ impl App {
         let mut cancel_del = false; // 确认态点取消
         let mut edit_id: Option<u64> = None; // 点铅笔 → 把该条回填表单进入编辑
         let mut cancel_edit = false; // 编辑态点「取消编辑」
-        let confirm_del = self.fwd_confirm_del; // 本帧处于确认态的转发 id（快照）
+        let confirm_del = self.fwd.confirm_del; // 本帧处于确认态的转发 id（快照）
         let mut close_win = false;
 
         let win = egui::Window::new("forward_win")
@@ -493,9 +493,9 @@ impl App {
                 };
 
                 // 新增/编辑表单（分段按钮代替下拉，避免点击下拉被判为窗口外而自动关闭）
-                let editing = self.fwd_editing; // 快照：编辑态决定按钮文案与提交语义
-                let fwd_error = self.fwd_error.clone(); // 快照：内联错误（避免与 f 的可变借用冲突）
-                let f = &mut self.fwd_form;
+                let editing = self.fwd.editing; // 快照：编辑态决定按钮文案与提交语义
+                let fwd_error = self.fwd.error.clone(); // 快照：内联错误（避免与 f 的可变借用冲突）
+                let f = &mut self.fwd.form;
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut f.kind, 0usize, crate::i18n::tr("本地转发", "Local"));
                     ui.selectable_value(&mut f.kind, 1usize, crate::i18n::tr("动态 SOCKS5", "Dynamic SOCKS5"));
@@ -587,21 +587,21 @@ impl App {
 
         // 行内删除确认态的进入/退出
         if let Some(id) = arm_del {
-            self.fwd_confirm_del = Some(id);
+            self.fwd.confirm_del = Some(id);
         }
         if cancel_del || remove_id.is_some() {
-            self.fwd_confirm_del = None;
+            self.fwd.confirm_del = None;
         }
 
         // 点击窗口外部自动隐藏（打开当帧除外）
         let clicked_outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
-        if close_win || (clicked_outside && !self.fwd_just_opened) {
-            self.show_forwards = false;
-            self.fwd_confirm_del = None; // 关窗时复位确认态，避免下次打开仍处于「确认删除」
-            self.fwd_editing = None; // 复位编辑态与内联错误
-            self.fwd_error = None;
+        if close_win || (clicked_outside && !self.fwd.just_opened) {
+            self.fwd.show = false;
+            self.fwd.confirm_del = None; // 关窗时复位确认态，避免下次打开仍处于「确认删除」
+            self.fwd.editing = None; // 复位编辑态与内联错误
+            self.fwd.error = None;
         }
-        self.fwd_just_opened = false;
+        self.fwd.just_opened = false;
 
         let idx = match idx {
             Some(i) => i,
@@ -609,18 +609,18 @@ impl App {
         };
         // 取消编辑：复位编辑态与表单
         if cancel_edit {
-            self.fwd_editing = None;
-            self.fwd_error = None;
-            self.fwd_form.local_port.clear();
-            self.fwd_form.target_host.clear();
-            self.fwd_form.target_port.clear();
-            self.fwd_just_opened = true;
+            self.fwd.editing = None;
+            self.fwd.error = None;
+            self.fwd.form.local_port.clear();
+            self.fwd.form.target_host.clear();
+            self.fwd.form.target_port.clear();
+            self.fwd.just_opened = true;
         }
         // 进入编辑：把选中转发的参数回填表单
         if let Some(id) = edit_id {
             if let Some(fwd) = self.sessions.get(idx).and_then(|s| s.forwards.iter().find(|f| f.id == id)) {
                 let (bh, bp, kind) = (fwd.bind_host.clone(), fwd.bind_port, fwd.kind.clone());
-                let form = &mut self.fwd_form;
+                let form = &mut self.fwd.form;
                 form.bind = bh;
                 form.local_port = bp.to_string();
                 match kind {
@@ -635,14 +635,14 @@ impl App {
                         form.target_port.clear();
                     }
                 }
-                self.fwd_editing = Some(id);
-                self.fwd_error = None;
+                self.fwd.editing = Some(id);
+                self.fwd.error = None;
             }
-            self.fwd_just_opened = true; // 点编辑不算窗外点击
+            self.fwd.just_opened = true; // 点编辑不算窗外点击
         }
         // 添加 / 保存：先做本地端口占用 + 重复校验，通过才发起（编辑则先删旧再加新）
         if let Some(mut spec) = add_spec {
-            let editing = self.fwd_editing;
+            let editing = self.fwd.editing;
             // 与现有转发重复（排除正在编辑的那条），或本机端口已被占用
             let dup = self.sessions.get(idx).is_some_and(|s| {
                 s.forwards
@@ -654,11 +654,11 @@ impl App {
                 .and_then(|id| self.sessions.get(idx).and_then(|s| s.forwards.iter().find(|f| f.id == id)))
                 .is_some_and(|f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host);
             if dup || (!same_as_editing && local_port_in_use(&spec.bind_host, spec.bind_port)) {
-                self.fwd_error = Some(match crate::i18n::current() {
+                self.fwd.error = Some(match crate::i18n::current() {
                     crate::i18n::Lang::Zh => format!("本地端口 {} 已被占用", spec.bind_port),
                     crate::i18n::Lang::En => format!("Local port {} is already in use", spec.bind_port),
                 });
-                self.fwd_just_opened = true;
+                self.fwd.just_opened = true;
             } else {
                 // 编辑模式：先删旧转发（移除记录 + 通知 worker 关闭监听）
                 if let Some(old) = editing {
@@ -688,12 +688,12 @@ impl App {
                     });
                     let _ = s.cmd_tx.send(UiCommand::AddForward(spec));
                 }
-                self.fwd_editing = None;
-                self.fwd_error = None;
-                self.fwd_form.local_port.clear();
-                self.fwd_form.target_host.clear();
-                self.fwd_form.target_port.clear();
-                self.fwd_just_opened = true;
+                self.fwd.editing = None;
+                self.fwd.error = None;
+                self.fwd.form.local_port.clear();
+                self.fwd.form.target_host.clear();
+                self.fwd.form.target_port.clear();
+                self.fwd.just_opened = true;
             }
         }
         if let Some(id) = remove_id {
