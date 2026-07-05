@@ -2372,8 +2372,22 @@ async fn sftp_overwrite(sftp: &russh_sftp::client::SftpSession, path: &str, data
     Ok(())
 }
 
-/// 事务性保存：先把新内容完整写入同目录临时文件，再用「换入」替换目标，
-/// 全程**任何一步失败原文件都不丢失**（始终存在于 目标 或 目标.bak）。
+/// 校验远端文件确实有 `expect` 字节。先用 metadata.size（便宜）；服务器不回报 size 时
+/// （退化实现）退回**实际读回**比对长度——不依赖任何可能撒谎的元数据，是数据安全的最后一道闸。
+async fn sftp_verify_size(sftp: &russh_sftp::client::SftpSession, path: &str, expect: usize) -> bool {
+    let meta_sz = sftp.metadata(path).await.ok().and_then(|m| m.size);
+    let read_len = sftp.read(path).await.map(|b| b.len());
+    // **读回优先**：实际读到 EOF 的字节数才是权威——rename 刚完成时 metadata.size 可能是缓存/陈旧值，
+    // 不能据此误判。只有读回失败（拿不到真值）时才退回 metadata.size。
+    if let Ok(n) = read_len {
+        return n == expect;
+    }
+    matches!(meta_sz, Some(sz) if sz == expect as u64)
+}
+
+/// 事务性保存：先把新内容完整写入同目录临时文件，**校验 tmp 落盘无误**后，把原文件挪到 `.bak`、
+/// 换入 tmp，**再校验最终目标字节数**——只有目标确认写对了才删 `.bak`；任何一步出错都从 `.bak`
+/// 还原，绝不把空/残缺文件留给用户。原文件全程存在于 目标 或 目标.bak。
 /// 特殊情形：
 /// - **符号链接**：解析到真实目标后在其上做同样的事务替换，链接语义保留、且仍然原子；
 ///   仅当链接损坏（无法解析）时退回直写（非原子，罕见）。
@@ -2390,60 +2404,103 @@ async fn sftp_write_atomic(sftp: &russh_sftp::client::SftpSession, path: &str, d
         path.to_string()
     };
 
-    // 一次 metadata：既取权限、也据 Ok/Err 判断目标是否已存在（省去额外的 try_exists 往返）。
-    let orig_perm = sftp.metadata(&target).await.ok().and_then(|m| m.permissions);
+    // 一次 metadata：既取权限、也据 Ok/Err 判断目标是否已存在。
+    let target_meta = sftp.metadata(&target).await.ok();
+    let target_exists = target_meta.is_some();
+    let orig_perm = target_meta.and_then(|m| m.permissions);
 
     let tmp = format!("{target}.ishell-tmp-{}", rand_hex(6));
     if let Err(e) = sftp_overwrite_progress_to(sftp, &tmp, path, data, sink).await {
         let _ = sftp.remove_file(&tmp).await; // 写失败：清理临时文件，原文件未动
         return Err(e);
     }
-    // 权限回填到临时文件（保存前继承原文件的 mode）
+    // 【闸一】换入前校验 tmp 是否完整落盘；不对就中止，原文件分毫未动。
+    if !sftp_verify_size(sftp, &tmp, data.len()).await {
+        let _ = sftp.remove_file(&tmp).await;
+        return Err(anyhow::anyhow!(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("保存校验失败：临时文件未完整写入（应为 {} 字节），已中止换入（原文件未改动）", data.len()),
+            crate::i18n::Lang::En => format!("save verify failed: temp file not fully written (expected {} bytes) — aborted (original unchanged)", data.len()),
+        }));
+    }
+    // 权限回填到临时文件（保存前继承原文件的 mode）。
+    // 【坑】个别服务器（外置盘 / 非 OpenSSH 实现）会在 SETSTAT 时把文件**截断为 0**！
+    // 这正是「保存清空文件」的真凶：tmp 写满→设权限被清空→rename 搬走空文件。
+    // 故设完权限必须**复验 tmp**；一旦发现被截断，就**重写 tmp 内容、放弃权限保留**（数据优先）。
     if let Some(mode) = orig_perm {
         let _ = sftp
             .set_metadata(&tmp, russh_sftp::protocol::FileAttributes { permissions: Some(mode), ..Default::default() })
             .await;
+        if !sftp_verify_size(sftp, &tmp, data.len()).await {
+            // 该服务器 SETSTAT 会截断文件：重写内容、放弃权限保留（数据优先）。
+            if let Err(e) = sftp_overwrite_progress_to(sftp, &tmp, path, data, sink).await {
+                let _ = sftp.remove_file(&tmp).await;
+                return Err(e);
+            }
+        }
     }
 
-    // 先尝试直接换入：SFTP v3 rename 目标不存在时成功（新建保存）——不必先探测存在性，
-    // 也就不会因 try_exists 的瞬时错误把新文件误判为已存在而走错分支。
-    if sftp.rename(&tmp, &target).await.is_ok() {
-        return Ok(());
-    }
+    // 统一走「备份 → 换入 → 校验 → 删备份」：OpenSSH 的 SSH_FXP_RENAME 对已存在目标会失败
+    //（link()+unlink() 语义），故必须先把原文件挪走再换入；这样也保证换入后校验失败时能还原。
+    let bak = if target_exists {
+        let bak = format!("{target}.ishell-bak-{}", rand_hex(6));
+        let r = sftp.rename(&target, &bak).await;
+        if let Err(e) = r {
+            let _ = sftp.remove_file(&tmp).await; // 备份失败：原文件未动，清理 tmp
+            return Err(anyhow::anyhow!(match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("保存失败（原文件未改动，新内容在 {tmp}）：{e}"),
+                crate::i18n::Lang::En => format!("save failed (original unchanged, new content at {tmp}): {e}"),
+            }));
+        }
+        Some(bak)
+    } else {
+        None
+    };
 
-    // 直接换入失败（多半因目标已存在，v3 rename 不覆盖）→ 备份 → 换入 → 删备份。
-    // 原文件始终在 target 或 bak，绝不凭空消失。
-    let bak = format!("{target}.ishell-bak-{}", rand_hex(6));
-    if let Err(e) = sftp.rename(&target, &bak).await {
-        // 备份也失败：清理 tmp，原文件未动（仍在 target 或本就不存在）
+    // 换入：tmp → target。失败则从 bak 还原原文件。
+    let rin = sftp.rename(&tmp, &target).await;
+    if let Err(e) = rin {
+        let restored = match &bak {
+            Some(b) => sftp.rename(b, &target).await.is_ok(),
+            None => true, // 本就是新建，无原文件可失
+        };
         let _ = sftp.remove_file(&tmp).await;
-        return Err(anyhow::anyhow!(match crate::i18n::current() {
-            crate::i18n::Lang::Zh => format!("保存失败（原文件未改动，新内容在 {tmp}）：{e}"),
-            crate::i18n::Lang::En => format!("save failed (original unchanged, new content at {tmp}): {e}"),
+        return Err(anyhow::anyhow!(reword_restore(&e.to_string(), restored, bak.as_deref())));
+    }
+
+    // 【闸二】换入后校验最终目标字节数——这是根治「保存却清空」的关键：只有目标确认写对了才提交。
+    // 目标为空/残缺（无论 rename 语义多古怪）都在此拦下，并从 bak 还原原文件，绝不把空文件留给用户。
+    if !sftp_verify_size(sftp, &target, data.len()).await {
+        let restored = match &bak {
+            Some(b) => {
+                let _ = sftp.remove_file(&target).await; // 移除写坏的目标
+                sftp.rename(b, &target).await.is_ok() // 还原原文件
+            }
+            None => {
+                let _ = sftp.remove_file(&target).await; // 新建却写坏：删掉空壳
+                true
+            }
+        };
+        return Err(anyhow::anyhow!(match (crate::i18n::current(), restored) {
+            (crate::i18n::Lang::Zh, true) => format!("保存后校验失败：目标文件字节数不符（应为 {}），已还原原文件", data.len()),
+            (crate::i18n::Lang::Zh, false) => format!("保存后校验失败且未能还原，原文件在 {}", bak.as_deref().unwrap_or("?")),
+            (crate::i18n::Lang::En, true) => format!("post-save verify failed: wrong byte count (expected {}); original restored", data.len()),
+            (crate::i18n::Lang::En, false) => format!("post-save verify failed and not restored; original is at {}", bak.as_deref().unwrap_or("?")),
         }));
     }
-    match sftp.rename(&tmp, &target).await {
-        Ok(_) => {
-            let _ = sftp.remove_file(&bak).await; // 换入成功，清理备份
-            Ok(())
-        }
-        Err(e) => {
-            // 换入失败：把备份还原为原文件；只有还原确实成功才说「已还原」，
-            // 否则如实告知原文件仍在 bak，避免误导恢复。
-            let restored = sftp.rename(&bak, &target).await.is_ok();
-            let _ = sftp.remove_file(&tmp).await;
-            Err(anyhow::anyhow!(if restored {
-                match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("替换失败，已还原原文件：{e}"),
-                    crate::i18n::Lang::En => format!("replace failed, original restored: {e}"),
-                }
-            } else {
-                match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("替换失败且未能还原，原文件在 {bak}：{e}"),
-                    crate::i18n::Lang::En => format!("replace failed and not restored; original is at {bak}: {e}"),
-                }
-            }))
-        }
+
+    if let Some(b) = bak {
+        let _ = sftp.remove_file(&b).await; // 目标已校验无误，清理备份
+    }
+    Ok(())
+}
+
+/// 组织「换入失败」的还原提示文案。
+fn reword_restore(err: &str, restored: bool, bak: Option<&str>) -> String {
+    match (crate::i18n::current(), restored) {
+        (crate::i18n::Lang::Zh, true) => format!("替换失败，已还原原文件：{err}"),
+        (crate::i18n::Lang::Zh, false) => format!("替换失败且未能还原，原文件在 {}：{err}", bak.unwrap_or("?")),
+        (crate::i18n::Lang::En, true) => format!("replace failed, original restored: {err}"),
+        (crate::i18n::Lang::En, false) => format!("replace failed and not restored; original is at {}: {err}", bak.unwrap_or("?")),
     }
 }
 

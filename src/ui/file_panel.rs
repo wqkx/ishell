@@ -40,6 +40,9 @@ pub struct FilePanelState {
     pub path_edit: Option<String>,
     /// 路径编辑框是否需要请求焦点（仅进入时一次）
     pub path_edit_focus: bool,
+    /// 右键路径编辑框那一刻的选区（字符下标 a<b）。egui 右键会把选区塌成光标、失焦又不画高亮，
+    /// 故在右键当帧把选区存下来：菜单「复制」用它取子串，菜单打开期间也据它把高亮还原回去。
+    pub path_edit_rsel: Option<(usize, usize)>,
     /// 上次已同步到树的 cwd（仅在 cwd 变化时同步，允许手动折叠）
     pub synced_cwd: String,
     /// 当前弹出的对话框
@@ -368,6 +371,28 @@ impl FilePanelState {
         // 刷新渲染时按名选中新条目（与上传后高亮一致）
         self.pending_select = Some((dir.to_string(), std::iter::once(name.to_string()).collect()));
     }
+}
+
+/// 路径栏「复制」：写系统剪贴板（供外部应用粘贴）+ 存入 egui 进程内暂存
+///（egui 的 copy_text 走 winit 剪贴板，同进程内 arboard 常读不到，故另存一份供内部粘贴回退）。
+fn write_clip_path(ui: &egui::Ui, path: String) {
+    ui.ctx().copy_text(path.clone());
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("file_panel_copied_path"), path));
+}
+
+/// 路径栏「粘贴」：优先系统剪贴板（能拿到外部复制的路径），读不到再退回进程内暂存。
+/// 返回已 trim 且非空的路径。
+fn read_clip_path(ui: &egui::Ui) -> Option<String> {
+    if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    ui.ctx()
+        .data(|d| d.get_temp::<String>(egui::Id::new("file_panel_copied_path")))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[allow(deprecated)] // egui::popup_below_widget/toggle_popup 在 0.34 仍稳定可用（收藏夹弹窗）
@@ -787,53 +812,107 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     let mut go: Option<String> = None;
                     let mut done = false;
                     let take_focus = state.path_edit_focus;
+                    // 固定 id，便于在 show 之前读到「上一帧的选区」（右键当帧 egui 会把它塌成光标）。
+                    let te_id = ui.make_persistent_id("file_path_edit_box");
+                    let pre_range = egui::text_edit::TextEditState::load(ui.ctx(), te_id)
+                        .and_then(|s| s.cursor.char_range());
+                    // 上一帧存下的右键选区（Copy 类型，先于可变借用读出）；本帧若右键会更新它。
+                    let rsel_prev = state.path_edit_rsel;
+                    let mut new_rsel: Option<Option<(usize, usize)>> = None;
                     if let Some(buf) = &mut state.path_edit {
                         let out = egui::TextEdit::singleline(buf)
+                            .id(te_id)
                             .desired_width(ui.available_width() - 4.0)
                             .hint_text(crate::i18n::tr("输入路径后回车跳转，Esc 取消", "Enter path, Enter to go, Esc to cancel"))
                             .show(ui);
                         if take_focus {
                             // 首帧进入编辑：聚焦并全选路径，便于直接覆盖输入
                             let len = buf.chars().count();
-                            let id = out.response.id;
                             let mut st = out.state;
                             st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
                                 egui::text::CCursor::new(0),
                                 egui::text::CCursor::new(len),
                             )));
-                            st.store(ui.ctx(), id);
+                            st.store(ui.ctx(), te_id);
                             out.response.request_focus();
+                            new_rsel = Some(None); // 进入编辑：清除旧的右键选区记忆
                         }
                         let resp = &out.response;
-                        // 右键菜单：复制当前路径文本 / 粘贴系统剪贴板并跳转
-                        //（否则右键只是把光标移过去、清掉选中，且无复制粘贴项）。
+                        // 右键菜单：复制**右键那刻选中的**文本（无选区则整条路径）/ 粘贴 / 粘贴并转到。
+                        // 关键：Copy 用的是「右键当帧存下的选区」rsel_prev，而非点菜单时的 live 选区
+                        //（后者早被 egui 塌缩/失焦清掉，会导致永远复制整条路径）。
                         let menu = resp.context_menu(|ui| {
                             ui.set_min_width(140.0);
                             if ui.button(crate::i18n::tr("复制", "Copy")).clicked() {
-                                ui.ctx().copy_text(buf.clone());
+                                let text = rsel_prev
+                                    .and_then(|(a, b)| (a < b).then(|| buf.chars().skip(a).take(b - a).collect::<String>()))
+                                    .unwrap_or_else(|| buf.clone());
+                                write_clip_path(ui, text);
                                 ui.close();
                             }
-                            // 粘贴：替换编辑框内容为剪贴板路径（停留在编辑态，由用户回车确认）
+                            // 粘贴：替换编辑框内容（停留在编辑态，由用户回车确认）
                             if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
-                                if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
-                                    let t = t.trim();
-                                    if !t.is_empty() {
-                                        *buf = t.to_string();
-                                    }
+                                if let Some(t) = read_clip_path(ui) {
+                                    *buf = t;
                                 }
                                 ui.close();
                             }
-                            // 粘贴并转到：直接跳转到剪贴板路径
+                            // 粘贴并转到：直接跳转
                             if ui.button(crate::i18n::tr("粘贴并转到", "Paste & go")).clicked() {
-                                if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
-                                    let t = t.trim();
-                                    if !t.is_empty() {
-                                        go = Some(t.to_string());
-                                    }
+                                if let Some(t) = read_clip_path(ui) {
+                                    go = Some(t);
                                 }
                                 ui.close();
                             }
                         });
+                        // 右键当帧：把「塌缩前」的选区（pre_range）记下来，供本轮菜单 Copy 与高亮还原使用。
+                        // 在「右键**按下**」这一帧捕获选区：egui 会在本帧 show 内因 any_pressed 把选区
+                        // 塌成光标，而 pre_range 是 show **之前**读的，正好是塌缩前的完整选区。
+                        // （之前用 secondary_clicked=抬起帧太晚，那时选区早在按下帧被塌掉了 → 永远 None。）
+                        let sec_pressed = ui.input(|i| {
+                            i.pointer.secondary_pressed()
+                                && i.pointer.interact_pos().is_some_and(|p| resp.rect.contains(p))
+                        });
+                        if sec_pressed {
+                            let sel = pre_range.and_then(|r| {
+                                let a = r.primary.index.min(r.secondary.index);
+                                let b = r.primary.index.max(r.secondary.index);
+                                (a < b).then_some((a, b))
+                            });
+                            new_rsel = Some(sel);
+                        }
+                        // 菜单打开期间：保持焦点、还原选区范围，并**自绘选区高亮**。
+                        // egui 只在有焦点时才画选区、且右键会塌缩选区——都靠不住；这里直接按 galley
+                        // 几何把选中字符的矩形自己画出来，右键菜单打开时高亮必然可见（不依赖焦点）。
+                        if menu.is_some() {
+                            resp.request_focus();
+                            let eff = new_rsel.unwrap_or(rsel_prev);
+                            if let Some((a, b)) = eff {
+                                if a < b {
+                                    // 还原 egui 内部选区（供重新获焦后继续正常操作）
+                                    if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), te_id) {
+                                        st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
+                                            egui::text::CCursor::new(a),
+                                            egui::text::CCursor::new(b),
+                                        )));
+                                        st.store(ui.ctx(), te_id);
+                                    }
+                                    // 自绘高亮：galley 局部坐标 + galley_pos，按 text_clip_rect 裁剪（兼容横向滚动）
+                                    let r0 = out.galley.pos_from_cursor(egui::text::CCursor::new(a));
+                                    let r1 = out.galley.pos_from_cursor(egui::text::CCursor::new(b));
+                                    let sel = egui::Rect::from_min_max(
+                                        out.galley_pos + r0.min.to_vec2(),
+                                        out.galley_pos + egui::vec2(r1.min.x, r0.max.y),
+                                    );
+                                    ui.painter().with_clip_rect(out.text_clip_rect).rect_filled(
+                                        sel,
+                                        2.0,
+                                        egui::Color32::from_rgba_unmultiplied(0xd9, 0x70, 0x49, 72),
+                                    );
+                                }
+                            }
+                            ui.ctx().request_repaint();
+                        }
                         // 用 consume_key「吃掉」回车事件：否则同一帧内文件列表的键盘处理器
                         // 会再次响应这次回车，误打开当前选中行（进入子目录 / 用编辑器打开文件）。
                         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
@@ -849,12 +928,16 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             done = true;
                         }
                     }
+                    if let Some(v) = new_rsel {
+                        state.path_edit_rsel = v; // 写回本帧更新的右键选区记忆
+                    }
                     state.path_edit_focus = false;
                     if let Some(p) = go {
                         bc_nav = Some(p);
                     }
                     if done {
                         state.path_edit = None;
+                        state.path_edit_rsel = None;
                     }
                 } else {
                     // 面包屑：路径超长时横向滚动（隐藏滚动条，滚轮滚动）；
@@ -915,25 +998,21 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     bc_resp.context_menu(|ui| {
                         ui.set_min_width(140.0);
                         if ui.button(crate::i18n::tr("复制", "Copy")).clicked() {
-                            ui.ctx().copy_text(state.cwd.clone());
+                            write_clip_path(ui, state.cwd.clone());
                             ui.close();
                         }
+                        // 粘贴：把路径填入编辑框（进入编辑态、全选），由用户回车确认
                         if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
-                            if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
-                                let t = t.trim();
-                                if !t.is_empty() {
-                                    state.path_edit = Some(t.to_string());
-                                    state.path_edit_focus = true;
-                                }
+                            if let Some(t) = read_clip_path(ui) {
+                                state.path_edit = Some(t);
+                                state.path_edit_focus = true;
                             }
                             ui.close();
                         }
+                        // 粘贴并转到：直接跳转
                         if ui.button(crate::i18n::tr("粘贴并转到", "Paste & go")).clicked() {
-                            if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
-                                let t = t.trim();
-                                if !t.is_empty() {
-                                    bc_nav = Some(t.to_string());
-                                }
+                            if let Some(t) = read_clip_path(ui) {
+                                bc_nav = Some(t);
                             }
                             ui.close();
                         }
@@ -964,6 +1043,11 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
         // 规范化：去掉末尾多余的 "/"（否则与 worker 返回的规范路径不匹配，无法进入）
         state.cwd = normalize_path(&p);
         state.selected.clear();
+        // 「粘贴并转到」等跳转必须退出路径编辑态：否则若此前处于编辑态，路径栏会继续显示
+        // 旧的编辑框内容，造成「列表变了、面包屑没变」的错觉。
+        state.path_edit = None;
+        state.path_edit_focus = false;
+        state.pending_nav = None;
         // 跳到未缓存的路径（如「粘贴并转到」到一个此前没进过的目录）：本帧 sync_tree 已在改 cwd 前
         // 跑过、不会再列举它，若不在此显式发起 List，会卡在空白/不加载。命中缓存则无需重复请求。
         if !state.listings.contains_key(&state.cwd) && !state.loading.contains(&state.cwd) {
