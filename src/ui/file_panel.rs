@@ -376,7 +376,12 @@ impl FilePanelState {
 /// 路径栏「复制」：写系统剪贴板（供外部应用粘贴）+ 存入 egui 进程内暂存
 ///（egui 的 copy_text 走 winit 剪贴板，同进程内 arboard 常读不到，故另存一份供内部粘贴回退）。
 fn write_clip_path(ui: &egui::Ui, path: String) {
-    ui.ctx().copy_text(path.clone());
+    ui.ctx().copy_text(path.clone()); // egui 剪贴板：供跨应用粘贴
+    // 同时用 arboard 写系统剪贴板：否则 Linux 上 egui/winit 的同进程 copy_text 读不回来，
+    // read_clip_path(arboard 优先) 会拿到旧的外部剪贴板、把刚复制的路径「盖掉」→ 粘贴错值。
+    if let Ok(mut c) = arboard::Clipboard::new() {
+        let _ = c.set_text(path.clone());
+    }
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("file_panel_copied_path"), path));
 }
 
@@ -882,6 +887,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             new_rsel = Some(sel);
                         }
                         let eff = new_rsel.unwrap_or(rsel_prev);
+                        let sec_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
                         // 菜单打开期间：保持焦点并还原 egui 内部选区（供重新获焦后继续正常操作）。
                         if menu.is_some() {
                             resp.request_focus();
@@ -896,12 +902,15 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                     }
                                 }
                             }
+                        }
+                        // 仅在右键**按住**的短暂期间持续刷新，跟上「按下→抬起弹菜单」的过渡；菜单静止打开后
+                        // 无需再刷（自绘高亮已画在最后一帧、会一直留在屏上），避免菜单久开时满帧空转。
+                        if sec_down {
                             ui.ctx().request_repaint();
                         }
                         // 自绘选区高亮：egui 只在有焦点时画、且右键会塌缩选区，都靠不住。
                         // 画的时机 = 菜单打开期间 **或** 右键按键仍按住时——后者覆盖「按下→抬起弹菜单」
                         // 整个窗口（含按住多帧），消除右键时高亮闪一下。按 galley 几何自绘、text_clip_rect 裁剪。
-                        let sec_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
                         if menu.is_some() || sec_down {
                             if let Some((a, b)) = eff {
                                 if a < b {
