@@ -881,15 +881,12 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                             });
                             new_rsel = Some(sel);
                         }
-                        // 菜单打开期间：保持焦点、还原选区范围，并**自绘选区高亮**。
-                        // egui 只在有焦点时才画选区、且右键会塌缩选区——都靠不住；这里直接按 galley
-                        // 几何把选中字符的矩形自己画出来，右键菜单打开时高亮必然可见（不依赖焦点）。
+                        let eff = new_rsel.unwrap_or(rsel_prev);
+                        // 菜单打开期间：保持焦点并还原 egui 内部选区（供重新获焦后继续正常操作）。
                         if menu.is_some() {
                             resp.request_focus();
-                            let eff = new_rsel.unwrap_or(rsel_prev);
                             if let Some((a, b)) = eff {
                                 if a < b {
-                                    // 还原 egui 内部选区（供重新获焦后继续正常操作）
                                     if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), te_id) {
                                         st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
                                             egui::text::CCursor::new(a),
@@ -897,7 +894,17 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                         )));
                                         st.store(ui.ctx(), te_id);
                                     }
-                                    // 自绘高亮：galley 局部坐标 + galley_pos，按 text_clip_rect 裁剪（兼容横向滚动）
+                                }
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                        // 自绘选区高亮：egui 只在有焦点时画、且右键会塌缩选区，都靠不住。
+                        // 画的时机 = 菜单打开期间 **或** 右键按键仍按住时——后者覆盖「按下→抬起弹菜单」
+                        // 整个窗口（含按住多帧），消除右键时高亮闪一下。按 galley 几何自绘、text_clip_rect 裁剪。
+                        let sec_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+                        if menu.is_some() || sec_down {
+                            if let Some((a, b)) = eff {
+                                if a < b {
                                     let r0 = out.galley.pos_from_cursor(egui::text::CCursor::new(a));
                                     let r1 = out.galley.pos_from_cursor(egui::text::CCursor::new(b));
                                     let sel = egui::Rect::from_min_max(
@@ -911,7 +918,6 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                     );
                                 }
                             }
-                            ui.ctx().request_repaint();
                         }
                         // 用 consume_key「吃掉」回车事件：否则同一帧内文件列表的键盘处理器
                         // 会再次响应这次回车，误打开当前选中行（进入子目录 / 用编辑器打开文件）。
