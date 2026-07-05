@@ -1,6 +1,6 @@
 [package]
 name = "ishell"
-version = "0.14.2"
+version = "0.14.3"
 edition = "2021"
 license = "MIT"
 description = "现代化 Rust SSH 客户端，仿 FinalShell 布局（系统信息 + 终端 + SFTP 文件管理）"
