@@ -924,9 +924,13 @@ impl Terminal {
                     if max_sb > 0 && p.x >= sb_track.left() {
                         self.sb_dragging = true;
                     } else {
-                        let c = cell_at(p);
-                        self.sel_anchor = Some(c);
-                        self.sel_cursor = Some(c);
+                        // 拖拽需移动超过阈值才激活，此刻指针已离开按下点——锚点必须用「按下位置」，
+                        // 否则起始字符会被漏选（与 editor.rs 的同类修法一致）
+                        let anchor = ui.input(|i| i.pointer.press_origin())
+                            .map(&cell_at)
+                            .unwrap_or_else(|| cell_at(p));
+                        self.sel_anchor = Some(anchor);
+                        self.sel_cursor = Some(cell_at(p));
                     }
                 }
             } else if resp.dragged() && !self.sb_dragging {
