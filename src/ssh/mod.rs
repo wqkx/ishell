@@ -2280,7 +2280,7 @@ fn decode_text(data: &[u8]) -> (String, String) {
 }
 
 /// 分块读取远程文本文件并上报进度（驱动占位标签上的珊瑚色进度条），与下载文件一致地分块读取。
-/// 非 force 时限制 4MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB 且跳过二进制检查。
+/// 非 force 时限制 20MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB 且跳过二进制检查。
 /// 跟随读取（tail -f）：从 offset 读到文件末尾（单次 ≤512KB）。
 /// offset=u64::MAX 只返回当前大小（跟随开启时的初始化，相当于 `tail -f -n 0`）；
 /// 文件变小（截断/轮转）时回报 truncated 并把 offset 重置为新大小。
@@ -2334,7 +2334,7 @@ async fn tail_file(sftp: &russh_sftp::client::SftpSession, path: &str, offset: u
 
 async fn read_file_chunked(sftp: &russh_sftp::client::SftpSession, path: &str, force: bool, id: u64, sink: &UiSink) {
     use tokio::io::AsyncReadExt;
-    let limit = if force { 128 * 1024 * 1024 } else { 4 * 1024 * 1024 };
+    let limit = if force { crate::limits::FILE_HARD_LIMIT as usize } else { crate::limits::FILE_SOFT_LIMIT as usize };
     let meta = sftp.metadata(path).await.ok();
     let total = meta.as_ref().and_then(|m| m.size).unwrap_or(0);
     let file_mtime = meta.as_ref().and_then(|m| m.mtime).unwrap_or(0);
@@ -2682,7 +2682,7 @@ fn remote_parent(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tar_entry_path_safe;
+    use super::{sh_quote, tar_entry_path_safe};
     use std::path::Path;
 
     #[test]
@@ -2693,5 +2693,23 @@ mod tests {
         assert!(!tar_entry_path_safe(Path::new("a/../../b")));
         assert!(!tar_entry_path_safe(Path::new("/abs/path")));
         assert!(!tar_entry_path_safe(Path::new("")));
+    }
+
+    #[test]
+    fn sh_quote_escapes_single_quotes() {
+        assert_eq!(sh_quote("plain"), "'plain'");
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sh_quote(""), "''");
+    }
+
+    #[test]
+    fn pdfinfo_pages_parse() {
+        let sample = "Title: x\nPages:  12\nEncrypted: no\n";
+        let pages = sample
+            .lines()
+            .find_map(|l| l.strip_prefix("Pages:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        assert_eq!(pages, 12);
     }
 }

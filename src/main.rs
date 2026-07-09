@@ -8,6 +8,7 @@
 
 mod app;
 mod i18n;
+mod limits;
 mod proto;
 mod ssh;
 mod store;

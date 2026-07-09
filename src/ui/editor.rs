@@ -125,10 +125,16 @@ pub struct Editor {
     words_ver: u64,
     /// 主光标屏幕坐标（渲染循环记录，供补全弹窗定位到光标下方）。
     caret_px: Option<egui::Pos2>,
+    /// 光标闪烁相位起点（秒）：移动/输入时重置，使光标立即可见。
+    caret_blink_at: f64,
     /// 跟随模式（tail -f）：追加远端新增内容并滚到底；开启期间常规修改输入被忽略。
     pub follow: bool,
     /// 状态栏「跟随」按钮被点击（app 层消费：切换跟随并发送初始化命令）。
     pub follow_req: bool,
+    /// 大文件默认只读（整文件仍在内存；可点状态栏「改为可编辑」解除）。
+    pub readonly: bool,
+    /// 状态栏「改为可编辑」被点击（一次性，app/editor 层消费后清零）。
+    pub unlock_req: bool,
     /// 占位（loading）状态下的自定义文案（None = 「下载中 …」）。
     pub loading_note: Option<String>,
 }
@@ -217,17 +223,35 @@ impl Editor {
             words: Vec::new(),
             words_ver: u64::MAX,
             caret_px: None,
+            caret_blink_at: 0.0,
             follow: false,
             follow_req: false,
+            readonly: false,
+            unlock_req: false,
             loading_note: None,
         }
     }
-    /// 切换查找栏（供窗口标签栏的「查找」按钮调用）；打开时请求聚焦查找框。
-    pub fn toggle_find(&mut self) {
-        self.show_find = !self.show_find;
-        if self.show_find {
-            self.find_focus = true;
+
+    /// 是否禁止修改内容（跟随或大文件只读）。
+    pub fn is_readonly(&self) -> bool {
+        self.follow || self.readonly
+    }
+    /// 打开查找栏（对齐 VSCode：Ctrl+F / 查找按钮只打开不关闭；Esc 才关）。
+    /// 若有单行选区，将其填入查找框。
+    pub fn open_find(&mut self) {
+        if let Some((a, b)) = v_sel_range(self) {
+            let sel = &self.content[a..b];
+            if !sel.is_empty() && !sel.contains('\n') {
+                self.find = sel.to_string();
+                self.find_sig = 0; // 强制 rebuild_matches
+            }
         }
+        self.show_find = true;
+        self.find_focus = true;
+    }
+    /// 兼容旧名：与 [`Self::open_find`] 相同（不再切换关闭）。
+    pub fn toggle_find(&mut self) {
+        self.open_find();
     }
     pub fn dirty(&self) -> bool {
         // 内容、编码、行尾任一与打开/上次保存时不同都算「有改动」——
@@ -1161,6 +1185,19 @@ fn auto_close_for(t: &str) -> Option<&'static str> {
     }
 }
 
+/// 光标处已是配对闭合符时，再输入同一闭合符则跳过（对齐 VSCode / 常见编辑器）。
+fn skip_closing_pair(ed: &Editor, t: &str) -> bool {
+    let close = match t {
+        ")" | "]" | "}" | "\"" | "'" | "`" => t,
+        _ => return false,
+    };
+    let i = ed.vcaret;
+    if i >= ed.content.len() || !ed.content.is_char_boundary(i) {
+        return false;
+    }
+    ed.content[i..].starts_with(close)
+}
+
 /// 若字节 bp 处是括号，返回 (该括号位置, 匹配括号位置)；否则 None。扫描有上限、忽略字符串/注释。
 fn bracket_at(s: &str, bp: usize) -> Option<(usize, usize)> {
     const OPENS: [char; 3] = ['(', '[', '{'];
@@ -1451,7 +1488,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     if ed.lint_ver != ed.vver {
         ed.lint_ver = ed.vver;
         if ed.content.len() <= LINT_LIMIT && highlight::lint_enabled(&ed.language) {
-            let (lines, ranges, msg) = highlight::lint_brackets(&ed.content, &ed.language);
+            let (lines, ranges, msg) = highlight::lint_syntax(&ed.content, &ed.language);
             ed.lint_lines = lines.into_iter().collect();
             ed.lint_ranges = ranges;
             ed.lint_msg = msg;
@@ -1575,10 +1612,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     if !focused {
         ed.complete = None; // 失焦关闭补全弹窗
     }
+    let mut typed = false; // 本帧是否有字符输入（补全触发 + 光标闪烁重置）
     if focused {
         let vver0 = ed.vver;
         let caret0 = ed.vcaret;
-        let mut typed = false; // 本帧是否有字符输入（补全的触发条件）
         let events = ui.input(|i| i.events.clone());
         for ev in events {
             // 补全弹窗打开时优先消费导航键：↑↓ 选择、Enter/Tab 接受、Esc 关闭
@@ -1611,8 +1648,8 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     }
                 }
             }
-            // 跟随模式：只读——吞掉常规修改输入（导航/复制/查找仍可用）
-            if ed.follow {
+            // 跟随 / 大文件只读：吞掉常规修改输入（导航/复制/查找仍可用）
+            if ed.is_readonly() {
                 match &ev {
                     egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(_) | egui::Event::Cut => continue,
                     egui::Event::Key { key: egui::Key::Backspace | egui::Key::Delete | egui::Key::Enter | egui::Key::Tab, pressed: true, .. } => continue,
@@ -1677,8 +1714,12 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             }
             match ev {
                 egui::Event::Text(t) if !t.is_empty() => {
+                    // 已在闭合符前再敲同一闭合符 → 跳过（如 "" 中间再敲 " 移到右侧）
+                    if v_sel_range(ed).is_none() && skip_closing_pair(ed, &t) {
+                        ed.vcaret = next_char_boundary(&ed.content, ed.vcaret);
+                        ed.vgoal_col = None;
                     // 自动补全括号/引号：无选区→插入成对并把光标放中间；有选区→用括号包裹并保留选中
-                    if let Some(close) = auto_close_for(&t) {
+                    } else if let Some(close) = auto_close_for(&t) {
                         if let Some((a, b)) = v_sel_range(ed) {
                             let inner = ed.content[a..b].to_string();
                             v_apply(ed, a, b - a, &format!("{t}{inner}{close}"));
@@ -1710,12 +1751,7 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     let cmd = modifiers.command || modifiers.ctrl;
                     match key {
                         egui::Key::S if cmd => save = true,
-                        egui::Key::F if cmd => {
-                            ed.show_find = !ed.show_find;
-                            if ed.show_find {
-                                ed.find_focus = true;
-                            }
-                        }
+                        egui::Key::F if cmd => ed.open_find(),
                         egui::Key::G if cmd => {
                             ed.goto_open = !ed.goto_open;
                             if ed.goto_open {
@@ -1784,6 +1820,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
     }
     // 真正判断光标是否移动（仅此情况才让视角跟随；无移动时自由滚动、绝不拉回）
     let moved = ed.vcaret != prev_caret;
+    // 光标移动或输入时重置闪烁相位，使光标立即显示
+    if focused && (moved || typed) {
+        ed.caret_blink_at = ui.input(|i| i.time);
+    }
 
     // 底部状态栏（仿小文件编辑器）：缩进可切换（矩形按钮、贴左）+ 语言贴右。
     egui::Panel::bottom("editor_status_v")
@@ -1844,6 +1884,20 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                     ui.add_space(10.0);
                     ui.label(RichText::new(ed.language.as_str()).color(Palette::TEXT_DIM).size(11.0));
                     ui.add_space(10.0);
+                    // 大文件只读徽标：点击可解除（整文件已在内存，编辑仍可能占较多 RAM）
+                    if ed.readonly && !ed.follow {
+                        if ui
+                            .add(egui::Label::new(RichText::new(crate::i18n::tr("只读", "Read-only")).color(Palette::WARN).size(11.0)).sense(egui::Sense::click()))
+                            .on_hover_text(crate::i18n::tr(
+                                "大文件默认只读（整文件已载入内存）。点击改为可编辑。",
+                                "Large files open read-only (fully loaded). Click to enable editing.",
+                            ))
+                            .clicked()
+                        {
+                            ed.unlock_req = true;
+                        }
+                        ui.add_space(10.0);
+                    }
                     // 跟随（tail -f）：↧ 图标，开启时珊瑚色；点击由 app 层切换（需发起 SFTP 命令）
                     let f_col = if ed.follow { Palette::ACCENT } else { Palette::TEXT_DIM };
                     if ui
@@ -2098,6 +2152,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                 clip
             };
             let resp = ui.interact(area, text_id, egui::Sense::click_and_drag());
+            // 编辑区悬停：I-beam（文本选择指针），与 VSCode / 系统文本控件一致
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
             // 右键弹菜单时选区可能被折叠/失焦：在右键按下这一帧冻结当前选区，供菜单复制/剪切/粘贴使用
             if ui.input(|i| i.pointer.secondary_pressed()) {
                 ed.menu_sel = v_sel_range(ed);
@@ -2367,12 +2425,16 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
                         }
                     }
                 }
-                // 光标（多选时每个选区末尾各画一个）
+                // 光标（多选时每个选区末尾各画一个；闪烁约 530ms 亮/灭）
                 if focused {
-                    for &cp in &carets {
-                        if cp >= ls && cp <= le && in_win(col_of(cp)) {
-                            let cx = x_of(cp - ls);
-                            painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
+                    let now = ui.input(|i| i.time);
+                    let blink_on = ((now - ed.caret_blink_at).rem_euclid(1.06)) < 0.53;
+                    if blink_on {
+                        for &cp in &carets {
+                            if cp >= ls && cp <= le && in_win(col_of(cp)) {
+                                let cx = x_of(cp - ls);
+                                painter.vline(cx, y..=(y + row_h), egui::Stroke::new(1.5, Palette::ACCENT));
+                            }
                         }
                     }
                     // 在主光标处上报 IME 输入区：激活输入法 + 定位候选框（否则虚拟编辑器无法输入中文）
@@ -2436,6 +2498,10 @@ fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bo
             if let Some(l) = fold_click {
                 v_toggle_fold(ed, l, unit_cols);
                 ui.ctx().request_repaint();
+            }
+            // 聚焦时驱动光标闪烁（约 30fps 即可，不必每帧满速）
+            if focused {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
             }
             // 补全弹窗（VSCode 风格）：对齐前缀起点、紧贴编辑行正下方；下方空间不足时
             // 翻到行上方——永不遮挡正在编辑的那一行。扁平卡片：细边框、无浮动大阴影。

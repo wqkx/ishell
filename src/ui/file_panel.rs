@@ -49,6 +49,8 @@ pub struct FilePanelState {
     pub dialog: Option<Dialog>,
     /// 对话框输入框的 IME 组字范围（字节位，绕开 egui Commit 门自绘 IME 用），跨帧维护
     pub dialog_ime: Option<(usize, usize)>,
+    /// 路径栏编辑框的 IME 组字范围（与 dialog_ime 同理）
+    pub path_edit_ime: Option<(usize, usize)>,
     /// 列表排序键 + 是否降序
     pub sort_key: SortKey,
     pub sort_desc: bool,
@@ -77,12 +79,16 @@ pub struct FilePanelState {
     pub favorites: Vec<String>,
     /// 该服务器的持久化键（host），收藏读写用。
     pub server_key: String,
-    /// 「返回上一个目录」历史栈（浏览器式后退；区别于「上级目录」=parent）。
+    /// 「返回上一个目录」历史栈（浏览器式后退）。
     pub nav_history: Vec<String>,
     /// 上一帧末的 cwd，用于检测目录切换并把旧目录压入历史。
     pub nav_prev: String,
     /// 本次切换由「后退」触发（不再压栈，避免来回循环）。
     pub nav_pending_back: bool,
+    /// 面包屑「幽灵」子路径：从当前 cwd 点到某父级后，仍以淡色显示的原完整路径。
+    /// 仅当 `cwd` 仍是其前缀时保留；点淡色段可回到子目录；cwd 切到旁支则清空。
+    /// 双击进入编辑时仍编辑 `cwd`，不受此字段影响。
+    pub path_trail: Option<String>,
 }
 
 /// 一次「移动」的撤销记录：被移动项的原始绝对路径 + 落入的目标目录。
@@ -275,7 +281,7 @@ fn open_intent(e: &FileEntry, full: &str) -> OpenIntent {
         OpenIntent::Docx(full.to_string())
     } else if !is_text_path(&e.name) {
         OpenIntent::ConfirmText(full.to_string(), e.size)
-    } else if e.size > 4 * 1024 * 1024 {
+    } else if e.size > crate::limits::FILE_SOFT_LIMIT {
         OpenIntent::ConfirmLarge(full.to_string(), e.size)
     } else {
         OpenIntent::Text(full.to_string())
@@ -406,8 +412,10 @@ fn read_clip_path(ui: &egui::Ui) -> Option<String> {
 pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Vec<FileAction> {
     let mut actions = Vec::new();
 
-    // 导航历史：检测上一帧的目录切换；非「后退」触发时，把旧目录压入历史，供「返回上一个目录」用。
+    // 导航历史 + 面包屑幽灵子路径：检测上一帧的目录切换。
     if state.cwd != state.nav_prev {
+        // 幽灵路径：沿原路径上/下钻时保留；切到旁支或回到幽灵末端则清除。
+        update_path_trail(state);
         if state.nav_pending_back {
             state.nav_pending_back = false;
         } else if !state.nav_prev.is_empty() {
@@ -686,10 +694,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     use egui_phosphor::regular as icon;
     let mut bc_nav: Option<String> = None;
     let mut paste_here = false; // 右键菜单「粘贴到此目录」触发（has_clip 由 App 传入）
-    // 弹簧式拖拽导航：本帧拖拽悬停的目标目录（Up 按钮的上一层 / 某文件夹），统一计时跳转
+    // 弹簧式拖拽导航：本帧拖拽悬停的目标目录（某文件夹），统一计时跳转
     let mut spring_target: Option<String> = None;
-    // 拖到「上级目录」按钮上释放的移动（与文件夹落点统一在表格后处理，便于记录撤销）
-    let mut up_move: Option<(Vec<String>, String)> = None;
     egui::Frame::new()
         .fill(Palette::PANEL_2)
         .corner_radius(6)
@@ -701,10 +707,9 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                 if tool_btn(ui, icon::ARROW_CLOCKWISE, crate::i18n::tr("刷新", "Refresh")) && state.refresh_dir(&state.cwd.clone()) {
                     actions.push(FileAction::List(state.cwd.clone()));
                 }
-                // 返回上一个目录（浏览器式后退，可连续返回；区别于「上级目录」=parent）
+                // 返回上一个目录（浏览器式后退，可连续返回；上级目录改由面包屑点击）
                 let back_enabled = !state.nav_history.is_empty();
                 let back_col = if back_enabled { Palette::TEXT } else { Palette::TEXT_DIM };
-                // 后退/上级用同一「箭头到横线」家族（←| / ↑|），风格一致、方向分明。
                 if tool_btn_color(ui, icon::ARROW_LINE_LEFT, crate::i18n::tr("返回上一个目录", "Back"), back_col) && back_enabled {
                     if let Some(prev) = state.nav_history.pop() {
                         state.nav_pending_back = true;
@@ -712,12 +717,6 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                         state.selected.clear();
                     }
                 }
-                let up_resp = tool_btn_resp(ui, icon::ARROW_LINE_UP, crate::i18n::tr("上级目录", "Up"), Palette::TEXT);
-                if up_resp.clicked() && !state.cwd.is_empty() {
-                    state.cwd = parent_of(&state.cwd);
-                    state.selected.clear();
-                }
-                handle_up_drag(ui, state, &up_resp, &mut up_move, &mut spring_target);
                 // 上传 / 删除 / 粘贴均不放工具栏：上传走拖拽或空白处右键菜单，删除走右键菜单或 Delete 键，
                 // 粘贴走空白处右键菜单「粘贴到此目录」（保持工具栏精简）
                 // 复制路径：点击后短暂显示绿色对勾，再恢复
@@ -827,6 +826,8 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     let rsel_prev = state.path_edit_rsel;
                     let mut new_rsel: Option<Option<(usize, usize)>> = None;
                     if let Some(buf) = &mut state.path_edit {
+                        // 与对话框相同：自绘 IME，避免路径栏中文第二次无法输入
+                        ime_apply_events(ui, te_id, buf, &mut state.path_edit_ime);
                         let out = egui::TextEdit::singleline(buf)
                             .id(te_id)
                             .desired_width(ui.available_width() - 4.0)
@@ -835,7 +836,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                         if take_focus {
                             // 首帧进入编辑：聚焦并全选路径，便于直接覆盖输入
                             let len = buf.chars().count();
-                            let mut st = out.state;
+                            let mut st = out.state.clone();
                             st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
                                 egui::text::CCursor::new(0),
                                 egui::text::CCursor::new(len),
@@ -955,15 +956,20 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     if done {
                         state.path_edit = None;
                         state.path_edit_rsel = None;
+                        state.path_edit_ime = None;
                     }
                 } else {
                     // 面包屑：路径超长时横向滚动（隐藏滚动条，滚轮滚动）；
                     // 单击逐级跳转，双击路径任意处（含分段、空白）进入编辑模式。
                     // 单击导航延后 ~0.28s 执行，期间若发生双击则取消，避免双击误触发跳转。
+                    // 点到父级后，原路径的后续段以极淡色「幽灵」显示，仍可点击回到子目录。
                     let now_t = ui.input(|i| i.time);
                     let cwd_s = state.cwd.clone();
+                    let trail_s = state.path_trail.clone();
                     let mut enter_edit = false;
                     let mut nav_click: Option<String> = None;
+                    // 幽灵段颜色：比 TEXT_DIM 更淡，一眼能区分「当前路径」与「可回跳的子路径」
+                    let ghost_col = egui::Color32::from_rgb(0xb8, 0xb3, 0xa6);
                     let bc_resp = egui::ScrollArea::horizontal()
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .auto_shrink([false, false])
@@ -982,6 +988,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                 // 故必须把菜单挂在各元素响应的并集上，右键才能在整条路径上都生效。
                                 let mut combined = root;
                                 let mut acc = String::new();
+                                // 活跃段：当前 cwd；幽灵段：trail 中 cwd 之后的子路径
                                 for seg in cwd_s.split('/').filter(|s| !s.is_empty()) {
                                     ui.label(RichText::new("›").color(Palette::TEXT_DIM));
                                     acc.push('/');
@@ -996,6 +1003,31 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                                         nav_click = Some(here);
                                     }
                                     combined = combined | r;
+                                }
+                                if let Some(trail) = trail_s.as_ref() {
+                                    if path_is_prefix(&cwd_s, trail) && trail != &cwd_s {
+                                        let suffix = if cwd_s == "/" {
+                                            trail.trim_start_matches('/')
+                                        } else {
+                                            trail[cwd_s.len()..].trim_start_matches('/')
+                                        };
+                                        for seg in suffix.split('/').filter(|s| !s.is_empty()) {
+                                            ui.label(RichText::new("›").color(ghost_col));
+                                            acc.push('/');
+                                            acc.push_str(seg);
+                                            let here = acc.clone();
+                                            let r = ui
+                                                .add(egui::Label::new(RichText::new(seg).color(ghost_col)).sense(Sense::click()))
+                                                .on_hover_text(crate::i18n::tr("回到此目录", "Go to this folder"));
+                                            if r.double_clicked() {
+                                                // 双击仍进入编辑当前 cwd（不是幽灵路径）
+                                                enter_edit = true;
+                                            } else if r.clicked() {
+                                                nav_click = Some(here);
+                                            }
+                                            combined = combined | r;
+                                        }
+                                    }
                                 }
                                 // 末尾空白：双击进入编辑；也并入右键菜单区
                                 let rest = ui.available_size_before_wrap();
@@ -1829,10 +1861,6 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
             }
         }
     }
-    // 「上级目录」按钮上的释放（几何上独立，已在工具栏阶段取走载荷）兜底并入
-    if drop_move.is_none() {
-        drop_move = up_move.take();
-    }
 
     // 拖拽移动：释放到某文件夹后发起远端 mv，并记录撤销。
     if let Some((srcs, dest_dir)) = drop_move {
@@ -2005,29 +2033,6 @@ fn valid_move_srcs(srcs: &[String], dest: &str) -> Vec<String> {
         })
         .cloned()
         .collect()
-}
-
-/// 拖拽到「上级目录」按钮：悬停时高亮并把上一层目录登记为弹簧目标（计时与跳转由
-/// `spring_navigate` 统一处理）；在按钮上释放则把文件移动到上一层目录。
-fn handle_up_drag(ui: &mut egui::Ui, state: &FilePanelState, up: &egui::Response, up_move: &mut Option<(Vec<String>, String)>, spring_target: &mut Option<String>) {
-    if state.cwd.is_empty() || state.cwd == "/" {
-        return;
-    }
-    let parent = parent_of(&state.cwd);
-    if let Some(payload) = up.dnd_release_payload::<DragPaths>() {
-        let srcs = valid_move_srcs(&payload.0, &parent);
-        if !srcs.is_empty() {
-            // 统一交由 file_list 的落点处理（乐观移除 + 记录撤销 + 发起 mv）
-            *up_move = Some((srcs, parent.clone()));
-        }
-    } else if up.dnd_hover_payload::<DragPaths>().is_some() {
-        // 悬停高亮（无进度条；是否跳转由停留时长决定）
-        let rect = up.rect;
-        let p = ui.painter();
-        p.rect_filled(rect, 6.0, Palette::ACCENT_SOFT);
-        p.rect_stroke(rect, 6.0, egui::Stroke::new(1.0, Palette::ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-        *spring_target = Some(parent);
-    }
 }
 
 /// 弹簧式拖拽导航的统一处理：在某目标目录上持续悬停 `UP_DWELL` 秒则进入它，
@@ -2354,8 +2359,14 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
             Dialog::ConfirmOpenLarge { path, size } => {
                 modal(&ctx, crate::i18n::tr("打开大文件", "Open large file"), |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("文件较大（{}），仍要打开吗？", fmt_bytes(*size as f64)), crate::i18n::Lang::En => format!("Large file ({}). Open anyway?", fmt_bytes(*size as f64)) });
-                        ui.label(RichText::new(crate::i18n::tr("将以虚拟化编辑器打开（仅渲染可见行，内存占用低）", "Opens in the virtualized editor (renders only visible lines)")).color(Palette::TEXT_DIM).size(11.0));
+                        ui.label(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("文件较大（{}），仍要打开吗？", fmt_bytes(*size as f64)),
+                            crate::i18n::Lang::En => format!("Large file ({}). Open anyway?", fmt_bytes(*size as f64)),
+                        });
+                        ui.label(RichText::new(crate::i18n::tr(
+                            "将以只读模式打开（整文件载入内存）；可在状态栏改为可编辑。",
+                            "Opens in read-only mode (full file loaded into memory). Unlock from the status bar to edit.",
+                        )).color(Palette::TEXT_DIM).size(11.0));
                     });
                     ui.add_space(10.0);
                     // 按钮水平居中
@@ -2509,6 +2520,71 @@ fn modal(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     // 收到按键/IME 事件时反应式重绘，对话框输入正常。
 }
 
+/// 在 TextEdit 渲染前抽走并落地本帧 Ime 事件（绕开 egui 0.34 fcitx Commit 门）。
+fn ime_apply_events(ui: &mut egui::Ui, id: egui::Id, buf: &mut String, preedit: &mut Option<(usize, usize)>) {
+    let focused = ui.ctx().memory(|m| m.focused() == Some(id));
+    if !focused {
+        return;
+    }
+    let ime: Vec<egui::ImeEvent> = ui.input_mut(|i| {
+        let evs: Vec<egui::ImeEvent> = i
+            .events
+            .iter()
+            .filter_map(|e| if let egui::Event::Ime(ev) = e { Some(ev.clone()) } else { None })
+            .collect();
+        i.events.retain(|e| !matches!(e, egui::Event::Ime(_)));
+        evs
+    });
+    if ime.is_empty() {
+        return;
+    }
+    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+    let caret_char = st
+        .cursor
+        .char_range()
+        .map(|r| r.primary.index)
+        .unwrap_or_else(|| buf.chars().count());
+    let mut caret = byte_of_char(buf, caret_char);
+    for ev in ime {
+        match ev {
+            egui::ImeEvent::Preedit(t) => {
+                if t == "\n" || t == "\r" {
+                    continue;
+                }
+                let (s, e) = preedit.take().unwrap_or((caret, caret));
+                let (s, e) = (s.min(buf.len()), e.min(buf.len()));
+                buf.replace_range(s..e, &t);
+                caret = s + t.len();
+                *preedit = if t.is_empty() { None } else { Some((s, caret)) };
+            }
+            egui::ImeEvent::Commit(t) => {
+                if t == "\n" || t == "\r" {
+                    continue;
+                }
+                if let Some((s, e)) = preedit.take() {
+                    let (s, e) = (s.min(buf.len()), e.min(buf.len()));
+                    buf.replace_range(s..e, "");
+                    caret = s;
+                }
+                let at = caret.min(buf.len());
+                buf.insert_str(at, &t);
+                caret = at + t.len();
+            }
+            egui::ImeEvent::Enabled => {}
+            egui::ImeEvent::Disabled => {
+                if let Some((s, e)) = preedit.take() {
+                    let (s, e) = (s.min(buf.len()), e.min(buf.len()));
+                    buf.replace_range(s..e, "");
+                    caret = s;
+                }
+            }
+        }
+    }
+    let cc = egui::text::CCursor::new(char_of_byte(buf, caret));
+    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(cc)));
+    st.store(ui.ctx(), id);
+}
+
 /// 单行输入框 + 自绘 IME：绕开 egui 0.34 `TextEdit` 的 Commit 门——fcitx(X11) 只发
 /// `Ime(Commit)`、不发 `Enabled`/`Preedit`，egui 的 `ime_cursor_range` 门永假导致「中文只能
 /// 输一次」（同 editor.rs 的修法，见 memory `ime-secondary-window-fix`）。本函数在 TextEdit
@@ -2521,69 +2597,7 @@ fn ime_singleline(
     preedit: &mut Option<(usize, usize)>,
 ) -> (egui::Response, bool) {
     let id = egui::Id::new(id_src);
-    let focused = ui.ctx().memory(|m| m.focused() == Some(id));
-    if focused {
-        // 抽取并移除本帧 Ime 事件，改由本函数写入 buf，egui TextEdit 便看不到、坏门不触发
-        let ime: Vec<egui::ImeEvent> = ui.input_mut(|i| {
-            let evs: Vec<egui::ImeEvent> = i
-                .events
-                .iter()
-                .filter_map(|e| if let egui::Event::Ime(ev) = e { Some(ev.clone()) } else { None })
-                .collect();
-            i.events.retain(|e| !matches!(e, egui::Event::Ime(_)));
-            evs
-        });
-        if !ime.is_empty() {
-            // 载入 TextEdit 光标（字符位）→ 字节位；缺省落到末尾
-            let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-            let caret_char = st
-                .cursor
-                .char_range()
-                .map(|r| r.primary.index)
-                .unwrap_or_else(|| buf.chars().count());
-            let mut caret = byte_of_char(buf, caret_char);
-            for ev in ime {
-                match ev {
-                    egui::ImeEvent::Preedit(t) => {
-                        if t == "\n" || t == "\r" {
-                            continue;
-                        }
-                        // 组字为临时预览：替换上一段 preedit 范围
-                        let (s, e) = preedit.take().unwrap_or((caret, caret));
-                        let (s, e) = (s.min(buf.len()), e.min(buf.len()));
-                        buf.replace_range(s..e, &t);
-                        caret = s + t.len();
-                        *preedit = if t.is_empty() { None } else { Some((s, caret)) };
-                    }
-                    egui::ImeEvent::Commit(t) => {
-                        if t == "\n" || t == "\r" {
-                            continue;
-                        }
-                        if let Some((s, e)) = preedit.take() {
-                            let (s, e) = (s.min(buf.len()), e.min(buf.len()));
-                            buf.replace_range(s..e, "");
-                            caret = s;
-                        }
-                        let at = caret.min(buf.len());
-                        buf.insert_str(at, &t);
-                        caret = at + t.len();
-                    }
-                    egui::ImeEvent::Enabled => {}
-                    egui::ImeEvent::Disabled => {
-                        if let Some((s, e)) = preedit.take() {
-                            let (s, e) = (s.min(buf.len()), e.min(buf.len()));
-                            buf.replace_range(s..e, "");
-                            caret = s;
-                        }
-                    }
-                }
-            }
-            // 字节位 → 字符位写回光标，使 TextEdit 本帧按新内容/新光标渲染
-            let cc = egui::text::CCursor::new(char_of_byte(buf, caret));
-            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(cc)));
-            st.store(ui.ctx(), id);
-        }
-    }
+    ime_apply_events(ui, id, buf, preedit);
     let out = egui::TextEdit::singleline(buf).id(id).desired_width(f32::INFINITY).show(ui);
     let resp = out.response.response; // TextEditOutput.response 是 AtomLayoutResponse，取其内层 Response
     // 回车提交：egui 单行不消费回车事件（`lost_focus()+key_pressed(Enter)` 官方惯用法），
@@ -2654,6 +2668,36 @@ fn parent_of(path: &str) -> String {
     match trimmed.rfind('/') {
         Some(0) | None => "/".into(),
         Some(i) => trimmed[..i].to_string(),
+    }
+}
+
+/// `prefix` 是否为 `path` 的目录前缀（`/` 或 `prefix/`…）。
+fn path_is_prefix(prefix: &str, path: &str) -> bool {
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// 目录切换后维护面包屑幽灵子路径：
+/// - 从更深路径点到其祖先 → 保留原完整路径为 trail（淡色显示后续段）
+/// - 沿 trail 下钻 / 上移但仍是前缀 → 保留 trail
+/// - 切到旁支、或 cwd 已等于 trail 末端 → 清除
+fn update_path_trail(state: &mut FilePanelState) {
+    let cwd = normalize_path(&state.cwd);
+    let prev = normalize_path(&state.nav_prev);
+    if let Some(trail) = state.path_trail.clone() {
+        let trail = normalize_path(&trail);
+        if cwd == trail || !path_is_prefix(&cwd, &trail) {
+            state.path_trail = None;
+        } else {
+            state.path_trail = Some(trail);
+        }
+        return;
+    }
+    // 无 trail：若从子路径上移到祖先，把离开前的路径记为幽灵
+    if !prev.is_empty() && path_is_prefix(&cwd, &prev) && cwd != prev {
+        state.path_trail = Some(prev);
     }
 }
 
@@ -2782,7 +2826,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_path;
+    use super::{normalize_path, path_is_prefix, update_path_trail, FilePanelState};
 
     #[test]
     fn normalize_trailing_slash() {
@@ -2793,5 +2837,41 @@ mod tests {
         assert_eq!(normalize_path("///"), "/");
         assert_eq!(normalize_path("  /tmp/  "), "/tmp");
         assert_eq!(normalize_path(""), "/");
+    }
+
+    #[test]
+    fn path_prefix_and_trail() {
+        assert!(path_is_prefix("/", "/a/b"));
+        assert!(path_is_prefix("/a", "/a/b/c"));
+        assert!(path_is_prefix("/a/b", "/a/b"));
+        assert!(!path_is_prefix("/a/b", "/a"));
+        assert!(!path_is_prefix("/a", "/ab"));
+
+        let mut s = FilePanelState {
+            cwd: "/a".into(),
+            nav_prev: "/a/b/c".into(),
+            ..Default::default()
+        };
+        update_path_trail(&mut s);
+        assert_eq!(s.path_trail.as_deref(), Some("/a/b/c"));
+
+        // 沿幽灵下钻：保留
+        s.cwd = "/a/b".into();
+        s.nav_prev = "/a".into();
+        update_path_trail(&mut s);
+        assert_eq!(s.path_trail.as_deref(), Some("/a/b/c"));
+
+        // 回到幽灵末端：清除
+        s.cwd = "/a/b/c".into();
+        s.nav_prev = "/a/b".into();
+        update_path_trail(&mut s);
+        assert!(s.path_trail.is_none());
+
+        // 旁支：清除
+        s.path_trail = Some("/a/b/c".into());
+        s.cwd = "/x".into();
+        s.nav_prev = "/a".into();
+        update_path_trail(&mut s);
+        assert!(s.path_trail.is_none());
     }
 }
