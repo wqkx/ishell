@@ -335,7 +335,7 @@ impl FilePanelState {
         }
         // 路径级错误（不存在/无权限）：清 loading、落「无效」占位（不覆盖已有非空列表）
         self.loading.remove(&path);
-        if self.listings.get(&path).map_or(true, |v| v.is_empty()) {
+        if self.listings.get(&path).is_none_or(|v| v.is_empty()) {
             self.nav_error.insert(path.clone());
             self.listings.insert(path, Vec::new());
         }
@@ -645,9 +645,7 @@ fn draw_node(
     // 拖拽目标：把文件列表里的项拖到树中的文件夹上。悬停高亮 + 登记弹簧目标（停留展开/折叠），
     // 在该节点上松手即移入该目录。
     let dragging_in = resp.dnd_hover_payload::<DragPaths>().is_some();
-    if is_cwd {
-        ui.painter().rect_filled(rect, 4.0, Palette::ACCENT_SOFT);
-    } else if dragging_in {
+    if is_cwd || dragging_in {
         ui.painter().rect_filled(rect, 4.0, Palette::ACCENT_SOFT);
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, egui::Color32::from_black_alpha(8));

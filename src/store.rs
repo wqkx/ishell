@@ -130,10 +130,8 @@ fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Op
         let _ = tx.send(f());
         KEYCHAIN_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
-        Ok(v) => Some(v),
-        Err(_) => None, // 超时：工作线程结束后自行减计数
-    }
+    // 超时：工作线程结束后自行减计数
+    rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
 }
 
 fn keychain_entry() -> Option<keyring::Entry> {

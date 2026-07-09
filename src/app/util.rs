@@ -28,28 +28,6 @@ pub(crate) fn host_in_known_hosts(host: &str, port: u16) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_loopback_bind, parent_dir};
-
-    #[test]
-    fn loopback_bind_detects_common_hosts() {
-        assert!(is_loopback_bind(""));
-        assert!(is_loopback_bind("127.0.0.1"));
-        assert!(is_loopback_bind("localhost"));
-        assert!(is_loopback_bind("::1"));
-        assert!(!is_loopback_bind("0.0.0.0"));
-        assert!(!is_loopback_bind("192.168.1.1"));
-    }
-
-    #[test]
-    fn parent_dir_basics() {
-        assert_eq!(parent_dir("/a/b/c"), "/a/b");
-        assert_eq!(parent_dir("/a"), "/");
-        assert_eq!(parent_dir("name"), "/");
-    }
-}
-
 /// 取远端路径的所在目录：去尾斜杠后截到最后一个 `/`；根下或无斜杠返回 `/`。
 pub(crate) fn parent_dir(path: &str) -> String {
     let t = path.trim_end_matches('/');
@@ -172,3 +150,36 @@ pub(crate) fn downloads_dir() -> std::path::PathBuf {
     }
     std::path::PathBuf::from(".")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{fmt_dur, is_loopback_bind, parent_dir};
+
+    #[test]
+    fn loopback_bind_detects_common_hosts() {
+        assert!(is_loopback_bind(""));
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind("::1"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("192.168.1.1"));
+    }
+
+    #[test]
+    fn parent_dir_basics() {
+        assert_eq!(parent_dir("/a/b/c"), "/a/b");
+        assert_eq!(parent_dir("/a"), "/");
+        assert_eq!(parent_dir("name"), "/");
+        assert_eq!(parent_dir("/a/b/"), "/a");
+    }
+
+    #[test]
+    fn fmt_dur_compact() {
+        assert_eq!(fmt_dur(0), "0s");
+        assert_eq!(fmt_dur(45), "45s");
+        assert_eq!(fmt_dur(80), "1m20s");
+        assert_eq!(fmt_dur(3600), "1h0m");
+        assert_eq!(fmt_dur(3723), "1h2m");
+    }
+}
+

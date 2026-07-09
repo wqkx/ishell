@@ -5,7 +5,6 @@ use egui::{RichText, Sense};
 use crate::proto::UiCommand;
 use crate::theme::Palette;
 use crate::ui::file_panel::{self, FileAction};
-use crate::ui::sidebar;
 
 use super::util::*;
 use super::view_state::{files_collapsed, osc7_consent, set_osc7_consent, OSC7_SNIPPET};

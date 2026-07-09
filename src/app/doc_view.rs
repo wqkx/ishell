@@ -76,23 +76,23 @@ pub(crate) fn doc_view(ui: &mut egui::Ui, tab: &mut EditorTab) {
                         let click_lbl = |ui: &mut egui::Ui, s: String, tip: &str| {
                             ui.add(egui::Label::new(RichText::new(s).size(11.5).color(dim)).sense(egui::Sense::click())).on_hover_text(tip.to_string()).clicked()
                         };
-                        if click_lbl(ui, icon::CARET_UP.to_string(), &crate::i18n::tr("上一页 (PageUp/←)", "Prev (PageUp/←)")) {
+                        if click_lbl(ui, icon::CARET_UP.to_string(), crate::i18n::tr("上一页 (PageUp/←)", "Prev (PageUp/←)")) {
                             *cur = cur.saturating_sub(1).max(1);
                         }
                         ui.label(RichText::new(format!("{cur} / {pages}")).monospace().size(11.0).color(Palette::TEXT));
-                        if click_lbl(ui, icon::CARET_DOWN.to_string(), &crate::i18n::tr("下一页 (PageDown/→)", "Next (PageDown/→)")) {
+                        if click_lbl(ui, icon::CARET_DOWN.to_string(), crate::i18n::tr("下一页 (PageDown/→)", "Next (PageDown/→)")) {
                             *cur = (*cur + 1).min(*pages);
                         }
                         ui.add_space(12.0);
-                        if click_lbl(ui, "−".into(), &crate::i18n::tr("缩小", "Zoom out")) {
+                        if click_lbl(ui, "−".into(), crate::i18n::tr("缩小", "Zoom out")) {
                             let z = if *zoom <= 0.0 { 1.0 } else { *zoom };
                             *zoom = (z / 1.2).max(0.25);
                         }
-                        if click_lbl(ui, "+".into(), &crate::i18n::tr("放大", "Zoom in")) {
+                        if click_lbl(ui, "+".into(), crate::i18n::tr("放大", "Zoom in")) {
                             let z = if *zoom <= 0.0 { 1.0 } else { *zoom };
                             *zoom = (z * 1.2).min(4.0);
                         }
-                        if click_lbl(ui, crate::i18n::tr("适宽", "Fit").into(), &crate::i18n::tr("适应窗口宽度", "Fit width")) {
+                        if click_lbl(ui, crate::i18n::tr("适宽", "Fit").into(), crate::i18n::tr("适应窗口宽度", "Fit width")) {
                             *zoom = 0.0;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

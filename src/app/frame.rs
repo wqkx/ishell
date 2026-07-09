@@ -3,20 +3,26 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::proto::UiCommand;
-use crate::theme::Palette;
+use crate::proto::{Eol, UiCommand};
 use crate::ui::file_panel;
 
 use super::util::{lock_mutex, trim_memory};
 use super::{App, DocKind, EditorTab, ImageTab, SaveState};
+
+/// 本帧从各会话 drain 出的占位标签：(id, path, server title, uid, cmd_tx)
+type FramePlaceholder = (u64, String, String, u64, UnboundedSender<UiCommand>);
+/// 本帧待填入编辑器的文件内容：(id, path, content, encoding, eol, mtime)
+type FrameFilled = (u64, String, String, String, Eol, u32);
+/// PDF 查找命中：(uid, path, hits, message)
+type FramePdfSearch = (u64, String, Vec<(u32, String)>, Option<String>);
 
 impl App {
     /// 处理本帧会话事件与编辑器/传输副作用（在布局绘制之前调用）。
     pub(super) fn process_frame_events(&mut self, ui: &mut egui::Ui) {
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
         // 身份用会话 uid（稳定唯一），title 仅作显示——避免同名会话（默认 title=用户名）串台。
-        let mut new_placeholders: Vec<(u64, String, String, u64, UnboundedSender<UiCommand>)> = Vec::new(); // id, path, title, uid, tx
-        let mut filled: Vec<(u64, String, String, String, crate::proto::Eol, u32)> = Vec::new(); // id, path, content, encoding, eol, mtime
+        let mut new_placeholders: Vec<FramePlaceholder> = Vec::new();
+        let mut filled: Vec<FrameFilled> = Vec::new();
         let mut load_progress: Vec<(u64, u64, u64)> = Vec::new();
         let mut load_fail: Vec<u64> = Vec::new();
         let mut new_images: Vec<(String, Vec<u8>, String, u64)> = Vec::new(); // path, data, title, uid
@@ -29,7 +35,7 @@ impl App {
         let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
         let mut pdf_infos: Vec<(u64, u32)> = Vec::new(); // 占位 id, 页数
         let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
-        let mut pdf_searches: Vec<(u64, String, Vec<(u32, String)>, Option<String>)> = Vec::new();
+        let mut pdf_searches: Vec<FramePdfSearch> = Vec::new();
         let mut new_docs: Vec<(u64, Vec<u8>)> = Vec::new(); // 占位 id, docx 字节
         let mut evt_backlog = false;
         for s in &mut self.sessions {
@@ -39,56 +45,56 @@ impl App {
                 s.initialized = true;
                 s.init_files();
             }
-            for (id, path) in s.pending_placeholder.drain(..) {
+            for (id, path) in s.pending.placeholder.drain(..) {
                 new_placeholders.push((id, path, s.title.clone(), s.uid, s.cmd_tx.clone()));
             }
-            for (id, path, content, encoding, eol, mtime) in s.pending_open.drain(..) {
+            for (id, path, content, encoding, eol, mtime) in s.pending.open.drain(..) {
                 filled.push((id, path, content, encoding, eol, mtime));
             }
-            for (path, mtime) in s.pending_saved.drain(..) {
+            for (path, mtime) in s.pending.saved.drain(..) {
                 saved.push((s.uid, path, mtime));
             }
-            for (path, done, total) in s.pending_save_progress.drain(..) {
+            for (path, done, total) in s.pending.save_progress.drain(..) {
                 save_progress.push((s.uid, path, done, total));
             }
-            for (path, data, offset, truncated) in s.pending_tail.drain(..) {
+            for (path, data, offset, truncated) in s.pending.tail.drain(..) {
                 tails.push((s.uid, path, data, offset, truncated));
             }
-            for path in s.pending_conflict.drain(..) {
+            for path in s.pending.conflict.drain(..) {
                 conflicts.push((s.uid, path));
             }
-            for w in s.pending_warn.drain(..) {
+            for w in s.pending.warn.drain(..) {
                 warns.push(w);
             }
-            for (path, msg) in s.pending_save_failed.drain(..) {
+            for (path, msg) in s.pending.save_failed.drain(..) {
                 save_failed.push((s.uid, path, msg));
             }
-            for (id, path, size) in s.pending_too_large.drain(..) {
+            for (id, path, size) in s.pending.too_large.drain(..) {
                 too_large.push((s.uid, id, path, size));
             }
-            for p in s.pending_load_progress.drain(..) {
+            for p in s.pending.load_progress.drain(..) {
                 load_progress.push(p);
             }
-            for (id, msg) in s.pending_load_fail.drain(..) {
+            for (id, msg) in s.pending.load_fail.drain(..) {
                 load_fail.push(id);
                 // PDF 缺 poppler 等打开失败：保留文案弹 toast（原先丢弃 message，用户只见标签消失）
                 if !msg.is_empty() {
                     warns.push(msg);
                 }
             }
-            for (path, data) in s.pending_image.drain(..) {
+            for (path, data) in s.pending.image.drain(..) {
                 new_images.push((path, data, s.title.clone(), s.uid));
             }
-            for x in s.pending_pdf_info.drain(..) {
+            for x in s.pending.pdf_info.drain(..) {
                 pdf_infos.push(x);
             }
-            for (path, page, data) in s.pending_pdf_page.drain(..) {
+            for (path, page, data) in s.pending.pdf_page.drain(..) {
                 pdf_pages.push((s.uid, path, page, data));
             }
-            for (path, hits, message) in s.pending_pdf_search.drain(..) {
+            for (path, hits, message) in s.pending.pdf_search.drain(..) {
                 pdf_searches.push((s.uid, path, hits, message));
             }
-            for x in s.pending_doc.drain(..) {
+            for x in s.pending.doc.drain(..) {
                 new_docs.push(x);
             }
         }
@@ -122,7 +128,7 @@ impl App {
                         continue; // 已关闭跟随：丢弃迟到的数据
                     }
                     if truncated {
-                        t.editor.append_tail(&crate::i18n::tr("\n--- 文件被截断/轮转，以下为新内容 ---\n", "\n--- file truncated/rotated, new content follows ---\n"));
+                        t.editor.append_tail(crate::i18n::tr("\n--- 文件被截断/轮转，以下为新内容 ---\n", "\n--- file truncated/rotated, new content follows ---\n"));
                     }
                     if !data.is_empty() {
                         // 跨块解码：与上一块留下的不完整尾字节拼接；UTF-8 时把本块末尾

@@ -772,9 +772,9 @@ fn v_toggle_comment(ed: &mut Editor, prefix: &str) {
         let indent = line.len() - line.trim_start().len();
         if all {
             let after = &line[indent..];
-            if after.starts_with(prefix) {
+            if let Some(rest) = after.strip_prefix(prefix) {
                 let mut rm = prefix.len();
-                if after[prefix.len()..].starts_with(' ') {
+                if rest.starts_with(' ') {
                     rm += 1;
                 }
                 v_apply(ed, ls + indent, rm, "");

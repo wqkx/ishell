@@ -312,7 +312,7 @@ impl App {
                 // 仅在「有改动」且「上次保存已完成」时才真正保存：无改动不触发也不放动画；
                 // 保存进行中（大文件耗时）屏蔽再次保存，避免用旧 mtime 重复写入被误判为外部改动；
                 // 跟随模式（tail -f）期间禁止保存——外部持续写入，本地内容无权威性。
-                let should = ed.tabs.get(active).map_or(false, |t| {
+                let should = ed.tabs.get(active).is_some_and(|t| {
                     t.editor.dirty() && !t.is_saving() && !t.editor.is_readonly()
                 });
                 if should {

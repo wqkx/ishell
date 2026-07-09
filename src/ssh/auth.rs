@@ -456,7 +456,7 @@ pub(super) async fn exec_capture_bytes(handle: &Handle<ClientHandler>, cmd: &str
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::Data { data } => out.extend_from_slice(&data),
-            ChannelMsg::ExtendedData { data, ext } if ext == 1 => err.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext: 1 } => err.extend_from_slice(&data),
             ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
             _ => {}
         }
@@ -474,7 +474,7 @@ pub(super) async fn exec_status(handle: &Handle<ClientHandler>, cmd: &str) -> an
     // 否则可能漏掉退出码；这里一直读到通道关闭（wait 返回 None）。
     while let Some(msg) = channel.wait().await {
         match msg {
-            ChannelMsg::ExtendedData { data, ext } if ext == 1 => err.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext: 1 } => err.extend_from_slice(&data),
             ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
             _ => {}
         }

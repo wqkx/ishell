@@ -244,8 +244,8 @@ fn tokenize(text: &str, lang: &Lang) -> Vec<(usize, usize, Tok)> {
         }
         // 块注释（先于行注释：Lua 的 --[[ 以 -- 开头，反序会被误判为行注释）
         if let Some((bs, be)) = lang.block {
-            if rest.starts_with(bs) {
-                let end = rest[bs.len()..].find(be).map(|e| i + bs.len() + e + be.len()).unwrap_or(n);
+            if let Some(after) = rest.strip_prefix(bs) {
+                let end = after.find(be).map(|e| i + bs.len() + e + be.len()).unwrap_or(n);
                 segs.push((i, end, Tok::Comment));
                 i = end;
                 continue;
@@ -478,7 +478,7 @@ pub fn highlight_segment(line: &str, win: Range<usize>, ext: &str, font_size: f3
         // 段内若与某错误范围相交，则进一步按边界切分以便只给错误处加下划线
         let mut p = rs;
         while p < re {
-            let err = errors.iter().find(|r| r.start < re && r.end > p && r.start <= p && r.end > p);
+            let err = errors.iter().find(|r| r.start <= p && p < r.end && r.start < re);
             let (seg_end, underline) = if let Some(r) = err {
                 (r.end.min(re), true)
             } else {
@@ -515,7 +515,8 @@ pub fn lint_enabled(ext: &str) -> bool {
 /// - 未闭合字符串 / 多行字符串
 /// - Python：列表/元组/调用参数中缺逗号、`:` 后空块、混用 Tab/空格缩进
 /// - JSON：尾逗号、非法结构的粗检
-/// 返回 (出问题的 0 基行号, 字节范围下划线, 概述文案)。
+///
+/// 返回：出问题的 0 基行号、字节范围下划线、概述文案。
 pub fn lint_syntax(text: &str, ext: &str) -> (Vec<usize>, Vec<Range<usize>>, Option<String>) {
     let lang = lang_for(ext);
     let segs = tokenize(text, &lang);
@@ -634,7 +635,7 @@ fn str_segment_unclosed(text: &str, s: usize, e: usize, lang: &Lang) -> bool {
         return true;
     }
     // 以引号结束，但可能是转义的假收尾：…\"
-    if body.len() >= q.len_utf8() + 1 {
+    if body.len() > q.len_utf8() {
         let before = &body[..body.len() - q.len_utf8()];
         // 奇数个连续反斜杠 → 引号被转义 → 未真正闭合
         let mut bs = 0usize;

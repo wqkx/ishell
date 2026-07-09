@@ -25,7 +25,7 @@ impl Session {
                 WorkerEvent::Status(s) => {
                     // ⚠ 前缀的警告（如编码丢字）转交 App 层弹顶部 toast，避免只写状态栏被后续消息滚走
                     if s.starts_with('⚠') {
-                        self.pending_warn.push(s.clone());
+                        self.pending.warn.push(s.clone());
                     }
                     self.status = s;
                 }
@@ -100,13 +100,13 @@ impl Session {
                             "Auto-reconnect stopped after 5 tries; reconnect manually",
                         );
                         self.status = format!("{} · {}", self.status, msg);
-                        self.pending_warn.push(msg.into());
+                        self.pending.warn.push(msg.into());
                     }
                 }
                 WorkerEvent::MonitorSupport(ok) => {
                     self.monitor_ok = Some(ok);
                     if !ok {
-                        self.pending_warn.push(crate::i18n::tr(
+                        self.pending.warn.push(crate::i18n::tr(
                             "远端非 Linux 或缺少 /proc，系统监控已禁用",
                             "Remote is not Linux or lacks /proc; system monitor disabled",
                         ).into());
@@ -158,48 +158,48 @@ impl Session {
                     self.status = crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
                 }
                 WorkerEvent::FileOpened { id, path, content, encoding, eol, mtime } => {
-                    self.pending_open.push((id, path, content, encoding, eol, mtime));
+                    self.pending.open.push((id, path, content, encoding, eol, mtime));
                     self.status = crate::i18n::tr("已打开文件", "File opened").into();
                 }
                 WorkerEvent::FileSaved { path, mtime } => {
-                    self.pending_saved.push((path, mtime));
+                    self.pending.saved.push((path, mtime));
                 }
                 WorkerEvent::FileSaveProgress { path, done, total } => {
-                    self.pending_save_progress.push((path, done, total));
+                    self.pending.save_progress.push((path, done, total));
                 }
                 WorkerEvent::FileTail { path, data, offset, truncated } => {
-                    self.pending_tail.push((path, data, offset, truncated));
+                    self.pending.tail.push((path, data, offset, truncated));
                 }
                 WorkerEvent::PdfInfo { id, path: _, pages } => {
-                    self.pending_pdf_info.push((id, pages));
+                    self.pending.pdf_info.push((id, pages));
                 }
                 WorkerEvent::PdfPage { path, page, data } => {
-                    self.pending_pdf_page.push((path, page, data));
+                    self.pending.pdf_page.push((path, page, data));
                 }
                 WorkerEvent::PdfSearch { path, query: _, hits, message } => {
-                    self.pending_pdf_search.push((path, hits, message));
+                    self.pending.pdf_search.push((path, hits, message));
                 }
                 WorkerEvent::DocOpened { id, path: _, data } => {
-                    self.pending_doc.push((id, data));
+                    self.pending.doc.push((id, data));
                 }
                 WorkerEvent::FileTooLarge { id, path, size } => {
-                    self.pending_too_large.push((id, path, size));
+                    self.pending.too_large.push((id, path, size));
                 }
                 WorkerEvent::FileSaveFailed { path, message } => {
-                    self.pending_save_failed.push((path, message));
+                    self.pending.save_failed.push((path, message));
                 }
                 WorkerEvent::FileSaveConflict { path } => {
-                    self.pending_conflict.push(path);
+                    self.pending.conflict.push(path);
                 }
                 WorkerEvent::FileLoadProgress { id, done, total } => {
-                    self.pending_load_progress.push((id, done, total));
+                    self.pending.load_progress.push((id, done, total));
                 }
                 WorkerEvent::FileLoadFailed { id, message } => {
-                    self.pending_load_fail.push((id, message.clone()));
+                    self.pending.load_fail.push((id, message.clone()));
                     self.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{message}"), crate::i18n::Lang::En => format!("Open failed: {message}") };
                 }
                 WorkerEvent::ImageOpened { path, data } => {
-                    self.pending_image.push((path, data));
+                    self.pending.image.push((path, data));
                     self.status = crate::i18n::tr("已打开图片", "Image opened").into();
                 }
                 WorkerEvent::OpDone { message, refresh_dir } => {

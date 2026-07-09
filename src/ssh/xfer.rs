@@ -408,7 +408,7 @@ async fn exec_direct_progress(
                     tail = tail[p + 1..].to_string();
                 }
             }
-            ChannelMsg::ExtendedData { data, ext } if ext == 1 => err.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext: 1 } => err.extend_from_slice(&data),
             ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
             _ => {}
         }

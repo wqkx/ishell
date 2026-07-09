@@ -151,7 +151,7 @@ pub fn parse(data: &[u8]) -> anyhow::Result<Doc> {
                 cell.push(CellPiece::Text(s.to_string()));
             }
         }
-        let mut flush_para = |spans: &mut Vec<Span>, heading: &mut u8, bullet: &mut bool, align: &mut Align, blocks: &mut Vec<Block>| {
+        let flush_para = |spans: &mut Vec<Span>, heading: &mut u8, bullet: &mut bool, align: &mut Align, blocks: &mut Vec<Block>| {
             if !spans.is_empty() {
                 blocks.push(Block::Para { spans: std::mem::take(spans), heading: *heading, bullet: *bullet, align: *align });
             }
@@ -160,12 +160,8 @@ pub fn parse(data: &[u8]) -> anyhow::Result<Doc> {
             *align = Align::Left;
         };
 
-        loop {
-            let ev = match reader.read_event_into(&mut buf) {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-            use quick_xml::events::Event;
+        use quick_xml::events::Event;
+        while let Ok(ev) = reader.read_event_into(&mut buf) {
             match &ev {
                 Event::Start(e) | Event::Empty(e) => {
                     let empty = matches!(&ev, Event::Empty(_));
@@ -182,7 +178,7 @@ pub fn parse(data: &[u8]) -> anyhow::Result<Doc> {
                         b"rPr" if !empty => in_rpr = true,
                         b"b" if in_rpr => b = !attr_off(e),
                         b"i" if in_rpr => i = !attr_off(e),
-                        b"u" if in_rpr => u = !attr_val(e, b"val").is_some_and(|v| v == "none"),
+                        b"u" if in_rpr => u = attr_val(e, b"val").is_none_or(|v| v != "none"),
                         b"pStyle" => {
                             if let Some(v) = attr_val(e, b"val") {
                                 // 首选 styles.xml 的 outlineLvl 映射；退路：样式名含 Heading/标题+数字
@@ -420,7 +416,7 @@ fn render_block(ui: &mut egui::Ui, block: &Block, images: &HashMap<String, egui:
                                             CellPiece::Image(name) => {
                                                 if let Some(tex) = images.get(name) {
                                                     let size = tex.size_vec2();
-                                                    let w = size.x.min(220.0).max(1.0);
+                                                    let w = size.x.clamp(1.0, 220.0);
                                                     ui.add(egui::Image::new((tex.id(), egui::vec2(w, w / size.x * size.y))).corner_radius(2.0));
                                                 }
                                             }

@@ -18,12 +18,13 @@ mod session_events;
 mod file_actions;
 mod layout;
 mod frame;
+mod pending;
 pub use widgets::view_context_menu;
 
 
 use std::sync::{Arc, Mutex};
 
-use egui::{RichText, Sense};
+use egui::RichText;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::proto::{AuthMethod, ConflictPolicy, ConnectConfig, UiCommand, WorkerEvent};
@@ -31,7 +32,7 @@ use crate::ssh::{self, UiSink};
 use crate::terminal::Terminal;
 use crate::theme::Palette;
 use crate::ui::connect::ConnectForm;
-use crate::ui::file_panel::{self, FileAction, FilePanelState};
+use crate::ui::file_panel::FilePanelState;
 use crate::ui::sidebar::{self, NetHistory};
 
 
@@ -58,37 +59,8 @@ struct Session {
     selected_nic: String,
     /// 进程列表是否按内存排序（false = 按 CPU）
     proc_sort_mem: bool,
-    /// 已读取待填充到占位编辑器标签的文件（id, path, content, encoding, eol, mtime）
-    pending_open: Vec<(u64, String, String, String, crate::proto::Eol, u32)>,
-    /// 保存成功回报的新 mtime（path, mtime）/ 外部改动冲突（path）
-    pending_saved: Vec<(String, u32)>,
-    /// 保存写入进度（path, done, total）——驱动编辑器标签「珊瑚→绿」保存动画
-    pending_save_progress: Vec<(String, u64, u64)>,
-    /// 跟随读取返回：(路径, 新增字节, 新 offset, 是否截断/轮转)
-    pending_tail: Vec<(String, Vec<u8>, u64, bool)>,
-    /// PDF 页数查询返回：(占位标签 id, 页数)
-    pending_pdf_info: Vec<(u64, u32)>,
-    /// PDF 单页 PNG 返回：(路径, 页码, PNG 字节)
-    pending_pdf_page: Vec<(String, u32, Vec<u8>)>,
-    /// PDF 查找返回：(路径, 命中列表, 失败消息)
-    pending_pdf_search: Vec<(String, Vec<(u32, String)>, Option<String>)>,
-    /// 文档原始字节返回：(占位标签 id, 字节)
-    pending_doc: Vec<(u64, Vec<u8>)>,
-    pending_conflict: Vec<String>,
-    /// 保存失败（网络/权限等）：(路径, 原因)
-    pending_save_failed: Vec<(String, String)>,
-    /// 需要在 App 层弹 toast 的警告（如编码丢字）；Session 无 toast/ctx，经此转交
-    pending_warn: Vec<String>,
-    /// 打开时发现实际超限（id, path, size）——移除占位标签 + 弹「打开大文件」确认
-    pending_too_large: Vec<(u64, String, u64)>,
-    /// 待新建的占位编辑器标签（id, path）——双击打开时立即建，显示文件名 + 进度条
-    pending_placeholder: Vec<(u64, String)>,
-    /// 文件下载进度（id, done, total），驱动占位标签进度条
-    pending_load_progress: Vec<(u64, u64, u64)>,
-    /// 文件打开失败（id, message）——移除占位标签 + 提示
-    pending_load_fail: Vec<(u64, String)>,
-    /// 已读取待打开到看图工具的图片（path, 原始字节）
-    pending_image: Vec<(String, Vec<u8>)>,
+    /// worker 事件缓冲（打开/保存/PDF/图片等），由 App 帧循环 drain
+    pending: pending::SessionPending,
     /// 向 worker 回复"是否信任未知主机"
     hostkey_tx: UnboundedSender<bool>,
     /// 待确认的主机（host, 指纹, 是否为密钥变更）
@@ -1048,22 +1020,7 @@ impl App {
             next_xfer: 1,
             selected_nic: String::new(),
             proc_sort_mem: false,
-            pending_open: Vec::new(),
-            pending_saved: Vec::new(),
-            pending_save_progress: Vec::new(),
-            pending_tail: Vec::new(),
-            pending_pdf_info: Vec::new(),
-            pending_pdf_page: Vec::new(),
-            pending_pdf_search: Vec::new(),
-            pending_doc: Vec::new(),
-            pending_conflict: Vec::new(),
-            pending_save_failed: Vec::new(),
-            pending_warn: Vec::new(),
-            pending_too_large: Vec::new(),
-            pending_placeholder: Vec::new(),
-            pending_load_progress: Vec::new(),
-            pending_load_fail: Vec::new(),
-            pending_image: Vec::new(),
+            pending: pending::SessionPending::default(),
             hostkey_tx,
             pending_hostkey: None,
             kbd_prompt: None,

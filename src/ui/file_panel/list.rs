@@ -10,8 +10,8 @@ use crate::theme::Palette;
 use crate::ui::fmt_bytes;
 use super::{
     basename, fmt_mtime, join_path, normalize_path, parent_of, path_is_prefix, perm_string,
-    read_clip_path, write_clip_path, Dialog, FileAction, FilePanelState, MoveRecord, OpenIntent,
-    Renaming, SortKey, DEFAULT_COLS, UP_DWELL, UP_FLASH, open_intent,
+    read_clip_path, write_clip_path, Dialog, FileAction, FilePanelState, OpenIntent, Renaming,
+    SortKey, DEFAULT_COLS, UP_DWELL, UP_FLASH, open_intent,
 };
 use super::ime::{ime_apply_events, ime_singleline};
 
@@ -328,7 +328,7 @@ pub(super) fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip:
                                     } else if r.clicked() {
                                         nav_click = Some(here);
                                     }
-                                    combined = combined | r;
+                                    combined |= r;
                                 }
                                 if let Some(trail) = trail_s.as_ref() {
                                     if path_is_prefix(&cwd_s, trail) && trail != &cwd_s {
@@ -351,7 +351,7 @@ pub(super) fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip:
                                             } else if r.clicked() {
                                                 nav_click = Some(here);
                                             }
-                                            combined = combined | r;
+                                            combined |= r;
                                         }
                                     }
                                 }
@@ -362,7 +362,7 @@ pub(super) fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip:
                                     if resp.double_clicked() {
                                         enter_edit = true;
                                     }
-                                    combined = combined | resp;
+                                    combined |= resp;
                                 }
                                 combined
                             })

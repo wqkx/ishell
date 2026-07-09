@@ -8,3 +8,19 @@ pub const FILE_HARD_LIMIT: u64 = 128 * 1024 * 1024;
 pub const LARGE_FILE_BYTES: usize = FILE_SOFT_LIMIT as usize;
 /// 同时打开的大文件标签上限（整文件驻留内存，防止多标签拖垮本机）。
 pub const MAX_LARGE_TABS: usize = 2;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 编译期锁定软/硬上限关系，避免运行时对常量 assert 触发 clippy。
+    const _: () = assert!(FILE_SOFT_LIMIT < FILE_HARD_LIMIT);
+    const _: () = assert!(LARGE_FILE_BYTES as u64 == FILE_SOFT_LIMIT);
+
+    #[test]
+    fn file_limits_match_documented_defaults() {
+        assert_eq!(FILE_SOFT_LIMIT, 20 * 1024 * 1024);
+        assert_eq!(FILE_HARD_LIMIT, 128 * 1024 * 1024);
+        assert_eq!(MAX_LARGE_TABS, 2);
+    }
+}

@@ -212,13 +212,30 @@ pub enum WorkerEvent {
     /// truncated = 文件被截断/轮转（此时 offset 已重置为新大小）
     FileTail { path: String, data: Vec<u8>, offset: u64, truncated: bool },
     /// PDF 页数查询成功（失败走 FileLoadFailed）。id 与占位标签对应。
-    PdfInfo { id: u64, path: String, pages: u32 },
+    /// `path` 供 UI 校验/日志（当前按 id 关联占位标签，字段保留）。
+    PdfInfo {
+        id: u64,
+        #[allow(dead_code)]
+        path: String,
+        pages: u32,
+    },
     /// PDF 单页渲染结果（PNG 字节；空表示该页渲染失败）
     PdfPage { path: String, page: u32, data: Vec<u8> },
     /// PDF 查找结果：命中 (页码, 该页首个命中行片段)；message=失败原因（如缺 pdftotext）
-    PdfSearch { path: String, query: String, hits: Vec<(u32, String)>, message: Option<String> },
+    PdfSearch {
+        path: String,
+        #[allow(dead_code)]
+        query: String,
+        hits: Vec<(u32, String)>,
+        message: Option<String>,
+    },
     /// 文档原始字节已读取（docx 查看器）。id 与占位标签对应。
-    DocOpened { id: u64, path: String, data: Vec<u8> },
+    DocOpened {
+        id: u64,
+        #[allow(dead_code)]
+        path: String,
+        data: Vec<u8>,
+    },
     /// 文本文件下载进度（驱动占位标签上的珊瑚色进度条）
     FileLoadProgress { id: u64, done: u64, total: u64 },
     /// 文本文件打开失败（移除占位标签 + 提示）

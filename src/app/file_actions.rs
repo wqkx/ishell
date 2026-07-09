@@ -149,7 +149,7 @@ impl App {
                 let id = s.next_xfer;
                 s.next_xfer += 1;
                 // 立即建占位标签（显示文件名 + 进度条），下载完成后由 FileOpened 填充内容
-                s.pending_placeholder.push((id, path.clone()));
+                s.pending.placeholder.push((id, path.clone()));
                 let _ = s.cmd_tx.send(UiCommand::ReadFile { id, path, force });
             }
             FileAction::OpenImage { path } => {
@@ -160,13 +160,13 @@ impl App {
                 // 与文本打开同构：先建占位标签（珊瑚线进度条），PdfInfo 就位后填充 PDF 视图
                 let id = s.next_xfer;
                 s.next_xfer += 1;
-                s.pending_placeholder.push((id, path.clone()));
+                s.pending.placeholder.push((id, path.clone()));
                 let _ = s.cmd_tx.send(UiCommand::PdfInfo { id, path });
             }
             FileAction::OpenDocx { path } => {
                 let id = s.next_xfer;
                 s.next_xfer += 1;
-                s.pending_placeholder.push((id, path.clone()));
+                s.pending.placeholder.push((id, path.clone()));
                 let _ = s.cmd_tx.send(UiCommand::ReadDoc { id, path });
             }
             FileAction::Move { srcs, dest_dir } => {

@@ -566,10 +566,9 @@ impl App {
                 let fb = self.xfer.pending_direct_fallback.remove(0);
                 self.execute_paste(fb.plan);
             }
-        } else if cancel {
-            if !self.xfer.pending_direct_fallback.is_empty() {
+        } else if cancel
+            && !self.xfer.pending_direct_fallback.is_empty() {
                 self.xfer.pending_direct_fallback.remove(0);
             }
-        }
     }
 }
