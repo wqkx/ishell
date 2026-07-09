@@ -3,6 +3,7 @@
 use crate::store::{self, SavedConnection};
 
 mod form;
+mod form_widgets;
 mod ui;
 
 #[derive(Clone, PartialEq)]

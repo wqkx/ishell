@@ -4,19 +4,20 @@
 //! 覆盖常见语言的注释、字符串、数字、关键字；不做完整 AST，常规语法问题尽量标出。
 
 mod indent;
-mod token;
+mod lang;
 mod lint;
+mod token;
 
 pub use indent::{detect_indent, Indent};
-pub use token::{
-    completion_words, highlight_segment, is_code, line_states, LineState,
-};
+pub use lang::{completion_words, is_code};
 pub use lint::{lint_enabled, lint_syntax};
+pub use token::{highlight_segment, line_states, LineState};
 
 #[cfg(test)]
 mod tests {
+    use super::lang::lang_for;
+    use super::token::{tokenize, Tok};
     use super::*;
-    use super::token::{lang_for, tokenize, Tok};
 
     /// 在 `text` 中找到 `pat` 的位置，返回覆盖它的 token 类别。
     fn tok_at(text: &str, ext: &str, pat: &str) -> Tok {
@@ -56,7 +57,10 @@ mod tests {
 
     #[test]
     fn py_decorator_and_numbers() {
-        assert_eq!(tok_at("@app.route\ndef f(): pass\n", "py", "@app.route"), Tok::Keyword);
+        assert_eq!(
+            tok_at("@app.route\ndef f(): pass\n", "py", "@app.route"),
+            Tok::Keyword
+        );
         // 科学计数整体是数字
         let src = "x = 1e-5\n";
         let lang = lang_for("py");

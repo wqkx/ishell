@@ -4,6 +4,7 @@ use crate::proto::ConnectConfig;
 use crate::store;
 use crate::theme::Palette;
 
+use super::form_widgets::{key_file_row, note_row, password_row, text_row, text_row_hint};
 use super::{AuthKind, ConnectForm, Mode};
 
 impl ConnectForm {
@@ -493,49 +494,33 @@ impl ConnectForm {
             .spacing([12.0, 12.0])
             .min_col_width(64.0)
             .show(ui, |ui| {
-                ui.label(crate::i18n::tr("名称", "Name"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.name)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(crate::i18n::tr("便于识别，可留空", "For display, optional")),
+                text_row_hint(
+                    ui,
+                    crate::i18n::tr("名称", "Name"),
+                    &mut self.name,
+                    crate::i18n::tr("便于识别，可留空", "For display, optional"),
                 );
-                ui.end_row();
 
-                ui.label(crate::i18n::tr("主机", "Host"));
-                let host_resp =
-                    ui.add(egui::TextEdit::singleline(&mut self.host).desired_width(f32::INFINITY));
+                let host_resp = text_row(ui, crate::i18n::tr("主机", "Host"), &mut self.host);
                 if self.focus_host {
                     host_resp.request_focus();
                     self.focus_host = false;
                 }
-                ui.end_row();
 
-                ui.label(crate::i18n::tr("端口", "Port"));
-                ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(f32::INFINITY));
-                ui.end_row();
-
-                ui.label(crate::i18n::tr("用户名", "User"));
-                ui.add(egui::TextEdit::singleline(&mut self.username).desired_width(f32::INFINITY));
-                ui.end_row();
-
-                ui.label(crate::i18n::tr("分组", "Group"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.group)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(crate::i18n::tr("可留空，用于归类", "Optional folder")),
+                text_row(ui, crate::i18n::tr("端口", "Port"), &mut self.port);
+                text_row(ui, crate::i18n::tr("用户名", "User"), &mut self.username);
+                text_row_hint(
+                    ui,
+                    crate::i18n::tr("分组", "Group"),
+                    &mut self.group,
+                    crate::i18n::tr("可留空，用于归类", "Optional folder"),
                 );
-                ui.end_row();
-
-                ui.label(crate::i18n::tr("标签", "Tags"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.tags)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(crate::i18n::tr(
-                            "逗号分隔，参与搜索",
-                            "Comma-separated, searchable",
-                        )),
+                text_row_hint(
+                    ui,
+                    crate::i18n::tr("标签", "Tags"),
+                    &mut self.tags,
+                    crate::i18n::tr("逗号分隔，参与搜索", "Comma-separated, searchable"),
                 );
-                ui.end_row();
 
                 ui.label(crate::i18n::tr("认证方式", "Auth"));
                 ui.horizontal(|ui| {
@@ -575,63 +560,39 @@ impl ConnectForm {
     fn auth_fields(&mut self, ui: &mut egui::Ui, w: f32) {
         match self.auth {
             AuthKind::Agent => {
-                ui.label("");
-                ui.label(
-                    RichText::new(crate::i18n::tr(
+                note_row(
+                    ui,
+                    crate::i18n::tr(
                         "使用本机 ssh-agent 中的私钥（先 ssh-add）",
                         "Use keys from local ssh-agent (ssh-add first)",
-                    ))
-                    .color(Palette::TEXT_DIM)
-                    .size(11.0),
+                    ),
                 );
-                ui.end_row();
             }
             AuthKind::Interactive => {
-                ui.label("");
-                ui.label(
-                    RichText::new(crate::i18n::tr(
+                note_row(
+                    ui,
+                    crate::i18n::tr(
                         "登录时按服务器提示逐项输入（支持验证码 / 二次验证）",
                         "Answer server prompts at login (OTP / 2FA)",
-                    ))
-                    .color(Palette::TEXT_DIM)
-                    .size(11.0),
+                    ),
                 );
-                ui.end_row();
             }
             AuthKind::Password => {
-                ui.label(crate::i18n::tr("密码", "Password"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.password)
-                        .desired_width(f32::INFINITY)
-                        .password(true),
-                );
-                ui.end_row();
+                password_row(ui, crate::i18n::tr("密码", "Password"), &mut self.password);
             }
             AuthKind::Key => {
-                ui.label(crate::i18n::tr("私钥路径", "Key file"));
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.key_path).desired_width(w - 36.0));
-                    if ui
-                        .button(egui_phosphor::regular::FOLDER_OPEN)
-                        .on_hover_text(crate::i18n::tr("浏览选择私钥文件", "Browse for key file"))
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_title(crate::i18n::tr("选择私钥文件", "Select key file"))
-                            .pick_file()
-                        {
-                            self.key_path = path.to_string_lossy().into_owned();
-                        }
-                    }
-                });
-                ui.end_row();
-                ui.label(crate::i18n::tr("私钥口令", "Passphrase"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.passphrase)
-                        .desired_width(f32::INFINITY)
-                        .password(true),
+                key_file_row(
+                    ui,
+                    crate::i18n::tr("私钥路径", "Key file"),
+                    &mut self.key_path,
+                    w,
+                    crate::i18n::tr("选择私钥文件", "Select key file"),
                 );
-                ui.end_row();
+                password_row(
+                    ui,
+                    crate::i18n::tr("私钥口令", "Passphrase"),
+                    &mut self.passphrase,
+                );
             }
         }
     }
@@ -670,22 +631,21 @@ impl ConnectForm {
                 .spacing([12.0, 10.0])
                 .min_col_width(64.0)
                 .show(ui, |ui| {
-                    ui.label(crate::i18n::tr("跳板主机", "Jump host"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.j_host).desired_width(f32::INFINITY),
+                    text_row(
+                        ui,
+                        crate::i18n::tr("跳板主机", "Jump host"),
+                        &mut self.j_host,
                     );
-                    ui.end_row();
-                    ui.label(crate::i18n::tr("跳板端口", "Jump port"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.j_port).desired_width(f32::INFINITY),
+                    text_row(
+                        ui,
+                        crate::i18n::tr("跳板端口", "Jump port"),
+                        &mut self.j_port,
                     );
-                    ui.end_row();
-                    ui.label(crate::i18n::tr("跳板用户", "Jump user"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.j_username)
-                            .desired_width(f32::INFINITY),
+                    text_row(
+                        ui,
+                        crate::i18n::tr("跳板用户", "Jump user"),
+                        &mut self.j_username,
                     );
-                    ui.end_row();
                     ui.label(crate::i18n::tr("跳板认证", "Jump auth"));
                     ui.horizontal(|ui| {
                         ui.selectable_value(
@@ -714,50 +674,31 @@ impl ConnectForm {
         match self.j_auth {
             AuthKind::Interactive => {}
             AuthKind::Agent => {
-                ui.label("");
-                ui.label(
-                    RichText::new(crate::i18n::tr("使用本机 ssh-agent", "Use local ssh-agent"))
-                        .color(Palette::TEXT_DIM)
-                        .size(11.0),
+                note_row(
+                    ui,
+                    crate::i18n::tr("使用本机 ssh-agent", "Use local ssh-agent"),
                 );
-                ui.end_row();
             }
             AuthKind::Password => {
-                ui.label(crate::i18n::tr("跳板密码", "Jump pwd"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.j_password)
-                        .desired_width(f32::INFINITY)
-                        .password(true),
+                password_row(
+                    ui,
+                    crate::i18n::tr("跳板密码", "Jump pwd"),
+                    &mut self.j_password,
                 );
-                ui.end_row();
             }
             AuthKind::Key => {
-                ui.label(crate::i18n::tr("跳板私钥", "Jump key"));
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.j_key_path).desired_width(w - 36.0),
-                    );
-                    if ui
-                        .button(egui_phosphor::regular::FOLDER_OPEN)
-                        .on_hover_text(crate::i18n::tr("浏览选择私钥文件", "Browse for key file"))
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_title(crate::i18n::tr("选择跳板机私钥", "Select jump key file"))
-                            .pick_file()
-                        {
-                            self.j_key_path = path.to_string_lossy().into_owned();
-                        }
-                    }
-                });
-                ui.end_row();
-                ui.label(crate::i18n::tr("私钥口令", "Passphrase"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.j_passphrase)
-                        .desired_width(f32::INFINITY)
-                        .password(true),
+                key_file_row(
+                    ui,
+                    crate::i18n::tr("跳板私钥", "Jump key"),
+                    &mut self.j_key_path,
+                    w,
+                    crate::i18n::tr("选择跳板机私钥", "Select jump key file"),
                 );
-                ui.end_row();
+                password_row(
+                    ui,
+                    crate::i18n::tr("私钥口令", "Passphrase"),
+                    &mut self.j_passphrase,
+                );
             }
         }
     }

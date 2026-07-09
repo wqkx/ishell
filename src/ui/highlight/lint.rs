@@ -2,7 +2,8 @@
 
 use std::ops::Range;
 
-use super::token::{lang_for, tokenize, Lang, Tok};
+use super::lang::{lang_for, Lang};
+use super::token::{tokenize, Tok};
 
 /// 是否对该语言做括号 lint。仅常见、括号配平规则明确的编程语言才判断；
 /// 文本/标记/配置/shell 等不判（避免对不认识的文本误报）。
