@@ -112,6 +112,8 @@ struct Session {
     osc7_confirm: bool,
     /// 已注入、等下个提示符上报 cwd 后把文件区跳过去
     osc7_pending_reveal: bool,
+    /// 远端是否支持 /proc 系统监控（None=尚未探测；false 时侧栏提示并跳过杀进程等）
+    monitor_ok: Option<bool>,
 }
 
 /// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
@@ -194,6 +196,8 @@ struct Transfers {
     direct_jobs: Vec<DirectJob>,
     /// 直传失败、待确认「转中转」的计划 + 原因（队列：多个失败依次弹，避免同帧互相覆盖）
     pending_direct_fallback: Vec<DirectFallback>,
+    /// 直传目标不在本机 known_hosts：待用户确认首次 TOFU（在源机 accept-new）后再执行
+    pending_direct_hostkey: Option<PendingPaste>,
 }
 
 /// 命令片段库状态（从 App 抽出的内聚字段组）。
@@ -389,6 +393,22 @@ impl Session {
                         self.reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
                         let tail = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("{secs}s 后重连"), crate::i18n::Lang::En => format!("reconnect in {secs}s") };
                         self.status = format!("{} · {}", self.status, tail);
+                    } else if self.was_connected && self.reconnect_tries >= MAX_TRIES {
+                        let msg = crate::i18n::tr(
+                            "自动重连已停止（已达 5 次），请手动重新连接",
+                            "Auto-reconnect stopped after 5 tries; reconnect manually",
+                        );
+                        self.status = format!("{} · {}", self.status, msg);
+                        self.pending_warn.push(msg.into());
+                    }
+                }
+                WorkerEvent::MonitorSupport(ok) => {
+                    self.monitor_ok = Some(ok);
+                    if !ok {
+                        self.pending_warn.push(crate::i18n::tr(
+                            "远端非 Linux 或缺少 /proc，系统监控已禁用",
+                            "Remote is not Linux or lacks /proc; system monitor disabled",
+                        ).into());
                     }
                 }
                 WorkerEvent::TerminalData(bytes) => {
@@ -707,6 +727,8 @@ struct ForwardUi {
     editing: Option<u64>,
     /// 表单内联校验错误（端口占用/参数无效等）
     error: Option<String>,
+    /// 非回环绑定待二次确认的转发规格（确认后才真正添加）
+    pending_open_bind: Option<crate::proto::ForwardSpec>,
 }
 
 /// "新增转发"表单状态。
@@ -1068,7 +1090,7 @@ impl App {
                 let big: String = (0..40000).map(|i| format!("{i}: the quick brown fox jumps over the lazy dog\n")).collect();
                 let t2 = app.alloc_editor_id();
                 let t3 = app.alloc_editor_id();
-                let mut ed = app.editor_state.lock().unwrap();
+                let mut ed = lock_mutex(&app.editor_state);
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new("/home/e5-1/demo.rs".into(), code),
                     server: server.clone(),
@@ -1338,6 +1360,7 @@ impl App {
             restore_cwd: false,
             osc7_confirm: false,
             osc7_pending_reveal: false,
+            monitor_ok: None,
         });
         self.active = Some(self.sessions.len() - 1);
         self.tabbar.scroll_to_active = true; // 新建标签后滚动到可视区
@@ -1357,6 +1380,7 @@ impl App {
         s.initialized = false;
         s.terminal = Terminal::new();
         s.sysinfo = None;
+        s.monitor_ok = None;
         // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建
         for f in &mut s.forwards {
             f.ok = true;
@@ -1368,7 +1392,8 @@ impl App {
         s.restore_cwd = true; // 重连成功后尝试 cd 回 last_cwd（保留不清空）
         s.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
         // M1：刷新该会话已打开编辑器标签的 cmd_tx——旧句柄随 worker 失效，否则重连后保存静默丢失。
-        if let Ok(mut es) = self.editor_state.lock() {
+        {
+            let mut es = lock_mutex(&self.editor_state);
             for t in es.tabs.iter_mut().filter(|t| t.uid == uid) {
                 t.cmd_tx = cmd_tx.clone();
             }
@@ -1781,7 +1806,7 @@ impl eframe::App for App {
         // 保留旧 mtime 让保存必走冲突确认流程，避免静默覆盖他人修改。
         {
             let now = self.ctx.input(|i| i.time);
-            let mut edst = self.editor_state.lock().unwrap();
+            let mut edst = lock_mutex(&self.editor_state);
             let mut any_follow = false;
             for (uid, path, data, offset, truncated) in tails {
                 if let Some(t) = edst.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
@@ -1893,7 +1918,7 @@ impl eframe::App for App {
             for _ in &new_placeholders {
                 ph_ids.push(self.alloc_editor_id());
             }
-            let mut ed = self.editor_state.lock().unwrap();
+            let mut ed = lock_mutex(&self.editor_state);
             // 1) 新建占位标签（同服务器同文件已打开则切过去）
             for ((id, path, server, uid, tx), tid) in new_placeholders.into_iter().zip(ph_ids) {
                 ed.focus = true;
@@ -2064,7 +2089,7 @@ impl eframe::App for App {
         }
         // 保存成功 → 更新对应标签 mtime（避免下次保存误判）；外部改动冲突 → 置标志，编辑器弹横幅。
         if !saved.is_empty() || !conflicts.is_empty() || !save_progress.is_empty() || !save_failed.is_empty() {
-            let mut ed = self.editor_state.lock().unwrap();
+            let mut ed = lock_mutex(&self.editor_state);
             for (uid, path, done, total) in save_progress {
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
                     t.save_done = done;
@@ -2164,7 +2189,7 @@ impl eframe::App for App {
 
         // 编辑器关闭标签后请求归还内存（deferred 回调里无法直接动 App，用共享标志传出）
         {
-            let mut ed = self.editor_state.lock().unwrap();
+            let mut ed = lock_mutex(&self.editor_state);
             if ed.trim_request {
                 ed.trim_request = false;
                 self.trim_after = Some(4);
@@ -2247,7 +2272,8 @@ impl eframe::App for App {
                 match self.active {
                     Some(idx) if idx < self.sessions.len() => {
                         let s = &mut self.sessions[idx];
-                        sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click, &mut gpu_click);
+                        let mon = s.monitor_ok;
+                        sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click, &mut gpu_click, mon);
                     }
                     _ => {
                         ui.add_space(16.0);
@@ -2362,6 +2388,8 @@ impl eframe::App for App {
 
         // 粘贴确认（跨服务器：含「直传/中转」互斥选择）
         self.paste_confirm_dialog(&ctx);
+        // 直传目标主机密钥未记录时的 TOFU 确认
+        self.direct_hostkey_dialog(&ctx);
         // 直传失败后的「必须改用中转」提醒
         self.direct_fallback_dialog(&ctx);
 

@@ -63,6 +63,7 @@ impl App {
             let _ = s.hostkey_tx.send(d);
             s.pending_hostkey = None;
         }
+        // 模态异常关闭时由 worker 侧 HOSTKEY_DECISION_TIMEOUT 兜底拒绝
     }
 
     /// 键盘交互认证：弹窗逐项收集回答，提交后经 cmd_tx 回 `KbdResponse`；取消则断开。
@@ -370,7 +371,10 @@ impl App {
     /// 关闭窗口前确认（仍有会话，或编辑器有未保存修改时——后者即使会话已全部关闭
     /// 也必须拦截，否则未保存内容会随主窗口静默丢失）。
     pub(super) fn handle_close(&mut self, ctx: &egui::Context) {
-        let dirty_tabs = self.editor_state.lock().map(|ed| ed.tabs.iter().filter(|t| t.editor.dirty()).count()).unwrap_or(0);
+        let dirty_tabs = {
+            let ed = super::util::lock_mutex(&self.editor_state);
+            ed.tabs.iter().filter(|t| t.editor.dirty()).count()
+        };
         if ctx.input(|i| i.viewport().close_requested())
             && !self.allow_close
             && (!self.sessions.is_empty() || dirty_tabs > 0)

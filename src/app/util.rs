@@ -10,6 +10,24 @@ pub(crate) fn local_port_in_use(host: &str, port: u16) -> bool {
     }
 }
 
+/// 绑定地址是否为回环（仅本机可连）。空串按 127.0.0.1 处理。
+pub(crate) fn is_loopback_bind(host: &str) -> bool {
+    let h = host.trim();
+    h.is_empty() || h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+/// 解毒 Mutex：持锁线程 panic 后仍可恢复状态，避免 UI 线程二次 unwrap 崩溃。
+pub(crate) fn lock_mutex<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 本机 ~/.ssh/known_hosts 是否已记录该主机（用于直传时选择 StrictHostKeyChecking）。
+pub(crate) fn host_in_known_hosts(host: &str, port: u16) -> bool {
+    russh::keys::known_hosts::known_host_keys(host, port)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// 取远端路径的所在目录：去尾斜杠后截到最后一个 `/`；根下或无斜杠返回 `/`。
 pub(crate) fn parent_dir(path: &str) -> String {
     let t = path.trim_end_matches('/');

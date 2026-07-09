@@ -146,6 +146,9 @@ pub struct DirectSpec {
     pub key_path: String,
     /// 展示名（首个条目名 + 数量），用于传输行标题
     pub label: String,
+    /// true：本机 known_hosts 已有该目标 → 远端 ssh 用 StrictHostKeyChecking=yes；
+    /// false：用户已确认首次 TOFU → 用 accept-new（仅首次自动信任）。
+    pub dest_host_known: bool,
 }
 
 /// 端口转发类型。
@@ -180,6 +183,8 @@ pub enum WorkerEvent {
     TerminalData(Vec<u8>),
     /// 周期性系统信息快照
     SysInfo(Box<SysInfo>),
+    /// 远端是否支持 Linux /proc 系统监控（连接后探测一次）
+    MonitorSupport(bool),
     /// 目录列表结果
     DirListing { path: String, entries: Vec<FileEntry> },
     /// 目录列举失败。`retryable`=true 表示会话级错误（弱网/SFTP 通道重连中），UI 应保留

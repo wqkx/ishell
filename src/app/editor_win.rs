@@ -5,6 +5,7 @@ use egui::RichText;
 use crate::proto::UiCommand;
 use crate::theme::Palette;
 
+use super::util::lock_mutex;
 use super::widgets::*;
 use super::doc_view::doc_view;
 use super::{App, DocKind, EditorState};
@@ -58,7 +59,7 @@ impl App {
     pub(super) fn editor_window(&mut self, ctx: &egui::Context) {
         // 标题随激活文件变化：锁内算好即释放，回调运行时再单独加锁（二者不同时持锁）。
         let title = {
-            let mut ed = self.editor_state.lock().unwrap();
+            let mut ed = lock_mutex(&self.editor_state);
             if ed.tabs.is_empty() {
                 return; // 无标签：不再注册 viewport → eframe 自动关闭该窗口
             }
@@ -84,7 +85,7 @@ impl App {
 
         ctx.show_viewport_deferred(vid, builder, move |vctx, _class| {
             use egui_phosphor::regular as icon;
-            let mut ed = state.lock().unwrap();
+            let mut ed = lock_mutex(&state);
             if ed.tabs.is_empty() {
                 return;
             }

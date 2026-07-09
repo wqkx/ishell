@@ -135,6 +135,8 @@ pub struct Renaming {
     pub idx: usize,
     pub buf: String,
     pub init: bool,
+    /// 行内重命名输入框的 IME 组字范围（与 dialog_ime 同理，绕开 egui Commit 门）
+    pub ime: Option<(usize, usize)>,
 }
 
 /// 模态小对话框。
@@ -1414,28 +1416,29 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
                     row.set_selected(state.selected.contains(&i));
                     row.col(|ui| {
                         // 重命名中：显示输入框（默认选中后缀前的主名）
+                        // 必须走 ime_singleline：与新建文件夹相同，绕开 egui 0.34 fcitx Commit 门
+                        // （否则中文只能输一次 / 第二次无法组字）。
                         let renaming_here = matches!(&state.renaming, Some(r) if r.idx == i);
                         if renaming_here {
                             if let Some(r) = &mut state.renaming {
-                                let out = egui::TextEdit::singleline(&mut r.buf)
-                                    .desired_width(f32::INFINITY)
-                                    .show(ui);
+                                let te_id = "file_rename_inline";
+                                let (resp, submit) = ime_singleline(ui, te_id, &mut r.buf, &mut r.ime);
                                 if r.init {
                                     let stem = stem_char_len(&r.buf);
-                                    let id = out.response.id;
-                                    let mut st = out.state;
+                                    let id = egui::Id::new(te_id);
+                                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
                                     st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(
                                         egui::text::CCursor::new(0),
                                         egui::text::CCursor::new(stem),
                                     )));
                                     st.store(ui.ctx(), id);
-                                    out.response.request_focus();
+                                    resp.request_focus();
                                     r.init = false;
                                 }
-                                if out.response.lost_focus() {
-                                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !r.buf.trim().is_empty() {
-                                        rename_commit = Some((full.clone(), join_path(&cwd, r.buf.trim())));
-                                    }
+                                if submit && !r.buf.trim().is_empty() {
+                                    rename_commit = Some((full.clone(), join_path(&cwd, r.buf.trim())));
+                                }
+                                if resp.lost_focus() {
                                     cancel_rename = true;
                                 }
                             }
@@ -1640,7 +1643,7 @@ fn file_list(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool, acti
     if let Some((i, t)) = state.pending_rename {
         if now - t > 0.40 {
             if let Some(e) = entries.get(i) {
-                state.renaming = Some(Renaming { idx: i, buf: e.name.clone(), init: true });
+                state.renaming = Some(Renaming { idx: i, buf: e.name.clone(), init: true, ime: None });
             }
             state.pending_rename = None;
         } else {
@@ -2288,11 +2291,11 @@ fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<File
             }
             Dialog::Rename { path, name } => {
                 modal(&ctx, crate::i18n::tr("重命名", "Rename"), |ui| {
-                    let resp = ui.text_edit_singleline(name);
+                    // 与新建文件夹相同：自绘 IME，避免 fcitx 下中文第二次无法输入
+                    let (resp, submit) = ime_singleline(ui, "rename_name", name, &mut ime);
                     if ui.memory(|m| m.focused().is_none()) {
                         resp.request_focus();
                     }
-                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {

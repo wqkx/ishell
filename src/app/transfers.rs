@@ -6,7 +6,7 @@ use egui::RichText;
 use crate::proto::{ConflictPolicy, UiCommand};
 use crate::theme::Palette;
 
-use super::util::parent_dir;
+use super::util::{host_in_known_hosts, parent_dir};
 use super::widgets::{dialog_body, dialog_button};
 use super::{App, DirectFallback, DirectJob, FileClip, PendingPaste, Relay, RelayPhase, Session, Transfer};
 
@@ -301,7 +301,12 @@ impl App {
 
     /// 执行跨服务器「直传」：据目标会话配置构造 DirectSpec，交源会话 worker 在源主机上
     /// 直接 rsync/scp 推到目标主机。仅目标为「无口令密钥」认证时可用；否则立即弹「转中转」。
+    /// `hostkey_confirmed`：目标不在本机 known_hosts 时须先经 UI 确认 TOFU。
     pub(super) fn execute_direct(&mut self, plan: PendingPaste) {
+        self.execute_direct_inner(plan, false);
+    }
+
+    fn execute_direct_inner(&mut self, plan: PendingPaste, hostkey_confirmed: bool) {
         let Some(si) = self.session_idx_by_uid(plan.src_uid) else {
             if let Some(di) = self.session_idx_by_uid(plan.dest_uid) {
                 self.sessions[di].status = crate::i18n::tr("源会话已关闭，无法直传", "Source session closed; cannot direct-transfer").into();
@@ -326,6 +331,11 @@ impl App {
                 return;
             }
         };
+        let dest_host_known = host_in_known_hosts(&dest_cfg.host, dest_cfg.port);
+        if !dest_host_known && !hostkey_confirmed {
+            self.xfer.pending_direct_hostkey = Some(plan);
+            return;
+        }
         let n = plan.items.len();
         let first = plan.items.first().map(|(p, _)| p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(p).to_string()).unwrap_or_default();
         let label = if n > 1 { format!("{first} +{}", n - 1) } else { first };
@@ -359,6 +369,7 @@ impl App {
             dest_dir: plan.dest_dir.clone(),
             key_path,
             label: label.clone(),
+            dest_host_known,
         };
         let _ = self.sessions[si].cmd_tx.send(UiCommand::DirectTransfer(Box::new(spec)));
         self.xfer.direct_jobs.push(DirectJob {
@@ -472,6 +483,51 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// 直传目标不在本机 known_hosts：确认后才允许源机 accept-new（首次 TOFU）。
+    pub(super) fn direct_hostkey_dialog(&mut self, ctx: &egui::Context) {
+        let Some(plan) = self.xfer.pending_direct_hostkey.as_ref() else { return };
+        let dest = plan.dest_label.clone();
+        let mut go = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("direct_hostkey")).show(ctx, |ui| {
+            dialog_body(ui, |ui| {
+                ui.label(RichText::new(crate::i18n::tr(
+                    "直传目标主机密钥未在本机记录",
+                    "Direct-transfer target host key not in local known_hosts",
+                )).size(16.0).strong());
+                ui.add_space(8.0);
+                ui.label(RichText::new(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("目标：{dest}"),
+                    crate::i18n::Lang::En => format!("Target: {dest}"),
+                }).size(12.0));
+                ui.add_space(6.0);
+                ui.label(RichText::new(crate::i18n::tr(
+                    "继续将使源主机以 accept-new 首次信任该目标（指纹确认发生在源机，不经本机 iShell 弹窗）。仅在确认目标无误时继续；否则请改用中转。",
+                    "Continuing lets the source host trust the target via accept-new on first connect (TOFU on the source, not in iShell). Continue only if the target is correct; otherwise use relay.",
+                )).color(Palette::DANGER).size(11.0));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let bw = 110.0;
+                    let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                    ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                    if dialog_button(ui, crate::i18n::tr("仍直传", "Direct anyway"), Some(Palette::DANGER), bw) {
+                        go = true;
+                    }
+                    if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
+                        cancel = true;
+                    }
+                });
+            });
+        });
+        if go {
+            if let Some(plan) = self.xfer.pending_direct_hostkey.take() {
+                self.execute_direct_inner(plan, true);
+            }
+        } else if cancel {
+            self.xfer.pending_direct_hostkey = None;
         }
     }
 

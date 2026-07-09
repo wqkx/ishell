@@ -112,13 +112,28 @@ fn keychain_available() -> bool {
     }
 }
 
-/// 在限定时间内执行可能阻塞的钥匙串操作；超时则放弃（线程将自行结束/泄漏一次，因主密钥已缓存）。
+/// 同时进行的钥匙串超时调用上限，避免反复超时堆积泄漏线程。
+static KEYCHAIN_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const KEYCHAIN_MAX_INFLIGHT: usize = 2;
+
+/// 在限定时间内执行可能阻塞的钥匙串操作；超时则放弃。
+/// 超时线程可能短暂存活至钥匙串返回，但并发数有上限，避免无限堆积。
 fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    use std::sync::atomic::Ordering;
+    let prev = KEYCHAIN_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    if prev >= KEYCHAIN_MAX_INFLIGHT {
+        KEYCHAIN_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
+        KEYCHAIN_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     });
-    rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(v) => Some(v),
+        Err(_) => None, // 超时：工作线程结束后自行减计数
+    }
 }
 
 fn keychain_entry() -> Option<keyring::Entry> {
@@ -302,26 +317,37 @@ fn cipher() -> Option<ChaCha20Poly1305> {
 }
 
 /// 加密一个秘密字段为 `enc:v1:<base64(nonce||ciphertext)>`；
-/// 空串原样返回；任何失败则退化为明文（不阻断保存）。
-pub fn encrypt_secret(plain: &str) -> String {
+/// 空串原样返回；失败返回 Err（fail-closed，绝不静默落盘明文）。
+pub fn encrypt_secret(plain: &str) -> Result<String, String> {
     if plain.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
     if plain.starts_with(ENC_PREFIX) {
-        return plain.to_string(); // 已是密文
+        return Ok(plain.to_string()); // 已是密文
     }
-    let Some(c) = cipher() else { return plain.to_string() };
+    let Some(c) = cipher() else {
+        return Err(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => "无法初始化密码加密（主密钥不可用）".into(),
+            crate::i18n::Lang::En => "Cannot init secret encryption (master key unavailable)".into(),
+        });
+    };
     let mut nonce = [0u8; 12];
     if getrandom::getrandom(&mut nonce).is_err() {
-        return plain.to_string();
+        return Err(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => "无法生成加密随机数".into(),
+            crate::i18n::Lang::En => "Failed to generate encryption nonce".into(),
+        });
     }
     match c.encrypt(Nonce::from_slice(&nonce), plain.as_bytes()) {
         Ok(ct) => {
             let mut blob = nonce.to_vec();
             blob.extend_from_slice(&ct);
-            format!("{ENC_PREFIX}{}", STANDARD.encode(blob))
+            Ok(format!("{ENC_PREFIX}{}", STANDARD.encode(blob)))
         }
-        Err(_) => plain.to_string(),
+        Err(_) => Err(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => "密码加密失败".into(),
+            crate::i18n::Lang::En => "Secret encryption failed".into(),
+        }),
     }
 }
 
@@ -618,35 +644,38 @@ pub fn load() -> Vec<SavedConnection> {
         c.jump_passphrase = decrypt_secret(&c.jump_passphrase);
     }
     if needs_migrate {
-        save(&list); // 以密文重写，完成迁移
+        if let Err(e) = save(&list) {
+            log::warn!("明文密码迁移加密失败，保留原文件不覆盖：{e}");
+        }
     }
     list
 }
 
 /// 写回连接列表（密码/口令加密后落盘）。
-pub fn save(list: &[SavedConnection]) {
+/// 任一秘密字段加密失败则整次保存中止，避免静默写入明文密码。
+pub fn save(list: &[SavedConnection]) -> Result<(), String> {
     let Some(path) = config_path() else {
-        return;
+        return Err(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => "无法定位配置目录".into(),
+            crate::i18n::Lang::En => "Config directory unavailable".into(),
+        });
     };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let encrypted: Vec<SavedConnection> = list
-        .iter()
-        .map(|c| {
-            let mut e = c.clone();
-            e.password = encrypt_secret(&c.password);
-            e.passphrase = encrypt_secret(&c.passphrase);
-            e.jump_password = encrypt_secret(&c.jump_password);
-            e.jump_passphrase = encrypt_secret(&c.jump_passphrase);
-            e
-        })
-        .collect();
-    if let Ok(json) = serde_json::to_string_pretty(&encrypted) {
-        if write_atomic(&path, &json).is_ok() {
-            restrict_perms(&path);
-        }
+    let mut encrypted = Vec::with_capacity(list.len());
+    for c in list {
+        let mut e = c.clone();
+        e.password = encrypt_secret(&c.password)?;
+        e.passphrase = encrypt_secret(&c.passphrase)?;
+        e.jump_password = encrypt_secret(&c.jump_password)?;
+        e.jump_passphrase = encrypt_secret(&c.jump_passphrase)?;
+        encrypted.push(e);
     }
+    let json = serde_json::to_string_pretty(&encrypted).map_err(|e| e.to_string())?;
+    write_atomic(&path, &json).map_err(|e| e.to_string())?;
+    restrict_perms(&path);
+    Ok(())
 }
 
 // ———————————————————————— 导入 ~/.ssh/config ————————————————————————
@@ -945,5 +974,20 @@ Host pat-*
         assert_eq!(h, "gw.example.com");
         assert_eq!(p, 2200);
         assert_eq!(u, "bastion");
+    }
+
+    #[test]
+    fn encrypt_secret_roundtrip_or_fail_closed() {
+        // 空串始终成功
+        assert_eq!(encrypt_secret("").unwrap(), "");
+        // 有主密钥时加密应产出 enc:v1: 前缀；无密钥环境则 Err（不得返回明文）
+        match encrypt_secret("s3cret") {
+            Ok(ct) => {
+                assert!(ct.starts_with(ENC_PREFIX), "ciphertext must use enc prefix, got {ct}");
+                assert_ne!(ct, "s3cret");
+                assert_eq!(decrypt_secret(&ct), "s3cret");
+            }
+            Err(e) => assert!(!e.is_empty()),
+        }
     }
 }

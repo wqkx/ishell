@@ -42,6 +42,8 @@ pub fn show(
     sort_mem: &mut bool,
     proc_click: &mut Option<(u32, egui::Pos2)>,
     gpu_click: &mut Option<egui::Pos2>,
+    // None=探测中；Some(false)=非 Linux / 无 /proc，监控不可用
+    monitor_ok: Option<bool>,
 ) {
     use egui_phosphor::regular as icon;
     egui::ScrollArea::vertical()
@@ -52,6 +54,15 @@ pub fn show(
         .show(ui, |ui| {
         // 适度行距（与快速连接列表一致的舒展感）
         ui.spacing_mut().item_spacing.y = 3.5;
+        if monitor_ok == Some(false) {
+            crate::ui::empty_state(
+                ui,
+                icon::WARNING,
+                tr("系统监控仅支持 Linux 远端（需 /proc）", "Monitor requires a Linux remote with /proc"),
+                false,
+            );
+            return;
+        }
         let Some(info) = info else {
             crate::ui::empty_state(ui, icon::CLOCK, tr("等待系统信息 …", "Waiting for system info …"), true);
             return;

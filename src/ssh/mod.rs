@@ -161,15 +161,30 @@ fn replace_known_host(host: &str, port: u16, new_key: &ssh_key::PublicKey) -> an
     Ok(())
 }
 
+/// 主机密钥确认等待上限：UI 异常关闭/卡住时避免 worker 永久挂起。
+const HOSTKEY_DECISION_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl ClientHandler {
     /// 未知或变更的主机密钥：弹窗请用户确认（changed=true 表示密钥已变更）。
+    /// 超时或通道关闭视为拒绝。
     async fn ask_trust(&mut self, fp: String, changed: bool) -> bool {
         self.sink.send(WorkerEvent::HostKeyPrompt {
             host: format!("{}:{}", self.host, self.port),
             fingerprint: fp,
             changed,
         });
-        matches!(self.decision_rx.lock().await.recv().await, Some(true))
+        let mut rx = self.decision_rx.lock().await;
+        match tokio::time::timeout(HOSTKEY_DECISION_TIMEOUT, rx.recv()).await {
+            Ok(Some(true)) => true,
+            Ok(Some(false)) | Ok(None) => false,
+            Err(_) => {
+                self.sink.send(WorkerEvent::Status(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => "主机密钥确认超时，已拒绝连接".into(),
+                    crate::i18n::Lang::En => "Host key confirmation timed out; connection rejected".into(),
+                }));
+                false
+            }
+        }
     }
 }
 
@@ -329,9 +344,21 @@ pub async fn run(
     let mut sftp_reconnecting = false;
 
     // 3) 系统信息采集任务（独立 handle 克隆，互不阻塞）
+    // 先探测 uname：非 Linux 或无 /proc 则禁用监控，避免空数据/误杀进程。
     let probe_handle = handle.clone();
     let probe_sink = sink.clone();
     let probe_task = tokio::spawn(async move {
+        let linux_ok = match exec_capture(&probe_handle, "uname -s 2>/dev/null; test -r /proc/stat && echo HAS_PROC").await {
+            Ok(out) => {
+                let u = out.to_ascii_lowercase();
+                u.contains("linux") && u.contains("has_proc")
+            }
+            Err(_) => false,
+        };
+        probe_sink.send(WorkerEvent::MonitorSupport(linux_ok));
+        if !linux_ok {
+            return;
+        }
         let mut sampler = SysSampler::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         loop {
@@ -765,8 +792,10 @@ pub async fn run(
                         let h = handle.clone();
                         let s = sink.clone();
                         tokio::spawn(async move {
-                            // 检查退出码：权限不足 / PID 不存在时如实反馈，而非一律「已发送」
-                            let msg = match exec_status(&h, &format!("kill -9 {pid}")).await {
+                            // 先 SIGTERM 再短等，仍存活则 SIGKILL；检查退出码如实反馈
+                            let msg = match exec_status(&h, &format!(
+                                "kill -15 {pid} 2>/dev/null; sleep 0.3; kill -0 {pid} 2>/dev/null && kill -9 {pid}; kill -0 {pid} 2>/dev/null && exit 1 || exit 0"
+                            )).await {
                                 Ok((0, _)) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已结束进程 {pid}"), crate::i18n::Lang::En => format!("Killed {pid}") },
                                 Ok((_, err)) => {
                                     let e = err.trim();
@@ -1176,13 +1205,52 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// 本地解压 tar.gz 到 dest 目录（纯 Rust，不依赖系统 tar）。
+/// 逐条校验路径：拒绝绝对路径、`..` 组件与指向 dest 外的链接，防止路径穿越写任意本地文件。
 fn extract_tar_gz(path: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
     let f = std::fs::File::open(path)?;
     let gz = flate2::read::GzDecoder::new(f);
     let mut ar = tar::Archive::new(gz);
     std::fs::create_dir_all(dest)?;
-    ar.unpack(dest)?;
+    let dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.into_owned();
+        if !tar_entry_path_safe(&entry_path) {
+            anyhow::bail!(
+                "{}",
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("拒绝不安全的归档路径：{}", entry_path.display()),
+                    crate::i18n::Lang::En => format!("Refusing unsafe archive path: {}", entry_path.display()),
+                }
+            );
+        }
+        // unpack_in 将相对路径落在 dest 下；返回 false 表示被跳过（含 ..）
+        if !entry.unpack_in(&dest)? {
+            anyhow::bail!(
+                "{}",
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("归档条目无法安全解压：{}", entry_path.display()),
+                    crate::i18n::Lang::En => format!("Archive entry could not be unpacked safely: {}", entry_path.display()),
+                }
+            );
+        }
+    }
     Ok(())
+}
+
+/// 归档条目路径是否可安全解压到目标目录内（相对路径、无 `..`、非绝对）。
+fn tar_entry_path_safe(p: &std::path::Path) -> bool {
+    use std::path::Component;
+    if p.as_os_str().is_empty() || p.is_absolute() {
+        return false;
+    }
+    for c in p.components() {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 /// 读取远程目录，返回（规范化后的绝对路径, 条目列表）。目录在前、按名排序。
@@ -1461,11 +1529,12 @@ async fn direct_transfer_inner(
     let srcs = join_quoted(&spec.srcs);
     // 目标强制以 "/" 结尾，令 rsync/scp 把源放「入目录」而非改名
     let dest = sh_quote(&format!("{}@{}:{}/", spec.dest_user, spec.dest_host, spec.dest_dir));
-    // 非交互 ssh 选项：用 accept-new（TOFU：首次记录、之后校验源主机上的 known_hosts），
-    // 比 StrictHostKeyChecking=no 安全——重复直传能发现目标主机密钥被替换（MITM）。
+    // 主机密钥策略：本机已信任目标 → yes（拒绝未知/变更）；用户确认过的首次 → accept-new。
+    // 绝不使用 StrictHostKeyChecking=no。
+    let hk = if spec.dest_host_known { "yes" } else { "accept-new" };
     let ssh_opt = format!(
-        "ssh -p {} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15",
-        spec.dest_port, sh_quote(&tmp_key)
+        "ssh -p {} -i {} -o StrictHostKeyChecking={} -o BatchMode=yes -o ConnectTimeout=15",
+        spec.dest_port, sh_quote(&tmp_key), hk
     );
 
     // 4) 优先 rsync（可解析进度、可续传）；缺失则回退 scp（仅 spinner）
@@ -1475,8 +1544,8 @@ async fn direct_transfer_inner(
     } else {
         // scp 用大写 -P 指定端口；其余 ssh 选项同样适用
         format!(
-            "scp -P {} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -r -- {}{}",
-            spec.dest_port, sh_quote(&tmp_key), srcs, dest
+            "scp -P {} -i {} -o StrictHostKeyChecking={} -o BatchMode=yes -o ConnectTimeout=15 -r -- {}{}",
+            spec.dest_port, sh_quote(&tmp_key), hk, srcs, dest
         )
     };
 
@@ -2608,5 +2677,21 @@ fn remote_parent(path: &str) -> String {
     match trimmed.rfind('/') {
         Some(0) | None => "/".into(),
         Some(i) => trimmed[..i].to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tar_entry_path_safe;
+    use std::path::Path;
+
+    #[test]
+    fn tar_paths_reject_traversal() {
+        assert!(tar_entry_path_safe(Path::new("ok/file.txt")));
+        assert!(tar_entry_path_safe(Path::new("./nested/a")));
+        assert!(!tar_entry_path_safe(Path::new("../escape")));
+        assert!(!tar_entry_path_safe(Path::new("a/../../b")));
+        assert!(!tar_entry_path_safe(Path::new("/abs/path")));
+        assert!(!tar_entry_path_safe(Path::new("")));
     }
 }

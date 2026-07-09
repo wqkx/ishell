@@ -209,7 +209,9 @@ impl ConnectForm {
                         {
                             if i < self.saved.len() {
                                 self.saved.remove(i);
-                                store::save(&self.saved);
+                                if let Err(e) = store::save(&self.saved) {
+                                    self.error = Some(e);
+                                }
                             }
                             self.sel = None;
                             close = true;
@@ -483,11 +485,15 @@ impl ConnectForm {
                 added += 1;
             }
         }
-        store::save(&self.saved);
-        self.notice = Some(match crate::i18n::current() {
-            crate::i18n::Lang::Zh => format!("已导入：新增 {added}，更新 {updated}"),
-            crate::i18n::Lang::En => format!("Imported: {added} new, {updated} updated"),
-        });
+        match store::save(&self.saved) {
+            Ok(()) => {
+                self.notice = Some(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("已导入：新增 {added}，更新 {updated}"),
+                    crate::i18n::Lang::En => format!("Imported: {added} new, {updated} updated"),
+                });
+            }
+            Err(e) => self.error = Some(e),
+        }
     }
 
     fn reset_form(&mut self) {
@@ -600,7 +606,16 @@ impl ConnectForm {
 
         ui.add_space(6.0);
         ui.checkbox(&mut self.forward_agent, crate::i18n::tr("转发本机 ssh-agent（-A）", "Forward ssh-agent (-A)"))
-            .on_hover_text(crate::i18n::tr("让远端进程复用本机 agent 的私钥；仅在连接可信主机时开启", "Let remote reuse local agent keys; enable only for trusted hosts"));
+            .on_hover_text(crate::i18n::tr(
+                "让远端任意进程复用本机 agent 的全部私钥，无密钥级限制；仅在完全信任的主机上开启",
+                "Lets any remote process use all keys in your local agent with no per-key restriction; enable only on fully trusted hosts",
+            ));
+        if self.forward_agent {
+            ui.label(RichText::new(crate::i18n::tr(
+                "⚠ 风险：远端任意进程可使用本机 agent 中的全部私钥，等同于把本地身份交给该主机。",
+                "⚠ Risk: any remote process can use every key in your local agent — equivalent to handing your local identity to that host.",
+            )).color(Palette::DANGER).size(11.0));
+        }
 
         ui.add_space(8.0);
         ui.checkbox(&mut self.use_jump, crate::i18n::tr("通过跳板机连接（ProxyJump）", "Via jump host (ProxyJump)"));
@@ -795,8 +810,10 @@ impl ConnectForm {
         }
         // 更新编辑标识为新值，便于在同一编辑会话内二次保存仍命中同一条目
         self.editing = Some((entry.name, entry.host));
-        store::save(&self.saved);
-        self.error = None;
+        match store::save(&self.saved) {
+            Ok(()) => self.error = None,
+            Err(e) => self.error = Some(e),
+        }
     }
 
     fn build(&self) -> Result<ConnectConfig, String> {

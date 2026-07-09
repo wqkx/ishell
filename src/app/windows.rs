@@ -439,7 +439,14 @@ impl App {
             // 发往「打开弹窗时所属会话」(uid)，而非当前 active——避免 Ctrl+Tab 切走后误 kill 别的主机
             let target = self.popups.proc.as_ref().and_then(|p| self.session_idx_by_uid(p.uid));
             if let Some(i) = target {
-                let _ = self.sessions[i].cmd_tx.send(UiCommand::KillProc(pid));
+                if self.sessions[i].monitor_ok == Some(false) {
+                    self.toast = Some((
+                        crate::i18n::tr("远端不支持进程管理", "Remote does not support process control").into(),
+                        ctx.input(|inp| inp.time),
+                    ));
+                } else {
+                    let _ = self.sessions[i].cmd_tx.send(UiCommand::KillProc(pid));
+                }
             }
             self.popups.proc = None;
         } else if close || (outside && !self.popups.proc_just_opened && !arm_kill) {
@@ -504,6 +511,12 @@ impl App {
                     ui.label(":");
                     ui.add(egui::TextEdit::singleline(&mut f.local_port).desired_width(48.0).hint_text(crate::i18n::tr("端口", "Port")));
                 });
+                if !is_loopback_bind(&f.bind) {
+                    ui.label(RichText::new(crate::i18n::tr(
+                        "⚠ 非回环地址：局域网内他人可使用此转发（SOCKS5 无认证）",
+                        "⚠ Non-loopback: others on the LAN can use this forward (SOCKS5 has no auth)",
+                    )).color(Palette::DANGER).size(11.0));
+                }
                 if f.kind == 0 {
                     ui.horizontal(|ui| {
                         ui.label(crate::i18n::tr("目标", "Target"));
@@ -639,7 +652,7 @@ impl App {
             self.fwd.just_opened = true; // 点编辑不算窗外点击
         }
         // 添加 / 保存：先做本地端口占用 + 重复校验，通过才发起（编辑则先删旧再加新）
-        if let Some(mut spec) = add_spec {
+        if let Some(spec) = add_spec {
             let editing = self.fwd.editing;
             // 与现有转发重复（排除正在编辑的那条），或本机端口已被占用
             let dup = self.sessions.get(idx).is_some_and(|s| {
@@ -657,41 +670,49 @@ impl App {
                     crate::i18n::Lang::En => format!("Local port {} is already in use", spec.bind_port),
                 });
                 self.fwd.just_opened = true;
-            } else {
-                // 编辑模式：先删旧转发（移除记录 + 通知 worker 关闭监听）
-                if let Some(old) = editing {
-                    if let Some(s) = self.sessions.get_mut(idx) {
-                        s.forwards.retain(|f| f.id != old);
-                        let _ = s.cmd_tx.send(UiCommand::RemoveForward(old));
-                    }
-                }
-                if let Some(s) = self.sessions.get_mut(idx) {
-                    let id = s.next_forward;
-                    s.next_forward += 1;
-                    spec.id = id;
-                    let label = match &spec.kind {
-                        ForwardKind::Local { remote_host, remote_port } => {
-                            format!("{}:{} → {}:{}", spec.bind_host, spec.bind_port, remote_host, remote_port)
-                        }
-                        ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
-                    };
-                    s.forwards.push(ForwardEntry {
-                        id,
-                        label,
-                        status: crate::i18n::tr("启动中 …", "Starting …").into(),
-                        ok: true,
-                        bind_host: spec.bind_host.clone(),
-                        bind_port: spec.bind_port,
-                        kind: spec.kind.clone(),
-                    });
-                    let _ = s.cmd_tx.send(UiCommand::AddForward(spec));
-                }
-                self.fwd.editing = None;
-                self.fwd.error = None;
-                self.fwd.form.local_port.clear();
-                self.fwd.form.target_host.clear();
-                self.fwd.form.target_port.clear();
+            } else if !is_loopback_bind(&spec.bind_host) {
+                // 非回环：二次确认后再真正添加（SOCKS5 无认证时即开放代理）
+                self.fwd.pending_open_bind = Some(spec);
                 self.fwd.just_opened = true;
+            } else {
+                self.commit_forward(idx, spec, editing);
+            }
+        }
+        // 非回环绑定二次确认
+        if self.fwd.pending_open_bind.is_some() {
+            let mut accept = false;
+            let mut reject = false;
+            let bind_desc = self.fwd.pending_open_bind.as_ref().map(|s| {
+                format!("{}:{}", s.bind_host, s.bind_port)
+            }).unwrap_or_default();
+            egui::Modal::new(egui::Id::new("fwd_open_bind")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(RichText::new(crate::i18n::tr("确认对外开放转发？", "Expose forward on the network?")).size(16.0).strong().color(Palette::DANGER));
+                ui.add_space(8.0);
+                ui.label(RichText::new(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("将绑定 {bind_desc}（非回环）。局域网内他人可使用此转发；动态 SOCKS5 无认证，等同开放代理。"),
+                    crate::i18n::Lang::En => format!("Will bind {bind_desc} (non-loopback). Others on the LAN can use it; dynamic SOCKS5 has no auth (open proxy)."),
+                }).size(12.0));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let bw = 120.0;
+                    let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                    ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                    if dialog_button(ui, crate::i18n::tr("仍然开放", "Expose anyway"), Some(Palette::DANGER), bw) {
+                        accept = true;
+                    }
+                    if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
+                        reject = true;
+                    }
+                });
+            });
+            if accept {
+                if let Some(spec) = self.fwd.pending_open_bind.take() {
+                    let editing = self.fwd.editing;
+                    self.commit_forward(idx, spec, editing);
+                }
+            } else if reject {
+                self.fwd.pending_open_bind = None;
             }
         }
         if let Some(id) = remove_id {
@@ -700,6 +721,45 @@ impl App {
                 let _ = s.cmd_tx.send(UiCommand::RemoveForward(id));
             }
         }
+    }
+
+    /// 真正添加/更新一条端口转发（编辑则先删旧再加新），并复位表单。
+    fn commit_forward(&mut self, idx: usize, mut spec: crate::proto::ForwardSpec, editing: Option<u64>) {
+        use crate::proto::ForwardKind;
+        if let Some(old) = editing {
+            if let Some(s) = self.sessions.get_mut(idx) {
+                s.forwards.retain(|f| f.id != old);
+                let _ = s.cmd_tx.send(UiCommand::RemoveForward(old));
+            }
+        }
+        if let Some(s) = self.sessions.get_mut(idx) {
+            let id = s.next_forward;
+            s.next_forward += 1;
+            spec.id = id;
+            let label = match &spec.kind {
+                ForwardKind::Local { remote_host, remote_port } => {
+                    format!("{}:{} → {}:{}", spec.bind_host, spec.bind_port, remote_host, remote_port)
+                }
+                ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
+            };
+            s.forwards.push(ForwardEntry {
+                id,
+                label,
+                status: crate::i18n::tr("启动中 …", "Starting …").into(),
+                ok: true,
+                bind_host: spec.bind_host.clone(),
+                bind_port: spec.bind_port,
+                kind: spec.kind.clone(),
+            });
+            let _ = s.cmd_tx.send(UiCommand::AddForward(spec));
+        }
+        self.fwd.editing = None;
+        self.fwd.error = None;
+        self.fwd.pending_open_bind = None;
+        self.fwd.form.local_port.clear();
+        self.fwd.form.target_host.clear();
+        self.fwd.form.target_port.clear();
+        self.fwd.just_opened = true;
     }
 
     /// 右上角传输进度浮窗（可弹出/隐藏）。
