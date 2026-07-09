@@ -3,18 +3,23 @@
 
 use egui::{Color32, FontId, Key, Rect, Sense, Stroke, Vec2};
 
-mod theme;
-mod vt;
+mod input;
 mod keys;
 mod osc;
 mod paint;
+mod search;
+mod selection;
+mod theme;
+mod vt;
 
-use theme::{term_theme, TermColors, TERM_THEMES};
-pub use theme::current_bg;
-use vt::{find_sub, incomplete_utf8_tail, serialize_row};
-use keys::{encode_key, encode_mouse};
+use input::HistState;
+use keys::encode_mouse;
 use osc::{open_url, parse_osc7};
 use paint::{cell_format, find_row_urls, highlight_colors, paint_row_backgrounds};
+use search::{Find, FindAction};
+pub use theme::current_bg;
+use theme::{term_theme, TermColors, TERM_THEMES};
+use vt::{find_sub, incomplete_utf8_tail, serialize_row};
 
 /// 默认字号（pt）。
 const FONT_SIZE: f32 = 14.0;
@@ -76,53 +81,6 @@ pub struct Terminal {
     /// 正在拖动右侧滚动条（区别于拖动选择文本）
     sb_dragging: bool,
 }
-
-/// 终端搜索状态。
-#[derive(Default)]
-struct Find {
-    query: String,
-    hits: Vec<usize>, // 命中行的绝对行号（顶部为 0）
-    cur: usize,
-    focus: bool,
-    /// 区分大小写（默认否 = 不区分）
-    case: bool,
-    /// 按正则匹配（默认否 = 字面子串）
-    regex: bool,
-    /// 全字匹配（用 \b 词边界包裹）
-    word: bool,
-    /// 正则无效时为 true（查找栏标红提示）
-    bad_re: bool,
-}
-
-enum FindAction {
-    None,
-    Search,
-    Step(i32),
-    Close,
-}
-
-/// 据查找选项编译匹配器：字面子串也统一转成正则，以便复用大小写/全字逻辑。
-/// 返回 None 表示正则无效（仅可能发生在 regex 模式）。
-fn build_search_regex(f: &Find) -> Option<regex::Regex> {
-    if f.query.is_empty() {
-        return None;
-    }
-    // 非正则模式：转义用户输入，按字面匹配
-    let pat = if f.regex { f.query.clone() } else { regex::escape(&f.query) };
-    // 全字：用词边界包裹（对字面与正则都适用）
-    let pat = if f.word { format!(r"\b(?:{pat})\b") } else { pat };
-    regex::RegexBuilder::new(&pat)
-        .case_insensitive(!f.case)
-        .build()
-        .ok()
-}
-
-/// 前缀历史搜索状态：记住起始前缀与当前命中位置。
-struct HistState {
-    prefix: String,
-    idx: usize,
-}
-
 
 impl Terminal {
     pub fn new() -> Self {
@@ -293,195 +251,6 @@ impl Terminal {
         out
     }
 
-    /// 重新执行搜索（查询/选项变化时）。支持大小写、正则、全字三种选项。
-    fn run_search(&mut self) {
-        // 空查询：清空命中与高亮
-        let empty = self.find.as_ref().is_none_or(|f| f.query.is_empty());
-        if empty {
-            if let Some(f) = &mut self.find {
-                f.hits.clear();
-                f.bad_re = false;
-            }
-            self.search_hl = None;
-            return;
-        }
-        // 编译匹配器（字面子串也走 regex，统一处理大小写/全字）
-        let re = self.find.as_ref().and_then(build_search_regex);
-        if let Some(f) = &mut self.find {
-            f.bad_re = re.is_none(); // 正则无效 → 标红、不改命中
-        }
-        let Some(re) = re else {
-            return;
-        };
-        let lines = self.collect_lines();
-        let hits: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| re.is_match(l))
-            .map(|(i, _)| i)
-            .collect();
-        if let Some(f) = &mut self.find {
-            f.hits = hits;
-            f.cur = 0;
-        }
-        self.jump_to_current();
-    }
-
-    /// 切换到上/下一个命中。
-    fn search_step(&mut self, dir: i32) {
-        if let Some(f) = &mut self.find {
-            let n = f.hits.len();
-            if n == 0 {
-                return;
-            }
-            f.cur = ((f.cur as i32 + dir).rem_euclid(n as i32)) as usize;
-        }
-        self.jump_to_current();
-    }
-
-    /// 滚动到当前命中行并记录高亮行。
-    fn jump_to_current(&mut self) {
-        let line_idx = match &self.find {
-            Some(f) if !f.hits.is_empty() => f.hits[f.cur.min(f.hits.len() - 1)],
-            _ => {
-                self.search_hl = None;
-                return;
-            }
-        };
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        let sb = self.parser.screen().scrollback();
-        let rows = self.rows as usize;
-        let r = rows / 3; // 命中尽量落在上 1/3
-        let start_idx = line_idx.saturating_sub(r);
-        let off = sb.saturating_sub(start_idx);
-        self.parser.screen_mut().set_scrollback(off);
-        self.scrollback = off.min(sb);
-        // 屏幕行 = 绝对行号 - 窗口起始行号
-        let win_start = sb.saturating_sub(self.scrollback);
-        self.search_hl = line_idx.checked_sub(win_start).map(|r| r as u16);
-    }
-
-    /// 据当前命中行与当前回滚位置，重算高亮所在的屏幕行（不移动视口）。
-    /// 用于手动滚动后让高亮「跟随」命中行：仍在视口内则继续高亮，滚出视口则不画。
-    fn recompute_search_hl(&mut self) {
-        let line_idx = match &self.find {
-            Some(f) if !f.hits.is_empty() => f.hits[f.cur.min(f.hits.len() - 1)],
-            _ => {
-                self.search_hl = None;
-                return;
-            }
-        };
-        // 探测总可回滚行数（set MAX 读回再还原，仅改偏移不重排，开销很小）
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        let sb = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(self.scrollback);
-        let win_start = sb.saturating_sub(self.scrollback);
-        // 仅当命中行落在当前可视窗口内（0..rows）才高亮
-        self.search_hl = match line_idx.checked_sub(win_start) {
-            Some(r) if (r as u16) < self.rows => Some(r as u16),
-            _ => None,
-        };
-    }
-
-    /// 选区按阅读顺序的 (起, 止)（含两端）。
-    fn ordered_selection(&self) -> Option<((u16, u16), (u16, u16))> {
-        let (a, b) = (self.sel_anchor?, self.sel_cursor?);
-        if (a.0, a.1) <= (b.0, b.1) {
-            Some((a, b))
-        } else {
-            Some((b, a))
-        }
-    }
-
-    /// 提取选中文本（按行拼接，行尾去除多余空格）。
-    fn selected_text(&self) -> Option<String> {
-        let ((sr, sc), (er, ec)) = self.ordered_selection()?;
-        let screen = self.parser.screen();
-        let mut out = String::new();
-        for row in sr..=er {
-            let c0 = if row == sr { sc } else { 0 };
-            let c1 = if row == er { ec } else { self.cols.saturating_sub(1) };
-            let mut line = String::new();
-            for col in c0..=c1 {
-                let Some(cell) = screen.cell(row, col) else {
-                    line.push(' ');
-                    continue;
-                };
-                // 宽字符（中文等）的续格不输出，避免复制出来每个汉字后多一个空格
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-                let ch = cell.contents();
-                line.push_str(if ch.is_empty() { " " } else { ch });
-            }
-            out.push_str(line.trim_end());
-            if row != er {
-                out.push('\n');
-            }
-        }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
-    }
-
-    fn has_selection(&self) -> bool {
-        matches!((self.sel_anchor, self.sel_cursor), (Some(a), Some(b)) if a != b)
-    }
-
-    /// 双击选词：返回 (row, col) 处「单词」的列区间 [c0, c1]（含两端）；点在空白/纯符号上返回 None。
-    /// 词字符 = 字母数字（含 CJK）+ 常见路径/标识符符号；宽字符续格并入，避免 CJK 选词在半格处断开。
-    fn word_range_at(&self, row: u16, col: u16) -> Option<(u16, u16)> {
-        let screen = self.parser.screen();
-        let is_word = |c: u16| -> bool {
-            match screen.cell(row, c) {
-                Some(cell) => {
-                    if cell.is_wide_continuation() {
-                        return true; // 宽字符（CJK）右半格，并入左侧词
-                    }
-                    // 用完整 cell 内容：组合字符/符号序列时首码点可能是修饰符
-                    let s = cell.contents();
-                    if s.is_empty() {
-                        return false;
-                    }
-                    s.chars().any(|ch| {
-                        ch.is_alphanumeric()
-                            || "_-./~:@+#%".contains(ch)
-                            // 非 ASCII 且非空白/控制（CJK、多数 Unicode 符号）并入词
-                            || (!ch.is_ascii() && !ch.is_whitespace() && !ch.is_control())
-                    })
-                }
-                None => false,
-            }
-        };
-        if !is_word(col) {
-            return None;
-        }
-        let mut c0 = col;
-        while c0 > 0 && is_word(c0 - 1) {
-            c0 -= 1;
-        }
-        let mut c1 = col;
-        while c1 + 1 < self.cols && is_word(c1 + 1) {
-            c1 += 1;
-        }
-        Some((c0, c1))
-    }
-
-    fn clear_selection(&mut self) {
-        self.sel_anchor = None;
-        self.sel_cursor = None;
-    }
-
-    /// 读系统剪贴板（懒初始化）。
-    fn read_clipboard(&mut self) -> Option<String> {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        self.clipboard.as_mut()?.get_text().ok()
-    }
-
     /// 请求下一帧让终端区域获得键盘焦点。
     pub fn request_focus(&mut self) {
         self.focus_req = true;
@@ -592,79 +361,21 @@ impl Terminal {
     /// 渲染终端内容。返回本帧用户键盘输入产生的字节流（交给 worker 发送）。
     ///
     /// `focused` 表示终端区域是否持有焦点，决定是否采集键盘事件。
-    /// 渲染搜索栏，返回用户动作。
-    fn draw_find_bar(&mut self, ui: &mut egui::Ui) -> FindAction {
-        use egui_phosphor::regular as icon;
-        let mut action = FindAction::None;
-        egui::Frame::new()
-            .fill(crate::theme::Palette::PANEL_2)
-            .inner_margin(egui::Margin::symmetric(6, 4))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let f = self.find.as_mut().unwrap();
-                    ui.label(egui::RichText::new(icon::MAGNIFYING_GLASS).color(crate::theme::Palette::TEXT_DIM));
-                    let resp = ui.add(egui::TextEdit::singleline(&mut f.query).desired_width(180.0).hint_text(crate::i18n::tr("查找终端内容", "Find in terminal")));
-                    if f.focus {
-                        resp.request_focus();
-                        f.focus = false;
-                    }
-                    if resp.changed() {
-                        action = FindAction::Search;
-                    }
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        action = FindAction::Step(1);
-                        resp.request_focus();
-                    }
-                    // 选项开关：Aa=区分大小写、.*=正则、\b=全字。切换即重搜。
-                    let tgl = |ui: &mut egui::Ui, on: &mut bool, label: &str, tip: &str| -> bool {
-                        let col = if *on { crate::theme::Palette::ACCENT } else { crate::theme::Palette::TEXT_DIM };
-                        let clicked = ui
-                            .add(egui::Button::new(egui::RichText::new(label).size(12.0).color(col)).frame(false).min_size(egui::vec2(20.0, 18.0)))
-                            .on_hover_text(tip)
-                            .clicked();
-                        if clicked {
-                            *on = !*on;
-                        }
-                        clicked
-                    };
-                    if tgl(ui, &mut f.case, "Aa", crate::i18n::tr("区分大小写", "Match case")) { action = FindAction::Search; }
-                    if tgl(ui, &mut f.regex, ".*", crate::i18n::tr("正则表达式", "Regex")) { action = FindAction::Search; }
-                    if tgl(ui, &mut f.word, "\\b", crate::i18n::tr("全字匹配", "Whole word")) { action = FindAction::Search; }
-                    let (cnt, cnt_col) = if f.bad_re {
-                        (crate::i18n::tr("正则错误", "bad regex").to_string(), crate::theme::Palette::DANGER)
-                    } else if f.hits.is_empty() {
-                        ("0/0".to_string(), crate::theme::Palette::TEXT_DIM)
-                    } else {
-                        (format!("{}/{}", f.cur + 1, f.hits.len()), crate::theme::Palette::TEXT_DIM)
-                    };
-                    ui.label(egui::RichText::new(cnt).color(cnt_col).size(11.0));
-                    if ui.button(icon::CARET_UP).on_hover_text(crate::i18n::tr("上一个", "Prev")).clicked() {
-                        action = FindAction::Step(-1);
-                    }
-                    if ui.button(icon::CARET_DOWN).on_hover_text(crate::i18n::tr("下一个", "Next")).clicked() {
-                        action = FindAction::Step(1);
-                    }
-                    if ui.button(icon::X).clicked() {
-                        action = FindAction::Close;
-                    }
-                });
-                if ui.input(|i| i.key_pressed(Key::Escape)) {
-                    action = FindAction::Close;
-                }
-            });
-        action
-    }
-
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Vec<u8> {
         // 从全局配色同步：任一终端切换后，所有终端下一帧统一生效
         self.theme = term_theme().load(std::sync::atomic::Ordering::Relaxed);
         // Ctrl+Shift+F 切换终端内容搜索
-        if ui.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::F)) {
+        if ui.input(|i| {
+            (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::F)
+        }) {
             if self.find.is_some() {
                 self.find = None;
                 self.search_hl = None;
             } else {
-                self.find = Some(Find { focus: true, ..Default::default() });
+                self.find = Some(Find {
+                    focus: true,
+                    ..Default::default()
+                });
             }
         }
         if self.find.is_some() {
@@ -738,8 +449,10 @@ impl Terminal {
         // 单元格定位（屏幕字符坐标）。捕获 cols/rows 副本以免与后续 &mut self 冲突。
         let (cols, rows) = (self.cols, self.rows);
         let cell_at = |pos: egui::Pos2| -> (u16, u16) {
-            let c = (((pos.x - rect.left()) / char_w).floor() as i32).clamp(0, cols as i32 - 1) as u16;
-            let r = (((pos.y - rect.top()) / char_h).floor() as i32).clamp(0, rows as i32 - 1) as u16;
+            let c =
+                (((pos.x - rect.left()) / char_w).floor() as i32).clamp(0, cols as i32 - 1) as u16;
+            let r =
+                (((pos.y - rect.top()) / char_h).floor() as i32).clamp(0, rows as i32 - 1) as u16;
             (r, c)
         };
 
@@ -752,7 +465,12 @@ impl Terminal {
 
         // 滚轮：Ctrl 调字号；鼠标上报时发滚轮键（64/65）；否则本地回滚
         if resp.hovered() {
-            let (scroll, ctrl) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl || i.modifiers.command));
+            let (scroll, ctrl) = ui.input(|i| {
+                (
+                    i.smooth_scroll_delta.y,
+                    i.modifiers.ctrl || i.modifiers.command,
+                )
+            });
             if scroll != 0.0 {
                 if ctrl {
                     self.font_size = (self.font_size + scroll.signum() * 1.0).clamp(8.0, 32.0);
@@ -767,7 +485,8 @@ impl Terminal {
                     }
                 } else {
                     let lines = (scroll / char_h).round() as i64;
-                    let nb = (self.scrollback as i64 + lines).clamp(0, DEFAULT_SCROLLBACK as i64) as usize;
+                    let nb = (self.scrollback as i64 + lines).clamp(0, DEFAULT_SCROLLBACK as i64)
+                        as usize;
                     self.parser.screen_mut().set_scrollback(nb);
                     // 回读 vt100 按「实际历史行数」钳制后的真实值：否则 self.scrollback 可能远超真实历史，
                     // 之后要空滚很多步才重新移动视口（「死滚动」）。
@@ -794,11 +513,17 @@ impl Terminal {
             // 在弹窗内点击/双击会被透传到背后的鼠标上报程序（vim/tmux/htop）。
             let term_layer = resp.layer_id;
             let ctx = ui.ctx().clone();
-            let on_top = |pos: egui::Pos2| rect.contains(pos) && ctx.layer_id_at(pos) == Some(term_layer);
+            let on_top =
+                |pos: egui::Pos2| rect.contains(pos) && ctx.layer_id_at(pos) == Some(term_layer);
             let events = ui.input(|i| i.events.clone());
             for ev in &events {
                 match ev {
-                    egui::Event::PointerButton { pos, button, pressed, modifiers } if on_top(*pos) => {
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers,
+                    } if on_top(*pos) => {
                         let (r, c) = cell_at(*pos);
                         let base = match button {
                             egui::PointerButton::Primary => 0u8,
@@ -807,8 +532,12 @@ impl Terminal {
                             _ => 0,
                         };
                         let mut cb = base;
-                        if modifiers.alt { cb += 8; }
-                        if modifiers.ctrl || modifiers.command { cb += 16; }
+                        if modifiers.alt {
+                            cb += 8;
+                        }
+                        if modifiers.ctrl || modifiers.command {
+                            cb += 16;
+                        }
                         if *pressed {
                             self.held_btn = Some(base);
                             encode_mouse(menc, cb, c, r, true, &mut mouse_out);
@@ -816,14 +545,19 @@ impl Terminal {
                             self.held_btn = None;
                             // X10(Press) 模式不上报释放；SGR 用原按钮码，传统编码用 3
                             if mmode != vt100::MouseProtocolMode::Press {
-                                let rel = if menc == vt100::MouseProtocolEncoding::Sgr { cb } else { 3 };
+                                let rel = if menc == vt100::MouseProtocolEncoding::Sgr {
+                                    cb
+                                } else {
+                                    3
+                                };
                                 encode_mouse(menc, rel, c, r, false, &mut mouse_out);
                             }
                         }
                     }
                     egui::Event::PointerMoved(pos) if on_top(*pos) => {
                         let motion = mmode == vt100::MouseProtocolMode::AnyMotion
-                            || (mmode == vt100::MouseProtocolMode::ButtonMotion && self.held_btn.is_some());
+                            || (mmode == vt100::MouseProtocolMode::ButtonMotion
+                                && self.held_btn.is_some());
                         if motion {
                             let (r, c) = cell_at(*pos);
                             let cb = 32 + self.held_btn.unwrap_or(3); // 32=移动标志位
@@ -889,7 +623,10 @@ impl Terminal {
         let sel = self.ordered_selection();
         let screen = self.parser.screen();
         // origin 也吸附到物理像素网格，使每个单元格都落在整数像素上（配合上面 char_w/char_h 吸附）
-        let origin = egui::pos2((rect.min.x * ppp).round() / ppp, (rect.min.y * ppp).round() / ppp);
+        let origin = egui::pos2(
+            (rect.min.x * ppp).round() / ppp,
+            (rect.min.y * ppp).round() / ppp,
+        );
 
         // 可见行中的链接：用于悬停下划线 + 点击打开（鼠标上报模式下让位给 TUI）
         let mut link_rects: Vec<(Rect, String)> = Vec::new();
@@ -899,12 +636,22 @@ impl Terminal {
                     let x0 = origin.x + sc as f32 * char_w;
                     let x1 = origin.x + (ec as f32 + 1.0) * char_w;
                     let y = origin.y + row as f32 * char_h;
-                    link_rects.push((Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)), url));
+                    link_rects.push((
+                        Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)),
+                        url,
+                    ));
                 }
             }
         }
-        let hover_pos = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p));
-        let hover_link = hover_pos.and_then(|p| link_rects.iter().find(|(r, _)| r.contains(p)).map(|(_, u)| u.clone()));
+        let hover_pos = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|p| rect.contains(*p));
+        let hover_link = hover_pos.and_then(|p| {
+            link_rects
+                .iter()
+                .find(|(r, _)| r.contains(p))
+                .map(|(_, u)| u.clone())
+        });
 
         for row in 0..self.rows {
             let y = origin.y + row as f32 * char_h;
@@ -914,7 +661,10 @@ impl Terminal {
             if self.search_hl == Some(row) {
                 let w = crate::theme::Palette::WARN;
                 painter.rect_filled(
-                    Rect::from_min_max(egui::pos2(origin.x, y), egui::pos2(rect.right(), y + char_h)),
+                    Rect::from_min_max(
+                        egui::pos2(origin.x, y),
+                        egui::pos2(rect.right(), y + char_h),
+                    ),
                     0.0,
                     Color32::from_rgba_unmultiplied(w.r(), w.g(), w.b(), 90),
                 );
@@ -923,7 +673,11 @@ impl Terminal {
             if let Some(((sr, sc), (er, ec))) = sel {
                 if row >= sr && row <= er {
                     let c0 = if row == sr { sc } else { 0 };
-                    let c1 = if row == er { ec } else { self.cols.saturating_sub(1) };
+                    let c1 = if row == er {
+                        ec
+                    } else {
+                        self.cols.saturating_sub(1)
+                    };
                     let x0 = origin.x + c0 as f32 * char_w;
                     let x1 = origin.x + (c1 as f32 + 1.0) * char_w;
                     let a = crate::theme::Palette::ACCENT;
@@ -937,9 +691,15 @@ impl Terminal {
             // 逐格绘制字形：固定网格定位，避免 CJK / 宽字符的字形步进破坏对齐。
             // 空内容（含宽字符的续格）跳过；宽字符自身在本格绘制，自然跨两格。
             // 关键字高亮：覆盖匹配单元格的文字颜色
-            let hl = if self.highlight { highlight_colors(screen, row, self.cols) } else { Vec::new() };
+            let hl = if self.highlight {
+                highlight_colors(screen, row, self.cols)
+            } else {
+                Vec::new()
+            };
             for col in 0..self.cols {
-                let Some(c) = screen.cell(row, col) else { continue };
+                let Some(c) = screen.cell(row, col) else {
+                    continue;
+                };
                 let s = c.contents();
                 if s.is_empty() {
                     continue;
@@ -961,7 +721,13 @@ impl Terminal {
                     );
                 } else {
                     // 半角字符：纵向居中，使 1.2× 行高的额外留白上下均分
-                    painter.text(egui::pos2(x, y + char_h / 2.0), egui::Align2::LEFT_CENTER, s, font.clone(), color);
+                    painter.text(
+                        egui::pos2(x, y + char_h / 2.0),
+                        egui::Align2::LEFT_CENTER,
+                        s,
+                        font.clone(),
+                        color,
+                    );
                 }
                 if fmt.underline.width > 0.0 {
                     // 下划线落在居中字形的底部附近
@@ -976,8 +742,14 @@ impl Terminal {
         if let Some(p) = hover_pos {
             if let Some((r, _)) = link_rects.iter().find(|(r, _)| r.contains(p)) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                let uy = (origin.y + ((r.top() - origin.y) / char_h).round() * char_h) + (char_h + glyph_h) / 2.0 - 1.0;
-                painter.hline(r.left()..=r.right(), uy, Stroke::new(1.0, crate::theme::Palette::ACCENT));
+                let uy = (origin.y + ((r.top() - origin.y) / char_h).round() * char_h)
+                    + (char_h + glyph_h) / 2.0
+                    - 1.0;
+                painter.hline(
+                    r.left()..=r.right(),
+                    uy,
+                    Stroke::new(1.0, crate::theme::Palette::ACCENT),
+                );
             }
         }
         if resp.clicked() {
@@ -993,9 +765,18 @@ impl Terminal {
             let crect = Rect::from_min_size(cpos, cell);
             // 失焦时仍用珊瑚色描边（而非低对比灰），避免点到文件栏/侧栏后光标看似「消失」
             if focused {
-                painter.rect_filled(crect, 1.0, crate::theme::Palette::ACCENT.gamma_multiply(0.6));
+                painter.rect_filled(
+                    crect,
+                    1.0,
+                    crate::theme::Palette::ACCENT.gamma_multiply(0.6),
+                );
             } else {
-                painter.rect_stroke(crect, 1.0, Stroke::new(1.2, crate::theme::Palette::ACCENT.gamma_multiply(0.8)), egui::StrokeKind::Inside);
+                painter.rect_stroke(
+                    crect,
+                    1.0,
+                    Stroke::new(1.2, crate::theme::Palette::ACCENT.gamma_multiply(0.8)),
+                    egui::StrokeKind::Inside,
+                );
             }
         }
 
@@ -1006,26 +787,41 @@ impl Terminal {
             let ipos = origin + Vec2::new(cc as f32 * char_w, cr as f32 * char_h);
             let irect = Rect::from_min_size(ipos, cell);
             ui.ctx().output_mut(|o| {
-                o.ime = Some(egui::output::IMEOutput { rect: irect, cursor_rect: irect });
+                o.ime = Some(egui::output::IMEOutput {
+                    rect: irect,
+                    cursor_rect: irect,
+                });
             });
             // 在光标处显示 IME 预编辑（组字中的拼音/候选），铺底 + 下划线以便辨识
             if !self.ime_preedit.is_empty() {
                 let font = egui::FontId::monospace(self.font_size / crate::theme::CJK_SCALE);
-                let galley = painter.layout_no_wrap(self.ime_preedit.clone(), font, crate::theme::Palette::ACCENT);
+                let galley = painter.layout_no_wrap(
+                    self.ime_preedit.clone(),
+                    font,
+                    crate::theme::Palette::ACCENT,
+                );
                 let bg = Rect::from_min_size(ipos, galley.size());
                 painter.rect_filled(bg, 0.0, crate::theme::Palette::PANEL);
                 painter.galley(ipos, galley, crate::theme::Palette::ACCENT);
-                painter.hline(bg.x_range(), bg.max.y - 1.0, Stroke::new(1.0, crate::theme::Palette::ACCENT));
+                painter.hline(
+                    bg.x_range(),
+                    bg.max.y - 1.0,
+                    Stroke::new(1.0, crate::theme::Palette::ACCENT),
+                );
             }
         }
 
         // 右侧滚动条（仅有可回滚历史时显示）：滑块高=视口/总量，位置由 scrollback 决定（0=底/最新）。
         if max_sb > 0 {
             let total = rows as f32 + max_sb as f32;
-            let handle_h = (sb_track.height() * (rows as f32 / total)).clamp(24.0, sb_track.height());
+            let handle_h =
+                (sb_track.height() * (rows as f32 / total)).clamp(24.0, sb_track.height());
             let pos_frac = 1.0 - (self.scrollback as f32 / max_sb as f32);
             let handle_top = sb_track.top() + (sb_track.height() - handle_h) * pos_frac;
-            let handle = Rect::from_min_size(egui::pos2(sb_track.left() + 1.0, handle_top), Vec2::new(sb_w - 2.0, handle_h));
+            let handle = Rect::from_min_size(
+                egui::pos2(sb_track.left() + 1.0, handle_top),
+                Vec2::new(sb_w - 2.0, handle_h),
+            );
             let hovered = hover_pos.is_some_and(|p| sb_track.contains(p));
             // 暖灰滑块，与全局暖色调一致
             let col = if self.sb_dragging {
@@ -1039,7 +835,11 @@ impl Terminal {
         }
 
         // 键盘输入
-        let mut out = if focused { self.collect_input(ui) } else { Vec::new() };
+        let mut out = if focused {
+            self.collect_input(ui)
+        } else {
+            Vec::new()
+        };
 
         // 键盘复制/粘贴由 collect_input 内的 Copy/Cut/Paste 事件处理（egui 会把
         // Ctrl+C/X/V 转成这些事件而不再下发按键）。这里只处理右键菜单。
@@ -1049,10 +849,13 @@ impl Terminal {
         let mut start_log = false;
         resp.context_menu(|ui| {
             ui.set_min_width(170.0); // 菜单宽度足些，看着舒服
-            // 菜单项不换行（否则英文较长的「Highlight ERROR/WARN」会折行，复选框被挤到两行正中）
+                                     // 菜单项不换行（否则英文较长的「Highlight ERROR/WARN」会折行，复选框被挤到两行正中）
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             let sel = self.has_selection();
-            if ui.add_enabled(sel, egui::Button::new(crate::i18n::tr("复制", "Copy"))).clicked() {
+            if ui
+                .add_enabled(sel, egui::Button::new(crate::i18n::tr("复制", "Copy")))
+                .clicked()
+            {
                 do_copy = true;
                 ui.close();
             }
@@ -1062,13 +865,26 @@ impl Terminal {
             }
             ui.separator();
             // 查找终端内容（等价快捷键 Ctrl+Shift+F；放菜单里更易发现、且不受桌面快捷键占用影响）
-            if ui.button(format!("{}  {}", egui_phosphor::regular::MAGNIFYING_GLASS, crate::i18n::tr("查找…  (Ctrl+Shift+F)", "Find…  (Ctrl+Shift+F)"))).clicked() {
+            if ui
+                .button(format!(
+                    "{}  {}",
+                    egui_phosphor::regular::MAGNIFYING_GLASS,
+                    crate::i18n::tr("查找…  (Ctrl+Shift+F)", "Find…  (Ctrl+Shift+F)")
+                ))
+                .clicked()
+            {
                 do_find = true;
                 ui.close();
             }
             ui.separator();
             // 在文件列表中显示终端当前目录：已知 cwd 直接跳；未知则请求 App 弹确认框注入 OSC 7。
-            if ui.button(crate::i18n::tr("在文件列表中显示当前目录", "Show current dir in files")).clicked() {
+            if ui
+                .button(crate::i18n::tr(
+                    "在文件列表中显示当前目录",
+                    "Show current dir in files",
+                ))
+                .clicked()
+            {
                 match self.osc7_cwd.clone() {
                     Some(c) => self.reveal_cwd = Some(c),
                     None => self.inject_request = true,
@@ -1081,7 +897,10 @@ impl Terminal {
                 ui.set_min_width(120.0);
                 for (i, (zh, en)) in TERM_THEMES.iter().enumerate() {
                     let i = i as u8;
-                    if ui.selectable_label(self.theme == i, crate::i18n::tr(zh, en)).clicked() {
+                    if ui
+                        .selectable_label(self.theme == i, crate::i18n::tr(zh, en))
+                        .clicked()
+                    {
                         term_theme().store(i, std::sync::atomic::Ordering::Relaxed);
                         crate::store::save_term_theme(i);
                         self.theme = i;
@@ -1090,33 +909,55 @@ impl Terminal {
                 }
             });
             // 高亮 ERROR/WARN：改成与「终端配色」一致的二级菜单（是 / 否）
-            ui.menu_button(crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN"), |ui| {
-                ui.set_min_width(90.0);
-                if ui.selectable_label(self.highlight, crate::i18n::tr("是", "Yes")).clicked() {
-                    self.highlight = true;
-                    ui.close();
-                }
-                if ui.selectable_label(!self.highlight, crate::i18n::tr("否", "No")).clicked() {
-                    self.highlight = false;
-                    ui.close();
-                }
-            });
+            ui.menu_button(
+                crate::i18n::tr("高亮 ERROR/WARN", "Highlight ERROR/WARN"),
+                |ui| {
+                    ui.set_min_width(90.0);
+                    if ui
+                        .selectable_label(self.highlight, crate::i18n::tr("是", "Yes"))
+                        .clicked()
+                    {
+                        self.highlight = true;
+                        ui.close();
+                    }
+                    if ui
+                        .selectable_label(!self.highlight, crate::i18n::tr("否", "No"))
+                        .clicked()
+                    {
+                        self.highlight = false;
+                        ui.close();
+                    }
+                },
+            );
             // 「强制 X11」已移至左侧监控栏的右键菜单，避免 shell 右键项过多
             ui.separator();
             // 会话日志录制
             if self.log_file.is_some() {
-                if ui.button(crate::i18n::tr("停止录制日志", "Stop recording")).clicked() {
+                if ui
+                    .button(crate::i18n::tr("停止录制日志", "Stop recording"))
+                    .clicked()
+                {
                     self.log_file = None;
                     ui.close();
                 }
-            } else if ui.button(crate::i18n::tr("录制会话日志…", "Record session log…")).clicked() {
+            } else if ui
+                .button(crate::i18n::tr("录制会话日志…", "Record session log…"))
+                .clicked()
+            {
                 start_log = true;
                 ui.close();
             }
         });
         if start_log {
-            if let Some(path) = rfd::FileDialog::new().set_file_name("session.log").save_file() {
-                if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name("session.log")
+                .save_file()
+            {
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
                     self.log_file = Some(f);
                 }
             }
@@ -1135,7 +976,12 @@ impl Terminal {
         if do_find {
             match &mut self.find {
                 Some(f) => f.focus = true,
-                None => self.find = Some(Find { focus: true, ..Default::default() }),
+                None => {
+                    self.find = Some(Find {
+                        focus: true,
+                        ..Default::default()
+                    })
+                }
             }
         }
         // 复制/粘贴（尤其右键菜单）后焦点会丢失，重新聚焦终端，免得还要再点一下
@@ -1152,173 +998,6 @@ impl Terminal {
         out.extend_from_slice(&mouse_out);
         out
     }
-
-    /// 把本帧键盘事件编码为终端字节，并维护输入行影子缓冲 / 前缀历史搜索。
-    fn collect_input(&mut self, ui: &egui::Ui) -> Vec<u8> {
-        let mut out = Vec::new();
-        let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
-        let shift = ui.input(|i| i.modifiers.shift);
-        // 全屏程序（vim/less/htop 等用备用屏幕）下不拦截方向键，避免破坏其交互
-        let alt = self.parser.screen().alternate_screen();
-        if alt {
-            self.input_line.clear();
-            self.hist = None;
-        }
-        for ev in events {
-            match ev {
-                egui::Event::Text(t) => {
-                    if !alt {
-                        self.input_line.push_str(&t);
-                        self.hist = None;
-                    }
-                    out.extend_from_slice(t.as_bytes());
-                }
-                // 输入法预编辑（组字中）：暂存以在光标处显示，不发往远端
-                egui::Event::Ime(egui::ImeEvent::Preedit(s)) => {
-                    log::debug!("IME Preedit: {s:?}");
-                    self.ime_preedit = s;
-                }
-                // 输入法提交（中文等）：清空预编辑，提交串以 UTF-8 发往远端
-                egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
-                    log::debug!("IME Commit: {t:?}");
-                    self.ime_preedit.clear();
-                    if !alt {
-                        self.input_line.push_str(&t);
-                        self.hist = None;
-                    }
-                    out.extend_from_slice(t.as_bytes());
-                }
-                // 输入法启用/禁用：清掉残留预编辑
-                egui::Event::Ime(egui::ImeEvent::Enabled) | egui::Event::Ime(egui::ImeEvent::Disabled) => {
-                    log::debug!("IME enabled/disabled event");
-                    self.ime_preedit.clear();
-                }
-                egui::Event::Paste(t) => {
-                    if !alt {
-                        self.input_line.push_str(&t);
-                        self.hist = None;
-                    }
-                    out.extend_from_slice(t.as_bytes());
-                }
-                // egui 把 Ctrl+C / Ctrl+X 转成 Copy/Cut 事件且不再下发按键，需在此处理：
-                // 终端里 Ctrl+C 应发 SIGINT(0x03)，而不是“复制”。
-                egui::Event::Copy => {
-                    // macOS：Cmd+C 复制（Ctrl+C 仍以按键事件到达 -> 走 encode_key 发 0x03）。
-                    // 其它平台：command 即 Ctrl —— 无 Shift 发 SIGINT，按住 Shift 才是复制。
-                    let copy_selection = cfg!(target_os = "macos") || shift;
-                    if copy_selection {
-                        if let Some(t) = self.selected_text() {
-                            ui.ctx().copy_text(t);
-                        }
-                    } else {
-                        out.push(0x03);
-                        if !alt {
-                            self.input_line.clear();
-                            self.hist = None;
-                        }
-                    }
-                }
-                egui::Event::Cut => {
-                    // 终端无“剪切”语义：非 macOS 下 Ctrl+X 发 0x18
-                    #[cfg(not(target_os = "macos"))]
-                    if !shift {
-                        out.push(0x18);
-                    }
-                }
-                egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    // 有前缀时，上下键做「本会话历史前缀搜索」（仅普通修饰、非全屏）
-                    let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.shift;
-                    if !alt && plain && matches!(key, Key::ArrowUp | Key::ArrowDown) {
-                        out.extend_from_slice(&self.history_nav(key == Key::ArrowUp));
-                        continue;
-                    }
-                    if !alt {
-                        match key {
-                            Key::Enter => self.commit_line(),
-                            Key::Backspace => {
-                                self.input_line.pop();
-                                self.hist = None;
-                            }
-                            Key::C | Key::U if modifiers.ctrl => {
-                                self.input_line.clear();
-                                self.hist = None;
-                            }
-                            _ => {}
-                        }
-                    }
-                    encode_key(key, modifiers, &mut out);
-                }
-                _ => {}
-            }
-        }
-        out
-    }
-
-    /// 上/下键的历史前缀搜索；返回应发送给远端的字节。
-    fn history_nav(&mut self, up: bool) -> Vec<u8> {
-        // 空行：交给远端 shell 自身的历史
-        if self.input_line.is_empty() {
-            self.hist = None;
-            return if up { b"\x1b[A".to_vec() } else { b"\x1b[B".to_vec() };
-        }
-        let prefix = match &self.hist {
-            Some(h) => h.prefix.clone(),
-            None => self.input_line.clone(),
-        };
-        let start = self.hist.as_ref().map(|h| h.idx as isize).unwrap_or(self.history.len() as isize);
-        if up {
-            let mut i = start - 1;
-            while i >= 0 {
-                let cand = &self.history[i as usize];
-                if cand.starts_with(&prefix) && cand != &self.input_line {
-                    let m = cand.clone();
-                    self.hist = Some(HistState { prefix, idx: i as usize });
-                    return self.rewrite_line(&m);
-                }
-                i -= 1;
-            }
-            Vec::new() // 没有更早的匹配，保持不变
-        } else {
-            if self.hist.is_none() {
-                return Vec::new(); // 不在搜索中，下键无意义
-            }
-            let mut i = start + 1;
-            while (i as usize) < self.history.len() {
-                let cand = &self.history[i as usize];
-                if cand.starts_with(&prefix) {
-                    let m = cand.clone();
-                    self.hist = Some(HistState { prefix, idx: i as usize });
-                    return self.rewrite_line(&m);
-                }
-                i += 1;
-            }
-            // 越过最新匹配：恢复到最初输入的前缀
-            self.hist = None;
-            self.rewrite_line(&prefix.clone())
-        }
-    }
-
-    /// 清空远端当前行并键入 `text`（Ctrl+E 到行尾 + Ctrl+U 清行 + 文本）。
-    fn rewrite_line(&mut self, text: &str) -> Vec<u8> {
-        let mut out = vec![0x05, 0x15]; // Ctrl+E, Ctrl+U
-        out.extend_from_slice(text.as_bytes());
-        self.input_line = text.to_string();
-        out
-    }
-
-    /// 回车提交：把当前行加入历史（去重相邻、去空）。
-    fn commit_line(&mut self) {
-        if !self.input_line.trim().is_empty()
-            && self.history.last().map(|s| s != &self.input_line).unwrap_or(true)
-        {
-            self.history.push(self.input_line.clone());
-            if self.history.len() > 500 {
-                self.history.remove(0);
-            }
-        }
-        self.input_line.clear();
-        self.hist = None;
-    }
 }
 
 impl Default for Terminal {
@@ -1329,13 +1008,16 @@ impl Default for Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::paint::{brighten_rgb, vt_color, xterm256};
+    use super::*;
 
     #[test]
     fn osc7_parsing() {
         let data = b"\x1b]7;file://host/home/user/%E4%B8%AD%E6%96%87\x07";
-        assert_eq!(parse_osc7(data).as_deref(), Some("/home/user/\u{4e2d}\u{6587}"));
+        assert_eq!(
+            parse_osc7(data).as_deref(),
+            Some("/home/user/\u{4e2d}\u{6587}")
+        );
         assert_eq!(parse_osc7(b"no osc here"), None);
     }
 
@@ -1354,8 +1036,17 @@ mod tests {
     fn detect_urls_in_row() {
         let mut p = vt100::Parser::new(2, 80, 0);
         p.process(b"see https://example.com/a/b, or http://x.y/z! end");
-        let got: Vec<String> = find_row_urls(p.screen(), 0, 80).into_iter().map(|(_, _, u)| u).collect();
-        assert_eq!(got, vec!["https://example.com/a/b".to_string(), "http://x.y/z".to_string()]);
+        let got: Vec<String> = find_row_urls(p.screen(), 0, 80)
+            .into_iter()
+            .map(|(_, _, u)| u)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "https://example.com/a/b".to_string(),
+                "http://x.y/z".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1369,7 +1060,10 @@ mod tests {
     fn detect_more_schemes() {
         let mut p = vt100::Parser::new(2, 120, 0);
         p.process(b"ftp://h/f sftp://h/x ssh://u@h file:///etc/hosts www.rust-lang.org");
-        let got: Vec<String> = find_row_urls(p.screen(), 0, 120).into_iter().map(|(_, _, u)| u).collect();
+        let got: Vec<String> = find_row_urls(p.screen(), 0, 120)
+            .into_iter()
+            .map(|(_, _, u)| u)
+            .collect();
         // 安全收窄：仅 http/https/ftp/ftps 与裸 www.（ssh/sftp/file 会触发本地协议
         // 处理器，终端输出不可信，不再识别为可点击链接）
         assert_eq!(
@@ -1412,14 +1106,20 @@ mod tests {
         for i in 0..60 {
             t.feed(format!("line number {i}\r\n").as_bytes());
         }
-        t.find = Some(Find { query: "number 5".into(), ..Default::default() });
+        t.find = Some(Find {
+            query: "number 5".into(),
+            ..Default::default()
+        });
         t.run_search();
         let f = t.find.as_ref().unwrap();
         // "number 5" 命中 5,50..59 等多行
         assert!(f.hits.len() >= 2, "应找到多处命中，实际 {}", f.hits.len());
         assert!(t.search_hl.is_some(), "应高亮命中行");
         // 不存在的查询无命中
-        t.find = Some(Find { query: "zzzNOPE".into(), ..Default::default() });
+        t.find = Some(Find {
+            query: "zzzNOPE".into(),
+            ..Default::default()
+        });
         t.run_search();
         assert!(t.find.as_ref().unwrap().hits.is_empty());
     }
