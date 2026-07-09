@@ -247,6 +247,75 @@ fn install_fonts(ctx: &egui::Context) {
         log::warn!("未找到系统中文字体，中文可能显示为方块");
     }
 
+    // Unicode 符号 / Powerline / 杂项符号：补 JetBrains Mono 与 CJK 未覆盖的字形
+    // （框线、箭头、几何图形、Nerd Font 常用码位等）。放在 emoji 之前，优先用单色矢量字。
+    // 可加载多个符号字体（按顺序追加到回退链）：Symbols → DejaVu → 可选 Nerd Font
+    let symbol_candidates = [
+        // Linux 通用符号
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansSymbols2-Regular.otf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+        "/usr/share/fonts/truetype/symbola/Symbola.ttf",
+        // Nerd Font / Powerline 私用区图标（若用户已安装）
+        "/usr/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+        "/usr/share/fonts/opentype/nerd-fonts/SymbolsNerdFontMono-Regular.otf",
+        // macOS
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/Library/Fonts/Apple Symbols.ttf",
+        // Windows
+        "C:/Windows/Fonts/seguisym.ttf",
+        "C:/Windows/Fonts/symbol.ttf",
+    ];
+    let mut sym_i = 0usize;
+    for path in symbol_candidates {
+        if !std::path::Path::new(path).is_file() {
+            continue;
+        }
+        let Ok(data) = std::fs::read(path) else { continue };
+        let key = format!("symbols{sym_i}");
+        sym_i += 1;
+        log::info!("加载符号字体：{path}");
+        fonts.font_data.insert(key.clone(), std::sync::Arc::new(egui::FontData::from_owned(data)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(key.clone());
+        }
+        // 最多挂 3 个，避免字体链过长拖慢布局
+        if sym_i >= 3 {
+            break;
+        }
+    }
+
+    // Emoji：终端/UI 缺字形时回退（彩色 emoji 在部分后端可能降级为单色，仍优于豆腐块）
+    let emoji_candidates = [
+        // Linux
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/truetype/joypixels/JoyPixels.ttf",
+        // macOS
+        "/System/Library/Fonts/Apple Color Emoji.ttc",
+        // Windows
+        "C:/Windows/Fonts/seguiemj.ttf",
+    ];
+    if let Some(path) = emoji_candidates.iter().find(|p| std::path::Path::new(p).is_file()) {
+        if let Ok(data) = std::fs::read(path) {
+            log::info!("加载 Emoji 字体：{path}");
+            let mut fd = egui::FontData::from_owned(data);
+            // Apple Color Emoji 等 TTC：优先 face 0
+            fd.index = 0;
+            fonts.font_data.insert("emoji".to_owned(), std::sync::Arc::new(fd));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.entry(family).or_default().push("emoji".to_owned());
+            }
+        }
+    } else {
+        log::warn!("未找到系统 Emoji 字体，部分 Unicode 符号可能显示为方块");
+    }
+
     // 仅 macOS：UI 比例字体用系统 SF Pro（原生且常规字重）；等宽已统一为内嵌 JetBrains Mono。
     // 拉丁字形走系统字体，中文仍回退到上面的 cjk 字体。
     #[cfg(target_os = "macos")]

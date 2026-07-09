@@ -534,7 +534,17 @@ impl Terminal {
                     if cell.is_wide_continuation() {
                         return true; // 宽字符（CJK）右半格，并入左侧词
                     }
-                    cell.contents().chars().next().is_some_and(|ch| ch.is_alphanumeric() || "_-./~".contains(ch))
+                    // 用完整 cell 内容：组合字符/符号序列时首码点可能是修饰符
+                    let s = cell.contents();
+                    if s.is_empty() {
+                        return false;
+                    }
+                    s.chars().any(|ch| {
+                        ch.is_alphanumeric()
+                            || "_-./~:@+#%".contains(ch)
+                            // 非 ASCII 且非空白/控制（CJK、多数 Unicode 符号）并入词
+                            || (!ch.is_ascii() && !ch.is_whitespace() && !ch.is_control())
+                    })
                 }
                 None => false,
             }
@@ -1837,10 +1847,19 @@ fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, 
 }
 
 fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> TextFormat {
-    let mut fg = vt_color(c.fgcolor(), tc.fg, tc);
     // 反显：文字改用背景色（实际背景块在 paint_row_backgrounds 中绘制）
-    if c.inverse() {
-        fg = vt_color(c.bgcolor(), tc.bg, tc);
+    let base = if c.inverse() { c.bgcolor() } else { c.fgcolor() };
+    let default = if c.inverse() { tc.bg } else { tc.fg };
+    let mut fg = vt_color(base, default, tc);
+    // Bold：ANSI 0–7 升到亮色 8–15（xterm 常见行为）；其余略提亮
+    if c.bold() && !c.dim() {
+        fg = match base {
+            vt100::Color::Idx(i) if i < 8 => vt_color(vt100::Color::Idx(i + 8), default, tc),
+            _ => brighten_rgb(fg, 1.18),
+        };
+    }
+    if c.dim() {
+        fg = brighten_rgb(fg, 0.55);
     }
     let mut f = TextFormat {
         font_id: font.clone(),
@@ -1851,6 +1870,14 @@ fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> TextFormat {
         f.underline = Stroke::new(1.0, fg);
     }
     f
+}
+
+/// 按比例调整 RGB（用于 bold 提亮 / dim 变暗），保持 alpha。
+fn brighten_rgb(c: Color32, factor: f32) -> Color32 {
+    let scale = |v: u8| -> u8 {
+        ((v as f32 * factor).round()).clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(scale(c.r()), scale(c.g()), scale(c.b()), c.a())
 }
 
 /// 逐格绘制非默认背景色（egui 文本布局不便携带逐段背景，单独画矩形）。
@@ -1998,6 +2025,31 @@ mod tests {
         t.find = Some(Find { query: "zzzNOPE".into(), ..Default::default() });
         t.run_search();
         assert!(t.find.as_ref().unwrap().hits.is_empty());
+    }
+
+    #[test]
+    fn truecolor_and_attrs_map() {
+        let tc = TermColors::light();
+        // 24 位真彩色直通
+        assert_eq!(
+            vt_color(vt100::Color::Rgb(0x12, 0x34, 0x56), tc.fg, &tc),
+            Color32::from_rgb(0x12, 0x34, 0x56)
+        );
+        // 256 色板索引
+        assert_eq!(
+            vt_color(vt100::Color::Idx(196), tc.fg, &tc),
+            xterm256(196, &tc)
+        );
+        // bold 提亮 / dim 变暗
+        let base = Color32::from_rgb(100, 100, 100);
+        assert!(brighten_rgb(base, 1.18).r() > base.r());
+        assert!(brighten_rgb(base, 0.55).r() < base.r());
+        // 解析端：喂入 SGR 38;2 后单元格应为 Rgb
+        let mut t = Terminal::new();
+        t.feed(b"\x1b[38;2;10;20;30mX\x1b[0m");
+        let cell = t.parser.screen().cell(0, 0).expect("cell");
+        assert_eq!(cell.contents(), "X");
+        assert_eq!(cell.fgcolor(), vt100::Color::Rgb(10, 20, 30));
     }
 
     #[test]
