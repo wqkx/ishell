@@ -11,6 +11,9 @@ use crate::proto::{ConflictPolicy, WorkerEvent};
 use super::super::auth::{exec_status, ClientHandler};
 use super::super::sftp::{join_remote, remote_parent};
 use super::super::{sh_quote, UiSink};
+#[path = "download_io.rs"]
+mod download_io;
+
 use super::rand_hex;
 use super::util::{
     basename, bitmap_len, data_part_path, extract_tar_gz, local_nonexistent, part_path,
@@ -33,23 +36,54 @@ pub(super) async fn download_dir_compressed(
 
     // 先登记传输行（total 未知），并把「打包中…」作为阶段提示上报——
     // 大目录 tar 打包可能耗时数十秒，此前 UI 一片空白，用户以为卡死。
-    sink.send(WorkerEvent::TransferStart { id, name: name.clone(), total: 0, dir: crate::proto::TransferDir::Download, local: Some(local.to_string()) });
-    sink.send(WorkerEvent::TransferNote { id, note: crate::i18n::tr("打包中…", "Packing…").into() });
+    sink.send(WorkerEvent::TransferStart {
+        id,
+        name: name.clone(),
+        total: 0,
+        dir: crate::proto::TransferDir::Download,
+        local: Some(local.to_string()),
+    });
+    sink.send(WorkerEvent::TransferNote {
+        id,
+        note: crate::i18n::tr("打包中…", "Packing…").into(),
+    });
 
     // 远端打包（czf：gzip 默认级别；-C 进入父目录，仅打包目标目录名）
-    let cmd = format!("tar czf {} -C {} {}", sh_quote(&tmp_remote), sh_quote(&parent), sh_quote(&name));
+    let cmd = format!(
+        "tar czf {} -C {} {}",
+        sh_quote(&tmp_remote),
+        sh_quote(&parent),
+        sh_quote(&name)
+    );
     let (code, err) = exec_status(handle, &cmd).await?;
     if code != 0 {
         let _ = exec_status(handle, &format!("rm -f {}", sh_quote(&tmp_remote))).await;
-        anyhow::bail!("{}", match crate::i18n::current() {
-            crate::i18n::Lang::Zh => format!("tar 打包失败（{code}）：{err}"),
-            crate::i18n::Lang::En => format!("tar pack failed ({code}): {err}"),
-        });
+        anyhow::bail!(
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("tar 打包失败（{code}）：{err}"),
+                crate::i18n::Lang::En => format!("tar pack failed ({code}): {err}"),
+            }
+        );
     }
-    let size = sftp.metadata(&tmp_remote).await.ok().and_then(|m| m.size).unwrap_or(0);
+    let size = sftp
+        .metadata(&tmp_remote)
+        .await
+        .ok()
+        .and_then(|m| m.size)
+        .unwrap_or(0);
     // 打包完成：更新真实总量并清除阶段提示，进入正常字节进度
-    sink.send(WorkerEvent::TransferStart { id, name: name.clone(), total: size, dir: crate::proto::TransferDir::Download, local: Some(local.to_string()) });
-    sink.send(WorkerEvent::TransferNote { id, note: String::new() });
+    sink.send(WorkerEvent::TransferStart {
+        id,
+        name: name.clone(),
+        total: size,
+        dir: crate::proto::TransferDir::Download,
+        local: Some(local.to_string()),
+    });
+    sink.send(WorkerEvent::TransferNote {
+        id,
+        note: String::new(),
+    });
 
     // 下载压缩包到本地临时文件（并发分段 + 进度）
     let local_tgz = std::path::PathBuf::from(format!("{local}.ishelldl.{}.tgz", rand_hex(6)));
@@ -87,9 +121,15 @@ pub(super) async fn download_dir_compressed(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let tgz = local_tgz.clone();
     // 本地解包也可能耗时（大量小文件），提示「解包中…」避免进度条满了却迟迟不完成
-    sink.send(WorkerEvent::TransferNote { id, note: crate::i18n::tr("解包中…", "Extracting…").into() });
+    sink.send(WorkerEvent::TransferNote {
+        id,
+        note: crate::i18n::tr("解包中…", "Extracting…").into(),
+    });
     tokio::task::spawn_blocking(move || extract_tar_gz(&tgz, &dest)).await??;
-    sink.send(WorkerEvent::TransferNote { id, note: String::new() });
+    sink.send(WorkerEvent::TransferNote {
+        id,
+        note: String::new(),
+    });
     let _ = std::fs::remove_file(&local_tgz);
     Ok(())
 }
@@ -106,13 +146,25 @@ pub(super) async fn download(
     cancel: Arc<AtomicBool>,
 ) {
     let name = basename(&remote);
-    let is_dir = sftp.metadata(&remote).await.map(|m| m.is_dir()).unwrap_or(false);
+    let is_dir = sftp
+        .metadata(&remote)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
 
     // 冲突处理：本地目标已存在时，按策略 跳过 / 重命名 / 覆盖
     let local = if std::path::Path::new(&local).exists() {
         match policy {
             ConflictPolicy::Skip => {
-                sink.send(WorkerEvent::TransferDone { id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已跳过（本地已存在）：{name}"), crate::i18n::Lang::En => format!("Skipped (exists): {name}") }, refresh_dir: None });
+                sink.send(WorkerEvent::TransferDone {
+                    id,
+                    ok: true,
+                    message: match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("已跳过（本地已存在）：{name}"),
+                        crate::i18n::Lang::En => format!("Skipped (exists): {name}"),
+                    },
+                    refresh_dir: None,
+                });
                 return;
             }
             ConflictPolicy::Rename => local_nonexistent(&local),
@@ -128,13 +180,24 @@ pub(super) async fn download(
         match download_dir_compressed(&handle, &sftp, id, &remote, &local, sink, &cancel).await {
             Ok(()) => {
                 sink.send(WorkerEvent::TransferDone {
-                    id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已下载 {name}"), crate::i18n::Lang::En => format!("Downloaded {name}") }, refresh_dir: None,
+                    id,
+                    ok: true,
+                    message: match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("已下载 {name}"),
+                        crate::i18n::Lang::En => format!("Downloaded {name}"),
+                    },
+                    refresh_dir: None,
                 });
                 return;
             }
             Err(e) => {
                 if cancel.load(Ordering::Relaxed) {
-                    sink.send(WorkerEvent::TransferDone { id, ok: false, message: crate::i18n::tr("已取消", "Canceled").into(), refresh_dir: None });
+                    sink.send(WorkerEvent::TransferDone {
+                        id,
+                        ok: false,
+                        message: crate::i18n::tr("已取消", "Canceled").into(),
+                        refresh_dir: None,
+                    });
                     return;
                 }
                 log::warn!("压缩下载失败，回退逐文件：{e}");
@@ -160,19 +223,35 @@ pub(super) async fn download(
                     if meta.is_dir() {
                         stack.push(full);
                     } else {
-                        let rel = full.strip_prefix(remote.as_str()).unwrap_or(&full).trim_start_matches('/');
-                        files.push((full.clone(), std::path::Path::new(&local).join(rel), meta.size.unwrap_or(0)));
+                        let rel = full
+                            .strip_prefix(remote.as_str())
+                            .unwrap_or(&full)
+                            .trim_start_matches('/');
+                        files.push((
+                            full.clone(),
+                            std::path::Path::new(&local).join(rel),
+                            meta.size.unwrap_or(0),
+                        ));
                     }
                 }
             }
         } else {
-            let sz = sftp.metadata(&remote).await.ok().and_then(|m| m.size).unwrap_or(0);
+            let sz = sftp
+                .metadata(&remote)
+                .await
+                .ok()
+                .and_then(|m| m.size)
+                .unwrap_or(0);
             files.push((remote.clone(), std::path::PathBuf::from(&local), sz));
         }
 
         let total: u64 = files.iter().map(|f| f.2).sum();
         sink.send(WorkerEvent::TransferStart {
-            id, name: name.clone(), total, dir: crate::proto::TransferDir::Download, local: Some(local.clone()),
+            id,
+            name: name.clone(),
+            total,
+            dir: crate::proto::TransferDir::Download,
+            local: Some(local.clone()),
         });
 
         // 累计已下载字节（多任务共享）+ 周期性上报进度
@@ -198,7 +277,20 @@ pub(super) async fn download(
 
         let result = async {
             for (rpath, lpath, size) in files {
-                download_file(&sftp, &rpath, &lpath, size, sftp.metadata(&rpath).await.ok().and_then(|m| m.mtime).unwrap_or(0), &cancel, &done).await?;
+                download_file(
+                    &sftp,
+                    &rpath,
+                    &lpath,
+                    size,
+                    sftp.metadata(&rpath)
+                        .await
+                        .ok()
+                        .and_then(|m| m.mtime)
+                        .unwrap_or(0),
+                    &cancel,
+                    &done,
+                )
+                .await?;
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -206,22 +298,39 @@ pub(super) async fn download(
 
         stop.store(true, Ordering::Relaxed);
         let _ = prog.await;
-        sink.send(WorkerEvent::TransferProgress { id, done: done.load(Ordering::Relaxed) });
+        sink.send(WorkerEvent::TransferProgress {
+            id,
+            done: done.load(Ordering::Relaxed),
+        });
         result
     }
     .await;
 
     match res {
         Ok(_) => sink.send(WorkerEvent::TransferDone {
-            id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已下载 {name}"), crate::i18n::Lang::En => format!("Downloaded {name}") }, refresh_dir: None,
+            id,
+            ok: true,
+            message: match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("已下载 {name}"),
+                crate::i18n::Lang::En => format!("Downloaded {name}"),
+            },
+            refresh_dir: None,
         }),
         Err(e) => {
             let message = if cancel.load(Ordering::Relaxed) {
                 crate::i18n::tr("已取消", "Canceled").to_string()
             } else {
-                match crate::i18n::current() { crate::i18n::Lang::Zh => format!("下载失败：{e}"), crate::i18n::Lang::En => format!("Download failed: {e}") }
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("下载失败：{e}"),
+                    crate::i18n::Lang::En => format!("Download failed: {e}"),
+                }
             };
-            sink.send(WorkerEvent::TransferDone { id, ok: false, message, refresh_dir: None });
+            sink.send(WorkerEvent::TransferDone {
+                id,
+                ok: false,
+                message,
+                refresh_dir: None,
+            });
         }
     }
 }
@@ -281,7 +390,12 @@ pub(super) async fn download_file(
     };
 
     let out = if resume_bm.is_some() {
-        Arc::new(std::fs::OpenOptions::new().read(true).write(true).open(&data_part)?) // 续传：保留已写分段
+        Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&data_part)?,
+        ) // 续传：保留已写分段
     } else {
         let f = std::fs::File::create(&data_part)?;
         f.set_len(size)?;
@@ -290,7 +404,9 @@ pub(super) async fn download_file(
     let chunk_done: Arc<Vec<AtomicBool>> = Arc::new(
         (0..n_chunks)
             .map(|i| {
-                let d = resume_bm.as_ref().is_some_and(|b| (b[(i / 8) as usize] >> (i % 8)) & 1 == 1);
+                let d = resume_bm
+                    .as_ref()
+                    .is_some_and(|b| (b[(i / 8) as usize] >> (i % 8)) & 1 == 1);
                 AtomicBool::new(d)
             })
             .collect(),
@@ -321,8 +437,14 @@ pub(super) async fn download_file(
         let workers = DL_PARALLEL.min(n_chunks.max(1));
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..workers {
-            let (sftp, out, cursor, done, cancel, chunk_done) =
-                (sftp.clone(), out.clone(), cursor.clone(), done.clone(), cancel.clone(), chunk_done.clone());
+            let (sftp, out, cursor, done, cancel, chunk_done) = (
+                sftp.clone(),
+                out.clone(),
+                cursor.clone(),
+                done.clone(),
+                cancel.clone(),
+                chunk_done.clone(),
+            );
             let part_file = part_file.clone();
             let rpath = rpath.to_string();
             set.spawn(async move {
@@ -357,7 +479,7 @@ pub(super) async fn download_file(
                     pwrite(&out, &buf[..want], off)?;
                     chunk_done[idx as usize].store(true, Ordering::Relaxed);
                     done.fetch_add(want as u64, Ordering::Relaxed); // 每段只计一次
-                    // 持久化该分段所在的位图字节（断点信息落盘）
+                                                                    // 持久化该分段所在的位图字节（断点信息落盘）
                     let byte_i = (idx / 8) as usize;
                     let mut b = 0u8;
                     for bit in 0..8u64 {
@@ -406,7 +528,10 @@ pub(super) async fn download_file(
 }
 
 /// 下载完成收尾：临时数据文件原子替换到目标（先删已存在目标，Windows rename 不覆盖）。
-pub(super) fn finish_download(data_part: &std::path::Path, lpath: &std::path::Path) -> anyhow::Result<()> {
+pub(super) fn finish_download(
+    data_part: &std::path::Path,
+    lpath: &std::path::Path,
+) -> anyhow::Result<()> {
     if !lpath.exists() {
         // 目标不存在：直接换入
         std::fs::rename(data_part, lpath)?;
@@ -464,23 +589,4 @@ pub(super) async fn download_small(
     res
 }
 
-/// 在指定偏移定位写入（跨平台）。
-pub(super) fn pwrite(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.write_all_at(buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        let mut off = offset;
-        let mut b = buf;
-        while !b.is_empty() {
-            let n = file.seek_write(b, off)?;
-            b = &b[n..];
-            off += n as u64;
-        }
-        Ok(())
-    }
-}
+use download_io::pwrite;

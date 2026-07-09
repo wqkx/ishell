@@ -13,6 +13,7 @@ mod selection;
 mod theme;
 mod ui_paint;
 mod vt;
+mod default;
 
 use input::HistState;
 use keys::encode_mouse;
@@ -590,11 +591,6 @@ impl Terminal {
     }
 }
 
-impl Default for Terminal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 #[path = "terminal_tests.rs"]
