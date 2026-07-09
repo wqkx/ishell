@@ -1,26 +1,31 @@
 //! 应用主体：会话管理 + 顶部标签 + 三区布局（系统信息 / 终端 / 文件）。
 
+mod types;
 mod util;
 mod view_state;
 mod widgets;
+pub(in crate::app) use types::{
+    DirectFallback, DirectJob, DocKind, EditorState, EditorTab, FileClip, ForwardEntry, ForwardUi,
+    ImageTab, ImageView, KbdPrompt, PendingPaste, Popups, ProcPopup, Relay, RelayPhase, SaveState,
+    Shot, Snippets, TabBar, Transfer, Transfers, XferFilter,
+};
 #[allow(unused_imports)]
 use util::*;
 #[allow(unused_imports)]
 use view_state::*;
 #[allow(unused_imports)]
 use widgets::*;
+mod dialogs;
 mod doc_view;
+mod editor_win;
+mod file_actions;
+mod frame;
+mod layout;
+mod pending;
+mod session_events;
 mod transfers;
 mod windows;
-mod dialogs;
-mod editor_win;
-mod session_events;
-mod file_actions;
-mod layout;
-mod frame;
-mod pending;
 pub use widgets::view_context_menu;
-
 
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +39,6 @@ use crate::theme::Palette;
 use crate::ui::connect::ConnectForm;
 use crate::ui::file_panel::FilePanelState;
 use crate::ui::sidebar::{self, NetHistory};
-
 
 /// 单个 SSH 会话的前台状态。
 struct Session {
@@ -99,187 +103,6 @@ pub(super) enum XferSpec {
     Upload { local: String, remote_dir: String },
 }
 
-/// 传输列表的状态筛选。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum XferFilter {
-    All,
-    Active,
-    Done,
-    Failed,
-}
-
-
-
-
-/// UI 侧的一条传输记录。
-pub(super) struct Transfer {
-    id: u64,
-    name: String,
-    dir: crate::proto::TransferDir,
-    /// 重发规格（用于断线重连续传 / 手动重试）；演示记录为 None
-    spec: Option<XferSpec>,
-    /// 因断线被中断、等待重连后自动续传
-    paused: bool,
-    done: u64,
-    total: u64,
-    /// None=进行中，Some(true/false)=完成/失败
-    ok: Option<bool>,
-    /// 下载到的本地路径（用于「打开所在文件夹」）
-    local: Option<String>,
-    /// 完成/失败原因（点击状态可展开查看）
-    message: String,
-    /// 是否展开显示失败原因
-    show_err: bool,
-    /// 实时速度（字节/秒，指数平滑）
-    speed: f64,
-    /// 上次采样的已传字节数与时刻（用于计算速度）
-    last_done: u64,
-    last_t: Option<std::time::Instant>,
-    /// 进行中的阶段提示（如「打包中…」「解包中…」「等待源端…」「直传中…」）；非空时在详情行替代字节读数
-    note: String,
-    /// 排队等待态（如跨服务器中转的目标端，正等源端下载完成）：显示「等待」而非进度数字
-    queued: bool,
-    /// 模式徽标（如「直传」）：显示在文件大小之后，标注传输方式；空串不显示
-    tag: String,
-}
-
-impl Transfer {
-    /// 新建一条「进行中」的传输记录（note/queued 默认空，speed 等计量字段归零）。
-    fn new(id: u64, name: String, dir: crate::proto::TransferDir, total: u64, local: Option<String>, spec: Option<XferSpec>) -> Self {
-        Transfer {
-            id, name, dir, spec, paused: false, done: 0, total, ok: None, local,
-            message: String::new(), show_err: false, speed: 0.0, last_done: 0, last_t: None,
-            note: String::new(), queued: false, tag: String::new(),
-        }
-    }
-}
-
-/// 文件传输子系统的聚合状态（剪贴板 / 待确认粘贴 / 跨服务器中转 / 直传）。
-/// 从 App 抽出的内聚字段组，配套 transfers.rs 里的方法。
-#[derive(Default)]
-struct Transfers {
-    /// 文件剪贴板（跨 tab 共享）：复制/剪切的源项
-    file_clip: Option<FileClip>,
-    /// 待确认的粘贴（剪切 或 跨服务器：执行前二次确认）
-    pending_paste: Option<PendingPaste>,
-    /// 跨服务器中转任务（下载→上传→可选删源）
-    relays: Vec<Relay>,
-    /// 中转临时目录去重计数
-    relay_seq: u64,
-    /// 粘贴确认弹框里「直传/中转」互斥选择的当前值（false=中转，默认更安全）
-    confirm_direct: bool,
-    /// 进行中的直传任务追踪（成功删源/刷新；失败弹回退）
-    direct_jobs: Vec<DirectJob>,
-    /// 直传失败、待确认「转中转」的计划 + 原因（队列：多个失败依次弹，避免同帧互相覆盖）
-    pending_direct_fallback: Vec<DirectFallback>,
-    /// 直传目标不在本机 known_hosts：待用户确认首次 TOFU（在源机 accept-new）后再执行
-    pending_direct_hostkey: Option<PendingPaste>,
-}
-
-/// 命令片段库状态（从 App 抽出的内聚字段组）。
-#[derive(Default)]
-struct Snippets {
-    /// 片段浮窗是否显示
-    show: bool,
-    /// 浮窗刚打开（本帧跳过"点击外部关闭"判定）
-    just_opened: bool,
-    /// 片段数据
-    list: Vec<crate::store::Snippet>,
-    /// 正在编辑的片段索引（None = 新建）
-    editing: Option<usize>,
-    /// 编辑表单缓冲
-    name: String,
-    cmd: String,
-    run: bool,
-}
-
-/// App 级文件剪贴板（跨 tab 共享）。
-struct FileClip {
-    /// (绝对路径, 是否目录)
-    items: Vec<(String, bool)>,
-    /// true=剪切（粘贴时移动），false=复制
-    is_cut: bool,
-    src_uid: u64,
-    src_host: String,
-    src_port: u16,
-    src_label: String,
-}
-
-/// 待确认的粘贴计划（剪切，或跨服务器复制/剪切，执行前二次确认）。
-#[derive(Clone)]
-struct PendingPaste {
-    items: Vec<(String, bool)>,
-    is_cut: bool,
-    /// 源与目标是否不同服务器（需经本地中转或直传）
-    cross: bool,
-    src_uid: u64,
-    dest_uid: u64,
-    /// 源目录（被复制/剪切项的所在目录，用于确认弹框展示）
-    src_dir: String,
-    dest_dir: String,
-    src_label: String,
-    dest_label: String,
-    /// 跨服务器时是否走「直传」（true=源主机直推目标；false=经本地中转）。一级确认后才据传输方式设定。
-    direct: bool,
-}
-
-/// 直传任务追踪（App 侧）：源会话里一条直传传输（id）的归属与善后信息。
-/// 成功 → 剪切则删源 + 刷新目标目录；失败 → 弹「转中转」提醒。
-struct DirectJob {
-    /// 源会话里的传输 id（真实数据通路在此）
-    id: u64,
-    /// 目标会话里的「镜像」进度行 id（直传数据不经 B，App 据源端进度同步显示）
-    mir_id: u64,
-    src_uid: u64,
-    dest_uid: u64,
-    /// 源目录（回退中转确认弹框展示用）
-    src_dir: String,
-    dest_dir: String,
-    is_cut: bool,
-    /// 原始条目（失败回退中转、或剪切删源时用）
-    items: Vec<(String, bool)>,
-    src_label: String,
-    dest_label: String,
-    /// 用户主动取消（经取消按钮标记）：失败收尾时据此跳过「转中转」提醒，避免误弹
-    cancelled: bool,
-}
-
-/// 直传失败后，等待用户确认「转中转」的计划 + 失败原因。
-struct DirectFallback {
-    plan: PendingPaste,
-    reason: String,
-}
-
-/// 跨服务器中转任务：源会话下载到本地临时 → 目标会话上传 →（剪切则删源）。
-struct Relay {
-    src_path: String,
-    is_dir: bool,
-    src_uid: u64,
-    dest_uid: u64,
-    dest_dir: String,
-    is_cut: bool,
-    tmp: std::path::PathBuf,
-    phase: RelayPhase,
-    /// 目标会话里预占的上传传输 id（粘贴时即登记「等待」占位行，源端下载完才真正发起上传）
-    up_id: u64,
-}
-
-/// 中转任务阶段：保存对应会话里的传输 id，用于轮询完成状态。
-enum RelayPhase {
-    Down(u64),
-    Up(u64),
-}
-
-/// 键盘交互认证的一组待回答提示（每项 (提示文本, 是否回显) + 用户输入缓冲）。
-struct KbdPrompt {
-    name: String,
-    instructions: String,
-    /// (提示文本, 是否回显)
-    prompts: Vec<(String, bool)>,
-    /// 与 prompts 等长的回答缓冲
-    answers: Vec<String>,
-}
-
 impl Session {
     fn refresh_dir(&mut self, dir: Option<String>) {
         if let Some(dir) = dir {
@@ -297,12 +120,6 @@ impl Session {
         let _ = self.cmd_tx.send(UiCommand::ListDir(".".into()));
     }
 }
-
-
-
-
-
-
 
 pub struct App {
     runtime: Arc<tokio::runtime::Runtime>,
@@ -337,8 +154,26 @@ pub struct App {
     /// 看图工具状态（标签、激活项、聚焦请求、拖动重排）
     image: ImageView,
     /// docx 后台解析结果通道：(占位标签 id, 解析结果)
-    doc_parse_tx: std::sync::mpsc::Sender<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)>,
-    doc_parse_rx: std::sync::mpsc::Receiver<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)>,
+    doc_parse_tx: std::sync::mpsc::Sender<(
+        u64,
+        Result<
+            (
+                crate::ui::docx::Doc,
+                std::collections::HashMap<String, egui::TextureHandle>,
+            ),
+            String,
+        >,
+    )>,
+    doc_parse_rx: std::sync::mpsc::Receiver<(
+        u64,
+        Result<
+            (
+                crate::ui::docx::Doc,
+                std::collections::HashMap<String, egui::TextureHandle>,
+            ),
+            String,
+        >,
+    )>,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）
@@ -370,294 +205,6 @@ pub struct App {
     logo: bool,
 }
 
-/// 进程详情小窗状态。
-struct ProcPopup {
-    pid: u32,
-    name: String,
-    cpu: f32,
-    mem: f32,
-    pos: egui::Pos2,
-    cmd: String,
-    cwd: String,
-    exe: String,
-    /// 最近一次复制的时刻（ctx 时间，秒），用于短暂显示「已复制」
-    copied_t: Option<f64>,
-    /// 是否处于「强制结束」二次确认态：kill 按钮先置此标志，确认后才真正下发 KillProc
-    confirm_kill: bool,
-    /// 打开弹窗时所属会话的 uid——kill 据此定位会话，避免切会话后误 kill 别的主机
-    uid: u64,
-}
-
-/// UI 侧的一条端口转发记录。
-struct ForwardEntry {
-    id: u64,
-    label: String,
-    status: String,
-    ok: bool,
-    /// 结构化参数：用于「编辑」时把该条回填到表单，以及本地端口占用检测。
-    bind_host: String,
-    bind_port: u16,
-    kind: crate::proto::ForwardKind,
-}
-
-/// 端口转发管理窗口的 UI 状态（从 App 抽出的内聚字段组）。
-#[derive(Default)]
-struct ForwardUi {
-    /// 管理窗口是否显示
-    show: bool,
-    /// 浮窗刚打开（本帧跳过"点击外部关闭"判定）
-    just_opened: bool,
-    /// 待删除确认的转发 id（行内二次确认）
-    confirm_del: Option<u64>,
-    /// 新增/编辑转发表单
-    form: ForwardForm,
-    /// 正在编辑的转发 id（Some=编辑模式）
-    editing: Option<u64>,
-    /// 表单内联校验错误（端口占用/参数无效等）
-    error: Option<String>,
-    /// 非回环绑定待二次确认的转发规格（确认后才真正添加）
-    pending_open_bind: Option<crate::proto::ForwardSpec>,
-}
-
-/// "新增转发"表单状态。
-struct ForwardForm {
-    /// 0 = 本地转发，1 = 动态 SOCKS5
-    kind: usize,
-    bind: String,
-    local_port: String,
-    target_host: String,
-    target_port: String,
-}
-
-impl Default for ForwardForm {
-    fn default() -> Self {
-        Self {
-            kind: 0,
-            bind: "127.0.0.1".into(),
-            local_port: String::new(),
-            target_host: String::new(),
-            target_port: String::new(),
-        }
-    }
-}
-
-/// 一个编辑器标签（含来源服务器，用于回写）。
-/// 文档标签内容（PDF / Word）：挂在 EditorTab 上，Some 时该标签渲染文档查看器
-/// 而非文本编辑器；占位/进度/失败/关闭全部复用编辑器标签框架。
-enum DocKind {
-    /// PDF：远端 poppler 逐页渲染为 PNG，本地页缓存 + 前后预取
-    Pdf {
-        /// 总页数（就位时已知，恒 >0）
-        pages: u32,
-        /// 当前页（1 基）
-        cur: u32,
-        /// 缩放；0 = 适应窗口宽
-        zoom: f32,
-        /// 页缓存（小 LRU：按插入序淘汰最旧）
-        cache: Vec<(u32, egui::TextureHandle, egui::Vec2)>,
-        /// 在途渲染请求的页码
-        pending: std::collections::HashSet<u32>,
-        /// 上次滚动连续翻页时刻（冷却 0.3s，防滚轮惯性连环翻页）
-        flip_at: f64,
-        /// 全文查找：输入、开关、命中 (页码, 片段)、当前命中序号、在途标志、失败消息
-        search: String,
-        search_open: bool,
-        hits: Vec<(u32, String)>,
-        hit_sel: usize,
-        searching: bool,
-        search_msg: Option<String>,
-    },
-    /// Word(docx)：本地解析的重排阅读视图
-    Docx {
-        doc: crate::ui::docx::Doc,
-        /// 内嵌图片纹理（media 名 → 纹理）
-        images: std::collections::HashMap<String, egui::TextureHandle>,
-        /// 各内容块上一帧实测高度（视口裁剪用：屏幕外块直接占位跳过渲染）
-        heights: Vec<f32>,
-        /// 本地查找：输入、开关、命中块索引、当前命中序号、待滚动目标块
-        search: String,
-        search_open: bool,
-        hits: Vec<usize>,
-        hit_sel: usize,
-        scroll_to: Option<usize>,
-    },
-}
-
-/// 编辑器保存流程的类型化状态机，取代旧的 saving/save_conflict/close_on_saved/save_rev
-/// 布尔量组合——那些组合能表达非法状态（如「保存中且冲突」）。此枚举保证任一时刻
-/// 至多处于一个合法状态。保存进度/动画字段（save_at 等）是展示层，另行保留。
-enum SaveState {
-    /// 空闲：无在途保存、无未决冲突。
-    Idle,
-    /// 已发出 WriteFile、等待结果。rev=发出时的修订签名 (vver, 编码, 行尾)，
-    /// 收到 FileSaved 且签名一致才算已保存；close_after=完成后是否关闭标签。
-    Saving { rev: (u64, String, crate::proto::Eol), close_after: bool },
-    /// 检测到外部改动（未写入），显示冲突横幅，等用户选择覆盖/取消。
-    Conflict,
-}
-
-struct EditorTab {
-    editor: crate::ui::editor::Editor,
-    /// 所属会话标题（仅用于标签显示）
-    server: String,
-    /// 所属会话稳定唯一 id（身份匹配用：保存/冲突/去重，避免同名会话串台）
-    uid: u64,
-    cmd_tx: UnboundedSender<UiCommand>,
-    /// 该编辑器固定的 TextEdit Id（关闭时据此清理 egui 状态/撤销历史）
-    text_id: egui::Id,
-    /// 下载中关联的 ReadFile id（Some=加载中占位，None=已就绪）；以及下载进度
-    load_id: Option<u64>,
-    load_done: u64,
-    load_total: u64,
-    /// 保存流程状态机（见 SaveState）。
-    save: SaveState,
-    /// 保存动画起始时刻（ctx 时间，秒）：驱动标签底部珊瑚线「绿扫→珊瑚扫」表示已保存；None=无动画
-    save_at: Option<f64>,
-    /// 保存写入进度（done/total 字节）：驱动绿扫跟随实际上传速度
-    save_done: u64,
-    save_total: u64,
-    /// 跟随模式（tail -f）状态：下次读取的字节偏移（u64::MAX=待初始化）、
-    /// 是否有在途请求、上次轮询时刻。注意：跟随期间**不更新 mtime**——外部对文件
-    /// 中间的修改无法检测，保留旧 mtime 让保存走冲突确认，避免静默覆盖他人修改。
-    tail_offset: u64,
-    tail_pending: bool,
-    tail_last: f64,
-    /// Some = 文档标签（PDF/Word 查看器）；None = 常规文本编辑器
-    doc: Option<DocKind>,
-    /// 跟随模式跨块解码缓冲：上一块末尾不完整的多字节字符原始字节，与下一块拼接
-    ///（否则 UTF-8/GBK 字符跨 512KB 分块边界会变替换字符并永久丢失原始字节）
-    tail_carry: Vec<u8>,
-    /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
-    save_done_at: Option<f64>,
-}
-
-impl EditorTab {
-    /// 保存进行中（已发 WriteFile、未收到结果）——期间屏蔽再次保存。
-    fn is_saving(&self) -> bool {
-        matches!(self.save, SaveState::Saving { .. })
-    }
-    /// 存在未决的外部改动冲突（显示横幅）。
-    fn is_conflict(&self) -> bool {
-        matches!(self.save, SaveState::Conflict)
-    }
-    /// 用户是否要求「保存成功后关闭标签」（仅在保存中有意义）。FSM 不变式，测试覆盖。
-    #[allow(dead_code)]
-    fn wants_close(&self) -> bool {
-        matches!(self.save, SaveState::Saving { close_after: true, .. })
-    }
-    /// 进入「保存中」：记录发出时的修订签名与是否保存后关闭。
-    fn begin_save(&mut self, close_after: bool) {
-        self.save = SaveState::Saving { rev: self.editor.save_rev(), close_after };
-    }
-    /// 若处于保存中，标记「完成后关闭」（用于保存进行时用户点『保存并关闭』）。
-    fn request_close_on_saved(&mut self) {
-        if let SaveState::Saving { close_after, .. } = &mut self.save {
-            *close_after = true;
-        }
-    }
-}
-
-/// 编辑器窗口的共享状态（主窗口与 deferred viewport 回调共用，见 App::editor_state）。
-#[derive(Default)]
-struct EditorState {
-    tabs: Vec<EditorTab>,
-    /// 当前激活标签
-    active: usize,
-    /// 上次渲染的激活标签（用于切换后滚到可视区）
-    shown: usize,
-    /// 一次性请求：新开/切换后把编辑器窗口置前并聚焦
-    focus: bool,
-    /// 「关闭全部」时若有未保存修改，弹确认框
-    close_confirm: bool,
-    /// 关闭单个「脏」标签前的确认（标签索引）
-    close_tab_confirm: Option<usize>,
-    /// 关闭标签后请求主循环归还内存（trim）
-    trim_request: bool,
-    /// 标签拖动重排状态（仿主窗口）：拖动索引 / 抓取偏移 / 内容总宽缓存
-    tab_drag: Option<usize>,
-    tab_grab_dx: f32,
-    tab_total_w: f32,
-}
-
-impl EditorState {
-    /// 关闭全部标签并清理各自的 TextEdit 内存状态；请求 trim。
-    fn close_all(&mut self, ctx: &egui::Context) {
-        for tab in self.tabs.drain(..) {
-            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(tab.text_id));
-        }
-        self.active = 0;
-        self.close_confirm = false;
-        self.trim_request = true;
-    }
-}
-
-/// 看图工具的一个标签页（一张已加载的图片）。
-/// 主窗口会话标签条的拖拽重排 + 滚动状态（从 App 抽出的内聚字段组）。
-#[derive(Default)]
-struct TabBar {
-    /// 正在拖拽排序的标签源索引
-    drag: Option<usize>,
-    /// 拖拽起点在标签内的横向抓取偏移（让被拖标签跟手而不跳到光标处）
-    grab_dx: f32,
-    /// 标签条总宽缓存（用于撑出横向滚动内容宽度）
-    total_w: f32,
-    /// 请求把激活标签滚动到可视区（新建/点击/Ctrl+Tab 切换时置位）
-    scroll_to_active: bool,
-}
-
-/// 进程/GPU 详情小窗状态（从 App 抽出的内聚字段组）。
-#[derive(Default)]
-struct Popups {
-    /// 进程详情小窗
-    proc: Option<ProcPopup>,
-    proc_just_opened: bool,
-    /// GPU 详情小窗（仅记录弹出位置，数据每帧从活动会话取）
-    gpu: Option<egui::Pos2>,
-    gpu_just_opened: bool,
-}
-
-/// 看图工具窗口状态（从 App 抽出的内聚字段组）。
-#[derive(Default)]
-struct ImageView {
-    /// 已打开的图片标签
-    tabs: Vec<ImageTab>,
-    /// 当前激活标签下标
-    active: usize,
-    /// 一次性请求：新开/切换后把看图窗口置前并聚焦
-    focus: bool,
-    /// 上次渲染时的激活标签（用于侦测切换后滚到可视区）
-    shown: usize,
-    /// 标签拖动重排状态（仿主窗口）
-    tab_drag: Option<usize>,
-    grab_dx: f32,
-    total_w: f32,
-}
-
-pub(super) struct ImageTab {
-    /// 所属会话标题（仅显示）
-    server: String,
-    /// 所属会话稳定唯一 id（身份匹配用）
-    uid: u64,
-    path: String,
-    tex: egui::TextureHandle,
-    /// 原始字节（用于「另存为」，保留源格式/质量）
-    data: Vec<u8>,
-    /// 原始像素尺寸
-    size: egui::Vec2,
-    /// 缩放系数；0 表示「首帧自动适应窗口」
-    zoom: f32,
-    /// 平移偏移（像素）
-    offset: egui::Vec2,
-}
-
-
-/// 自检截图状态。
-struct Shot {
-    path: String,
-    deadline: std::time::Instant,
-    requested: bool,
-}
-
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::apply(&cc.egui_ctx);
@@ -680,7 +227,10 @@ impl App {
         form.open = true; // 启动即弹出连接框
 
         let shot = std::env::var("ISHELL_SHOT").ok().map(|path| {
-            let secs: u64 = std::env::var("ISHELL_SHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+            let secs: u64 = std::env::var("ISHELL_SHOT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
             Shot {
                 path,
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(secs),
@@ -693,10 +243,15 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             sessions: Vec::new(),
             active: None,
-            tabbar: TabBar { total_w: 1.0, ..Default::default() },
+            tabbar: TabBar {
+                total_w: 1.0,
+                ..Default::default()
+            },
             next_uid: 0,
             connect_form: form,
-            download_dir: crate::store::load_download_dir().map(std::path::PathBuf::from).unwrap_or_else(downloads_dir),
+            download_dir: crate::store::load_download_dir()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(downloads_dir),
             xfer_filter: XferFilter::All,
             show_transfers: false,
             xfer_just_opened: false,
@@ -714,9 +269,15 @@ impl App {
             active_uid_prev: None,
             show_broadcast: false,
             broadcast_input: String::new(),
-            conflict_policy: crate::store::load_conflict_policy().map(|s| ConflictPolicy::from_str(&s)).unwrap_or(ConflictPolicy::Overwrite),
+            conflict_policy: crate::store::load_conflict_policy()
+                .map(|s| ConflictPolicy::from_str(&s))
+                .unwrap_or(ConflictPolicy::Overwrite),
             xfer: Transfers::default(),
-            snip: Snippets { list: crate::store::load_snippets(), run: true, ..Default::default() },
+            snip: Snippets {
+                list: crate::store::load_snippets(),
+                run: true,
+                ..Default::default()
+            },
             popups: Popups::default(),
             demo_gpu: std::env::var("ISHELL_DEMO_GPU").is_ok(),
             demo_net: std::env::var("ISHELL_DEMO_NET").is_ok(),
@@ -734,7 +295,14 @@ impl App {
                         host: parts[0].into(),
                         port,
                         username: parts[2].into(),
-                        auth: if parts[3] == "agent" { AuthMethod::Agent } else { AuthMethod::KeyFile { path: parts[3].into(), passphrase: None } },
+                        auth: if parts[3] == "agent" {
+                            AuthMethod::Agent
+                        } else {
+                            AuthMethod::KeyFile {
+                                path: parts[3].into(),
+                                passphrase: None,
+                            }
+                        },
                         label: String::new(),
                         // 自检：ISHELL_JUMP="host|port|user|key" 时经跳板机连接
                         jump: std::env::var("ISHELL_JUMP").ok().and_then(|s| {
@@ -743,7 +311,10 @@ impl App {
                                 host: p[0].into(),
                                 port: p[1].parse().unwrap_or(22),
                                 username: p[2].into(),
-                                auth: AuthMethod::KeyFile { path: p[3].into(), passphrase: None },
+                                auth: AuthMethod::KeyFile {
+                                    path: p[3].into(),
+                                    passphrase: None,
+                                },
                             })
                         }),
                         forward_agent: false,
@@ -771,11 +342,17 @@ impl App {
         }
         // 自检：注入演示编辑器内容（截图核对代码高亮 + 多标签）
         if std::env::var("ISHELL_DEMO_EDIT").is_ok() {
-            if let Some((server, uid, tx)) = app.sessions.first().map(|s| (s.title.clone(), s.uid, s.cmd_tx.clone())) {
+            if let Some((server, uid, tx)) = app
+                .sessions
+                .first()
+                .map(|s| (s.title.clone(), s.uid, s.cmd_tx.clone()))
+            {
                 let code = "use std::io;\n\n// 示例：读取并打印\nfn main() {\n    let mut s = String::new();\n    io::stdin().read_line(&mut s).unwrap();\n    let n: i32 = s.trim().parse().unwrap_or(0);\n    for i in 0..n {\n        println!(\"line {}\", i);\n    }\n}\n".to_string();
                 let t1 = app.alloc_editor_id();
                 // 大文件（>1MB）→ 只读模式，核对「改为可编辑」按钮
-                let big: String = (0..40000).map(|i| format!("{i}: the quick brown fox jumps over the lazy dog\n")).collect();
+                let big: String = (0..40000)
+                    .map(|i| format!("{i}: the quick brown fox jumps over the lazy dog\n"))
+                    .collect();
                 let t2 = app.alloc_editor_id();
                 let t3 = app.alloc_editor_id();
                 let mut ed = lock_mutex(&app.editor_state);
@@ -787,17 +364,17 @@ impl App {
                     text_id: t1,
                     load_id: None,
                     load_done: 0,
-            load_total: 0,
-            save: SaveState::Idle,
-            save_at: None,
-            save_done: 0,
-            save_total: 0,
-            save_done_at: None,
-            tail_offset: u64::MAX,
-            tail_pending: false,
-            tail_last: 0.0,
-            doc: None,
-            tail_carry: Vec::new(),
+                    load_total: 0,
+                    save: SaveState::Idle,
+                    save_at: None,
+                    save_done: 0,
+                    save_total: 0,
+                    save_done_at: None,
+                    tail_offset: u64::MAX,
+                    tail_pending: false,
+                    tail_last: 0.0,
+                    doc: None,
+                    tail_carry: Vec::new(),
                 });
                 let mut big_ed = crate::ui::editor::Editor::new("/var/log/huge.log".into(), big);
                 big_ed.readonly = true; // 演示大文件默认只读
@@ -809,37 +386,40 @@ impl App {
                     text_id: t2,
                     load_id: None,
                     load_done: 0,
-            load_total: 0,
-            save: SaveState::Idle,
-            save_at: None,
-            save_done: 0,
-            save_total: 0,
-            save_done_at: None,
-            tail_offset: u64::MAX,
-            tail_pending: false,
-            tail_last: 0.0,
-            doc: None,
-            tail_carry: Vec::new(),
+                    load_total: 0,
+                    save: SaveState::Idle,
+                    save_at: None,
+                    save_done: 0,
+                    save_total: 0,
+                    save_done_at: None,
+                    tail_offset: u64::MAX,
+                    tail_pending: false,
+                    tail_last: 0.0,
+                    doc: None,
+                    tail_carry: Vec::new(),
                 });
                 ed.tabs.push(EditorTab {
-                    editor: crate::ui::editor::Editor::new("/etc/hosts".into(), "127.0.0.1 localhost\n::1 localhost\n".into()),
+                    editor: crate::ui::editor::Editor::new(
+                        "/etc/hosts".into(),
+                        "127.0.0.1 localhost\n::1 localhost\n".into(),
+                    ),
                     server,
                     uid,
                     cmd_tx: tx,
                     text_id: t3,
                     load_id: None,
                     load_done: 0,
-            load_total: 0,
-            save: SaveState::Idle,
-            save_at: None,
-            save_done: 0,
-            save_total: 0,
-            save_done_at: None,
-            tail_offset: u64::MAX,
-            tail_pending: false,
-            tail_last: 0.0,
-            doc: None,
-            tail_carry: Vec::new(),
+                    load_total: 0,
+                    save: SaveState::Idle,
+                    save_at: None,
+                    save_done: 0,
+                    save_total: 0,
+                    save_done_at: None,
+                    tail_offset: u64::MAX,
+                    tail_pending: false,
+                    tail_last: 0.0,
+                    doc: None,
+                    tail_carry: Vec::new(),
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -860,10 +440,15 @@ impl App {
                     }
                 }
                 let color = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
-                let tex = cc.egui_ctx.load_texture("demo_img", color, egui::TextureOptions::LINEAR);
+                let tex = cc
+                    .egui_ctx
+                    .load_texture("demo_img", color, egui::TextureOptions::LINEAR);
                 let mut data = Vec::new();
                 if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, px) {
-                    let _ = image::DynamicImage::ImageRgba8(buf).write_to(&mut std::io::Cursor::new(&mut data), image::ImageFormat::Png);
+                    let _ = image::DynamicImage::ImageRgba8(buf).write_to(
+                        &mut std::io::Cursor::new(&mut data),
+                        image::ImageFormat::Png,
+                    );
                 }
                 app.image.tabs.push(ImageTab {
                     server,
@@ -891,13 +476,19 @@ impl App {
                     ok: true,
                     bind_host: "127.0.0.1".into(),
                     bind_port: 18022,
-                    kind: ForwardKind::Local { remote_host: "127.0.0.1".into(), remote_port: 22 },
+                    kind: ForwardKind::Local {
+                        remote_host: "127.0.0.1".into(),
+                        remote_port: 22,
+                    },
                 });
                 let _ = s.cmd_tx.send(UiCommand::AddForward(ForwardSpec {
                     id,
                     bind_host: "127.0.0.1".into(),
                     bind_port: 18022,
-                    kind: ForwardKind::Local { remote_host: "127.0.0.1".into(), remote_port: 22 },
+                    kind: ForwardKind::Local {
+                        remote_host: "127.0.0.1".into(),
+                        remote_port: 22,
+                    },
                 }));
             }
             app.fwd.show = true;
@@ -956,12 +547,36 @@ impl App {
                     t.ok = ok;
                     s.transfers.push(t);
                 };
-                demo(1, "backup.tar.gz", Download, 73_400_320, 104_857_600, None, None);
+                demo(
+                    1,
+                    "backup.tar.gz",
+                    Download,
+                    73_400_320,
+                    104_857_600,
+                    None,
+                    None,
+                );
                 demo(2, "deploy.sh", Upload, 2048, 2048, Some(true), None);
-                demo(3, "huge.bin", Download, 1024, 2048, Some(true), Some("/root/Downloads/huge.bin".into()));
+                demo(
+                    3,
+                    "huge.bin",
+                    Download,
+                    1024,
+                    2048,
+                    Some(true),
+                    Some("/root/Downloads/huge.bin".into()),
+                );
                 // 自检：再塞一批，验证滚动
                 for i in 4..16u64 {
-                    demo(i, &format!("file_{i}.dat"), Download, i * 1000, 20000, if i % 3 == 0 { Some(true) } else { None }, None);
+                    demo(
+                        i,
+                        &format!("file_{i}.dat"),
+                        Download,
+                        i * 1000,
+                        20000,
+                        if i % 3 == 0 { Some(true) } else { None },
+                        None,
+                    );
                 }
             }
             app.show_transfers = true;
@@ -981,7 +596,11 @@ impl App {
     fn spawn_worker(
         &self,
         cfg: ConnectConfig,
-    ) -> (UnboundedSender<UiCommand>, std::sync::mpsc::Receiver<WorkerEvent>, UnboundedSender<bool>) {
+    ) -> (
+        UnboundedSender<UiCommand>,
+        std::sync::mpsc::Receiver<WorkerEvent>,
+        UnboundedSender<bool>,
+    ) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
         let (hostkey_tx, hostkey_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -997,7 +616,11 @@ impl App {
         self.next_uid += 1;
         self.sessions.push(Session {
             uid: self.next_uid,
-            title: if cfg.label.trim().is_empty() { cfg.username.clone() } else { cfg.label.trim().to_string() },
+            title: if cfg.label.trim().is_empty() {
+                cfg.username.clone()
+            } else {
+                cfg.label.trim().to_string()
+            },
             tip: format!("{}@{}:{}", cfg.username, cfg.host, cfg.port),
             cmd_tx,
             evt_rx,
@@ -1043,10 +666,14 @@ impl App {
 
     /// 重连指定会话：用原配置重启 worker，重置连接相关状态，保留标签/目录等。
     fn reconnect_session(&mut self, idx: usize) {
-        let Some(s) = self.sessions.get(idx) else { return };
+        let Some(s) = self.sessions.get(idx) else {
+            return;
+        };
         let cfg = s.cfg.clone();
         let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg);
-        let Some(s) = self.sessions.get_mut(idx) else { return };
+        let Some(s) = self.sessions.get_mut(idx) else {
+            return;
+        };
         let uid = s.uid;
         s.cmd_tx = cmd_tx.clone();
         s.evt_rx = evt_rx;
@@ -1137,7 +764,6 @@ impl App {
         }
     }
 
-
     fn session_idx_by_uid(&self, uid: u64) -> Option<usize> {
         self.sessions.iter().position(|s| s.uid == uid)
     }
@@ -1145,7 +771,9 @@ impl App {
     /// 与指定会话「同一台服务器」（host:port 相同）的所有会话下标，活动会话排在最前。
     /// 用于把多个标签页对同一服务器的传输任务汇总到同一个传输列表里。
     fn same_server_idxs(&self, idx: usize) -> Vec<usize> {
-        let Some(base) = self.sessions.get(idx) else { return Vec::new() };
+        let Some(base) = self.sessions.get(idx) else {
+            return Vec::new();
+        };
         let (host, port) = (base.cfg.host.clone(), base.cfg.port);
         let mut out = vec![idx];
         for (i, s) in self.sessions.iter().enumerate() {
@@ -1155,7 +783,6 @@ impl App {
         }
         out
     }
-
 }
 
 impl eframe::App for App {
@@ -1188,11 +815,18 @@ impl eframe::App for App {
                 } else {
                     // logo：圆角矩形贴合文字，四周边距大致相等（避免左右过宽）
                     let galley = ui.ctx().fonts_mut(|f| {
-                        f.layout_no_wrap("iShell".to_owned(), egui::FontId::proportional(76.0), Palette::ACCENT)
+                        f.layout_no_wrap(
+                            "iShell".to_owned(),
+                            egui::FontId::proportional(76.0),
+                            Palette::ACCENT,
+                        )
                     });
                     let sz = galley.size();
                     // 上下内边距小一些（galley 自带行间距），让视觉四边接近
-                    let rect = egui::Rect::from_center_size(ui.max_rect().center(), sz + egui::vec2(64.0, 40.0));
+                    let rect = egui::Rect::from_center_size(
+                        ui.max_rect().center(),
+                        sz + egui::vec2(64.0, 40.0),
+                    );
                     let painter = ui.painter();
                     painter.rect_filled(rect, 26.0, Palette::BG);
                     painter.galley(rect.center() - sz / 2.0, galley, Palette::ACCENT);
@@ -1215,7 +849,10 @@ impl eframe::App for App {
 
         // 活动会话切换时，复位「跨会话易串台」的临时 UI 态：转发的删除确认/编辑、进程详情弹窗
         // （否则 Ctrl+Tab 切走后，转发窗按 id 的确认/编辑可能命中新会话同 id 的另一条；进程弹窗显示陈旧）。
-        let cur_active_uid = self.active.and_then(|i| self.sessions.get(i)).map(|s| s.uid);
+        let cur_active_uid = self
+            .active
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.uid);
         if cur_active_uid != self.active_uid_prev {
             self.active_uid_prev = cur_active_uid;
             self.fwd.confirm_del = None;
@@ -1236,47 +873,94 @@ impl eframe::App for App {
         let mut proc_click: Option<(u32, egui::Pos2)> = None;
         let mut gpu_click: Option<egui::Pos2> = None;
         if !sidebar_collapsed() {
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(300.0)
-            .size_range(220.0..=460.0)
-            .frame(egui::Frame::new().fill(Palette::PANEL).inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 }))
-            .show_inside(ui, |ui| {
-                // 背景层右键弹语言菜单：在子控件之前注册，置于最底层 z 序，
-                // 这样不会抢走进程行/网卡/IP 等子控件的左键；空白处右键仍可触发。
-                let bg = ui.interact(ui.max_rect(), ui.id().with("sidebar_bg"), egui::Sense::click());
-                // 监控栏右键：语言 / 字体大小 / 折叠开关 / 强制 X11 的统一入口
-                view_context_menu(&bg);
-                match self.active {
-                    Some(idx) if idx < self.sessions.len() => {
-                        let s = &mut self.sessions[idx];
-                        let mon = s.monitor_ok;
-                        sidebar::show(ui, s.sysinfo.as_ref(), &s.net_hist, &mut s.selected_nic, &mut s.proc_sort_mem, &mut proc_click, &mut gpu_click, mon);
+            egui::Panel::left("sidebar")
+                .resizable(true)
+                .default_size(300.0)
+                .size_range(220.0..=460.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(Palette::PANEL)
+                        .inner_margin(egui::Margin {
+                            left: 10,
+                            right: 10,
+                            top: 8,
+                            bottom: 8,
+                        }),
+                )
+                .show_inside(ui, |ui| {
+                    // 背景层右键弹语言菜单：在子控件之前注册，置于最底层 z 序，
+                    // 这样不会抢走进程行/网卡/IP 等子控件的左键；空白处右键仍可触发。
+                    let bg = ui.interact(
+                        ui.max_rect(),
+                        ui.id().with("sidebar_bg"),
+                        egui::Sense::click(),
+                    );
+                    // 监控栏右键：语言 / 字体大小 / 折叠开关 / 强制 X11 的统一入口
+                    view_context_menu(&bg);
+                    match self.active {
+                        Some(idx) if idx < self.sessions.len() => {
+                            let s = &mut self.sessions[idx];
+                            let mon = s.monitor_ok;
+                            sidebar::show(
+                                ui,
+                                s.sysinfo.as_ref(),
+                                &s.net_hist,
+                                &mut s.selected_nic,
+                                &mut s.proc_sort_mem,
+                                &mut proc_click,
+                                &mut gpu_click,
+                                mon,
+                            );
+                        }
+                        _ => {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new(egui_phosphor::regular::PLUGS)
+                                        .size(28.0)
+                                        .color(Palette::TEXT_DIM),
+                                );
+                                ui.label(
+                                    RichText::new(crate::i18n::tr("未连接", "Not connected"))
+                                        .color(Palette::TEXT_DIM),
+                                );
+                            });
+                        }
                     }
-                    _ => {
-                        ui.add_space(16.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new(egui_phosphor::regular::PLUGS).size(28.0).color(Palette::TEXT_DIM));
-                            ui.label(RichText::new(crate::i18n::tr("未连接", "Not connected")).color(Palette::TEXT_DIM));
-                        });
-                    }
-                }
-            });
+                });
         } else {
             // 折叠态：保留一条细边，提供展开按钮 + 同样的右键菜单（否则收起后无处可点回来）
             egui::Panel::left("sidebar_strip")
                 .resizable(false)
                 .default_size(20.0)
                 .size_range(20.0..=20.0)
-                .frame(egui::Frame::new().fill(Palette::PANEL_2).inner_margin(egui::Margin::same(2)))
+                .frame(
+                    egui::Frame::new()
+                        .fill(Palette::PANEL_2)
+                        .inner_margin(egui::Margin::same(2)),
+                )
                 .show_inside(ui, |ui| {
-                    let bg = ui.interact(ui.max_rect(), ui.id().with("sidebar_strip_bg"), egui::Sense::click());
+                    let bg = ui.interact(
+                        ui.max_rect(),
+                        ui.id().with("sidebar_strip_bg"),
+                        egui::Sense::click(),
+                    );
                     view_context_menu(&bg);
                     ui.add_space(4.0);
                     ui.vertical_centered(|ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new(egui_phosphor::regular::CARET_RIGHT).size(14.0).color(Palette::TEXT_DIM)).frame(false))
-                            .on_hover_text(crate::i18n::tr("展开系统监控栏", "Expand monitor sidebar"))
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(egui_phosphor::regular::CARET_RIGHT)
+                                        .size(14.0)
+                                        .color(Palette::TEXT_DIM),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text(crate::i18n::tr(
+                                "展开系统监控栏",
+                                "Expand monitor sidebar",
+                            ))
                             .clicked()
                         {
                             set_sidebar_collapsed(false);
@@ -1288,10 +972,20 @@ impl eframe::App for App {
         if let Some((pid, pos)) = proc_click {
             let mut popup = None;
             if let Some(s) = self.active.and_then(|i| self.sessions.get(i)) {
-                if let Some(p) = s.sysinfo.as_ref().and_then(|si| si.procs.iter().find(|p| p.pid == pid)) {
+                if let Some(p) = s
+                    .sysinfo
+                    .as_ref()
+                    .and_then(|si| si.procs.iter().find(|p| p.pid == pid))
+                {
                     popup = Some(ProcPopup {
-                        pid, name: p.name.clone(), cpu: p.cpu, mem: p.mem, pos,
-                        cmd: String::new(), cwd: String::new(), exe: String::new(),
+                        pid,
+                        name: p.name.clone(),
+                        cpu: p.cpu,
+                        mem: p.mem,
+                        pos,
+                        cmd: String::new(),
+                        cwd: String::new(),
+                        exe: String::new(),
                         copied_t: None,
                         confirm_kill: false,
                         uid: s.uid,
@@ -1312,7 +1006,12 @@ impl eframe::App for App {
         // Ctrl+Tab / Ctrl+Shift+Tab 切换会话标签（consume 以免终端把 Tab 发往远端）
         if !self.sessions.is_empty() {
             let ctx = ui.ctx();
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab)) {
+            if ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::Tab,
+                )
+            }) {
                 self.switch_tab(-1);
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
                 self.switch_tab(1);
@@ -1379,55 +1078,5 @@ impl eframe::App for App {
 
         // 自检截图驱动
         self.drive_screenshot(&ctx);
-    }
-}
-
-#[cfg(test)]
-mod save_fsm_tests {
-    use super::*;
-
-    fn tab() -> EditorTab {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        EditorTab {
-            editor: crate::ui::editor::Editor::new("/t.txt".into(), "hi\n".into()),
-            server: String::new(),
-            uid: 1,
-            cmd_tx: tx,
-            text_id: egui::Id::new(0u8),
-            load_id: None,
-            load_done: 0,
-            load_total: 0,
-            save: SaveState::Idle,
-            save_at: None,
-            save_done: 0,
-            save_total: 0,
-            tail_offset: u64::MAX,
-            tail_pending: false,
-            tail_last: 0.0,
-            doc: None,
-            tail_carry: Vec::new(),
-            save_done_at: None,
-        }
-    }
-
-    #[test]
-    fn save_state_transitions() {
-        let mut t = tab();
-        // 初始：空闲
-        assert!(!t.is_saving() && !t.is_conflict() && !t.wants_close());
-        // 进入保存中（无关闭意图）
-        t.begin_save(false);
-        assert!(t.is_saving() && !t.is_conflict() && !t.wants_close());
-        // 保存中追加「完成后关闭」意图
-        t.request_close_on_saved();
-        assert!(t.wants_close());
-        // 非保存中调用 request_close_on_saved 无效（不产生非法状态）
-        t.save = SaveState::Idle;
-        t.request_close_on_saved();
-        assert!(!t.wants_close() && !t.is_saving());
-        // 冲突：与 saving 互斥，且不携带关闭意图
-        t.begin_save(true);
-        t.save = SaveState::Conflict;
-        assert!(t.is_conflict() && !t.is_saving() && !t.wants_close());
     }
 }
