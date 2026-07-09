@@ -43,7 +43,7 @@ pub(super) fn apply_table_tail_actions(
             .filter_map(|&k| {
                 entries
                     .get(k)
-                    .map(|e| (join_path(&cwd, &e.name), e.is_dir, e.name.clone()))
+                    .map(|e| (join_path(cwd, &e.name), e.is_dir, e.name.clone()))
             })
             .collect();
         if !items.is_empty() {
@@ -55,7 +55,7 @@ pub(super) fn apply_table_tail_actions(
     // 必须在表格渲染之后再取载荷，否则 bg 会抢在文件夹行之前把载荷取走。
     if drop_move.is_none() {
         if let Some(payload) = bg.dnd_release_payload::<DragPaths>() {
-            let srcs = valid_move_srcs(&payload.0, &cwd);
+            let srcs = valid_move_srcs(&payload.0, cwd);
             if !srcs.is_empty() {
                 drop_move = Some((srcs, cwd.to_string()));
             }
@@ -69,7 +69,7 @@ pub(super) fn apply_table_tail_actions(
         if dest_dir != cwd {
             if let Some(list) = state.listings.get_mut(cwd) {
                 let moved: std::collections::HashSet<String> = srcs.iter().cloned().collect();
-                list.retain(|e| !moved.contains(&join_path(&cwd, &e.name)));
+                list.retain(|e| !moved.contains(&join_path(cwd, &e.name)));
             }
         }
         state.record_move(srcs.clone(), dest_dir.clone());
