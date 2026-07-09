@@ -121,21 +121,29 @@ impl App {
             let mut edst = lock_mutex(&self.editor_state);
             let mut any_follow = false;
             for (uid, path, data, offset, truncated) in tails {
-                if let Some(t) = edst.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(t) = edst
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.editor.path == path)
+                {
                     t.tail_pending = false;
                     t.tail_offset = offset;
                     if !t.editor.follow {
                         continue; // 已关闭跟随：丢弃迟到的数据
                     }
                     if truncated {
-                        t.editor.append_tail(crate::i18n::tr("\n--- 文件被截断/轮转，以下为新内容 ---\n", "\n--- file truncated/rotated, new content follows ---\n"));
+                        t.editor.append_tail(crate::i18n::tr(
+                            "\n--- 文件被截断/轮转，以下为新内容 ---\n",
+                            "\n--- file truncated/rotated, new content follows ---\n",
+                        ));
                     }
                     if !data.is_empty() {
                         // 跨块解码：与上一块留下的不完整尾字节拼接；UTF-8 时把本块末尾
                         // 不完整的多字节序列留到下一块（跨块字符不再变 �）
                         let mut bytes = std::mem::take(&mut t.tail_carry);
                         bytes.extend_from_slice(&data);
-                        let enc = encoding_rs::Encoding::for_label(t.editor.encoding().as_bytes()).unwrap_or(encoding_rs::UTF_8);
+                        let enc = encoding_rs::Encoding::for_label(t.editor.encoding().as_bytes())
+                            .unwrap_or(encoding_rs::UTF_8);
                         if enc == encoding_rs::UTF_8 {
                             let valid = match std::str::from_utf8(&bytes) {
                                 Ok(_) => bytes.len(),
@@ -161,14 +169,19 @@ impl App {
                     if !t.tail_pending && t.tail_offset != u64::MAX && now - t.tail_last > 1.0 {
                         t.tail_pending = true;
                         t.tail_last = now;
-                        let _ = t.cmd_tx.send(UiCommand::TailFile { path: t.editor.path.clone(), offset: t.tail_offset });
+                        let _ = t.cmd_tx.send(UiCommand::TailFile {
+                            path: t.editor.path.clone(),
+                            offset: t.tail_offset,
+                        });
                     }
                 }
             }
             if any_follow {
                 // 维持轮询节奏 + 唤醒编辑器窗口显示新内容
-                self.ctx.request_repaint_after(std::time::Duration::from_millis(500));
-                self.ctx.request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+                self.ctx
+                    .request_repaint_after(std::time::Duration::from_millis(500));
+                self.ctx
+                    .request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
             }
         }
         // 跨服务器中转任务推进（下载完→上传，上传完→剪切则删源）
@@ -177,8 +190,13 @@ impl App {
         self.process_direct_jobs();
         for (path, data, server, uid) in new_images {
             self.image.focus = true; // 打开/切换后聚焦看图窗口
-            // 同一会话同一图片已打开则切到该标签（身份用 uid，不用可能重名的 title）
-            if let Some(i) = self.image.tabs.iter().position(|t| t.uid == uid && t.path == path) {
+                                     // 同一会话同一图片已打开则切到该标签（身份用 uid，不用可能重名的 title）
+            if let Some(i) = self
+                .image
+                .tabs
+                .iter()
+                .position(|t| t.uid == uid && t.path == path)
+            {
                 self.image.active = i;
                 continue;
             }
@@ -188,7 +206,9 @@ impl App {
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
                     let name = format!("img:{server}:{path}");
-                    let tex = ui.ctx().load_texture(name, color, egui::TextureOptions::LINEAR);
+                    let tex = ui
+                        .ctx()
+                        .load_texture(name, color, egui::TextureOptions::LINEAR);
                     self.image.tabs.push(ImageTab {
                         server,
                         uid,
@@ -202,7 +222,10 @@ impl App {
                     self.image.active = self.image.tabs.len() - 1;
                 }
                 Err(e) => {
-                    let msg = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("图片解码失败：{e}"), crate::i18n::Lang::En => format!("Decode failed: {e}") };
+                    let msg = match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("图片解码失败：{e}"),
+                        crate::i18n::Lang::En => format!("Decode failed: {e}"),
+                    };
                     if let Some(sess) = self.sessions.iter_mut().find(|s| s.uid == uid) {
                         sess.status = msg;
                     }
@@ -213,8 +236,16 @@ impl App {
         // PDF / Word 文档标签完整复用该框架（占位/进度/失败路径相同，就位时填充 doc 内容）。
         // docx 后台解析结果先收集（mpsc 无 peek；必须与其它事件一起纳入触发条件，
         // 否则「解析完成」那帧若无其它编辑器事件，下方块不执行 → 永远停在「渲染中」）
-        let parsed: Vec<(u64, Result<(crate::ui::docx::Doc, std::collections::HashMap<String, egui::TextureHandle>), String>)> =
-            self.doc_parse_rx.try_iter().collect();
+        let parsed: Vec<(
+            u64,
+            Result<
+                (
+                    crate::ui::docx::Doc,
+                    std::collections::HashMap<String, egui::TextureHandle>,
+                ),
+                String,
+            >,
+        )> = self.doc_parse_rx.try_iter().collect();
         let opened_editor = !new_placeholders.is_empty()
             || !filled.is_empty()
             || !load_progress.is_empty()
@@ -234,12 +265,35 @@ impl App {
             // 1) 新建占位标签（同服务器同文件已打开则切过去）
             for ((id, path, server, uid, tx), tid) in new_placeholders.into_iter().zip(ph_ids) {
                 ed.focus = true;
-                if let Some(i) = ed.tabs.iter().position(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(i) = ed
+                    .tabs
+                    .iter()
+                    .position(|t| t.uid == uid && t.editor.path == path)
+                {
                     ed.active = i;
                 } else {
                     let mut editor = crate::ui::editor::Editor::new(path, String::new());
                     editor.set_loading(true);
-                    ed.tabs.push(EditorTab { editor, server, uid, cmd_tx: tx, text_id: tid, load_id: Some(id), load_done: 0, load_total: 0, save: SaveState::Idle, save_at: None, save_done: 0, save_total: 0, save_done_at: None, tail_offset: u64::MAX, tail_pending: false, tail_last: 0.0, doc: None, tail_carry: Vec::new() });
+                    ed.tabs.push(EditorTab {
+                        editor,
+                        server,
+                        uid,
+                        cmd_tx: tx,
+                        text_id: tid,
+                        load_id: Some(id),
+                        load_done: 0,
+                        load_total: 0,
+                        save: SaveState::Idle,
+                        save_at: None,
+                        save_done: 0,
+                        save_total: 0,
+                        save_done_at: None,
+                        tail_offset: u64::MAX,
+                        tail_pending: false,
+                        tail_last: 0.0,
+                        doc: None,
+                        tail_carry: Vec::new(),
+                    });
                     ed.active = ed.tabs.len() - 1;
                 }
             }
@@ -296,37 +350,7 @@ impl App {
                     // 进度条置满（下载已完成）
                     t.load_done = t.load_total.max(1);
                     t.load_total = t.load_total.max(1);
-                    let ctx2 = ui.ctx().clone();
-                    let tx = self.doc_parse_tx.clone();
-                    let uid = t.uid;
-                    let tpath = t.editor.path.clone();
-                    std::thread::spawn(move || {
-                        let res = match crate::ui::docx::parse(&data) {
-                            Ok(mut doc) => {
-                                let mut images = std::collections::HashMap::new();
-                                // 图片纹理上限 100 张：图海文档防内存/显存失控
-                                for (name, bytes) in doc.media.iter().take(100) {
-                                    if let Ok(mut img) = image::load_from_memory(bytes) {
-                                        // 大图降采样到 ≤1600px：相机原图直接建纹理动辄几十 MB，
-                                        // 阅读视图用不到原始分辨率（这是 docx 内存高的大头）
-                                        if img.width() > 1600 || img.height() > 1600 {
-                                            img = img.thumbnail(1600, 1600);
-                                        }
-                                        let rgba = img.to_rgba8();
-                                        let size = [rgba.width() as usize, rgba.height() as usize];
-                                        let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                                        images.insert(name.clone(), ctx2.load_texture(format!("docx:{uid}:{tpath}:{name}"), color, egui::TextureOptions::LINEAR));
-                                    }
-                                }
-                                doc.media = Vec::new(); // 原始字节释放（内存大头）
-                                Ok((doc, images))
-                            }
-                            Err(e) => Err(e.to_string()),
-                        };
-                        let _ = tx.send((id, res));
-                        ctx2.request_repaint();
-                        ctx2.request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
-                    });
+                    self.spawn_docx_parse(ui, id, data, t.uid, t.editor.path.clone());
                 }
             }
             // 后台解析完成 → 装配文档标签
@@ -350,15 +374,34 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.toast = Some((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("文档解析失败：{e}"), crate::i18n::Lang::En => format!("Doc parse failed: {e}") }, ui.input(|i| i.time)));
+                        self.toast = Some((
+                            match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!("文档解析失败：{e}"),
+                                crate::i18n::Lang::En => format!("Doc parse failed: {e}"),
+                            },
+                            ui.input(|i| i.time),
+                        ));
                         load_fail.push(id);
                     }
                 }
             }
             // PDF 查找结果 → 命中列表（跳到首个命中页）
             for (uid, path, hits_in, message) in pdf_searches {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
-                    if let Some(DocKind::Pdf { hits, hit_sel, searching, search_msg, cur, pages, .. }) = &mut t.doc {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.editor.path == path)
+                {
+                    if let Some(DocKind::Pdf {
+                        hits,
+                        hit_sel,
+                        searching,
+                        search_msg,
+                        cur,
+                        pages,
+                        ..
+                    }) = &mut t.doc
+                    {
                         *searching = false;
                         *search_msg = message;
                         *hits = hits_in;
@@ -371,7 +414,11 @@ impl App {
             }
             // PDF 页渲染结果 → 页缓存
             for (uid, path, page, data) in pdf_pages {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.editor.path == path)
+                {
                     if let Some(DocKind::Pdf { cache, pending, .. }) = &mut t.doc {
                         pending.remove(&page);
                         if data.is_empty() {
@@ -380,8 +427,13 @@ impl App {
                         if let Ok(img) = image::load_from_memory(&data) {
                             let rgba = img.to_rgba8();
                             let size = [rgba.width() as usize, rgba.height() as usize];
-                            let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                            let tex = ui.ctx().load_texture(format!("pdf:{uid}:{path}:{page}"), color, egui::TextureOptions::LINEAR);
+                            let color =
+                                egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                            let tex = ui.ctx().load_texture(
+                                format!("pdf:{uid}:{path}:{page}"),
+                                color,
+                                egui::TextureOptions::LINEAR,
+                            );
                             cache.retain(|(p, _, _)| *p != page);
                             cache.push((page, tex, egui::vec2(size[0] as f32, size[1] as f32)));
                             // 小 LRU：只留最近 6 页（控制内存）
@@ -402,22 +454,35 @@ impl App {
                 }
             }
             // 编辑器是独立 deferred 子窗口：变化后必须显式唤醒它重绘（含进度条动画）。
-            ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+            ui.ctx()
+                .request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
         // 保存成功 → 更新对应标签 mtime（避免下次保存误判）；外部改动冲突 → 置标志，编辑器弹横幅。
-        if !saved.is_empty() || !conflicts.is_empty() || !save_progress.is_empty() || !save_failed.is_empty() {
+        if !saved.is_empty()
+            || !conflicts.is_empty()
+            || !save_progress.is_empty()
+            || !save_failed.is_empty()
+        {
             let mut ed = lock_mutex(&self.editor_state);
             for (uid, path, done, total) in save_progress {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.editor.path == path)
+                {
                     t.save_done = done;
                     t.save_total = total;
                 }
             }
             let mut close_after_save: Vec<(u64, String)> = Vec::new();
             for (uid, path, mtime) in saved {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.editor.path == path)
+                {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
-                    // 取出本次保存发出时的签名与关闭意图（Saving 状态里）；非 Saving 则忽略这条确认。
+                                               // 取出本次保存发出时的签名与关闭意图（Saving 状态里）；非 Saving 则忽略这条确认。
                     let (sent_rev, close_after) = match &t.save {
                         SaveState::Saving { rev, close_after } => (rev.clone(), *close_after),
                         _ => continue,
@@ -449,7 +514,11 @@ impl App {
                 }
             }
             for (uid, path) in conflicts {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.editor.path == path)
+                {
                     // 冲突：进入 Conflict（未写入，保留 dirty）；「保存并关闭」意图自然丢弃，交用户处理
                     t.save = SaveState::Conflict;
                     t.save_at = None; // 冲突未写入：中止「已保存」动画
@@ -457,19 +526,36 @@ impl App {
                 }
             }
             for (uid, path, message) in save_failed {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.editor.path == path)
+                {
                     t.save = SaveState::Idle; // 失败：解锁重试；dirty 未被清，标签仍显示未保存；关闭意图丢弃
                     t.save_at = None; // 中止保存动画
                     t.save_done_at = None;
                 }
-                self.toast = Some((match crate::i18n::current() { crate::i18n::Lang::Zh => format!("保存失败：{message}"), crate::i18n::Lang::En => format!("Save failed: {message}") }, ui.input(|i| i.time)));
+                self.toast = Some((
+                    match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("保存失败：{message}"),
+                        crate::i18n::Lang::En => format!("Save failed: {message}"),
+                    },
+                    ui.input(|i| i.time),
+                ));
             }
             // 「保存并关闭」：确认成功后移除标签
             for (uid, path) in close_after_save {
-                if let Some(i) = ed.tabs.iter().position(|t| t.uid == uid && t.editor.path == path) {
+                if let Some(i) = ed
+                    .tabs
+                    .iter()
+                    .position(|t| t.uid == uid && t.editor.path == path)
+                {
                     let closed = ed.tabs.remove(i);
                     if closed.doc.is_none() {
-                        crate::store::save_cursor_line(&format!("{}|{}", closed.server, closed.editor.path), closed.editor.caret_line());
+                        crate::store::save_cursor_line(
+                            &format!("{}|{}", closed.server, closed.editor.path),
+                            closed.editor.caret_line(),
+                        );
                     }
                     if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
                         ed.active = ed.tabs.len() - 1;
@@ -477,7 +563,8 @@ impl App {
                     ed.trim_request = true;
                 }
             }
-            ui.ctx().request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+            ui.ctx()
+                .request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
 
         // 断线自动重连：到点的执行重连，并安排下次唤醒（即使无交互也能触发）
@@ -531,8 +618,12 @@ impl App {
                 // 仅 30 个点，便于核对「从右侧起、向左生长」与点密度
                 for i in 0..30 {
                     let t = i as f64;
-                    s.net_hist.down.push_back(((t * 0.4).sin() * 0.5 + 0.5) * 5.0e6);
-                    s.net_hist.up.push_back(((t * 0.3).cos() * 0.5 + 0.5) * 2.0e6);
+                    s.net_hist
+                        .down
+                        .push_back(((t * 0.4).sin() * 0.5 + 0.5) * 5.0e6);
+                    s.net_hist
+                        .up
+                        .push_back(((t * 0.3).cos() * 0.5 + 0.5) * 2.0e6);
                 }
             }
         }
@@ -542,8 +633,20 @@ impl App {
             if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
                 if let Some(si) = s.sysinfo.as_mut() {
                     si.gpus = vec![
-                        crate::proto::GpuInfo { index: 0, name: "RTX 4090".into(), util: 73.0, mem_used_mb: 18000, mem_total_mb: 24564 },
-                        crate::proto::GpuInfo { index: 1, name: "RTX 4090".into(), util: 12.0, mem_used_mb: 2000, mem_total_mb: 24564 },
+                        crate::proto::GpuInfo {
+                            index: 0,
+                            name: "RTX 4090".into(),
+                            util: 73.0,
+                            mem_used_mb: 18000,
+                            mem_total_mb: 24564,
+                        },
+                        crate::proto::GpuInfo {
+                            index: 1,
+                            name: "RTX 4090".into(),
+                            util: 12.0,
+                            mem_used_mb: 2000,
+                            mem_total_mb: 24564,
+                        },
                     ];
                 }
             }
@@ -553,7 +656,10 @@ impl App {
 
         // 进程详情返回 -> 填充小窗
         if let Some(idx) = self.active {
-            let detail = self.sessions.get_mut(idx).and_then(|s| s.proc_detail.take());
+            let detail = self
+                .sessions
+                .get_mut(idx)
+                .and_then(|s| s.proc_detail.take());
             if let Some((pid, cmd, cwd, exe)) = detail {
                 if let Some(pp) = &mut self.popups.proc {
                     if pp.pid == pid {
@@ -564,6 +670,5 @@ impl App {
                 }
             }
         }
-
     }
 }
