@@ -23,7 +23,11 @@ fn load_icon() -> egui::IconData {
         Ok(img) => {
             let img = img.into_rgba8();
             let (width, height) = img.dimensions();
-            egui::IconData { rgba: img.into_raw(), width, height }
+            egui::IconData {
+                rgba: img.into_raw(),
+                width,
+                height,
+            }
         }
         Err(_) => egui::IconData::default(),
     }
@@ -57,13 +61,19 @@ fn main() -> eframe::Result<()> {
         egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title(i18n::tr("iShell — Rust SSH 客户端", "iShell — Rust SSH Client"))
+            .with_title(i18n::tr(
+                "iShell — Rust SSH 客户端",
+                "iShell — Rust SSH Client",
+            ))
             // app_id 必须与 Linux 桌面项 ishell.desktop 的基名/StartupWMClass 完全一致，
             // GNOME 等用它匹配 .desktop 取图标（不读窗口内嵌 _NET_WM_ICON）；统一小写避免大小写匹配失败
             .with_app_id("ishell")
             .with_icon(load_icon())
     };
-    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "iShell",

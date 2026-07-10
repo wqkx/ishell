@@ -18,8 +18,10 @@ pub(super) fn extract_tar_gz(path: &std::path::Path, dest: &std::path::Path) -> 
             anyhow::bail!(
                 "{}",
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("拒绝不安全的归档路径：{}", entry_path.display()),
-                    crate::i18n::Lang::En => format!("Refusing unsafe archive path: {}", entry_path.display()),
+                    crate::i18n::Lang::Zh =>
+                        format!("拒绝不安全的归档路径：{}", entry_path.display()),
+                    crate::i18n::Lang::En =>
+                        format!("Refusing unsafe archive path: {}", entry_path.display()),
                 }
             );
         }
@@ -28,8 +30,12 @@ pub(super) fn extract_tar_gz(path: &std::path::Path, dest: &std::path::Path) -> 
             anyhow::bail!(
                 "{}",
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("归档条目无法安全解压：{}", entry_path.display()),
-                    crate::i18n::Lang::En => format!("Archive entry could not be unpacked safely: {}", entry_path.display()),
+                    crate::i18n::Lang::Zh =>
+                        format!("归档条目无法安全解压：{}", entry_path.display()),
+                    crate::i18n::Lang::En => format!(
+                        "Archive entry could not be unpacked safely: {}",
+                        entry_path.display()
+                    ),
                 }
             );
         }
@@ -74,11 +80,20 @@ pub(super) fn local_nonexistent(path: &str) -> String {
     }
     let is_dir = p.is_dir();
     let parent = p.parent();
-    let fname = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let fname = p
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let (stem, ext) = split_name(&fname, is_dir);
     for n in 1..10000u32 {
-        let cand_name = match &ext { Some(e) => format!("{stem} ({n}).{e}"), None => format!("{stem} ({n})") };
-        let cand = match parent { Some(d) => d.join(&cand_name), None => std::path::PathBuf::from(&cand_name) };
+        let cand_name = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let cand = match parent {
+            Some(d) => d.join(&cand_name),
+            None => std::path::PathBuf::from(&cand_name),
+        };
         if !cand.exists() {
             return cand.to_string_lossy().into_owned();
         }
@@ -87,10 +102,18 @@ pub(super) fn local_nonexistent(path: &str) -> String {
 }
 
 /// 给远端目录里的名字找一个不冲突的变体。
-pub(super) async fn remote_nonexistent(sftp: &russh_sftp::client::SftpSession, dir: &str, name: &str, is_dir: bool) -> String {
+pub(super) async fn remote_nonexistent(
+    sftp: &russh_sftp::client::SftpSession,
+    dir: &str,
+    name: &str,
+    is_dir: bool,
+) -> String {
     let (stem, ext) = split_name(name, is_dir);
     for n in 1..10000u32 {
-        let cand = match &ext { Some(e) => format!("{stem} ({n}).{e}"), None => format!("{stem} ({n})") };
+        let cand = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
         if sftp.metadata(&join_remote(dir, &cand)).await.is_err() {
             return cand;
         }
@@ -146,13 +169,21 @@ pub(super) fn bitmap_len(n_chunks: u64) -> usize {
 /// 数据全程写 `<local>.ishellpart.data`，完整后原子 rename 到目标——成功前不动目标文件。
 /// `remote_mtime` 参与断点校验（0 = 不允许跨次续传，如临时打包文件）。
 pub(super) fn basename(path: &str) -> String {
-    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string()
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// 取「本地」路径的文件名：同时按 `/` 和 `\` 切分，正确处理 Windows 路径
 /// （否则 `C:\Users\x\a.txt` 会被当成整体文件名上传，远端文件名也带上盘符路径）。
 pub(super) fn local_basename(path: &str) -> String {
-    path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_string()
 }
 
 #[cfg(test)]

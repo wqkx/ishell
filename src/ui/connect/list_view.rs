@@ -6,11 +6,7 @@ use crate::theme::Palette;
 use super::{ConnectForm, Mode};
 
 impl ConnectForm {
-    pub(super) fn list_view(
-        &mut self,
-        ui: &mut egui::Ui,
-        result: &mut Option<ConnectConfig>,
-    ) {
+    pub(super) fn list_view(&mut self, ui: &mut egui::Ui, result: &mut Option<ConnectConfig>) {
         use egui_phosphor::regular as icon;
         ui.horizontal(|ui| {
             ui.heading(

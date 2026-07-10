@@ -1,6 +1,11 @@
 //! 单行输入 IME 绕过（fcitx/X11 Commit 门）。从 file_panel 拆出，行为不变。
 
-pub(super) fn ime_apply_events(ui: &mut egui::Ui, id: egui::Id, buf: &mut String, preedit: &mut Option<(usize, usize)>) {
+pub(super) fn ime_apply_events(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    buf: &mut String,
+    preedit: &mut Option<(usize, usize)>,
+) {
     let focused = ui.ctx().memory(|m| m.focused() == Some(id));
     if !focused {
         return;
@@ -9,7 +14,13 @@ pub(super) fn ime_apply_events(ui: &mut egui::Ui, id: egui::Id, buf: &mut String
         let evs: Vec<egui::ImeEvent> = i
             .events
             .iter()
-            .filter_map(|e| if let egui::Event::Ime(ev) = e { Some(ev.clone()) } else { None })
+            .filter_map(|e| {
+                if let egui::Event::Ime(ev) = e {
+                    Some(ev.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         i.events.retain(|e| !matches!(e, egui::Event::Ime(_)));
         evs
@@ -60,7 +71,8 @@ pub(super) fn ime_apply_events(ui: &mut egui::Ui, id: egui::Id, buf: &mut String
         }
     }
     let cc = egui::text::CCursor::new(char_of_byte(buf, caret));
-    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(cc)));
+    st.cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(cc)));
     st.store(ui.ctx(), id);
 }
 
@@ -77,18 +89,25 @@ pub(super) fn ime_singleline(
 ) -> (egui::Response, bool) {
     let id = egui::Id::new(id_src);
     ime_apply_events(ui, id, buf, preedit);
-    let out = egui::TextEdit::singleline(buf).id(id).desired_width(f32::INFINITY).show(ui);
+    let out = egui::TextEdit::singleline(buf)
+        .id(id)
+        .desired_width(f32::INFINITY)
+        .show(ui);
     let resp = out.response.response; // TextEditOutput.response 是 AtomLayoutResponse，取其内层 Response
-    // 回车提交：egui 单行不消费回车事件（`lost_focus()+key_pressed(Enter)` 官方惯用法），
-    // 聚焦或本帧刚失焦时读到回车即视为提交，比单看 lost_focus 更可靠。
-    let enter = (resp.has_focus() || resp.lost_focus())
-        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                      // 回车提交：egui 单行不消费回车事件（`lost_focus()+key_pressed(Enter)` 官方惯用法），
+                                      // 聚焦或本帧刚失焦时读到回车即视为提交，比单看 lost_focus 更可靠。
+    let enter =
+        (resp.has_focus() || resp.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
     (resp, enter)
 }
 
 /// 字符位 → 字节偏移（越界回退到串尾）。
 pub(super) fn byte_of_char(s: &str, ch: usize) -> usize {
-    s.char_indices().map(|(b, _)| b).chain(std::iter::once(s.len())).nth(ch).unwrap_or(s.len())
+    s.char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(s.len()))
+        .nth(ch)
+        .unwrap_or(s.len())
 }
 
 /// 字节偏移 → 字符位（非字符边界时向下取整，避免切片 panic）。
@@ -99,4 +118,3 @@ pub(super) fn char_of_byte(s: &str, b: usize) -> usize {
     }
     s[..b].chars().count()
 }
-

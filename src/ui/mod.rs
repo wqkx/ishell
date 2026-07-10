@@ -39,14 +39,30 @@ pub fn empty_state(ui: &mut egui::Ui, icon: &str, text: &str, centered: bool) {
     if centered {
         ui.add_space(18.0);
         ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new(icon).color(Palette::TEXT_DIM).size(20.0));
+            ui.label(
+                egui::RichText::new(icon)
+                    .color(Palette::TEXT_DIM)
+                    .size(20.0),
+            );
             ui.add_space(2.0);
-            ui.label(egui::RichText::new(text).color(Palette::TEXT_DIM).size(12.0));
+            ui.label(
+                egui::RichText::new(text)
+                    .color(Palette::TEXT_DIM)
+                    .size(12.0),
+            );
         });
     } else {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(icon).color(Palette::TEXT_DIM).size(13.0));
-            ui.label(egui::RichText::new(text).color(Palette::TEXT_DIM).size(12.0));
+            ui.label(
+                egui::RichText::new(icon)
+                    .color(Palette::TEXT_DIM)
+                    .size(13.0),
+            );
+            ui.label(
+                egui::RichText::new(text)
+                    .color(Palette::TEXT_DIM)
+                    .size(12.0),
+            );
         });
     }
 }
@@ -71,7 +87,12 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, s
     // 卡片式画布：圆角 + 细边框，与全局控件风格一致；底边框即 0 基线。
     // 底色用暖奶油 CARD，贴合全局暖色调
     painter.rect_filled(rect, 4.0, Palette::CARD);
-    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, Palette::BORDER), egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, Palette::BORDER),
+        egui::StrokeKind::Inside,
+    );
 
     // 1px 横线对齐物理像素中心，避免高 DPI 下发虚
     let ppp = painter.ctx().pixels_per_point();
@@ -83,7 +104,11 @@ pub fn net_sparkline(ui: &mut egui::Ui, down: &[f64], up: &[f64], height: f32, s
         egui::pos2(rect.right() - 6.0, snap(rect.bottom() - 4.0)),
     );
 
-    let raw_max = down.iter().chain(up.iter()).cloned().fold(0.0_f64, f64::max);
+    let raw_max = down
+        .iter()
+        .chain(up.iter())
+        .cloned()
+        .fold(0.0_f64, f64::max);
     let max = nice_ceiling(raw_max.max(1024.0)); // 至少 1KB，向上取整到“整”刻度
 
     // 三条水平虚线（frac = 1, 2/3, 1/3，把绘图区分三块），刻度值贴在各自线下方
@@ -159,7 +184,15 @@ fn nice_ceiling(v: f64) -> f64 {
     let exp = v.log10().floor();
     let base = 10f64.powf(exp);
     let m = v / base;
-    let nice = if m <= 1.0 { 1.0 } else if m <= 2.0 { 2.0 } else if m <= 5.0 { 5.0 } else { 10.0 };
+    let nice = if m <= 1.0 {
+        1.0
+    } else if m <= 2.0 {
+        2.0
+    } else if m <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
     nice * base
 }
 

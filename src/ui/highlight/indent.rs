@@ -51,7 +51,9 @@ pub fn detect_indent(text: &str) -> Indent {
     if tabs > 0 && tabs >= space_lines {
         return Indent::Tab;
     }
-    let best = (1..=8).max_by_key(|&d| (counts[d], usize::from(d == 4))).unwrap_or(4);
+    let best = (1..=8)
+        .max_by_key(|&d| (counts[d], usize::from(d == 4)))
+        .unwrap_or(4);
     if counts[best] == 0 {
         return Indent::Spaces(4); // 没有可判定的缩进，默认 4
     }

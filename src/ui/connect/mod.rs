@@ -2,8 +2,8 @@
 
 use crate::store::{self, SavedConnection};
 
-mod form;
 mod dialogs;
+mod form;
 mod form_view;
 mod form_widgets;
 mod list_view;

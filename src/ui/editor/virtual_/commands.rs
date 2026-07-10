@@ -6,8 +6,13 @@ use super::geom::{prev_char_boundary, v_line_of, v_line_range, v_sel_range};
 
 pub(super) fn line_comment(lang: &str) -> Option<&'static str> {
     Some(match lang {
-        "rs" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "go" | "java" | "kt" | "kts" | "swift" | "dart" | "cs" | "scala" | "php" | "rust" | "json5" | "proto" | "groovy" | "v" | "zig" | "vue" | "svelte" => "//",
-        "py" | "pyw" | "rb" | "sh" | "bash" | "zsh" | "fish" | "pl" | "pm" | "r" | "jl" | "yaml" | "yml" | "toml" | "ini" | "conf" | "cfg" | "config" | "properties" | "dockerfile" | "makefile" | "mk" | "cmake" | "gitignore" | "env" | "tcl" | "nim" | "awk" | "sed" | "gro" | "top" | "itp" | "mdp" | "ndx" => "#",
+        "rs" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "js" | "mjs" | "cjs" | "ts" | "tsx"
+        | "jsx" | "go" | "java" | "kt" | "kts" | "swift" | "dart" | "cs" | "scala" | "php"
+        | "rust" | "json5" | "proto" | "groovy" | "v" | "zig" | "vue" | "svelte" => "//",
+        "py" | "pyw" | "rb" | "sh" | "bash" | "zsh" | "fish" | "pl" | "pm" | "r" | "jl"
+        | "yaml" | "yml" | "toml" | "ini" | "conf" | "cfg" | "config" | "properties"
+        | "dockerfile" | "makefile" | "mk" | "cmake" | "gitignore" | "env" | "tcl" | "nim"
+        | "awk" | "sed" | "gro" | "top" | "itp" | "mdp" | "ndx" => "#",
         "sql" | "lua" | "hs" | "ml" | "elm" | "adoc" => "--",
         "clj" | "cljs" | "lisp" | "el" | "asm" | "s" => ";",
         "vim" => "\"",

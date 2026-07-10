@@ -2,14 +2,16 @@
 
 use egui::RichText;
 
+use super::ime::ime_singleline;
+use super::{basename, join_path, parent_of, Dialog, FileAction, FilePanelState};
 use crate::theme::Palette;
 use crate::ui::fmt_bytes;
-use super::{
-    basename, join_path, parent_of, Dialog, FileAction, FilePanelState,
-};
-use super::ime::ime_singleline;
 
-pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut Vec<FileAction>) {
+pub(super) fn dialogs(
+    ui: &mut egui::Ui,
+    state: &mut FilePanelState,
+    actions: &mut Vec<FileAction>,
+) {
     let ctx = ui.ctx().clone();
     let mut close = false;
     let mut clear_sel = false; // 批量删除确认后清空选中，避免残留的陈旧行索引
@@ -30,7 +32,9 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                     }
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
-                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
+                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit)
+                            && !name.trim().is_empty()
+                        {
                             actions.push(FileAction::Mkdir(join_path(&cwd, name.trim())));
                             new_item = Some((name.trim().to_string(), true));
                             close = true;
@@ -49,7 +53,9 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                     }
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
-                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
+                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit)
+                            && !name.trim().is_empty()
+                        {
                             actions.push(FileAction::CreateFile(join_path(&cwd, name.trim())));
                             new_item = Some((name.trim().to_string(), false));
                             close = true;
@@ -62,37 +68,64 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
             }
             Dialog::Upload { local } => {
                 modal(&ctx, crate::i18n::tr("上传", "Upload"), |ui| {
-                    ui.label(RichText::new(crate::i18n::tr("本地文件/文件夹路径（也可拖拽到文件区）", "Local file/folder path (or drag onto the panel)")).size(12.0).color(Palette::TEXT_DIM));
+                    ui.label(
+                        RichText::new(crate::i18n::tr(
+                            "本地文件/文件夹路径（也可拖拽到文件区）",
+                            "Local file/folder path (or drag onto the panel)",
+                        ))
+                        .size(12.0)
+                        .color(Palette::TEXT_DIM),
+                    );
                     let (resp, submit) = ime_singleline(ui, "upload_local_path", local, &mut ime);
                     if ui.memory(|m| m.focused().is_none()) {
                         resp.request_focus();
                     }
                     if submit && !local.trim().is_empty() {
-                        actions.push(FileAction::Upload { local: local.trim().to_string(), remote_dir: cwd.clone() });
+                        actions.push(FileAction::Upload {
+                            local: local.trim().to_string(),
+                            remote_dir: cwd.clone(),
+                        });
                         close = true;
                     }
                     ui.add_space(6.0);
                     // 原生选择器：选文件（可多选）/ 选文件夹（整个上传）
                     button_row(ui, 118.0, 2, |ui| {
-                        if dlg_btn(ui, crate::i18n::tr("选择文件…", "Choose files…"), 118.0, 0) {
+                        if dlg_btn(ui, crate::i18n::tr("选择文件…", "Choose files…"), 118.0, 0)
+                        {
                             if let Some(paths) = rfd::FileDialog::new().pick_files() {
                                 for p in paths {
-                                    actions.push(FileAction::Upload { local: p.to_string_lossy().into_owned(), remote_dir: cwd.clone() });
+                                    actions.push(FileAction::Upload {
+                                        local: p.to_string_lossy().into_owned(),
+                                        remote_dir: cwd.clone(),
+                                    });
                                 }
                                 close = true;
                             }
                         }
-                        if dlg_btn(ui, crate::i18n::tr("选择文件夹…", "Choose folder…"), 118.0, 0) {
+                        if dlg_btn(
+                            ui,
+                            crate::i18n::tr("选择文件夹…", "Choose folder…"),
+                            118.0,
+                            0,
+                        ) {
                             if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                actions.push(FileAction::Upload { local: p.to_string_lossy().into_owned(), remote_dir: cwd.clone() });
+                                actions.push(FileAction::Upload {
+                                    local: p.to_string_lossy().into_owned(),
+                                    remote_dir: cwd.clone(),
+                                });
                                 close = true;
                             }
                         }
                     });
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
-                        if dlg_btn(ui, crate::i18n::tr("上传", "Upload"), 72.0, 2) && !local.trim().is_empty() {
-                            actions.push(FileAction::Upload { local: local.trim().to_string(), remote_dir: cwd.clone() });
+                        if dlg_btn(ui, crate::i18n::tr("上传", "Upload"), 72.0, 2)
+                            && !local.trim().is_empty()
+                        {
+                            actions.push(FileAction::Upload {
+                                local: local.trim().to_string(),
+                                remote_dir: cwd.clone(),
+                            });
                             close = true;
                         }
                         if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
@@ -107,11 +140,23 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                     ui.add_space(8.0);
                     ui.vertical_centered(|ui| chmod_grid(ui, mode));
                     ui.add_space(6.0);
-                    ui.vertical_centered(|ui| ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("八进制：{:03o}", *mode & 0o777), crate::i18n::Lang::En => format!("Octal: {:03o}", *mode & 0o777) }).monospace().color(Palette::TEXT_DIM)));
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!("八进制：{:03o}", *mode & 0o777),
+                                crate::i18n::Lang::En => format!("Octal: {:03o}", *mode & 0o777),
+                            })
+                            .monospace()
+                            .color(Palette::TEXT_DIM),
+                        )
+                    });
                     ui.add_space(10.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if dlg_btn(ui, crate::i18n::tr("应用", "Apply"), 72.0, 2) {
-                            actions.push(FileAction::Chmod { path: path.clone(), mode: *mode & 0o777 });
+                            actions.push(FileAction::Chmod {
+                                path: path.clone(),
+                                mode: *mode & 0o777,
+                            });
                             close = true;
                         }
                         if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
@@ -129,9 +174,14 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                     }
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
-                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit) && !name.trim().is_empty() {
+                        if (dlg_btn(ui, crate::i18n::tr("确定", "OK"), 72.0, 0) || submit)
+                            && !name.trim().is_empty()
+                        {
                             let parent = parent_of(path);
-                            actions.push(FileAction::Rename { from: path.clone(), to: join_path(&parent, name.trim()) });
+                            actions.push(FileAction::Rename {
+                                from: path.clone(),
+                                to: join_path(&parent, name.trim()),
+                            });
                             close = true;
                         }
                         if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
@@ -141,50 +191,71 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                 });
             }
             Dialog::ConfirmDelete { items } => {
-                modal(&ctx, crate::i18n::tr("确认删除", "Confirm delete"), |ui| {
-                    let n = items.len();
-                    if n == 1 {
-                        let name = &items[0].2;
-                        ui.label(match crate::i18n::current() {
-                            crate::i18n::Lang::Zh => format!("确定删除 {name} 吗？此操作不可恢复。"),
-                            crate::i18n::Lang::En => format!("Delete {name}? This cannot be undone."),
-                        });
-                    } else {
-                        ui.label(match crate::i18n::current() {
-                            crate::i18n::Lang::Zh => format!("确定删除选中的 {n} 项吗？此操作不可恢复。"),
-                            crate::i18n::Lang::En => format!("Delete {n} selected items? This cannot be undone."),
-                        });
-                        // 列出待删名称（最多 4 个，多余用 … 概括），避免文件多时对话框过长
-                        ui.add_space(4.0);
-                        let shown: Vec<String> = items.iter().take(4).map(|(_, _, nm)| nm.clone()).collect();
-                        let more = if n > 4 {
-                            match crate::i18n::current() {
-                                crate::i18n::Lang::Zh => format!(" … 等 {n} 项"),
-                                crate::i18n::Lang::En => format!(" … ({n} total)"),
-                            }
+                modal(
+                    &ctx,
+                    crate::i18n::tr("确认删除", "Confirm delete"),
+                    |ui| {
+                        let n = items.len();
+                        if n == 1 {
+                            let name = &items[0].2;
+                            ui.label(match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => {
+                                    format!("确定删除 {name} 吗？此操作不可恢复。")
+                                }
+                                crate::i18n::Lang::En => {
+                                    format!("Delete {name}? This cannot be undone.")
+                                }
+                            });
                         } else {
-                            String::new()
-                        };
-                        ui.label(RichText::new(format!("{}{}", shown.join("、"), more)).color(Palette::TEXT_DIM).size(11.0));
-                    }
-                    ui.add_space(8.0);
-                    button_row(ui, 72.0, 2, |ui| {
-                        if dlg_btn(ui, crate::i18n::tr("删除", "Delete"), 72.0, 1) {
-                            // 一条批量删除（单 rm，单通道）——避免多文件时并发开过多 SSH 通道被拒
-                            let paths: Vec<String> = items.iter().map(|(p, _, _)| p.clone()).collect();
-                            actions.push(FileAction::DeleteMany(paths));
-                            clear_sel = true;
-                            close = true;
+                            ui.label(match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => {
+                                    format!("确定删除选中的 {n} 项吗？此操作不可恢复。")
+                                }
+                                crate::i18n::Lang::En => {
+                                    format!("Delete {n} selected items? This cannot be undone.")
+                                }
+                            });
+                            // 列出待删名称（最多 4 个，多余用 … 概括），避免文件多时对话框过长
+                            ui.add_space(4.0);
+                            let shown: Vec<String> =
+                                items.iter().take(4).map(|(_, _, nm)| nm.clone()).collect();
+                            let more = if n > 4 {
+                                match crate::i18n::current() {
+                                    crate::i18n::Lang::Zh => format!(" … 等 {n} 项"),
+                                    crate::i18n::Lang::En => format!(" … ({n} total)"),
+                                }
+                            } else {
+                                String::new()
+                            };
+                            ui.label(
+                                RichText::new(format!("{}{}", shown.join("、"), more))
+                                    .color(Palette::TEXT_DIM)
+                                    .size(11.0),
+                            );
                         }
-                        if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
-                            close = true;
-                        }
-                    });
-                });
+                        ui.add_space(8.0);
+                        button_row(ui, 72.0, 2, |ui| {
+                            if dlg_btn(ui, crate::i18n::tr("删除", "Delete"), 72.0, 1) {
+                                // 一条批量删除（单 rm，单通道）——避免多文件时并发开过多 SSH 通道被拒
+                                let paths: Vec<String> =
+                                    items.iter().map(|(p, _, _)| p.clone()).collect();
+                                actions.push(FileAction::DeleteMany(paths));
+                                clear_sel = true;
+                                close = true;
+                            }
+                            if dlg_btn(ui, crate::i18n::tr("取消", "Cancel"), 72.0, 0) {
+                                close = true;
+                            }
+                        });
+                    },
+                );
             }
             Dialog::ConfirmOpenLarge { path, size } => {
-                modal(&ctx, crate::i18n::tr("打开大文件", "Open large file"), |ui| {
-                    ui.vertical_centered(|ui| {
+                modal(
+                    &ctx,
+                    crate::i18n::tr("打开大文件", "Open large file"),
+                    |ui| {
+                        ui.vertical_centered(|ui| {
                         ui.label(match crate::i18n::current() {
                             crate::i18n::Lang::Zh => format!("文件较大（{}），仍要打开吗？", fmt_bytes(*size as f64)),
                             crate::i18n::Lang::En => format!("Large file ({}). Open anyway?", fmt_bytes(*size as f64)),
@@ -194,43 +265,86 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                             "Opens in read-only mode (full file loaded into memory). Unlock from the status bar to edit.",
                         )).color(Palette::TEXT_DIM).size(11.0));
                     });
-                    ui.add_space(10.0);
-                    // 按钮水平居中
-                    ui.horizontal(|ui| {
-                        let bw = 80.0;
-                        let total = bw * 2.0 + ui.spacing().item_spacing.x;
-                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                        if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("打开", "Open")).color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
-                            actions.push(FileAction::OpenFile { path: path.clone(), force: true });
-                            close = true;
-                        }
-                        if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
-                            close = true;
-                        }
-                    });
-                });
+                        ui.add_space(10.0);
+                        // 按钮水平居中
+                        ui.horizontal(|ui| {
+                            let bw = 80.0;
+                            let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                            ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(crate::i18n::tr("打开", "Open"))
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(Palette::ACCENT)
+                                    .min_size(egui::vec2(bw, 0.0)),
+                                )
+                                .clicked()
+                            {
+                                actions.push(FileAction::OpenFile {
+                                    path: path.clone(),
+                                    force: true,
+                                });
+                                close = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(crate::i18n::tr("取消", "Cancel"))
+                                        .min_size(egui::vec2(bw, 0.0)),
+                                )
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                        });
+                    },
+                );
             }
             Dialog::ConfirmOpenAsText { path, size } => {
-                modal(&ctx, crate::i18n::tr("用文本编辑器打开？", "Open as text?"), |ui| {
-                    ui.vertical_centered(|ui| {
+                modal(
+                    &ctx,
+                    crate::i18n::tr("用文本编辑器打开？", "Open as text?"),
+                    |ui| {
+                        ui.vertical_centered(|ui| {
                         let fname = path.rsplit('/').next().unwrap_or(path);
                         ui.label(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("「{}」不是常见文本/代码类型。", fname), crate::i18n::Lang::En => format!("\"{}\" is not a known text type.", fname) });
                         ui.label(RichText::new(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("仍用文本编辑器打开吗？（{}，二进制内容会显示为乱码）", fmt_bytes(*size as f64)), crate::i18n::Lang::En => format!("Open with the text editor anyway? ({}, binary will look garbled)", fmt_bytes(*size as f64)) }).color(Palette::TEXT_DIM).size(11.0));
                     });
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        let bw = 100.0;
-                        let total = bw * 2.0 + ui.spacing().item_spacing.x;
-                        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                        if ui.add(egui::Button::new(RichText::new(crate::i18n::tr("文本打开", "Open as text")).color(egui::Color32::WHITE)).fill(Palette::ACCENT).min_size(egui::vec2(bw, 0.0))).clicked() {
-                            actions.push(FileAction::OpenFile { path: path.clone(), force: true });
-                            close = true;
-                        }
-                        if ui.add(egui::Button::new(crate::i18n::tr("取消", "Cancel")).min_size(egui::vec2(bw, 0.0))).clicked() {
-                            close = true;
-                        }
-                    });
-                });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let bw = 100.0;
+                            let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                            ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(crate::i18n::tr("文本打开", "Open as text"))
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(Palette::ACCENT)
+                                    .min_size(egui::vec2(bw, 0.0)),
+                                )
+                                .clicked()
+                            {
+                                actions.push(FileAction::OpenFile {
+                                    path: path.clone(),
+                                    force: true,
+                                });
+                                close = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(crate::i18n::tr("取消", "Cancel"))
+                                        .min_size(egui::vec2(bw, 0.0)),
+                                )
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                        });
+                    },
+                );
             }
             Dialog::ConfirmUndoMove { what, from, to } => {
                 modal(&ctx, crate::i18n::tr("撤销移动", "Undo move"), |ui| {
@@ -240,10 +354,14 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                     });
                     ui.add_space(4.0);
                     // 明确「从哪移回哪」，避免误撤销
-                    ui.label(RichText::new(match crate::i18n::current() {
-                        crate::i18n::Lang::Zh => format!("从 {from}\n移回 {to}"),
-                        crate::i18n::Lang::En => format!("from {from}\nback to {to}"),
-                    }).color(Palette::TEXT_DIM).size(11.0));
+                    ui.label(
+                        RichText::new(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("从 {from}\n移回 {to}"),
+                            crate::i18n::Lang::En => format!("from {from}\nback to {to}"),
+                        })
+                        .color(Palette::TEXT_DIM)
+                        .size(11.0),
+                    );
                     ui.add_space(8.0);
                     button_row(ui, 72.0, 2, |ui| {
                         if dlg_btn(ui, crate::i18n::tr("撤销", "Undo"), 72.0, 2) {
@@ -278,7 +396,11 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
     if undo_confirmed {
         if let Some(rec) = state.move_undo.pop() {
             let orig_parent = parent_of(&rec.original[0]);
-            let new_srcs: Vec<String> = rec.original.iter().map(|o| join_path(&rec.dest_dir, basename(o))).collect();
+            let new_srcs: Vec<String> = rec
+                .original
+                .iter()
+                .map(|o| join_path(&rec.dest_dir, basename(o)))
+                .collect();
             // 把这些项从「目标目录」缓存移除，否则该目录/树节点仍显示已移回的文件（看着像没删）
             {
                 let moved: std::collections::HashSet<String> = new_srcs.iter().cloned().collect();
@@ -296,11 +418,20 @@ pub(super) fn dialogs(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &m
                 }
             };
             let msg = match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("已撤销移动：{what}（从 {} 移回 {}）", rec.dest_dir, orig_parent),
-                crate::i18n::Lang::En => format!("Undid move: {what} (from {} back to {})", rec.dest_dir, orig_parent),
+                crate::i18n::Lang::Zh => format!(
+                    "已撤销移动：{what}（从 {} 移回 {}）",
+                    rec.dest_dir, orig_parent
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Undid move: {what} (from {} back to {})",
+                    rec.dest_dir, orig_parent
+                ),
             };
             // 先发反向 mv，再设提示——确保撤销提示覆盖 Move 自身的「移动中」提示
-            actions.push(FileAction::Move { srcs: new_srcs, dest_dir: orig_parent });
+            actions.push(FileAction::Move {
+                srcs: new_srcs,
+                dest_dir: orig_parent,
+            });
             actions.push(FileAction::Status(msg));
             state.selected.clear();
             state.anchor = None;
@@ -355,11 +486,26 @@ fn chmod_grid(ui: &mut egui::Ui, mode: &mut u32) {
         .min_col_width(46.0)
         .show(ui, |ui| {
             ui.label("");
-            for t in [crate::i18n::tr("读", "R"), crate::i18n::tr("写", "W"), crate::i18n::tr("执行", "X")] {
-                ui.vertical_centered(|ui| ui.label(RichText::new(t).strong().color(Palette::TEXT_DIM).size(12.0)));
+            for t in [
+                crate::i18n::tr("读", "R"),
+                crate::i18n::tr("写", "W"),
+                crate::i18n::tr("执行", "X"),
+            ] {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(t)
+                            .strong()
+                            .color(Palette::TEXT_DIM)
+                            .size(12.0),
+                    )
+                });
             }
             ui.end_row();
-            for (label, base) in [(crate::i18n::tr("所有者", "Owner"), 6u32), (crate::i18n::tr("用户组", "Group"), 3), (crate::i18n::tr("其他", "Other"), 0)] {
+            for (label, base) in [
+                (crate::i18n::tr("所有者", "Owner"), 6u32),
+                (crate::i18n::tr("用户组", "Group"), 3),
+                (crate::i18n::tr("其他", "Other"), 0),
+            ] {
                 ui.label(RichText::new(label).size(12.0).color(Palette::TEXT));
                 for bit in [2u32, 1, 0] {
                     let shift = base + bit;
@@ -378,4 +524,3 @@ fn chmod_grid(ui: &mut egui::Ui, mode: &mut u32) {
             }
         });
 }
-

@@ -74,7 +74,12 @@ fn keychain_set_key(k: &[u8; 32]) -> bool {
         return false;
     }
     let v = STANDARD.encode(k);
-    with_timeout(move || keychain_entry().and_then(|e| e.set_password(&v).ok()).is_some()).unwrap_or(false)
+    with_timeout(move || {
+        keychain_entry()
+            .and_then(|e| e.set_password(&v).ok())
+            .is_some()
+    })
+    .unwrap_or(false)
 }
 
 /// 进程内缓存的主密钥（仅加载一次，避免反复访问钥匙串）。
@@ -217,7 +222,9 @@ pub fn encrypt_secret(plain: &str) -> Result<String, String> {
     let Some(c) = cipher() else {
         return Err(match crate::i18n::current() {
             crate::i18n::Lang::Zh => "无法初始化密码加密（主密钥不可用）".into(),
-            crate::i18n::Lang::En => "Cannot init secret encryption (master key unavailable)".into(),
+            crate::i18n::Lang::En => {
+                "Cannot init secret encryption (master key unavailable)".into()
+            }
         });
     };
     let mut nonce = [0u8; 12];
@@ -273,7 +280,10 @@ mod tests {
         // 有主密钥时加密应产出 enc:v1: 前缀；无密钥环境则 Err（不得返回明文）
         match encrypt_secret("s3cret") {
             Ok(ct) => {
-                assert!(ct.starts_with(ENC_PREFIX), "ciphertext must use enc prefix, got {ct}");
+                assert!(
+                    ct.starts_with(ENC_PREFIX),
+                    "ciphertext must use enc prefix, got {ct}"
+                );
                 assert_ne!(ct, "s3cret");
                 assert_eq!(decrypt_secret(&ct), "s3cret");
             }

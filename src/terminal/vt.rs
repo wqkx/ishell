@@ -66,7 +66,11 @@ impl CellAttrs {
 
 /// 把一个颜色追加为 SGR 参数（前景 fg=true / 背景 fg=false）。
 fn push_sgr_color(p: &mut Vec<String>, c: vt100::Color, fg: bool) {
-    let (base, bright, ext) = if fg { (30u16, 90u16, 38u16) } else { (40, 100, 48) };
+    let (base, bright, ext) = if fg {
+        (30u16, 90u16, 38u16)
+    } else {
+        (40, 100, 48)
+    };
     match c {
         vt100::Color::Default => {}
         vt100::Color::Idx(i) => {

@@ -83,7 +83,10 @@ pub fn load() -> Vec<SavedConnection> {
     // 检测是否存在旧明文（需要迁移）
     let is_plain = |s: &str| !s.is_empty() && !s.starts_with(ENC_PREFIX);
     let needs_migrate = list.iter().any(|c| {
-        is_plain(&c.password) || is_plain(&c.passphrase) || is_plain(&c.jump_password) || is_plain(&c.jump_passphrase)
+        is_plain(&c.password)
+            || is_plain(&c.passphrase)
+            || is_plain(&c.jump_password)
+            || is_plain(&c.jump_passphrase)
     });
     // 解密到内存明文
     for c in &mut list {
@@ -154,15 +157,30 @@ fn split_kv(line: &str) -> (&str, &str) {
 }
 
 /// 解析 ProxyJump 值：可能是配置内别名，或 `user@host:port`。返回 (use_jump, host, port, user)。
-fn parse_proxyjump(val: &str, blocks: &[SshHostBlock], default_user: &str) -> (bool, String, u16, String) {
+fn parse_proxyjump(
+    val: &str,
+    blocks: &[SshHostBlock],
+    default_user: &str,
+) -> (bool, String, u16, String) {
     let v = val.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return (false, String::new(), 22, String::new());
     }
     let first = v.split(',').next().unwrap_or(v).trim(); // 多跳取第一跳
-    if let Some(b) = blocks.iter().find(|b| b.patterns.iter().any(|p| p == first)) {
-        let host = if b.hostname.is_empty() { first.to_string() } else { b.hostname.clone() };
-        let user = if b.user.is_empty() { default_user.to_string() } else { b.user.clone() };
+    if let Some(b) = blocks
+        .iter()
+        .find(|b| b.patterns.iter().any(|p| p == first))
+    {
+        let host = if b.hostname.is_empty() {
+            first.to_string()
+        } else {
+            b.hostname.clone()
+        };
+        let user = if b.user.is_empty() {
+            default_user.to_string()
+        } else {
+            b.user.clone()
+        };
         return (true, host, b.port.parse().unwrap_or(22), user);
     }
     let (user, rest) = match first.split_once('@') {
@@ -178,7 +196,9 @@ fn parse_proxyjump(val: &str, blocks: &[SshHostBlock], default_user: &str) -> (b
 
 /// 解析 `~/.ssh/config`，产出可导入的连接列表（跳过通配 Host；无 IdentityFile 默认用 agent）。
 pub fn import_ssh_config() -> Vec<SavedConnection> {
-    let Some(home) = home_dir() else { return Vec::new() };
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
     let Ok(text) = std::fs::read_to_string(home.join(".ssh").join("config")) else {
         return Vec::new();
     };
@@ -229,7 +249,11 @@ fn parse_ssh_config_text(text: &str, default_user: &str) -> Vec<SavedConnection>
     let mut out = Vec::new();
     for b in &blocks {
         // 取第一个非通配模式作为名称；纯通配块（如 Host *）跳过
-        let Some(name) = b.patterns.iter().find(|p| !p.contains('*') && !p.contains('?')) else {
+        let Some(name) = b
+            .patterns
+            .iter()
+            .find(|p| !p.contains('*') && !p.contains('?'))
+        else {
             continue;
         };
         let (auth_kind, key_path) = if b.identity.is_empty() {
@@ -240,9 +264,17 @@ fn parse_ssh_config_text(text: &str, default_user: &str) -> Vec<SavedConnection>
         let (use_jump, jh, jp, ju) = parse_proxyjump(&b.proxyjump, &blocks, default_user);
         out.push(SavedConnection {
             name: name.clone(),
-            host: if b.hostname.is_empty() { name.clone() } else { b.hostname.clone() },
+            host: if b.hostname.is_empty() {
+                name.clone()
+            } else {
+                b.hostname.clone()
+            },
             port: b.port.parse().unwrap_or(22),
-            username: if b.user.is_empty() { default_user.to_string() } else { b.user.clone() },
+            username: if b.user.is_empty() {
+                default_user.to_string()
+            } else {
+                b.user.clone()
+            },
             auth_kind,
             forward_agent: false,
             password: String::new(),

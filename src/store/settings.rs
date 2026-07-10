@@ -119,7 +119,10 @@ pub fn load_term_theme() -> u8 {
     {
         return v;
     }
-    if let Some(s) = config_dir().map(|d| d.join("term_dark")).and_then(|p| std::fs::read_to_string(p).ok()) {
+    if let Some(s) = config_dir()
+        .map(|d| d.join("term_dark"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+    {
         return if s.trim() == "1" { 0 } else { 1 };
     }
     1
@@ -143,7 +146,10 @@ fn conflict_policy_path() -> Option<PathBuf> {
 
 /// 读取冲突策略字符串（"overwrite"/"skip"/"rename"），未设置则 None（调用方默认覆盖）。
 pub fn load_conflict_policy() -> Option<String> {
-    let s = std::fs::read_to_string(conflict_policy_path()?).ok()?.trim().to_string();
+    let s = std::fs::read_to_string(conflict_policy_path()?)
+        .ok()?
+        .trim()
+        .to_string();
     (!s.is_empty()).then_some(s)
 }
 
@@ -189,7 +195,10 @@ fn file_cols_path() -> Option<PathBuf> {
 /// 读取文件面板列宽（名称/大小/修改时间/权限/所有者，空格分隔）；未设置或格式不符则 None。
 pub fn load_file_cols() -> Option<[f32; 5]> {
     let s = std::fs::read_to_string(file_cols_path()?).ok()?;
-    let v: Vec<f32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    let v: Vec<f32> = s
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect();
     let arr: [f32; 5] = v.try_into().ok()?;
     // 夹到合理范围，防止手改文件出现 0/负数把列挤没
     Some(arr.map(|w| w.clamp(40.0, 800.0)))

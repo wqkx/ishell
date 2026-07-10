@@ -11,7 +11,6 @@ mod virtual_;
 
 use virtual_::{editable_virtual, v_line_of, v_recompute, v_sel_range};
 
-
 pub struct Editor {
     pub path: String,
     pub content: String,
@@ -28,7 +27,7 @@ pub struct Editor {
     /// 打开查找栏时请求把焦点定位到查找输入框（一次性）
     find_focus: bool,
     /// —— VSCode 风格查找/替换选项 ——
-    find_case: bool,    // 区分大小写
+    find_case: bool, // 区分大小写
     find_word: bool,    // 全字匹配
     find_regex: bool,   // 正则
     replace_open: bool, // 展开替换行
@@ -256,7 +255,9 @@ impl Editor {
     pub fn dirty(&self) -> bool {
         // 内容、编码、行尾任一与打开/上次保存时不同都算「有改动」——
         // 仅切换 GBK/UTF-8 或 LF/CRLF 也必须能保存、关闭时也要警告
-        self.content != self.orig || self.encoding != self.orig_encoding || self.eol != self.orig_eol
+        self.content != self.orig
+            || self.encoding != self.orig_encoding
+            || self.eol != self.orig_eol
     }
     pub fn mark_saved(&mut self) {
         self.orig = self.content.clone();
@@ -269,7 +270,12 @@ impl Editor {
         (self.vver, self.encoding.clone(), self.eol)
     }
     pub fn filename(&self) -> String {
-        self.path.trim_end_matches('/').rsplit('/').next().unwrap_or(&self.path).to_string()
+        self.path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.path)
+            .to_string()
     }
     /// 当前光标所在逻辑行（0 基），供「记住光标位置」持久化。
     pub fn caret_line(&self) -> usize {
@@ -290,7 +296,8 @@ impl Editor {
         if text.is_empty() {
             return;
         }
-        let at_end = self.vcaret >= self.content.len() && self.vsel.is_none() && self.msel.is_empty();
+        let at_end =
+            self.vcaret >= self.content.len() && self.vsel.is_none() && self.msel.is_empty();
         self.content.push_str(text);
         self.orig.push_str(text);
         v_recompute(self);
@@ -332,7 +339,6 @@ impl Editor {
 /// 渲染编辑器内容（工具栏 + 查找栏 + 代码区）。返回 true 表示请求保存。
 /// `text_id` 为该编辑器固定的 TextEdit Id（用于关闭时清理其状态/撤销历史）。
 pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
-
     // 下载中占位：只显示文件名、不可编辑（进度由标签栏的珊瑚色进度条体现）。
     // 文案可被覆盖（文档标签下载完转后台解析时显示「渲染中 …」）。
     if ed.loading {
@@ -343,7 +349,10 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
                     ui.add_space(ui.available_height() * 0.4);
                     ui.label(RichText::new(ed.filename()).size(16.0).color(Palette::TEXT));
                     ui.add_space(6.0);
-                    let note = ed.loading_note.clone().unwrap_or_else(|| crate::i18n::tr("下载中 …", "Downloading …").into());
+                    let note = ed
+                        .loading_note
+                        .clone()
+                        .unwrap_or_else(|| crate::i18n::tr("下载中 …", "Downloading …").into());
                     ui.label(RichText::new(note).size(12.0).color(Palette::TEXT_DIM));
                 });
             });

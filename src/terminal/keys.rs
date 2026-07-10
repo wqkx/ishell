@@ -36,19 +36,47 @@ pub(super) fn encode_key(key: Key, mods: Modifiers, out: &mut Vec<u8>) {
 fn key_to_ascii_letter(key: Key) -> Option<char> {
     use Key::*;
     let c = match key {
-        A => 'a', B => 'b', C => 'c', D => 'd', E => 'e', F => 'f', G => 'g',
-        H => 'h', I => 'i', J => 'j', K => 'k', L => 'l', M => 'm', N => 'n',
-        O => 'o', P => 'p', Q => 'q', R => 'r', S => 's', T => 't', U => 'u',
-        V => 'v', W => 'w', X => 'x', Y => 'y', Z => 'z',
+        A => 'a',
+        B => 'b',
+        C => 'c',
+        D => 'd',
+        E => 'e',
+        F => 'f',
+        G => 'g',
+        H => 'h',
+        I => 'i',
+        J => 'j',
+        K => 'k',
+        L => 'l',
+        M => 'm',
+        N => 'n',
+        O => 'o',
+        P => 'p',
+        Q => 'q',
+        R => 'r',
+        S => 's',
+        T => 't',
+        U => 'u',
+        V => 'v',
+        W => 'w',
+        X => 'x',
+        Y => 'y',
+        Z => 'z',
         _ => return None,
     };
     Some(c)
 }
 
-
 /// 编码一个鼠标事件为终端字节流。`cb` 为按钮码（含修饰位/移动位/滚轮位）。
 /// `col`/`row` 为 0 基屏幕坐标，内部转 1 基。`press` 仅影响 SGR 的 M/m。
-pub(super) fn encode_mouse(enc: vt100::MouseProtocolEncoding, cb: u8, col: u16, row: u16, press: bool, out: &mut Vec<u8>) {
+pub(super) fn encode_mouse(
+    enc: vt100::MouseProtocolEncoding,
+    cb: u8,
+    col: u16,
+    row: u16,
+    press: bool,
+    out: &mut Vec<u8>,
+) {
     let cx = col as u32 + 1;
     let cy = row as u32 + 1;
     match enc {

@@ -19,13 +19,28 @@ pub(super) async fn upload(
     cancel: Arc<AtomicBool>,
 ) {
     let name = local_basename(&local); // 本地路径用 Windows 兼容的取名（处理反斜杠/盘符）
-    let is_dir = tokio::fs::metadata(&local).await.map(|m| m.is_dir()).unwrap_or(false);
+    let is_dir = tokio::fs::metadata(&local)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
 
     // 冲突处理：远端目标已存在时，按策略 跳过 / 重命名 / 覆盖
-    let name = if sftp.metadata(&join_remote(&remote_dir, &name)).await.is_ok() {
+    let name = if sftp
+        .metadata(&join_remote(&remote_dir, &name))
+        .await
+        .is_ok()
+    {
         match policy {
             ConflictPolicy::Skip => {
-                sink.send(WorkerEvent::TransferDone { id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已跳过（远端已存在）：{name}"), crate::i18n::Lang::En => format!("Skipped (exists): {name}") }, refresh_dir: None });
+                sink.send(WorkerEvent::TransferDone {
+                    id,
+                    ok: true,
+                    message: match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("已跳过（远端已存在）：{name}"),
+                        crate::i18n::Lang::En => format!("Skipped (exists): {name}"),
+                    },
+                    refresh_dir: None,
+                });
                 return;
             }
             ConflictPolicy::Rename => remote_nonexistent(sftp, &remote_dir, &name, is_dir).await,
@@ -48,7 +63,11 @@ pub(super) async fn upload(
                 let mut rd = tokio::fs::read_dir(&dir).await?;
                 while let Some(entry) = rd.next_entry().await? {
                     let p = entry.path();
-                    let rel = p.strip_prefix(&local_root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    let rel = p
+                        .strip_prefix(&local_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     let rpath = format!("{root_remote}/{rel}");
                     let ft = entry.file_type().await?;
                     if ft.is_dir() {
@@ -61,13 +80,24 @@ pub(super) async fn upload(
                 }
             }
         } else {
-            let sz = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
-            files.push((std::path::PathBuf::from(&local), join_remote(&remote_dir, &name), sz));
+            let sz = tokio::fs::metadata(&local)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            files.push((
+                std::path::PathBuf::from(&local),
+                join_remote(&remote_dir, &name),
+                sz,
+            ));
         }
 
         let total: u64 = files.iter().map(|f| f.2).sum();
         sink.send(WorkerEvent::TransferStart {
-            id, name: name.clone(), total, dir: crate::proto::TransferDir::Upload, local: None,
+            id,
+            name: name.clone(),
+            total,
+            dir: crate::proto::TransferDir::Upload,
+            local: None,
         });
 
         // 先按深度建好远端目录（父先于子），已存在则忽略
@@ -82,7 +112,19 @@ pub(super) async fn upload(
         for (lpath, rpath, sz) in files {
             let mut attempt = 0u32;
             loop {
-                match upload_file_once(sftp, &lpath, &rpath, &cancel, done_base, id, sink, &last, attempt > 0).await {
+                match upload_file_once(
+                    sftp,
+                    &lpath,
+                    &rpath,
+                    &cancel,
+                    done_base,
+                    id,
+                    sink,
+                    &last,
+                    attempt > 0,
+                )
+                .await
+                {
                     Ok(()) => break,
                     Err(e) => {
                         if cancel.load(Ordering::Relaxed) || attempt >= XFER_RETRIES {
@@ -94,22 +136,39 @@ pub(super) async fn upload(
                 }
             }
             done_base += sz;
-            sink.send(WorkerEvent::TransferProgress { id, done: done_base });
+            sink.send(WorkerEvent::TransferProgress {
+                id,
+                done: done_base,
+            });
         }
         Ok(())
     }
     .await;
     match res {
         Ok(_) => sink.send(WorkerEvent::TransferDone {
-            id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已上传 {name}"), crate::i18n::Lang::En => format!("Uploaded {name}") }, refresh_dir: Some(remote_dir),
+            id,
+            ok: true,
+            message: match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("已上传 {name}"),
+                crate::i18n::Lang::En => format!("Uploaded {name}"),
+            },
+            refresh_dir: Some(remote_dir),
         }),
         Err(e) => {
             let message = if cancel.load(Ordering::Relaxed) {
                 crate::i18n::tr("已取消", "Canceled").to_string()
             } else {
-                match crate::i18n::current() { crate::i18n::Lang::Zh => format!("上传失败：{e}"), crate::i18n::Lang::En => format!("Upload failed: {e}") }
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("上传失败：{e}"),
+                    crate::i18n::Lang::En => format!("Upload failed: {e}"),
+                }
             };
-            sink.send(WorkerEvent::TransferDone { id, ok: false, message, refresh_dir: None });
+            sink.send(WorkerEvent::TransferDone {
+                id,
+                ok: false,
+                message,
+                refresh_dir: None,
+            });
         }
     }
 }
@@ -129,14 +188,26 @@ pub(super) async fn upload_file_once(
     use russh_sftp::protocol::OpenFlags;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-    let local_size = tokio::fs::metadata(lpath).await.map(|m| m.len()).unwrap_or(0);
+    let local_size = tokio::fs::metadata(lpath)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     // 续传只允许发生在**本次传输的失败重试**（allow_resume）：此时远端内容必然是
     // 本进程刚写入的本地前缀，按大小续写安全。首次尝试一律 TRUNCATE 从 0 全量写——
     // 盲按「远端大小 ≤ 本地大小」续传会把无关同名文件误判为已传前缀
     //（大小恰好相等时一个字节不写就报成功；远端较小时保留错误前缀再续尾部）。
     let start = if allow_resume {
-        let remote_size = sftp.metadata(rpath).await.ok().and_then(|m| m.size).unwrap_or(0);
-        if remote_size > 0 && remote_size <= local_size { remote_size } else { 0 }
+        let remote_size = sftp
+            .metadata(rpath)
+            .await
+            .ok()
+            .and_then(|m| m.size)
+            .unwrap_or(0);
+        if remote_size > 0 && remote_size <= local_size {
+            remote_size
+        } else {
+            0
+        }
     } else {
         0
     };

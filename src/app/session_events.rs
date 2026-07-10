@@ -38,7 +38,9 @@ impl Session {
                     // 重连后恢复工作目录（若断线前由 OSC 7 记录过）
                     if self.restore_cwd && !self.last_cwd.is_empty() {
                         let quoted = format!("'{}'", self.last_cwd.replace('\'', "'\\''"));
-                        let _ = self.cmd_tx.send(UiCommand::TerminalInput(format!("cd {quoted}\r").into_bytes()));
+                        let _ = self.cmd_tx.send(UiCommand::TerminalInput(
+                            format!("cd {quoted}\r").into_bytes(),
+                        ));
                     }
                     self.restore_cwd = false;
                     // OSC 7 注入改为「点菜单时按需注入」（那时 shell 闲置在提示符，回显可被可靠吞掉），
@@ -50,10 +52,20 @@ impl Session {
                         }
                         match &t.spec {
                             Some(XferSpec::Download { remote, local }) => {
-                                let _ = self.cmd_tx.send(UiCommand::Download { id: t.id, remote: remote.clone(), local: local.clone(), policy: ConflictPolicy::Overwrite });
+                                let _ = self.cmd_tx.send(UiCommand::Download {
+                                    id: t.id,
+                                    remote: remote.clone(),
+                                    local: local.clone(),
+                                    policy: ConflictPolicy::Overwrite,
+                                });
                             }
                             Some(XferSpec::Upload { local, remote_dir }) => {
-                                let _ = self.cmd_tx.send(UiCommand::Upload { id: t.id, local: local.clone(), remote_dir: remote_dir.clone(), policy: ConflictPolicy::Overwrite });
+                                let _ = self.cmd_tx.send(UiCommand::Upload {
+                                    id: t.id,
+                                    local: local.clone(),
+                                    remote_dir: remote_dir.clone(),
+                                    policy: ConflictPolicy::Overwrite,
+                                });
                             }
                             None => continue,
                         }
@@ -84,15 +96,21 @@ impl Session {
                             t.ok = None;
                             t.paused = true;
                             t.speed = 0.0;
-                            t.message = crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume").into();
+                            t.message =
+                                crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume")
+                                    .into();
                         }
                     }
                     // 仅对"曾连上又掉线"的会话自动重连，最多 5 次，指数退避
                     const MAX_TRIES: u32 = 5;
                     if self.was_connected && self.reconnect_tries < MAX_TRIES {
                         let secs = (2u64 << self.reconnect_tries.min(4)).min(30); // 2,4,8,16,30
-                        self.reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
-                        let tail = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("{secs}s 后重连"), crate::i18n::Lang::En => format!("reconnect in {secs}s") };
+                        self.reconnect_at =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+                        let tail = match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("{secs}s 后重连"),
+                            crate::i18n::Lang::En => format!("reconnect in {secs}s"),
+                        };
                         self.status = format!("{} · {}", self.status, tail);
                     } else if self.was_connected && self.reconnect_tries >= MAX_TRIES {
                         let msg = crate::i18n::tr(
@@ -106,10 +124,13 @@ impl Session {
                 WorkerEvent::MonitorSupport(ok) => {
                     self.monitor_ok = Some(ok);
                     if !ok {
-                        self.pending.warn.push(crate::i18n::tr(
-                            "远端非 Linux 或缺少 /proc，系统监控已禁用",
-                            "Remote is not Linux or lacks /proc; system monitor disabled",
-                        ).into());
+                        self.pending.warn.push(
+                            crate::i18n::tr(
+                                "远端非 Linux 或缺少 /proc，系统监控已禁用",
+                                "Remote is not Linux or lacks /proc; system monitor disabled",
+                            )
+                            .into(),
+                        );
                     }
                 }
                 WorkerEvent::TerminalData(bytes) => {
@@ -136,7 +157,11 @@ impl Session {
                 WorkerEvent::DirListing { path, entries } => {
                     self.files.on_listing(path, entries);
                 }
-                WorkerEvent::DirListFailed { path, message, retryable } => {
+                WorkerEvent::DirListFailed {
+                    path,
+                    message,
+                    retryable,
+                } => {
                     self.status = message;
                     self.files.on_list_failed(path, retryable);
                 }
@@ -149,16 +174,39 @@ impl Session {
                         f.status = message;
                     }
                 }
-                WorkerEvent::KbdPrompt { name, instructions, prompts } => {
+                WorkerEvent::KbdPrompt {
+                    name,
+                    instructions,
+                    prompts,
+                } => {
                     let answers = vec![String::new(); prompts.len()];
-                    self.kbd_prompt = Some(KbdPrompt { name, instructions, prompts, answers });
+                    self.kbd_prompt = Some(KbdPrompt {
+                        name,
+                        instructions,
+                        prompts,
+                        answers,
+                    });
                 }
-                WorkerEvent::HostKeyPrompt { host, fingerprint, changed } => {
+                WorkerEvent::HostKeyPrompt {
+                    host,
+                    fingerprint,
+                    changed,
+                } => {
                     self.pending_hostkey = Some((host, fingerprint, changed));
-                    self.status = crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
+                    self.status =
+                        crate::i18n::tr("等待确认主机指纹 …", "Awaiting host key …").into();
                 }
-                WorkerEvent::FileOpened { id, path, content, encoding, eol, mtime } => {
-                    self.pending.open.push((id, path, content, encoding, eol, mtime));
+                WorkerEvent::FileOpened {
+                    id,
+                    path,
+                    content,
+                    encoding,
+                    eol,
+                    mtime,
+                } => {
+                    self.pending
+                        .open
+                        .push((id, path, content, encoding, eol, mtime));
                     self.status = crate::i18n::tr("已打开文件", "File opened").into();
                 }
                 WorkerEvent::FileSaved { path, mtime } => {
@@ -167,7 +215,12 @@ impl Session {
                 WorkerEvent::FileSaveProgress { path, done, total } => {
                     self.pending.save_progress.push((path, done, total));
                 }
-                WorkerEvent::FileTail { path, data, offset, truncated } => {
+                WorkerEvent::FileTail {
+                    path,
+                    data,
+                    offset,
+                    truncated,
+                } => {
                     self.pending.tail.push((path, data, offset, truncated));
                 }
                 WorkerEvent::PdfInfo { id, path: _, pages } => {
@@ -176,7 +229,12 @@ impl Session {
                 WorkerEvent::PdfPage { path, page, data } => {
                     self.pending.pdf_page.push((path, page, data));
                 }
-                WorkerEvent::PdfSearch { path, query: _, hits, message } => {
+                WorkerEvent::PdfSearch {
+                    path,
+                    query: _,
+                    hits,
+                    message,
+                } => {
                     self.pending.pdf_search.push((path, hits, message));
                 }
                 WorkerEvent::DocOpened { id, path: _, data } => {
@@ -196,19 +254,31 @@ impl Session {
                 }
                 WorkerEvent::FileLoadFailed { id, message } => {
                     self.pending.load_fail.push((id, message.clone()));
-                    self.status = match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{message}"), crate::i18n::Lang::En => format!("Open failed: {message}") };
+                    self.status = match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("打开失败：{message}"),
+                        crate::i18n::Lang::En => format!("Open failed: {message}"),
+                    };
                 }
                 WorkerEvent::ImageOpened { path, data } => {
                     self.pending.image.push((path, data));
                     self.status = crate::i18n::tr("已打开图片", "Image opened").into();
                 }
-                WorkerEvent::OpDone { message, refresh_dir } => {
+                WorkerEvent::OpDone {
+                    message,
+                    refresh_dir,
+                } => {
                     self.status = message;
                     // 刷新操作目标目录。拖拽移动到「非当前目录」的文件夹时，源目录(cwd)
                     // 已在前端乐观移除被移动项、不在此刷新，避免整目录重载导致的跳动。
                     self.refresh_dir(refresh_dir);
                 }
-                WorkerEvent::TransferStart { id, name, total, dir, local } => {
+                WorkerEvent::TransferStart {
+                    id,
+                    name,
+                    total,
+                    dir,
+                    local,
+                } => {
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                         t.name = name;
                         t.total = total;
@@ -220,7 +290,8 @@ impl Session {
                             t.local = local;
                         }
                     } else {
-                        self.transfers.push(Transfer::new(id, name, dir, total, local, None));
+                        self.transfers
+                            .push(Transfer::new(id, name, dir, total, local, None));
                     }
                 }
                 WorkerEvent::TransferProgress { id, done } => {
@@ -232,7 +303,11 @@ impl Session {
                                 if dt >= 0.25 {
                                     let inst = done.saturating_sub(t.last_done) as f64 / dt;
                                     // 指数平滑，读数更稳
-                                    t.speed = if t.speed <= 0.0 { inst } else { t.speed * 0.6 + inst * 0.4 };
+                                    t.speed = if t.speed <= 0.0 {
+                                        inst
+                                    } else {
+                                        t.speed * 0.6 + inst * 0.4
+                                    };
                                     t.last_done = done;
                                     t.last_t = Some(now);
                                 }
@@ -250,7 +325,12 @@ impl Session {
                         t.note = note;
                     }
                 }
-                WorkerEvent::TransferDone { id, ok, message, refresh_dir } => {
+                WorkerEvent::TransferDone {
+                    id,
+                    ok,
+                    message,
+                    refresh_dir,
+                } => {
                     let connected = self.connected;
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                         t.note = String::new();
@@ -259,7 +339,9 @@ impl Session {
                             // 断线引起的失败：转为暂停，等重连续传
                             t.paused = true;
                             t.speed = 0.0;
-                            t.message = crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume").into();
+                            t.message =
+                                crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume")
+                                    .into();
                         } else {
                             t.ok = Some(ok);
                             if ok && t.total == 0 {
@@ -272,15 +354,25 @@ impl Session {
                     self.status = message;
                     // 上传成功：记下「待选中」的文件名，列表刷新后在该目录选中它（拖动上传后高亮所传文件）
                     if ok {
-                        if let Some((dir, name)) = self.transfers.iter().find(|t| t.id == id).and_then(|t| match &t.spec {
-                            Some(XferSpec::Upload { remote_dir, .. }) => Some((remote_dir.clone(), t.name.clone())),
-                            _ => None,
-                        }) {
+                        if let Some((dir, name)) = self
+                            .transfers
+                            .iter()
+                            .find(|t| t.id == id)
+                            .and_then(|t| match &t.spec {
+                                Some(XferSpec::Upload { remote_dir, .. }) => {
+                                    Some((remote_dir.clone(), t.name.clone()))
+                                }
+                                _ => None,
+                            })
+                        {
                             match &mut self.files.pending_select {
                                 Some((d, names)) if *d == dir => {
                                     names.insert(name);
                                 }
-                                _ => self.files.pending_select = Some((dir, std::iter::once(name).collect())),
+                                _ => {
+                                    self.files.pending_select =
+                                        Some((dir, std::iter::once(name).collect()))
+                                }
                             }
                         }
                     }

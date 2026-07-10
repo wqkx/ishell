@@ -24,7 +24,11 @@ const HL_RULES: &[(&str, Color32)] = &[
 ];
 
 /// 计算一行各单元格的高亮覆盖色（None=不覆盖）。关键字为 ASCII，按 1 列/字符。
-pub(super) fn highlight_colors(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<Option<Color32>> {
+pub(super) fn highlight_colors(
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+) -> Vec<Option<Color32>> {
     let mut chars: Vec<(u16, char)> = Vec::new();
     let mut col = 0u16;
     while col < cols {
@@ -74,7 +78,11 @@ fn url_regex() -> &'static regex::Regex {
 
 /// 在一行里查找链接，返回 (起列, 止列(含), url)。列号按屏幕单元格计。
 /// 支持 http(s)/ftp(s)/ssh/sftp/file 协议与裸 `www.`（后者自动补 https://）。
-pub(super) fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, String)> {
+pub(super) fn find_row_urls(
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+) -> Vec<(u16, u16, String)> {
     // 逐字符记录 (起始列, 字符)；宽字符续格跳过
     let mut chars: Vec<(u16, char)> = Vec::new();
     let mut col = 0u16;
@@ -94,7 +102,9 @@ pub(super) fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<
     let mut urls = Vec::new();
     for m in url_regex().find_iter(&text) {
         // 裁掉常见的尾随句读（URL 紧跟逗号/句号/右括号等时不应纳入）
-        let trimmed = m.as_str().trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '!', '?']);
+        let trimmed = m
+            .as_str()
+            .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '!', '?']);
         let ulen = trimmed.chars().count();
         if ulen == 0 {
             continue;
@@ -115,7 +125,11 @@ pub(super) fn find_row_urls(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<
 
 pub(super) fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> TextFormat {
     // 反显：文字改用背景色（实际背景块在 paint_row_backgrounds 中绘制）
-    let base = if c.inverse() { c.bgcolor() } else { c.fgcolor() };
+    let base = if c.inverse() {
+        c.bgcolor()
+    } else {
+        c.fgcolor()
+    };
     let default = if c.inverse() { tc.bg } else { tc.fg };
     let mut fg = vt_color(base, default, tc);
     // Bold：ANSI 0–7 升到亮色 8–15（xterm 常见行为）；其余略提亮
@@ -141,9 +155,7 @@ pub(super) fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> Te
 
 /// 按比例调整 RGB（用于 bold 提亮 / dim 变暗），保持 alpha。
 pub(super) fn brighten_rgb(c: Color32, factor: f32) -> Color32 {
-    let scale = |v: u8| -> u8 {
-        ((v as f32 * factor).round()).clamp(0.0, 255.0) as u8
-    };
+    let scale = |v: u8| -> u8 { ((v as f32 * factor).round()).clamp(0.0, 255.0) as u8 };
     Color32::from_rgba_unmultiplied(scale(c.r()), scale(c.g()), scale(c.b()), c.a())
 }
 

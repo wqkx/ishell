@@ -10,11 +10,35 @@ use super::token::{tokenize, Tok};
 pub fn lint_enabled(ext: &str) -> bool {
     matches!(
         ext,
-        "rs" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cu"
-            | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
-            | "go" | "java" | "kt" | "kts" | "swift" | "scala"
-            | "py" | "pyw" | "rb" | "php" | "lua"
-            | "json" | "css" | "scss" | "less"
+        "rs" | "c"
+            | "h"
+            | "cpp"
+            | "cc"
+            | "cxx"
+            | "hpp"
+            | "hh"
+            | "cu"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "mjs"
+            | "cjs"
+            | "go"
+            | "java"
+            | "kt"
+            | "kts"
+            | "swift"
+            | "scala"
+            | "py"
+            | "pyw"
+            | "rb"
+            | "php"
+            | "lua"
+            | "json"
+            | "css"
+            | "scss"
+            | "less"
     )
 }
 
@@ -77,7 +101,8 @@ pub fn lint_syntax(text: &str, ext: &str) -> (Vec<usize>, Vec<Range<usize>>, Opt
     match ext {
         "py" | "pyw" => lint_python(text, &segs, &mut bad),
         "json" => lint_json(text, &segs, &mut bad),
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "rs" | "go" | "c" | "h" | "cpp" | "cc" | "cxx" | "java" => {
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "rs" | "go" | "c" | "h" | "cpp" | "cc"
+        | "cxx" | "java" => {
             lint_comma_in_brackets(text, &segs, &mut bad);
         }
         _ => {}
@@ -85,11 +110,22 @@ pub fn lint_syntax(text: &str, ext: &str) -> (Vec<usize>, Vec<Range<usize>>, Opt
 
     bad.sort_unstable();
     bad.dedup();
-    let ranges: Vec<Range<usize>> = bad.iter().map(|&b| {
-        let end = next_utf8_end(text, b);
-        b..end
-    }).collect();
-    let lines: Vec<usize> = bad.iter().map(|&b| text[..b.min(text.len())].bytes().filter(|x| *x == b'\n').count()).collect();
+    let ranges: Vec<Range<usize>> = bad
+        .iter()
+        .map(|&b| {
+            let end = next_utf8_end(text, b);
+            b..end
+        })
+        .collect();
+    let lines: Vec<usize> = bad
+        .iter()
+        .map(|&b| {
+            text[..b.min(text.len())]
+                .bytes()
+                .filter(|x| *x == b'\n')
+                .count()
+        })
+        .collect();
     let msg = if bad.is_empty() {
         None
     } else {
@@ -105,7 +141,11 @@ fn next_utf8_end(text: &str, b: usize) -> usize {
     if b >= text.len() {
         return b;
     }
-    text[b..].chars().next().map(|c| b + c.len_utf8()).unwrap_or(b + 1)
+    text[b..]
+        .chars()
+        .next()
+        .map(|c| b + c.len_utf8())
+        .unwrap_or(b + 1)
 }
 
 /// 判断字符串 token 是否未正确闭合。
@@ -225,8 +265,12 @@ fn looks_like_value_end(text: &str, s: usize, e: usize, tok: Tok) -> bool {
         Tok::Num | Tok::Str | Tok::Keyword => true,
         Tok::Plain => {
             let t = text[s..e].trim_end();
-            t.ends_with(')') || t.ends_with(']') || t.ends_with('}')
-                || t.chars().next_back().is_some_and(|c| c == '_' || c.is_alphanumeric())
+            t.ends_with(')')
+                || t.ends_with(']')
+                || t.ends_with('}')
+                || t.chars()
+                    .next_back()
+                    .is_some_and(|c| c == '_' || c.is_alphanumeric())
         }
         Tok::Comment => false,
     }
@@ -244,8 +288,12 @@ fn looks_like_value_start(text: &str, s: usize, e: usize, tok: Tok) -> bool {
         }
         Tok::Plain => {
             let t = text[s..e].trim_start();
-            t.starts_with('(') || t.starts_with('[') || t.starts_with('{')
-                || t.chars().next().is_some_and(|c| c == '_' || c.is_alphanumeric() || c == '"' || c == '\'' || c == '`')
+            t.starts_with('(')
+                || t.starts_with('[')
+                || t.starts_with('{')
+                || t.chars().next().is_some_and(|c| {
+                    c == '_' || c.is_alphanumeric() || c == '"' || c == '\'' || c == '`'
+                })
         }
         Tok::Comment => false,
     }
@@ -299,7 +347,10 @@ fn lint_python(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Vec<usize>) {
         let trimmed = line.trim_end();
         let code = strip_py_line_comment(trimmed);
         if code.ends_with(':') && !code.ends_with("::") {
-            let lead = line.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+            let lead = line
+                .bytes()
+                .take_while(|b| *b == b' ' || *b == b'\t')
+                .count();
             // 找下一非空、非注释行
             let mut j = i + 1;
             while j < lines.len() {
@@ -315,7 +366,10 @@ fn lint_python(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Vec<usize>) {
                 bad.push(off + lead.max(1) - 1);
             } else {
                 let next = lines[j];
-                let nlead = next.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+                let nlead = next
+                    .bytes()
+                    .take_while(|b| *b == b' ' || *b == b'\t')
+                    .count();
                 if nlead <= lead && !next.trim_start().starts_with('#') {
                     // 同级或更浅 → 可能缺缩进块（except/elif/else/finally/case 同级合法）
                     let nt = next.trim_start();

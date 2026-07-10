@@ -12,7 +12,11 @@ use super::App;
 impl App {
     /// 未知主机首次连接：确认指纹（TOFU），同意则 worker 写入 known_hosts。
     pub(super) fn host_key_dialog(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.sessions.iter().position(|s| s.pending_hostkey.is_some()) else {
+        let Some(idx) = self
+            .sessions
+            .iter()
+            .position(|s| s.pending_hostkey.is_some())
+        else {
             return;
         };
         let (host, fp, changed) = self.sessions[idx].pending_hostkey.clone().unwrap();
@@ -85,21 +89,32 @@ impl App {
             ui.label(RichText::new(title).size(16.0).strong());
             if !kp.instructions.trim().is_empty() {
                 ui.add_space(4.0);
-                ui.label(RichText::new(&kp.instructions).color(Palette::TEXT_DIM).size(12.0));
+                ui.label(
+                    RichText::new(&kp.instructions)
+                        .color(Palette::TEXT_DIM)
+                        .size(12.0),
+                );
             }
             ui.add_space(8.0);
-            egui::Grid::new("kbd_grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                for (i, (prompt, echo)) in kp.prompts.iter().enumerate() {
-                    ui.label(prompt);
-                    // echo=false 的提示（如密码/验证码）做遮蔽
-                    let r = ui.add(egui::TextEdit::singleline(&mut kp.answers[i]).desired_width(200.0).password(!echo));
-                    // 打开即聚焦第一个输入框，可直接输入验证码
-                    if i == 0 && ui.memory(|m| m.focused().is_none()) {
-                        r.request_focus();
+            egui::Grid::new("kbd_grid")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    for (i, (prompt, echo)) in kp.prompts.iter().enumerate() {
+                        ui.label(prompt);
+                        // echo=false 的提示（如密码/验证码）做遮蔽
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut kp.answers[i])
+                                .desired_width(200.0)
+                                .password(!echo),
+                        );
+                        // 打开即聚焦第一个输入框，可直接输入验证码
+                        if i == 0 && ui.memory(|m| m.focused().is_none()) {
+                            r.request_focus();
+                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-            });
+                });
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 submit = true;
             }
@@ -108,7 +123,12 @@ impl App {
                 let bw = 96.0;
                 let total = bw * 2.0 + ui.spacing().item_spacing.x;
                 ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
-                if dialog_button(ui, crate::i18n::tr("提交", "Submit"), Some(Palette::ACCENT), bw) {
+                if dialog_button(
+                    ui,
+                    crate::i18n::tr("提交", "Submit"),
+                    Some(Palette::ACCENT),
+                    bw,
+                ) {
                     submit = true;
                 }
                 if dialog_button(ui, crate::i18n::tr("取消", "Cancel"), None, bw) {
@@ -130,7 +150,9 @@ impl App {
 
     /// 粘贴二次确认：剪切（移动/删源）或跨服务器（重操作）执行前弹窗确认。
     pub(super) fn paste_confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(plan) = self.xfer.pending_paste.as_ref() else { return };
+        let Some(plan) = self.xfer.pending_paste.as_ref() else {
+            return;
+        };
         let mut go = false;
         let mut cancel = false;
         // 互斥选择的本地镜像（plan 已不可变借用 self，不能再借 self.xfer.confirm_direct）
@@ -239,13 +261,34 @@ impl App {
             .anchor(egui::Align2::RIGHT_TOP, [-10.0, 44.0])
             .default_width(340.0)
             .resizable(false)
-            .frame(egui::Frame::window(&ctx.global_style()).fill(Palette::PANEL).inner_margin(10))
+            .frame(
+                egui::Frame::window(&ctx.global_style())
+                    .fill(Palette::PANEL)
+                    .inner_margin(10),
+            )
             .show(ctx, |ui| {
                 // 自定义紧凑标题栏
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}  {}", icon::CODE, crate::i18n::tr("命令片段", "Snippets"))).strong().size(13.0).color(Palette::TEXT));
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  {}",
+                            icon::CODE,
+                            crate::i18n::tr("命令片段", "Snippets")
+                        ))
+                        .strong()
+                        .size(13.0)
+                        .color(Palette::TEXT),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM)).frame(false)).clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
                             close_win = true;
                         }
                     });
@@ -254,54 +297,143 @@ impl App {
 
                 if self.snip.list.is_empty() {
                     ui.add_space(4.0);
-                    crate::ui::empty_state(ui, egui_phosphor::regular::CODE, crate::i18n::tr("暂无片段，在下方新增", "No snippets; add one below"), false);
+                    crate::ui::empty_state(
+                        ui,
+                        egui_phosphor::regular::CODE,
+                        crate::i18n::tr("暂无片段，在下方新增", "No snippets; add one below"),
+                        false,
+                    );
                 }
                 // 列表：点名称即发送到当前会话终端；右侧编辑 / 删除（无边框图标，风格统一）
-                egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, sn) in self.snip.list.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(icon::PAPER_PLANE_TILT).color(Palette::ACCENT).size(13.0));
-                            let label = if sn.name.trim().is_empty() { sn.command.clone() } else { sn.name.clone() };
-                            if ui
-                                .add(egui::Label::new(RichText::new(label).size(12.0).color(Palette::TEXT)).sense(Sense::click()))
-                                .on_hover_text(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("发送：{}", sn.command), crate::i18n::Lang::En => format!("Send: {}", sn.command) })
-                                .clicked()
-                            {
-                                send_cmd = Some((sn.command.clone(), sn.run));
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add(egui::Button::new(RichText::new(icon::TRASH).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("删除", "Delete")).clicked() {
-                                    delete = Some(i);
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (i, sn) in self.snip.list.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(icon::PAPER_PLANE_TILT)
+                                        .color(Palette::ACCENT)
+                                        .size(13.0),
+                                );
+                                let label = if sn.name.trim().is_empty() {
+                                    sn.command.clone()
+                                } else {
+                                    sn.name.clone()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(label).size(12.0).color(Palette::TEXT),
+                                        )
+                                        .sense(Sense::click()),
+                                    )
+                                    .on_hover_text(match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("发送：{}", sn.command),
+                                        crate::i18n::Lang::En => format!("Send: {}", sn.command),
+                                    })
+                                    .clicked()
+                                {
+                                    send_cmd = Some((sn.command.clone(), sn.run));
                                 }
-                                if ui.add(egui::Button::new(RichText::new(icon::PENCIL_SIMPLE).size(12.0).color(Palette::TEXT_DIM)).frame(false)).on_hover_text(crate::i18n::tr("编辑", "Edit")).clicked() {
-                                    edit = Some(i);
-                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(icon::TRASH)
+                                                        .size(12.0)
+                                                        .color(Palette::TEXT_DIM),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .on_hover_text(crate::i18n::tr("删除", "Delete"))
+                                            .clicked()
+                                        {
+                                            delete = Some(i);
+                                        }
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(icon::PENCIL_SIMPLE)
+                                                        .size(12.0)
+                                                        .color(Palette::TEXT_DIM),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .on_hover_text(crate::i18n::tr("编辑", "Edit"))
+                                            .clicked()
+                                        {
+                                            edit = Some(i);
+                                        }
+                                    },
+                                );
                             });
-                        });
-                        // 有名称时在下方以等宽小字补充命令原文
-                        if !sn.name.trim().is_empty() {
-                            ui.label(RichText::new(&sn.command).monospace().size(10.5).color(Palette::TEXT_DIM));
+                            // 有名称时在下方以等宽小字补充命令原文
+                            if !sn.name.trim().is_empty() {
+                                ui.label(
+                                    RichText::new(&sn.command)
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(Palette::TEXT_DIM),
+                                );
+                            }
+                            ui.add_space(3.0);
                         }
-                        ui.add_space(3.0);
-                    }
-                });
+                    });
 
                 ui.separator();
                 let editing = self.snip.editing.is_some();
-                ui.label(RichText::new(if editing { crate::i18n::tr("编辑片段", "Edit snippet") } else { crate::i18n::tr("新增片段", "New snippet") }).strong().size(12.0));
+                ui.label(
+                    RichText::new(if editing {
+                        crate::i18n::tr("编辑片段", "Edit snippet")
+                    } else {
+                        crate::i18n::tr("新增片段", "New snippet")
+                    })
+                    .strong()
+                    .size(12.0),
+                );
                 ui.add_space(2.0);
-                egui::Grid::new("snip_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label(crate::i18n::tr("名称", "Name"));
-                    ui.add(egui::TextEdit::singleline(&mut self.snip.name).desired_width(210.0).hint_text(crate::i18n::tr("可选，便于识别", "Optional label")));
-                    ui.end_row();
-                    ui.label(crate::i18n::tr("命令", "Command"));
-                    ui.add(egui::TextEdit::multiline(&mut self.snip.cmd).desired_width(210.0).desired_rows(2));
-                    ui.end_row();
-                });
-                ui.checkbox(&mut self.snip.run, crate::i18n::tr("发送后自动回车执行", "Press Enter after sending"));
+                egui::Grid::new("snip_form")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(crate::i18n::tr("名称", "Name"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.snip.name)
+                                .desired_width(210.0)
+                                .hint_text(crate::i18n::tr("可选，便于识别", "Optional label")),
+                        );
+                        ui.end_row();
+                        ui.label(crate::i18n::tr("命令", "Command"));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.snip.cmd)
+                                .desired_width(210.0)
+                                .desired_rows(2),
+                        );
+                        ui.end_row();
+                    });
+                ui.checkbox(
+                    &mut self.snip.run,
+                    crate::i18n::tr("发送后自动回车执行", "Press Enter after sending"),
+                );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(RichText::new(if editing { crate::i18n::tr("保存", "Save") } else { crate::i18n::tr("添加", "Add") }).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(if editing {
+                                    crate::i18n::tr("保存", "Save")
+                                } else {
+                                    crate::i18n::tr("添加", "Add")
+                                })
+                                .color(egui::Color32::WHITE),
+                            )
+                            .fill(Palette::ACCENT),
+                        )
+                        .clicked()
+                    {
                         save_now = true;
                     }
                     if editing && ui.button(crate::i18n::tr("取消编辑", "Cancel")).clicked() {
@@ -336,7 +468,11 @@ impl App {
         if save_now {
             let cmd = self.snip.cmd.trim().to_string();
             if !cmd.is_empty() {
-                let sn = crate::store::Snippet { name: self.snip.name.trim().to_string(), command: cmd, run: self.snip.run };
+                let sn = crate::store::Snippet {
+                    name: self.snip.name.trim().to_string(),
+                    command: cmd,
+                    run: self.snip.run,
+                };
                 match self.snip.editing.take() {
                     Some(i) if i < self.snip.list.len() => self.snip.list[i] = sn,
                     _ => self.snip.list.push(sn),
@@ -361,7 +497,10 @@ impl App {
             }
         }
         // 点击窗口外部自动隐藏（打开当帧除外），或点 X 关闭
-        let clicked_outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
+        let clicked_outside = win
+            .as_ref()
+            .map(|r| r.response.clicked_elsewhere())
+            .unwrap_or(false);
         if close_win || (clicked_outside && !self.snip.just_opened) {
             self.snip.show = false;
         }
@@ -418,5 +557,4 @@ impl App {
     }
 }
 
-impl App {
-}
+impl App {}

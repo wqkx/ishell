@@ -348,11 +348,19 @@ impl App {
             let raw: Vec<(u64, u64)> = server_idxs
                 .iter()
                 .filter_map(|&i| self.sessions.get(i))
-                .flat_map(|s| s.transfers.iter().filter(|t| t.ok.is_none() && !t.queued).map(move |t| (s.uid, t.id)))
+                .flat_map(|s| {
+                    s.transfers
+                        .iter()
+                        .filter(|t| t.ok.is_none() && !t.queued)
+                        .map(move |t| (s.uid, t.id))
+                })
                 .collect();
             for (uid, id) in raw {
                 let (tu, ti) = self.cancel_target(uid, id);
-                if let Some(s) = self.session_idx_by_uid(tu).and_then(|i| self.sessions.get(i)) {
+                if let Some(s) = self
+                    .session_idx_by_uid(tu)
+                    .and_then(|i| self.sessions.get(i))
+                {
                     let _ = s.cmd_tx.send(UiCommand::CancelTransfer(ti));
                 }
             }
@@ -371,10 +379,20 @@ impl App {
                     for (id, spec) in targets {
                         match spec {
                             XferSpec::Download { remote, local } => {
-                                let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy: ConflictPolicy::Overwrite });
+                                let _ = s.cmd_tx.send(UiCommand::Download {
+                                    id,
+                                    remote,
+                                    local,
+                                    policy: ConflictPolicy::Overwrite,
+                                });
                             }
                             XferSpec::Upload { local, remote_dir } => {
-                                let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy: ConflictPolicy::Overwrite });
+                                let _ = s.cmd_tx.send(UiCommand::Upload {
+                                    id,
+                                    local,
+                                    remote_dir,
+                                    policy: ConflictPolicy::Overwrite,
+                                });
                             }
                         }
                         if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
@@ -391,7 +409,10 @@ impl App {
         // 取消传输：镜像行/源行都经 cancel_target 路由到源端真实传输并标记 cancelled
         if let Some((uid, id)) = cancel_id {
             let (tu, ti) = self.cancel_target(uid, id);
-            if let Some(s) = self.session_idx_by_uid(tu).and_then(|i| self.sessions.get(i)) {
+            if let Some(s) = self
+                .session_idx_by_uid(tu)
+                .and_then(|i| self.sessions.get(i))
+            {
                 let _ = s.cmd_tx.send(UiCommand::CancelTransfer(ti));
             }
             self.xfer_just_opened = true; // 避免点击被当作窗外点击而关窗
@@ -400,10 +421,29 @@ impl App {
         if let Some((uid, id)) = resume_id {
             if let Some(i) = self.session_idx_by_uid(uid) {
                 let s = &mut self.sessions[i];
-                if let Some(spec) = s.transfers.iter().find(|t| t.id == id).and_then(|t| t.spec.clone()) {
+                if let Some(spec) = s
+                    .transfers
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.spec.clone())
+                {
                     match spec {
-                        XferSpec::Download { remote, local } => { let _ = s.cmd_tx.send(UiCommand::Download { id, remote, local, policy: ConflictPolicy::Overwrite }); }
-                        XferSpec::Upload { local, remote_dir } => { let _ = s.cmd_tx.send(UiCommand::Upload { id, local, remote_dir, policy: ConflictPolicy::Overwrite }); }
+                        XferSpec::Download { remote, local } => {
+                            let _ = s.cmd_tx.send(UiCommand::Download {
+                                id,
+                                remote,
+                                local,
+                                policy: ConflictPolicy::Overwrite,
+                            });
+                        }
+                        XferSpec::Upload { local, remote_dir } => {
+                            let _ = s.cmd_tx.send(UiCommand::Upload {
+                                id,
+                                local,
+                                remote_dir,
+                                policy: ConflictPolicy::Overwrite,
+                            });
+                        }
                     }
                     if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
                         t.ok = None;
@@ -441,7 +481,13 @@ impl App {
         }
         // 选择默认下载目录（原生文件夹选择器）
         if pick_dir {
-            if let Some(dir) = rfd::FileDialog::new().set_title(crate::i18n::tr("选择默认下载文件夹", "Select default download folder")).pick_folder() {
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title(crate::i18n::tr(
+                    "选择默认下载文件夹",
+                    "Select default download folder",
+                ))
+                .pick_folder()
+            {
                 self.download_dir = dir.clone();
                 crate::store::save_download_dir(&dir.to_string_lossy());
             }

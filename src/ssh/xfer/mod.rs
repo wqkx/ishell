@@ -1,9 +1,9 @@
 //! SSH 文件传输：从 ssh God Object 拆出，行为不变。
 
-mod util;
+mod direct;
 mod download;
 mod upload;
-mod direct;
+mod util;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +17,8 @@ use crate::proto::{ConflictPolicy, WorkerEvent};
 use super::auth::{open_sftp, ClientHandler};
 use super::UiSink;
 
-use download::download;
 use direct::direct_transfer;
+use download::download;
 use upload::upload;
 
 /// 同一会话同时进行的最大传输数（不同会话各自独立）。
@@ -26,8 +26,18 @@ pub(super) const MAX_CONCURRENT_XFER: usize = 6;
 
 /// 待执行/进行中的传输任务描述。
 pub(super) enum PendingXfer {
-    Download { id: u64, remote: String, local: String, policy: ConflictPolicy },
-    Upload { id: u64, local: String, remote_dir: String, policy: ConflictPolicy },
+    Download {
+        id: u64,
+        remote: String,
+        local: String,
+        policy: ConflictPolicy,
+    },
+    Upload {
+        id: u64,
+        local: String,
+        remote_dir: String,
+        policy: ConflictPolicy,
+    },
     /// 跨主机直传：在本（源）主机上 rsync/scp 直推到目标主机
     Direct(Box<crate::proto::DirectSpec>),
 }
@@ -61,7 +71,13 @@ pub(super) fn start_xfer(
     let cancel = Arc::new(AtomicBool::new(false));
     let id = p.id();
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-    cancels.insert(id, XferCancel { flag: cancel.clone(), stop: Some(stop_tx) });
+    cancels.insert(
+        id,
+        XferCancel {
+            flag: cancel.clone(),
+            stop: Some(stop_tx),
+        },
+    );
     let h = handle.clone();
     let s = sink.clone();
     let s_cancel = sink.clone();
@@ -74,13 +90,45 @@ pub(super) fn start_xfer(
                 Ok(sftp) => {
                     let sftp = Arc::new(sftp);
                     match p {
-                        PendingXfer::Download { id, remote, local, policy } => download(h.clone(), sftp, id, remote, local, policy, &s, cancel_work).await,
-                        PendingXfer::Upload { id, local, remote_dir, policy } => upload(sftp.as_ref(), id, local, remote_dir, policy, &s, cancel_work).await,
-                        PendingXfer::Direct(spec) => direct_transfer(h.clone(), sftp, *spec, &s, cancel_work).await,
+                        PendingXfer::Download {
+                            id,
+                            remote,
+                            local,
+                            policy,
+                        } => {
+                            download(h.clone(), sftp, id, remote, local, policy, &s, cancel_work)
+                                .await
+                        }
+                        PendingXfer::Upload {
+                            id,
+                            local,
+                            remote_dir,
+                            policy,
+                        } => {
+                            upload(
+                                sftp.as_ref(),
+                                id,
+                                local,
+                                remote_dir,
+                                policy,
+                                &s,
+                                cancel_work,
+                            )
+                            .await
+                        }
+                        PendingXfer::Direct(spec) => {
+                            direct_transfer(h.clone(), sftp, *spec, &s, cancel_work).await
+                        }
                     }
                 }
                 Err(e) => s.send(WorkerEvent::TransferDone {
-                    id, ok: false, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"), crate::i18n::Lang::En => format!("SFTP unavailable: {e}") }, refresh_dir: None,
+                    id,
+                    ok: false,
+                    message: match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("SFTP 不可用：{e}"),
+                        crate::i18n::Lang::En => format!("SFTP unavailable: {e}"),
+                    },
+                    refresh_dir: None,
                 }),
             }
         };

@@ -23,23 +23,42 @@ pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, 
             sink.send(WorkerEvent::ForwardStatus {
                 id: spec.id,
                 ok: false,
-                message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("绑定 {bind} 失败：{e}"), crate::i18n::Lang::En => format!("Bind {bind} failed: {e}") },
+                message: match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("绑定 {bind} 失败：{e}"),
+                    crate::i18n::Lang::En => format!("Bind {bind} failed: {e}"),
+                },
             });
             return;
         }
     };
     let label = match &spec.kind {
-        ForwardKind::Local { remote_host, remote_port } => format!("{bind} → {remote_host}:{remote_port}"),
+        ForwardKind::Local {
+            remote_host,
+            remote_port,
+        } => format!("{bind} → {remote_host}:{remote_port}"),
         ForwardKind::Dynamic => format!("SOCKS5 {bind}"),
     };
     // 绑定到非回环地址：同网段任何主机都能使用此转发（SOCKS5 无认证时即开放代理）——
     // 在状态里明确警示，让「对外开放」是一个知情决定
-    let open_warn = if spec.bind_host != "127.0.0.1" && spec.bind_host != "localhost" && spec.bind_host != "::1" {
-        crate::i18n::tr("（警告：绑定非回环地址，局域网内他人可使用此转发）", " (WARNING: bound to non-loopback; others on the network can use it)")
+    let open_warn = if spec.bind_host != "127.0.0.1"
+        && spec.bind_host != "localhost"
+        && spec.bind_host != "::1"
+    {
+        crate::i18n::tr(
+            "（警告：绑定非回环地址，局域网内他人可使用此转发）",
+            " (WARNING: bound to non-loopback; others on the network can use it)",
+        )
     } else {
         ""
     };
-    sink.send(WorkerEvent::ForwardStatus { id: spec.id, ok: true, message: match crate::i18n::current() { crate::i18n::Lang::Zh => format!("监听中  {label}{open_warn}"), crate::i18n::Lang::En => format!("Listening  {label}{open_warn}") } });
+    sink.send(WorkerEvent::ForwardStatus {
+        id: spec.id,
+        ok: true,
+        message: match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("监听中  {label}{open_warn}"),
+            crate::i18n::Lang::En => format!("Listening  {label}{open_warn}"),
+        },
+    });
 
     // 并发连接上限：防异常客户端把本机拖入无界任务/文件句柄增长
     let permits = Arc::new(tokio::sync::Semaphore::new(128));
@@ -70,7 +89,10 @@ async fn handle_conn(
     let oport = peer.port() as u32;
 
     match kind {
-        ForwardKind::Local { remote_host, remote_port } => {
+        ForwardKind::Local {
+            remote_host,
+            remote_port,
+        } => {
             let ch = handle
                 .channel_open_direct_tcpip(remote_host, remote_port as u32, origin, oport)
                 .await?;
@@ -79,7 +101,10 @@ async fn handle_conn(
         }
         ForwardKind::Dynamic => {
             let (host, port) = socks5_negotiate(&mut sock).await?;
-            match handle.channel_open_direct_tcpip(host, port as u32, origin, oport).await {
+            match handle
+                .channel_open_direct_tcpip(host, port as u32, origin, oport)
+                .await
+            {
                 Ok(ch) => {
                     socks5_reply(&mut sock, 0x00).await?; // succeeded
                     let mut stream = ch.into_stream();
@@ -103,7 +128,12 @@ const SOCKS5_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 async fn socks5_negotiate(sock: &mut TcpStream) -> anyhow::Result<(String, u16)> {
     tokio::time::timeout(SOCKS5_HANDSHAKE_TIMEOUT, socks5_negotiate_inner(sock))
         .await
-        .map_err(|_| anyhow::anyhow!("{}", crate::i18n::tr("SOCKS5 握手超时", "SOCKS5 handshake timeout")))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "{}",
+                crate::i18n::tr("SOCKS5 握手超时", "SOCKS5 handshake timeout")
+            )
+        })?
 }
 
 async fn socks5_negotiate_inner(sock: &mut TcpStream) -> anyhow::Result<(String, u16)> {
@@ -119,7 +149,13 @@ async fn socks5_negotiate_inner(sock: &mut TcpStream) -> anyhow::Result<(String,
     // 不能无条件替客户端拍板
     if !methods.contains(&0x00) {
         let _ = sock.write_all(&[0x05, 0xFF]).await;
-        anyhow::bail!("{}", crate::i18n::tr("客户端不支持无认证方式", "Client offers no acceptable auth method"));
+        anyhow::bail!(
+            "{}",
+            crate::i18n::tr(
+                "客户端不支持无认证方式",
+                "Client offers no acceptable auth method"
+            )
+        );
     }
     sock.write_all(&[0x05, 0x00]).await?; // 选择「无认证」
 
@@ -151,7 +187,10 @@ async fn socks5_negotiate_inner(sock: &mut TcpStream) -> anyhow::Result<(String,
         }
         _ => {
             socks5_reply(sock, 0x08).await?; // address type not supported
-            anyhow::bail!("{}", crate::i18n::tr("不支持的地址类型", "Unsupported address type"));
+            anyhow::bail!(
+                "{}",
+                crate::i18n::tr("不支持的地址类型", "Unsupported address type")
+            );
         }
     };
     let mut pb = [0u8; 2];
@@ -161,6 +200,7 @@ async fn socks5_negotiate_inner(sock: &mut TcpStream) -> anyhow::Result<(String,
 
 /// 发送 SOCKS5 响应（rep=0x00 成功）。BND.ADDR 固定 0.0.0.0:0。
 async fn socks5_reply(sock: &mut TcpStream, rep: u8) -> anyhow::Result<()> {
-    sock.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    sock.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
     Ok(())
 }

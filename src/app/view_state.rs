@@ -2,7 +2,8 @@
 
 /// 是否已同意「向 shell 注入 OSC 7 上报工作目录」。同意一次后持久化，后续静默注入。
 /// 用全局原子（启动时从 store 载入），便于 Session 的连接回调直接读取。
-pub(crate) static OSC7_CONSENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static OSC7_CONSENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn osc7_consent() -> bool {
     OSC7_CONSENT.load(std::sync::atomic::Ordering::Relaxed)
@@ -20,30 +21,49 @@ pub(crate) const OSC7_SNIPPET: &str = r#" __ishell_cwd(){ printf '\033]7;file://
 // ===== 全局视图状态（折叠监控栏/文件栏、界面缩放）=====
 // 设为进程级全局，便于侧栏背景层与各子控件（进程行/网卡/IP 等）共用同一右键菜单，
 // 避免「右键到子控件上弹不出完整菜单」的不一致。
-pub(crate) static SIDEBAR_COLLAPSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static SIDEBAR_COLLAPSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) static FILES_COLLAPSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static FILES_COLLAPSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) static ZOOM_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0 哨兵=未初始化(按 1.0)
 
 /// 「关于」弹框是否显示（右键菜单触发；自由函数态，与折叠/缩放一致用全局）。
-pub(crate) static ABOUT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static ABOUT_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) fn about_open() -> bool { ABOUT_OPEN.load(std::sync::atomic::Ordering::Relaxed) }
+pub(crate) fn about_open() -> bool {
+    ABOUT_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-pub(crate) fn set_about_open(v: bool) { ABOUT_OPEN.store(v, std::sync::atomic::Ordering::Relaxed); }
+pub(crate) fn set_about_open(v: bool) {
+    ABOUT_OPEN.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
-pub(crate) fn sidebar_collapsed() -> bool { SIDEBAR_COLLAPSED.load(std::sync::atomic::Ordering::Relaxed) }
+pub(crate) fn sidebar_collapsed() -> bool {
+    SIDEBAR_COLLAPSED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-pub(crate) fn set_sidebar_collapsed(v: bool) { SIDEBAR_COLLAPSED.store(v, std::sync::atomic::Ordering::Relaxed); }
+pub(crate) fn set_sidebar_collapsed(v: bool) {
+    SIDEBAR_COLLAPSED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
-pub(crate) fn files_collapsed() -> bool { FILES_COLLAPSED.load(std::sync::atomic::Ordering::Relaxed) }
+pub(crate) fn files_collapsed() -> bool {
+    FILES_COLLAPSED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-pub(crate) fn set_files_collapsed(v: bool) { FILES_COLLAPSED.store(v, std::sync::atomic::Ordering::Relaxed); }
+pub(crate) fn set_files_collapsed(v: bool) {
+    FILES_COLLAPSED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub(crate) fn ui_zoom() -> f32 {
     let b = ZOOM_BITS.load(std::sync::atomic::Ordering::Relaxed);
-    if b == 0 { 1.0 } else { f32::from_bits(b) }
+    if b == 0 {
+        1.0
+    } else {
+        f32::from_bits(b)
+    }
 }
 
 pub(crate) fn set_ui_zoom(z: f32) {
@@ -57,6 +77,12 @@ pub(crate) fn set_ui_zoom(z: f32) {
 
 /// 启动时把已保存的缩放载入全局。
 pub(crate) fn init_view_state() {
-    ZOOM_BITS.store(crate::store::load_zoom().to_bits(), std::sync::atomic::Ordering::Relaxed);
-    OSC7_CONSENT.store(crate::store::load_osc7_consent(), std::sync::atomic::Ordering::Relaxed);
+    ZOOM_BITS.store(
+        crate::store::load_zoom().to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    OSC7_CONSENT.store(
+        crate::store::load_osc7_consent(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }

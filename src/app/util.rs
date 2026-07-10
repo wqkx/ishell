@@ -3,7 +3,11 @@
 /// 本地端口预占用探测（添加端口转发前）：仅当明确 `AddrInUse` 才判为占用；
 /// 其它错误（如 bind 地址非本机网卡）返回 false——不武断拦截，交给 worker 实际绑定决定。
 pub(crate) fn local_port_in_use(host: &str, port: u16) -> bool {
-    let h = if host.trim().is_empty() { "127.0.0.1" } else { host };
+    let h = if host.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        host
+    };
     match std::net::TcpListener::bind((h, port)) {
         Ok(_) => false, // 立即 drop 释放，worker 随后真正绑定
         Err(e) => e.kind() == std::io::ErrorKind::AddrInUse,
@@ -79,10 +83,26 @@ pub(crate) fn edge_fade(painter: &egui::Painter, rect: egui::Rect, left: bool, b
     let (t, b) = (rect.top(), rect.bottom());
     let mut mesh = egui::Mesh::default();
     let uv = egui::epaint::WHITE_UV;
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, t), uv, color: c0 });
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, t), uv, color: c1 });
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, b), uv, color: c1 });
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, b), uv, color: c0 });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x0, t),
+        uv,
+        color: c0,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x1, t),
+        uv,
+        color: c1,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x1, b),
+        uv,
+        color: c1,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x0, b),
+        uv,
+        color: c0,
+    });
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
 }
@@ -92,12 +112,17 @@ pub(crate) fn open_containing_folder(file: &str) {
     #[cfg(target_os = "windows")]
     {
         // explorer /select, 选中文件
-        let _ = std::process::Command::new("explorer").arg(format!("/select,{file}")).spawn();
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{file}"))
+            .spawn();
     }
     #[cfg(target_os = "macos")]
     {
         // Finder 中显示并选中
-        let _ = std::process::Command::new("open").arg("-R").arg(file).spawn();
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(file)
+            .spawn();
     }
     #[cfg(target_os = "linux")]
     {
@@ -130,7 +155,9 @@ pub(crate) fn file_uri(p: &str) -> String {
     let mut s = String::from("file://");
     for b in p.bytes() {
         match b {
-            b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => s.push(b as char),
+            b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => {
+                s.push(b as char)
+            }
             _ => s.push_str(&format!("%{b:02X}")),
         }
     }
@@ -182,4 +209,3 @@ mod tests {
         assert_eq!(fmt_dur(3723), "1h2m");
     }
 }
-

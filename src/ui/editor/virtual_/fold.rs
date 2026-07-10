@@ -60,7 +60,9 @@ pub(super) fn v_lead(ed: &Editor, line: usize, unit: usize) -> Option<usize> {
 }
 /// 是否可折叠（快速判定，供画箭头）：下一个非空行缩进更深即可折。只向下看少量行。
 pub(super) fn v_foldable(ed: &Editor, line: usize, unit: usize) -> bool {
-    let Some(head) = v_lead(ed, line, unit) else { return false };
+    let Some(head) = v_lead(ed, line, unit) else {
+        return false;
+    };
     let total = ed.vlines.len();
     let mut l = line + 1;
     while l < total && l <= line + 50 {
@@ -128,7 +130,9 @@ pub(super) fn v_toggle_fold(ed: &mut Editor, line: usize, unit: usize) {
         ed.fold_ver = ed.fold_ver.wrapping_add(1);
         return;
     }
-    let Some((h, e)) = v_fold_region(ed, line, unit) else { return };
+    let Some((h, e)) = v_fold_region(ed, line, unit) else {
+        return;
+    };
     // 移除与新区域重叠的旧折叠（含嵌套），保持互不重叠
     ed.folds.retain(|&(h2, e2)| e2 < h || h2 > e);
     let at = ed.folds.partition_point(|&(h2, _)| h2 < h);

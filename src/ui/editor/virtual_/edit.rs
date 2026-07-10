@@ -1,12 +1,12 @@
 //! 编辑核心：插入/删除/撤销、光标移动与多选、词补全。
 
-use crate::ui::highlight::{self, Indent};
 use super::super::{EditOp, Editor};
 use super::fold::v_remap_folds;
 use super::geom::{
     char_to_byte, next_char_boundary, prev_char_boundary, v_line_of, v_line_range, v_sel_range,
 };
 use super::wrap::{v_byte_of_vpos, v_recompute, v_total_vrows, v_vpos_of_byte};
+use crate::ui::highlight::{self, Indent};
 
 // ——— 缓冲词补全 ———
 /// 重建词表（内容版本变化时）：提取长度 3..=48、以字母/下划线开头的标识符，去重排序。
@@ -21,8 +21,13 @@ pub(super) fn v_build_words(ed: &mut Editor) {
     }
     let words: Vec<String> = {
         let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for w in ed.content.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-            if (3..=48).contains(&w.len()) && (w.as_bytes()[0].is_ascii_alphabetic() || w.starts_with('_')) {
+        for w in ed
+            .content
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        {
+            if (3..=48).contains(&w.len())
+                && (w.as_bytes()[0].is_ascii_alphabetic() || w.starts_with('_'))
+            {
                 set.insert(w);
             }
         }
@@ -46,7 +51,8 @@ pub(super) fn v_word_prefix(ed: &Editor) -> Option<(usize, String)> {
         }
     }
     let prefix = &ed.content[start..b];
-    (prefix.len() >= 2 && (bytes[start].is_ascii_alphabetic() || prefix.starts_with('_'))).then(|| (prefix.len(), prefix.to_string()))
+    (prefix.len() >= 2 && (bytes[start].is_ascii_alphabetic() || prefix.starts_with('_')))
+        .then(|| (prefix.len(), prefix.to_string()))
 }
 /// 按光标前缀打开/刷新补全弹窗；无候选则关闭。
 /// 候选 = 缓冲区单词（优先）+ 该语言关键字/常见内置名（补足），去重、至多 8 条。
@@ -56,7 +62,13 @@ pub(super) fn v_complete_refresh(ed: &mut Editor) {
         return;
     };
     v_build_words(ed);
-    let mut items: Vec<String> = ed.words.iter().filter(|w| w.starts_with(&prefix) && w.as_str() != prefix).take(8).cloned().collect();
+    let mut items: Vec<String> = ed
+        .words
+        .iter()
+        .filter(|w| w.starts_with(&prefix) && w.as_str() != prefix)
+        .take(8)
+        .cloned()
+        .collect();
     if items.len() < 8 {
         for w in highlight::completion_words(&ed.language) {
             if w.starts_with(prefix.as_str()) && w != prefix && !items.iter().any(|x| x == w) {
@@ -67,7 +79,11 @@ pub(super) fn v_complete_refresh(ed: &mut Editor) {
             }
         }
     }
-    ed.complete = if items.is_empty() { None } else { Some((items, 0, plen)) };
+    ed.complete = if items.is_empty() {
+        None
+    } else {
+        Some((items, 0, plen))
+    };
 }
 /// 接受补全候选：把候选词剩余部分插入光标处。
 pub(super) fn v_complete_accept(ed: &mut Editor, idx: usize) {
@@ -94,7 +110,10 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
     let mergeable = removed.is_empty() && !inserted.is_empty() && !inserted.contains('\n');
     if mergeable {
         if let Some(last) = ed.vundo.last_mut() {
-            if last.removed.is_empty() && !last.inserted.ends_with('\n') && last.at + last.inserted.len() == at {
+            if last.removed.is_empty()
+                && !last.inserted.ends_with('\n')
+                && last.at + last.inserted.len() == at
+            {
                 last.inserted.push_str(inserted);
                 last.caret_after = ed.vcaret;
                 ed.vredo.clear();
@@ -103,7 +122,13 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
             }
         }
     }
-    ed.vundo.push(EditOp { at, removed, inserted: inserted.to_string(), caret_before, caret_after: ed.vcaret });
+    ed.vundo.push(EditOp {
+        at,
+        removed,
+        inserted: inserted.to_string(),
+        caret_before,
+        caret_after: ed.vcaret,
+    });
     if ed.vundo.len() > 5000 {
         ed.vundo.remove(0);
     }
@@ -121,7 +146,11 @@ pub(super) fn v_delete_selection(ed: &mut Editor) -> bool {
     }
 }
 pub(super) fn v_insert(ed: &mut Editor, t: &str) {
-    let (at, rl) = if let Some((a, b)) = v_sel_range(ed) { (a, b - a) } else { (ed.vcaret, 0) };
+    let (at, rl) = if let Some((a, b)) = v_sel_range(ed) {
+        (a, b - a)
+    } else {
+        (ed.vcaret, 0)
+    };
     v_apply(ed, at, rl, t);
     ed.vgoal_col = None;
 }
@@ -130,10 +159,16 @@ pub(super) fn v_newline_indent(ed: &mut Editor) {
     let at = v_sel_range(ed).map(|(a, _)| a).unwrap_or(ed.vcaret);
     let ls = v_line_range(ed, v_line_of(ed, at)).0;
     let before = &ed.content[ls..at.max(ls)];
-    let lead: String = before.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+    let lead: String = before
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
     let mut t = String::from("\n");
     t.push_str(&lead);
-    if matches!(before.trim_end().chars().last(), Some(':' | '{' | '(' | '[')) {
+    if matches!(
+        before.trim_end().chars().last(),
+        Some(':' | '{' | '(' | '[')
+    ) {
         t.push_str(&ed.indent.unit());
     }
     v_insert(ed, &t);
@@ -144,7 +179,14 @@ pub(super) fn v_block_indent(ed: &mut Editor, add: bool) {
     let (a, b) = v_sel_range(ed).unwrap_or((ed.vcaret, ed.vcaret));
     let la = v_line_of(ed, a);
     // 选区末端恰在行首时不包含该行（主流编辑器惯例）
-    let lb = v_line_of(ed, if b > a && ed.vlines.get(v_line_of(ed, b)).copied() == Some(b) { b - 1 } else { b });
+    let lb = v_line_of(
+        ed,
+        if b > a && ed.vlines.get(v_line_of(ed, b)).copied() == Some(b) {
+            b - 1
+        } else {
+            b
+        },
+    );
     let start = v_line_range(ed, la).0;
     let end = v_line_range(ed, lb).1;
     let unit = ed.indent.unit();
@@ -240,7 +282,11 @@ pub(super) fn v_move_h(ed: &mut Editor, fwd: bool, shift: bool) {
     } else if ed.vsel.is_none() {
         ed.vsel = Some(ed.vcaret);
     }
-    ed.vcaret = if fwd { next_char_boundary(&ed.content, ed.vcaret) } else { prev_char_boundary(&ed.content, ed.vcaret) };
+    ed.vcaret = if fwd {
+        next_char_boundary(&ed.content, ed.vcaret)
+    } else {
+        prev_char_boundary(&ed.content, ed.vcaret)
+    };
 }
 pub(super) fn v_move_v(ed: &mut Editor, delta: isize, shift: bool) {
     if shift && ed.vsel.is_none() {
@@ -262,7 +308,9 @@ pub(super) fn v_move_v(ed: &mut Editor, delta: isize, shift: bool) {
     }
     let line = v_line_of(ed, ed.vcaret);
     let (ls, _) = v_line_range(ed, line);
-    let col = ed.vgoal_col.unwrap_or_else(|| ed.content[ls..ed.vcaret].chars().count());
+    let col = ed
+        .vgoal_col
+        .unwrap_or_else(|| ed.content[ls..ed.vcaret].chars().count());
     ed.vgoal_col = Some(col);
     let target = (line as isize + delta).clamp(0, ed.vlines.len() as isize - 1) as usize;
     let (ts, te) = v_line_range(ed, target);
@@ -361,7 +409,11 @@ pub(super) fn v_multi_add_next(ed: &mut Editor) {
     let n = needle.len();
     let mut pos = le;
     for _ in 0..(ed.msel.len() + 2) {
-        let p = match ed.content[pos.min(ed.content.len())..].find(&needle).map(|o| pos + o).or_else(|| ed.content.find(&needle)) {
+        let p = match ed.content[pos.min(ed.content.len())..]
+            .find(&needle)
+            .map(|o| pos + o)
+            .or_else(|| ed.content.find(&needle))
+        {
             Some(p) => p,
             None => return,
         };
@@ -424,12 +476,32 @@ pub(super) fn v_multi_replace(ed: &mut Editor, text: &str) {
     ed.vgoal_col = None;
 }
 pub(super) fn v_multi_backspace(ed: &mut Editor) {
-    let del: Vec<(usize, usize)> = ed.msel.iter().map(|&(s, e)| if e > s { (s, e) } else { (prev_char_boundary(&ed.content, s), s) }).collect();
+    let del: Vec<(usize, usize)> = ed
+        .msel
+        .iter()
+        .map(|&(s, e)| {
+            if e > s {
+                (s, e)
+            } else {
+                (prev_char_boundary(&ed.content, s), s)
+            }
+        })
+        .collect();
     ed.msel = del;
     v_multi_replace(ed, "");
 }
 pub(super) fn v_multi_delete(ed: &mut Editor) {
-    let del: Vec<(usize, usize)> = ed.msel.iter().map(|&(s, e)| if e > s { (s, e) } else { (s, next_char_boundary(&ed.content, s)) }).collect();
+    let del: Vec<(usize, usize)> = ed
+        .msel
+        .iter()
+        .map(|&(s, e)| {
+            if e > s {
+                (s, e)
+            } else {
+                (s, next_char_boundary(&ed.content, s))
+            }
+        })
+        .collect();
     ed.msel = del;
     v_multi_replace(ed, "");
 }
@@ -460,7 +532,12 @@ pub(super) fn v_multi_move(ed: &mut Editor, fwd: bool) {
     ed.vgoal_col = None;
 }
 pub(super) fn v_multi_copy(ed: &Editor) -> String {
-    let parts: Vec<String> = ed.msel.iter().filter(|&&(s, e)| e > s).map(|&(s, e)| ed.content[s..e].to_string()).collect();
+    let parts: Vec<String> = ed
+        .msel
+        .iter()
+        .filter(|&&(s, e)| e > s)
+        .map(|&(s, e)| ed.content[s..e].to_string())
+        .collect();
     parts.join("\n")
 }
 pub(super) fn v_move_word(ed: &mut Editor, fwd: bool, shift: bool) {
@@ -477,7 +554,11 @@ pub(super) fn v_delete_word(ed: &mut Editor, fwd: bool) {
         return;
     }
     let to = v_word_boundary(&ed.content, ed.vcaret, fwd);
-    let (a, b) = if fwd { (ed.vcaret, to) } else { (to, ed.vcaret) };
+    let (a, b) = if fwd {
+        (ed.vcaret, to)
+    } else {
+        (to, ed.vcaret)
+    };
     if b > a {
         v_apply(ed, a, b - a, "");
     }

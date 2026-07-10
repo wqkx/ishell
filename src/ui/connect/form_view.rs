@@ -8,11 +8,7 @@ use super::form_widgets::{key_file_row, note_row, password_row, text_row, text_r
 use super::{AuthKind, ConnectForm, Mode};
 
 impl ConnectForm {
-    pub(super) fn form_view(
-        &mut self,
-        ui: &mut egui::Ui,
-        result: &mut Option<ConnectConfig>,
-    ) {
+    pub(super) fn form_view(&mut self, ui: &mut egui::Ui, result: &mut Option<ConnectConfig>) {
         ui.set_min_width(340.0);
         let w = 250.0;
         egui::Grid::new("conn_form")

@@ -12,7 +12,11 @@ pub(super) fn line_vrows(chars: usize, cols: usize) -> u32 {
 /// 同步换行行数前缀和缓存（列宽/内容/折叠变化时重算）。折叠区域内的行占 0 视觉行。
 pub(super) fn v_wrap_sync(ed: &mut Editor, cols: usize) {
     let cols = cols.max(1);
-    if ed.vrow_cols == cols && ed.vrow_ver == ed.vver && ed.vrow_fver == ed.fold_ver && ed.vrow_pre.len() == ed.vlines.len() + 1 {
+    if ed.vrow_cols == cols
+        && ed.vrow_ver == ed.vver
+        && ed.vrow_fver == ed.fold_ver
+        && ed.vrow_pre.len() == ed.vlines.len() + 1
+    {
         return;
     }
     let n = ed.vlines.len();
@@ -40,7 +44,11 @@ pub(super) fn v_total_vrows(ed: &Editor) -> usize {
 /// 视觉行号 → (逻辑行, 段内序号)。
 pub(super) fn v_line_of_vrow(ed: &Editor, vrow: usize) -> (usize, usize) {
     let v = vrow as u32;
-    let line = ed.vrow_pre.partition_point(|&p| p <= v).saturating_sub(1).min(ed.vlines.len().saturating_sub(1));
+    let line = ed
+        .vrow_pre
+        .partition_point(|&p| p <= v)
+        .saturating_sub(1)
+        .min(ed.vlines.len().saturating_sub(1));
     let seg = vrow - ed.vrow_pre.get(line).copied().unwrap_or(0) as usize;
     (line, seg)
 }
@@ -70,7 +78,9 @@ pub fn v_recompute(ed: &mut Editor) {
         .vlines
         .windows(2)
         .map(|w| w[1] - w[0])
-        .chain(std::iter::once(ed.content.len() - ed.vlines.last().copied().unwrap_or(0)))
+        .chain(std::iter::once(
+            ed.content.len() - ed.vlines.last().copied().unwrap_or(0),
+        ))
         .max()
         .unwrap_or(0);
 }

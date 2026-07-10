@@ -3,7 +3,11 @@
 pub(super) fn open_url(url: &str) {
     // 终端输出内容不可信：先做 scheme 白名单（避免 file:// 打开本地任意文件、
     // 或恶意注册协议触发任意处理器）；裸 www. 补 https。
-    let normalized = if url.to_ascii_lowercase().starts_with("www.") { format!("https://{url}") } else { url.to_string() };
+    let normalized = if url.to_ascii_lowercase().starts_with("www.") {
+        format!("https://{url}")
+    } else {
+        url.to_string()
+    };
     let lower = normalized.to_ascii_lowercase();
     const ALLOWED: [&str; 4] = ["http://", "https://", "ftp://", "ftps://"];
     if !ALLOWED.iter().any(|p| lower.starts_with(p)) {
@@ -18,7 +22,9 @@ pub(super) fn open_url(url: &str) {
     // Windows：不经 cmd（`cmd /C start` 会解释 URL 中的 & ^ 等元字符，恶意 URL 可
     // 触发本地命令）；rundll32 的 FileProtocolHandler 以单参数接收 URL，无 shell 解释。
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
 }
 
 /// 解析 OSC 7（`ESC ] 7 ; file://host/path BEL|ST`），返回最后一个上报的本地路径。
@@ -27,7 +33,9 @@ pub(super) fn parse_osc7(data: &[u8]) -> Option<String> {
     let mut result = None;
     let mut i = 0;
     while i + pat.len() <= data.len() {
-        let Some(rel) = data[i..].windows(pat.len()).position(|w| w == pat) else { break };
+        let Some(rel) = data[i..].windows(pat.len()).position(|w| w == pat) else {
+            break;
+        };
         let start = i + rel + pat.len();
         let mut end = start;
         while end < data.len() {

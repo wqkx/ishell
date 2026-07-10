@@ -159,7 +159,10 @@ impl App {
         }
 
         // 点击窗口外部自动隐藏（打开当帧除外）
-        let clicked_outside = win.as_ref().map(|r| r.response.clicked_elsewhere()).unwrap_or(false);
+        let clicked_outside = win
+            .as_ref()
+            .map(|r| r.response.clicked_elsewhere())
+            .unwrap_or(false);
         if close_win || (clicked_outside && !self.fwd.just_opened) {
             self.fwd.show = false;
             self.fwd.confirm_del = None; // 关窗时复位确认态，避免下次打开仍处于「确认删除」
@@ -183,13 +186,20 @@ impl App {
         }
         // 进入编辑：把选中转发的参数回填表单
         if let Some(id) = edit_id {
-            if let Some(fwd) = self.sessions.get(idx).and_then(|s| s.forwards.iter().find(|f| f.id == id)) {
+            if let Some(fwd) = self
+                .sessions
+                .get(idx)
+                .and_then(|s| s.forwards.iter().find(|f| f.id == id))
+            {
                 let (bh, bp, kind) = (fwd.bind_host.clone(), fwd.bind_port, fwd.kind.clone());
                 let form = &mut self.fwd.form;
                 form.bind = bh;
                 form.local_port = bp.to_string();
                 match kind {
-                    ForwardKind::Local { remote_host, remote_port } => {
+                    ForwardKind::Local {
+                        remote_host,
+                        remote_port,
+                    } => {
                         form.kind = 0;
                         form.target_host = remote_host;
                         form.target_port = remote_port.to_string();
@@ -210,18 +220,26 @@ impl App {
             let editing = self.fwd.editing;
             // 与现有转发重复（排除正在编辑的那条），或本机端口已被占用
             let dup = self.sessions.get(idx).is_some_and(|s| {
-                s.forwards
-                    .iter()
-                    .any(|f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host && Some(f.id) != editing)
+                s.forwards.iter().any(|f| {
+                    f.bind_port == spec.bind_port
+                        && f.bind_host == spec.bind_host
+                        && Some(f.id) != editing
+                })
             });
             // 编辑且端口与原值相同时跳过 OS 探测：那个端口正被「被编辑的转发」自身监听着，会误报占用
             let same_as_editing = editing
-                .and_then(|id| self.sessions.get(idx).and_then(|s| s.forwards.iter().find(|f| f.id == id)))
+                .and_then(|id| {
+                    self.sessions
+                        .get(idx)
+                        .and_then(|s| s.forwards.iter().find(|f| f.id == id))
+                })
                 .is_some_and(|f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host);
             if dup || (!same_as_editing && local_port_in_use(&spec.bind_host, spec.bind_port)) {
                 self.fwd.error = Some(match crate::i18n::current() {
                     crate::i18n::Lang::Zh => format!("本地端口 {} 已被占用", spec.bind_port),
-                    crate::i18n::Lang::En => format!("Local port {} is already in use", spec.bind_port),
+                    crate::i18n::Lang::En => {
+                        format!("Local port {} is already in use", spec.bind_port)
+                    }
                 });
                 self.fwd.just_opened = true;
             } else if !is_loopback_bind(&spec.bind_host) {
@@ -236,9 +254,12 @@ impl App {
         if self.fwd.pending_open_bind.is_some() {
             let mut accept = false;
             let mut reject = false;
-            let bind_desc = self.fwd.pending_open_bind.as_ref().map(|s| {
-                format!("{}:{}", s.bind_host, s.bind_port)
-            }).unwrap_or_default();
+            let bind_desc = self
+                .fwd
+                .pending_open_bind
+                .as_ref()
+                .map(|s| format!("{}:{}", s.bind_host, s.bind_port))
+                .unwrap_or_default();
             egui::Modal::new(egui::Id::new("fwd_open_bind")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 ui.label(RichText::new(crate::i18n::tr("确认对外开放转发？", "Expose forward on the network?")).size(16.0).strong().color(Palette::DANGER));
@@ -278,7 +299,12 @@ impl App {
     }
 
     /// 真正添加/更新一条端口转发（编辑则先删旧再加新），并复位表单。
-    fn commit_forward(&mut self, idx: usize, mut spec: crate::proto::ForwardSpec, editing: Option<u64>) {
+    fn commit_forward(
+        &mut self,
+        idx: usize,
+        mut spec: crate::proto::ForwardSpec,
+        editing: Option<u64>,
+    ) {
         use crate::proto::ForwardKind;
         if let Some(old) = editing {
             if let Some(s) = self.sessions.get_mut(idx) {
@@ -291,8 +317,14 @@ impl App {
             s.next_forward += 1;
             spec.id = id;
             let label = match &spec.kind {
-                ForwardKind::Local { remote_host, remote_port } => {
-                    format!("{}:{} → {}:{}", spec.bind_host, spec.bind_port, remote_host, remote_port)
+                ForwardKind::Local {
+                    remote_host,
+                    remote_port,
+                } => {
+                    format!(
+                        "{}:{} → {}:{}",
+                        spec.bind_host, spec.bind_port, remote_host, remote_port
+                    )
                 }
                 ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
             };

@@ -45,7 +45,11 @@ pub(super) fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::R
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
-    let uniq = format!("ishell-tmp.{}.{}", std::process::id(), CTR.fetch_add(1, Ordering::Relaxed));
+    let uniq = format!(
+        "ishell-tmp.{}.{}",
+        std::process::id(),
+        CTR.fetch_add(1, Ordering::Relaxed)
+    );
     let tmp = path.with_extension(uniq);
     {
         let mut f = std::fs::File::create(&tmp)?;

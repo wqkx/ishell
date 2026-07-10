@@ -34,18 +34,26 @@ pub(crate) struct ClientHandler {
 fn known_hosts_file() -> anyhow::Result<std::path::PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| anyhow::anyhow!("{}", crate::i18n::tr("找不到用户主目录", "Home directory not found")))?;
-    Ok(std::path::PathBuf::from(home).join(".ssh").join("known_hosts"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                crate::i18n::tr("找不到用户主目录", "Home directory not found")
+            )
+        })?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".ssh")
+        .join("known_hosts"))
 }
 
 /// 主机密钥变更后用户确认接受：删除 known_hosts 中该主机的旧行，再写入新键。
 fn replace_known_host(host: &str, port: u16, new_key: &ssh_key::PublicKey) -> anyhow::Result<()> {
     // 收集匹配该主机的行号（russh 的匹配能处理哈希主机名）
-    let remove: std::collections::HashSet<usize> = russh::keys::known_hosts::known_host_keys(host, port)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(line, _)| line)
-        .collect();
+    let remove: std::collections::HashSet<usize> =
+        russh::keys::known_hosts::known_host_keys(host, port)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
     let path = known_hosts_file()?;
     if let Ok(content) = std::fs::read_to_string(&path) {
         // known_host_keys 的行号从 1 计；过滤掉这些行后回写
@@ -78,10 +86,13 @@ impl ClientHandler {
             Ok(Some(true)) => true,
             Ok(Some(false)) | Ok(None) => false,
             Err(_) => {
-                self.sink.send(WorkerEvent::Status(match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => "主机密钥确认超时，已拒绝连接".into(),
-                    crate::i18n::Lang::En => "Host key confirmation timed out; connection rejected".into(),
-                }));
+                self.sink
+                    .send(WorkerEvent::Status(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => "主机密钥确认超时，已拒绝连接".into(),
+                        crate::i18n::Lang::En => {
+                            "Host key confirmation timed out; connection rejected".into()
+                        }
+                    }));
                 false
             }
         }
@@ -121,7 +132,11 @@ impl Handler for ClientHandler {
             // 未知主机 -> 请 UI 确认（TOFU），同意则写入 known_hosts
             Ok(false) => {
                 if self.ask_trust(fp, false).await {
-                    let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
+                    let _ = russh::keys::known_hosts::learn_known_hosts(
+                        &self.host,
+                        self.port,
+                        server_public_key,
+                    );
                     Ok(true)
                 } else {
                     Ok(false)
@@ -131,7 +146,13 @@ impl Handler for ClientHandler {
             Err(_) => {
                 if self.ask_trust(fp, true).await {
                     if let Err(e) = replace_known_host(&self.host, self.port, server_public_key) {
-                        self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("更新 known_hosts 失败：{e}"), crate::i18n::Lang::En => format!("Failed to update known_hosts: {e}") }));
+                        self.sink
+                            .send(WorkerEvent::Error(match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!("更新 known_hosts 失败：{e}"),
+                                crate::i18n::Lang::En => {
+                                    format!("Failed to update known_hosts: {e}")
+                                }
+                            }));
                         return Ok(false);
                     }
                     Ok(true)
@@ -170,13 +191,19 @@ impl Handler for JumpHandler {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        let fp = server_public_key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        let fp = server_public_key
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
         match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
             Ok(true) => Ok(true),
             // 跳板机首次连接也需 TOFU 用户确认（不再自动信任，防中间人冒充堡垒机）
             Ok(false) => {
                 if self.ask_trust(fp, false).await {
-                    let _ = russh::keys::known_hosts::learn_known_hosts(&self.host, self.port, server_public_key);
+                    let _ = russh::keys::known_hosts::learn_known_hosts(
+                        &self.host,
+                        self.port,
+                        server_public_key,
+                    );
                     Ok(true)
                 } else {
                     Ok(false)
@@ -185,7 +212,13 @@ impl Handler for JumpHandler {
             Err(_) => {
                 if self.ask_trust(fp, true).await {
                     if let Err(e) = replace_known_host(&self.host, self.port, server_public_key) {
-                        self.sink.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("更新 known_hosts 失败：{e}"), crate::i18n::Lang::En => format!("Failed to update known_hosts: {e}") }));
+                        self.sink
+                            .send(WorkerEvent::Error(match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!("更新 known_hosts 失败：{e}"),
+                                crate::i18n::Lang::En => {
+                                    format!("Failed to update known_hosts: {e}")
+                                }
+                            }));
                         return Ok(false);
                     }
                     Ok(true)
@@ -218,7 +251,10 @@ where
             handle
                 .authenticate_publickey(
                     username,
-                    russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), Some(russh::keys::HashAlg::Sha512)),
+                    russh::keys::PrivateKeyWithHashAlg::new(
+                        Arc::new(key),
+                        Some(russh::keys::HashAlg::Sha512),
+                    ),
                 )
                 .await?
                 .success()
@@ -254,10 +290,18 @@ where
 
     let ids = agent.request_identities().await?;
     if ids.is_empty() {
-        anyhow::bail!("{}", crate::i18n::tr("ssh-agent 中没有可用私钥（先 ssh-add）", "No keys in ssh-agent (run ssh-add)"));
+        anyhow::bail!(
+            "{}",
+            crate::i18n::tr(
+                "ssh-agent 中没有可用私钥（先 ssh-add）",
+                "No keys in ssh-agent (run ssh-add)"
+            )
+        );
     }
     for id in ids {
-        let AgentIdentity::PublicKey { key, .. } = id else { continue };
+        let AgentIdentity::PublicKey { key, .. } = id else {
+            continue;
+        };
         // RSA 须用 rsa-sha2-512；其它算法 hash_alg 用 None
         let hash_alg = if matches!(key.algorithm(), russh::keys::ssh_key::Algorithm::Rsa { .. }) {
             Some(russh::keys::HashAlg::Sha512)
@@ -280,7 +324,12 @@ async fn bridge_local_agent(channel: Channel<client::Msg>) -> anyhow::Result<()>
     let mut remote = channel.into_stream();
     #[cfg(unix)]
     {
-        let sock = std::env::var("SSH_AUTH_SOCK").map_err(|_| anyhow::anyhow!("{}", crate::i18n::tr("SSH_AUTH_SOCK 未设置", "SSH_AUTH_SOCK not set")))?;
+        let sock = std::env::var("SSH_AUTH_SOCK").map_err(|_| {
+            anyhow::anyhow!(
+                "{}",
+                crate::i18n::tr("SSH_AUTH_SOCK 未设置", "SSH_AUTH_SOCK not set")
+            )
+        })?;
         let mut local = tokio::net::UnixStream::connect(sock).await?;
         tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
     }
@@ -313,10 +362,16 @@ where
         match resp {
             Resp::Success => return Ok(true),
             Resp::Failure { .. } => return Ok(false),
-            Resp::InfoRequest { name, instructions, prompts } => {
+            Resp::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
                 // 空提示组（部分服务器仅发指示信息）：直接回空响应推进
                 if prompts.is_empty() {
-                    resp = handle.authenticate_keyboard_interactive_respond(Vec::new()).await?;
+                    resp = handle
+                        .authenticate_keyboard_interactive_respond(Vec::new())
+                        .await?;
                     continue;
                 }
                 sink.send(WorkerEvent::KbdPrompt {
@@ -332,7 +387,9 @@ where
                         _ => {}
                     }
                 };
-                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+                resp = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await?;
             }
         }
     }
@@ -365,14 +422,29 @@ pub(super) async fn connect(
 
     let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {
         // 1) 先连跳板机并认证
-        sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("正在连接跳板机 {}:{} …", jump.host, jump.port), crate::i18n::Lang::En => format!("Connecting jump {}:{} …", jump.host, jump.port) }));
-        let jhandler = JumpHandler { host: jump.host.clone(), port: jump.port, sink: sink.clone(), decision_rx: decision_rx.clone() };
-        let mut jhandle = client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?;
+        sink.send(WorkerEvent::Status(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("正在连接跳板机 {}:{} …", jump.host, jump.port),
+            crate::i18n::Lang::En => format!("Connecting jump {}:{} …", jump.host, jump.port),
+        }));
+        let jhandler = JumpHandler {
+            host: jump.host.clone(),
+            port: jump.port,
+            sink: sink.clone(),
+            decision_rx: decision_rx.clone(),
+        };
+        let mut jhandle =
+            client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?;
         if !authenticate(&mut jhandle, &jump.username, &jump.auth, sink, cmd_rx).await? {
-            anyhow::bail!("{}", crate::i18n::tr("跳板机认证被拒绝", "Jump host auth rejected"));
+            anyhow::bail!(
+                "{}",
+                crate::i18n::tr("跳板机认证被拒绝", "Jump host auth rejected")
+            );
         }
         // 2) 经跳板机打开到目标主机的 direct-tcpip 通道，并在该流上完成目标 SSH 握手
-        sink.send(WorkerEvent::Status(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("经跳板机连接 {}:{} …", cfg.host, cfg.port), crate::i18n::Lang::En => format!("Via jump to {}:{} …", cfg.host, cfg.port) }));
+        sink.send(WorkerEvent::Status(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("经跳板机连接 {}:{} …", cfg.host, cfg.port),
+            crate::i18n::Lang::En => format!("Via jump to {}:{} …", cfg.host, cfg.port),
+        }));
         let ch = jhandle
             .channel_open_direct_tcpip(cfg.host.clone(), cfg.port as u32, "127.0.0.1", 0)
             .await?;
@@ -383,15 +455,26 @@ pub(super) async fn connect(
         (handle, None)
     };
 
-    sink.send(WorkerEvent::Status(crate::i18n::tr("正在认证 …", "Authenticating …").into()));
+    sink.send(WorkerEvent::Status(
+        crate::i18n::tr("正在认证 …", "Authenticating …").into(),
+    ));
     if !authenticate(&mut handle, &cfg.username, &cfg.auth, sink, cmd_rx).await? {
-        anyhow::bail!("{}", crate::i18n::tr("认证被拒绝（用户名/密码或密钥错误）", "Authentication rejected (bad credentials)"));
+        anyhow::bail!(
+            "{}",
+            crate::i18n::tr(
+                "认证被拒绝（用户名/密码或密钥错误）",
+                "Authentication rejected (bad credentials)"
+            )
+        );
     }
     Ok((handle, jump_keep))
 }
 
 /// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发。
-pub(super) async fn open_shell(handle: &Handle<ClientHandler>, forward_agent: bool) -> anyhow::Result<russh::Channel<client::Msg>> {
+pub(super) async fn open_shell(
+    handle: &Handle<ClientHandler>,
+    forward_agent: bool,
+) -> anyhow::Result<russh::Channel<client::Msg>> {
     // request_pty/request_shell 均为 &self，channel 之后按值返回，无需 mut
     let channel = handle.channel_open_session().await?;
     // 在该会话通道上请求 agent 转发；服务器随后回连的 auth-agent 通道由
@@ -428,7 +511,10 @@ pub(super) async fn open_sftp(
 }
 
 /// 打开一次性 exec 通道执行命令并收集 stdout。
-pub(super) async fn exec_capture(handle: &Handle<ClientHandler>, cmd: &str) -> anyhow::Result<String> {
+pub(super) async fn exec_capture(
+    handle: &Handle<ClientHandler>,
+    cmd: &str,
+) -> anyhow::Result<String> {
     // wait(&mut self) 需要可变借用
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
@@ -446,7 +532,10 @@ pub(super) async fn exec_capture(handle: &Handle<ClientHandler>, cmd: &str) -> a
 
 /// 执行命令并捕获二进制 stdout：返回 (退出码, stdout 字节, stderr 文本)。
 /// 与 exec_capture 的区别：stdout 不做 UTF-8 转换（PDF 页 PNG 等二进制输出用）。
-pub(super) async fn exec_capture_bytes(handle: &Handle<ClientHandler>, cmd: &str) -> anyhow::Result<(i32, Vec<u8>, String)> {
+pub(super) async fn exec_capture_bytes(
+    handle: &Handle<ClientHandler>,
+    cmd: &str,
+) -> anyhow::Result<(i32, Vec<u8>, String)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
     let mut out = Vec::new();
@@ -465,7 +554,10 @@ pub(super) async fn exec_capture_bytes(handle: &Handle<ClientHandler>, cmd: &str
 }
 
 /// 执行命令，返回 (退出码, stderr)。
-pub(super) async fn exec_status(handle: &Handle<ClientHandler>, cmd: &str) -> anyhow::Result<(i32, String)> {
+pub(super) async fn exec_status(
+    handle: &Handle<ClientHandler>,
+    cmd: &str,
+) -> anyhow::Result<(i32, String)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
     let mut code = -1i32;
