@@ -133,7 +133,7 @@ pub(crate) fn about_window(ctx: &egui::Context) {
     if !about_open() {
         return;
     }
-    let ver = env!("CARGO_PKG_VERSION"); // 编译期内嵌的 Cargo.toml 版本
+    let ver = crate::version::VERSION;
     let mut open = true;
     // 版本号同时放进标题，确保一定可见
     let title = match crate::i18n::current() {

@@ -15,6 +15,7 @@ mod store;
 mod terminal;
 mod theme;
 mod ui;
+mod version;
 
 /// 应用图标（任务栏/窗口/Alt-Tab）。编译期内嵌 PNG，运行时解码为 RGBA。
 fn load_icon() -> egui::IconData {
@@ -34,6 +35,11 @@ fn load_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("ishell {}", version::VERSION);
+        return Ok(());
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // 尽早加载界面语言：窗口标题等在 App::new 之前创建，需要语言已就位才能本地化（App::new 再设一次无妨）。
