@@ -423,6 +423,28 @@ pub(super) struct EditorState {
 }
 
 impl EditorState {
+    /// 移除指定标签：修正 active、可选保存光标、清理 egui TextEditState，并请求 trim。
+    pub(super) fn remove_tab_at(&mut self, ctx: &egui::Context, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+        let closed = self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+            self.active = self.tabs.len() - 1;
+        }
+        if closed.doc.is_none() && closed.load_id.is_none() {
+            crate::store::save_cursor_line(
+                &format!("{}|{}", closed.server, closed.editor.path),
+                closed.editor.caret_line(),
+            );
+        }
+        ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(closed.text_id));
+        self.trim_request = true;
+        true
+    }
+
     /// 关闭全部标签并清理各自的 TextEdit 内存状态；请求 trim。
     pub(super) fn close_all(&mut self, ctx: &egui::Context) {
         for tab in self.tabs.drain(..) {
@@ -473,6 +495,22 @@ pub(super) struct ImageView {
     pub(super) tab_drag: Option<usize>,
     pub(super) grab_dx: f32,
     pub(super) total_w: f32,
+}
+
+impl ImageView {
+    /// 移除指定图片标签并修正 active 下标。
+    pub(super) fn remove_tab_at(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+        self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+            self.active = self.tabs.len() - 1;
+        }
+        true
+    }
 }
 
 pub(super) struct ImageTab {

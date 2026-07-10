@@ -236,13 +236,10 @@ impl App {
                     }
                 }
             }
-            // 4) 失败：移除对应占位标签
+            // 4) 失败：移除对应占位标签（含 TextEditState，避免加载失败仍占内存）
             for id in load_fail {
                 if let Some(i) = ed.tabs.iter().position(|t| t.load_id == Some(id)) {
-                    ed.tabs.remove(i);
-                    if ed.active >= ed.tabs.len() {
-                        ed.active = ed.tabs.len().saturating_sub(1);
-                    }
+                    ed.remove_tab_at(ui.ctx(), i);
                 }
             }
             // 编辑器是独立 deferred 子窗口：变化后必须显式唤醒它重绘（含进度条动画）。
@@ -352,17 +349,7 @@ impl App {
                     .iter()
                     .position(|t| t.uid == uid && t.editor.path == path)
                 {
-                    let closed = ed.tabs.remove(i);
-                    if closed.doc.is_none() {
-                        crate::store::save_cursor_line(
-                            &format!("{}|{}", closed.server, closed.editor.path),
-                            closed.editor.caret_line(),
-                        );
-                    }
-                    if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
-                        ed.active = ed.tabs.len() - 1;
-                    }
-                    ed.trim_request = true;
+                    ed.remove_tab_at(ui.ctx(), i);
                 }
             }
             ui.ctx()

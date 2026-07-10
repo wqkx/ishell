@@ -411,24 +411,7 @@ impl App {
                 if ed.tabs.get(i).map(|t| t.editor.dirty()).unwrap_or(false) {
                     ed.close_tab_confirm = Some(i);
                 } else {
-                    if i < ed.tabs.len() {
-                        let closed = ed.tabs.remove(i);
-                        // 记住光标位置（下次打开恢复）
-                        if closed.doc.is_none() {
-                            crate::store::save_cursor_line(
-                                &format!("{}|{}", closed.server, closed.editor.path),
-                                closed.editor.caret_line(),
-                            );
-                        }
-                        // 清除该编辑器在 egui 内存中的 TextEdit 状态（含撤销历史的文本快照）
-                        vctx.data_mut(|d| {
-                            d.remove::<egui::text_edit::TextEditState>(closed.text_id)
-                        });
-                    }
-                    if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
-                        ed.active = ed.tabs.len() - 1;
-                    }
-                    ed.trim_request = true;
+                    ed.remove_tab_at(vctx, i);
                 }
             }
             // 脏标签关闭确认
@@ -519,22 +502,7 @@ impl App {
                         }
                     }
                     if decision == 2 {
-                        if ti < ed.tabs.len() {
-                            let closed = ed.tabs.remove(ti);
-                            if closed.doc.is_none() {
-                                crate::store::save_cursor_line(
-                                    &format!("{}|{}", closed.server, closed.editor.path),
-                                    closed.editor.caret_line(),
-                                );
-                            }
-                            vctx.data_mut(|d| {
-                                d.remove::<egui::text_edit::TextEditState>(closed.text_id)
-                            });
-                        }
-                        if ed.active >= ed.tabs.len() && !ed.tabs.is_empty() {
-                            ed.active = ed.tabs.len() - 1;
-                        }
-                        ed.trim_request = true;
+                        ed.remove_tab_at(vctx, ti);
                     }
                     ed.close_tab_confirm = None;
                 }

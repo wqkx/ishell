@@ -219,12 +219,7 @@ impl App {
                 }
             }
             if let Some(i) = close_tab {
-                if i < self.image.tabs.len() {
-                    self.image.tabs.remove(i); // 丢弃 TextureHandle 即释放 GPU 纹理
-                }
-                if self.image.active >= self.image.tabs.len() && !self.image.tabs.is_empty() {
-                    self.image.active = self.image.tabs.len() - 1;
-                }
+                self.image.remove_tab_at(i);
                 self.trim_after = Some(4);
             }
 
