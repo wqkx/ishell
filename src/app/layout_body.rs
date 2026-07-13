@@ -139,7 +139,9 @@ impl App {
                     s.files.selected.clear();
                 }
                 // 无 cwd 时点该菜单：已同意过则静默注入（吞掉命令回显）；否则弹确认框（同意后记住）
-                if s.terminal.take_inject_request() {
+                // ai_owned 会话是只读的（AI 专用），不接受这类注入——也避免和 MCP 自己的
+                // expect_echo（哨兵回显吞除）互相覆盖，打断正在进行的 run_command。
+                if s.terminal.take_inject_request() && !s.ai_owned {
                     if osc7_consent() {
                         let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
                         s.terminal.expect_echo(OSC7_SNIPPET);

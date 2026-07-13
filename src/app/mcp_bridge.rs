@@ -71,6 +71,11 @@ pub(super) struct PendingAiRun {
     /// 原始命令文本：用于把回填给 AI 的输出里，命令自身的回显行去掉（人看的终端不受影响，
     /// 只裁剪返回给 AI 的文本，省 token）。
     command: String,
+    /// 哨兵命中时若恰好没有 waiter（resp_tx 为 None——比如上一次已经因超时把响应发出去，
+    /// 下一次 poll_run 还没打进来），必须把结果缓存在这里，不能直接丢掉再清空
+    /// pending_ai_run：否则随后的 poll_run 会看到"这个会话没有任何挂起的运行"，
+    /// 返回"run_id 不存在或已结束"，而这条命令其实已经跑完了，结果却永久丢失。
+    finished_result: Option<(i32, String)>,
 }
 
 /// 开头这条命令自己的回显行不是命令产生的内容，我们知道发的是什么，原样比对裁掉。
@@ -159,10 +164,24 @@ async fn handle_conn(stream: UnixStream, tx: mpsc::UnboundedSender<McpCall>, ctx
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     let Ok(Some(line)) = lines.next_line().await else {
-        return;
+        return; // 对端没写完就断了连接，没东西可读也没法回应
     };
-    let Ok(req) = serde_json::from_str::<McpRequest>(&line) else {
-        return;
+    let req: McpRequest = match serde_json::from_str(&line) {
+        Ok(r) => r,
+        Err(e) => {
+            // JSON 解不出来时，之前是直接静默关闭连接——对端只会看到一个空响应/EOF，
+            // 完全不知道发生了什么。这里至少回一条结构化错误（id 用 0，因为请求本身
+            // 都没解出来，不知道真实 id 是什么）。
+            let resp = McpResponse {
+                id: 0,
+                result: Err(format!("请求 JSON 解析失败：{e}")),
+            };
+            if let Ok(mut json) = serde_json::to_string(&resp) {
+                json.push('\n');
+                let _ = w.write_all(json.as_bytes()).await;
+            }
+            return;
+        }
     };
     let id = req.id;
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -190,21 +209,31 @@ impl App {
             let Some(pending) = s.pending_ai_run.as_mut() else {
                 continue;
             };
-            if let Some((code, output)) = s.terminal.take_ai_done() {
-                let output = trim_command_echo_and_prompt(&output, &pending.command);
-                let resp = McpResponse {
-                    id: pending.req_id,
-                    result: Ok(McpReqResult::Run(McpRunResult {
-                        run_id: pending.run_id,
-                        finished: true,
-                        output,
-                        exit_code: Some(code),
-                    })),
-                };
-                if let Some(tx) = pending.resp_tx.take() {
-                    let _ = tx.send(resp);
+            // 哨兵命中后先存进 finished_result，不直接在这里判断有没有 waiter——
+            // 上一轮超时已经把 resp_tx 发出去了的话，这里刚好没人等，绝不能就此丢掉结果。
+            if pending.finished_result.is_none() {
+                if let Some((code, output)) = s.terminal.take_ai_done() {
+                    let output = trim_command_echo_and_prompt(&output, &pending.command);
+                    pending.finished_result = Some((code, output));
                 }
-                s.pending_ai_run = None;
+            }
+            if let Some((code, output)) = pending.finished_result.take() {
+                if let Some(tx) = pending.resp_tx.take() {
+                    let resp = McpResponse {
+                        id: pending.req_id,
+                        result: Ok(McpReqResult::Run(McpRunResult {
+                            run_id: pending.run_id,
+                            finished: true,
+                            output,
+                            exit_code: Some(code),
+                        })),
+                    };
+                    let _ = tx.send(resp);
+                    s.pending_ai_run = None;
+                } else {
+                    // 没有 waiter：把结果放回去缓存着，等下一次 poll_run 打进来再取走。
+                    pending.finished_result = Some((code, output));
+                }
             } else if Instant::now() >= pending.deadline {
                 let output = s.terminal.peek_ai_output().unwrap_or_default();
                 let output = trim_leading_echo(&output, &pending.command);
@@ -348,6 +377,7 @@ impl App {
                     resp_tx: Some(resp_tx),
                     req_id: id,
                     command,
+                    finished_result: None,
                 });
             }
             McpReqKind::PollRun {

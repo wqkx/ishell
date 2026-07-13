@@ -80,7 +80,8 @@ impl App {
         if send && !self.broadcast_input.trim().is_empty() {
             let mut bytes = self.broadcast_input.clone().into_bytes();
             bytes.push(b'\r'); // 用 CR（Enter）提交，与其它终端输入一致；\n 在多数行规程下不会执行命令
-            for s in self.sessions.iter().filter(|s| s.connected) {
+            // ai_owned 会话是只读的（AI 专用），广播不应该往里面灌用户输入
+            for s in self.sessions.iter().filter(|s| s.connected && !s.ai_owned) {
                 let _ = s.cmd_tx.send(UiCommand::TerminalInput(bytes.clone()));
             }
             self.broadcast_input.clear();

@@ -254,11 +254,14 @@ impl App {
             }
             FileAction::CdTerminal(path) => {
                 // 以 POSIX 单引号转义路径后在终端 cd，并聚焦终端
-                let quoted = format!("'{}'", path.replace('\'', "'\\''"));
-                let _ = s.cmd_tx.send(UiCommand::TerminalInput(
-                    format!("cd {quoted}\r").into_bytes(),
-                ));
-                s.terminal.request_focus();
+                // ai_owned 会话是只读的（AI 专用），这个入口不能往里面灌命令
+                if !s.ai_owned {
+                    let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+                    let _ = s.cmd_tx.send(UiCommand::TerminalInput(
+                        format!("cd {quoted}\r").into_bytes(),
+                    ));
+                    s.terminal.request_focus();
+                }
             }
             // 已在函数开头前置处理并 return，此处仅为穷尽匹配
             FileAction::ClipCopy { .. } | FileAction::ClipCut { .. } | FileAction::Paste { .. } => {

@@ -52,8 +52,10 @@ impl Session {
                     self.reconnect_tries = 0;
                     self.reconnect_at = None;
                     self.status = crate::i18n::tr("已连接", "Connected").into();
-                    // 重连后恢复工作目录（若断线前由 OSC 7 记录过）
-                    if self.restore_cwd && !self.last_cwd.is_empty() {
+                    // 重连后恢复工作目录（若断线前由 OSC 7 记录过）；ai_owned 会话从不做
+                    // OSC 7 注入（见 layout_body.rs），restore_cwd 理论上不会为 true，这里
+                    // 仍显式排除一下，避免以后有别的路径意外置位时悄悄破了只读约定。
+                    if self.restore_cwd && !self.last_cwd.is_empty() && !self.ai_owned {
                         let quoted = format!("'{}'", self.last_cwd.replace('\'', "'\\''"));
                         let _ = self.cmd_tx.send(UiCommand::TerminalInput(
                             format!("cd {quoted}\r").into_bytes(),

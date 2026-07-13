@@ -488,12 +488,15 @@ impl App {
         }
         if let Some((cmd, run)) = send_cmd {
             if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
-                let mut bytes = cmd.into_bytes();
-                if run {
-                    bytes.push(b'\r');
+                // ai_owned 会话是只读的（AI 专用），代码片段不能往里面插
+                if !s.ai_owned {
+                    let mut bytes = cmd.into_bytes();
+                    if run {
+                        bytes.push(b'\r');
+                    }
+                    let _ = s.cmd_tx.send(UiCommand::TerminalInput(bytes));
+                    s.terminal.request_focus();
                 }
-                let _ = s.cmd_tx.send(UiCommand::TerminalInput(bytes));
-                s.terminal.request_focus();
             }
         }
         // 点击窗口外部自动隐藏（打开当帧除外），或点 X 关闭

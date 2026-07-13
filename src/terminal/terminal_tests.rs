@@ -234,6 +234,35 @@ fn expect_echo_coincidental_first_char_in_real_content_not_lost() {
 }
 
 #[test]
+fn ai_capture_end_to_end_matches_real_mcp_bridge_wire_format() {
+    // 之前几条 ai_capture 测试用的前缀都带一个原始 \x1e 字节开头（`b"\x1eAI_DONE_42:"`），
+    // 但 mcp_bridge.rs 里 RunCommand 实际发的前缀早就改成纯文本 "AI_DONE_{nonce}:"
+    // （不带原始控制字节——见该文件里关于 ECHOCTL 的注释），真正的 \x1e 只由 printf
+    // 在执行后的输出里产生。这里用跟生产完全一致的格式走一遍完整流程，确保两边没有
+    // 悄悄分叉、单测测的不是实际线上跑的东西。
+    let mut t = Terminal::new();
+    let prefix = "AI_DONE_123456789:";
+    let marker = format!("printf '{prefix}%d\\x1e' $?; printf '\\r\\x1b[K'");
+    t.expect_echo(&marker);
+    t.arm_ai_capture(prefix.as_bytes().to_vec());
+    // 真实命令自己的回显 + 输出（不该被吞，也不该打断后面对标记行的匹配）
+    t.feed(b"echo hi\r\nhi\r\n");
+    // 标记行的回显（应被完整吞掉）
+    t.feed(marker.as_bytes());
+    t.feed(b"\r\n");
+    // printf 真正执行后的输出：前缀 + 退出码 + 真实 \x1e 字节（不是转义文本）
+    t.feed(format!("{prefix}0\x1e").as_bytes());
+    let (code, out) = t.take_ai_done().expect("应已命中哨兵");
+    assert_eq!(code, 0);
+    // Terminal::take_ai_done 只负责剥 ANSI，不负责裁掉命令自身的回显——那是
+    // mcp_bridge.rs::trim_command_echo_and_prompt 的职责（见该文件里的单测），这里
+    // 保留原始回显是符合预期的。
+    assert_eq!(out, "echo hi\nhi\n");
+    let visible = t.screen_text();
+    assert!(!visible.contains("printf"), "标记行不应出现在可见终端里：{visible:?}");
+}
+
+#[test]
 fn strip_ansi_removes_escapes_and_normalizes_newlines() {
     use super::vt::strip_ansi_to_text;
     let raw = b"\x1b[32mgreen\x1b[0m text\r\nline2\x1b]0;title\x07end";

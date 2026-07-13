@@ -29,7 +29,12 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 ///   3. `~/.ishell-mcp-*.sock` 里 mtime 最新的一个（iShell 反向转发到「这个代理所在的机器」
 ///      时会落在这里；每次重连都是新文件，取最新的即可自动跟上，不用手动改配置）。
 /// 都没有时回退到 (2) 的默认路径，让错误信息保持原样好懂。
-fn socket_path() -> std::path::PathBuf {
+///
+/// 第 2 步不能只看文件存不存在：iShell 异常退出或从没在这台机器跑过时，
+/// `~/.config/ishell/mcp.sock` 可能是个没人监听的残留文件——只判断 `.exists()` 会一直
+/// 挡在这里，永远走不到第 3 步的反向转发发现。直接尝试连接一次，连得上才说明真的有人
+/// 在监听（这个探测连接立刻丢弃，不影响后面 `call()` 里真正发请求的那次连接）。
+async fn socket_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
         return std::path::PathBuf::from(p);
     }
@@ -38,7 +43,7 @@ fn socket_path() -> std::path::PathBuf {
         .join(".config")
         .join("ishell")
         .join("mcp.sock");
-    if same_machine.exists() {
+    if UnixStream::connect(&same_machine).await.is_ok() {
         return same_machine;
     }
     let newest_forwarded = std::fs::read_dir(&home).ok().and_then(|entries| {
@@ -60,7 +65,7 @@ fn socket_path() -> std::path::PathBuf {
 /// 连接 iShell 主进程的本地 socket，发一条请求、等一行 JSON 响应（一次连接=一问一答）。
 async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let path = socket_path();
+    let path = socket_path().await;
     let stream = UnixStream::connect(&path).await.map_err(|_| {
         "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".to_string()
     })?;
@@ -226,8 +231,10 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "用一个已保存的连接（按名称，即 list_sessions/侧栏里显示的那个名字）新开一个终端会话/标签，\
-                        等价于用户在 iShell 侧栏里双击这条已保存连接。返回新会话的 uid，可直接用于后续 run_command。"
+        description = "用一个已保存的连接（按名称）新开一个终端会话/标签，等价于用户在 iShell 侧栏里\
+                        双击这条已保存连接。name 是已保存连接的名字，不是主机地址，也不是 \
+                        list_sessions 里的会话标题——不确定具体拼写时先调 list_saved_connections \
+                        核对。返回新会话的 uid，可直接用于后续 run_command。"
     )]
     async fn open_session(
         &self,
