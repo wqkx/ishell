@@ -68,7 +68,11 @@ impl SysSampler {
         }
         if let Some(s) = sections.get("UP") {
             // /proc/uptime: "12345.67 9876.54"
-            if let Some(secs) = s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()) {
+            if let Some(secs) = s
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+            {
                 info.uptime = fmt_uptime(secs as u64);
             }
         }
@@ -109,13 +113,24 @@ impl SysSampler {
 
     /// 解析进程段（每行 `pid (utime+stime)ticks rss_pages comm…`），按 tick 差分算**瞬时** CPU%
     /// （与 htop 一致，多核可超 100%）；内存% 由 rss 页数 × 页大小 / 总内存换算。返回按 CPU 降序的前若干个。
-    fn parse_proc_delta(&mut self, raw: &str, dt: f64, mem_total_kb: u64, clk_tck: f64, page_kb: u64) -> Vec<ProcInfo> {
+    fn parse_proc_delta(
+        &mut self,
+        raw: &str,
+        dt: f64,
+        mem_total_kb: u64,
+        clk_tck: f64,
+        page_kb: u64,
+    ) -> Vec<ProcInfo> {
         let mut cur: HashMap<u32, u64> = HashMap::new();
         let mut out = Vec::new();
         for line in raw.lines() {
             let mut it = line.split_whitespace();
-            let (Some(pid_s), Some(tick_s), Some(rss_s)) = (it.next(), it.next(), it.next()) else { continue };
-            let Ok(pid) = pid_s.parse::<u32>() else { continue };
+            let (Some(pid_s), Some(tick_s), Some(rss_s)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let Ok(pid) = pid_s.parse::<u32>() else {
+                continue;
+            };
             let ticks: u64 = tick_s.parse().unwrap_or(0);
             let rss_pages: u64 = rss_s.parse().unwrap_or(0);
             let name = it.collect::<Vec<_>>().join(" ");
@@ -133,10 +148,19 @@ impl SysSampler {
                 0.0
             };
             cur.insert(pid, ticks);
-            out.push(ProcInfo { pid, name, cpu, mem });
+            out.push(ProcInfo {
+                pid,
+                name,
+                cpu,
+                mem,
+            });
         }
         self.prev_proc = cur; // 仅保留本次见到的进程，自动淘汰已退出的 pid
-        out.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.cpu
+                .partial_cmp(&a.cpu)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(40);
         out
     }
@@ -182,7 +206,11 @@ impl SysSampler {
     }
 
     fn parse_net(&mut self, raw: &str, info: &mut SysInfo) {
-        let dt = self.prev_instant.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0).max(0.001);
+        let dt = self
+            .prev_instant
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+            .max(0.001);
         let have_prev = !self.prev_net.is_empty();
         let mut cur: HashMap<String, (u64, u64)> = HashMap::new();
         let mut rx_total = 0u64;
@@ -190,12 +218,17 @@ impl SysSampler {
         let (mut sum_rx_bps, mut sum_tx_bps) = (0.0f64, 0.0f64);
 
         for line in raw.lines() {
-            let Some((iface, rest)) = line.split_once(':') else { continue };
+            let Some((iface, rest)) = line.split_once(':') else {
+                continue;
+            };
             let iface = iface.trim();
             if iface == "lo" || iface.is_empty() {
                 continue;
             }
-            let cols: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            let cols: Vec<u64> = rest
+                .split_whitespace()
+                .filter_map(|v| v.parse().ok())
+                .collect();
             if cols.len() < 9 {
                 continue;
             }
@@ -209,10 +242,18 @@ impl SysSampler {
                 let tx_bps = tx.saturating_sub(*ptx) as f64 / dt;
                 sum_rx_bps += rx_bps;
                 sum_tx_bps += tx_bps;
-                info.nets.push(crate::proto::NetIface { name: iface.to_string(), rx_bps, tx_bps });
+                info.nets.push(crate::proto::NetIface {
+                    name: iface.to_string(),
+                    rx_bps,
+                    tx_bps,
+                });
             } else if have_prev {
                 // 新出现的网卡，本次无差分
-                info.nets.push(crate::proto::NetIface { name: iface.to_string(), rx_bps: 0.0, tx_bps: 0.0 });
+                info.nets.push(crate::proto::NetIface {
+                    name: iface.to_string(),
+                    rx_bps: 0.0,
+                    tx_bps: 0.0,
+                });
             }
         }
         info.nets.sort_by(|a, b| a.name.cmp(&b.name));
@@ -286,7 +327,9 @@ fn parse_disk(raw: &str) -> Vec<DiskInfo> {
         let avail: u64 = cols[3].parse().unwrap_or(0);
         let mount = cols[5..].join(" ");
         // 跳过伪文件系统与系统挂载点
-        let pseudo_fs = ["tmpfs", "devtmpfs", "overlay", "squashfs", "efivarfs", "ramfs"];
+        let pseudo_fs = [
+            "tmpfs", "devtmpfs", "overlay", "squashfs", "efivarfs", "ramfs",
+        ];
         let pseudo_mount = ["/sys", "/proc", "/dev", "/run", "/snap", "/boot/efi"];
         if pseudo_fs.iter().any(|p| fs.starts_with(p))
             || pseudo_mount.iter().any(|p| mount.starts_with(p))
@@ -296,8 +339,17 @@ fn parse_disk(raw: &str) -> Vec<DiskInfo> {
         }
         // 占用率与 df 的 Capacity 一致：used/(used+avail)，把 root 预留块排除在分母外
         let denom = used + avail;
-        let percent = if denom > 0 { used as f32 / denom as f32 * 100.0 } else { 0.0 };
-        out.push(DiskInfo { mount, total_kb: total, avail_kb: avail, percent });
+        let percent = if denom > 0 {
+            used as f32 / denom as f32 * 100.0
+        } else {
+            0.0
+        };
+        out.push(DiskInfo {
+            mount,
+            total_kb: total,
+            avail_kb: avail,
+            percent,
+        });
     }
     out
 }
@@ -306,8 +358,16 @@ fn parse_disk(raw: &str) -> Vec<DiskInfo> {
 /// 返回 (每秒 tick 数, 页大小 KiB)；缺失/异常回退到 (100, 4)。
 fn parse_sysconf(raw: Option<&str>) -> (f64, u64) {
     let mut it = raw.unwrap_or("").split_whitespace();
-    let clk = it.next().and_then(|v| v.parse::<f64>().ok()).filter(|&v| v > 0.0).unwrap_or(100.0);
-    let page_bytes = it.next().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(4096);
+    let clk = it
+        .next()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(100.0);
+    let page_bytes = it
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(4096);
     (clk, (page_bytes / 1024).max(1))
 }
 
@@ -323,7 +383,9 @@ fn parse_gpu(raw: &str) -> Vec<GpuInfo> {
         if cols.len() < 5 {
             continue;
         }
-        let Ok(index) = cols[0].parse::<u32>() else { continue };
+        let Ok(index) = cols[0].parse::<u32>() else {
+            continue;
+        };
         out.push(GpuInfo {
             index,
             name: cols[1].to_string(),

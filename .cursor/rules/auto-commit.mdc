@@ -1,0 +1,15 @@
+---
+description: After finishing a coherent change set, commit automatically without waiting to be asked.
+alwaysApply: true
+---
+
+# Auto-commit after completed work
+
+When a task (or a coherent batch of related changes) is **done and verified** (build/tests as appropriate):
+
+1. **Commit automatically** — do not wait for the user to say "commit".
+2. Follow the repo’s normal git safety protocol: status + diff + log in parallel, stage relevant files, HEREDOC commit message focused on why, never amend unless amend rules allow, never update git config, never skip hooks.
+3. **Do not push** unless the user explicitly asks to push (or a separate user rule requires it).
+4. Skip empty commits. Do not commit secrets (`.env`, credentials, etc.).
+5. If the working tree mixes unrelated WIP the user did not ask for, only commit files belonging to the completed task; leave the rest unstaged.
+6. After committing, briefly tell the user the commit hash/subject (and that it was not pushed, unless they asked to push).

@@ -3,11 +3,33 @@
 /// 本地端口预占用探测（添加端口转发前）：仅当明确 `AddrInUse` 才判为占用；
 /// 其它错误（如 bind 地址非本机网卡）返回 false——不武断拦截，交给 worker 实际绑定决定。
 pub(crate) fn local_port_in_use(host: &str, port: u16) -> bool {
-    let h = if host.trim().is_empty() { "127.0.0.1" } else { host };
+    let h = if host.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        host
+    };
     match std::net::TcpListener::bind((h, port)) {
         Ok(_) => false, // 立即 drop 释放，worker 随后真正绑定
         Err(e) => e.kind() == std::io::ErrorKind::AddrInUse,
     }
+}
+
+/// 绑定地址是否为回环（仅本机可连）。空串按 127.0.0.1 处理。
+pub(crate) fn is_loopback_bind(host: &str) -> bool {
+    let h = host.trim();
+    h.is_empty() || h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+/// 解毒 Mutex：持锁线程 panic 后仍可恢复状态，避免 UI 线程二次 unwrap 崩溃。
+pub(crate) fn lock_mutex<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 本机 ~/.ssh/known_hosts 是否已记录该主机（用于直传时选择 StrictHostKeyChecking）。
+pub(crate) fn host_in_known_hosts(host: &str, port: u16) -> bool {
+    russh::keys::known_hosts::known_host_keys(host, port)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 /// 取远端路径的所在目录：去尾斜杠后截到最后一个 `/`；根下或无斜杠返回 `/`。
@@ -61,10 +83,26 @@ pub(crate) fn edge_fade(painter: &egui::Painter, rect: egui::Rect, left: bool, b
     let (t, b) = (rect.top(), rect.bottom());
     let mut mesh = egui::Mesh::default();
     let uv = egui::epaint::WHITE_UV;
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, t), uv, color: c0 });
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, t), uv, color: c1 });
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, b), uv, color: c1 });
-    mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, b), uv, color: c0 });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x0, t),
+        uv,
+        color: c0,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x1, t),
+        uv,
+        color: c1,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x1, b),
+        uv,
+        color: c1,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: egui::pos2(x0, b),
+        uv,
+        color: c0,
+    });
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
 }
@@ -74,12 +112,17 @@ pub(crate) fn open_containing_folder(file: &str) {
     #[cfg(target_os = "windows")]
     {
         // explorer /select, 选中文件
-        let _ = std::process::Command::new("explorer").arg(format!("/select,{file}")).spawn();
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{file}"))
+            .spawn();
     }
     #[cfg(target_os = "macos")]
     {
         // Finder 中显示并选中
-        let _ = std::process::Command::new("open").arg("-R").arg(file).spawn();
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(file)
+            .spawn();
     }
     #[cfg(target_os = "linux")]
     {
@@ -112,7 +155,9 @@ pub(crate) fn file_uri(p: &str) -> String {
     let mut s = String::from("file://");
     for b in p.bytes() {
         match b {
-            b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => s.push(b as char),
+            b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => {
+                s.push(b as char)
+            }
             _ => s.push_str(&format!("%{b:02X}")),
         }
     }
@@ -131,4 +176,36 @@ pub(crate) fn downloads_dir() -> std::path::PathBuf {
         return d;
     }
     std::path::PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fmt_dur, is_loopback_bind, parent_dir};
+
+    #[test]
+    fn loopback_bind_detects_common_hosts() {
+        assert!(is_loopback_bind(""));
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind("::1"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("192.168.1.1"));
+    }
+
+    #[test]
+    fn parent_dir_basics() {
+        assert_eq!(parent_dir("/a/b/c"), "/a/b");
+        assert_eq!(parent_dir("/a"), "/");
+        assert_eq!(parent_dir("name"), "/");
+        assert_eq!(parent_dir("/a/b/"), "/a");
+    }
+
+    #[test]
+    fn fmt_dur_compact() {
+        assert_eq!(fmt_dur(0), "0s");
+        assert_eq!(fmt_dur(45), "45s");
+        assert_eq!(fmt_dur(80), "1m20s");
+        assert_eq!(fmt_dur(3600), "1h0m");
+        assert_eq!(fmt_dur(3723), "1h2m");
+    }
 }

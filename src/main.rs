@@ -8,12 +8,14 @@
 
 mod app;
 mod i18n;
+mod limits;
 mod proto;
 mod ssh;
 mod store;
 mod terminal;
 mod theme;
 mod ui;
+mod version;
 
 /// 应用图标（任务栏/窗口/Alt-Tab）。编译期内嵌 PNG，运行时解码为 RGBA。
 fn load_icon() -> egui::IconData {
@@ -22,13 +24,22 @@ fn load_icon() -> egui::IconData {
         Ok(img) => {
             let img = img.into_rgba8();
             let (width, height) = img.dimensions();
-            egui::IconData { rgba: img.into_raw(), width, height }
+            egui::IconData {
+                rgba: img.into_raw(),
+                width,
+                height,
+            }
         }
         Err(_) => egui::IconData::default(),
     }
 }
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("ishell {}", version::VERSION);
+        return Ok(());
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // 尽早加载界面语言：窗口标题等在 App::new 之前创建，需要语言已就位才能本地化（App::new 再设一次无妨）。
@@ -56,13 +67,19 @@ fn main() -> eframe::Result<()> {
         egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title(i18n::tr("iShell — Rust SSH 客户端", "iShell — Rust SSH Client"))
+            .with_title(i18n::tr(
+                "iShell — Rust SSH 客户端",
+                "iShell — Rust SSH Client",
+            ))
             // app_id 必须与 Linux 桌面项 ishell.desktop 的基名/StartupWMClass 完全一致，
             // GNOME 等用它匹配 .desktop 取图标（不读窗口内嵌 _NET_WM_ICON）；统一小写避免大小写匹配失败
             .with_app_id("ishell")
             .with_icon(load_icon())
     };
-    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "iShell",

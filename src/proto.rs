@@ -59,7 +59,10 @@ impl ConflictPolicy {
 pub enum AuthMethod {
     Password(String),
     /// 私钥文件路径（可选 passphrase）
-    KeyFile { path: String, passphrase: Option<String> },
+    KeyFile {
+        path: String,
+        passphrase: Option<String>,
+    },
     /// 使用本机 ssh-agent 中的私钥（SSH_AUTH_SOCK / Windows OpenSSH 命名管道）
     Agent,
     /// 键盘交互（keyboard-interactive）：按服务器提示逐项输入，支持 OTP / 二次验证
@@ -76,9 +79,19 @@ pub enum UiCommand {
     /// 请求列出远程目录（SFTP）
     ListDir(String),
     /// 下载远程文件到本地路径
-    Download { id: u64, remote: String, local: String, policy: ConflictPolicy },
+    Download {
+        id: u64,
+        remote: String,
+        local: String,
+        policy: ConflictPolicy,
+    },
     /// 上传本地文件到远程目录
-    Upload { id: u64, local: String, remote_dir: String, policy: ConflictPolicy },
+    Upload {
+        id: u64,
+        local: String,
+        remote_dir: String,
+        policy: ConflictPolicy,
+    },
     /// 取消某个传输任务（进行中或排队中）
     CancelTransfer(u64),
     /// 新建目录
@@ -92,7 +105,11 @@ pub enum UiCommand {
     /// 重命名 / 移动
     Rename { from: String, to: String },
     /// 远端批量复制 / 移动到目标目录（经 shell 执行 cp -a / mv）
-    CopyMove { srcs: Vec<String>, dest_dir: String, do_move: bool },
+    CopyMove {
+        srcs: Vec<String>,
+        dest_dir: String,
+        do_move: bool,
+    },
     /// 跨主机「直传」：在源主机上直接用 rsync/scp 把 srcs 推到目标主机 dest（数据不经本地）。
     /// 仅目标为「无口令密钥」认证时可用；key_path 为本地（本进程可直接读）的 B 私钥路径，
     /// worker 会临时上传到源主机 /tmp（0600）供 ssh 使用、用完即删。失败由上层提示转中转。
@@ -117,7 +134,14 @@ pub enum UiCommand {
     ReadDoc { id: u64, path: String },
     /// 写回文本文件内容（保存）。content 为内部 LF 文本，worker 按 eol 还原行尾、按 encoding 编码后写入。
     /// expect_mtime≠0 且与远端当前 mtime 不一致且 !force 时，判定外部已改动、拒绝写入并回报冲突。
-    WriteFile { path: String, content: String, encoding: String, eol: Eol, expect_mtime: u32, force: bool },
+    WriteFile {
+        path: String,
+        content: String,
+        encoding: String,
+        eol: Eol,
+        expect_mtime: u32,
+        force: bool,
+    },
     /// 查询进程详情（cmdline / cwd / exe）
     ProcDetail(u32),
     /// 强制结束进程（kill -9）
@@ -146,13 +170,19 @@ pub struct DirectSpec {
     pub key_path: String,
     /// 展示名（首个条目名 + 数量），用于传输行标题
     pub label: String,
+    /// true：本机 known_hosts 已有该目标 → 远端 ssh 用 StrictHostKeyChecking=yes；
+    /// false：用户已确认首次 TOFU → 用 accept-new（仅首次自动信任）。
+    pub dest_host_known: bool,
 }
 
 /// 端口转发类型。
 #[derive(Clone, Debug)]
 pub enum ForwardKind {
     /// 本地转发：本地端口 -> 远端 host:port
-    Local { remote_host: String, remote_port: u16 },
+    Local {
+        remote_host: String,
+        remote_port: u16,
+    },
     /// 动态转发：本地 SOCKS5 代理
     Dynamic,
 }
@@ -180,19 +210,43 @@ pub enum WorkerEvent {
     TerminalData(Vec<u8>),
     /// 周期性系统信息快照
     SysInfo(Box<SysInfo>),
+    /// 远端是否支持 Linux /proc 系统监控（连接后探测一次）
+    MonitorSupport(bool),
     /// 目录列表结果
-    DirListing { path: String, entries: Vec<FileEntry> },
+    DirListing {
+        path: String,
+        entries: Vec<FileEntry>,
+    },
     /// 目录列举失败。`retryable`=true 表示会话级错误（弱网/SFTP 通道重连中），UI 应保留
     /// loading 并稍后自动重试；=false 表示路径级错误（不存在/无权限），UI 标记该路径无效。
-    DirListFailed { path: String, message: String, retryable: bool },
+    DirListFailed {
+        path: String,
+        message: String,
+        retryable: bool,
+    },
     /// 未知主机请 UI 确认指纹（TOFU）；changed=true 表示主机密钥**已变更**（更危险）
-    HostKeyPrompt { host: String, fingerprint: String, changed: bool },
+    HostKeyPrompt {
+        host: String,
+        fingerprint: String,
+        changed: bool,
+    },
     /// 键盘交互认证：服务器下发一组提示，请 UI 收集回答后回 `KbdResponse`
     /// prompts 每项为 (提示文本, 是否回显)；echo=false 的项应做密码遮蔽
-    KbdPrompt { name: String, instructions: String, prompts: Vec<(String, bool)> },
+    KbdPrompt {
+        name: String,
+        instructions: String,
+        prompts: Vec<(String, bool)>,
+    },
     /// 文本文件已读取，填充对应占位编辑器标签（id 与 ReadFile 一致）。
     /// content 已按探测到的编码解码、行尾统一为 LF；encoding/eol 用于保存时还原；mtime 用于外部改动检测。
-    FileOpened { id: u64, path: String, content: String, encoding: String, eol: Eol, mtime: u32 },
+    FileOpened {
+        id: u64,
+        path: String,
+        content: String,
+        encoding: String,
+        eol: Eol,
+        mtime: u32,
+    },
     /// 保存成功（携带新的 mtime，编辑器据此更新，避免下次保存误判为外部改动）
     FileSaved { path: String, mtime: u32 },
     /// 保存写入进度（驱动编辑器标签的「珊瑚→绿」保存动画，跟随实际上传速度）
@@ -205,15 +259,41 @@ pub enum WorkerEvent {
     FileTooLarge { id: u64, path: String, size: u64 },
     /// 跟随读取返回：data 为新增原始字节（可能为空）；offset 为下次读取起点；
     /// truncated = 文件被截断/轮转（此时 offset 已重置为新大小）
-    FileTail { path: String, data: Vec<u8>, offset: u64, truncated: bool },
+    FileTail {
+        path: String,
+        data: Vec<u8>,
+        offset: u64,
+        truncated: bool,
+    },
     /// PDF 页数查询成功（失败走 FileLoadFailed）。id 与占位标签对应。
-    PdfInfo { id: u64, path: String, pages: u32 },
+    /// `path` 供 UI 校验/日志（当前按 id 关联占位标签，字段保留）。
+    PdfInfo {
+        id: u64,
+        #[allow(dead_code)]
+        path: String,
+        pages: u32,
+    },
     /// PDF 单页渲染结果（PNG 字节；空表示该页渲染失败）
-    PdfPage { path: String, page: u32, data: Vec<u8> },
+    PdfPage {
+        path: String,
+        page: u32,
+        data: Vec<u8>,
+    },
     /// PDF 查找结果：命中 (页码, 该页首个命中行片段)；message=失败原因（如缺 pdftotext）
-    PdfSearch { path: String, query: String, hits: Vec<(u32, String)>, message: Option<String> },
+    PdfSearch {
+        path: String,
+        #[allow(dead_code)]
+        query: String,
+        hits: Vec<(u32, String)>,
+        message: Option<String>,
+    },
     /// 文档原始字节已读取（docx 查看器）。id 与占位标签对应。
-    DocOpened { id: u64, path: String, data: Vec<u8> },
+    DocOpened {
+        id: u64,
+        #[allow(dead_code)]
+        path: String,
+        data: Vec<u8>,
+    },
     /// 文本文件下载进度（驱动占位标签上的珊瑚色进度条）
     FileLoadProgress { id: u64, done: u64, total: u64 },
     /// 文本文件打开失败（移除占位标签 + 提示）
@@ -221,18 +301,37 @@ pub enum WorkerEvent {
     /// 图片文件已读取（原始字节），打开看图工具
     ImageOpened { path: String, data: Vec<u8> },
     /// 一次文件操作成功完成（携带提示文本与需要刷新的目录）
-    OpDone { message: String, refresh_dir: Option<String> },
+    OpDone {
+        message: String,
+        refresh_dir: Option<String>,
+    },
     /// 传输开始（携带总字节数与方向）
-    TransferStart { id: u64, name: String, total: u64, dir: TransferDir, local: Option<String> },
+    TransferStart {
+        id: u64,
+        name: String,
+        total: u64,
+        dir: TransferDir,
+        local: Option<String>,
+    },
     /// 传输进度（已完成字节）
     TransferProgress { id: u64, done: u64 },
     /// 传输阶段提示（如「打包中…」「解包中…」「直传中…」）；空串表示清除提示。
     /// 在传输进行中（ok=None）于详情行替代字节读数显示，让长耗时的非传输阶段对用户可见。
     TransferNote { id: u64, note: String },
     /// 传输结束
-    TransferDone { id: u64, ok: bool, message: String, refresh_dir: Option<String> },
+    TransferDone {
+        id: u64,
+        ok: bool,
+        message: String,
+        refresh_dir: Option<String>,
+    },
     /// 进程详情返回
-    ProcDetail { pid: u32, cmd: String, cwd: String, exe: String },
+    ProcDetail {
+        pid: u32,
+        cmd: String,
+        cwd: String,
+        exe: String,
+    },
     /// 端口转发状态更新（监听中 / 失败原因）
     ForwardStatus { id: u64, ok: bool, message: String },
     /// 错误提示
