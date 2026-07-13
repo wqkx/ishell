@@ -168,7 +168,9 @@ impl IshellMcp {
 
     #[tool(
         description = "在指定终端会话里运行一条命令，等待其执行完成（或超时）后返回输出与退出码。\
-                        命令和输出会实时显示在用户正在看的那个终端标签里，效果等同于用户亲自输入。"
+                        命令和输出会实时显示在用户正在看的那个终端标签里，效果等同于用户亲自输入。\
+                        会话还没连上（open_session 刚返回时可能仍在连接/认证中）会直接报错，\
+                        不会挂起——遇到这个错误就用 list_sessions 确认 connected 变 true 后再试。"
     )]
     async fn run_command(
         &self,
@@ -234,7 +236,9 @@ impl IshellMcp {
         description = "用一个已保存的连接（按名称）新开一个终端会话/标签，等价于用户在 iShell 侧栏里\
                         双击这条已保存连接。name 是已保存连接的名字，不是主机地址，也不是 \
                         list_sessions 里的会话标题——不确定具体拼写时先调 list_saved_connections \
-                        核对。返回新会话的 uid，可直接用于后续 run_command。"
+                        核对。返回新会话的 uid；此时通常还没连上（connected=false，正在连接/\
+                        认证中），直接对它调 run_command 会报错——用 list_sessions 确认 \
+                        connected 变 true 后再执行命令。"
     )]
     async fn open_session(
         &self,

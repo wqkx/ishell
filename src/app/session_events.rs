@@ -109,6 +109,10 @@ impl Session {
                 WorkerEvent::Disconnected(reason) => {
                     self.connected = false;
                     self.status = reason;
+                    // 断线意味着这个会话上任何挂起的 AI 命令都注定等不到哨兵了（worker 重启
+                    // 后旧连接的输出流已经没了）——给还在等的 poll_run 一个明确的"未完成"
+                    // 响应，而不是让它一直空等到自己的超时，也避免这个会话被"忙碌"卡住。
+                    self.cancel_pending_ai_run();
                     // 进行中的传输标记为暂停，等重连后续传（不计为失败）
                     for t in &mut self.transfers {
                         if t.spec.is_some() && t.ok != Some(true) {

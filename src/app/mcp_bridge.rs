@@ -15,7 +15,30 @@ use crate::mcp_protocol::{
 use crate::proto::{AuthMethod, ConnectConfig, JumpHost, UiCommand};
 use crate::store::SavedConnection;
 
-use super::App;
+use super::{App, Session};
+
+impl Session {
+    /// 放弃当前挂起的 AI 命令运行：给还在等待的 `poll_run` 一个明确的"未完成"响应
+    /// （而不是让它继续空等到超时），并取消哨兵捕获、清空 `pending_ai_run`。
+    /// 用于打断（`interrupt`）、断线等"这条运行注定等不到哨兵了"的场景。
+    pub(super) fn cancel_pending_ai_run(&mut self) {
+        if let Some(mut pending) = self.pending_ai_run.take() {
+            if let Some(tx) = pending.resp_tx.take() {
+                let output = self.terminal.peek_ai_output().unwrap_or_default();
+                let _ = tx.send(McpResponse {
+                    id: pending.req_id,
+                    result: Ok(McpReqResult::Run(McpRunResult {
+                        run_id: pending.run_id,
+                        finished: false,
+                        output,
+                        exit_code: None,
+                    })),
+                });
+            }
+        }
+        self.terminal.cancel_ai_capture();
+    }
+}
 
 /// 把 `SavedConnection` 的 `auth_kind` 字符串 + 相应字段还原成 `AuthMethod`（跟
 /// `ui/connect/form.rs::build()` 里对同一套字段的映射保持一致）。
@@ -346,6 +369,13 @@ impl App {
                     return;
                 };
                 let s = &mut self.sessions[idx];
+                if !s.connected {
+                    // 未连上（还在连接/认证中）或已断线时，输入会被 worker 静默丢弃——
+                    // 哨兵永远等不到，会话会被 pending_ai_run 占死。直接拒绝，让 AI 明确
+                    // 知道要等连上了再试（可用 list_sessions 的 connected 字段确认）。
+                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    return;
+                }
                 if s.pending_ai_run.is_some() {
                     send_err(resp_tx, "该会话已有一条 AI 命令正在执行，请先 poll_run 或等待完成".into());
                     return;
@@ -417,23 +447,8 @@ impl App {
                 let s = &mut self.sessions[idx];
                 let _ = s.cmd_tx.send(UiCommand::TerminalInput(vec![0x03]));
                 // 打断意味着放弃这条命令的哨兵检测：被打断的程序（比如 `cat`）很可能会把
-                // 紧跟着排的标记行当成自己的输入吃掉，哨兵永远等不到。不清掉 pending_ai_run
-                // 的话，这个会话的 run_command 会被"忙碌"卡死，往后再也调不动，直到重启。
-                if let Some(mut pending) = s.pending_ai_run.take() {
-                    if let Some(tx) = pending.resp_tx.take() {
-                        let output = s.terminal.peek_ai_output().unwrap_or_default();
-                        let _ = tx.send(McpResponse {
-                            id: pending.req_id,
-                            result: Ok(McpReqResult::Run(McpRunResult {
-                                run_id: pending.run_id,
-                                finished: false,
-                                output,
-                                exit_code: None,
-                            })),
-                        });
-                    }
-                }
-                s.terminal.cancel_ai_capture();
+                // 紧跟着排的标记行当成自己的输入吃掉，哨兵永远等不到。
+                s.cancel_pending_ai_run();
                 let _ = resp_tx.send(McpResponse {
                     id,
                     result: Ok(McpReqResult::Ok),
