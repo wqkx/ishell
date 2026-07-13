@@ -211,11 +211,17 @@ impl IshellMcp {
 }
 
 #[tool_handler(
-    instructions = "驱动本机 iShell 已打开的终端会话（而不是另开一条无上下文的 ssh 连接）：\
-                    list_sessions 看有哪些会话 → 需要的目标不在列表里时用 open_session（按已保存连接的名称）\
-                    新开一个 → run_command 执行命令并等待完成 → \
-                    超时用 poll_run 续等 → read_screen 看当前屏幕（适合交互式程序）→ \
-                    interrupt 发 Ctrl+C。命令会实时显示在用户正在看的终端标签里。"
+    instructions = "涉及“在远端服务器上执行命令/查看文件/运行程序”这类需求时，优先用这个\
+                    工具集操作 iShell 已打开的终端会话，而不是自己直接跑 `ssh host cmd`——\
+                    直接开 ssh 会丢失用户已经建立的会话上下文（cwd、环境变量、shell 历史、\
+                    已登录状态），也不会显示给用户看。只有确认 iShell 没在跑、或用户明确要求\
+                    你自己开一条独立 ssh 连接时，才退回直接用 ssh。\
+                    用法：list_sessions 看有哪些已打开的会话 → 需要的目标不在列表里时用 \
+                    open_session（按已保存连接的名称，首次使用某条连接会让用户当面确认）新开\
+                    一个（这类会话只读，仅供你操作，用户不能往里打字）→ run_command 执行命令\
+                    并等待完成 → 超时用 poll_run 续等（不会重发命令）→ read_screen 看当前屏幕\
+                    （适合 vim/top 等交互式程序）→ interrupt 发 Ctrl+C 中断。用户自己在用的\
+                    会话里，命令和输出会实时显示在其正在看的终端标签里。"
 )]
 impl ServerHandler for IshellMcp {}
 
