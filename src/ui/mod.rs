@@ -11,6 +11,12 @@ use egui::{Color32, Rect, Vec2};
 
 use crate::theme::Palette;
 
+/// 拖拽起点的真实按下位置：`drag_started()` 触发时指针已越过拖拽阈值、离开了真实按下点，
+/// 直接用当前帧指针位置算锚点/偏移会导致按下处的目标被漏选或跳动。取不到按下点时退回 `current`。
+pub fn drag_press_pos(ui: &egui::Ui, current: egui::Pos2) -> egui::Pos2 {
+    ui.input(|i| i.pointer.press_origin()).unwrap_or(current)
+}
+
 /// 人性化字节单位（KB 入参为千字节时用 `fmt_kb`）。
 pub fn fmt_bytes(bytes: f64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];

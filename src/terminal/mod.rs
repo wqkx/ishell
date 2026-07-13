@@ -358,19 +358,18 @@ impl Terminal {
                 }
             }
         } else {
-            // 拖动起点落在右侧滚动条上 → 拖滚动条；否则本地拖拽选择文本
+            // 拖动起点落在右侧滚动条上 → 拖滚动条；否则本地拖拽选择文本。
+            // 拖拽需移动超过阈值才激活，此刻指针已离开真实按下点——路由判断（滚动条/文本）
+            // 和选区锚点都必须用「按下位置」，否则起始处会被误判/漏选（与 editor.rs 的同类修法一致）。
             if resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    if max_sb > 0 && p.x >= sb_track.left() {
+                    let press = crate::ui::drag_press_pos(ui, p);
+                    if max_sb > 0 && press.x >= sb_track.left() {
                         self.sb_dragging = true;
                     } else {
-                        // 拖拽需移动超过阈值才激活，此刻指针已离开按下点——锚点必须用「按下位置」，
-                        // 否则起始字符会被漏选（与 editor.rs 的同类修法一致）
-                        let anchor = ui.input(|i| i.pointer.press_origin())
-                            .map(&cell_at)
-                            .unwrap_or_else(|| cell_at(p));
-                        self.sel_anchor = Some(anchor);
-                        self.sel_cursor = Some(cell_at(p));
+                        let cur = cell_at(p);
+                        self.sel_anchor = Some(cell_at(press));
+                        self.sel_cursor = Some(cur);
                     }
                 }
             } else if resp.dragged() && !self.sb_dragging {

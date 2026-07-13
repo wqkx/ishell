@@ -307,7 +307,10 @@ impl App {
                                         if resp.drag_started() {
                                             drag_start = Some(i);
                                             if let Some(pp) = pointer {
-                                                new_grab = Some(pp.x - (origin.x + x));
+                                                // drag_started() 触发时指针已越过拖拽阈值离开真实按下点，
+                                                // 抓取偏移须用按下位置计算，否则拖动起始瞬间标签会相对光标跳动
+                                                let press = crate::ui::drag_press_pos(ui, pp);
+                                                new_grab = Some(press.x - (origin.x + x));
                                             }
                                         }
                                         // 命中用「目标槽」位置，稳定判断拖到哪个槽
