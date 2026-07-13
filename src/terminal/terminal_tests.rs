@@ -142,6 +142,70 @@ fn truecolor_and_attrs_map() {
 }
 
 #[test]
+fn ai_capture_detects_sentinel_and_exit_code() {
+    let mut t = Terminal::new();
+    t.feed(b"prompt$ echo hi\r\nhi\r\n");
+    // 武装捕获，喂入一批混合了「正常输出 + 哨兵」的字节（模拟一次 feed 里全齐）
+    t.arm_ai_capture(b"\x1eAI_DONE_42:".to_vec());
+    assert!(t.ai_capture_pending());
+    t.feed(b"more output\r\n\x1eAI_DONE_42:7\x1e");
+    let (code, out) = t.take_ai_done().expect("应已命中哨兵");
+    assert_eq!(code, 7);
+    assert!(!t.ai_capture_pending()); // 命中后自动清空
+    assert!(t.take_ai_done().is_none()); // 取走即清空，第二次为 None
+    // 武装之后（"prompt$ echo hi\r\nhi\r\n" 之前的内容不算）才开始记录输出
+    assert!(!out.contains("prompt$"));
+    assert!(out.contains("more output"));
+}
+
+#[test]
+fn ai_capture_sentinel_split_across_feed_calls() {
+    let mut t = Terminal::new();
+    t.arm_ai_capture(b"\x1eAI_DONE_99:".to_vec());
+    // 哨兵前缀被拆到两次 feed() 里，退出码和结束标记又是第三次
+    t.feed(b"output\r\n\x1eAI_DO");
+    assert!(t.take_ai_done().is_none());
+    // 命中前可以看到「目前为止」的部分输出（此时哨兵前缀还没凑完，残留片段属预期）
+    assert_eq!(t.peek_ai_output().as_deref(), Some("output\nAI_DO"));
+    t.feed(b"NE_99:");
+    assert!(t.take_ai_done().is_none());
+    t.feed(b"0\x1e");
+    let (code, out) = t.take_ai_done().expect("应已命中哨兵");
+    assert_eq!(code, 0);
+    assert_eq!(out, "output\n");
+}
+
+#[test]
+fn ai_capture_ignores_unmatched_prefix() {
+    let mut t = Terminal::new();
+    t.arm_ai_capture(b"\x1eAI_DONE_1:".to_vec());
+    // 不同 nonce 的哨兵不应触发命中
+    t.feed(b"\x1eAI_DONE_2:0\x1e");
+    assert!(t.take_ai_done().is_none());
+    assert!(t.ai_capture_pending());
+    t.cancel_ai_capture();
+    assert!(!t.ai_capture_pending());
+}
+
+#[test]
+fn strip_ansi_removes_escapes_and_normalizes_newlines() {
+    use super::vt::strip_ansi_to_text;
+    let raw = b"\x1b[32mgreen\x1b[0m text\r\nline2\x1b]0;title\x07end";
+    assert_eq!(strip_ansi_to_text(raw), "green text\nline2end");
+}
+
+#[test]
+fn screen_text_matches_visible_rows() {
+    let mut t = Terminal::new();
+    t.feed(b"line one\r\nline two\r\n");
+    let s = t.screen_text();
+    assert!(s.contains("line one"));
+    assert!(s.contains("line two"));
+    // 尾部空行应被裁掉，不残留大片空白
+    assert!(!s.ends_with('\n'));
+}
+
+#[test]
 fn clear_wipes_scrollback() {
     let mut t = Terminal::new();
     for i in 0..50 {

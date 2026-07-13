@@ -104,6 +104,33 @@ pub fn save_osc7_consent(on: bool) {
     }
 }
 
+fn mcp_consent_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("mcp_consent"))
+}
+
+/// 是否已开启「允许 AI 通过本地 MCP server 控制终端」（默认关闭，需用户在设置里显式开启）。
+pub fn load_mcp_consent() -> bool {
+    mcp_consent_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// 保存 AI/MCP 控制开关。
+pub fn save_mcp_consent(on: bool) {
+    if let Some(p) = mcp_consent_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, if on { "1" } else { "0" });
+    }
+}
+
+/// AI/MCP 控制通道用的本地 Unix domain socket 路径（`~/.config/ishell/mcp.sock`）。
+pub fn mcp_socket_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("mcp.sock"))
+}
+
 // ---------- 终端配色（多套主题，按索引存储） ----------
 
 fn term_theme_path() -> Option<PathBuf> {

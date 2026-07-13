@@ -7,6 +7,56 @@ pub(super) fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// 剥掉 ANSI 转义（CSI/OSC/简单双字节），`\r` 一律丢弃（换行只留 `\n`），供 AI 捕获的
+/// 命令输出转成干净纯文本。只做常见序列的宽松跳过，不追求对所有转义严格合法性校验。
+pub(super) fn strip_ansi_to_text(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    // CSI：ESC [ 参数... 终止字节 (0x40..=0x7e)
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC：ESC ] ... BEL 或 ESC \
+                    chars.next();
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\x07' {
+                            break;
+                        }
+                        if c2 == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next(); // 简单双字节转义（如 ESC(、ESC)），跳过第二个字符
+                }
+                None => {}
+            }
+            continue;
+        }
+        if c == '\r' {
+            continue;
+        }
+        // 其它 C0 控制字符（含哨兵用的 \x1e）一律丢弃，只留可打印文本和换行/制表符
+        if (c as u32) < 0x20 && c != '\n' && c != '\t' {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// 一个单元格的可序列化属性（用于 resize 重排时还原颜色/字形）。
 #[derive(Clone, Copy, PartialEq)]
 struct CellAttrs {

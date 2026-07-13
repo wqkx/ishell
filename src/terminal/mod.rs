@@ -81,6 +81,20 @@ pub struct Terminal {
     prev_alt: bool,
     /// 正在拖动右侧滚动条（区别于拖动选择文本）
     sb_dragging: bool,
+    /// AI/MCP 命令补全检测：等待中的哨兵前缀 + 滑动扫描缓冲（与 `strip_echo` 完全独立的
+    /// 状态，避免耦合到已在生产使用的回显吞除逻辑）。见 `feed.rs` 里的扫描步骤。
+    ai_capture: Option<AiCapture>,
+    /// 哨兵命中后的 (退出码, 纯文本输出)，供 App 每帧取走（None=尚未完成/无正在等待的捕获）。
+    ai_done: Option<(i32, String)>,
+}
+
+struct AiCapture {
+    /// 待匹配的前缀（含唯一 nonce），命中后紧跟的数字到下一个 `\x1e` 之间即退出码。
+    prefix: Vec<u8>,
+    /// 武装以来喂入的原始字节（命中前的这段即命令输出，剥 ANSI 后返回给 AI）。
+    /// 超过上限会从前端裁掉最早的部分并标记 `truncated`（极端长输出兜底，不做无界增长）。
+    buf: Vec<u8>,
+    truncated: bool,
 }
 
 impl Terminal {
@@ -116,6 +130,8 @@ impl Terminal {
             prev_focused: false,
             prev_alt: false,
             sb_dragging: false,
+            ai_capture: None,
+            ai_done: None,
         }
     }
 
@@ -137,6 +153,60 @@ impl Terminal {
         self.echo_expect = s.as_bytes().to_vec();
         self.echo_pos = 0;
         self.echo_tail = false;
+    }
+
+    /// 武装一次「等待哨兵」捕获：`prefix` 是唯一前缀（含 nonce），命中后紧跟的退出码数字
+    /// 到下一个 `\x1e` 之间会被解析出来，见 `take_ai_done`。
+    pub fn arm_ai_capture(&mut self, prefix: Vec<u8>) {
+        self.ai_capture = Some(AiCapture {
+            prefix,
+            buf: Vec::new(),
+            truncated: false,
+        });
+        self.ai_done = None;
+    }
+
+    /// 是否已有一次 AI 捕获正在等待（同一时刻只允许一个，见调用方的 busy 判断）。
+    pub fn ai_capture_pending(&self) -> bool {
+        self.ai_capture.is_some()
+    }
+
+    /// 取走哨兵命中后的结果：`(退出码, 已剥离 ANSI 的纯文本输出)`（取走即清空；None=仍未完成）。
+    pub fn take_ai_done(&mut self) -> Option<(i32, String)> {
+        self.ai_done.take()
+    }
+
+    /// 放弃当前捕获（如 App 侧判定超时/请求被取消）。
+    pub fn cancel_ai_capture(&mut self) {
+        self.ai_capture = None;
+        self.ai_done = None;
+    }
+
+    /// 捕获尚未完成时，看一眼「目前为止」已剥离 ANSI 的输出（不消费、不影响后续检测）。
+    pub fn peek_ai_output(&self) -> Option<String> {
+        self.ai_capture.as_ref().map(|c| vt::strip_ansi_to_text(&c.buf))
+    }
+
+    /// 当前可见屏幕的纯文本（tmux capture-pane 风格），自动裁掉尾部空行。
+    pub fn screen_text(&mut self) -> String {
+        let saved = self.scrollback;
+        if saved != 0 {
+            self.parser.screen_mut().set_scrollback(0);
+        }
+        let cols = self.cols;
+        let mut lines: Vec<String> = self
+            .parser
+            .screen()
+            .rows(0, cols)
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        if saved != 0 {
+            self.parser.screen_mut().set_scrollback(saved);
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
     }
 
     /// 请求下一帧让终端区域获得键盘焦点。

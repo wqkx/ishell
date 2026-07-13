@@ -4,9 +4,12 @@ use std::io::Write;
 
 use super::{
     osc::parse_osc7,
-    vt::{find_sub, incomplete_utf8_tail, serialize_row},
+    vt::{find_sub, incomplete_utf8_tail, serialize_row, strip_ansi_to_text},
     Terminal, DEFAULT_SCROLLBACK,
 };
+
+/// AI 捕获缓冲上限：超过后从前端裁掉最早的部分（兜底极端长输出，不做无界增长）。
+const AI_CAPTURE_CAP: usize = 4 * 1024 * 1024;
 
 impl Terminal {
     /// 从输入字节里剥掉待吞的注入命令回显；遇到非预期可见字节即放弃（保证不误吞真实输出）。
@@ -133,6 +136,34 @@ impl Terminal {
         } else {
             bytes
         };
+        // AI/MCP 命令补全检测：扫描哨兵前缀，命中后解析退出码。纯只读扫描，不影响
+        // 后续渲染/日志——与 strip_echo 状态完全独立，不耦合已在生产使用的回显吞除逻辑。
+        // 哨兵行自身的可见性由注入方（见 mcp_bridge）用 `\r\x1b[K` 自擦除处理，这里无需
+        // 剔除字节、也就不影响 parser.process() 的正常喂入顺序。
+        if let Some(cap) = &mut self.ai_capture {
+            cap.buf.extend_from_slice(bytes);
+            if let Some(p0) = find_sub(&cap.buf, &cap.prefix) {
+                let after = p0 + cap.prefix.len();
+                if let Some(p1) = find_sub(&cap.buf[after..], b"\x1e") {
+                    let code = std::str::from_utf8(&cap.buf[after..after + p1])
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(-1);
+                    let mut text = strip_ansi_to_text(&cap.buf[..p0]);
+                    if cap.truncated {
+                        text = format!("[输出过长，已截断保留末尾部分]\n{text}");
+                    }
+                    self.ai_done = Some((code, text));
+                    self.ai_capture = None;
+                }
+            } else if cap.buf.len() > AI_CAPTURE_CAP {
+                // 兜底：命令迟迟不结束、输出持续增长时，只保留最近一段，避免无界内存增长
+                let keep = AI_CAPTURE_CAP / 2;
+                let drop = cap.buf.len() - keep;
+                cap.buf.drain(..drop);
+                cap.truncated = true;
+            }
+        }
         // 会话日志：原样落盘（可用 cat 回放）
         if let Some(f) = &mut self.log_file {
             let _ = f.write_all(bytes);

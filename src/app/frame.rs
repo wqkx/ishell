@@ -19,6 +19,8 @@ type FramePdfSearch = (u64, String, Vec<(u32, String)>, Option<String>);
 impl App {
     /// 处理本帧会话事件与编辑器/传输副作用（在布局绘制之前调用）。
     pub(super) fn process_frame_events(&mut self, ui: &mut egui::Ui) {
+        // 0) AI/MCP 控制通道：排空本地 socket 收到的请求 + 检查各会话待完成的命令运行
+        self.drain_mcp_calls();
         // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
         // 身份用会话 uid（稳定唯一），title 仅作显示——避免同名会话（默认 title=用户名）串台。
         let mut new_placeholders: Vec<FramePlaceholder> = Vec::new();

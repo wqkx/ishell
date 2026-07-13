@@ -165,6 +165,27 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 | Async | `tokio` |
 | Encrypted storage | `chacha20poly1305` |
 
+## 🤖 AI / MCP integration
+
+Let an AI assistant (e.g. Claude Code) drive a terminal session you already have open — instead of
+spawning a throwaway `ssh host cmd` that loses your shell's cwd, env, and history every time.
+
+- **Off by default.** Enable it via the right-click settings menu → "Allow AI to control terminal
+  via MCP" (takes effect after restart). It only listens on a local Unix domain socket
+  (`~/.config/ishell/mcp.sock`, mode `0600`) — no network port is opened.
+- **Shared, visible terminal.** Commands the AI runs — and their output — appear in the same
+  terminal tab you're looking at, in real time, exactly as if you'd typed them yourself. A small
+  🤖 indicator shows in the terminal pane while this is enabled.
+- **Setup**: build the companion binary (`cargo build --release --bin ishell-mcp`) and point your
+  MCP client at it, e.g. in Claude Code's MCP config:
+  ```json
+  { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
+  ```
+- **Tools exposed**: `list_sessions`, `run_command` (waits for completion or a timeout, returns
+  output + exit code), `poll_run` (keep waiting on a timed-out command without resending it),
+  `read_screen` (tmux `capture-pane`-style dump of the visible screen, for interactive programs
+  like `vim`/`top`), `interrupt` (send Ctrl+C).
+
 ## 🔒 Security
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.

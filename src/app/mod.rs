@@ -28,12 +28,14 @@ mod frame_editor;
 mod layout;
 mod layout_tabs;
 mod layout_body;
+mod mcp_bridge;
 mod pending;
 mod screenshot;
 mod session;
 mod session_events;
 mod transfers;
 mod windows;
+pub(in crate::app) use mcp_bridge::PendingAiRun;
 pub(in crate::app) use session::{Session, XferSpec};
 pub use widgets::view_context_menu;
 
@@ -128,6 +130,8 @@ pub struct App {
     shot: Option<Shot>,
     /// Logo 生成模式（ISHELL_LOGO）：只画 logo 圆角矩形
     logo: bool,
+    /// AI/MCP 控制通道：本地 socket 收到的请求队列（未开启该功能时是个永远空的通道）
+    mcp_rx: tokio::sync::mpsc::UnboundedReceiver<mcp_bridge::McpCall>,
 }
 
 impl App {
@@ -148,6 +152,7 @@ impl App {
                 .build()
                 .expect("无法创建 tokio 运行时"),
         );
+        let mcp_rx = mcp_bridge::spawn_mcp_listener(&runtime, cc.egui_ctx.clone());
         let mut form = ConnectForm::default();
         form.open = true; // 启动即弹出连接框
 
@@ -208,6 +213,7 @@ impl App {
             demo_net: std::env::var("ISHELL_DEMO_NET").is_ok(),
             shot,
             logo: std::env::var("ISHELL_LOGO").is_ok() || std::env::var("ISHELL_ICON").is_ok(),
+            mcp_rx,
         };
 
         app.apply_demo_flags(cc);

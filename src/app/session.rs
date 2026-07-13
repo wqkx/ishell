@@ -63,6 +63,8 @@ pub(super) struct Session {
     pub(super) osc7_pending_reveal: bool,
     /// 远端是否支持 /proc 系统监控（None=尚未探测；false 时侧栏提示并跳过杀进程等）
     pub(super) monitor_ok: Option<bool>,
+    /// AI/MCP 控制通道正在等待完成的一次命令运行（同一会话同一时刻只允许一条）
+    pub(super) pending_ai_run: Option<super::PendingAiRun>,
 }
 
 /// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
@@ -169,6 +171,7 @@ impl App {
             osc7_confirm: false,
             osc7_pending_reveal: false,
             monitor_ok: None,
+            pending_ai_run: None,
         });
         self.active = Some(self.sessions.len() - 1);
         self.tabbar.scroll_to_active = true; // 新建标签后滚动到可视区
@@ -194,6 +197,7 @@ impl App {
         s.terminal = Terminal::new();
         s.sysinfo = None;
         s.monitor_ok = None;
+        s.pending_ai_run = None; // worker 已重启：旧的 AI 命令等待作废（对端 oneshot 断线会收到错误）
         // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建
         for f in &mut s.forwards {
             f.ok = true;

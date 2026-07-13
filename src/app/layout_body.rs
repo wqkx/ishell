@@ -78,6 +78,21 @@ impl App {
                         });
                     ui.add_space(4.0);
                 }
+                // AI/MCP 控制通道已开启：提示用户此终端可能被 AI 助手驱动（发命令、读输出）
+                if crate::store::load_mcp_consent() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  {}",
+                                egui_phosphor::regular::ROBOT,
+                                crate::i18n::tr("AI 可通过 MCP 控制此终端", "AI can control this terminal via MCP"),
+                            ))
+                            .color(Palette::TEXT_DIM)
+                            .size(11.0),
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
                 let input = s.terminal.ui(ui);
                 if !input.is_empty() {
                     let _ = s.cmd_tx.send(UiCommand::TerminalInput(input));

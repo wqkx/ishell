@@ -165,6 +165,25 @@ cargo run --release
 | 异步 | `tokio` |
 | 加密存储 | `chacha20poly1305` |
 
+## 🤖 AI / MCP 集成
+
+让 AI 助手（如 Claude Code）直接驱动你已经打开的终端会话——而不是每次都另开一条丢光 cwd/环境/
+历史的 `ssh host cmd`。
+
+- **默认关闭**。在右键设置菜单里打开"允许 AI 通过 MCP 控制终端"（需重启生效）。只监听本地
+  Unix domain socket（`~/.config/ishell/mcp.sock`，权限 `0600`），不监听任何网络端口。
+- **共享可见终端**。AI 执行的命令和产生的输出会实时显示在你正在看的那个终端标签里，效果等同于
+  你亲自输入；开启后终端区域会有一个小小的 🤖 标识提示。
+- **接入方式**：编译配套的独立二进制（`cargo build --release --bin ishell-mcp`），在 MCP 客户端
+  （如 Claude Code）里指向它，例如：
+  ```json
+  { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
+  ```
+- **暴露的工具**：`list_sessions`（列出会话）、`run_command`（执行命令并等待完成或超时，返回
+  输出+退出码）、`poll_run`（对一次超时未完成的命令继续等待，不重发）、`read_screen`（类似
+  `tmux capture-pane`，导出当前可见屏幕纯文本，适合看 `vim`/`top` 这类交互式程序）、
+  `interrupt`（发送 Ctrl+C）。
+
 ## 🔒 安全
 
 - **主机密钥校验**：known_hosts 校验，未知主机首次连接弹窗确认 SHA256 指纹（TOFU）并写入；密钥改变则拒绝告警。

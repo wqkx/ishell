@@ -66,6 +66,10 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 
+# AI/MCP 控制通道（独立二进制 src/bin/ishell-mcp.rs 用；主 GUI 二进制不依赖它，
+# 只走本地 Unix socket 收发 JSON，不引入 rmcp）：官方 Rust MCP SDK，stdio server。
+rmcp = { version = "2.2.0", features = ["transport-io"] }
+
 # Unix（Linux/macOS）：libc 用于 malloc_trim 归还内存、localtime_r 取本地时区偏移
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

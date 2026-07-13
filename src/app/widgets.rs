@@ -112,6 +112,29 @@ pub fn view_context_menu(resp: &egui::Response) {
             }
         }
 
+        // —— AI/MCP 控制（本地 socket，供 AI 助手驱动终端·重启生效）——
+        ui.separator();
+        let mut mcp_on = crate::store::load_mcp_consent();
+        if ui
+            .checkbox(
+                &mut mcp_on,
+                crate::i18n::tr(
+                    "允许 AI 通过 MCP 控制终端（重启生效）",
+                    "Allow AI to control terminal via MCP (restart)",
+                ),
+            )
+            .on_hover_text(crate::i18n::tr(
+                "开启后本机可通过本地 MCP server 驱动已打开的终端会话（发命令、读输出）；\
+                 仅本地 Unix socket，不监听网络端口",
+                "Lets an AI client drive your open terminal sessions via a local MCP server \
+                 (run commands, read output); local Unix socket only, no network exposure",
+            ))
+            .clicked()
+        {
+            crate::store::save_mcp_consent(mcp_on);
+            ui.close();
+        }
+
         // —— 关于 ——
         ui.separator();
         if ui
