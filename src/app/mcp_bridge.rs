@@ -9,7 +9,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::mcp_protocol::{McpReqKind, McpReqResult, McpRequest, McpResponse, McpRunResult, McpSessionInfo};
+use crate::mcp_protocol::{
+    McpReqKind, McpReqResult, McpRequest, McpResponse, McpRunResult, McpSavedConn, McpSessionInfo,
+};
 use crate::proto::{AuthMethod, ConnectConfig, JumpHost, UiCommand};
 use crate::store::SavedConnection;
 
@@ -66,6 +68,36 @@ pub(super) struct PendingAiRun {
     /// 当前这次调用（run_command 或最近一次 poll_run）待回填的响应通道 + 请求 id。
     resp_tx: Option<oneshot::Sender<McpResponse>>,
     req_id: u64,
+    /// 原始命令文本：用于把回填给 AI 的输出里，命令自身的回显行去掉（人看的终端不受影响，
+    /// 只裁剪返回给 AI 的文本，省 token）。
+    command: String,
+}
+
+/// 开头这条命令自己的回显行不是命令产生的内容，我们知道发的是什么，原样比对裁掉。
+/// 命令是否已经跑完都适用（回显在命令刚发出时就到达，跟命令有没有跑完无关）。
+/// 注意：命令长到被终端硬换行（回显中间插入了 `\r\n`）时，这里的整段精确匹配会失配，
+/// 退回原样返回——不裁但也不会误伤，只是这一种情况下省不了这份 token，属已知取舍。
+fn trim_leading_echo(output: &str, command: &str) -> String {
+    match output.strip_prefix(command.trim()) {
+        Some(rest) => rest.trim_start_matches(['\r', '\n']).to_string(),
+        None => output.to_string(),
+    }
+}
+
+/// 命令已跑完时，再裁掉结尾那一小段没有换行收尾的提示符残片（标记行是紧跟在提示符后面
+/// 同一行打的，提示符本身没被吞，但这一行天然没有换行结尾）。**只有确实找得到换行符才裁**：
+/// 找不到换行符时无法区分"就是这一小段提示符残片"和"命令本身输出就没有换行"（比如
+/// `printf 'done'`），裁了可能把真实输出整段删掉——宁可保留这一小段噪音，也不能丢真实数据。
+/// **不能用于还没跑完的中途快照**：命令仍在运行时结尾没换行完全可能是真实输出（比如进度条），
+/// 裁掉会误伤。
+/// 注意：多行自定义 prompt 里提示符上方还可能残留一两行噪音，属已知的、有意保守的取舍
+/// （避免用不可靠的启发式误伤真实输出）。
+fn trim_command_echo_and_prompt(output: &str, command: &str) -> String {
+    let s = trim_leading_echo(output, command);
+    match s.rfind('\n') {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
 }
 
 /// AI 调 `open_session` 时，若这条已保存连接本次运行期间还没被用户批准过，需要弹窗让用户
@@ -90,7 +122,16 @@ pub(super) fn spawn_mcp_listener(
         return rx;
     };
     runtime.spawn(async move {
-        let _ = std::fs::remove_file(&sock_path); // 清理上次异常退出残留的 socket 文件
+        // 本机可能同时开着好几个 iShell 实例，默认本机直连 socket 路径是固定的
+        // （~/.config/ishell/mcp.sock）——但这里不能靠"探测到已有监听者就放弃绑定"来避让：
+        // 每个进程自己的 SSH 反向转发桥接（bridge_local_mcp）在收到远端连进来的请求时，
+        // 都是连去这同一个固定路径找"本进程的" mcp_socket_path()；如果本进程因为探测到
+        // 别的实例在监听就放弃了绑定，本进程自己那些会话就永远够不到自己的本地监听器
+        // （反而落到了别的实例头上，那个实例根本不认识这些会话）——这比"后启动的实例
+        // 顶掉前一个实例的 socket 文件"更糟：这里退回最简单可靠的做法，每次都
+        // remove_file+bind，谁最后启动/重连谁就拿到这个共享路径，符合直觉、且保证
+        // "当前正在被 AI 操作的这个进程"自己的反向转发链路始终是通的。
+        let _ = std::fs::remove_file(&sock_path); // 清理上次异常退出/被顶替残留的 socket 文件
         let listener = match UnixListener::bind(&sock_path) {
             Ok(l) => l,
             Err(e) => {
@@ -150,6 +191,7 @@ impl App {
                 continue;
             };
             if let Some((code, output)) = s.terminal.take_ai_done() {
+                let output = trim_command_echo_and_prompt(&output, &pending.command);
                 let resp = McpResponse {
                     id: pending.req_id,
                     result: Ok(McpReqResult::Run(McpRunResult {
@@ -165,6 +207,7 @@ impl App {
                 s.pending_ai_run = None;
             } else if Instant::now() >= pending.deadline {
                 let output = s.terminal.peek_ai_output().unwrap_or_default();
+                let output = trim_leading_echo(&output, &pending.command);
                 let resp = McpResponse {
                     id: pending.req_id,
                     result: Ok(McpReqResult::Run(McpRunResult {
@@ -304,6 +347,7 @@ impl App {
                     deadline: Instant::now() + Duration::from_millis(timeout_ms.max(100)),
                     resp_tx: Some(resp_tx),
                     req_id: id,
+                    command,
                 });
             }
             McpReqKind::PollRun {
@@ -316,7 +360,7 @@ impl App {
                     return;
                 };
                 match self.sessions[idx].pending_ai_run.as_mut() {
-                    Some(p) if p.run_id == run_id => {
+                    Some(p) if run_id.map_or(true, |r| r == p.run_id) => {
                         p.deadline = Instant::now() + Duration::from_millis(timeout_ms.max(100));
                         p.resp_tx = Some(resp_tx);
                         p.req_id = id;
@@ -340,9 +384,26 @@ impl App {
                     send_err(resp_tx, "会话不存在".into());
                     return;
                 };
-                let _ = self.sessions[idx]
-                    .cmd_tx
-                    .send(UiCommand::TerminalInput(vec![0x03]));
+                let s = &mut self.sessions[idx];
+                let _ = s.cmd_tx.send(UiCommand::TerminalInput(vec![0x03]));
+                // 打断意味着放弃这条命令的哨兵检测：被打断的程序（比如 `cat`）很可能会把
+                // 紧跟着排的标记行当成自己的输入吃掉，哨兵永远等不到。不清掉 pending_ai_run
+                // 的话，这个会话的 run_command 会被"忙碌"卡死，往后再也调不动，直到重启。
+                if let Some(mut pending) = s.pending_ai_run.take() {
+                    if let Some(tx) = pending.resp_tx.take() {
+                        let output = s.terminal.peek_ai_output().unwrap_or_default();
+                        let _ = tx.send(McpResponse {
+                            id: pending.req_id,
+                            result: Ok(McpReqResult::Run(McpRunResult {
+                                run_id: pending.run_id,
+                                finished: false,
+                                output,
+                                exit_code: None,
+                            })),
+                        });
+                    }
+                }
+                s.terminal.cancel_ai_capture();
                 let _ = resp_tx.send(McpResponse {
                     id,
                     result: Ok(McpReqResult::Ok),
@@ -371,6 +432,99 @@ impl App {
                     deadline: Instant::now() + Duration::from_secs(60),
                 });
             }
+            McpReqKind::CloseSession { session_uid } => {
+                let Some(idx) = self.session_idx_by_uid(session_uid) else {
+                    send_err(resp_tx, "会话不存在".into());
+                    return;
+                };
+                // 只允许关自己（AI）开的会话，不能关用户自己的会话——关闭权限不超过打开权限。
+                if !self.sessions[idx].ai_owned {
+                    send_err(resp_tx, "这不是 AI 自己开的会话，不能通过这个工具关闭".into());
+                    return;
+                }
+                self.close_session(idx);
+                let _ = resp_tx.send(McpResponse {
+                    id,
+                    result: Ok(McpReqResult::Ok),
+                });
+            }
+            McpReqKind::ReadHistory {
+                session_uid,
+                max_lines,
+            } => {
+                let Some(idx) = self.session_idx_by_uid(session_uid) else {
+                    send_err(resp_tx, "会话不存在".into());
+                    return;
+                };
+                let text = self.sessions[idx]
+                    .terminal
+                    .history_text(max_lines as usize);
+                let _ = resp_tx.send(McpResponse {
+                    id,
+                    result: Ok(McpReqResult::History(text)),
+                });
+            }
+            McpReqKind::ListSavedConnections => {
+                let list: Vec<McpSavedConn> = crate::store::load()
+                    .into_iter()
+                    .map(|c| McpSavedConn {
+                        name: c.name,
+                        host: c.host,
+                        username: c.username,
+                        port: c.port,
+                    })
+                    .collect();
+                let _ = resp_tx.send(McpResponse {
+                    id,
+                    result: Ok(McpReqResult::SavedConnections(list)),
+                });
+            }
+            McpReqKind::SendInput { session_uid, text } => {
+                let Some(idx) = self.session_idx_by_uid(session_uid) else {
+                    send_err(resp_tx, "会话不存在".into());
+                    return;
+                };
+                let _ = self.sessions[idx]
+                    .cmd_tx
+                    .send(UiCommand::TerminalInput(text.into_bytes()));
+                let _ = resp_tx.send(McpResponse {
+                    id,
+                    result: Ok(McpReqResult::Ok),
+                });
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{trim_command_echo_and_prompt, trim_leading_echo};
+
+    #[test]
+    fn trim_leading_echo_strips_command_line_only() {
+        let out = "hostname && whoami\r\nhost\nuser\n";
+        assert_eq!(trim_leading_echo(out, "hostname && whoami"), "host\nuser\n");
+        // 命令文本对不上时原样返回（不误伤）
+        assert_eq!(trim_leading_echo(out, "other"), out);
+    }
+
+    #[test]
+    fn trim_command_echo_and_prompt_strips_leading_echo_and_trailing_prompt_fragment() {
+        let out = "hostname && whoami && pwd\ns3-server\ns3\n/home/s3\n(env) s3@s3-server:~\n$ ";
+        assert_eq!(
+            trim_command_echo_and_prompt(out, "hostname && whoami && pwd"),
+            "s3-server\ns3\n/home/s3\n(env) s3@s3-server:~"
+        );
+    }
+
+    #[test]
+    fn trim_command_echo_and_prompt_keeps_output_without_any_newline() {
+        // 命令自身输出没有换行（如 `printf 'done'`），裁掉开头回显后就再没有 '\n' 了——
+        // 这时不能把整段当成「提示符残片」删掉，真实输出必须保留。
+        let out = "printf 'done'\ndone$ ";
+        assert_eq!(
+            trim_command_echo_and_prompt(out, "printf 'done'"),
+            "done$ "
+        );
     }
 }

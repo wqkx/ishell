@@ -13,32 +13,44 @@ const AI_CAPTURE_CAP: usize = 4 * 1024 * 1024;
 
 impl Terminal {
     /// 从输入字节里剥掉待吞的注入命令回显。武装后目标回显之前可能先到达其它真实内容（如
-    /// AI 命令场景里先发的真实命令自己的回显）——这些字节原样透传、不影响继续等待目标出现；
-    /// 只有在目标回显**已经部分匹配中**又出现意外字节，才判定为误判、放弃本次吞回显。
+    /// AI 命令场景里先发的真实命令自己的回显）——这些字节原样透传、不影响继续等待目标出现。
+    /// 真实内容里偶然出现和目标回显开头相同的字节时，会先暂存（`echo_pending`）当作「可能是
+    /// 目标回显」而不立即输出；一旦后续字节证明只是巧合（失配），把暂存字节原样还给真实输出，
+    /// 并从当前字节重新判断是否是新一轮匹配的开头——不清空 `echo_expect`（否则真正的目标回显
+    /// 到达时也不会被吞了），只重置匹配进度，继续等目标出现。
     fn strip_echo(&mut self, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len());
         for &b in input {
             if self.echo_pos < self.echo_expect.len() {
                 if b == self.echo_expect[self.echo_pos] {
                     self.echo_pos += 1;
+                    self.echo_pending.push(b);
                     if self.echo_pos >= self.echo_expect.len() {
                         self.echo_tail = true; // 命令体已吞完，接着吞回车换行
+                        self.echo_pending.clear(); // 确认命中，暂存字节真正吞掉
                     }
                     continue;
                 }
-                if self.echo_pos == 0 {
-                    // 匹配还没开始：这是抢在目标回显之前到达的真实内容，原样透传，继续等
-                    out.push(b);
-                    continue;
-                }
-                if b == b'\r' || b == b'\n' {
+                if (b == b'\r' || b == b'\n') && self.echo_pos > 0 {
                     continue; // 部分匹配中，终端自动换行/回显格式，忽略
                 }
-                // 部分匹配中途出现意外字节：放弃本次吞回显，恢复未匹配状态，原样透传剩余
-                self.echo_expect.clear();
+                // 失配：先把暂存的疑似字节还给真实输出（之前只是巧合的部分匹配），
+                // 再看这个字节本身是不是新一轮匹配的开头。
+                out.append(&mut self.echo_pending);
                 self.echo_pos = 0;
-                self.echo_tail = false;
-                out.push(b);
+                if b == self.echo_expect[0] {
+                    self.echo_pos = 1;
+                    self.echo_pending.push(b);
+                    if self.echo_pos >= self.echo_expect.len() {
+                        // echo_expect 只有一个字节：这一个字节本身就已经是完整匹配，
+                        // 需要立即确认命中，否则这个字节会卡在「已匹配完但没置 echo_tail」
+                        // 的状态里，既不会被吞掉标记为完成，也不会被当成正常字节输出。
+                        self.echo_tail = true;
+                        self.echo_pending.clear();
+                    }
+                } else {
+                    out.push(b);
+                }
             } else if self.echo_tail {
                 if b == b'\r' || b == b'\n' {
                     continue;

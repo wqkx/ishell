@@ -59,6 +59,14 @@ impl App {
                     .outer_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 0 }),
             )
             .show_inside(root, |ui| {
+                // 当前所有 AI（open_session）打开的会话 uid，AI 提示条里要报全，方便 AI
+                // 自己核对哪些会话还在。
+                let ai_uids: Vec<u64> = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.ai_owned)
+                    .map(|s| s.uid)
+                    .collect();
                 let s = &mut self.sessions[idx];
                 // 断线提示条 + 手动重连（初次"连接中"不显示）
                 if !s.connected {
@@ -79,18 +87,27 @@ impl App {
                     ui.add_space(4.0);
                 }
                 // AI/MCP 控制通道已开启：提示用户此终端可能被 AI 助手驱动（发命令、读输出）；
-                // ai_owned 会话是 AI 自己新开的只读会话，用不同文案说明「只能看不能敲」。
+                // ai_owned 会话是 AI 自己新开的只读会话，用不同文案说明「只能看不能敲」，
+                // 并且报出这个终端自己的 uid + 当前全部 AI 终端的 uid（方便 AI 核对）。
                 if s.ai_owned {
+                    let uid = s.uid;
+                    let ai_list = ai_uids
+                        .iter()
+                        .map(|u| u.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!(
-                                "{}  {}",
-                                egui_phosphor::regular::ROBOT,
-                                crate::i18n::tr(
-                                    "AI 正在驱动此终端（只读，你的按键不会发送到这里）",
-                                    "AI is driving this terminal (read-only — your keystrokes aren't sent here)",
+                            RichText::new(match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!(
+                                    "{}  AI 正在驱动此终端（只读，uid={uid}）· 当前全部 AI 终端 uid：{ai_list}",
+                                    egui_phosphor::regular::ROBOT,
                                 ),
-                            ))
+                                crate::i18n::Lang::En => format!(
+                                    "{}  AI is driving this terminal (read-only, uid={uid}) · All AI terminals: uid {ai_list}",
+                                    egui_phosphor::regular::ROBOT,
+                                ),
+                            })
                             .color(Palette::ACCENT)
                             .size(11.0),
                         );

@@ -173,10 +173,17 @@ impl App {
                                     let mut acc = 0.0f32; // 目标布局累计左边界
                                     for (i, s) in self.sessions.iter().enumerate() {
                                         let selected = active == Some(i);
+                                        // AI（open_session）新开的会话在标签上加机器人图标前缀，
+                                        // 一眼和用户自己开的会话区分开。
+                                        let display_title = if s.ai_owned {
+                                            format!("{} {}", icon::ROBOT, s.title)
+                                        } else {
+                                            s.title.clone()
+                                        };
                                         // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
                                         let title_w = ctx.fonts_mut(|f| {
                                             f.layout_no_wrap(
-                                                s.title.clone(),
+                                                display_title.clone(),
                                                 body_font.clone(),
                                                 Palette::TEXT,
                                             )
@@ -266,7 +273,9 @@ impl App {
                                         p.circle_filled(
                                             egui::pos2(tab_rect.left() + 14.0, tab_rect.center().y),
                                             4.0,
-                                            if s.connected {
+                                            if s.ai_owned {
+                                                Palette::ACCENT
+                                            } else if s.connected {
                                                 Palette::OK
                                             } else {
                                                 Palette::WARN
@@ -280,7 +289,7 @@ impl App {
                                         p.text(
                                             egui::pos2(tab_rect.left() + 25.0, tab_rect.center().y),
                                             egui::Align2::LEFT_CENTER,
-                                            &s.title,
+                                            &display_title,
                                             body_font.clone(),
                                             tcolor,
                                         );
@@ -392,8 +401,14 @@ impl App {
                         }
                     }
                     if let Some(i) = to_close {
-                        // 会话仍连接（活动）则弹确认，避免误关；否则直接关闭
-                        if self.sessions.get(i).map(|s| s.connected).unwrap_or(false) {
+                        // 会话仍连接（活动），或是 AI 正在用的会话，则弹确认——后者关闭会
+                        // 立即终止 AI 那条通道，不能悄无声息地关掉。
+                        let need_confirm = self
+                            .sessions
+                            .get(i)
+                            .map(|s| s.connected || s.ai_owned)
+                            .unwrap_or(false);
+                        if need_confirm {
                             self.pending_close_tab = Some(i);
                         } else {
                             self.close_session(i);

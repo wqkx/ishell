@@ -209,6 +209,31 @@ fn expect_echo_survives_unrelated_bytes_arriving_first() {
 }
 
 #[test]
+fn expect_echo_coincidental_first_char_in_real_content_not_lost() {
+    // 复现场景（真实环境里跑 `hostname && whoami && pwd` 触发过）：真实命令的回显里偶然
+    // 出现和标记行开头相同的字符（这里是 "pwd" 里的 'p'，标记行以 "printf" 开头），
+    // 旧实现会把这个 'p' 当成「可能是目标回显」的开头暂存起来，紧接着 'w' 对不上就整体
+    // 放弃匹配——不仅把这个 'p' 弄丢了（"pwd" 变成 "wd"），还因为放弃时把 echo_expect
+    // 清空，导致后面真正的标记行回显再也不会被吞、原样漏了出来。
+    let mut t = Terminal::new();
+    let marker = "printf '\x1eAI_DONE_2:%d\x1e' $?; printf '\\r\\x1b[K'";
+    t.expect_echo(marker);
+    t.feed(b"hostname && whoami && pwd\r\n");
+    t.feed(b"host\nuser\n/home/user\r\n");
+    t.feed(marker.as_bytes());
+    t.feed(b"\r\n");
+    let visible = t.screen_text();
+    assert!(
+        visible.contains("pwd"),
+        "巧合命中标记行首字符的真实字节不应丢失：{visible:?}"
+    );
+    assert!(
+        !visible.contains("printf"),
+        "标记行回显不应因为前面一次巧合失配就漏出来：{visible:?}"
+    );
+}
+
+#[test]
 fn strip_ansi_removes_escapes_and_normalizes_newlines() {
     use super::vt::strip_ansi_to_text;
     let raw = b"\x1b[32mgreen\x1b[0m text\r\nline2\x1b]0;title\x07end";

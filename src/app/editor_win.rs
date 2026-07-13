@@ -13,12 +13,12 @@ impl App {
         let Some(idx) = self.pending_close_tab else {
             return;
         };
-        // 若该会话已不在或已断开，则无需确认
-        let Some(title) = self
+        // 若该会话已不在、已断开且不是 AI 会话，则无需确认
+        let Some((title, ai_owned)) = self
             .sessions
             .get(idx)
-            .filter(|s| s.connected)
-            .map(|s| s.title.clone())
+            .filter(|s| s.connected || s.ai_owned)
+            .map(|s| (s.title.clone(), s.ai_owned))
         else {
             self.pending_close_tab = None;
             return;
@@ -33,9 +33,23 @@ impl App {
                         .strong(),
                 );
                 ui.add_space(6.0);
-                ui.label(match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("「{title}」仍在连接中，确定关闭吗？"),
-                    crate::i18n::Lang::En => format!("\"{title}\" is still connected. Close it?"),
+                ui.label(if ai_owned {
+                    match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!(
+                            "「{title}」是 AI 正在使用的终端，关闭会立即终止这条连接——\
+                             AI 之后对它的操作都会失败。确定关闭吗？"
+                        ),
+                        crate::i18n::Lang::En => format!(
+                            "\"{title}\" is a terminal AI is currently using. Closing it \
+                             immediately terminates that connection — any further AI action \
+                             on it will fail. Close it?"
+                        ),
+                    }
+                } else {
+                    match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("「{title}」仍在连接中，确定关闭吗？"),
+                        crate::i18n::Lang::En => format!("\"{title}\" is still connected. Close it?"),
+                    }
                 });
             });
             ui.add_space(12.0);

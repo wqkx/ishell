@@ -109,8 +109,10 @@ pub struct RunCommandArgs {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PollRunArgs {
     pub session_uid: u64,
-    /// run_command / 上一次 poll_run 返回的 run_id
-    pub run_id: u64,
+    /// 可省略：同一会话同一时刻只会有一条挂起的运行，省略就直接续等它，不需要精确转述
+    /// run_command 返回的那个长数字 id。传了会做一致性校验（防止误续等一条不相关的旧运行）。
+    #[serde(default)]
+    pub run_id: Option<u64>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -125,6 +127,27 @@ pub struct SessionArgs {
 pub struct OpenSessionArgs {
     /// 已保存连接的名称（iShell 侧栏里显示的那个名字，不是主机地址）
     pub name: String,
+}
+
+fn default_max_lines() -> u64 {
+    200
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReadHistoryArgs {
+    /// list_sessions 返回的会话 uid
+    pub session_uid: u64,
+    /// 只要最后这么多行（默认 200，够用再加大）；传 0 表示不限制（回滚很长时可能很大）
+    #[serde(default = "default_max_lines")]
+    pub max_lines: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SendInputArgs {
+    /// list_sessions 返回的会话 uid
+    pub session_uid: u64,
+    /// 要发送的原始文本/按键，不会自动加回车——要按 Enter 就在末尾加 "\r"
+    pub text: String,
 }
 
 #[tool_router]
@@ -160,7 +183,11 @@ impl IshellMcp {
         )
     }
 
-    #[tool(description = "继续等待一次因超时而未完成的 run_command，不会重新发送命令，可反复调用直到 finished=true")]
+    #[tool(
+        description = "继续等待一次因超时而未完成的 run_command，不会重新发送命令，可反复调用直到 \
+                        finished=true。run_id 可以不填——同一会话同一时刻只会有一条挂起的运行，\
+                        直接省略就行，不需要精确转述那个长数字。"
+    )]
     async fn poll_run(
         &self,
         Parameters(PollRunArgs {
@@ -208,6 +235,59 @@ impl IshellMcp {
     ) -> Result<CallToolResult, McpError> {
         text_result(call(McpReqKind::OpenSession { name }).await)
     }
+
+    #[tool(
+        description = "关闭一个终端会话/标签。只能关闭你自己用 open_session 开的会话（用户自己开的\
+                        会话即使有权限操作也不能用这个工具关掉）。不再需要某个 open_session 开的\
+                        会话时应该主动关掉，避免一直占着连接。"
+    )]
+    async fn close_session(
+        &self,
+        Parameters(SessionArgs { session_uid }): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        text_result(call(McpReqKind::CloseSession { session_uid }).await)
+    }
+
+    #[tool(
+        description = "读取指定终端的完整历史（回滚缓冲区 + 当前可见屏，从最早到最新），\
+                        不止 read_screen 那样只看当前一屏——适合回顾这个会话从头到现在都发生了什么。\
+                        max_lines 只要最后这么多行（默认 200，避免一次性读回过长历史）。"
+    )]
+    async fn read_history(
+        &self,
+        Parameters(ReadHistoryArgs {
+            session_uid,
+            max_lines,
+        }): Parameters<ReadHistoryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        text_result(
+            call(McpReqKind::ReadHistory {
+                session_uid,
+                max_lines,
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "列出所有已保存的连接（名称/主机/用户名/端口，不含密码/密钥），\
+                        用在 open_session 之前确认名字拼写对不对、有哪些机器可以连。"
+    )]
+    async fn list_saved_connections(&self) -> Result<CallToolResult, McpError> {
+        text_result(call(McpReqKind::ListSavedConnections).await)
+    }
+
+    #[tool(
+        description = "往指定终端直接发送原始文本/按键，不等待、不做完成检测——用于 run_command \
+                        覆盖不到的交互式场景（sudo 密码提示、vim/REPL 里继续输入等）。发送后配合 \
+                        read_screen 看效果。不会自动加回车，要按 Enter 就在 text 末尾加 \"\\r\"。"
+    )]
+    async fn send_input(
+        &self,
+        Parameters(SendInputArgs { session_uid, text }): Parameters<SendInputArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        text_result(call(McpReqKind::SendInput { session_uid, text }).await)
+    }
 }
 
 #[tool_handler(
@@ -216,12 +296,17 @@ impl IshellMcp {
                     直接开 ssh 会丢失用户已经建立的会话上下文（cwd、环境变量、shell 历史、\
                     已登录状态），也不会显示给用户看。只有确认 iShell 没在跑、或用户明确要求\
                     你自己开一条独立 ssh 连接时，才退回直接用 ssh。\
-                    用法：list_sessions 看有哪些已打开的会话 → 需要的目标不在列表里时用 \
-                    open_session（按已保存连接的名称，首次使用某条连接会让用户当面确认）新开\
-                    一个（这类会话只读，仅供你操作，用户不能往里打字）→ run_command 执行命令\
-                    并等待完成 → 超时用 poll_run 续等（不会重发命令）→ read_screen 看当前屏幕\
-                    （适合 vim/top 等交互式程序）→ interrupt 发 Ctrl+C 中断。用户自己在用的\
-                    会话里，命令和输出会实时显示在其正在看的终端标签里。"
+                    用法：list_sessions 看有哪些已打开的会话 → 需要的目标不在列表里时先用 \
+                    list_saved_connections 核对有哪些已保存连接、名字怎么拼，再用 open_session\
+                    （首次使用某条连接会让用户当面确认）新开一个（这类会话只读，仅供你操作，\
+                    用户不能往里打字）→ run_command 执行命令并等待完成 → 超时用 poll_run 续等\
+                    （不会重发命令）→ 遇到 run_command/poll_run 覆盖不到的交互式提示（sudo 密码、\
+                    vim/REPL 里继续输入）用 send_input 直接发原始按键 → read_screen 看当前屏幕\
+                    （适合 vim/top 等交互式程序）→ read_history 看这个会话从头到现在的完整历史\
+                    （不止当前一屏）→ interrupt 发 Ctrl+C 中断。用 open_session 开的会话不再需要\
+                    时应主动用 close_session 关掉（只能关自己开的，不能关用户自己的会话），\
+                    避免一直占着连接。用户自己在用的会话里，命令和输出会实时显示在其正在看的\
+                    终端标签里。"
 )]
 impl ServerHandler for IshellMcp {}
 

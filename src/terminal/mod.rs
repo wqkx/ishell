@@ -73,6 +73,10 @@ pub struct Terminal {
     echo_pos: usize,
     /// 回显匹配完成后，再吞掉紧随的回车换行（命令执行的 Enter 回显）
     echo_tail: bool,
+    /// 部分匹配中暂存的疑似回显字节：真实内容里偶然出现和 `echo_expect` 开头相同的字节时，
+    /// 会先当作「可能是目标回显」而不立即输出；一旦后续字节证明只是巧合（失配），要把这些
+    /// 暂存字节还给真实输出，不能凭空丢掉。
+    echo_pending: Vec<u8>,
     /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
     ime_preedit: String,
     /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
@@ -95,6 +99,15 @@ struct AiCapture {
     /// 超过上限会从前端裁掉最早的部分并标记 `truncated`（极端长输出兜底，不做无界增长）。
     buf: Vec<u8>,
     truncated: bool,
+}
+
+/// 逐行裁掉行尾空白，再裁掉结尾的连续空行——`screen_text`/`history_text` 共用的收尾步骤。
+fn finalize_lines(lines: Vec<String>) -> Vec<String> {
+    let mut lines: Vec<String> = lines.into_iter().map(|l| l.trim_end().to_string()).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines
 }
 
 impl Terminal {
@@ -126,6 +139,7 @@ impl Terminal {
             echo_expect: Vec::new(),
             echo_pos: 0,
             echo_tail: false,
+            echo_pending: Vec::new(),
             ime_preedit: String::new(),
             prev_focused: false,
             prev_alt: false,
@@ -153,6 +167,7 @@ impl Terminal {
         self.echo_expect = s.as_bytes().to_vec();
         self.echo_pos = 0;
         self.echo_tail = false;
+        self.echo_pending.clear();
     }
 
     /// 武装一次「等待哨兵」捕获：`prefix` 是唯一前缀（含 nonce），命中后紧跟的退出码数字
@@ -194,17 +209,20 @@ impl Terminal {
             self.parser.screen_mut().set_scrollback(0);
         }
         let cols = self.cols;
-        let mut lines: Vec<String> = self
-            .parser
-            .screen()
-            .rows(0, cols)
-            .map(|l| l.trim_end().to_string())
-            .collect();
+        let lines: Vec<String> = self.parser.screen().rows(0, cols).collect();
         if saved != 0 {
             self.parser.screen_mut().set_scrollback(saved);
         }
-        while lines.last().is_some_and(|l| l.is_empty()) {
-            lines.pop();
+        finalize_lines(lines).join("\n")
+    }
+
+    /// 完整历史（回滚缓冲区 + 当前可见屏），从最早到最新排列；`max_lines == 0` 不限制，
+    /// 否则只保留最后 `max_lines` 行（避免超长回滚一次性喂给 AI）。
+    pub fn history_text(&mut self, max_lines: usize) -> String {
+        let mut lines = finalize_lines(self.collect_lines());
+        if max_lines > 0 && lines.len() > max_lines {
+            let start = lines.len() - max_lines;
+            lines.drain(..start);
         }
         lines.join("\n")
     }
