@@ -48,6 +48,11 @@ pub enum McpReqKind {
     Interrupt {
         session_uid: u64,
     },
+    /// 用一个已保存的连接（按名称）开一个新会话/标签，等价于用户在侧栏双击那条已保存连接。
+    OpenSession {
+        /// `SavedConnection.name`（侧栏里显示的那个名字）
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +67,8 @@ pub enum McpReqResult {
     Run(McpRunResult),
     Screen(String),
     Ok,
+    /// `OpenSession` 成功后新建会话的摘要（同 `McpSessionInfo`）。
+    Opened(McpSessionInfo),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

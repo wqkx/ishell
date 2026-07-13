@@ -132,6 +132,10 @@ pub struct App {
     logo: bool,
     /// AI/MCP 控制通道：本地 socket 收到的请求队列（未开启该功能时是个永远空的通道）
     mcp_rx: tokio::sync::mpsc::UnboundedReceiver<mcp_bridge::McpCall>,
+    /// AI 请求 `open_session` 时待用户确认的一条连接请求（同一时刻只允许一条待确认）
+    pending_open_consent: Option<mcp_bridge::PendingOpenConsent>,
+    /// 本次运行期间已被用户允许过的已保存连接名（内存态，不持久化；重启后需要重新确认）
+    mcp_open_approved: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -214,6 +218,8 @@ impl App {
             shot,
             logo: std::env::var("ISHELL_LOGO").is_ok() || std::env::var("ISHELL_ICON").is_ok(),
             mcp_rx,
+            pending_open_consent: None,
+            mcp_open_approved: std::collections::HashSet::new(),
         };
 
         app.apply_demo_flags(cc);
@@ -511,6 +517,7 @@ impl eframe::App for App {
 
         // 关闭确认：仍有会话连接时，先弹确认
         self.handle_close(&ctx);
+        self.handle_ai_open_consent(&ctx);
 
         // 自检截图驱动
         self.drive_screenshot(&ctx);

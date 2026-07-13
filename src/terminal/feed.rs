@@ -12,15 +12,12 @@ use super::{
 const AI_CAPTURE_CAP: usize = 4 * 1024 * 1024;
 
 impl Terminal {
-    /// 从输入字节里剥掉待吞的注入命令回显；遇到非预期可见字节即放弃（保证不误吞真实输出）。
+    /// 从输入字节里剥掉待吞的注入命令回显。武装后目标回显之前可能先到达其它真实内容（如
+    /// AI 命令场景里先发的真实命令自己的回显）——这些字节原样透传、不影响继续等待目标出现；
+    /// 只有在目标回显**已经部分匹配中**又出现意外字节，才判定为误判、放弃本次吞回显。
     fn strip_echo(&mut self, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len());
-        let mut aborted = false;
         for &b in input {
-            if aborted {
-                out.push(b);
-                continue;
-            }
             if self.echo_pos < self.echo_expect.len() {
                 if b == self.echo_expect[self.echo_pos] {
                     self.echo_pos += 1;
@@ -29,24 +26,26 @@ impl Terminal {
                     }
                     continue;
                 }
-                if b == b'\r' || b == b'\n' {
-                    continue; // 终端自动换行/回显格式，忽略
+                if self.echo_pos == 0 {
+                    // 匹配还没开始：这是抢在目标回显之前到达的真实内容，原样透传，继续等
+                    out.push(b);
+                    continue;
                 }
-                // 出现非预期可见字节：放弃吞回显，原样输出剩余（避免误吞真实内容）
+                if b == b'\r' || b == b'\n' {
+                    continue; // 部分匹配中，终端自动换行/回显格式，忽略
+                }
+                // 部分匹配中途出现意外字节：放弃本次吞回显，恢复未匹配状态，原样透传剩余
                 self.echo_expect.clear();
                 self.echo_pos = 0;
                 self.echo_tail = false;
-                aborted = true;
                 out.push(b);
             } else if self.echo_tail {
                 if b == b'\r' || b == b'\n' {
                     continue;
                 }
                 self.echo_tail = false;
-                aborted = true;
                 out.push(b);
             } else {
-                aborted = true;
                 out.push(b);
             }
         }

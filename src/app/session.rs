@@ -65,6 +65,8 @@ pub(super) struct Session {
     pub(super) monitor_ok: Option<bool>,
     /// AI/MCP 控制通道正在等待完成的一次命令运行（同一会话同一时刻只允许一条）
     pub(super) pending_ai_run: Option<super::PendingAiRun>,
+    /// 是否由 AI 通过 `open_session` 新开（只读：用户键盘输入不会发给这个会话，只能看不能敲）
+    pub(super) ai_owned: bool,
 }
 
 /// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
@@ -172,6 +174,7 @@ impl App {
             osc7_pending_reveal: false,
             monitor_ok: None,
             pending_ai_run: None,
+            ai_owned: false,
         });
         self.active = Some(self.sessions.len() - 1);
         self.tabbar.scroll_to_active = true; // 新建标签后滚动到可视区

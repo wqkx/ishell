@@ -117,6 +117,32 @@ pub async fn run(
         tokio::sync::mpsc::unbounded_channel::<Option<russh_sftp::client::SftpSession>>();
     let mut sftp_reconnecting = false;
 
+    // 2.5) AI/MCP 反向转发：把本机 mcp.sock 反向转发到这台远端主机，让"能 SSH 到这台服务器
+    // 的人"也能连到转发出来的 socket 控制本机 iShell（复用这条已认证/加密的 SSH 连接，
+    // 不额外开监听端口）。仅当设置里已开启 AI/MCP 控制时才注册；失败不影响正常连接使用。
+    //
+    // 远端路径带随机后缀（而非固定的 ~/.ishell-mcp.sock）：同一台主机短时间内被反复连接/
+    // 重连时，服务器端可能因为迟迟未判定旧连接已死（无 keepalive 时 TCP 层探测很慢）而拒绝
+    // 复用同一个固定路径的新注册请求（"rejected by the other party"）。加上随机后缀后各次
+    // 连接互不冲突；对端按 `~/.ishell-mcp-*.sock` 通配、取最新一个即可发现当前有效的路径。
+    if crate::store::load_mcp_consent() {
+        let fwd_handle = handle.clone();
+        tokio::spawn(async move {
+            let home = match exec_capture(&fwd_handle, "echo -n $HOME").await {
+                Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
+                _ => return, // 探测不到远端 HOME：放弃转发，不影响其余功能
+            };
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let remote_path = format!("{home}/.ishell-mcp-{nonce}.sock");
+            if let Err(e) = fwd_handle.streamlocal_forward(remote_path).await {
+                log::debug!("AI/MCP 反向转发注册失败：{e}");
+            }
+        });
+    }
+
     // 3) 系统信息采集任务（独立 handle 克隆，互不阻塞）
     // 先探测 uname：非 Linux 或无 /proc 则禁用监控，避免空数据/误杀进程。
     let probe_handle = handle.clone();

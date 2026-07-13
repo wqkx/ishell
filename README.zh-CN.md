@@ -183,6 +183,21 @@ cargo run --release
   输出+退出码）、`poll_run`（对一次超时未完成的命令继续等待，不重发）、`read_screen`（类似
   `tmux capture-pane`，导出当前可见屏幕纯文本，适合看 `vim`/`top` 这类交互式程序）、
   `interrupt`（发送 Ctrl+C）。
+- **远程访问，自动完成**。开关打开后，iShell 每次连上一台服务器，都会顺便把本机的 `mcp.sock`
+  经这条已认证加密的 SSH 连接反向转发到**那台服务器**上的 `~/.ishell-mcp-<随机后缀>.sock`
+  （每次连接的后缀都不同，重连时不会跟服务器还没判定为死亡的上一条连接抢同一个路径）——
+  不额外开监听端口，也不需要单独管理一套凭据。谁能 SSH 到那台服务器，谁就能通过转发出来的
+  socket 控制这边的 iShell，所以只对你真正信任的服务器开启这个开关。`ishell-mcp` 自己会动态
+  探测当前有效的转发 socket（每次调用都重新找一遍最新的 `~/.ishell-mcp-*.sock`），不需要配置
+  路径，iShell 重连后也不用重连 MCP client：
+  ```bash
+  /path/to/ishell-mcp
+  ```
+- **手动方式**：不依赖上面的自动反向转发，自己用 SSH 转发：
+  ```bash
+  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp.sock user@ishell-host &
+  ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
+  ```
 
 ## 🔒 安全
 

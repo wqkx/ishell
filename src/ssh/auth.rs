@@ -28,6 +28,9 @@ pub(crate) struct ClientHandler {
     decision_rx: HostKeyDecision,
     /// 是否转发本机 ssh-agent：为真时桥接远端回连的 auth-agent 通道到本地 agent
     agent_forward: bool,
+    /// 是否把本机 AI/MCP 控制 socket 反向转发到这台远端主机
+    /// （远端能连到转发出来的 socket，等于能控制本机 iShell）
+    mcp_forward: bool,
 }
 
 /// 用户主目录下的 known_hosts 路径（与 russh 内部一致）。
@@ -113,6 +116,24 @@ impl Handler for ClientHandler {
             tokio::spawn(async move {
                 if let Err(e) = bridge_local_agent(channel).await {
                     log::debug!("agent 转发桥接结束：{e}");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    // 远端连接我们此前用 streamlocal_forward 反向登记的 socket 路径时，服务器经此回调开一个
+    // 通道；桥接到本机 AI/MCP 控制 socket，即实现「远端能连到转发出来的 socket 就能控制本机」。
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _socket_path: &str,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if self.mcp_forward {
+            tokio::spawn(async move {
+                if let Err(e) = bridge_local_mcp(channel).await {
+                    log::debug!("AI/MCP 反向转发桥接结束：{e}");
                 }
             });
         }
@@ -342,6 +363,16 @@ async fn bridge_local_agent(channel: Channel<client::Msg>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// 把一条反向转发来的通道桥接到本机 AI/MCP 控制 socket（`~/.config/ishell/mcp.sock`）。
+async fn bridge_local_mcp(channel: Channel<client::Msg>) -> anyhow::Result<()> {
+    let sock = crate::store::mcp_socket_path()
+        .ok_or_else(|| anyhow::anyhow!("mcp socket 路径不可用（无法确定用户目录）"))?;
+    let mut remote = channel.into_stream();
+    let mut local = tokio::net::UnixStream::connect(&sock).await?;
+    tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
+    Ok(())
+}
+
 /// 键盘交互（keyboard-interactive）认证：循环把服务器提示交给 UI、等回答再提交，
 /// 直至成功或失败。支持 OTP / 二次验证等多步提示。响应经 `cmd_rx` 收 `KbdResponse`。
 async fn authenticate_interactive<H>(
@@ -418,6 +449,7 @@ pub(super) async fn connect(
         sink: sink.clone(),
         decision_rx: decision_rx.clone(),
         agent_forward: cfg.forward_agent,
+        mcp_forward: crate::store::load_mcp_consent(),
     };
 
     let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {

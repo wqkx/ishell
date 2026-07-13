@@ -185,6 +185,25 @@ spawning a throwaway `ssh host cmd` that loses your shell's cwd, env, and histor
   output + exit code), `poll_run` (keep waiting on a timed-out command without resending it),
   `read_screen` (tmux `capture-pane`-style dump of the visible screen, for interactive programs
   like `vim`/`top`), `interrupt` (send Ctrl+C).
+- **Remote access, automatic.** Whenever iShell opens an SSH session to a server (with this
+  setting on), it also reverse-forwards its local `mcp.sock` to `~/.ishell-mcp-<nonce>.sock`
+  **on that remote server** (a random suffix per connection, so a reconnect never collides with
+  a not-yet-expired previous forward), over the very same authenticated/encrypted SSH connection
+  (no new listening port anywhere, no extra credentials to manage). Anyone who can already SSH
+  into that server can reach iShell through the forwarded socket — so only enable this for
+  servers you'd trust with that level of access. `ishell-mcp` auto-discovers the current forwarded
+  socket on its own (it re-probes on every call, picking the newest `~/.ishell-mcp-*.sock`) — just
+  run it on (or with SSH access to) that server, no path to configure and no need to reconnect the
+  MCP client after iShell reconnects:
+  ```bash
+  /path/to/ishell-mcp
+  ```
+- **Manual alternative**: forward the socket yourself with plain SSH instead of relying on the
+  automatic reverse-forward above:
+  ```bash
+  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp.sock user@ishell-host &
+  ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
+  ```
 
 ## 🔒 Security
 

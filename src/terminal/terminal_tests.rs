@@ -188,6 +188,27 @@ fn ai_capture_ignores_unmatched_prefix() {
 }
 
 #[test]
+fn expect_echo_survives_unrelated_bytes_arriving_first() {
+    // 复现场景：AI 命令先发真实命令（其自身回显不该被吞），紧接着发标记行（回显要被吞掉）。
+    // 两条命令的回显可能在同一批/相邻几批字节里先后到达，标记行回显不一定是 armed 之后
+    // 第一批收到的字节。之前的实现一旦第一个字节对不上就永久放弃吞回显，导致标记行原样漏出。
+    let mut t = Terminal::new();
+    let marker = "printf '\x1eAI_DONE_1:%d\x1e' $?; printf '\\r\\x1b[K'";
+    t.expect_echo(marker);
+    // 先到达的是真实命令自己的回显+输出：不该被吞，也不该打断后续对标记行的匹配。
+    t.feed(b"echo hi\r\nhi\r\n");
+    // 标记行的回显紧随其后到达：应被完整吞掉，不出现在可见输出里。
+    t.feed(marker.as_bytes());
+    t.feed(b"\r\n");
+    let visible = t.screen_text();
+    assert!(visible.contains("hi"), "真实命令输出不应被误吞：{visible:?}");
+    assert!(
+        !visible.contains("printf"),
+        "标记行回显应被吞掉，不应出现在可见终端里：{visible:?}"
+    );
+}
+
+#[test]
 fn strip_ansi_removes_escapes_and_normalizes_newlines() {
     use super::vt::strip_ansi_to_text;
     let raw = b"\x1b[32mgreen\x1b[0m text\r\nline2\x1b]0;title\x07end";

@@ -555,6 +555,53 @@ impl App {
                 });
         }
     }
+
+    /// AI 首次通过 `open_session` 使用某条已保存连接时，弹窗等用户当面批准（而不是仅凭
+    /// AI 传的名字字符串就信任）；批准后本次运行期间对同一条连接不再重复询问。
+    pub(super) fn handle_ai_open_consent(&mut self, ctx: &egui::Context) {
+        let Some(name) = self
+            .pending_open_consent
+            .as_ref()
+            .map(|p| p.conn.name.clone())
+        else {
+            return;
+        };
+        egui::Modal::new(egui::Id::new("ai_open_consent_modal")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(crate::i18n::tr("AI 请求新开一个终端会话", "AI wants to open a new terminal session"))
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!(
+                        "AI 想用已保存连接 “{name}” 新开一个终端会话。这个会话会由 AI 驱动执行命令，\
+                         你可以实时看到，但键盘输入不会发给它。是否允许？"
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "AI wants to open a new terminal session using the saved connection “{name}”. \
+                         AI will drive it; you can watch in real time, but your keystrokes won't be \
+                         sent to it. Allow?"
+                    ),
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let bw = 96.0;
+                let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                let space = ((ui.available_width() - total) / 2.0).max(0.0);
+                ui.add_space(space);
+                if dialog_button(ui, crate::i18n::tr("允许", "Allow"), Some(Palette::ACCENT), bw) {
+                    self.resolve_open_consent(true);
+                }
+                if dialog_button(ui, crate::i18n::tr("拒绝", "Deny"), Some(Palette::DANGER), bw) {
+                    self.resolve_open_consent(false);
+                }
+            });
+        });
+    }
 }
 
 impl App {}

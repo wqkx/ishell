@@ -21,12 +21,40 @@ use mcp_protocol::{McpReqKind, McpReqResult, McpRequest, McpResponse};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 每次调用都重新探测（而非启动时定死一个路径），因为反向转发的 socket 路径每次 iShell
+/// 重连都会换一个带随机后缀的新名字（见 `src/ssh/mod.rs`）——固定住只会导致每次重连都要手动
+/// 改 `ISHELL_MCP_SOCKET` 再重连 MCP client，体验很差。按优先级探测：
+///   1. `ISHELL_MCP_SOCKET` 显式指定（手动隧道场景，最明确，始终优先）；
+///   2. `~/.config/ishell/mcp.sock`（同机场景：iShell 和这个代理跑在同一台机器上）；
+///   3. `~/.ishell-mcp-*.sock` 里 mtime 最新的一个（iShell 反向转发到「这个代理所在的机器」
+///      时会落在这里；每次重连都是新文件，取最新的即可自动跟上，不用手动改配置）。
+/// 都没有时回退到 (2) 的默认路径，让错误信息保持原样好懂。
 fn socket_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
+        return std::path::PathBuf::from(p);
+    }
     let home = std::env::var_os("HOME").expect("HOME 环境变量未设置");
-    std::path::PathBuf::from(home)
+    let same_machine = std::path::PathBuf::from(&home)
         .join(".config")
         .join("ishell")
-        .join("mcp.sock")
+        .join("mcp.sock");
+    if same_machine.exists() {
+        return same_machine;
+    }
+    let newest_forwarded = std::fs::read_dir(&home).ok().and_then(|entries| {
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".ishell-mcp-") && n.ends_with(".sock"))
+            })
+            .filter_map(|p| p.metadata().and_then(|m| m.modified()).ok().map(|t| (t, p)))
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, p)| p)
+    });
+    newest_forwarded.unwrap_or(same_machine)
 }
 
 /// 连接 iShell 主进程的本地 socket，发一条请求、等一行 JSON 响应（一次连接=一问一答）。
@@ -91,6 +119,12 @@ pub struct PollRunArgs {
 pub struct SessionArgs {
     /// list_sessions 返回的会话 uid
     pub session_uid: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct OpenSessionArgs {
+    /// 已保存连接的名称（iShell 侧栏里显示的那个名字，不是主机地址）
+    pub name: String,
 }
 
 #[tool_router]
@@ -163,11 +197,23 @@ impl IshellMcp {
     ) -> Result<CallToolResult, McpError> {
         text_result(call(McpReqKind::Interrupt { session_uid }).await)
     }
+
+    #[tool(
+        description = "用一个已保存的连接（按名称，即 list_sessions/侧栏里显示的那个名字）新开一个终端会话/标签，\
+                        等价于用户在 iShell 侧栏里双击这条已保存连接。返回新会话的 uid，可直接用于后续 run_command。"
+    )]
+    async fn open_session(
+        &self,
+        Parameters(OpenSessionArgs { name }): Parameters<OpenSessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        text_result(call(McpReqKind::OpenSession { name }).await)
+    }
 }
 
 #[tool_handler(
     instructions = "驱动本机 iShell 已打开的终端会话（而不是另开一条无上下文的 ssh 连接）：\
-                    list_sessions 看有哪些会话 → run_command 执行命令并等待完成 → \
+                    list_sessions 看有哪些会话 → 需要的目标不在列表里时用 open_session（按已保存连接的名称）\
+                    新开一个 → run_command 执行命令并等待完成 → \
                     超时用 poll_run 续等 → read_screen 看当前屏幕（适合交互式程序）→ \
                     interrupt 发 Ctrl+C。命令会实时显示在用户正在看的终端标签里。"
 )]

@@ -125,9 +125,14 @@ pub fn view_context_menu(resp: &egui::Response) {
             )
             .on_hover_text(crate::i18n::tr(
                 "开启后本机可通过本地 MCP server 驱动已打开的终端会话（发命令、读输出）；\
-                 仅本地 Unix socket，不监听网络端口",
+                 本身不监听网络端口，但会把这个控制通道反向转发到你连接的每一台服务器\
+                 （复用该 SSH 连接）——谁能 SSH 到那台服务器，谁就能借此控制本机 iShell，\
+                 只对可信的服务器开启",
                 "Lets an AI client drive your open terminal sessions via a local MCP server \
-                 (run commands, read output); local Unix socket only, no network exposure",
+                 (run commands, read output); doesn't open a network port itself, but reverse-\
+                 forwards this control channel to every server you connect to (over that SSH \
+                 session) — anyone who can SSH into that server can control this iShell through \
+                 it, so only enable this for servers you trust",
             ))
             .clicked()
         {

@@ -78,8 +78,25 @@ impl App {
                         });
                     ui.add_space(4.0);
                 }
-                // AI/MCP 控制通道已开启：提示用户此终端可能被 AI 助手驱动（发命令、读输出）
-                if crate::store::load_mcp_consent() {
+                // AI/MCP 控制通道已开启：提示用户此终端可能被 AI 助手驱动（发命令、读输出）；
+                // ai_owned 会话是 AI 自己新开的只读会话，用不同文案说明「只能看不能敲」。
+                if s.ai_owned {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  {}",
+                                egui_phosphor::regular::ROBOT,
+                                crate::i18n::tr(
+                                    "AI 正在驱动此终端（只读，你的按键不会发送到这里）",
+                                    "AI is driving this terminal (read-only — your keystrokes aren't sent here)",
+                                ),
+                            ))
+                            .color(Palette::ACCENT)
+                            .size(11.0),
+                        );
+                    });
+                    ui.add_space(2.0);
+                } else if crate::store::load_mcp_consent() {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(format!(
@@ -94,7 +111,9 @@ impl App {
                     ui.add_space(2.0);
                 }
                 let input = s.terminal.ui(ui);
-                if !input.is_empty() {
+                // ai_owned 会话由 AI 驱动：用户仍可看（渲染/滚动/查找都照常），但键盘输入
+                // 不转发给远端，避免用户误敲打断 AI 正在等待的哨兵检测。
+                if !input.is_empty() && !s.ai_owned {
                     let _ = s.cmd_tx.send(UiCommand::TerminalInput(input));
                 }
                 // 右键菜单「在文件列表中显示当前目录」：把文件区导航到终端当前目录
