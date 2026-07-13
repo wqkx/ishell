@@ -11,6 +11,23 @@ impl Session {
     /// 超出预算的事件留在队列、下一帧继续（返回 true 表示还有积压需要重绘）——
     /// 远端持续大量输出时 UI 仍按帧渲染，不会被「全量排空循环」饿死。
     pub(crate) fn drain_events(&mut self) -> bool {
+        // 系统信息走独立 watch 通道（只保留最新一份，不随 UI 排空节奏堆积），每帧单独取一次。
+        if self.sysinfo_rx.has_changed().unwrap_or(false) {
+            if let Some(info) = self.sysinfo_rx.borrow_and_update().clone() {
+                // 历史曲线记录当前选中网卡（空=全部）的速率
+                let (rx, tx) = if self.selected_nic.is_empty() {
+                    (info.net_rx_bps, info.net_tx_bps)
+                } else {
+                    info.nets
+                        .iter()
+                        .find(|n| n.name == self.selected_nic)
+                        .map(|n| (n.rx_bps, n.tx_bps))
+                        .unwrap_or((info.net_rx_bps, info.net_tx_bps))
+                };
+                self.net_hist.push(rx, tx);
+                self.sysinfo = Some(info);
+            }
+        }
         let mut term_budget: usize = 2 * 1024 * 1024;
         let mut evt_budget: usize = 512;
         loop {
@@ -139,20 +156,6 @@ impl Session {
                     if let Some(c) = self.terminal.cwd() {
                         self.last_cwd = c.to_string();
                     }
-                }
-                WorkerEvent::SysInfo(info) => {
-                    // 历史曲线记录当前选中网卡（空=全部）的速率
-                    let (rx, tx) = if self.selected_nic.is_empty() {
-                        (info.net_rx_bps, info.net_tx_bps)
-                    } else {
-                        info.nets
-                            .iter()
-                            .find(|n| n.name == self.selected_nic)
-                            .map(|n| (n.rx_bps, n.tx_bps))
-                            .unwrap_or((info.net_rx_bps, info.net_tx_bps))
-                    };
-                    self.net_hist.push(rx, tx);
-                    self.sysinfo = Some(*info);
                 }
                 WorkerEvent::DirListing { path, entries } => {
                     self.files.on_listing(path, entries);

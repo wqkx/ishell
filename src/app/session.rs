@@ -16,6 +16,8 @@ pub(super) struct Session {
     pub(super) tip: String,
     pub(super) cmd_tx: UnboundedSender<UiCommand>,
     pub(super) evt_rx: std::sync::mpsc::Receiver<WorkerEvent>,
+    /// 系统信息快照（独立 watch 通道，只保留最新一份，见 `UiSink::send_sysinfo`）
+    pub(super) sysinfo_rx: tokio::sync::watch::Receiver<Option<crate::proto::SysInfo>>,
     pub(super) connected: bool,
     pub(super) status: String,
     pub(super) terminal: Terminal,
@@ -104,19 +106,21 @@ impl App {
     ) -> (
         UnboundedSender<UiCommand>,
         std::sync::mpsc::Receiver<WorkerEvent>,
+        tokio::sync::watch::Receiver<Option<crate::proto::SysInfo>>,
         UnboundedSender<bool>,
     ) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let (sysinfo_tx, sysinfo_rx) = tokio::sync::watch::channel(None);
         let (hostkey_tx, hostkey_rx) = tokio::sync::mpsc::unbounded_channel();
-        let sink = UiSink::new(evt_tx, self.ctx.clone());
+        let sink = UiSink::new(evt_tx, self.ctx.clone(), std::sync::Arc::new(sysinfo_tx));
         self.runtime.spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx));
-        (cmd_tx, evt_rx, hostkey_tx)
+        (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx)
     }
 
     pub(super) fn spawn_session(&mut self, cfg: ConnectConfig) {
         self.show_close_confirm = false; // 新建会话则取消退出提示
-        let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg.clone());
+        let (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx) = self.spawn_worker(cfg.clone());
 
         self.next_uid += 1;
         self.sessions.push(Session {
@@ -129,6 +133,7 @@ impl App {
             tip: format!("{}@{}:{}", cfg.username, cfg.host, cfg.port),
             cmd_tx,
             evt_rx,
+            sysinfo_rx,
             connected: false,
             status: crate::i18n::tr("连接中 …", "Connecting …").into(),
             terminal: Terminal::new(),
@@ -175,13 +180,14 @@ impl App {
             return;
         };
         let cfg = s.cfg.clone();
-        let (cmd_tx, evt_rx, hostkey_tx) = self.spawn_worker(cfg);
+        let (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx) = self.spawn_worker(cfg);
         let Some(s) = self.sessions.get_mut(idx) else {
             return;
         };
         let uid = s.uid;
         s.cmd_tx = cmd_tx.clone();
         s.evt_rx = evt_rx;
+        s.sysinfo_rx = sysinfo_rx;
         s.hostkey_tx = hostkey_tx;
         s.connected = false;
         s.initialized = false;

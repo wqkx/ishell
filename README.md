@@ -12,7 +12,7 @@ System monitor · interactive terminal · SFTP file manager · port forwarding �
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-> **Latest release:** [v0.15.0](https://github.com/wqkx/ishell/releases/tag/v0.15.0)
+> **Latest release:** [v0.15.1](https://github.com/wqkx/ishell/releases/tag/v0.15.1)
 
 ![iShell](docs/screenshots/hero.png)
 

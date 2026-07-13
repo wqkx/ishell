@@ -208,8 +208,6 @@ pub enum WorkerEvent {
     Disconnected(String),
     /// 来自远程 shell 的原始字节，喂给 vt100 解析器
     TerminalData(Vec<u8>),
-    /// 周期性系统信息快照
-    SysInfo(Box<SysInfo>),
     /// 远端是否支持 Linux /proc 系统监控（连接后探测一次）
     MonitorSupport(bool),
     /// 目录列表结果

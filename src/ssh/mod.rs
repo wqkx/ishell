@@ -29,14 +29,31 @@ use xfer::{start_xfer, PendingXfer, XferCancel, MAX_CONCURRENT_XFER};
 pub struct UiSink {
     tx: std::sync::mpsc::Sender<WorkerEvent>,
     ctx: egui::Context,
+    /// 系统信息走独立的 watch 通道而非 mpsc 队列：窗口最小化等导致 UI 长时间不排空时，
+    /// mpsc 会把每 2 秒一份的快照无限堆积（真实内存暴涨根因）；watch 只保留「最新一份」，
+    /// 天然与是否被及时消费无关，恢复窗口后也不会有积压可"爆发式重绘"。
+    sysinfo_tx: Arc<tokio::sync::watch::Sender<Option<crate::proto::SysInfo>>>,
 }
 
 impl UiSink {
-    pub fn new(tx: std::sync::mpsc::Sender<WorkerEvent>, ctx: egui::Context) -> Self {
-        Self { tx, ctx }
+    pub fn new(
+        tx: std::sync::mpsc::Sender<WorkerEvent>,
+        ctx: egui::Context,
+        sysinfo_tx: Arc<tokio::sync::watch::Sender<Option<crate::proto::SysInfo>>>,
+    ) -> Self {
+        Self {
+            tx,
+            ctx,
+            sysinfo_tx,
+        }
     }
     fn send(&self, ev: WorkerEvent) {
         let _ = self.tx.send(ev);
+        self.ctx.request_repaint();
+    }
+    /// 周期性系统信息快照：覆盖式发送（只留最新），不进入 mpsc 队列。
+    fn send_sysinfo(&self, info: crate::proto::SysInfo) {
+        let _ = self.sysinfo_tx.send(Some(info));
         self.ctx.request_repaint();
     }
 }
@@ -128,7 +145,7 @@ pub async fn run(
             match exec_capture(&probe_handle, PROBE_CMD).await {
                 Ok(out) => {
                     let info = sampler.parse(&out);
-                    probe_sink.send(WorkerEvent::SysInfo(Box::new(info)));
+                    probe_sink.send_sysinfo(info);
                 }
                 Err(_) => break, // 连接已断
             }
