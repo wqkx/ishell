@@ -100,7 +100,7 @@ impl Terminal {
                             _ => {}
                         }
                     }
-                    encode_key(key, modifiers, &mut out);
+                    encode_key(key, modifiers, self.parser.screen().application_cursor(), &mut out);
                 }
                 _ => {}
             }

@@ -2,7 +2,13 @@
 
 use egui::{Key, Modifiers};
 
-pub(super) fn encode_key(key: Key, mods: Modifiers, out: &mut Vec<u8>) {
+/// `app_cursor`：远端是否已启用「应用光标键模式」（DECCKM，`CSI ?1h`）。ncurses 程序
+/// （htop/vim/less 等）初始化时靠 terminfo 的 `smkx` 能力打开这个模式，之后期望方向键/
+/// Home/End 编码为 SS3 形式（`ESC O A` 等），不再是普通形式（`ESC [ A`）。此前无论模式如何
+/// 都只发普通形式——htop 开启 DECCKM 后收到的 `ESC [ A` 对不上它的解析器，会把转义序列
+/// 拆开当成散落的普通字符处理，其中 `[`/`]` 恰好是 htop 的「降/升 nice」快捷键，表现为
+/// 「按上下键变成改了 NI」。同理受影响的不止 htop，任何按标准 DECCKM 协议走的全屏程序都会。
+pub(super) fn encode_key(key: Key, mods: Modifiers, app_cursor: bool, out: &mut Vec<u8>) {
     // Ctrl+Shift+C/V 保留给复制/粘贴，不作为终端输入
     if (mods.ctrl || mods.command) && mods.shift && matches!(key, Key::C | Key::V | Key::F) {
         return;
@@ -19,12 +25,12 @@ pub(super) fn encode_key(key: Key, mods: Modifiers, out: &mut Vec<u8>) {
         Key::Backspace => out.push(0x7f),
         Key::Tab => out.push(b'\t'),
         Key::Escape => out.push(0x1b),
-        Key::ArrowUp => out.extend_from_slice(b"\x1b[A"),
-        Key::ArrowDown => out.extend_from_slice(b"\x1b[B"),
-        Key::ArrowRight => out.extend_from_slice(b"\x1b[C"),
-        Key::ArrowLeft => out.extend_from_slice(b"\x1b[D"),
-        Key::Home => out.extend_from_slice(b"\x1b[H"),
-        Key::End => out.extend_from_slice(b"\x1b[F"),
+        Key::ArrowUp => out.extend_from_slice(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }),
+        Key::ArrowDown => out.extend_from_slice(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }),
+        Key::ArrowRight => out.extend_from_slice(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }),
+        Key::ArrowLeft => out.extend_from_slice(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }),
+        Key::Home => out.extend_from_slice(if app_cursor { b"\x1bOH" } else { b"\x1b[H" }),
+        Key::End => out.extend_from_slice(if app_cursor { b"\x1bOF" } else { b"\x1b[F" }),
         Key::PageUp => out.extend_from_slice(b"\x1b[5~"),
         Key::PageDown => out.extend_from_slice(b"\x1b[6~"),
         Key::Insert => out.extend_from_slice(b"\x1b[2~"),
