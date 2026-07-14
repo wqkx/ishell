@@ -12,9 +12,7 @@
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-> **最新版本：** [v0.15.1](https://github.com/wqkx/ishell/releases/tag/v0.15.1)
-
-![iShell](docs/screenshots/hero.png)
+> **最新版本：** [v0.16.3](https://github.com/wqkx/ishell/releases/tag/v0.16.3)
 
 </div>
 
