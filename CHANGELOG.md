@@ -2,6 +2,12 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [0.16.4] - 2026-07-14
+
+### Changed
+- 应用图标与 README 顶部 logo 换新（新的像素风 3D 立体字 wordmark），统一加上圆角，
+  同步更新 `assets/icon.png` / `assets/icon.ico` / `assets/macos/icon.png` / `docs/logo.png`
+
 ## [0.16.3] - 2026-07-14
 
 ### Fixed
