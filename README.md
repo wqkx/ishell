@@ -167,41 +167,63 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 
 ## 🤖 AI / MCP integration
 
-Let an AI assistant (e.g. Claude Code) drive a terminal session you already have open — instead of
-spawning a throwaway `ssh host cmd` that loses your shell's cwd, env, and history every time.
+Let an AI assistant (e.g. Claude Code) drive a real terminal session — instead of spawning a
+throwaway `ssh host cmd` that loses your shell's cwd, env, and history every time. It can either
+take over a tab you already have open, or open a brand-new one itself from a saved connection
+(read-only, for the AI's own use — a human can't type into it). Either way, the tab gets a clear
+🤖 indicator in the tab bar.
 
 - **Off by default.** Enable it via the right-click settings menu → "Allow AI to control terminal
-  via MCP" (takes effect after restart). It only listens on a local Unix domain socket
-  (`~/.config/ishell/mcp.sock`, mode `0600`) — no network port is opened.
-- **Shared, visible terminal.** Commands the AI runs — and their output — appear in the same
-  terminal tab you're looking at, in real time, exactly as if you'd typed them yourself. A small
-  🤖 indicator shows in the terminal pane while this is enabled.
+  via MCP" (takes effect after restart). It only listens on a local Unix domain socket — one per
+  iShell process (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port is opened.
+- **Shared, visible terminal.** Commands the AI runs — and their output — appear in the
+  corresponding terminal tab in real time, exactly as if you'd typed them yourself.
 - **Setup**: build the companion binary (`cargo build --release --bin ishell-mcp`) and point your
-  MCP client at it, e.g. in Claude Code's MCP config:
+  MCP client at it. With Claude Code, register it globally (not scoped to one project) in one line:
+  ```bash
+  claude mcp add ishell -s user -- /path/to/ishell-mcp
+  ```
+  or configure it by hand:
   ```json
   { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
   ```
-- **Tools exposed**: `list_sessions`, `run_command` (waits for completion or a timeout, returns
-  output + exit code), `poll_run` (keep waiting on a timed-out command without resending it),
-  `read_screen` (tmux `capture-pane`-style dump of the visible screen, for interactive programs
-  like `vim`/`top`), `interrupt` (send Ctrl+C).
+- **Tools exposed**:
+  - `list_sessions` / `list_saved_connections`: list currently open sessions / all saved
+    connection configs;
+  - `open_session`: open a new read-only session from a saved connection for the AI's own use;
+    first use of a given connection pops a confirmation dialog for you to approve, no repeat
+    prompt for the rest of that run;
+  - `close_session`: close a session the AI itself opened (it can't close yours);
+  - `run_command`: run a command and wait for completion or a timeout, returning output + exit
+    code; `poll_run` keeps waiting on a timed-out command without resending it; for long tasks,
+    just pass a large `timeout_ms` directly (up to 24h) instead of polling with `sleep`;
+  - `send_input`: send raw keystrokes straight to an interactive prompt (a `sudo` password,
+    continuing input inside `vim`/a REPL), bypassing completion detection;
+  - `read_screen`: a tmux `capture-pane`-style dump of the visible screen, for interactive
+    programs like `vim`/`top`; `read_history` reads that session's full scrollback from the start,
+    not just one screen;
+  - `interrupt`: send Ctrl+C — also the escape hatch for the concurrency guard: a session only
+    ever allows one pending AI command at a time, and calling `interrupt` immediately frees it up
+    if stuck (at the cost of losing that command's result);
+  - `write_file` / `read_file`: read/write a remote text file over the existing SFTP connection,
+    no need to shell out to `scp`.
 - **Remote access, automatic.** Whenever iShell opens an SSH session to a server (with this
-  setting on), it also reverse-forwards its local `mcp.sock` to `~/.ishell-mcp-<nonce>.sock`
+  setting on), it also reverse-forwards its local MCP socket to `~/.ishell-mcp-<nonce>.sock`
   **on that remote server** (a random suffix per connection, so a reconnect never collides with
   a not-yet-expired previous forward), over the very same authenticated/encrypted SSH connection
   (no new listening port anywhere, no extra credentials to manage). Anyone who can already SSH
   into that server can reach iShell through the forwarded socket — so only enable this for
   servers you'd trust with that level of access. `ishell-mcp` auto-discovers the current forwarded
-  socket on its own (it re-probes on every call, picking the newest `~/.ishell-mcp-*.sock`) — just
-  run it on (or with SSH access to) that server, no path to configure and no need to reconnect the
-  MCP client after iShell reconnects:
+  socket on its own (it re-probes on every call, picking the newest connectable `mcp-*.sock` /
+  `~/.ishell-mcp-*.sock`) — just run it on (or with SSH access to) that server, no path to
+  configure and no need to reconnect the MCP client after iShell reconnects:
   ```bash
   /path/to/ishell-mcp
   ```
 - **Manual alternative**: forward the socket yourself with plain SSH instead of relying on the
-  automatic reverse-forward above:
+  automatic reverse-forward above (substitute the actual pid in the socket name):
   ```bash
-  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp.sock user@ishell-host &
+  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
   ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
   ```
 

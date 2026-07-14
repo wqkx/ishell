@@ -167,35 +167,51 @@ cargo run --release
 
 ## 🤖 AI / MCP 集成
 
-让 AI 助手（如 Claude Code）直接驱动你已经打开的终端会话——而不是每次都另开一条丢光 cwd/环境/
-历史的 `ssh host cmd`。
+让 AI 助手（如 Claude Code）直接驱动一个真实的终端会话——而不是每次都另开一条丢光 cwd/环境/
+历史的 `ssh host cmd`。既可以接管你已经打开的标签，也可以让 AI 用一个已保存的连接自己新开一个
+（只读，仅供 AI 操作，人不能往里打字），两种会话在标签栏都会有醒目的 🤖 标识。
 
 - **默认关闭**。在右键设置菜单里打开"允许 AI 通过 MCP 控制终端"（需重启生效）。只监听本地
-  Unix domain socket（`~/.config/ishell/mcp.sock`，权限 `0600`），不监听任何网络端口。
-- **共享可见终端**。AI 执行的命令和产生的输出会实时显示在你正在看的那个终端标签里，效果等同于
-  你亲自输入；开启后终端区域会有一个小小的 🤖 标识提示。
+  Unix domain socket（每个 iShell 进程各一份 `~/.config/ishell/mcp-<pid>.sock`，权限 `0600`），
+  不监听任何网络端口。
+- **共享可见终端**。AI 执行的命令和产生的输出会实时显示在对应终端标签里，效果等同于人亲自输入。
 - **接入方式**：编译配套的独立二进制（`cargo build --release --bin ishell-mcp`），在 MCP 客户端
-  （如 Claude Code）里指向它，例如：
+  里指向它。用 Claude Code 的话可以直接注册为全局可用（不限于某个项目目录）：
+  ```bash
+  claude mcp add ishell -s user -- /path/to/ishell-mcp
+  ```
+  或手写配置：
   ```json
   { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
   ```
-- **暴露的工具**：`list_sessions`（列出会话）、`run_command`（执行命令并等待完成或超时，返回
-  输出+退出码）、`poll_run`（对一次超时未完成的命令继续等待，不重发）、`read_screen`（类似
-  `tmux capture-pane`，导出当前可见屏幕纯文本，适合看 `vim`/`top` 这类交互式程序）、
-  `interrupt`（发送 Ctrl+C）。
-- **远程访问，自动完成**。开关打开后，iShell 每次连上一台服务器，都会顺便把本机的 `mcp.sock`
+- **暴露的工具**：
+  - `list_sessions` / `list_saved_connections`：列出当前打开的会话 / 所有已保存的连接配置；
+  - `open_session`：用一个已保存的连接新开一个只读会话供 AI 专用；首次使用某条连接会弹窗让你
+    当面确认，之后同一进程生命周期内不再重复确认；
+  - `close_session`：关闭一个 AI 自己开的会话（不能关用户自己的会话）；
+  - `run_command`：执行一条命令并等待完成或超时，返回输出 + 退出码；`poll_run` 对超时未完成的
+    命令继续等待、不重发；长任务直接传一个够大的 `timeout_ms`（最长 24 小时）即可，不需要
+    `sleep` 轮询；
+  - `send_input`：向交互式提示（`sudo` 密码、`vim`/REPL 里继续输入）直接发送原始按键，跳过
+    完成检测；
+  - `read_screen`：类似 `tmux capture-pane`，导出当前可见屏幕纯文本，适合看 `vim`/`top` 这类
+    交互式程序；`read_history` 读取该会话从开始至今的完整回滚历史（不止一屏）；
+  - `interrupt`：发送 Ctrl+C；同时也是并发保护的退出口——一个会话同一时刻只允许一条挂起的
+    AI 命令，卡住时调用一次 `interrupt` 即可立即释放（代价是丢失那条命令的结果）；
+  - `write_file` / `read_file`：复用已有 SFTP 连接读写远端文本文件，不必另开 `scp`。
+- **远程访问，自动完成**。开关打开后，iShell 每次连上一台服务器，都会顺便把本机的 MCP socket
   经这条已认证加密的 SSH 连接反向转发到**那台服务器**上的 `~/.ishell-mcp-<随机后缀>.sock`
   （每次连接的后缀都不同，重连时不会跟服务器还没判定为死亡的上一条连接抢同一个路径）——
   不额外开监听端口，也不需要单独管理一套凭据。谁能 SSH 到那台服务器，谁就能通过转发出来的
   socket 控制这边的 iShell，所以只对你真正信任的服务器开启这个开关。`ishell-mcp` 自己会动态
-  探测当前有效的转发 socket（每次调用都重新找一遍最新的 `~/.ishell-mcp-*.sock`），不需要配置
-  路径，iShell 重连后也不用重连 MCP client：
+  探测当前有效的转发 socket（每次调用都重新找一遍最新可连接的 `mcp-*.sock`/`~/.ishell-mcp-*.sock`），
+  不需要配置路径，iShell 重连后也不用重连 MCP client：
   ```bash
   /path/to/ishell-mcp
   ```
-- **手动方式**：不依赖上面的自动反向转发，自己用 SSH 转发：
+- **手动方式**：不依赖上面的自动反向转发，自己用 SSH 转发（socket 名按实际 pid 替换）：
   ```bash
-  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp.sock user@ishell-host &
+  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
   ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
   ```
 
