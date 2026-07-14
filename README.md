@@ -28,6 +28,7 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 - 🔗 **Terminal ↔ files, linked** — "open this dir in terminal" from the file list, "reveal the terminal's current dir in the file list" the other way, and the working directory is **restored on reconnect** (OSC 7).
 - 🧰 **Complete feature set** — agent auth & forwarding, jump hosts, port forwarding + SOCKS5, command broadcast & snippets, live CPU/GPU/net/disk/process monitoring with `kill -9`.
 - ✍️ **A genuinely powerful editor** — a virtualized code editor that opens in its own window: **multi-cursor (Ctrl+D)**, syntax highlighting, find & replace, encoding/EOL auto-detect, Chinese IME, and it stays fast on huge files.
+- 🤖 **Let AI drive the terminal (MCP)** — an AI assistant like Claude Code can operate a real, persistent terminal session (cwd/env/history intact) instead of spawning a throwaway `ssh host cmd` that loses all context every time; commands and output show up in real time in the tab you're looking at. Off by default, opt-in when you want it. See "AI / MCP integration" below.
 
 ## ⚙️ Footprint
 
@@ -91,6 +92,11 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 
 **Monitoring**
 - Live monitor: CPU / memory / swap, **GPU (NVIDIA / AMD / Intel)**, network graph, disks, top processes (click for details + kill -9)
+
+**AI / MCP integration** (off by default — see "AI / MCP integration" below)
+- Let an AI assistant drive a real terminal session directly — shared, visible tab, commands and output in real time, instead of another SSH connection that loses all context
+- Full tool set: run a command and wait for completion, keep waiting on long tasks, read screen/history, send raw keystrokes (for interactive prompts), interrupt, open/close sessions, read/write remote files
+- **Automatic reverse-forward** over your existing SSH connection so the AI can reach back and control this iShell from the remote server too, no extra setup needed
 
 ## 📸 Screenshots
 
