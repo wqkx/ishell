@@ -229,7 +229,14 @@ impl IshellMcp {
                         有反斜杠续行、未闭合引号、heredoc 还没结束，这条命令文本会被当成那个\
                         程序/续行的输入吃掉，完成检测可能永远等不到，且可能改动那个程序里的\
                         数据。不确定当前前台状态时，先用 read_screen 看一眼再决定要不要发命令，\
-                        或者改用 send_input 应对交互式场景。"
+                        或者改用 send_input 应对交互式场景。\
+                        两个解读输出时容易踩的坑：① output 末尾常带一段 shell 提示符残留（比如 \
+                        `(venv) user@host:~$`，有时只剩一个 `$`）——这是刻意不做的清理（早期试过按\
+                        「最后一行大概率是提示符」启发式剥掉，但 PS1 为空/不可见时会把真实输出误删，\
+                        权衡后选择宁可留一点噪声也不丢数据），解析时自己按需忽略即可；② 超时返回的是\
+                        finished=false 加**这一轮已产生的部分输出**（可能是空字符串）——空输出不代表\
+                        命令什么都没打印，只代表还没等到完成哨兵，用 poll_run 续等或用 read_screen \
+                        看实时内容。"
     )]
     async fn run_command(
         &self,
@@ -283,7 +290,15 @@ impl IshellMcp {
         text_result(call(McpReqKind::ReadScreen { session_uid }).await)
     }
 
-    #[tool(description = "向指定终端发送 Ctrl+C，用于中断一个卡住或不需要的命令")]
+    #[tool(
+        description = "向指定终端发送 Ctrl+C，用于中断一个卡住或不需要的命令。这也是 run_command/\
+                        poll_run 并发保护的唯一退出口：同一会话同一时刻只允许一条挂起的运行、\
+                        只允许一个 poll_run 等待者，新 run_command 被「已有一条 AI 命令正在执行」\
+                        拒绝、或 poll_run 被「已有一个 poll_run 在等待」拒绝时，调用一次 interrupt \
+                        会立即清空这条挂起的运行（之后马上就能发新命令），但代价是那条被中断的命令\
+                        彻底失去结果——执行到哪一步、是否已产生副作用都无法再确认，仅会拿到已知的\
+                        部分输出作参考。"
+    )]
     async fn interrupt(
         &self,
         Parameters(SessionArgs { session_uid }): Parameters<SessionArgs>,

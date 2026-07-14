@@ -96,6 +96,13 @@ pub(super) fn sync_tree(state: &mut FilePanelState, actions: &mut Vec<FileAction
     }
     for anc in ancestors(&state.cwd) {
         state.expanded.insert(anc.clone());
+        // 目录被外部（另一个终端/进程）频繁改动时，这里缓存的「无效」判定会一直卡住导航——
+        // 哪怕目标目录后来又变回存在，也得手动刷新父目录才能清掉。这是几乎所有导航路径
+        // （双击进入、面包屑、拖拽弹簧跳转）汇聚到的唯一入口，跟路径栏「粘贴并转到」同一个
+        // 陈旧负缓存问题，在这里一并修，覆盖面更全。
+        if state.nav_error.remove(&anc) {
+            state.listings.remove(&anc);
+        }
         if !state.listings.contains_key(&anc) && !state.loading.contains(&anc) {
             state.loading.insert(anc.clone());
             actions.push(FileAction::List(anc));

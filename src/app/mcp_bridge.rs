@@ -633,7 +633,12 @@ impl App {
                     return;
                 }
                 if s.pending_ai_run.is_some() {
-                    send_err(resp_tx, "该会话已有一条 AI 命令正在执行，请先 poll_run 或等待完成".into());
+                    send_err(
+                        resp_tx,
+                        "该会话已有一条 AI 命令正在执行，请先 poll_run 或等待完成；如果这条命令已经\
+                         不需要了，调用 interrupt 可以立即中断并释放（但会丢失那条命令的结果）"
+                            .into(),
+                    );
                     return;
                 }
                 let nonce = std::time::SystemTime::now()
@@ -702,7 +707,12 @@ impl App {
                         // "iShell 未能处理该请求"，而不是正常的超时/完成语义。拒绝新调用，
                         // 让调用方明确知道"已经有一个等待者了"。
                         if p.resp_tx.is_some() {
-                            send_err(resp_tx, "这条运行已经有一个 poll_run 在等待，请勿并发调用".into());
+                            send_err(
+                                resp_tx,
+                                "这条运行已经有一个 poll_run 在等待，请勿并发调用；如果那个等待者\
+                                 已经不需要了（比如它本身也超时卡住），调用 interrupt 可以立即释放"
+                                    .into(),
+                            );
                             return;
                         }
                         p.deadline = Instant::now() + clamp_timeout(timeout_ms);

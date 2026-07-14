@@ -325,10 +325,17 @@ fn install_fonts(ctx: &egui::Context) {
         // Windows
         "C:/Windows/Fonts/seguiemj.ttf",
     ];
-    if let Some(path) = emoji_candidates
-        .iter()
-        .find(|p| std::path::Path::new(p).is_file())
-    {
+    // 体积上限：macOS 的 Apple Color Emoji.ttc 为兼容多档 Retina 位图字形，体积可达
+    // 150~200+ MB，整份读入并作为 Arc<FontData> 常驻，是"iShell 刚打开什么都没做就占
+    // 几百 MB"的直接原因——emoji 图标本就是锦上添花，不值得为它长期占用这么大内存。
+    // Linux/Windows 的彩色 emoji 字体通常远小于此（Noto/Segoe UI Emoji 一般 <30 MB），
+    // 用体积而非按平台硬编码判断，同样能兜住"某天系统 emoji 字体也变巨大"的情况。
+    const EMOJI_FONT_SIZE_CAP: u64 = 32 * 1024 * 1024;
+    if let Some(path) = emoji_candidates.iter().find(|p| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.len() <= EMOJI_FONT_SIZE_CAP)
+            .unwrap_or(false)
+    }) {
         if let Ok(data) = std::fs::read(path) {
             log::info!("加载 Emoji 字体：{path}");
             let mut fd = egui::FontData::from_owned(data);
@@ -345,6 +352,11 @@ fn install_fonts(ctx: &egui::Context) {
                     .push("emoji".to_owned());
             }
         }
+    } else if emoji_candidates
+        .iter()
+        .any(|p| std::path::Path::new(p).is_file())
+    {
+        log::warn!("系统 Emoji 字体体积过大（>{}MB），为控制内存占用已跳过加载，部分 Unicode 符号可能显示为方块", EMOJI_FONT_SIZE_CAP / 1024 / 1024);
     } else {
         log::warn!("未找到系统 Emoji 字体，部分 Unicode 符号可能显示为方块");
     }
