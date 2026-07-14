@@ -431,6 +431,12 @@ impl IshellMcp {
                     需要同步/生成远端文件时用 write_file/read_file（复用 SFTP，不用另开 scp）。\
                     长任务不要用 `sleep N` 反复轮询——run_command/poll_run 的 timeout_ms 最长支持\
                     24 小时，直接传一个足够长的值（比如几十分钟），一次调用等到跑完更省事。\
+                    如果确实想先把任务丢到后台、之后再回来看结果（比如中途还要做别的事），\
+                    不要写 `sleep N; tail log` 这种盲等轮询，改用“等进程退出”的写法一步等到位：\
+                    `nohup cmd > out.log 2>&1 & echo $! > pid; ...`启动后，之后另开一次\
+                    run_command 执行 `tail --pid=$(cat pid) -f /dev/null; cat out.log`，\
+                    这一条命令会一直阻塞到目标进程真正退出才返回，配合足够大的 timeout_ms 用，\
+                    不需要猜测任务要跑多久、也不需要一遍遍轮询。\
                     如果某次 run_command/poll_run 的返回意外丢失或报错（比如工具调用本身失败），\
                     不确定命令有没有跑完时不要盲目重试有副作用的命令——先用 poll_run（不填 run_id）\
                     去认领那个会话当前挂起的运行，能问出真实状态。\

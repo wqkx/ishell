@@ -116,6 +116,24 @@ pub async fn run(
     let (sftp_new_tx, mut sftp_new_rx) =
         tokio::sync::mpsc::unbounded_channel::<Option<russh_sftp::client::SftpSession>>();
     let mut sftp_reconnecting = false;
+    // 后台重开一条 SFTP 通道，结果经 sftp_new_tx 回送；调用方需自行先把 sftp_reconnecting
+    // 置 true 去重（两处调用点——会话假死上报、以及 sftp 本就是 None 时的 ListDir——共用同一
+    // 套重连逻辑，不重复实现）。
+    let spawn_sftp_reconnect = {
+        let handle = handle.clone();
+        let tx = sftp_new_tx.clone();
+        move || {
+            let h = handle.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let fresh = match tokio::time::timeout(Duration::from_secs(15), open_sftp(&h)).await {
+                    Ok(Ok(s)) => Some(s),
+                    _ => None, // 超时或失败：回送 None，主循环解锁重连位，下个操作会再次触发
+                };
+                let _ = tx.send(fresh);
+            });
+        }
+    };
 
     // 2.5) AI/MCP 反向转发：把本机 mcp.sock 反向转发到这台远端主机，让"能 SSH 到这台服务器
     // 的人"也能连到转发出来的 socket 控制本机 iShell（复用这条已认证/加密的 SSH 连接，
@@ -210,15 +228,7 @@ pub async fn run(
             Some(dead_gen) = sftp_dead_rx.recv() => {
                 if dead_gen == sftp_gen && !sftp_reconnecting {
                     sftp_reconnecting = true;
-                    let h = handle.clone();
-                    let tx = sftp_new_tx.clone();
-                    tokio::spawn(async move {
-                        let fresh = match tokio::time::timeout(Duration::from_secs(15), open_sftp(&h)).await {
-                            Ok(Ok(s)) => Some(s),
-                            _ => None, // 超时或失败：回送 None，主循环解锁重连位，下个操作会再次触发
-                        };
-                        let _ = tx.send(fresh);
-                    });
+                    spawn_sftp_reconnect();
                 }
             }
             // 重连结果回送：成功则热替换会话并自增代号（旧会话的迟到死亡上报据此被忽略）。
@@ -286,8 +296,16 @@ pub async fn run(
                                 }
                             });
                         } else {
-                            // SFTP 未就绪（首次初始化失败等）：回报可重试失败——UI 保持自动重试，
-                            // 而不是静默吞掉后永久停在「加载中」
+                            // SFTP 未就绪（首次初始化失败，或上一轮重连本身超时/失败）：回报可重试
+                            // 失败让 UI 保持自动重试的同时，这里也必须顺带再触发一次重连尝试——
+                            // 否则 sftp 永远停在 None，之后每次 ListDir 都只会走到这个分支干等，
+                            // 用户点多少次刷新都没用，只能整条 SSH 会话重连才能恢复（好网络下这条
+                            // 分支只在启动瞬间命中一次，之前没暴露；弱网下一旦上一轮重连超时/失败
+                            // 落到这里，就再也没有第二次机会）。
+                            if !sftp_reconnecting {
+                                sftp_reconnecting = true;
+                                spawn_sftp_reconnect();
+                            }
                             sink.send(WorkerEvent::DirListFailed {
                                 path,
                                 message: crate::i18n::tr("SFTP 未就绪", "SFTP not ready").into(),

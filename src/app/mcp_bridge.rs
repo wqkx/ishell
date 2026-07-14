@@ -480,7 +480,10 @@ impl App {
                 if let Some(tx) = pending.resp_tx.take() {
                     let _ = tx.send(McpResponse {
                         id: pending.req_id,
-                        result: Err("等待用户确认超时，已自动拒绝".into()),
+                        result: Err(
+                            "等待用户确认超时（5 分钟），已自动拒绝：请让用户切回 iShell 点击\
+                             确认弹窗，或直接重新调用 open_session 再次发起确认请求".into(),
+                        ),
                     });
                 }
                 self.pending_open_consent = None;
@@ -565,6 +568,26 @@ impl App {
         }
     }
 
+    /// "会话不存在"的报错要带上当前实际可用的会话列表，不然调用方只知道这个 uid 不对，
+    /// 猜不出是自己传错了、还是 iShell 重启后整张会话表都换了（比如 MCP 更新后重启，
+    /// 所有 uid 会从 1 重新分配）——报错里直接列出来，不用再额外调一次 list_sessions
+    /// 才能定位问题。
+    fn session_not_found_msg(&self, uid: u64) -> String {
+        if self.sessions.is_empty() {
+            return format!("会话不存在（uid={uid}）：当前没有任何打开的会话，可能是 iShell 刚重启");
+        }
+        let list = self
+            .sessions
+            .iter()
+            .map(|s| format!("{}:{}", s.uid, s.title))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "会话不存在（uid={uid}）：可能是 iShell 已重启（重启后 uid 会重新分配）或这个会话\
+             已被关闭。当前可用会话（uid:标题）：{list}"
+        )
+    }
+
     fn handle_mcp_call(&mut self, call: McpCall) {
         let McpCall { req, resp_tx } = call;
         let id = req.id;
@@ -598,7 +621,7 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -669,7 +692,7 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 match self.sessions[idx].pending_ai_run.as_mut() {
@@ -691,7 +714,7 @@ impl App {
             }
             McpReqKind::ReadScreen { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 let text = self.sessions[idx].terminal.screen_text();
@@ -702,7 +725,7 @@ impl App {
             }
             McpReqKind::Interrupt { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -735,12 +758,15 @@ impl App {
                     conn: c,
                     resp_tx: Some(resp_tx),
                     req_id: id,
-                    deadline: Instant::now() + Duration::from_secs(60),
+                    // 60s 对"用户可能不在电脑前"这种常见情况太紧——超时会被下面的
+                    // 拒绝分支吃掉,还得让 AI 重新发起一次 open_session 才能再弹一次
+                    // 确认框。放宽到 5 分钟,给用户更充裕的反应时间。
+                    deadline: Instant::now() + Duration::from_secs(300),
                 });
             }
             McpReqKind::CloseSession { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 // 只允许关自己（AI）开的会话，不能关用户自己的会话——关闭权限不超过打开权限。
@@ -759,7 +785,7 @@ impl App {
                 max_lines,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 let text = self.sessions[idx]
@@ -787,7 +813,7 @@ impl App {
             }
             McpReqKind::SendInput { session_uid, text } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 let _ = self.sessions[idx]
@@ -805,7 +831,7 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -854,7 +880,7 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, "会话不存在".into());
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
                 let s = &mut self.sessions[idx];
