@@ -418,7 +418,10 @@ async fn bridge_local_agent(channel: Channel<client::Msg>) -> anyhow::Result<()>
     Ok(())
 }
 
-/// 把一条反向转发来的通道桥接到本机 AI/MCP 控制 socket（`~/.config/ishell/mcp.sock`）。
+/// 把一条反向转发来的通道桥接到本机 AI/MCP 控制 socket（每进程一份
+/// `~/.config/ishell/mcp-<pid>.sock`）。MCP 本地 IPC 建立在 Unix domain socket 上，
+/// 目前只支持 unix 平台；Windows 上直接报错（不静默丢弃这条转发通道）。
+#[cfg(unix)]
 async fn bridge_local_mcp(channel: Channel<client::Msg>) -> anyhow::Result<()> {
     let sock = crate::store::mcp_socket_path()
         .ok_or_else(|| anyhow::anyhow!("mcp socket 路径不可用（无法确定用户目录）"))?;
@@ -426,6 +429,11 @@ async fn bridge_local_mcp(channel: Channel<client::Msg>) -> anyhow::Result<()> {
     let mut local = tokio::net::UnixStream::connect(&sock).await?;
     tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+async fn bridge_local_mcp(_channel: Channel<client::Msg>) -> anyhow::Result<()> {
+    anyhow::bail!("AI/MCP 控制目前仅支持 Unix（Linux/macOS）系统，暂不支持 Windows")
 }
 
 /// 键盘交互（keyboard-interactive）认证：循环把服务器提示交给 UI、等回答再提交，

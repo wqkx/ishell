@@ -15,6 +15,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use mcp_protocol::{McpReqKind, McpReqResult, McpRequest, McpResponse};
@@ -24,6 +25,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// 找目录下匹配前缀/后缀的文件里，mtime 最新且真的连得上的那一个（探测连接立刻丢弃）。
 /// 用于同机发现（`mcp-*.sock`，每进程一个独立文件）和反向转发发现
 /// （`.ishell-mcp-*.sock`）——两处逻辑完全一样，抽出来共用。
+#[cfg(unix)]
 async fn newest_connectable(dir: &std::path::Path, prefix: &str, suffix: &str) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(dir)
         .ok()?
@@ -56,6 +58,7 @@ async fn newest_connectable(dir: &std::path::Path, prefix: &str, suffix: &str) -
 ///      所在的机器」时会落在这里；每次重连都是新文件，取最新的即可自动跟上）。
 /// 都没找到时回退到本机默认目录下的固定占位路径，让错误信息保持原样好懂（不会是任何一个
 /// 真实存在的进程的路径，纯粹是给 `call()` 里的 connect 失败提供一个统一的报错落点）。
+#[cfg(unix)]
 async fn socket_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
         return std::path::PathBuf::from(p);
@@ -80,6 +83,11 @@ const CONNECT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 60 * 60);
 
 /// 连接 iShell 主进程的本地 socket，发一条请求、等一行 JSON 响应（一次连接=一问一答）。
+/// 整套本地 IPC 建立在 Unix domain socket 上（tokio 的 UnixListener/UnixStream 只在 unix
+/// 平台提供），Windows 上没有等价实现——不是漏掉了 cfg 门，而是这个特性眼下确实不支持
+/// Windows；这里给出清晰的运行时报错而不是让编译直接失败，其余工具定义/MCP server 骨架
+/// 在所有平台上都能正常编译。
+#[cfg(unix)]
 async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let path = socket_path().await;
@@ -107,6 +115,11 @@ async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
     }
     let resp: McpResponse = serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())?;
     resp.result
+}
+
+#[cfg(not(unix))]
+async fn call(_kind: McpReqKind) -> Result<McpReqResult, String> {
+    Err("ishell-mcp 目前仅支持 Unix（Linux/macOS）系统的本地 IPC，暂不支持 Windows".into())
 }
 
 fn text_result(body: Result<McpReqResult, String>) -> Result<CallToolResult, McpError> {

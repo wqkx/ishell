@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -300,6 +301,11 @@ pub(super) struct PendingOpenConsent {
 }
 
 /// 启动 socket 监听（若用户未在设置里开启 AI 控制，返回一个永远收不到数据的空通道）。
+/// 整套本地 IPC 建立在 Unix domain socket 上，tokio 的 UnixListener/UnixStream 只在 unix
+/// 平台提供——Windows 上这个特性眼下确实不支持，下面 `#[cfg(not(unix))]` 版本直接返回一个
+/// 永远收不到数据的空通道（等价于"用户没开启"的路径），其余 App 代码按同一通道消费事件，
+/// 不需要为平台差异专门分叉。
+#[cfg(unix)]
 pub(super) fn spawn_mcp_listener(
     runtime: &Arc<tokio::runtime::Runtime>,
     ctx: egui::Context,
@@ -364,17 +370,30 @@ pub(super) fn spawn_mcp_listener(
     rx
 }
 
+#[cfg(not(unix))]
+pub(super) fn spawn_mcp_listener(
+    _runtime: &Arc<tokio::runtime::Runtime>,
+    _ctx: egui::Context,
+) -> mpsc::UnboundedReceiver<McpCall> {
+    let (_tx, rx) = mpsc::unbounded_channel::<McpCall>();
+    rx
+}
+
 /// 并发连接数上限（见 spawn_mcp_listener 里的信号量）。
+#[cfg(unix)]
 const MAX_MCP_CONNECTIONS: usize = 32;
 /// 首行请求的最大字节数：write_file 的 content 可能是个不小的源码/日志文件，读大文件场景
 /// 也不该被卡得太死，但也不能真的无界——给一个远大于任何正常请求、又能兜住"恶意/异常连接
 /// 持续灌数据不换行"这种情况的上限。
+#[cfg(unix)]
 const MAX_MCP_LINE_BYTES: u64 = 256 * 1024 * 1024;
 /// 首行读取超时：连上但迟迟不发完整一行的连接（占位攻击/半开连接）不能无限占着任务和 fd。
+#[cfg(unix)]
 const FIRST_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 一条连接只处理一问一答：读一行 JSON 请求，转发进 mpsc，等 App 帧循环回填后写一行 JSON 响应。
 /// `_permit` 只用来在这个连接存活期间占着信号量里的一个名额，函数退出时自动释放。
+#[cfg(unix)]
 async fn handle_conn(
     stream: UnixStream,
     tx: mpsc::UnboundedSender<McpCall>,
