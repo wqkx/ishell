@@ -17,7 +17,7 @@ mod download_io;
 use super::rand_hex;
 use super::util::{
     basename, bitmap_len, data_part_path, extract_tar_gz, local_nonexistent, part_path,
-    xfer_backoff, DL_CHUNK, DL_PARALLEL, XFER_RETRIES,
+    place_extracted_dir, xfer_backoff, DL_CHUNK, DL_PARALLEL, XFER_RETRIES,
 };
 
 pub(super) async fn download_dir_compressed(
@@ -114,23 +114,43 @@ pub(super) async fn download_dir_compressed(
     dl?;
     sink.send(WorkerEvent::TransferProgress { id, done: size });
 
-    // 本地解包到 local 的父目录（归档顶层即目录名，解包后落在 local）
+    // 解包到 local 父目录下的一次性临时子目录，而不是直接解包到父目录——归档顶层目录名
+    // 固定是远端 basename（打包命令里的 `name`），调用方要求的本地目标名（`local` 的
+    // basename）可以和它不同（copy_from_remote 允许改名），直接解包到父目录只会产生
+    // `parent/name`，不是 `local`，会出现「报告成功但目标路径不存在」。这里统一解包到
+    // 随机子目录，再原子移动/替换到 `local`，不管两边名字是否一致都能落到正确位置。
     let dest = std::path::Path::new(local)
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let scratch = dest.join(format!(".ishelldl-extract-{id}-{}", rand_hex(6)));
     let tgz = local_tgz.clone();
+    let scratch_for_extract = scratch.clone();
     // 本地解包也可能耗时（大量小文件），提示「解包中…」避免进度条满了却迟迟不完成
     sink.send(WorkerEvent::TransferNote {
         id,
         note: crate::i18n::tr("解包中…", "Extracting…").into(),
     });
-    tokio::task::spawn_blocking(move || extract_tar_gz(&tgz, &dest)).await??;
+    let extract_result =
+        tokio::task::spawn_blocking(move || extract_tar_gz(&tgz, &scratch_for_extract)).await?;
     sink.send(WorkerEvent::TransferNote {
         id,
         note: String::new(),
     });
     let _ = std::fs::remove_file(&local_tgz);
+    extract_result?;
+    // 归档解包后的顶层目录固定叫 `name`（远端 basename）；移到调用方要求的 `local`——
+    // 已存在则整体替换（镜像覆盖，见 place_extracted_dir）。
+    let extracted = scratch.join(&name);
+    let local_path = std::path::PathBuf::from(local);
+    let place_result =
+        tokio::task::spawn_blocking(move || place_extracted_dir(&extracted, &local_path)).await?;
+    // 只有真正挪走成功才清理 scratch——挪动失败时里面还是刚解压出来的完整内容，
+    // 删掉的话用户就得重新下载一遍，宁可留着等人工核实。
+    if place_result.is_ok() {
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+    place_result?;
     Ok(())
 }
 
@@ -173,6 +193,33 @@ pub(super) async fn download(
     } else {
         local
     };
+
+    // 目录且目标已存在：只有 Overwrite 策略会走到这里（Skip 已在上面提前返回；
+    // Rename 已用 local_nonexistent 换成一个确定不存在的名字）——先整体清空旧目录，
+    // 保证「镜像覆盖」：下载完成后目标只包含这次下载来的内容，不残留旧目录里远端
+    // 已经不存在的文件/子目录。压缩下载分支还有 place_extracted_dir 兜底同一逻辑；
+    // 这里统一处理是因为逐文件下载分支只会覆盖同名文件，没有类似的「整体替换」步骤。
+    if is_dir {
+        if let Ok(meta) = std::fs::symlink_metadata(&local) {
+            let clean = if meta.is_dir() {
+                std::fs::remove_dir_all(&local)
+            } else {
+                std::fs::remove_file(&local)
+            };
+            if let Err(e) = clean {
+                sink.send(WorkerEvent::TransferDone {
+                    id,
+                    ok: false,
+                    message: match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("清理旧目标失败：{e}"),
+                        crate::i18n::Lang::En => format!("Failed to clear old target: {e}"),
+                    },
+                    refresh_dir: None,
+                });
+                return;
+            }
+        }
+    }
 
     // 目录优先走压缩下载（远端 tar.gz 打包 → 单文件并发下载 → 本地解包），
     // 大幅减少多小文件的逐个 SFTP 往返；任何失败则回退到逐文件下载。

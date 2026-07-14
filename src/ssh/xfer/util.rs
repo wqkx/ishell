@@ -192,9 +192,22 @@ pub(super) fn local_basename(path: &str) -> String {
         .to_string()
 }
 
+/// 把解压出来的目录 `extracted` 原子移动到 `target`：目标已存在则先整体清空
+/// （镜像覆盖——目标最终只包含这次传输的内容，不残留旧目录里源端已经不存在的文件/
+/// 子目录），保证不管压缩包顶层目录名（固定是远端 basename）和调用方要求的目标名
+/// 是否一致，最终都落在 `target` 这个确切路径上。
+pub(super) fn place_extracted_dir(extracted: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target)?,
+        Ok(_) => std::fs::remove_file(target)?,
+        Err(_) => {}
+    }
+    std::fs::rename(extracted, target)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tar_entry_path_safe;
+    use super::{place_extracted_dir, tar_entry_path_safe};
     use std::path::Path;
 
     #[test]
@@ -205,5 +218,61 @@ mod tests {
         assert!(!tar_entry_path_safe(Path::new("a/../../b")));
         assert!(!tar_entry_path_safe(Path::new("/abs/path")));
         assert!(!tar_entry_path_safe(Path::new("")));
+    }
+
+    #[test]
+    fn place_extracted_dir_renames_into_place_when_target_absent() {
+        let tmp = std::env::temp_dir().join(format!("ishell-test-place-{}", rand_suffix()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let extracted = tmp.join("old_name");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("a.txt"), b"hello").unwrap();
+        let target = tmp.join("new_name");
+
+        place_extracted_dir(&extracted, &target).unwrap();
+
+        assert!(!extracted.exists());
+        assert!(target.join("a.txt").exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn place_extracted_dir_mirrors_over_existing_target_dropping_stale_files() {
+        let tmp = std::env::temp_dir().join(format!("ishell-test-place-{}", rand_suffix()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let extracted = tmp.join("old_name");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("fresh.txt"), b"fresh").unwrap();
+        let target = tmp.join("new_name");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("stale.txt"), b"stale").unwrap();
+
+        place_extracted_dir(&extracted, &target).unwrap();
+
+        // 镜像覆盖：旧目录里源端已不存在的文件不应该被保留下来。
+        assert!(!target.join("stale.txt").exists());
+        assert!(target.join("fresh.txt").exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn place_extracted_dir_replaces_existing_target_file() {
+        let tmp = std::env::temp_dir().join(format!("ishell-test-place-{}", rand_suffix()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let extracted = tmp.join("old_name");
+        std::fs::create_dir_all(&extracted).unwrap();
+        let target = tmp.join("new_name");
+        std::fs::write(&target, b"i used to be a file").unwrap();
+
+        place_extracted_dir(&extracted, &target).unwrap();
+
+        assert!(target.is_dir());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        (std::process::id() as u64) ^ CTR.fetch_add(1, Ordering::Relaxed)
     }
 }

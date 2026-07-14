@@ -328,8 +328,8 @@ const MAX_RUN_OUTPUT_BYTES: usize = 200_000;
 /// `copy_file` 用的极简远端路径工具：SFTP 远端路径总是 POSIX 风格，不需要
 /// `ssh::sftp`（不对 `src/app` 公开）里那套一致的 `remote_parent`/`basename` 实现，
 /// 这里按同样的语义写一份小的，避免为了共享几行逻辑扩大那边的可见性。
-/// 只应该在 `remote_path` 已经确认是绝对路径（`is_absolute_remote_path` 校验过）之后调用：
-/// 对相对路径，`rfind('/')` 找不到分隔符会退化成 `"/"`，把上传目标悄悄改到文件系统根目录。
+/// 只应该在 `remote_path` 已经过 `validate_remote_path` 校验之后调用：对相对路径，
+/// `rfind('/')` 找不到分隔符会退化成 `"/"`，把上传目标悄悄改到文件系统根目录。
 fn remote_basename(path: &str) -> String {
     path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string()
 }
@@ -342,11 +342,40 @@ fn remote_parent(path: &str) -> String {
     }
 }
 
-/// 远端路径必须是绝对路径（以 `/` 开头）才能安全地拆成 `remote_dir`/文件名——
-/// 相对路径下 `remote_parent` 会退化成 `"/"`，把上传目标悄悄改到文件系统根目录，
-/// 所以在拆分之前先在这里挡掉，报清楚的错误而不是默默写到错误的地方。
-fn is_absolute_remote_path(path: &str) -> bool {
-    path.starts_with('/')
+/// 校验一个 `copy_file` 用的远端 POSIX 路径：必须绝对、不含 `.`/`..` 路径段、拆出来的
+/// 文件名非空。三者任一不满足，`remote_parent`/`remote_basename` 拆分出来的目标要么会
+/// 落在意料之外的目录（`.`/`..` 段）、要么文件名为空（`"/"`、`"////"` 这类路径）——
+/// 不校验的话这些都要等 SFTP 报错才会发现，报错还来得晚、含义也不清楚。
+fn validate_remote_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("remote_path 必须是绝对路径：{path}"));
+    }
+    if path.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(format!("remote_path 不能包含 \".\" 或 \"..\" 路径段：{path}"));
+    }
+    if remote_basename(path).is_empty() {
+        return Err(format!("remote_path 缺少有效的文件名：{path}"));
+    }
+    Ok(())
+}
+
+/// 校验一个 `copy_file` 用的本地路径：必须绝对、不含 `.`/`..` 路径段、有有效文件名
+/// （拒绝文件系统根目录等 `Path::file_name()` 返回 `None` 的路径）。
+fn validate_local_path(path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!("local_path 必须是绝对路径：{path}"));
+    }
+    // 按原始字符串拆分校验，不用 `Path::components()`——它会把内部的 "." 直接
+    // 规整掉（只有开头的 "." 才会被保留成 `Component::CurDir`），导致
+    // "/tmp/./notes.txt" 这类路径检测不到，字符串层面直接拆分才可靠。
+    if path.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(format!("local_path 不能包含 \".\" 或 \"..\" 路径段：{path}"));
+    }
+    if p.file_name().is_none() {
+        return Err(format!("local_path 缺少有效的文件名：{path}"));
+    }
+    Ok(())
 }
 
 fn cap_output_for_ai(output: String) -> String {
@@ -1041,20 +1070,19 @@ impl App {
                     send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
                     return;
                 }
-                if !std::path::Path::new(&local_path).is_absolute() {
-                    send_err(resp_tx, format!("local_path 必须是绝对路径：{local_path}"));
+                if let Err(e) = validate_local_path(&local_path) {
+                    send_err(resp_tx, e);
                     return;
                 }
-                if !is_absolute_remote_path(&remote_path) {
-                    send_err(resp_tx, format!("remote_path 必须是绝对路径：{remote_path}"));
+                if let Err(e) = validate_remote_path(&remote_path) {
+                    send_err(resp_tx, e);
                     return;
                 }
-                // 本地源不存在的话，与其让它进传输任务的重试/退避跑一圈才报错，不如现在
-                // 就快速失败——metadata 探测不了文件/目录，upload() 无论如何都不会成功。
-                if std::fs::metadata(&local_path).is_err() {
-                    send_err(resp_tx, format!("本地路径不存在或不可读：{local_path}"));
-                    return;
-                }
+                // 本地源是否存在留给 upload() 自己异步探测（它本来就要在 worker 侧
+                // 做 tokio::fs::metadata）——这里不再同步 stat，避免本地路径落在慢速/
+                // 挂起的挂载点（网络盘、FUSE）时卡住 UI 线程（这段处理逻辑本身跑在
+                // egui 每帧的事件排空里，见 drain_mcp_calls）。源不存在时 upload()
+                // 打开文件会失败，重试用尽后经 TransferDone 正常报错。
                 let op_id = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
@@ -1105,12 +1133,12 @@ impl App {
                     send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
                     return;
                 }
-                if !is_absolute_remote_path(&remote_path) {
-                    send_err(resp_tx, format!("remote_path 必须是绝对路径：{remote_path}"));
+                if let Err(e) = validate_remote_path(&remote_path) {
+                    send_err(resp_tx, e);
                     return;
                 }
-                if !std::path::Path::new(&local_path).is_absolute() {
-                    send_err(resp_tx, format!("local_path 必须是绝对路径：{local_path}"));
+                if let Err(e) = validate_local_path(&local_path) {
+                    send_err(resp_tx, e);
                     return;
                 }
                 let op_id = std::time::SystemTime::now()
@@ -1145,7 +1173,54 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::trim_leading_echo;
+    use super::{
+        remote_basename, remote_parent, trim_leading_echo, validate_local_path,
+        validate_remote_path,
+    };
+
+    #[test]
+    fn remote_path_must_be_absolute() {
+        assert!(validate_remote_path("notes.txt").is_err());
+        assert!(validate_remote_path("/notes.txt").is_ok());
+    }
+
+    #[test]
+    fn remote_path_rejects_dot_and_dotdot_segments() {
+        assert!(validate_remote_path("/foo/../bar").is_err());
+        assert!(validate_remote_path("/foo/./bar").is_err());
+        assert!(validate_remote_path("/foo/bar").is_ok());
+    }
+
+    #[test]
+    fn remote_path_rejects_empty_basename() {
+        // "/" 和 "////" 拆分出来的文件名都是空串——不能悄悄当成合法目标。
+        assert!(validate_remote_path("/").is_err());
+        assert!(validate_remote_path("////").is_err());
+    }
+
+    #[test]
+    fn remote_parent_and_basename_split_normal_paths() {
+        assert_eq!(remote_parent("/foo/bar.txt"), "/foo");
+        assert_eq!(remote_basename("/foo/bar.txt"), "bar.txt");
+        assert_eq!(remote_parent("/bar.txt"), "/");
+    }
+
+    #[test]
+    fn local_path_must_be_absolute() {
+        assert!(validate_local_path("notes.txt").is_err());
+        assert!(validate_local_path("/tmp/notes.txt").is_ok());
+    }
+
+    #[test]
+    fn local_path_rejects_dot_and_dotdot_segments() {
+        assert!(validate_local_path("/tmp/../etc/passwd").is_err());
+        assert!(validate_local_path("/tmp/./notes.txt").is_err());
+    }
+
+    #[test]
+    fn local_path_rejects_root_and_missing_filename() {
+        assert!(validate_local_path("/").is_err());
+    }
 
     #[test]
     fn trim_leading_echo_strips_command_line_only() {
