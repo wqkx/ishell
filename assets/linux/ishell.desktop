@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=iShell
-Version=0.16.4
+Version=0.16.5
 GenericName=SSH Client
 Comment=Modern Rust SSH client — terminal + SFTP + monitoring
 Exec=@EXEC@
