@@ -584,6 +584,13 @@ pub(super) fn toolbar(
         state.path_edit = None;
         state.path_edit_focus = false;
         state.pending_nav = None;
+        // 显式「跳转到路径」是用户主动动作，可信度高于被动预取：若这个路径之前被判定过
+        // 「无效」（比如粘贴的文件夹是刚在另一个终端里创建的，上次探测时还不存在），不能让
+        // 那次陈旧判定继续拦着——清掉无效标记与占位空列表，强制重新查一次，不然只能靠用户
+        // 先跳父级目录刷新（连带清子目录缓存）才能间接清掉这个陈旧状态。
+        if state.nav_error.remove(&state.cwd) {
+            state.listings.remove(&state.cwd);
+        }
         // 跳到未缓存的路径（如「粘贴并转到」到一个此前没进过的目录）：本帧 sync_tree 已在改 cwd 前
         // 跑过、不会再列举它，若不在此显式发起 List，会卡在空白/不加载。命中缓存则无需重复请求。
         if !state.listings.contains_key(&state.cwd) && !state.loading.contains(&state.cwd) {

@@ -90,6 +90,10 @@ pub struct Terminal {
     ai_capture: Option<AiCapture>,
     /// 哨兵命中后的 (退出码, 纯文本输出)，供 App 每帧取走（None=尚未完成/无正在等待的捕获）。
     ai_done: Option<(i32, String)>,
+    /// 普通屏本地回滚的像素余量：smooth_scroll_delta 带惯性，连续多帧的小增量若逐帧
+    /// round 会一直得 0（触控板/平滑滚轮尤其明显），导致"滚了但纹丝不动"。这里跨帧
+    /// 累计，凑够一整行才真正推动 vt100 scrollback，不足一行的余量保留到下一帧。
+    local_scroll_accum: f32,
 }
 
 struct AiCapture {
@@ -142,6 +146,7 @@ impl Terminal {
             echo_pending: Vec::new(),
             ime_preedit: String::new(),
             prev_focused: false,
+            local_scroll_accum: 0.0,
             prev_alt: false,
             sb_dragging: false,
             ai_capture: None,
@@ -341,36 +346,115 @@ impl Terminal {
         let report_mouse = mmode != vt100::MouseProtocolMode::None && !shift;
         let mut mouse_out: Vec<u8> = Vec::new();
 
-        // 滚轮：Ctrl 调字号；鼠标上报时发滚轮键（64/65）；否则本地回滚
+        // 滚轮：Ctrl 调字号；鼠标上报时发滚轮键（64/65）；全屏程序（htop/less/codex/
+        // claude code 这类跑在备用屏幕、但没开鼠标上报的 TUI）转发方向键模拟滚动；
+        // 否则（主屏幕、无鼠标上报）本地回滚。
+        //
+        // 鼠标滚轮键/方向键这两条路径都是「离散点击」语义（一次滚轮缺口 = 一次点击/
+        // 一次按键），必须用本帧的原始滚轮事件，不能用 smooth_scroll_delta：后者带惯性
+        // 平滑，一次真实滚动会在其后连续多帧里持续吐出衰减的非零值，若照旧按帧转换成
+        // 点击/按键，会把一次滚动动作放大成几十次点击尾随发送给远端，表现为「点了但慢
+        // 慢滚」的本地场景感觉正常，一到把滚轮语义变成离散点击/按键的远端 TUI 程序里就
+        // 变成「越滚越快、停不下来」（这正是 claude code 里滚动特别快的根因）。本地像素级
+        // 回滚（最后的 else 分支）仍用 smooth_scroll_delta，因为它要的就是这种连续平滑感。
         if resp.hovered() {
-            let (scroll, ctrl) = ui.input(|i| {
+            let (smooth, raw, ctrl) = ui.input(|i| {
+                // smooth_scroll_delta 带惯性平滑：一次真实滚动会在其后连续多帧持续吐出衰减的
+                // 非零值。离散点击/按键语义的两条路径需要「这一帧真实发生了多少」，故从本帧
+                // 原始事件里自己累加（单位统一换算成「行」，与 char_h 步长口径一致）。
+                let mut raw_lines = 0.0f32;
+                for ev in &i.events {
+                    if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+                        raw_lines += match unit {
+                            egui::MouseWheelUnit::Line => delta.y,
+                            egui::MouseWheelUnit::Point => delta.y / char_h,
+                            egui::MouseWheelUnit::Page => delta.y * rows as f32,
+                        };
+                    }
+                }
                 (
                     i.smooth_scroll_delta.y,
+                    raw_lines,
                     i.modifiers.ctrl || i.modifiers.command,
                 )
             });
-            if scroll != 0.0 {
-                if ctrl {
-                    self.font_size = (self.font_size + scroll.signum() * 1.0).clamp(8.0, 32.0);
-                } else if report_mouse {
+            let alt = self.parser.screen().alternate_screen();
+            if raw != 0.0 {
+                // 诊断日志（RUST_LOG=debug 可见）：完整记录一次滚轮事件从「到达」到「落地」的
+                // 全过程状态，而不是只挑几个字段——否则没法回答"事件到底有没有到、走了哪条路、
+                // scrollback 是否真的变了"这几个关键问题（外部审查报告 5.3 的意见）。
+                log::debug!(
+                    "term scroll: alt={alt} report_mouse={report_mouse} mmode={mmode:?} \
+                     menc={menc:?} app_cursor={} raw={raw:.3} smooth={smooth:.2} char_h={char_h:.2} \
+                     sb_before={} accum_before={:.3}",
+                    self.parser.screen().application_cursor(),
+                    self.scrollback,
+                    self.local_scroll_accum,
+                );
+            }
+            if ctrl && smooth != 0.0 {
+                self.font_size = (self.font_size + smooth.signum() * 1.0).clamp(8.0, 32.0);
+            } else if report_mouse {
+                self.local_scroll_accum = 0.0; // 切换路径：旧余量不该带到鼠标上报语义里
+                if raw != 0.0 {
                     if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                         let (r, c) = cell_at(p);
-                        let cb = if scroll > 0.0 { 64 } else { 65 };
-                        let steps = ((scroll.abs() / char_h).round() as i32).clamp(1, 5);
+                        let cb = if raw > 0.0 { 64 } else { 65 };
+                        let steps = (raw.abs().round() as i32).clamp(1, 3);
                         for _ in 0..steps {
                             encode_mouse(menc, cb, c, r, true, &mut mouse_out);
                         }
                     }
-                } else {
-                    let lines = (scroll / char_h).round() as i64;
-                    let nb = (self.scrollback as i64 + lines).clamp(0, DEFAULT_SCROLLBACK as i64)
-                        as usize;
+                }
+            } else if alt {
+                // 备用屏幕没有回滚历史（本地 set_scrollback 在这里是空操作），大多数不开
+                // 鼠标上报的全屏程序（less/htop 等）靠自己拦截方向键实现翻页/滚动——把滚轮转成
+                // 方向键转发过去；这只是经验性兼容策略，不是任何终端协议承诺的行为，具体某个
+                // TUI 是否真的把方向键当滚动用，以它自己的按键处理为准。
+                self.local_scroll_accum = 0.0;
+                if raw != 0.0 {
+                    let steps = (raw.abs().round() as i32).clamp(1, 3);
+                    let key = if raw > 0.0 { b"\x1b[A".as_slice() } else { b"\x1b[B".as_slice() };
+                    for _ in 0..steps {
+                        mouse_out.extend_from_slice(key);
+                    }
+                }
+            } else if smooth != 0.0 {
+                // 本地像素级回滚要的是连续平滑感，用 smooth_scroll_delta；但触控板/平滑滚轮
+                // 的单帧增量常常小于半个字符高度，逐帧 round 会让这些小增量永远舍入成 0、
+                // 白白丢掉（"滚了但纹丝不动"）。这里跨帧累计余量，凑够整行才真正移动
+                // scrollback，不足一行的部分留到下一帧继续累加，方向反转时自然抵消。
+                self.local_scroll_accum += smooth;
+                let whole_lines = (self.local_scroll_accum / char_h).trunc() as i64;
+                if whole_lines != 0 {
+                    self.local_scroll_accum -= whole_lines as f32 * char_h;
+                    let nb = (self.scrollback as i64 + whole_lines)
+                        .clamp(0, DEFAULT_SCROLLBACK as i64) as usize;
                     self.parser.screen_mut().set_scrollback(nb);
                     // 回读 vt100 按「实际历史行数」钳制后的真实值：否则 self.scrollback 可能远超真实历史，
-                    // 之后要空滚很多步才重新移动视口（「死滚动」）。
-                    self.scrollback = self.parser.screen().scrollback();
+                    // 之后要空滚很多步才重新移动视口（「死滚动」）。到达边界时顺带清空余量，避免
+                    // 继续同向空滚积累巨量余数（外部审查报告 5.1 的边界注意事项）。
+                    let clamped = self.parser.screen().scrollback();
+                    if clamped != nb {
+                        self.local_scroll_accum = 0.0;
+                    }
+                    self.scrollback = clamped;
                     self.recompute_search_hl(); // 手动滚动：高亮跟随命中行（滚出视口才消失）
                 }
+            }
+            if raw != 0.0 {
+                log::debug!(
+                    "term scroll: -> sb_after={} accum_after={:.3} max_sb={}",
+                    self.scrollback,
+                    self.local_scroll_accum,
+                    {
+                        let cur = self.scrollback;
+                        self.parser.screen_mut().set_scrollback(usize::MAX);
+                        let m = self.parser.screen().scrollback();
+                        self.parser.screen_mut().set_scrollback(cur);
+                        m
+                    },
+                );
             }
         }
 

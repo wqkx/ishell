@@ -115,6 +115,29 @@ fn replace_known_host(host: &str, port: u16, new_key: &ssh_key::PublicKey) -> an
 /// 主机密钥确认等待上限：UI 异常关闭/卡住时避免 worker 永久挂起。
 const HOSTKEY_DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// TCP 连接 + SSH 版本协商/密钥交换的等待上限。这一步纯粹是网络层握手，不等待任何用户交互
+/// （用户交互在 authenticate() 里，主机密钥确认另有 HOSTKEY_DECISION_TIMEOUT 兜底），弱网/
+/// 目标不可达时 russh 的 `client::connect`/`connect_stream` 在此之前完全没有超时保护，会一直
+/// 挂在 TCP 握手或 kex 上——远超用户等待意愿，且看起来和"卡死无响应"没有区别；每次重连都会
+/// 再次卡住同样长时间，表现为"第一次连不上、后面怎么点重连都连不上"。加一层超时让它老老实实
+/// 报错，交回既有的指数退避重连循环（session_events.rs）去重试。
+const NET_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn with_connect_timeout<T>(
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(NET_CONNECT_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!(
+            "{}",
+            crate::i18n::tr(
+                "连接超时（网络较弱或目标不可达）",
+                "Connect timed out (weak network or host unreachable)"
+            )
+        ),
+    }
+}
+
 impl ClientHandler {
     /// 未知或变更的主机密钥：弹窗请用户确认（changed=true 表示密钥已变更）。
     /// 超时或通道关闭视为拒绝。
@@ -496,8 +519,10 @@ pub(super) async fn connect(
             sink: sink.clone(),
             decision_rx: decision_rx.clone(),
         };
-        let mut jhandle =
-            client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?;
+        let mut jhandle = with_connect_timeout(async {
+            Ok(client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?)
+        })
+        .await?;
         if !authenticate(&mut jhandle, &jump.username, &jump.auth, sink, cmd_rx).await? {
             anyhow::bail!(
                 "{}",
@@ -509,13 +534,19 @@ pub(super) async fn connect(
             crate::i18n::Lang::Zh => format!("经跳板机连接 {}:{} …", cfg.host, cfg.port),
             crate::i18n::Lang::En => format!("Via jump to {}:{} …", cfg.host, cfg.port),
         }));
-        let ch = jhandle
-            .channel_open_direct_tcpip(cfg.host.clone(), cfg.port as u32, "127.0.0.1", 0)
-            .await?;
-        let handle = client::connect_stream(config, ch.into_stream(), target_handler).await?;
+        let handle = with_connect_timeout(async {
+            let ch = jhandle
+                .channel_open_direct_tcpip(cfg.host.clone(), cfg.port as u32, "127.0.0.1", 0)
+                .await?;
+            Ok(client::connect_stream(config, ch.into_stream(), target_handler).await?)
+        })
+        .await?;
         (handle, Some(jhandle))
     } else {
-        let handle = client::connect(config, (cfg.host.as_str(), cfg.port), target_handler).await?;
+        let handle = with_connect_timeout(async {
+            Ok(client::connect(config, (cfg.host.as_str(), cfg.port), target_handler).await?)
+        })
+        .await?;
         (handle, None)
     };
 

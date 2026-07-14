@@ -155,10 +155,16 @@ impl App {
                     };
                     // 整个传输项包进一个感知点击的 scope，便于整体右键（否则右键会穿透到下方终端）
                     let item = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(dir_icon).color(dir_col).size(13.0));
-                            ui.label(RichText::new(&t.name).size(12.0).color(Palette::TEXT));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 文件名过长时需要跟右侧状态图标留出空间、省略号截断，而不是原样撑开
+                        // 和图标区域重叠——先出右侧（图标/按钮，天然宽度小），再把剩余宽度
+                        // 让给左侧名字标签做截断（Sides::shrink_left 正是为这个场景设计的）。
+                        egui::Sides::new().shrink_left().truncate().show(
+                            ui,
+                            |ui| {
+                                ui.label(RichText::new(dir_icon).color(dir_col).size(13.0));
+                                ui.label(RichText::new(&t.name).size(12.0).color(Palette::TEXT));
+                            },
+                            |ui| {
                                 match t.ok {
                                     Some(true) => {
                                         ui.label(RichText::new(icon::CHECK_CIRCLE).color(Palette::OK).size(13.0));
@@ -214,8 +220,8 @@ impl App {
                                         ui.spinner();
                                     }
                                 }
-                            });
-                        });
+                            },
+                        );
                         let done = t.ok == Some(true);
                         let frac = if done { 1.0 } else if t.total > 0 { t.done as f32 / t.total as f32 } else { 0.0 };
                         let pct = (frac.clamp(0.0, 1.0) * 100.0).round() as i32;

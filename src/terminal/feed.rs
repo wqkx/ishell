@@ -203,9 +203,13 @@ impl Terminal {
             if let Some(pos) = find_sub(bytes, b"\x1b[3J") {
                 let (before, after) = bytes.split_at(pos + 4);
                 self.parser.process(before);
+                // 与 resize 的普通屏重建同理：清屏该清的是内容和回滚缓冲，不该连带清掉鼠标
+                // 上报等私有模式——否则 `clear` 这个日常动作就会悄悄把已开启的鼠标上报关掉。
+                let restore = Self::mode_restore_bytes(self.parser.screen());
                 self.parser = vt100::Parser::new(self.rows, self.cols, DEFAULT_SCROLLBACK);
                 self.scrollback = 0;
                 self.parser.process(after);
+                self.parser.process(&restore);
                 self.ensure_cursor_after_alt();
                 return;
             }
@@ -222,6 +226,43 @@ impl Terminal {
             self.parser.process(b"\x1b[?25h");
         }
         self.prev_alt = alt;
+    }
+
+    /// 普通屏重建解析器（见 `resize`）时，鼠标上报/应用键盘/应用光标键/括号粘贴等私有模式
+    /// 不属于「屏幕内容」，`serialize_buffer` 不会带上它们；远端程序（尤其是不切备用屏、
+    /// 靠自己重绘实现内部滚动的 TUI，如 codex/claude code 这类 chat CLI）并不知道 iShell
+    /// 内部悄悄重建了一次解析器，也就不会重新发送这些模式的开启序列——不主动补回的话，一次
+    /// 窗口缩放就会把已经开启的鼠标上报静默清空，此后滚轮/按键行为全都对不上远端预期（曾出现
+    /// 「codex 里滚动一次、缩放窗口后再也滚不动，且看到的是进入 codex 之前的历史」）。
+    /// 这里把旧解析器当前生效的模式换算成等价的开启转义序列，喂给新解析器，效果等同于远端
+    /// 重新发了一遍——不改变新解析器"从头历史重放"这个既有设计，只是把旁路状态一并接上。
+    fn mode_restore_bytes(old: &vt100::Screen) -> Vec<u8> {
+        let mut out = Vec::new();
+        if old.application_keypad() {
+            out.extend_from_slice(b"\x1b=");
+        }
+        if old.application_cursor() {
+            out.extend_from_slice(b"\x1b[?1h");
+        }
+        if old.bracketed_paste() {
+            out.extend_from_slice(b"\x1b[?2004h");
+        }
+        if old.hide_cursor() {
+            out.extend_from_slice(b"\x1b[?25l");
+        }
+        match old.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => {}
+            vt100::MouseProtocolMode::Press => out.extend_from_slice(b"\x1b[?9h"),
+            vt100::MouseProtocolMode::PressRelease => out.extend_from_slice(b"\x1b[?1000h"),
+            vt100::MouseProtocolMode::ButtonMotion => out.extend_from_slice(b"\x1b[?1002h"),
+            vt100::MouseProtocolMode::AnyMotion => out.extend_from_slice(b"\x1b[?1003h"),
+        }
+        match old.mouse_protocol_encoding() {
+            vt100::MouseProtocolEncoding::Default => {}
+            vt100::MouseProtocolEncoding::Utf8 => out.extend_from_slice(b"\x1b[?1005h"),
+            vt100::MouseProtocolEncoding::Sgr => out.extend_from_slice(b"\x1b[?1006h"),
+        }
+        out
     }
 
     /// 调整逻辑尺寸（字符行列）。返回是否真的变化。
@@ -243,8 +284,10 @@ impl Terminal {
         } else {
             let prev_sb = self.scrollback;
             let data = self.serialize_buffer();
+            let restore = Self::mode_restore_bytes(self.parser.screen());
             let mut np = vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK);
             np.process(&data);
+            np.process(&restore);
             self.parser = np;
             self.cols = cols;
             self.rows = rows;
