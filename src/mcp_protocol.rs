@@ -102,6 +102,25 @@ pub enum McpReqKind {
         force: bool,
         timeout_ms: u64,
     },
+    /// 把本地文件/目录复制到远端（走 SFTP 上传通道，字节不经过这条 JSON-RPC 连接）——
+    /// 大文件/整个目录用这个，不要用 `write_file`（那条路要求把全部内容内联进请求 JSON，
+    /// 大文件会撑爆传输层、也很浪费）。
+    CopyToRemote {
+        session_uid: u64,
+        /// 本地绝对路径（文件或目录）
+        local_path: String,
+        /// 远端目标绝对路径，可以和 `local_path` 的文件名不同（自动改名）
+        remote_path: String,
+        timeout_ms: u64,
+    },
+    /// 把远端文件/目录复制到本地（走 SFTP 下载通道），是 `CopyToRemote` 的反方向。
+    CopyFromRemote {
+        session_uid: u64,
+        remote_path: String,
+        /// 本地目标绝对路径，可以和 `remote_path` 的文件名不同；所在目录不存在会自动创建
+        local_path: String,
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +145,8 @@ pub enum McpReqResult {
     FileWritten { path: String, mtime: u32 },
     /// `ReadFile` 的结果。
     FileContent { path: String, content: String },
+    /// `CopyToRemote`/`CopyFromRemote` 成功后的目标路径。
+    Copied { path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

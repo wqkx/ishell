@@ -373,6 +373,17 @@ impl Session {
                     message,
                     refresh_dir,
                 } => {
+                    // AI/MCP `copy_file` 借用的临时改名目录（若有）：传输真正结束时删除，
+                    // 与下面 pending_file_op 的 resolve 各自独立，即便响应已经因超时提前
+                    // 发出，临时目录也总能在这里被清理，不会残留在系统临时目录里。
+                    if let Some(dir) = self.copy_tmp_dirs.remove(&id) {
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                    // 同理，回填 MCP 响应本身不影响下面继续走 self.transfers 记账——
+                    // AI 发起的这次复制也应该像普通传输一样，在传输窗口里对用户可见。
+                    if self.file_copy_op_would_resolve(id) {
+                        self.try_resolve_file_copy(id, if ok { Ok(()) } else { Err(message.clone()) });
+                    }
                     let connected = self.connected;
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                         t.note = String::new();

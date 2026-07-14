@@ -210,7 +210,10 @@ cargo run --release
     交互式程序；`read_history` 读取该会话从开始至今的完整回滚历史（不止一屏）；
   - `interrupt`：发送 Ctrl+C；同时也是并发保护的退出口——一个会话同一时刻只允许一条挂起的
     AI 命令，卡住时调用一次 `interrupt` 即可立即释放（代价是丢失那条命令的结果）；
-  - `write_file` / `read_file`：复用已有 SFTP 连接读写远端文本文件，不必另开 `scp`。
+  - `write_file` / `read_file`：复用已有 SFTP 连接读写远端文本文件，**内容内联在请求/响应里**——
+    小文件很方便，但整份内容都要经过这条 JSON-RPC 连接；
+  - `copy_to_remote` / `copy_from_remote`：复用同一条 SFTP 连接在本地/远端之间复制文件或目录，
+    **字节不经过 MCP 请求本身**——大文件、整个目录应该用这两个，而不是 `write_file`/`read_file`。
 - **远程访问，自动完成**。开关打开后，iShell 每次连上一台服务器，都会顺便把本机的 MCP socket
   经这条已认证加密的 SSH 连接反向转发到**那台服务器**上的 `~/.ishell-mcp-<随机后缀>.sock`
   （每次连接的后缀都不同，重连时不会跟服务器还没判定为死亡的上一条连接抢同一个路径）——

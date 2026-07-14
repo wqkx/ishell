@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::mcp_protocol::{
     McpReqKind, McpReqResult, McpRequest, McpResponse, McpRunResult, McpSavedConn, McpSessionInfo,
 };
-use crate::proto::{AuthMethod, ConnectConfig, Eol, JumpHost, UiCommand};
+use crate::proto::{AuthMethod, ConflictPolicy, ConnectConfig, Eol, JumpHost, UiCommand};
 use crate::store::SavedConnection;
 
 use super::{App, Session};
@@ -164,6 +164,50 @@ impl Session {
         }
         true
     }
+
+    /// 同上，`copy_file`（`CopyToRemote`/`CopyFromRemote`）版本：`op_id` 匹配
+    /// `WorkerEvent::TransferDone`。与 write/read 不同的是，传输事件本身还要继续走
+    /// `session_events.rs` 里已有的 `self.transfers` 记账（让用户在传输窗口里也能看到这次
+    /// AI 发起的复制），所以调用方不应该像 write/read 那样把事件"吞掉"——这里只负责回填
+    /// MCP 响应，不影响事件其余部分的处理。
+    pub(super) fn file_copy_op_would_resolve(&self, id: u64) -> bool {
+        self.file_op_tombstones.contains(&id)
+            || matches!(
+                &self.pending_file_op,
+                Some(op) if matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id)
+            )
+    }
+
+    pub(super) fn try_resolve_file_copy(&mut self, id: u64, result: Result<(), String>) -> bool {
+        if self.file_op_tombstones.contains(&id) {
+            return true;
+        }
+        let matches = matches!(
+            &self.pending_file_op,
+            Some(op) if matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id)
+        );
+        if !matches {
+            return false;
+        }
+        let Some(mut op) = self.pending_file_op.take() else {
+            return false;
+        };
+        if let Some(tx) = op.resp_tx.take() {
+            let req_id = op.req_id;
+            let resp = match result {
+                Ok(()) => McpResponse {
+                    id: req_id,
+                    result: Ok(McpReqResult::Copied { path: op.path }),
+                },
+                Err(msg) => McpResponse {
+                    id: req_id,
+                    result: Err(msg),
+                },
+            };
+            let _ = tx.send(resp);
+        }
+        true
+    }
 }
 
 /// Write 用 `op_id` 匹配 `FileSaved`/`FileSaveFailed`/`FileSaveConflict`；Read 用 `op_id`
@@ -173,6 +217,10 @@ impl Session {
 pub(super) enum FileOpKind {
     Write { op_id: u64 },
     Read { op_id: u64 },
+    /// `CopyToRemote`/`CopyFromRemote`：`op_id` 匹配 `WorkerEvent::TransferDone`（同一 id
+    /// 空间，见 mcp_bridge.rs 里 nanosecond 时间戳生成 op_id 的既有写法，避免跟 GUI 自己
+    /// 发起的传输、走 `Session::next_xfer` 的小整数 id 撞车）。
+    Copy { op_id: u64 },
 }
 
 /// AI 的 `write_file`/`read_file` 请求，正等待 worker 侧 SFTP 操作完成的事件
@@ -276,6 +324,64 @@ fn trim_leading_echo(output: &str, command: &str) -> String {
 /// （UTF-8 里最多到 4 倍）远超预期——按字节限制才跟"防止 JSON-RPC 响应撑爆传输层"这个
 /// 目的对得上。
 const MAX_RUN_OUTPUT_BYTES: usize = 200_000;
+
+/// `copy_file` 用的极简远端路径工具：SFTP 远端路径总是 POSIX 风格，不需要
+/// `ssh::sftp`（不对 `src/app` 公开）里那套一致的 `remote_parent`/`basename` 实现，
+/// 这里按同样的语义各写一份小的，避免为了共享几行逻辑扩大那边的可见性。
+fn remote_basename(path: &str) -> String {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string()
+}
+
+fn remote_parent(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".into(),
+        Some(i) => trimmed[..i].to_string(),
+    }
+}
+
+/// 本地路径取名同时按 `/` 和 `\` 切分（跟 `ssh::xfer::util::local_basename` 语义一致，
+/// 兼容 Windows 路径字面量），否则「远端要求的文件名是否和本地源文件名不同」这个判断
+/// 会跟 upload() 实际采用的文件名对不上。
+fn local_basename(path: &str) -> String {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// `copy_file`（本地→远端方向）里，若调用方要求的远端文件名与本地源文件名不同，
+/// 借一个临时符号链接"改名"后再喂给已有的 `upload()`——它按 `local` 参数的 basename
+/// 决定远端文件名，这样不用改动其内部已经过充分验证的冲突检测/断点续传/目录递归逻辑。
+/// 返回 (喂给 `UiCommand::Upload` 的 local 路径, 之后需要整体删除的临时目录)。
+#[cfg(unix)]
+fn make_rename_link(
+    local_path: &str,
+    desired_name: &str,
+    op_id: u64,
+) -> std::io::Result<(String, std::path::PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("ishell-mcp-copy-{op_id}"));
+    std::fs::create_dir_all(&dir)?;
+    let link = dir.join(desired_name);
+    std::os::unix::fs::symlink(local_path, &link)?;
+    Ok((link.to_string_lossy().into_owned(), dir))
+}
+/// 非 unix 平台从未真正走到这里（`spawn_mcp_listener` 在这些平台上直接返回一个永远收不到
+/// 数据的空通道），保留这个分支只是为了让本文件在所有平台上都能编译；符号链接不可移植，
+/// 退化为实际拷贝一份（正确性优先于这条从不会被执行的路径上的效率）。
+#[cfg(not(unix))]
+fn make_rename_link(
+    local_path: &str,
+    desired_name: &str,
+    op_id: u64,
+) -> std::io::Result<(String, std::path::PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("ishell-mcp-copy-{op_id}"));
+    std::fs::create_dir_all(&dir)?;
+    let link = dir.join(desired_name);
+    std::fs::copy(local_path, &link)?;
+    Ok((link.to_string_lossy().into_owned(), dir))
+}
 
 fn cap_output_for_ai(output: String) -> String {
     if output.len() <= MAX_RUN_OUTPUT_BYTES {
@@ -531,7 +637,9 @@ impl App {
                     // 这样迟到的真实完成事件到达时能被认出来直接丢弃，不会因为
                     // pending_file_op 已经是 None 就被误路由进普通编辑器 UI。
                     let op_id = match op.kind {
-                        FileOpKind::Write { op_id } | FileOpKind::Read { op_id } => op_id,
+                        FileOpKind::Write { op_id }
+                        | FileOpKind::Read { op_id }
+                        | FileOpKind::Copy { op_id } => op_id,
                     };
                     s.file_op_tombstones.push_back(op_id);
                     if s.file_op_tombstones.len() > MAX_TOMBSTONES {
@@ -943,6 +1051,120 @@ impl App {
                 s.pending_file_op = Some(PendingAiFileOp {
                     kind: FileOpKind::Read { op_id },
                     path,
+                    resp_tx: Some(resp_tx),
+                    req_id: id,
+                    deadline: Instant::now() + clamp_timeout(timeout_ms),
+                });
+            }
+            McpReqKind::CopyToRemote {
+                session_uid,
+                local_path,
+                remote_path,
+                timeout_ms,
+            } => {
+                let Some(idx) = self.session_idx_by_uid(session_uid) else {
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    return;
+                };
+                let s = &mut self.sessions[idx];
+                if !s.connected {
+                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    return;
+                }
+                if s.pending_file_op.is_some() {
+                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                    return;
+                }
+                // 本地源不存在的话，与其让它进传输任务的重试/退避跑一圈才报错，不如现在
+                // 就快速失败——metadata 探测不了文件/目录，upload() 无论如何都不会成功。
+                if std::fs::metadata(&local_path).is_err() {
+                    send_err(resp_tx, format!("本地路径不存在或不可读：{local_path}"));
+                    return;
+                }
+                let op_id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let remote_dir = remote_parent(&remote_path);
+                let desired_name = remote_basename(&remote_path);
+                let upload_local = if desired_name == local_basename(&local_path) {
+                    local_path.clone()
+                } else {
+                    match make_rename_link(&local_path, &desired_name, op_id) {
+                        Ok((link, tmp_dir)) => {
+                            s.copy_tmp_dirs.insert(op_id, tmp_dir);
+                            link
+                        }
+                        Err(e) => {
+                            send_err(resp_tx, format!("准备改名用的临时链接失败：{e}"));
+                            return;
+                        }
+                    }
+                };
+                let sent = s
+                    .cmd_tx
+                    .send(UiCommand::Upload {
+                        id: op_id,
+                        local: upload_local,
+                        remote_dir,
+                        policy: ConflictPolicy::Overwrite,
+                    })
+                    .is_ok();
+                if !sent {
+                    if let Some(dir) = s.copy_tmp_dirs.remove(&op_id) {
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    return;
+                }
+                s.pending_file_op = Some(PendingAiFileOp {
+                    kind: FileOpKind::Copy { op_id },
+                    path: remote_path,
+                    resp_tx: Some(resp_tx),
+                    req_id: id,
+                    deadline: Instant::now() + clamp_timeout(timeout_ms),
+                });
+            }
+            McpReqKind::CopyFromRemote {
+                session_uid,
+                remote_path,
+                local_path,
+                timeout_ms,
+            } => {
+                let Some(idx) = self.session_idx_by_uid(session_uid) else {
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    return;
+                };
+                let s = &mut self.sessions[idx];
+                if !s.connected {
+                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    return;
+                }
+                if s.pending_file_op.is_some() {
+                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                    return;
+                }
+                let op_id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                // download() 内部会按 local 的父目录 create_dir_all，不需要预先建目录。
+                let sent = s
+                    .cmd_tx
+                    .send(UiCommand::Download {
+                        id: op_id,
+                        remote: remote_path,
+                        local: local_path.clone(),
+                        policy: ConflictPolicy::Overwrite,
+                    })
+                    .is_ok();
+                if !sent {
+                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    return;
+                }
+                s.pending_file_op = Some(PendingAiFileOp {
+                    kind: FileOpKind::Copy { op_id },
+                    path: local_path,
                     resp_tx: Some(resp_tx),
                     req_id: id,
                     deadline: Instant::now() + clamp_timeout(timeout_ms),

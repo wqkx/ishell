@@ -75,6 +75,10 @@ pub(super) struct Session {
     /// None 就被误当成"普通编辑器操作"路由过去（可能凭空建一个用户没开过的编辑器标签，
     /// 或者把无关标签的保存状态搅乱）。有界环形缓冲，避免无限增长。
     pub(super) file_op_tombstones: std::collections::VecDeque<u64>,
+    /// `copy_file`（本地→远端方向）为改名借用的临时符号链接目录：op_id -> 临时目录路径。
+    /// 传输真正结束（`TransferDone`，见 session_events.rs）时删除；与 `pending_file_op`/
+    /// 墓碑机制各自独立，保证哪怕响应已经因超时提前发出，临时目录也总会在传输实际完成后清理。
+    pub(super) copy_tmp_dirs: std::collections::HashMap<u64, std::path::PathBuf>,
 }
 
 /// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
@@ -185,6 +189,7 @@ impl App {
             ai_owned: false,
             pending_file_op: None,
             file_op_tombstones: std::collections::VecDeque::new(),
+            copy_tmp_dirs: std::collections::HashMap::new(),
         });
         self.active = Some(self.sessions.len() - 1);
         self.tabbar.scroll_to_active = true; // 新建标签后滚动到可视区
@@ -212,6 +217,11 @@ impl App {
         s.monitor_ok = None;
         s.pending_ai_run = None; // worker 已重启：旧的 AI 命令等待作废（对端 oneshot 断线会收到错误）
         s.pending_file_op = None; // 同上：旧的 write_file/read_file 等待也一并作废
+        // worker 已重启，旧连接上那些还在跑的传输任务已经跟丢了，对应的临时改名目录不会再
+        // 收到 TransferDone 来触发清理——这里直接清掉，避免残留在系统临时目录里。
+        for dir in s.copy_tmp_dirs.drain().map(|(_, d)| d) {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建
         for f in &mut s.forwards {
             f.ok = true;
@@ -263,6 +273,9 @@ impl App {
             return;
         }
         let s = self.sessions.remove(idx);
+        for dir in s.copy_tmp_dirs.values() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         let _ = s.cmd_tx.send(UiCommand::Disconnect);
         if self.sessions.is_empty() {
             self.active = None;

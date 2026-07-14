@@ -216,8 +216,12 @@ take over a tab you already have open, or open a brand-new one itself from a sav
   - `interrupt`: send Ctrl+C — also the escape hatch for the concurrency guard: a session only
     ever allows one pending AI command at a time, and calling `interrupt` immediately frees it up
     if stuck (at the cost of losing that command's result);
-  - `write_file` / `read_file`: read/write a remote text file over the existing SFTP connection,
-    no need to shell out to `scp`.
+  - `write_file` / `read_file`: read/write a remote text file **inlined in the request/response**,
+    over the existing SFTP connection — convenient for small files, but the whole content goes
+    through the JSON-RPC payload;
+  - `copy_to_remote` / `copy_from_remote`: copy a local file/directory to/from the remote side over
+    the same SFTP connection **without inlining bytes into the MCP request** — use these instead of
+    `write_file`/`read_file` for large files or whole directories.
 - **Remote access, automatic.** Whenever iShell opens an SSH session to a server (with this
   setting on), it also reverse-forwards its local MCP socket to `~/.ishell-mcp-<nonce>.sock`
   **on that remote server** (a random suffix per connection, so a reconnect never collides with

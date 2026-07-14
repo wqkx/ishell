@@ -221,6 +221,34 @@ pub struct ReadFileArgs {
     pub timeout_ms: u64,
 }
 
+fn default_copy_timeout_ms() -> u64 {
+    300_000
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CopyToRemoteArgs {
+    /// list_sessions 返回的会话 uid
+    pub session_uid: u64,
+    /// 本地绝对路径（文件或目录）
+    pub local_path: String,
+    /// 远端目标绝对路径，文件名可以和 local_path 不同
+    pub remote_path: String,
+    #[serde(default = "default_copy_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CopyFromRemoteArgs {
+    /// list_sessions 返回的会话 uid
+    pub session_uid: u64,
+    /// 远端绝对路径（文件或目录）
+    pub remote_path: String,
+    /// 本地目标绝对路径，文件名可以和 remote_path 不同；所在目录不存在会自动创建
+    pub local_path: String,
+    #[serde(default = "default_copy_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
 #[tool_router]
 impl IshellMcp {
     pub fn new() -> Self {
@@ -432,6 +460,59 @@ impl IshellMcp {
                 session_uid,
                 path,
                 force,
+                timeout_ms,
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "把本地文件/目录复制到远端（走 SFTP 上传，字节不经过这条 MCP 连接的 \
+                        JSON 传输）。同步大文件、整个目录、或任何体积明显超出「内联进一次 \
+                        JSON 请求」划算范围的内容都应该用这个，而不是 write_file——write_file \
+                        要求把全部内容内联传入，大文件会占用巨量上下文、还可能撑爆传输层。\
+                        remote_path 的文件名可以和本地不同。"
+    )]
+    async fn copy_to_remote(
+        &self,
+        Parameters(CopyToRemoteArgs {
+            session_uid,
+            local_path,
+            remote_path,
+            timeout_ms,
+        }): Parameters<CopyToRemoteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        text_result(
+            call(McpReqKind::CopyToRemote {
+                session_uid,
+                local_path,
+                remote_path,
+                timeout_ms,
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "把远端文件/目录复制到本地（走 SFTP 下载），是 copy_to_remote 的反方向。\
+                        拉取大文件/整个目录时用这个，而不是 read_file——read_file 会把全部内容\
+                        内联进响应 JSON，大文件既浪费上下文又可能被截断。local_path 的文件名\
+                        可以和远端不同，所在目录不存在会自动创建。"
+    )]
+    async fn copy_from_remote(
+        &self,
+        Parameters(CopyFromRemoteArgs {
+            session_uid,
+            remote_path,
+            local_path,
+            timeout_ms,
+        }): Parameters<CopyFromRemoteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        text_result(
+            call(McpReqKind::CopyFromRemote {
+                session_uid,
+                remote_path,
+                local_path,
                 timeout_ms,
             })
             .await,
