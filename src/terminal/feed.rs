@@ -12,26 +12,6 @@ use super::{
 const AI_CAPTURE_CAP: usize = 4 * 1024 * 1024;
 
 impl Terminal {
-    /// 跟踪 vt100 0.16 未暴露的 DECSET 1007（Alternate Scroll）。序列可能跨 SSH
-    /// 数据块，因此把上次短尾与本次输入拼接后按出现顺序处理。
-    fn track_terminal_modes(&mut self, bytes: &[u8]) {
-        const ENABLE: &[u8] = b"\x1b[?1007h";
-        const DISABLE: &[u8] = b"\x1b[?1007l";
-        const KEEP: usize = ENABLE.len() - 1;
-
-        let mut data = std::mem::take(&mut self.mode_scan_tail);
-        data.extend_from_slice(bytes);
-        for window in data.windows(ENABLE.len()) {
-            if window == ENABLE {
-                self.alternate_scroll = true;
-            } else if window == DISABLE {
-                self.alternate_scroll = false;
-            }
-        }
-        let keep_from = data.len().saturating_sub(KEEP);
-        self.mode_scan_tail.extend_from_slice(&data[keep_from..]);
-    }
-
     /// 从输入字节里剥掉待吞的注入命令回显。武装后目标回显之前可能先到达其它真实内容（如
     /// AI 命令场景里先发的真实命令自己的回显）——这些字节原样透传、不影响继续等待目标出现。
     /// 真实内容里偶然出现和目标回显开头相同的字节时，会先暂存（`echo_pending`）当作「可能是
@@ -167,7 +147,6 @@ impl Terminal {
         } else {
             bytes
         };
-        self.track_terminal_modes(bytes);
         // AI/MCP 命令补全检测：扫描哨兵前缀，命中后解析退出码。纯只读扫描，不影响
         // 后续渲染/日志——与 strip_echo 状态完全独立，不耦合已在生产使用的回显吞除逻辑。
         // 哨兵行自身的可见性由注入方（见 mcp_bridge）用 `\r\x1b[K` 自擦除处理，这里无需
@@ -298,10 +277,11 @@ impl Terminal {
         if cols == self.cols && rows == self.rows {
             return false;
         }
-        if self.parser.screen().alternate_screen() || self.alternate_scroll {
-            // 备用屏以及显式开启 DECSET 1007 的交互式 TUI 都会在收到 SIGWINCH 后自行
-            // 重绘。这里若序列化普通屏再重建，会把动态视口错误固化成 shell 历史，并丢失
-            // vt100 未建模的旁路状态；直接调整几何尺寸，等待远端重绘才符合协议边界。
+        if self.parser.screen().alternate_screen() || rows > self.rows {
+            // 备用屏由应用收到 SIGWINCH 后自行重绘。普通屏放高时也必须直接扩容：如果把
+            // scrollback 序列化后按更高的视口重放，历史行会被吸回可见区；Codex 等 TUI
+            // 随后的清屏重绘会覆盖这些行，表现为 max scrollback 在缩小再放大后归零。
+            // 直接 set_size 会保留既有 scrollback，只在底部增加空白，远端重绘后即可填满。
             self.cols = cols;
             self.rows = rows;
             self.parser.screen_mut().set_size(rows, cols);

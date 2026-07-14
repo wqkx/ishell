@@ -94,12 +94,6 @@ pub struct Terminal {
     /// round 会一直得 0（触控板/平滑滚轮尤其明显），导致"滚了但纹丝不动"。这里跨帧
     /// 累计，凑够一整行才真正推动 vt100 scrollback，不足一行的余量保留到下一帧。
     local_scroll_accum: f32,
-    /// DECSET 1007（Alternate Scroll）：应用要求终端在未启用鼠标上报时，把备用滚轮
-    /// 转成光标键。Codex 的 inline/main-screen TUI 也会使用该模式，不能只看
-    /// `alternate_screen()` 判断滚轮是否应交给应用。
-    alternate_scroll: bool,
-    /// DEC 私有模式序列可能跨 SSH 数据块，保留足够短的尾部供下一次 feed 拼接扫描。
-    mode_scan_tail: Vec<u8>,
 }
 
 struct AiCapture {
@@ -153,8 +147,6 @@ impl Terminal {
             ime_preedit: String::new(),
             prev_focused: false,
             local_scroll_accum: 0.0,
-            alternate_scroll: false,
-            mode_scan_tail: Vec::new(),
             prev_alt: false,
             sb_dragging: false,
             ai_capture: None,
@@ -392,10 +384,9 @@ impl Terminal {
                 // 全过程状态，而不是只挑几个字段——否则没法回答"事件到底有没有到、走了哪条路、
                 // scrollback 是否真的变了"这几个关键问题（外部审查报告 5.3 的意见）。
                 log::debug!(
-                    "term scroll: alt={alt} alt_scroll={} report_mouse={report_mouse} mmode={mmode:?} \
+                    "term scroll: alt={alt} report_mouse={report_mouse} mmode={mmode:?} \
                      menc={menc:?} app_cursor={} raw={raw:.3} smooth={smooth:.2} char_h={char_h:.2} \
                      sb_before={} accum_before={:.3}",
-                    self.alternate_scroll,
                     self.parser.screen().application_cursor(),
                     self.scrollback,
                     self.local_scroll_accum,
@@ -415,11 +406,11 @@ impl Terminal {
                         }
                     }
                 }
-            } else if alt || self.alternate_scroll {
+            } else if alt {
                 // 备用屏幕没有回滚历史（本地 set_scrollback 在这里是空操作），大多数不开
-                // 鼠标上报的全屏程序（less/htop 等）靠自己拦截方向键实现翻页/滚动。DECSET
-                // 1007 则是应用对这种转换的显式请求；Codex 即使运行在主屏也会使用它，因此
-                // 这里不能只依赖 alternate_screen()。
+                // 鼠标上报的全屏程序（less/htop 等）靠自己拦截方向键实现翻页/滚动——把滚轮转成
+                // 方向键转发过去；这只是经验性兼容策略，不是任何终端协议承诺的行为，具体某个
+                // TUI 是否真的把方向键当滚动用，以它自己的按键处理为准。
                 self.local_scroll_accum = 0.0;
                 if raw != 0.0 {
                     let steps = (raw.abs().round() as i32).clamp(1, 3);

@@ -303,35 +303,21 @@ fn clear_wipes_scrollback() {
 }
 
 #[test]
-fn tracks_alternate_scroll_across_feed_boundaries() {
+fn growing_main_screen_keeps_existing_scrollback() {
     let mut t = Terminal::new();
-    assert!(!t.alternate_scroll);
+    assert!(t.resize(80, 10));
+    for i in 0..40 {
+        t.feed(format!("L{i}\r\n").as_bytes());
+    }
+    t.parser.screen_mut().set_scrollback(usize::MAX);
+    let before = t.parser.screen().scrollback();
+    assert!(before > 0);
+    t.parser.screen_mut().set_scrollback(0);
+    t.scrollback = 0;
 
-    // Codex/crossterm 使用 DECSET 1007 请求终端把滚轮转换为光标键；序列可能被 SSH
-    // 拆包，状态跟踪必须跨 feed 调用生效。
-    t.feed(b"\x1b[?10");
-    assert!(!t.alternate_scroll);
-    t.feed(b"07h");
-    assert!(t.alternate_scroll);
-
-    t.feed(b"\x1b[?1007");
-    assert!(t.alternate_scroll);
-    t.feed(b"l");
-    assert!(!t.alternate_scroll);
-}
-
-#[test]
-fn alternate_scroll_survives_main_screen_resize() {
-    let mut t = Terminal::new();
-    t.feed(b"before\r\n\x1b[?1007h");
-    assert!(!t.parser.screen().alternate_screen());
-    assert!(t.alternate_scroll);
-
+    // 回归：旧实现会把全部缓冲按更高视口重放，导致历史被吸回可见区；应用紧接着
+    // 清屏重绘后，max scrollback 就从非零变成 0。
     assert!(t.resize(100, 30));
-    assert_eq!(t.size(), (100, 30));
-    assert!(t.alternate_scroll);
-
-    // resize 不得重建/关闭应用请求的滚轮模式，后续关闭序列仍应正常生效。
-    t.feed(b"\x1b[?1007l");
-    assert!(!t.alternate_scroll);
+    t.parser.screen_mut().set_scrollback(usize::MAX);
+    assert_eq!(t.parser.screen().scrollback(), before);
 }
