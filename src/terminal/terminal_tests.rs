@@ -321,3 +321,20 @@ fn growing_main_screen_keeps_existing_scrollback() {
     t.parser.screen_mut().set_scrollback(usize::MAX);
     assert_eq!(t.parser.screen().scrollback(), before);
 }
+
+#[test]
+fn replies_to_cursor_position_query_in_output_order() {
+    let mut t = Terminal::new();
+    let reply = t.feed(b"\x1b[2;3H\x1b[6n\x1b[5;6H");
+
+    // 查询发生在第 2 行第 3 列；后续光标移动不能污染已经生成的 CPR。
+    assert_eq!(reply, b"\x1b[2;3R");
+    assert_eq!(t.parser.screen().cursor_position(), (4, 5));
+}
+
+#[test]
+fn replies_to_cursor_position_query_split_across_feeds() {
+    let mut t = Terminal::new();
+    assert!(t.feed(b"abc\x1b[").is_empty());
+    assert_eq!(t.feed(b"6n"), b"\x1b[1;4R");
+}

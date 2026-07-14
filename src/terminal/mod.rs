@@ -94,6 +94,8 @@ pub struct Terminal {
     /// round 会一直得 0（触控板/平滑滚轮尤其明显），导致"滚了但纹丝不动"。这里跨帧
     /// 累计，凑够一整行才真正推动 vt100 scrollback，不足一行的余量保留到下一帧。
     local_scroll_accum: f32,
+    /// 终端查询序列可能跨 SSH 数据块；暂存尚不能确定是否为完整查询的短尾。
+    query_tail: Vec<u8>,
 }
 
 struct AiCapture {
@@ -147,6 +149,7 @@ impl Terminal {
             ime_preedit: String::new(),
             prev_focused: false,
             local_scroll_accum: 0.0,
+            query_tail: Vec::new(),
             prev_alt: false,
             sb_dragging: false,
             ai_capture: None,

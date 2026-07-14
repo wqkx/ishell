@@ -12,6 +12,37 @@ use super::{
 const AI_CAPTURE_CAP: usize = 4 * 1024 * 1024;
 
 impl Terminal {
+    /// 处理终端输出，并为需要终端主动应答的查询生成回写字节。
+    ///
+    /// Codex 的 inline viewport 启动时用 DSR `CSI 6 n` 查询光标位置；若终端不返回
+    /// CPR，它会超时后假定光标位于原点，后续 history insertion/resize 都会基于错误
+    /// viewport。查询必须与输出严格按序处理，不能整批 process 完后才读取光标。
+    fn process_with_replies(&mut self, bytes: &[u8]) -> Vec<u8> {
+        const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+        let mut data = std::mem::take(&mut self.query_tail);
+        data.extend_from_slice(bytes);
+        let mut replies = Vec::new();
+        let mut pos = 0;
+
+        while let Some(rel) = find_sub(&data[pos..], CURSOR_QUERY) {
+            let query_at = pos + rel;
+            self.parser.process(&data[pos..query_at]);
+            let (row, col) = self.parser.screen().cursor_position();
+            replies.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+            pos = query_at + CURSOR_QUERY.len();
+        }
+
+        let rest = &data[pos..];
+        let keep = (1..CURSOR_QUERY.len())
+            .rev()
+            .find(|&n| rest.ends_with(&CURSOR_QUERY[..n]))
+            .unwrap_or(0);
+        self.parser.process(&rest[..rest.len() - keep]);
+        self.query_tail.extend_from_slice(&rest[rest.len() - keep..]);
+        replies
+    }
+
     /// 从输入字节里剥掉待吞的注入命令回显。武装后目标回显之前可能先到达其它真实内容（如
     /// AI 命令场景里先发的真实命令自己的回显）——这些字节原样透传、不影响继续等待目标出现。
     /// 真实内容里偶然出现和目标回显开头相同的字节时，会先暂存（`echo_pending`）当作「可能是
@@ -138,7 +169,7 @@ impl Terminal {
     }
 
     /// 喂入来自远程的原始字节。
-    pub fn feed(&mut self, bytes: &[u8]) {
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         // 注入命令的回显吞除（仅当有待吞内容时）
         let stripped;
         let bytes: &[u8] = if self.echo_pos < self.echo_expect.len() || self.echo_tail {
@@ -193,7 +224,7 @@ impl Terminal {
         data.truncate(split);
         let bytes = &data[..];
         if bytes.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // `clear` 会发 ESC[2J（清屏）+ ESC[3J（清回滚缓冲）。vt100 不处理 [3J，
@@ -202,20 +233,21 @@ impl Terminal {
         if find_sub(bytes, b"\x1b[2J").is_some() {
             if let Some(pos) = find_sub(bytes, b"\x1b[3J") {
                 let (before, after) = bytes.split_at(pos + 4);
-                self.parser.process(before);
+                let mut replies = self.process_with_replies(before);
                 // 与 resize 的普通屏重建同理：清屏该清的是内容和回滚缓冲，不该连带清掉鼠标
                 // 上报等私有模式——否则 `clear` 这个日常动作就会悄悄把已开启的鼠标上报关掉。
                 let restore = Self::mode_restore_bytes(self.parser.screen());
                 self.parser = vt100::Parser::new(self.rows, self.cols, DEFAULT_SCROLLBACK);
                 self.scrollback = 0;
-                self.parser.process(after);
+                replies.extend(self.process_with_replies(after));
                 self.parser.process(&restore);
                 self.ensure_cursor_after_alt();
-                return;
+                return replies;
             }
         }
-        self.parser.process(bytes);
+        let replies = self.process_with_replies(bytes);
         self.ensure_cursor_after_alt();
+        replies
     }
 
     /// 离开备用屏（如退出 vim/less/htop）时，确保光标恢复可见——有些程序异常退出（被 Ctrl+C/

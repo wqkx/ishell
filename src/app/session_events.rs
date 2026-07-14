@@ -159,7 +159,10 @@ impl Session {
                 }
                 WorkerEvent::TerminalData(bytes) => {
                     term_budget = term_budget.saturating_sub(bytes.len());
-                    self.terminal.feed(&bytes);
+                    let replies = self.terminal.feed(&bytes);
+                    if !replies.is_empty() {
+                        let _ = self.cmd_tx.send(UiCommand::TerminalInput(replies));
+                    }
                     if let Some(c) = self.terminal.cwd() {
                         self.last_cwd = c.to_string();
                     }
