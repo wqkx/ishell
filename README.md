@@ -2,9 +2,9 @@
 
 <img src="docs/logo.png" alt="iShell" width="300">
 
-**A modern, cross-platform SSH client written in Rust**
+**A modern, AI-native SSH terminal written in Rust**
 
-System monitor · interactive terminal · SFTP file manager · port forwarding · jump hosts — all in one window
+Let Claude Code, Codex CLI, or any MCP-compatible agent drive a real, persistent terminal session — plus system monitor · SFTP file manager · port forwarding · jump hosts, all in one window
 
 **English** · [中文](README.zh-CN.md)
 
@@ -20,13 +20,13 @@ System monitor · interactive terminal · SFTP file manager · port forwarding �
 
 Everything you need for daily SSH work in **one window** — and it stays out of your way.
 
+- 🤖 **Let AI drive the terminal (MCP)** — Claude Code, Codex CLI, and any other MCP-compatible agent can operate a real, persistent terminal session (cwd/env/history intact) instead of spawning a throwaway `ssh host cmd` that loses all context every time; commands and output show up in real time in the tab you're looking at. Off by default, opt-in when you want it. See "AI / MCP integration" below.
 - ⚡ **Fast & lightweight** — pure Rust + GPU immediate-mode UI. A single binary (~8–12 MB), instant startup, **~0% idle CPU**, **~80 MB RAM**. No Electron / JVM / Python, no daemon, no runtime deps.
 - 🎯 **Refined user experience** — a clean, warm light theme; smooth drag-to-reorder tabs; no toolbar clutter; English / 中文 switchable on the fly; sensible defaults so it just works.
 - 📁 **Effortless file operations** — multi-select rubber-band, batch delete/download, server-side copy/move, **resumable** transfers that **auto-resume after reconnect**, and folder **compress-download** (tar.gz) for thousands of small files.
 - 🔗 **Terminal ↔ files, linked** — "open this dir in terminal" from the file list, "reveal the terminal's current dir in the file list" the other way, and the working directory is **restored on reconnect** (OSC 7).
 - 🧰 **Complete feature set** — agent auth & forwarding, jump hosts, port forwarding + SOCKS5, command broadcast & snippets, live CPU/GPU/net/disk/process monitoring with `kill -9`.
 - ✍️ **A genuinely powerful editor** — a virtualized code editor that opens in its own window: **multi-cursor (Ctrl+D)**, syntax highlighting, find & replace, encoding/EOL auto-detect, Chinese IME, and it stays fast on huge files.
-- 🤖 **Let AI drive the terminal (MCP)** — an AI assistant like Claude Code can operate a real, persistent terminal session (cwd/env/history intact) instead of spawning a throwaway `ssh host cmd` that loses all context every time; commands and output show up in real time in the tab you're looking at. Off by default, opt-in when you want it. See "AI / MCP integration" below.
 
 ## ⚙️ Footprint
 
@@ -39,6 +39,12 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 > Measured on Linux, release build, one idle session; varies slightly with GPU driver / resolution.
 
 ## 🚀 Features
+
+**AI / MCP integration** (off by default — see "AI / MCP integration" below)
+- Let an AI assistant drive a real terminal session directly — shared, visible tab, commands and output in real time, instead of another SSH connection that loses all context
+- Works with **Claude Code, Codex CLI, and any other MCP-compatible client** — one binary, standard MCP stdio transport
+- Full tool set: run a command and wait for completion, keep waiting on long tasks, read screen/history, send raw keystrokes (for interactive prompts), interrupt, open/close sessions, read/write remote files
+- **Automatic reverse-forward** over your existing SSH connection so the AI can reach back and control this iShell from the remote server too, no extra setup needed
 
 **Connections & sessions**
 - Multi-session tabs: status dots, **smooth drag-to-reorder animation**, overflow fade, close confirmation
@@ -90,11 +96,6 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 
 **Monitoring**
 - Live monitor: CPU / memory / swap, **GPU (NVIDIA / AMD / Intel)**, network graph, disks, top processes (click for details + kill -9)
-
-**AI / MCP integration** (off by default — see "AI / MCP integration" below)
-- Let an AI assistant drive a real terminal session directly — shared, visible tab, commands and output in real time, instead of another SSH connection that loses all context
-- Full tool set: run a command and wait for completion, keep waiting on long tasks, read screen/history, send raw keystrokes (for interactive prompts), interrupt, open/close sessions, read/write remote files
-- **Automatic reverse-forward** over your existing SSH connection so the AI can reach back and control this iShell from the remote server too, no extra setup needed
 
 ## 📸 Screenshots
 
@@ -171,7 +172,7 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 
 ## 🤖 AI / MCP integration
 
-Let an AI assistant (e.g. Claude Code) drive a real terminal session — instead of spawning a
+Let an AI assistant (Claude Code, Codex CLI, or any other MCP-compatible agent) drive a real terminal session — instead of spawning a
 throwaway `ssh host cmd` that loses your shell's cwd, env, and history every time. It can either
 take over a tab you already have open, or open a brand-new one itself from a saved connection
 (read-only, for the AI's own use — a human can't type into it). Either way, the tab gets a clear
@@ -182,15 +183,21 @@ take over a tab you already have open, or open a brand-new one itself from a sav
   iShell process (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port is opened.
 - **Shared, visible terminal.** Commands the AI runs — and their output — appear in the
   corresponding terminal tab in real time, exactly as if you'd typed them yourself.
-- **Setup**: build the companion binary (`cargo build --release --bin ishell-mcp`) and point your
-  MCP client at it. With Claude Code, register it globally (not scoped to one project) in one line:
-  ```bash
-  claude mcp add ishell -s user -- /path/to/ishell-mcp
-  ```
-  or configure it by hand:
-  ```json
-  { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
-  ```
+- **Setup**: build the companion binary once (`cargo build --release --bin ishell-mcp`) — it
+  speaks the standard MCP stdio transport, so it isn't tied to any one client:
+  - **Claude Code** — register it globally (not scoped to one project) in one line:
+    ```bash
+    claude mcp add ishell -s user -- /path/to/ishell-mcp
+    ```
+  - **Codex CLI** — same idea:
+    ```bash
+    codex mcp add ishell -- /path/to/ishell-mcp
+    ```
+    (or add it by hand to `~/.codex/config.toml`: `[mcp_servers.ishell]` / `command = "/path/to/ishell-mcp"` — check `codex mcp --help` if the CLI/config format has changed since this was written)
+  - **Any other MCP-compatible client** (Cursor, Windsurf, Cline, …) — most accept the generic form:
+    ```json
+    { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
+    ```
 - **Tools exposed**:
   - `list_sessions` / `list_saved_connections`: list currently open sessions / all saved
     connection configs;

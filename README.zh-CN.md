@@ -2,9 +2,9 @@
 
 <img src="docs/logo.png" alt="iShell" width="300">
 
-**一个用 Rust 编写的现代化跨平台 SSH 客户端**
+**一个面向 AI 工作流的现代化终端，用 Rust 编写**
 
-系统监控 · 交互式终端 · SFTP 文件管理 · 端口转发 · 跳板机 —— 一屏搞定
+让 Claude Code、Codex CLI 等任意 MCP 兼容的 AI 助手直接驱动一个真实、持久的终端会话——外加系统监控 · SFTP 文件管理 · 端口转发 · 跳板机，一屏搞定
 
 [English](README.md) · **中文**
 
@@ -20,13 +20,13 @@
 
 日常 SSH 运维需要的一切都在**同一个窗口**里——而且不打扰你。
 
+- 🤖 **让 AI 直接驱动终端（MCP）** —— Claude Code、Codex CLI，以及任何兼容 MCP 的 AI 助手都可以直接操作一个真实、持久的终端会话（保留 cwd/环境/历史），而不是每次都开一条丢光上下文的 `ssh host cmd`；命令和输出实时显示在你看的到的标签里，默认关闭、按需开启。详见下文「AI / MCP 集成」一节。
 - ⚡ **快、占用低** —— 纯 Rust + GPU 即时模式 UI。单文件（约 8–12 MB）、秒开、**空闲 CPU ≈ 0%**、**内存约 80 MB**。无 Electron / JVM / Python，无守护进程，无运行时依赖。
 - 🎯 **用心打磨的体验** —— 干净的暖色浅色主题、标签平滑拖拽排序、不堆砌工具栏、中文 / English 随时切换、默认值合理，开箱即用。
 - 📁 **便捷的文件操作** —— 框选多选、批量删除/下载、远端服务器侧复制/移动、**下载断点续传**且**断线后自动续传**、文件夹 **压缩下载**（tar.gz）应对成千上万小文件。
 - 🔗 **终端 ↔ 文件 联动** —— 文件列表「在终端打开此目录」，反向「在文件列表中显示终端当前目录」，断线重连还会**恢复工作目录**（OSC 7）。
 - 🧰 **功能完善** —— Agent 认证与转发、跳板机、端口转发 + SOCKS5、命令广播与片段库、CPU/GPU/网络/磁盘/进程实时监控并可 `kill -9`。
 - ✍️ **真正强大的编辑器** —— 独立窗口的虚拟化代码编辑器：**多光标（Ctrl+D）**、语法高亮、查找替换、编码/换行自动识别、中文输入法，超大文件依旧流畅。
-- 🤖 **让 AI 直接驱动终端（MCP）** —— 像 Claude Code 这样的 AI 助手可以直接操作一个真实、持久的终端会话（保留 cwd/环境/历史），而不是每次都开一条丢光上下文的 `ssh host cmd`；命令和输出实时显示在你看的到的标签里，默认关闭、按需开启。详见下文「AI / MCP 集成」一节。
 
 ## ⚙️ 资源占用
 
@@ -39,6 +39,12 @@
 > 实测环境：Linux，release 构建，单会话空闲；具体随 GPU 驱动/分辨率略有差异。
 
 ## 🚀 功能
+
+**AI / MCP 集成**（默认关闭，详见下文「AI / MCP 集成」一节）
+- 让 AI 助手直接驱动一个真实终端会话——共享可见标签、命令与输出实时可见，而不是另开一条丢光上下文的 SSH 连接
+- 支持 **Claude Code、Codex CLI，以及任何兼容 MCP 的客户端**——一个二进制，标准 MCP stdio 传输
+- 完整工具集：执行命令并等待完成、继续等待长任务、读屏幕/历史、发送原始按键（应对交互式提示）、中断、开关会话、读写远端文件
+- 通过已有 SSH 连接**自动反向转发**到远端服务器，AI 在远端也能连回来控制本机 iShell，无需额外配置
 
 **连接与会话**
 - 多会话标签：状态圆点、**平滑拖拽排序动画**、溢出渐隐、关闭确认
@@ -90,11 +96,6 @@
 
 **监控**
 - 实时监控：CPU / 内存 / 交换、**GPU（NVIDIA / AMD / Intel）**、网络曲线、磁盘、进程 Top（点击查看详情 + 强制结束）
-
-**AI / MCP 集成**（默认关闭，详见下文「AI / MCP 集成」一节）
-- 让 AI 助手直接驱动一个真实终端会话——共享可见标签、命令与输出实时可见，而不是另开一条丢光上下文的 SSH 连接
-- 完整工具集：执行命令并等待完成、继续等待长任务、读屏幕/历史、发送原始按键（应对交互式提示）、中断、开关会话、读写远端文件
-- 通过已有 SSH 连接**自动反向转发**到远端服务器，AI 在远端也能连回来控制本机 iShell，无需额外配置
 
 ## 📸 截图
 
@@ -171,7 +172,7 @@ cargo run --release
 
 ## 🤖 AI / MCP 集成
 
-让 AI 助手（如 Claude Code）直接驱动一个真实的终端会话——而不是每次都另开一条丢光 cwd/环境/
+让 AI 助手（Claude Code、Codex CLI，或任何其它兼容 MCP 的智能体）直接驱动一个真实的终端会话——而不是每次都另开一条丢光 cwd/环境/
 历史的 `ssh host cmd`。既可以接管你已经打开的标签，也可以让 AI 用一个已保存的连接自己新开一个
 （只读，仅供 AI 操作，人不能往里打字），两种会话在标签栏都会有醒目的 🤖 标识。
 
@@ -179,15 +180,22 @@ cargo run --release
   Unix domain socket（每个 iShell 进程各一份 `~/.config/ishell/mcp-<pid>.sock`，权限 `0600`），
   不监听任何网络端口。
 - **共享可见终端**。AI 执行的命令和产生的输出会实时显示在对应终端标签里，效果等同于人亲自输入。
-- **接入方式**：编译配套的独立二进制（`cargo build --release --bin ishell-mcp`），在 MCP 客户端
-  里指向它。用 Claude Code 的话可以直接注册为全局可用（不限于某个项目目录）：
-  ```bash
-  claude mcp add ishell -s user -- /path/to/ishell-mcp
-  ```
-  或手写配置：
-  ```json
-  { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
-  ```
+- **接入方式**：编译一次配套的独立二进制（`cargo build --release --bin ishell-mcp`）——它走标准
+  MCP stdio 传输，不绑定任何特定客户端：
+  - **Claude Code** —— 直接注册为全局可用（不限于某个项目目录）：
+    ```bash
+    claude mcp add ishell -s user -- /path/to/ishell-mcp
+    ```
+  - **Codex CLI** —— 用法类似：
+    ```bash
+    codex mcp add ishell -- /path/to/ishell-mcp
+    ```
+    （或手动加到 `~/.codex/config.toml`：`[mcp_servers.ishell]` / `command = "/path/to/ishell-mcp"`——
+    如果 CLI/配置格式有变化，以 `codex mcp --help` 为准）
+  - **其它兼容 MCP 的客户端**（Cursor、Windsurf、Cline……）—— 大多接受通用写法：
+    ```json
+    { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
+    ```
 - **暴露的工具**：
   - `list_sessions` / `list_saved_connections`：列出当前打开的会话 / 所有已保存的连接配置；
   - `open_session`：用一个已保存的连接新开一个只读会话供 AI 专用；首次使用某条连接会弹窗让你
