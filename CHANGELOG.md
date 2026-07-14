@@ -2,6 +2,14 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [0.16.6] - 2026-07-14
+
+### Fixed
+- v0.16.5 的 Windows CI 失败：新增的路径校验单元测试用 POSIX 风格路径（如 `/tmp/x`）断言
+  `Path::is_absolute()` 应为真，但该判定标准随平台而变——Windows 下没有盘符前缀的路径不算
+  绝对路径，导致测试在 Windows 上失败；这几个用例现在只在 unix 上跑（本来这条 MCP 通道也
+  只在 unix 上真正启用）
+
 ## [0.16.5] - 2026-07-14
 
 ### Added

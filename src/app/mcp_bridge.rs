@@ -1205,13 +1205,19 @@ mod tests {
         assert_eq!(remote_parent("/bar.txt"), "/");
     }
 
+    // `Path::is_absolute()` 的判定标准随平台而变（Windows 下 "/tmp/x" 没有盘符前缀，
+    // 不算绝对路径）——这条 MCP 通道本身也只在 unix 上真正启用（见 spawn_mcp_listener
+    // 的 `#[cfg(unix)]` 版本），这几个用 POSIX 风格路径断言"应该合法"的用例只在 unix
+    // 上跑，避免在 Windows CI 上因为平台语义差异而不是真实回归失败。
     #[test]
+    #[cfg(unix)]
     fn local_path_must_be_absolute() {
         assert!(validate_local_path("notes.txt").is_err());
         assert!(validate_local_path("/tmp/notes.txt").is_ok());
     }
 
     #[test]
+    #[cfg(unix)]
     fn local_path_rejects_dot_and_dotdot_segments() {
         assert!(validate_local_path("/tmp/../etc/passwd").is_err());
         assert!(validate_local_path("/tmp/./notes.txt").is_err());
