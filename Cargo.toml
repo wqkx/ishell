@@ -91,6 +91,9 @@ winresource = "0.1"
 # crates.io 0.32.3 原样副本，仅改 is_view_current 一行（无视图时返回 false），跨平台安全。
 [patch.crates-io]
 glutin = { path = "vendor/glutin" }
+# vt100 0.16.2 在任何 DECSTBM 滚动区域启用时都丢弃被推出顶部的行；Codex 等
+# inline TUI 使用从第 1 行开始的滚动区域写入原生历史，因此需要保留这些行。
+vt100 = { path = "vendor/vt100" }
 
 [profile.release]
 opt-level = "s"   # 优化体积（GUI 仅事件驱动重绘，活跃渲染影响可忽略）

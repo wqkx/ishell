@@ -338,3 +338,17 @@ fn replies_to_cursor_position_query_split_across_feeds() {
     assert!(t.feed(b"abc\x1b[").is_empty());
     assert_eq!(t.feed(b"6n"), b"\x1b[1;4R");
 }
+
+#[test]
+fn top_anchored_scroll_region_writes_to_scrollback() {
+    let mut t = Terminal::new();
+    assert!(t.resize(20, 5));
+    t.feed(b"history-row\r\nlive-one\r\nlive-two");
+
+    // Codex/ratatui 的 inline history insertion：限制顶部区域后用 CSI S 将首行
+    // 推出屏幕。真实终端会把该行放入 scrollback；原 vt100 0.16.2 会直接丢弃。
+    t.feed(b"\x1b[1;3r\x1b[S");
+    t.parser.screen_mut().set_scrollback(usize::MAX);
+    assert_eq!(t.parser.screen().scrollback(), 1);
+    assert_eq!(t.parser.screen().cell(0, 0).unwrap().contents(), "h");
+}
