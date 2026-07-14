@@ -48,8 +48,39 @@ fn known_hosts_file() -> anyhow::Result<std::path::PathBuf> {
         .join("known_hosts"))
 }
 
+/// 进程内锁：串行化对 known_hosts 的读-改-写，避免多个并发连接同时触发主机密钥变更确认时
+/// 互相覆盖对方的改动（比如两条连接都在过滤旧行，后写的那个会带着自己那份「过滤前」的
+/// 旧内容覆盖回去，把另一条连接刚学会的新键连带丢掉）。
+static KNOWN_HOSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 同目录临时文件 + rename 的原子写：避免半截内容被读到，或进程崩溃时整个 known_hosts
+/// 变成空文件（`std::fs::write` 是"先截断再写"，中途失败/崩溃会丢光原有内容）。
+fn atomic_write_text(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("ishell-tmp.{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// 首次信任新主机（TOFU）：直接追加，复用 russh 自带的 append 逻辑，但要跟
+/// `replace_known_host` 共用同一把锁——否则一条连接正在读取整份文件准备重写（过滤旧行）
+/// 时，另一条连接这边的追加可能夹在中间又被前者的重写覆盖掉，白白学会的新主机记录丢失。
+fn learn_known_host_locked(host: &str, port: u16, key: &ssh_key::PublicKey) {
+    let _guard = KNOWN_HOSTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = russh::keys::known_hosts::learn_known_hosts(host, port, key);
+}
+
 /// 主机密钥变更后用户确认接受：删除 known_hosts 中该主机的旧行，再写入新键。
+/// 过滤旧行和写入新键合并成一次原子写（不再是"先覆盖删除旧行"+"再调用 russh 自己的追加
+/// 逻辑"这两个独立步骤）：避免中间崩溃时该主机的记录暂时性缺失，也避免两次独立文件操作
+/// 之间出现别的并发写入插进来。
 fn replace_known_host(host: &str, port: u16, new_key: &ssh_key::PublicKey) -> anyhow::Result<()> {
+    let _guard = KNOWN_HOSTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 收集匹配该主机的行号（russh 的匹配能处理哈希主机名）
     let remove: std::collections::HashSet<usize> =
         russh::keys::known_hosts::known_host_keys(host, port)
@@ -58,17 +89,26 @@ fn replace_known_host(host: &str, port: u16, new_key: &ssh_key::PublicKey) -> an
             .map(|(line, _)| line)
             .collect();
     let path = known_hosts_file()?;
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        // known_host_keys 的行号从 1 计；过滤掉这些行后回写
-        let kept: String = content
-            .lines()
-            .enumerate()
-            .filter(|(i, _)| !remove.contains(&(i + 1)))
-            .map(|(_, l)| format!("{l}\n"))
-            .collect();
-        std::fs::write(&path, kept)?;
+    // known_host_keys 的行号从 1 计；过滤掉这些行，保留其余内容
+    let mut kept: String = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| !remove.contains(&(i + 1)))
+        .map(|(_, l)| format!("{l}\n"))
+        .collect();
+    // 追加新键这一行，格式与 russh 的 learn_known_hosts_path 保持一致
+    if port != 22 {
+        kept.push_str(&format!("[{host}]:{port} "));
+    } else {
+        kept.push_str(&format!("{host} "));
     }
-    russh::keys::known_hosts::learn_known_hosts(host, port, new_key)?;
+    kept.push_str(&new_key.to_openssh()?);
+    kept.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write_text(&path, &kept)?;
     Ok(())
 }
 
@@ -153,11 +193,7 @@ impl Handler for ClientHandler {
             // 未知主机 -> 请 UI 确认（TOFU），同意则写入 known_hosts
             Ok(false) => {
                 if self.ask_trust(fp, false).await {
-                    let _ = russh::keys::known_hosts::learn_known_hosts(
-                        &self.host,
-                        self.port,
-                        server_public_key,
-                    );
+                    learn_known_host_locked(&self.host, self.port, server_public_key);
                     Ok(true)
                 } else {
                     Ok(false)
@@ -220,11 +256,7 @@ impl Handler for JumpHandler {
             // 跳板机首次连接也需 TOFU 用户确认（不再自动信任，防中间人冒充堡垒机）
             Ok(false) => {
                 if self.ask_trust(fp, false).await {
-                    let _ = russh::keys::known_hosts::learn_known_hosts(
-                        &self.host,
-                        self.port,
-                        server_public_key,
-                    );
+                    learn_known_host_locked(&self.host, self.port, server_public_key);
                     Ok(true)
                 } else {
                     Ok(false)

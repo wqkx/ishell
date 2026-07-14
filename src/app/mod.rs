@@ -35,7 +35,7 @@ mod session;
 mod session_events;
 mod transfers;
 mod windows;
-pub(in crate::app) use mcp_bridge::PendingAiRun;
+pub(in crate::app) use mcp_bridge::{PendingAiFileOp, PendingAiRun};
 pub(in crate::app) use session::{Session, XferSpec};
 pub use widgets::view_context_menu;
 

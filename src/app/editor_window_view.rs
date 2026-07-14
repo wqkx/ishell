@@ -315,6 +315,7 @@ impl App {
                                                     .clicked()
                                                 {
                                                     let _ = tab.cmd_tx.send(UiCommand::WriteFile {
+                                                        id: tab.tid,
                                                         path: tab.editor.path.clone(),
                                                         content: tab.editor.content.clone(),
                                                         encoding: tab.editor.encoding().to_string(),
@@ -386,6 +387,7 @@ impl App {
                 if should {
                     if let Some(tab) = ed.tabs.get(active) {
                         let _ = tab.cmd_tx.send(UiCommand::WriteFile {
+                            id: tab.tid,
                             path: tab.editor.path.clone(),
                             content: tab.editor.content.clone(),
                             encoding: tab.editor.encoding().to_string(),
@@ -484,6 +486,7 @@ impl App {
                         if let Some(t) = ed.tabs.get_mut(ti) {
                             if !t.is_saving() {
                                 let _ = t.cmd_tx.send(UiCommand::WriteFile {
+                                    id: t.tid,
                                     path: t.editor.path.clone(),
                                     content: t.editor.content.clone(),
                                     encoding: t.editor.encoding().to_string(),

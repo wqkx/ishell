@@ -134,7 +134,11 @@ pub enum UiCommand {
     ReadDoc { id: u64, path: String },
     /// 写回文本文件内容（保存）。content 为内部 LF 文本，worker 按 eol 还原行尾、按 encoding 编码后写入。
     /// expect_mtime≠0 且与远端当前 mtime 不一致且 !force 时，判定外部已改动、拒绝写入并回报冲突。
+    /// id 关联发起方（编辑器标签的 tid，或 AI/MCP write_file 的请求 id）：回报的
+    /// FileSaved/FileSaveFailed/FileSaveConflict 都带同一个 id，按 id 而不是 path 字符串
+    /// 匹配——同一路径可能同时有编辑器手动保存和 AI 写入两路请求，仅按 path 匹配会串档。
     WriteFile {
+        id: u64,
         path: String,
         content: String,
         encoding: String,
@@ -245,14 +249,15 @@ pub enum WorkerEvent {
         eol: Eol,
         mtime: u32,
     },
-    /// 保存成功（携带新的 mtime，编辑器据此更新，避免下次保存误判为外部改动）
-    FileSaved { path: String, mtime: u32 },
+    /// 保存成功（携带新的 mtime，编辑器据此更新，避免下次保存误判为外部改动）。
+    /// id 与发起的 WriteFile 一致，按 id 匹配发起方（不止 path，避免同路径多个发起方串档）。
+    FileSaved { id: u64, path: String, mtime: u32 },
     /// 保存写入进度（驱动编辑器标签的「珊瑚→绿」保存动画，跟随实际上传速度）
     FileSaveProgress { path: String, done: u64, total: u64 },
     /// 保存时检测到文件已被外部修改（未写入）；UI 提示用户是否覆盖
-    FileSaveConflict { path: String },
+    FileSaveConflict { id: u64, path: String },
     /// 保存失败（网络/权限/磁盘等）：标签保持未保存状态并提示
-    FileSaveFailed { path: String, message: String },
+    FileSaveFailed { id: u64, path: String, message: String },
     /// 打开时发现文件实际大小超限（列表里的旧大小已过时）：请 UI 弹「打开大文件」确认，可强制打开
     FileTooLarge { id: u64, path: String, size: u64 },
     /// 跟随读取返回：data 为新增原始字节（可能为空）；offset 为下次读取起点；

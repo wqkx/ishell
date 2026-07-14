@@ -67,6 +67,14 @@ pub(super) struct Session {
     pub(super) pending_ai_run: Option<super::PendingAiRun>,
     /// 是否由 AI 通过 `open_session` 新开（只读：用户键盘输入不会发给这个会话，只能看不能敲）
     pub(super) ai_owned: bool,
+    /// AI/MCP 控制通道正在等待完成的一次文件读写（write_file/read_file，同一会话同一时刻
+    /// 只允许一个）
+    pub(super) pending_file_op: Option<super::PendingAiFileOp>,
+    /// 最近因超时被清理的文件操作 id（"墓碑"）：worker 侧的 SFTP 操作本身没法取消，超时后
+    /// 姗姗来迟的真实完成事件如果落到这里，必须直接丢弃——不能因为 pending_file_op 已经是
+    /// None 就被误当成"普通编辑器操作"路由过去（可能凭空建一个用户没开过的编辑器标签，
+    /// 或者把无关标签的保存状态搅乱）。有界环形缓冲，避免无限增长。
+    pub(super) file_op_tombstones: std::collections::VecDeque<u64>,
 }
 
 /// 传输的重发规格（断线重连/手动重试时据此重新发起，底层自动续传）。
@@ -175,6 +183,8 @@ impl App {
             monitor_ok: None,
             pending_ai_run: None,
             ai_owned: false,
+            pending_file_op: None,
+            file_op_tombstones: std::collections::VecDeque::new(),
         });
         self.active = Some(self.sessions.len() - 1);
         self.tabbar.scroll_to_active = true; // 新建标签后滚动到可视区
@@ -201,6 +211,7 @@ impl App {
         s.sysinfo = None;
         s.monitor_ok = None;
         s.pending_ai_run = None; // worker 已重启：旧的 AI 命令等待作废（对端 oneshot 断线会收到错误）
+        s.pending_file_op = None; // 同上：旧的 write_file/read_file 等待也一并作废
         // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建
         for f in &mut s.forwards {
             f.ok = true;

@@ -72,6 +72,7 @@ impl App {
                         uid,
                         cmd_tx: tx,
                         text_id: tid,
+                        tid: id,
                         load_id: Some(id),
                         load_done: 0,
                         load_total: 0,
@@ -251,10 +252,10 @@ impl App {
     pub(super) fn process_editor_save_events(
         &mut self,
         ui: &mut egui::Ui,
-        saved: Vec<(u64, String, u32)>,
-        conflicts: Vec<(u64, String)>,
+        saved: Vec<(u64, u64, String, u32)>,
+        conflicts: Vec<(u64, u64, String)>,
         save_progress: Vec<(u64, String, u64, u64)>,
-        save_failed: Vec<(u64, String, String)>,
+        save_failed: Vec<(u64, u64, String, String)>,
     ) {
         // 保存成功 → 更新对应标签 mtime（避免下次保存误判）；外部改动冲突 → 置标志，编辑器弹横幅。
         if !saved.is_empty()
@@ -263,6 +264,8 @@ impl App {
             || !save_failed.is_empty()
         {
             let mut ed = lock_mutex(&self.editor_state);
+            // 进度事件（FileSaveProgress）没有请求 id，仍按 path 匹配——只驱动动画，
+            // 偶尔撞车顶多是动画进度短暂不准，不影响最终保存结果的正确性。
             for (uid, path, done, total) in save_progress {
                 if let Some(t) = ed
                     .tabs
@@ -273,13 +276,10 @@ impl App {
                     t.save_total = total;
                 }
             }
-            let mut close_after_save: Vec<(u64, String)> = Vec::new();
-            for (uid, path, mtime) in saved {
-                if let Some(t) = ed
-                    .tabs
-                    .iter_mut()
-                    .find(|t| t.uid == uid && t.editor.path == path)
-                {
+            let mut close_after_save: Vec<(u64, u64)> = Vec::new(); // (uid, tid)
+            // path 只是事件携带的上下文信息，实际匹配标签靠 (uid, id)——不再需要它，前缀下划线。
+            for (uid, id, _path, mtime) in saved {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.tid == id) {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
                                                // 取出本次保存发出时的签名与关闭意图（Saving 状态里）；非 Saving 则忽略这条确认。
                     let (sent_rev, close_after) = match &t.save {
@@ -292,12 +292,13 @@ impl App {
                         t.save = SaveState::Idle;
                         t.editor.mark_saved();
                         if close_after {
-                            close_after_save.push((uid, t.editor.path.clone()));
+                            close_after_save.push((uid, t.tid));
                         }
                     } else if close_after {
                         // 保存期间内容又变了但用户要「保存并关闭」：用最新内容再存一次，
                         // 存完（届时签名一致）再关闭；否则「保存并关闭」会静默不生效。
                         let _ = t.cmd_tx.send(UiCommand::WriteFile {
+                            id: t.tid,
                             path: t.editor.path.clone(),
                             content: t.editor.content.clone(),
                             encoding: t.editor.encoding().to_string(),
@@ -312,24 +313,16 @@ impl App {
                     }
                 }
             }
-            for (uid, path) in conflicts {
-                if let Some(t) = ed
-                    .tabs
-                    .iter_mut()
-                    .find(|t| t.uid == uid && t.editor.path == path)
-                {
+            for (uid, id, _path) in conflicts {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.tid == id) {
                     // 冲突：进入 Conflict（未写入，保留 dirty）；「保存并关闭」意图自然丢弃，交用户处理
                     t.save = SaveState::Conflict;
                     t.save_at = None; // 冲突未写入：中止「已保存」动画
                     t.save_done_at = None;
                 }
             }
-            for (uid, path, message) in save_failed {
-                if let Some(t) = ed
-                    .tabs
-                    .iter_mut()
-                    .find(|t| t.uid == uid && t.editor.path == path)
-                {
+            for (uid, id, _path, message) in save_failed {
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.tid == id) {
                     t.save = SaveState::Idle; // 失败：解锁重试；dirty 未被清，标签仍显示未保存；关闭意图丢弃
                     t.save_at = None; // 中止保存动画
                     t.save_done_at = None;
@@ -343,12 +336,8 @@ impl App {
                 ));
             }
             // 「保存并关闭」：确认成功后移除标签
-            for (uid, path) in close_after_save {
-                if let Some(i) = ed
-                    .tabs
-                    .iter()
-                    .position(|t| t.uid == uid && t.editor.path == path)
-                {
+            for (uid, tid) in close_after_save {
+                if let Some(i) = ed.tabs.iter().position(|t| t.uid == uid && t.tid == tid) {
                     ed.remove_tab_at(ui.ctx(), i);
                 }
             }

@@ -8,8 +8,8 @@ use crate::proto::Eol;
 pub(super) struct SessionPending {
     /// 已读取待填充到占位编辑器标签的文件（id, path, content, encoding, eol, mtime）
     pub open: Vec<(u64, String, String, String, Eol, u32)>,
-    /// 保存成功回报的新 mtime（path, mtime）
-    pub saved: Vec<(String, u32)>,
+    /// 保存成功回报的新 mtime（请求 id, path, mtime）
+    pub saved: Vec<(u64, String, u32)>,
     /// 保存写入进度（path, done, total）——驱动编辑器标签「珊瑚→绿」保存动画
     pub save_progress: Vec<(String, u64, u64)>,
     /// 跟随读取返回：(路径, 新增字节, 新 offset, 是否截断/轮转)
@@ -22,10 +22,10 @@ pub(super) struct SessionPending {
     pub pdf_search: Vec<(String, Vec<(u32, String)>, Option<String>)>,
     /// 文档原始字节返回：(占位标签 id, 字节)
     pub doc: Vec<(u64, Vec<u8>)>,
-    /// 外部改动冲突（path）
-    pub conflict: Vec<String>,
-    /// 保存失败（网络/权限等）：(路径, 原因)
-    pub save_failed: Vec<(String, String)>,
+    /// 外部改动冲突（请求 id, path）
+    pub conflict: Vec<(u64, String)>,
+    /// 保存失败（网络/权限等）：(请求 id, 路径, 原因)
+    pub save_failed: Vec<(u64, String, String)>,
     /// 需要在 App 层弹 toast 的警告（如编码丢字）
     pub warn: Vec<String>,
     /// 打开时发现实际超限（id, path, size）——移除占位标签 + 弹「打开大文件」确认

@@ -380,7 +380,7 @@ pub async fn run(
                                 s.send(WorkerEvent::FileLoadProgress { id, done: 0, total: size });
                                 let res: anyhow::Result<Vec<u8>> = async {
                                     let mut f = sftp.open(&path).await?;
-                                    let mut data = Vec::with_capacity(size as usize);
+                                    let mut data = Vec::with_capacity(size.min(DOC_LIMIT) as usize);
                                     let mut buf = vec![0u8; 128 * 1024];
                                     let mut last = 0usize;
                                     loop {
@@ -389,6 +389,16 @@ pub async fn run(
                                             break;
                                         }
                                         data.extend_from_slice(&buf[..n]);
+                                        // metadata.size 只是读取前的一次性快照：服务端不报告/请求失败/
+                                        // 文件读取期间持续增长/上报了不准确的大小，都可能让实际读到的
+                                        // 字节数远超上面检查过的 size。这里对累计长度做真正的硬上限，
+                                        // 不能只靠开始前那一次检查。
+                                        if data.len() as u64 > DOC_LIMIT {
+                                            anyhow::bail!(match crate::i18n::current() {
+                                                crate::i18n::Lang::Zh => format!("文档过大（>{}MB）", DOC_LIMIT / 1024 / 1024),
+                                                crate::i18n::Lang::En => format!("Document too large (>{}MB)", DOC_LIMIT / 1024 / 1024),
+                                            });
+                                        }
                                         if data.len() - last >= 256 * 1024 {
                                             last = data.len();
                                             s.send(WorkerEvent::FileLoadProgress { id, done: data.len() as u64, total: size.max(data.len() as u64) });
@@ -471,8 +481,8 @@ pub async fn run(
                             });
                         } else {
                             // SFTP 未就绪：WriteFile 必须回专用失败事件，否则编辑器永久停在 saving=true。
-                            if let UiCommand::WriteFile { path, .. } = &cmd {
-                                sink.send(WorkerEvent::FileSaveFailed { path: path.clone(), message: crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into() });
+                            if let UiCommand::WriteFile { id, path, .. } = &cmd {
+                                sink.send(WorkerEvent::FileSaveFailed { id: *id, path: path.clone(), message: crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into() });
                             } else {
                                 sink.send(WorkerEvent::Error(crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into()));
                             }

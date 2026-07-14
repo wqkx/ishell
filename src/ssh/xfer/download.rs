@@ -376,9 +376,16 @@ pub(super) async fn download_file(
     let n_chunks = size.div_ceil(DL_CHUNK);
     let part = part_path(lpath);
 
-    // 能否续传：sidecar 存在、记录的大小与远端 mtime 均一致、临时数据文件仍在。
-    // 绑定 mtime：远端文件内容变化但大小不变时，旧分段不能复用（否则拼出混合损坏文件）。
-    let resume_bm: Option<Vec<u8>> = if data_part.exists() && remote_mtime != 0 {
+    // 能否续传：sidecar 存在、记录的大小与远端 mtime 均一致、临时数据文件仍在**且长度
+    // 与预期一致**。只看 sidecar 记录、不验证临时数据文件本身的长度是不够的：如果临时文件
+    // 被截断或没有完整落盘（异常退出、外部误删部分内容等），但 sidecar 的完成位图仍然
+    // 声称某些分段"已完成"，续传时这些分段就不会被重新下载，最终换入的文件会是短文件/
+    // 零填充/新旧数据混合，且不会被发现——这里先验证临时文件实际长度，不一致就直接放弃
+    // 续传信息，走全新下载（数据文件下面会被重新 create+set_len，不会残留旧内容）。
+    let data_len_ok = std::fs::metadata(&data_part)
+        .map(|m| m.len() == size)
+        .unwrap_or(false);
+    let resume_bm: Option<Vec<u8>> = if data_len_ok && remote_mtime != 0 {
         std::fs::read(&part).ok().and_then(|d| {
             let ok = d.len() == 12 + bitmap_len(n_chunks)
                 && u64::from_le_bytes(d[0..8].try_into().unwrap()) == size
@@ -488,8 +495,13 @@ pub(super) async fn download_file(
                             b |= 1 << bit;
                         }
                     }
-                    if let Ok(g) = part_file.lock() {
-                        let _ = pwrite(&g, &[b], 12 + byte_i as u64);
+                    // sidecar（断点位图）写入失败不能忽略：忽略的话位图可能比实际数据更新
+                    // （比如这次持久化失败，但内存里已经标记这一段"完成"），下次续传时
+                    // 会误以为这段已经下载好而跳过重新下载，产生零填充/旧数据的损坏文件。
+                    // 落盘失败直接当这个分段失败处理，交给上层整体重试。
+                    match part_file.lock() {
+                        Ok(g) => pwrite(&g, &[b], 12 + byte_i as u64)?,
+                        Err(_) => anyhow::bail!("sidecar 断点文件锁获取失败"),
                     }
                 }
                 Ok::<(), anyhow::Error>(())
@@ -523,6 +535,14 @@ pub(super) async fn download_file(
         tokio::time::sleep(xfer_backoff(attempt)).await;
     }
     drop(out); // 关闭数据句柄后再 rename（Windows 需要）
+    // 换入前最后再校验一次实际长度：所有分段都标记"完成"不等于文件真的完整落盘
+    // （比如某个分段的 pwrite 系统调用层面部分失败但没有被上面的 short-read 检测捕捉到），
+    // 长度不对就直接报错、不换入，避免把损坏文件当成下载成功。
+    match std::fs::metadata(&data_part) {
+        Ok(m) if m.len() == size => {}
+        Ok(m) => anyhow::bail!("下载文件长度不符（期望 {size}，实际 {}），未换入目标文件", m.len()),
+        Err(e) => anyhow::bail!("下载完成后无法校验临时文件：{e}"),
+    }
     finish_download(&data_part, lpath)?;
     Ok(())
 }

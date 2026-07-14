@@ -86,9 +86,9 @@ impl App {
                         });
                     ui.add_space(4.0);
                 }
-                // AI/MCP 控制通道已开启：提示用户此终端可能被 AI 助手驱动（发命令、读输出）；
-                // ai_owned 会话是 AI 自己新开的只读会话，用不同文案说明「只能看不能敲」，
-                // 并且报出这个终端自己的 uid + 当前全部 AI 终端的 uid（方便 AI 核对）。
+                // ai_owned 会话是 AI 自己新开的只读会话：报出这个终端自己的 uid + 当前全部
+                // AI 终端的 uid（方便 AI 核对），用高对比度的实心底色 + 加粗白字，确保不管
+                // 当前终端主题深浅都清楚可辨。非 AI 会话不显示任何 MCP 相关提示。
                 if s.ai_owned {
                     let uid = s.uid;
                     let ai_list = ai_uids
@@ -96,36 +96,28 @@ impl App {
                         .map(|u| u.to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(match crate::i18n::current() {
-                                crate::i18n::Lang::Zh => format!(
-                                    "{}  AI 正在驱动此终端（只读，uid={uid}）· 当前全部 AI 终端 uid：{ai_list}",
-                                    egui_phosphor::regular::ROBOT,
-                                ),
-                                crate::i18n::Lang::En => format!(
-                                    "{}  AI is driving this terminal (read-only, uid={uid}) · All AI terminals: uid {ai_list}",
-                                    egui_phosphor::regular::ROBOT,
-                                ),
-                            })
-                            .color(Palette::ACCENT)
-                            .size(11.0),
-                        );
-                    });
-                    ui.add_space(2.0);
-                } else if crate::store::load_mcp_consent() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{}  {}",
-                                egui_phosphor::regular::ROBOT,
-                                crate::i18n::tr("AI 可通过 MCP 控制此终端", "AI can control this terminal via MCP"),
-                            ))
-                            .color(Palette::TEXT_DIM)
-                            .size(11.0),
-                        );
-                    });
-                    ui.add_space(2.0);
+                    egui::Frame::new()
+                        .fill(Palette::ACCENT)
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(match crate::i18n::current() {
+                                    crate::i18n::Lang::Zh => format!(
+                                        "{}  AI 正在驱动此终端（只读，uid={uid}）· 当前全部 AI 终端 uid：{ai_list}",
+                                        egui_phosphor::regular::ROBOT,
+                                    ),
+                                    crate::i18n::Lang::En => format!(
+                                        "{}  AI is driving this terminal (read-only, uid={uid}) · All AI terminals: uid {ai_list}",
+                                        egui_phosphor::regular::ROBOT,
+                                    ),
+                                })
+                                .color(egui::Color32::WHITE)
+                                .strong()
+                                .size(12.0),
+                            );
+                        });
+                    ui.add_space(4.0);
                 }
                 let input = s.terminal.ui(ui);
                 // ai_owned 会话由 AI 驱动：用户仍可看（渲染/滚动/查找都照常），但键盘输入

@@ -83,6 +83,25 @@ pub enum McpReqKind {
         session_uid: u64,
         text: String,
     },
+    /// 把文本内容写入远端指定路径（存在则直接覆盖，不做外部改动冲突检测——这条通道只给
+    /// AI 自己用）。复用 iShell 编辑器已有的 SFTP 写入通路，不用另开一条 scp。
+    WriteFile {
+        session_uid: u64,
+        path: String,
+        /// 文本内容（UTF-8），按 LF 换行写入
+        content: String,
+        timeout_ms: u64,
+    },
+    /// 读取远端指定路径的文本文件内容（自动探测编码，行尾统一为 LF）。
+    ReadFile {
+        session_uid: u64,
+        path: String,
+        /// false（默认）：遵守 20MB 软上限、拒绝二进制内容（含 NUL 字节直接报错，不强行当
+        /// 文本解码）；true：放宽到 128MB，且跳过二进制检测——确实需要读大文件/强制当文本
+        /// 读时才应该传 true，否则读到二进制文件会得到乱码而不是清楚的报错。
+        force: bool,
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +122,10 @@ pub enum McpReqResult {
     History(String),
     /// `ListSavedConnections` 的结果。
     SavedConnections(Vec<McpSavedConn>),
+    /// `WriteFile` 成功后的新 mtime。
+    FileWritten { path: String, mtime: u32 },
+    /// `ReadFile` 的结果。
+    FileContent { path: String, content: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

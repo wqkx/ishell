@@ -112,7 +112,8 @@ impl Session {
                     // 断线意味着这个会话上任何挂起的 AI 命令都注定等不到哨兵了（worker 重启
                     // 后旧连接的输出流已经没了）——给还在等的 poll_run 一个明确的"未完成"
                     // 响应，而不是让它一直空等到自己的超时，也避免这个会话被"忙碌"卡住。
-                    self.cancel_pending_ai_run();
+                    self.cancel_pending_ai_run("会话已断线");
+                    self.cancel_pending_file_op();
                     // 进行中的传输标记为暂停，等重连后续传（不计为失败）
                     for t in &mut self.transfers {
                         if t.spec.is_some() && t.ok != Some(true) {
@@ -213,13 +214,24 @@ impl Session {
                     eol,
                     mtime,
                 } => {
-                    self.pending
-                        .open
-                        .push((id, path, content, encoding, eol, mtime));
-                    self.status = crate::i18n::tr("已打开文件", "File opened").into();
+                    // 先看是不是 MCP read_file 在等这次读取（或者是个该丢弃的迟到墓碑）——
+                    // 是的话直接把内容 move 给它，不转发给编辑器 UI（这种读取没有对应的
+                    // 编辑器标签页），也不需要为了先探测匹配而白白 clone 一份大内容。
+                    if self.file_read_op_would_resolve(id) {
+                        self.try_resolve_file_read(id, Ok(content));
+                    } else {
+                        self.pending
+                            .open
+                            .push((id, path, content, encoding, eol, mtime));
+                        self.status = crate::i18n::tr("已打开文件", "File opened").into();
+                    }
                 }
-                WorkerEvent::FileSaved { path, mtime } => {
-                    self.pending.saved.push((path, mtime));
+                WorkerEvent::FileSaved { id, path, mtime } => {
+                    if !self.file_write_op_would_resolve(id) {
+                        self.pending.saved.push((id, path, mtime));
+                    } else {
+                        self.try_resolve_file_write(id, Ok(mtime));
+                    }
                 }
                 WorkerEvent::FileSaveProgress { path, done, total } => {
                     self.pending.save_progress.push((path, done, total));
@@ -250,23 +262,41 @@ impl Session {
                     self.pending.doc.push((id, data));
                 }
                 WorkerEvent::FileTooLarge { id, path, size } => {
-                    self.pending.too_large.push((id, path, size));
+                    // 绝大多数情况下没有 MCP 文件操作在等：先廉价判断一下，避免每次普通的
+                    // "打开大文件"事件都白白 format! 一次。
+                    if self.file_read_op_would_resolve(id) {
+                        self.try_resolve_file_read(id, Err(format!("文件过大（{size} 字节）")));
+                    } else {
+                        self.pending.too_large.push((id, path, size));
+                    }
                 }
-                WorkerEvent::FileSaveFailed { path, message } => {
-                    self.pending.save_failed.push((path, message));
+                WorkerEvent::FileSaveFailed { id, path, message } => {
+                    if self.file_write_op_would_resolve(id) {
+                        self.try_resolve_file_write(id, Err(message));
+                    } else {
+                        self.pending.save_failed.push((id, path, message));
+                    }
                 }
-                WorkerEvent::FileSaveConflict { path } => {
-                    self.pending.conflict.push(path);
+                WorkerEvent::FileSaveConflict { id, path } => {
+                    if self.file_write_op_would_resolve(id) {
+                        self.try_resolve_file_write(id, Err("文件已被外部修改，写入被拒绝".into()));
+                    } else {
+                        self.pending.conflict.push((id, path));
+                    }
                 }
                 WorkerEvent::FileLoadProgress { id, done, total } => {
                     self.pending.load_progress.push((id, done, total));
                 }
                 WorkerEvent::FileLoadFailed { id, message } => {
-                    self.pending.load_fail.push((id, message.clone()));
-                    self.status = match crate::i18n::current() {
-                        crate::i18n::Lang::Zh => format!("打开失败：{message}"),
-                        crate::i18n::Lang::En => format!("Open failed: {message}"),
-                    };
+                    if self.file_read_op_would_resolve(id) {
+                        self.try_resolve_file_read(id, Err(message));
+                    } else {
+                        self.pending.load_fail.push((id, message.clone()));
+                        self.status = match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("打开失败：{message}"),
+                            crate::i18n::Lang::En => format!("Open failed: {message}"),
+                        };
+                    }
                 }
                 WorkerEvent::ImageOpened { path, data } => {
                     self.pending.image.push((path, data));

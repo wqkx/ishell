@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::super::sftp::join_remote;
+use super::super::sftp::{is_sftp_not_found, join_remote};
 use super::super::sh_quote;
 
 pub(super) fn extract_tar_gz(path: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
@@ -102,23 +102,29 @@ pub(super) fn local_nonexistent(path: &str) -> String {
 }
 
 /// 给远端目录里的名字找一个不冲突的变体。
+/// 找一个远端不存在的候选名（"name (1)"、"name (2)" ...）。metadata 探测遇到明确的
+/// "不存在"（NoSuchFile）才当作候选可用；权限不足、网络超时、SFTP 会话异常等其它错误
+/// 不能被当成"不存在"直接放行——那样可能把一个探测失败、但其实已经存在的候选名
+/// 错误地当成安全目标，交给上层决定要不要重试/放弃（返回错误，而不是悄悄继续猜下一个）。
 pub(super) async fn remote_nonexistent(
     sftp: &russh_sftp::client::SftpSession,
     dir: &str,
     name: &str,
     is_dir: bool,
-) -> String {
+) -> anyhow::Result<String> {
     let (stem, ext) = split_name(name, is_dir);
     for n in 1..10000u32 {
         let cand = match &ext {
             Some(e) => format!("{stem} ({n}).{e}"),
             None => format!("{stem} ({n})"),
         };
-        if sftp.metadata(&join_remote(dir, &cand)).await.is_err() {
-            return cand;
+        match sftp.metadata(&join_remote(dir, &cand)).await {
+            Ok(_) => continue, // 候选已存在，试下一个
+            Err(e) if is_sftp_not_found(&e) => return Ok(cand),
+            Err(e) => anyhow::bail!("探测远端候选名失败：{e}"),
         }
     }
-    name.to_string()
+    Ok(name.to_string())
 }
 
 /// 拆分文件名为 (主名, 扩展)；目录或无扩展时扩展为 None（首字符的点不算扩展）。

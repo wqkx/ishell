@@ -210,14 +210,37 @@ fn cipher() -> Option<ChaCha20Poly1305> {
     Some(ChaCha20Poly1305::new(Key::from_slice(&k)))
 }
 
+/// 只有前缀匹配还不够：真实密码恰好以 `enc:v1:` 开头时，光看前缀会把它误判成"已经是
+/// 密文"，从而完全跳过加密、原样存成明文——这正是"绝不静默落盘明文"这条承诺被破坏的
+/// 地方。这里额外验证"前缀后面那段确实能被当前密钥解出来"（base64 解出来的字节数够长、
+/// AEAD 认证也通过）才真正当作已加密；哪怕前缀凑巧对上，只要解不出来就说明这就是一段
+/// 普通明文（只是恰好长得像密文前缀），必须继续走下面的真正加密流程。
+fn is_genuine_ciphertext(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix(ENC_PREFIX) else {
+        return false;
+    };
+    let Some(c) = cipher() else { return false };
+    let Ok(blob) = STANDARD.decode(rest) else {
+        return false;
+    };
+    if blob.len() < 12 {
+        return false;
+    }
+    let (nonce, ct) = blob.split_at(12);
+    c.decrypt(Nonce::from_slice(nonce), ct)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .is_some()
+}
+
 /// 加密一个秘密字段为 `enc:v1:<base64(nonce||ciphertext)>`；
 /// 空串原样返回；失败返回 Err（fail-closed，绝不静默落盘明文）。
 pub fn encrypt_secret(plain: &str) -> Result<String, String> {
     if plain.is_empty() {
         return Ok(String::new());
     }
-    if plain.starts_with(ENC_PREFIX) {
-        return Ok(plain.to_string()); // 已是密文
+    if is_genuine_ciphertext(plain) {
+        return Ok(plain.to_string()); // 确认已是本机密钥能解开的密文，不用再加密一遍
     }
     let Some(c) = cipher() else {
         return Err(match crate::i18n::current() {
@@ -247,26 +270,35 @@ pub fn encrypt_secret(plain: &str) -> Result<String, String> {
     }
 }
 
-/// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回。
-/// 解密失败（含罕见的「明文密码恰好以 enc:v1: 开头」被误判为密文）时**返回原串**——
-/// 当明文用会导致一次登录失败，但绝不把已存密码静默变成空串。
+/// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回。解密失败时**返回原串**——当明文
+/// 用会导致一次登录失败，但绝不把已存密码静默变成空串；调用方（目前都还是"返回一个
+/// String 直接拿去用"的既有约定，为避免大范围改调用点没有改成 Result）看不出这是失败
+/// 回退还是真的原文，但至少把具体原因（主密钥不可用/密文格式损坏/AEAD 认证失败，分别
+/// 对应"钥匙串不可用或换了机器"“文件被截断/手改坏了”“密钥不匹配或数据被篡改"三种不同
+/// 情况）打到日志里——之前这里完全静默，用户只会看到一次不明不白的 SSH 认证失败，
+/// 排查时无从下手。
 pub fn decrypt_secret(s: &str) -> String {
     let Some(rest) = s.strip_prefix(ENC_PREFIX) else {
         return s.to_string();
     };
-    let fallback = || s.to_string();
-    let Some(c) = cipher() else { return fallback() };
+    let fallback = |reason: &str| {
+        log::warn!("已保存的密码/密钥口令解密失败（{reason}），将按原文尝试，很可能导致后续认证失败");
+        s.to_string()
+    };
+    let Some(c) = cipher() else {
+        return fallback("主密钥不可用，可能是系统钥匙串访问不了或换了一台机器");
+    };
     let Ok(blob) = STANDARD.decode(rest) else {
-        return fallback();
+        return fallback("密文不是合法的 base64，格式已损坏");
     };
     if blob.len() < 12 {
-        return fallback();
+        return fallback("密文长度不足，格式已损坏");
     }
     let (nonce, ct) = blob.split_at(12);
     c.decrypt(Nonce::from_slice(nonce), ct)
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(fallback)
+        .unwrap_or_else(|| fallback("AEAD 认证未通过（密钥不匹配，或数据已损坏/被篡改）"))
 }
 
 #[cfg(test)]

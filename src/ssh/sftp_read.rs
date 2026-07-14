@@ -240,16 +240,30 @@ pub(in crate::ssh) async fn read_image_file(
             );
         }
     }
-    let data = sftp.read(path).await?;
-    // 兜底：元数据不可用时，读后再判一次
-    if data.len() > limit {
-        anyhow::bail!(
-            "{}",
-            match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("图片过大（>{}MB）", limit / 1024 / 1024),
-                crate::i18n::Lang::En => format!("Image too large (>{}MB)", limit / 1024 / 1024),
-            }
-        );
+    // 不用一次性的 sftp.read(path)：那是把整个远端文件读进内存后才能拿到长度，
+    // 上面基于 metadata.size 的检查形同虚设——服务端不报告/请求失败/文件读取期间持续
+    // 增长/上报不准确的大小，都能绕过检查，峰值内存实际上取决于远端文件真实大小，
+    // 不受这个 32MB 限制约束。改成分块读、每次追加后立即检查累计长度，真正做到硬上限。
+    use tokio::io::AsyncReadExt;
+    let mut f = sftp.open(path).await?;
+    let mut data = Vec::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if data.len() > limit {
+            anyhow::bail!(
+                "{}",
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("图片过大（>{}MB）", limit / 1024 / 1024),
+                    crate::i18n::Lang::En =>
+                        format!("Image too large (>{}MB)", limit / 1024 / 1024),
+                }
+            );
+        }
     }
     Ok(data)
 }

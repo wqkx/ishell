@@ -28,10 +28,10 @@ impl App {
         let mut load_progress: Vec<(u64, u64, u64)> = Vec::new();
         let mut load_fail: Vec<u64> = Vec::new();
         let mut new_images: Vec<(String, Vec<u8>, String, u64)> = Vec::new(); // path, data, title, uid
-        let mut saved: Vec<(u64, String, u32)> = Vec::new(); // uid, path, mtime
+        let mut saved: Vec<(u64, u64, String, u32)> = Vec::new(); // uid, id, path, mtime
         let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
-        let mut conflicts: Vec<(u64, String)> = Vec::new(); // uid, path
-        let mut save_failed: Vec<(u64, String, String)> = Vec::new(); // uid, path, message
+        let mut conflicts: Vec<(u64, u64, String)> = Vec::new(); // uid, id, path
+        let mut save_failed: Vec<(u64, u64, String, String)> = Vec::new(); // uid, id, path, message
         let mut warns: Vec<String> = Vec::new(); // 需弹 toast 的警告
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
         let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
@@ -53,8 +53,8 @@ impl App {
             for (id, path, content, encoding, eol, mtime) in s.pending.open.drain(..) {
                 filled.push((id, path, content, encoding, eol, mtime));
             }
-            for (path, mtime) in s.pending.saved.drain(..) {
-                saved.push((s.uid, path, mtime));
+            for (id, path, mtime) in s.pending.saved.drain(..) {
+                saved.push((s.uid, id, path, mtime));
             }
             for (path, done, total) in s.pending.save_progress.drain(..) {
                 save_progress.push((s.uid, path, done, total));
@@ -62,14 +62,14 @@ impl App {
             for (path, data, offset, truncated) in s.pending.tail.drain(..) {
                 tails.push((s.uid, path, data, offset, truncated));
             }
-            for path in s.pending.conflict.drain(..) {
-                conflicts.push((s.uid, path));
+            for (id, path) in s.pending.conflict.drain(..) {
+                conflicts.push((s.uid, id, path));
             }
             for w in s.pending.warn.drain(..) {
                 warns.push(w);
             }
-            for (path, msg) in s.pending.save_failed.drain(..) {
-                save_failed.push((s.uid, path, msg));
+            for (id, path, msg) in s.pending.save_failed.drain(..) {
+                save_failed.push((s.uid, id, path, msg));
             }
             for (id, path, size) in s.pending.too_large.drain(..) {
                 too_large.push((s.uid, id, path, size));
@@ -100,6 +100,9 @@ impl App {
                 new_docs.push(x);
             }
         }
+        // 必须在上面这个 drain_events 循环之后调用：文件读写超时判定要晚于"本帧事件是否
+        // 已经带来真正结果"的判断，否则会跟刚好本帧到达的完成事件打时序竞争（见该方法注释）。
+        self.check_file_op_timeouts();
         if evt_backlog {
             self.ctx.request_repaint();
         }

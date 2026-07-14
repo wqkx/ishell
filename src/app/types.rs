@@ -339,6 +339,12 @@ pub(super) struct EditorTab {
     pub(super) cmd_tx: UnboundedSender<UiCommand>,
     /// 该编辑器固定的 TextEdit Id（关闭时据此清理 egui 状态/撤销历史）
     pub(super) text_id: egui::Id,
+    /// 稳定唯一的标签身份（创建时取当初那次 ReadFile 请求的 id，此后永久不变，
+    /// 不像 load_id 那样加载完就清空）：保存请求（WriteFile）用它做 id，收到的
+    /// FileSaved/FileSaveFailed/FileSaveConflict 按这个 id 匹配回这个标签，
+    /// 不再仅靠 path 字符串——避免同一路径同时有编辑器手动保存和 AI write_file
+    /// 两路请求时响应张冠李戴。
+    pub(super) tid: u64,
     /// 下载中关联的 ReadFile id（Some=加载中占位，None=已就绪）；以及下载进度
     pub(super) load_id: Option<u64>,
     pub(super) load_done: u64,
@@ -549,6 +555,7 @@ mod save_fsm_tests {
             uid: 1,
             cmd_tx: tx,
             text_id: egui::Id::new(0u8),
+            tid: 1,
             load_id: None,
             load_done: 0,
             load_total: 0,

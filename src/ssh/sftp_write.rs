@@ -121,10 +121,29 @@ pub(in crate::ssh) async fn sftp_write_atomic(
 
     // 换入策略：先把原文件挪到 .bak（若存在），再换入 tmp，最后校验；任一步失败从 .bak 还原。
     // **是否已备份由 rename 结果判定，不依赖可能瞬时失败的 stat**：
-    // rename(target->bak) 成功 = 原文件存在且已妥善备份；失败 = 原文件不存在(新建)或无法备份。
-    // （避免「stat 瞬时失败→误判为新建→OpenSSH 拒绝覆盖已存在目标→报错却谎称已还原」。）
+    // rename(target->bak) 成功 = 原文件存在且已妥善备份；明确的 NoSuchFile = 原文件不存在
+    // （新建，backed_up=false 安全）；其它错误（权限不足/网络异常/目标被占用等）既不代表
+    // "不存在"也不代表"已备份"——真相不明时绝不能当成"新建"直接往下走 rename(tmp->target)，
+    // 那样如果原文件其实存在，会在没有备份的情况下把它直接覆盖丢失。这种情况下直接中止，
+    // 原文件（如果存在）分毫未动，tmp 里的新内容也还在、不会丢。
     let bak = format!("{target}.ishell-bak-{}", rand_hex(6));
-    let backed_up = sftp.rename(&target, &bak).await.is_ok();
+    let backed_up = match sftp.rename(&target, &bak).await {
+        Ok(()) => true,
+        Err(e) if super::is_sftp_not_found(&e) => false,
+        Err(e) => {
+            let _ = sftp.remove_file(&tmp).await;
+            return Err(anyhow::anyhow!(match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!(
+                    "无法确认原文件状态（备份步骤失败，原因不明，非「文件不存在」）：{e}，\
+                     已中止保存，原文件未改动"
+                ),
+                crate::i18n::Lang::En => format!(
+                    "could not determine original file state (backup step failed for a reason \
+                     other than \"not found\"): {e}, save aborted, original unchanged"
+                ),
+            }));
+        }
+    };
 
     // 换入：tmp → target。失败则从 bak 还原原文件（若有备份）。
     if let Err(e) = sftp.rename(&tmp, &target).await {
@@ -312,6 +331,7 @@ pub(in crate::ssh) async fn handle_fs_op(
                 .map_err(Into::into)
         }
         UiCommand::WriteFile {
+            id,
             path,
             content,
             encoding,
@@ -332,7 +352,7 @@ pub(in crate::ssh) async fn handle_fs_op(
                 false
             };
             if conflict {
-                sink.send(WorkerEvent::FileSaveConflict { path });
+                sink.send(WorkerEvent::FileSaveConflict { id, path });
                 Ok((String::new(), None))
             } else {
                 // 内部统一 LF → 按原文件行尾还原；再按原编码编码后写回，避免破坏非 UTF-8 文件 / 改动行尾。
@@ -360,6 +380,7 @@ pub(in crate::ssh) async fn handle_fs_op(
                             .and_then(|m| m.mtime)
                             .unwrap_or(0);
                         sink.send(WorkerEvent::FileSaved {
+                            id,
                             path: path.clone(),
                             mtime: nm,
                         });
@@ -374,6 +395,7 @@ pub(in crate::ssh) async fn handle_fs_op(
                     Err(e) => {
                         // 专用失败事件（带路径）：UI 据此复位 saving、保留 dirty，不再只有匿名 Error
                         sink.send(WorkerEvent::FileSaveFailed {
+                            id,
                             path: path.clone(),
                             message: e.to_string(),
                         });
