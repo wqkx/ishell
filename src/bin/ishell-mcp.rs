@@ -471,7 +471,9 @@ impl IshellMcp {
                         JSON 传输）。同步大文件、整个目录、或任何体积明显超出「内联进一次 \
                         JSON 请求」划算范围的内容都应该用这个，而不是 write_file——write_file \
                         要求把全部内容内联传入，大文件会占用巨量上下文、还可能撑爆传输层。\
-                        remote_path 的文件名可以和本地不同。"
+                        local_path/remote_path 都必须是绝对路径；remote_path 的文件名可以和\
+                        本地不同。远端目标存在会被直接覆盖，不做冲突检测——这条通道只给你自己\
+                        用，默认信任调用方，跟 write_file 的覆盖语义一致。"
     )]
     async fn copy_to_remote(
         &self,
@@ -496,8 +498,10 @@ impl IshellMcp {
     #[tool(
         description = "把远端文件/目录复制到本地（走 SFTP 下载），是 copy_to_remote 的反方向。\
                         拉取大文件/整个目录时用这个，而不是 read_file——read_file 会把全部内容\
-                        内联进响应 JSON，大文件既浪费上下文又可能被截断。local_path 的文件名\
-                        可以和远端不同，所在目录不存在会自动创建。"
+                        内联进响应 JSON，大文件既浪费上下文又可能被截断。local_path/remote_path \
+                        都必须是绝对路径；local_path 的文件名可以和远端不同，所在目录不存在会\
+                        自动创建。本地目标存在会被直接覆盖，不做冲突检测——这条通道只给你自己\
+                        用，默认信任调用方，跟 write_file 的覆盖语义一致。"
     )]
     async fn copy_from_remote(
         &self,

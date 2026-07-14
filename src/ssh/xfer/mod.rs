@@ -36,6 +36,7 @@ pub(super) enum PendingXfer {
         id: u64,
         local: String,
         remote_dir: String,
+        remote_name: Option<String>,
         policy: ConflictPolicy,
     },
     /// 跨主机直传：在本（源）主机上 rsync/scp 直推到目标主机
@@ -103,6 +104,7 @@ pub(super) fn start_xfer(
                             id,
                             local,
                             remote_dir,
+                            remote_name,
                             policy,
                         } => {
                             upload(
@@ -110,6 +112,7 @@ pub(super) fn start_xfer(
                                 id,
                                 local,
                                 remote_dir,
+                                remote_name,
                                 policy,
                                 &s,
                                 cancel_work,

@@ -90,6 +90,9 @@ pub enum UiCommand {
         id: u64,
         local: String,
         remote_dir: String,
+        /// 远端文件名覆盖：None 时按 `local` 的 basename 取名（原有行为）；
+        /// Some 时按这个名字落地，不必和本地文件名一致（AI/MCP `copy_to_remote` 改名用）。
+        remote_name: Option<String>,
         policy: ConflictPolicy,
     },
     /// 取消某个传输任务（进行中或排队中）

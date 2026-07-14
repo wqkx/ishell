@@ -323,8 +323,8 @@ pub async fn run(
                             pending_xfer.push_back(p);
                         }
                     }
-                    Some(UiCommand::Upload { id, local, remote_dir, policy }) => {
-                        let p = PendingXfer::Upload { id, local, remote_dir, policy };
+                    Some(UiCommand::Upload { id, local, remote_dir, remote_name, policy }) => {
+                        let p = PendingXfer::Upload { id, local, remote_dir, remote_name, policy };
                         if active_xfer < MAX_CONCURRENT_XFER {
                             start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
                             active_xfer += 1;

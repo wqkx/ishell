@@ -397,6 +397,7 @@ impl App {
                                     id,
                                     local,
                                     remote_dir,
+                                    remote_name: None,
                                     policy: ConflictPolicy::Overwrite,
                                 });
                             }
@@ -447,6 +448,7 @@ impl App {
                                 id,
                                 local,
                                 remote_dir,
+                                remote_name: None,
                                 policy: ConflictPolicy::Overwrite,
                             });
                         }

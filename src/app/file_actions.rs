@@ -143,6 +143,7 @@ impl App {
                             id,
                             local,
                             remote_dir,
+                            remote_name: None,
                             policy,
                         });
                         if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
@@ -173,6 +174,7 @@ impl App {
                             id,
                             local,
                             remote_dir,
+                            remote_name: None,
                             policy,
                         });
                     }

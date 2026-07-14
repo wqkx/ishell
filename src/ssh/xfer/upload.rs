@@ -9,16 +9,20 @@ use super::super::sftp::{is_sftp_not_found, join_remote};
 use super::super::UiSink;
 use super::util::{local_basename, remote_nonexistent, xfer_backoff, XFER_RETRIES};
 
+#[allow(clippy::too_many_arguments)] // 跟 download()（同样 8 个参数）一致，未拆结构体
 pub(super) async fn upload(
     sftp: &russh_sftp::client::SftpSession,
     id: u64,
     local: String,
     remote_dir: String,
+    remote_name: Option<String>,
     policy: ConflictPolicy,
     sink: &UiSink,
     cancel: Arc<AtomicBool>,
 ) {
-    let name = local_basename(&local); // 本地路径用 Windows 兼容的取名（处理反斜杠/盘符）
+    // 远端文件名默认按本地路径取（Windows 兼容，处理反斜杠/盘符）；调用方要求改名时
+    // （AI/MCP copy_to_remote）用 remote_name 覆盖，不需要为此另建符号链接绕路。
+    let name = remote_name.unwrap_or_else(|| local_basename(&local));
     let is_dir = tokio::fs::metadata(&local)
         .await
         .map(|m| m.is_dir())

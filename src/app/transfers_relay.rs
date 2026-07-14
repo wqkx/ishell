@@ -141,6 +141,7 @@ impl App {
                             id: up_id,
                             local: tmp,
                             remote_dir: dest_dir,
+                            remote_name: None,
                             policy: ConflictPolicy::Overwrite,
                         });
                         if let Some(t) = self.sessions[di]
