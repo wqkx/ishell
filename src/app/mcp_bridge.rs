@@ -525,15 +525,25 @@ async fn handle_conn(
         }
     };
     let id = req.id;
-    let (resp_tx, resp_rx) = oneshot::channel();
+    let (resp_tx, mut resp_rx) = oneshot::channel();
     if tx.send(McpCall { req, resp_tx }).is_err() {
         return;
     }
     ctx.request_repaint(); // 唤醒 UI 线程尽快排空这条请求
-    let resp = resp_rx.await.unwrap_or(McpResponse {
-        id,
-        result: Err("iShell 未能处理该请求（可能已关闭）".into()),
-    });
+    // 对端（ishell-mcp）自己可能有更短的超时（比如 MCP 客户端的空闲中止），在我们等到
+    // App 处理完之前就提前断开连接——这种情况下这一行不再读到任何东西，`next_line()`
+    // 会返回 Ok(None)（EOF）。如果只是死等 resp_rx，那么即使对端早就走了，
+    // 这个 resp_tx 依旧会一直挂在 PendingAiRun 上，把后续 poll_run 卡死在
+    // "已有一个 poll_run 在等待"——release 掉 resp_rx（丢弃它，触发发送端的
+    // is_closed()），让 App 那边能识别出这个等待者其实已经没人要结果了。
+    let resp = tokio::select! {
+        biased;
+        r = &mut resp_rx => r.unwrap_or(McpResponse {
+            id,
+            result: Err("iShell 未能处理该请求（可能已关闭）".into()),
+        }),
+        _ = lines.next_line() => return,
+    };
     if let Ok(mut json) = serde_json::to_string(&resp) {
         json.push('\n');
         let _ = w.write_all(json.as_bytes()).await;
@@ -828,7 +838,11 @@ impl App {
                         // resp_tx，否则旧调用的 oneshot 被直接丢弃，只会收到一个模糊的
                         // "iShell 未能处理该请求"，而不是正常的超时/完成语义。拒绝新调用，
                         // 让调用方明确知道"已经有一个等待者了"。
-                        if p.resp_tx.is_some() {
+                        // 但如果那个等待者对应的连接已经先断开了（比如 MCP 客户端自己的空闲
+                        // 超时提前中止了那次调用，见 handle_conn 里的 EOF 检测），resp_tx 的
+                        // 接收端早就被丢弃，is_closed() 为真——这种情况不是"正在等待"，而是
+                        // 孤儿等待者，不应该继续挡住新的 poll_run。
+                        if p.resp_tx.as_ref().is_some_and(|tx| !tx.is_closed()) {
                             send_err(
                                 resp_tx,
                                 "这条运行已经有一个 poll_run 在等待，请勿并发调用；如果那个等待者\
