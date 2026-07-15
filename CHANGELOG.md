@@ -2,12 +2,16 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
-## [未发布]
+## [0.16.7] - 2026-07-15
 
 ### Fixed
 - AI/MCP `poll_run` 在对端（`ishell-mcp` 进程）因其自身调用超时提前断开连接后，主进程侧仍把
   那次等待计为"占用中"，导致后续 `poll_run` 一直被"已有一个 poll_run 在等待"拒绝，只能靠
   `interrupt`（会中断正在跑的命令）才能恢复；现在连接一断开就能识别出这是孤儿等待者并自动放行
+
+### Changed
+- `write_file` 工具说明补充"二进制文件请用 copy_to_remote"提示；服务器说明补充 `&` 优先级
+  低于 `&&` 的提醒，避免 `md5sum f && nohup cmd &` 这类写法把整条 `&&` 链一起丢进后台
 
 ## [0.16.6] - 2026-07-14
 
