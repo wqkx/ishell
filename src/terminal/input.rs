@@ -14,6 +14,12 @@ impl Terminal {
         let mut out = Vec::new();
         let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
         let shift = ui.input(|i| i.modifiers.shift);
+        // 「Option 当 Meta 键」：按住 Alt 时丢掉 Text 事件，改由 encode_key 发 `ESC <char>`。
+        // 不这样做的话，macOS 上 Option+B 会既产生文本 "∫"（Event::Text）又产生 Key 事件，
+        // 两者都发出去就是双份输入；而终端用户要的是 Meta 语义（Alt+B = 按词后移）。
+        // 排除 ctrl：Windows/Linux 的 AltGr 被报成 Ctrl+Alt，那是真的要输入字符（某些键盘
+        // 布局靠它打 @、# 等），不能吞。
+        let meta_held = ui.input(|i| i.modifiers.alt && !i.modifiers.ctrl);
         let alt = self.parser.screen().alternate_screen();
         if alt {
             self.input_line.clear();
@@ -22,6 +28,9 @@ impl Terminal {
         for ev in events {
             match ev {
                 egui::Event::Text(t) => {
+                    if meta_held {
+                        continue; // Alt 组合交给 encode_key 发 ESC 前缀形式，见上面 meta_held
+                    }
                     if !alt {
                         self.input_line.push_str(&t);
                         self.hist = None;
@@ -88,7 +97,10 @@ impl Terminal {
                     }
                     if !alt {
                         match key {
-                            Key::Enter => self.commit_line(),
+                            // 只有「裸回车」才是提交：Shift/Alt+Enter 现在发 `ESC CR`，语义是
+                            // 换行继续输入（见 keys.rs），若也当成提交会把半截命令推进本地
+                            // 历史、并清空正在跟踪的输入行。
+                            Key::Enter if !modifiers.shift && !modifiers.alt => self.commit_line(),
                             Key::Backspace => {
                                 self.input_line.pop();
                                 self.hist = None;

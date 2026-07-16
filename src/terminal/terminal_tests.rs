@@ -352,3 +352,100 @@ fn top_anchored_scroll_region_writes_to_scrollback() {
     assert_eq!(t.parser.screen().scrollback(), 1);
     assert_eq!(t.parser.screen().cell(0, 0).unwrap().contents(), "h");
 }
+
+// ── 按键编码（keys.rs::encode_key）─────────────────────────────────────────
+// 这些组合此前要么丢修饰键、要么完全不发，导致在 iShell 里跑 Claude Code 等 TUI 时
+// 大量快捷键失灵（Shift+Tab 切模式、Shift+Enter 换行、Ctrl+方向键按词跳转等）。
+
+/// 便捷：按 key+修饰编码一次，返回字节。
+fn enc(key: egui::Key, mods: egui::Modifiers, app_cursor: bool) -> Vec<u8> {
+    let mut v = Vec::new();
+    keys::encode_key(key, mods, app_cursor, &mut v);
+    v
+}
+
+const NONE: egui::Modifiers = egui::Modifiers::NONE;
+const SHIFT: egui::Modifiers = egui::Modifiers::SHIFT;
+const ALT: egui::Modifiers = egui::Modifiers::ALT;
+const CTRL: egui::Modifiers = egui::Modifiers::CTRL;
+
+#[test]
+fn shift_tab_encodes_back_tab() {
+    // Claude Code 用 Shift+Tab 切换权限模式；此前发的是普通 \t（=Tab 补全）。
+    assert_eq!(enc(egui::Key::Tab, SHIFT, false), b"\x1b[Z");
+    assert_eq!(enc(egui::Key::Tab, NONE, false), b"\t");
+}
+
+#[test]
+fn shift_or_alt_enter_encodes_esc_cr_for_newline_without_submit() {
+    // 裸回车=提交；Shift/Alt+Enter=换行不提交（等价 /terminal-setup 给别的终端配的映射）。
+    assert_eq!(enc(egui::Key::Enter, NONE, false), b"\r");
+    assert_eq!(enc(egui::Key::Enter, SHIFT, false), b"\x1b\r");
+    assert_eq!(enc(egui::Key::Enter, ALT, false), b"\x1b\r");
+}
+
+#[test]
+fn modified_arrows_carry_modifier_param() {
+    // 无修饰：普通/SS3 短形式（受 DECCKM 影响）
+    assert_eq!(enc(egui::Key::ArrowLeft, NONE, false), b"\x1b[D");
+    assert_eq!(enc(egui::Key::ArrowLeft, NONE, true), b"\x1bOD");
+    // 带修饰：一律 CSI 1;<m> X 长形式，即便在应用光标模式下
+    assert_eq!(enc(egui::Key::ArrowRight, CTRL, false), b"\x1b[1;5C"); // 按词右移
+    assert_eq!(enc(egui::Key::ArrowRight, CTRL, true), b"\x1b[1;5C");
+    assert_eq!(enc(egui::Key::ArrowLeft, SHIFT, false), b"\x1b[1;2D"); // 选择
+    assert_eq!(enc(egui::Key::Home, CTRL, false), b"\x1b[1;5H");
+}
+
+#[test]
+fn tilde_keys_carry_modifier_param() {
+    assert_eq!(enc(egui::Key::Delete, NONE, false), b"\x1b[3~");
+    assert_eq!(enc(egui::Key::Delete, CTRL, false), b"\x1b[3;5~");
+    assert_eq!(enc(egui::Key::PageUp, SHIFT, false), b"\x1b[5;2~");
+}
+
+#[test]
+fn function_keys_encode() {
+    // 此前 F1..F12 落到 `_ => {}`，按下什么都不发。
+    assert_eq!(enc(egui::Key::F1, NONE, false), b"\x1bOP");
+    assert_eq!(enc(egui::Key::F1, CTRL, false), b"\x1b[1;5P");
+    assert_eq!(enc(egui::Key::F5, NONE, false), b"\x1b[15~");
+    assert_eq!(enc(egui::Key::F12, NONE, false), b"\x1b[24~");
+    assert_eq!(enc(egui::Key::F12, SHIFT, false), b"\x1b[24;2~");
+}
+
+#[test]
+fn alt_letter_encodes_meta_prefix() {
+    // readline 的 Meta 惯例：Alt+B/F 按词移动、Alt+D 删词。
+    assert_eq!(enc(egui::Key::B, ALT, false), b"\x1bb");
+    assert_eq!(enc(egui::Key::F, ALT, false), b"\x1bf");
+    // Alt+Shift+B -> 大写
+    let alt_shift = egui::Modifiers { alt: true, shift: true, ..Default::default() };
+    assert_eq!(enc(egui::Key::B, alt_shift, false), b"\x1bB");
+    // Alt+Backspace = 删除前一个词
+    assert_eq!(enc(egui::Key::Backspace, ALT, false), b"\x1b\x7f");
+}
+
+#[test]
+fn ctrl_letter_and_symbols_encode_control_chars() {
+    assert_eq!(enc(egui::Key::C, CTRL, false), &[0x03]); // 中断
+    assert_eq!(enc(egui::Key::Space, CTRL, false), &[0x00]); // set-mark
+    assert_eq!(enc(egui::Key::Slash, CTRL, false), &[0x1f]); // 撤销
+    assert_eq!(enc(egui::Key::Backslash, CTRL, false), &[0x1c]); // SIGQUIT
+    // Ctrl+_ (=Ctrl+Shift+-) 发 US；而裸 Ctrl+- 必须不发——它被 egui 内建的
+    // zoom_with_keyboard 绑成界面缩小（COMMAND 在 Linux/Windows 上就是 Ctrl），
+    // 若这里也发 0x1f 就会「既缩放又发撤销」。
+    let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+    assert_eq!(enc(egui::Key::Minus, ctrl_shift, false), &[0x1f]);
+    assert!(enc(egui::Key::Minus, CTRL, false).is_empty());
+    // Alt+Ctrl+B -> ESC 前缀 + 控制字符
+    let alt_ctrl = egui::Modifiers { alt: true, ctrl: true, ..Default::default() };
+    assert_eq!(enc(egui::Key::B, alt_ctrl, false), b"\x1b\x02");
+}
+
+#[test]
+fn copy_paste_shortcuts_are_not_sent_to_terminal() {
+    // Ctrl+Shift+C/V/F 保留给复制/粘贴/查找，不能当终端输入发下去。
+    let cs = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+    assert!(enc(egui::Key::C, cs, false).is_empty());
+    assert!(enc(egui::Key::V, cs, false).is_empty());
+}

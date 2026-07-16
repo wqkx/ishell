@@ -2,6 +2,25 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [未发布]
+
+### Fixed
+- 在 iShell 终端里跑 Claude Code 等 TUI 时大量快捷键失灵：按键编码此前只处理了
+  `Ctrl+字母`，其余修饰组合一律被丢弃或干脆不发。现补齐 xterm 标准编码——
+  - **Shift+Tab** 发 `CSI Z`（back-tab），此前发的是普通 `\t`，于是 Claude Code 里用来切换
+    权限模式（plan / auto-accept）的 Shift+Tab 变成了 Tab 补全
+  - **Shift/Alt+Enter** 发 `ESC CR`，用作"换行但不提交"（裸 xterm 编码下它和回车都是 CR、
+    无法区分，这也正是 Claude Code 的 `/terminal-setup` 要给别的终端写入的映射；iShell 自己
+    就是终端，现已内建，用户无需再配）
+  - **修饰键 + 方向键 / Home / End** 发 `CSI 1;<m> X`、**+ Insert/Delete/PageUp/PageDown**
+    发 `CSI <n>;<m> ~`，此前修饰键被丢弃、降级成无修饰的普通方向键（Ctrl+←/→ 按词跳转、
+    Shift+←/→ 选择因此失效）
+  - **F1–F12**（含修饰）此前完全不发
+  - **Alt+字母/数字** 发 `ESC <char>`（Meta 惯例：Alt+B/F 按词移动、Alt+D 删词），
+    **Alt+Backspace** 发 `ESC DEL` 删词；macOS 上按住 Alt 时同时产生的文本事件（Option+B
+    会输入 "∫"）随之抑制，即"Option 当 Meta 键"，但 AltGr（被报成 Ctrl+Alt）仍照常输入字符
+  - **Ctrl+Space/[/\\/]//-** 发对应控制字符（NUL / ESC / FS / GS / US）
+
 ## [0.16.8] - 2026-07-16
 
 ### Fixed
