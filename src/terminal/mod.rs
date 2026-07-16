@@ -361,25 +361,41 @@ impl Terminal {
         // 变成「越滚越快、停不下来」（这正是 claude code 里滚动特别快的根因）。本地像素级
         // 回滚（最后的 else 分支）仍用 smooth_scroll_delta，因为它要的就是这种连续平滑感。
         if resp.hovered() {
-            let (smooth, raw, ctrl) = ui.input(|i| {
+            let (smooth, raw, zoom) = ui.input(|i| {
                 // smooth_scroll_delta 带惯性平滑：一次真实滚动会在其后连续多帧持续吐出衰减的
                 // 非零值。离散点击/按键语义的两条路径需要「这一帧真实发生了多少」，故从本帧
                 // 原始事件里自己累加（单位统一换算成「行」，与 char_h 步长口径一致）。
+                //
+                // Ctrl+滚轮缩放同样必须只看本帧真实事件、且用**事件自带的**修饰键状态
+                // （MouseWheel.modifiers 记录的是「该事件发生那一刻」的按键状态）：
+                // 之前用的是 `i.modifiers`（本帧末的全局状态）+ smooth（带惯性），于是
+                // 「滚完轮子后、惯性还在吐值的那几帧里按下 Ctrl」会凭空触发缩放——用户
+                // 只是滚动时顺手按了 Ctrl，界面却莫名放大/缩小（几率小，因为要恰好按在
+                // 惯性窗口内）。顺带也修掉了「一次 Ctrl+滚动被惯性放大成连续多帧、每帧
+                // 各缩放一级」的失控问题。
                 let mut raw_lines = 0.0f32;
+                let mut zoom_lines = 0.0f32;
                 for ev in &i.events {
-                    if let egui::Event::MouseWheel { unit, delta, .. } = ev {
-                        raw_lines += match unit {
+                    if let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } = ev
+                    {
+                        let lines = match unit {
                             egui::MouseWheelUnit::Line => delta.y,
                             egui::MouseWheelUnit::Point => delta.y / char_h,
                             egui::MouseWheelUnit::Page => delta.y * rows as f32,
                         };
+                        if modifiers.ctrl || modifiers.command {
+                            zoom_lines += lines;
+                        } else {
+                            raw_lines += lines;
+                        }
                     }
                 }
-                (
-                    i.smooth_scroll_delta.y,
-                    raw_lines,
-                    i.modifiers.ctrl || i.modifiers.command,
-                )
+                (i.smooth_scroll_delta.y, raw_lines, zoom_lines)
             });
             let alt = self.parser.screen().alternate_screen();
             if raw != 0.0 {
@@ -395,8 +411,10 @@ impl Terminal {
                     self.local_scroll_accum,
                 );
             }
-            if ctrl && smooth != 0.0 {
-                self.font_size = (self.font_size + smooth.signum() * 1.0).clamp(8.0, 32.0);
+            if zoom != 0.0 {
+                // 一次滚轮缺口 = 一级字号；不吃惯性尾巴（见上面 zoom_lines 的说明）
+                self.font_size = (self.font_size + zoom.signum() * 1.0).clamp(8.0, 32.0);
+                self.local_scroll_accum = 0.0; // 缩放不该顺带把余量带进回滚
             } else if report_mouse {
                 self.local_scroll_accum = 0.0; // 切换路径：旧余量不该带到鼠标上报语义里
                 if raw != 0.0 {
