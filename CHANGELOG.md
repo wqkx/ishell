@@ -4,6 +4,21 @@
 
 ## [未发布]
 
+### Removed
+- **回退 0.16.10 引入的 vendor `egui-winit` 补丁**（连同 `vendor/egui-winit` 整个目录）：实测
+  证明它在目标环境下**从未生效**，0.16.10 记载的根因是错的。真实根因不在 iShell 也不在
+  egui-winit，而在输入法侧——fcitx4 的 XIM 模块默认 `UseOnTheSpotStyle=False`，此时它只向应用
+  宣告 `PreeditPosition`/`PreeditNothing` 这类 style（语义是「组字文本由输入法自己画，不交给
+  应用」）。winit 因此退回 root-window 模式，iShell 全程收不到**任何** `Ime::Preedit` 事件，
+  那个补丁所在的分支自然永远执行不到。诊断方式：直接 `XGetIMValues(XNQueryInputStyle)` 把
+  输入法**实际宣告**的 style 位图打出来，一次就问清了此前三轮推断都没问对的问题
+- 用户侧解法与其代价（不涉及代码改动）：把 fcitx 的 `UseOnTheSpotStyle` 改为 `True` 并**完整
+  重启** fcitx（该选项只在 XIM 服务器启动时读一次），Shift 丢字回显即消失；但随之而来的是
+  候选窗口被钉死在窗口左下角、无法跟随光标——这是 libX11 在启用 preedit callbacks 时
+  `XNSpotLocation` 失效导致的，见 freedesktop bug #1580（2004 年至今未修），winit 亦在
+  `ime/context.rs::set_spot` 的注释里明确记载了这一限制。X11 + XIM 下二者不可兼得，两边都
+  不在本项目可控范围内；Wayland 的 `text-input-v3` 没有这个包袱（eframe 已编入 wayland 特性）
+
 ### Fixed
 - 滚动鼠标滚轮的过程中顺手按下 Ctrl，终端会莫名放大/缩小（几率不高）：Ctrl+滚轮缩放此前
   判断的是 `i.modifiers`（**本帧末**的全局修饰键状态）配 `smooth_scroll_delta`（**带惯性**，
