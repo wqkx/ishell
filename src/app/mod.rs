@@ -45,6 +45,19 @@ use egui::RichText;
 
 use crate::proto::{ConflictPolicy, UiCommand};
 use crate::theme::Palette;
+
+/// docx 后台解析线程回传的一条结果：(会话 uid, 占位标签 id, 解析出的文档+图片纹理 或 错误)。
+pub(in crate::app) type DocParseMsg = (
+    u64,
+    u64,
+    Result<
+        (
+            crate::ui::docx::Doc,
+            std::collections::HashMap<String, egui::TextureHandle>,
+        ),
+        String,
+    >,
+);
 use crate::ui::connect::ConnectForm;
 use crate::ui::sidebar;
 
@@ -80,27 +93,11 @@ pub struct App {
     editor_state: Arc<Mutex<EditorState>>,
     /// 看图工具状态（标签、激活项、聚焦请求、拖动重排）
     image: ImageView,
-    /// docx 后台解析结果通道：(占位标签 id, 解析结果)
-    doc_parse_tx: std::sync::mpsc::Sender<(
-        u64,
-        Result<
-            (
-                crate::ui::docx::Doc,
-                std::collections::HashMap<String, egui::TextureHandle>,
-            ),
-            String,
-        >,
-    )>,
-    doc_parse_rx: std::sync::mpsc::Receiver<(
-        u64,
-        Result<
-            (
-                crate::ui::docx::Doc,
-                std::collections::HashMap<String, egui::TextureHandle>,
-            ),
-            String,
-        >,
-    )>,
+    /// docx 后台解析结果通道：(会话 uid, 占位标签 id, 解析结果)。
+    /// 带 uid 是必须的：id 来自各会话独立的 next_xfer 计数器，跨会话会重号，
+    /// 而编辑器标签是全局一张表——只按 id 找会装配到别的会话的同号标签上。
+    doc_parse_tx: std::sync::mpsc::Sender<DocParseMsg>,
+    doc_parse_rx: std::sync::mpsc::Receiver<DocParseMsg>,
     /// 下一个编辑器 TextEdit Id 序号
     next_editor_id: u64,
     /// 关闭大文件编辑器后延迟若干帧再 malloc_trim（等 galley 缓存被淘汰）

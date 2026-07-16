@@ -11,8 +11,10 @@ use super::{App, ImageTab};
 
 /// 本帧从各会话 drain 出的占位标签：(id, path, server title, uid, cmd_tx)
 type FramePlaceholder = (u64, String, String, u64, UnboundedSender<UiCommand>);
-/// 本帧待填入编辑器的文件内容：(id, path, content, encoding, eol, mtime)
-type FrameFilled = (u64, String, String, String, Eol, u32);
+/// 本帧待填入编辑器的文件内容：(uid, id, path, content, encoding, eol, mtime)。
+/// **必须带 uid**：id 来自各会话**独立**的 `next_xfer` 计数器（见 file_actions.rs），
+/// 跨会话必然重号，而编辑器标签是全局一张表——只按 id 找标签会填进别的会话的标签里。
+type FrameFilled = (u64, u64, String, String, String, Eol, u32);
 /// PDF 查找命中：(uid, path, hits, message)
 type FramePdfSearch = (u64, String, Vec<(u32, String)>, Option<String>);
 
@@ -25,8 +27,8 @@ impl App {
         // 身份用会话 uid（稳定唯一），title 仅作显示——避免同名会话（默认 title=用户名）串台。
         let mut new_placeholders: Vec<FramePlaceholder> = Vec::new();
         let mut filled: Vec<FrameFilled> = Vec::new();
-        let mut load_progress: Vec<(u64, u64, u64)> = Vec::new();
-        let mut load_fail: Vec<u64> = Vec::new();
+        let mut load_progress: Vec<(u64, u64, u64, u64)> = Vec::new(); // uid, id, done, total
+        let mut load_fail: Vec<(u64, u64)> = Vec::new(); // uid, id
         let mut new_images: Vec<(String, Vec<u8>, String, u64)> = Vec::new(); // path, data, title, uid
         let mut saved: Vec<(u64, u64, String, u32)> = Vec::new(); // uid, id, path, mtime
         let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
@@ -35,10 +37,10 @@ impl App {
         let mut warns: Vec<String> = Vec::new(); // 需弹 toast 的警告
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
         let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
-        let mut pdf_infos: Vec<(u64, u32)> = Vec::new(); // 占位 id, 页数
+        let mut pdf_infos: Vec<(u64, u64, u32)> = Vec::new(); // uid, 占位 id, 页数
         let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
         let mut pdf_searches: Vec<FramePdfSearch> = Vec::new();
-        let mut new_docs: Vec<(u64, Vec<u8>)> = Vec::new(); // 占位 id, docx 字节
+        let mut new_docs: Vec<(u64, u64, Vec<u8>)> = Vec::new(); // uid, 占位 id, docx 字节
         let mut relay_source: Vec<(u64, Result<u64, String>)> = Vec::new(); // op_id, Ok(size)/Err(msg)
         let mut copy_done: Vec<(u64, u64, bool, String)> = Vec::new(); // uid, op_id, ok, message
         let mut temp_key_trusted: Vec<(u64, bool, String)> = Vec::new();
@@ -57,7 +59,7 @@ impl App {
                 new_placeholders.push((id, path, s.title.clone(), s.uid, s.cmd_tx.clone()));
             }
             for (id, path, content, encoding, eol, mtime) in s.pending.open.drain(..) {
-                filled.push((id, path, content, encoding, eol, mtime));
+                filled.push((s.uid, id, path, content, encoding, eol, mtime));
             }
             for (id, path, mtime) in s.pending.saved.drain(..) {
                 saved.push((s.uid, id, path, mtime));
@@ -80,11 +82,11 @@ impl App {
             for (id, path, size) in s.pending.too_large.drain(..) {
                 too_large.push((s.uid, id, path, size));
             }
-            for p in s.pending.load_progress.drain(..) {
-                load_progress.push(p);
+            for (id, done, total) in s.pending.load_progress.drain(..) {
+                load_progress.push((s.uid, id, done, total));
             }
             for (id, msg) in s.pending.load_fail.drain(..) {
-                load_fail.push(id);
+                load_fail.push((s.uid, id));
                 // PDF 缺 poppler 等打开失败：保留文案弹 toast（原先丢弃 message，用户只见标签消失）
                 if !msg.is_empty() {
                     warns.push(msg);
@@ -93,8 +95,8 @@ impl App {
             for (path, data) in s.pending.image.drain(..) {
                 new_images.push((path, data, s.title.clone(), s.uid));
             }
-            for x in s.pending.pdf_info.drain(..) {
-                pdf_infos.push(x);
+            for (id, pages) in s.pending.pdf_info.drain(..) {
+                pdf_infos.push((s.uid, id, pages));
             }
             for (path, page, data) in s.pending.pdf_page.drain(..) {
                 pdf_pages.push((s.uid, path, page, data));
@@ -102,8 +104,8 @@ impl App {
             for (path, hits, message) in s.pending.pdf_search.drain(..) {
                 pdf_searches.push((s.uid, path, hits, message));
             }
-            for x in s.pending.doc.drain(..) {
-                new_docs.push(x);
+            for (id, data) in s.pending.doc.drain(..) {
+                new_docs.push((s.uid, id, data));
             }
             for x in s.pending.relay_source.drain(..) {
                 relay_source.push(x);
@@ -145,7 +147,7 @@ impl App {
         // 打开时发现文件实际超限：移除占位标签（复用 load_fail 移除逻辑），并在对应会话的文件面板
         // 弹「打开大文件」确认，确认后走 force=true 重新打开（列表里的旧大小已过时，双击前无法预判）。
         for (uid, id, path, size) in too_large {
-            load_fail.push(id);
+            load_fail.push((uid, id));
             if let Some(s) = self.sessions.iter_mut().find(|s| s.uid == uid) {
                 s.files.dialog = Some(file_panel::Dialog::ConfirmOpenLarge { path, size });
             }

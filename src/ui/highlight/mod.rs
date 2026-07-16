@@ -194,7 +194,17 @@ mod tests {
         let mid = line.find('维').unwrap() + 1; // 汉字内部，非字符边界
         assert!(!line.is_char_boundary(mid), "用例前提：该偏移确实在字符中间");
         // 不 panic 即通过（此前会 `end byte index N is not a char boundary`）
-        let job = highlight_segment(line, 0..line.len(), "py", 12.0, &[0..mid], LineState::Normal);
+        // from_ref：本意就是「只含这一个 Range 的切片」，写成 &[0..mid] 会被 clippy 误认为
+        // 想要 0..mid 这个区间的所有值（single_range_in_vec_init）。
+        let err = 0..mid;
+        let job = highlight_segment(
+            line,
+            0..line.len(),
+            "py",
+            12.0,
+            std::slice::from_ref(&err),
+            LineState::Normal,
+        );
         assert!(!job.sections.is_empty());
         // 窗口边界本身落在字符中间时同样不能崩
         let job2 = highlight_segment(line, 0..mid, "py", 12.0, &[], LineState::Normal);

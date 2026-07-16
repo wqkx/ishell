@@ -44,7 +44,7 @@ impl App {
                 }
                 Err(e) => Err(e.to_string()),
             };
-            let _ = tx.send((id, res));
+            let _ = tx.send((uid, id, res));
             ctx2.request_repaint();
             ctx2.request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         });

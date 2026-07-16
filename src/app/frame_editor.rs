@@ -8,36 +8,29 @@ use super::util::lock_mutex;
 use super::{App, DocKind, EditorTab, SaveState};
 
 type FramePlaceholder = (u64, String, String, u64, UnboundedSender<UiCommand>);
-type FrameFilled = (u64, String, String, String, Eol, u32);
+/// (uid, id, path, content, encoding, eol, mtime) —— uid 不可省，见 frame.rs 同名类型注释。
+type FrameFilled = (u64, u64, String, String, String, Eol, u32);
 type FramePdfSearch = (u64, String, Vec<(u32, String)>, Option<String>);
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn process_editor_load_events(
         &mut self,
         ui: &mut egui::Ui,
         new_placeholders: Vec<FramePlaceholder>,
         filled: Vec<FrameFilled>,
-        load_progress: Vec<(u64, u64, u64)>,
-        mut load_fail: Vec<u64>,
-        pdf_infos: Vec<(u64, u32)>,
+        load_progress: Vec<(u64, u64, u64, u64)>, // uid, id, done, total
+        mut load_fail: Vec<(u64, u64)>,           // uid, id
+        pdf_infos: Vec<(u64, u64, u32)>,          // uid, id, pages
         pdf_pages: Vec<(u64, String, u32, Vec<u8>)>,
-        new_docs: Vec<(u64, Vec<u8>)>,
+        new_docs: Vec<(u64, u64, Vec<u8>)>, // uid, id, docx 字节
         pdf_searches: Vec<FramePdfSearch>,
     ) {
         // 编辑器标签：立即建占位（loading）→ 进度更新 → 内容就位 → 失败移除。
         // PDF / Word 文档标签完整复用该框架（占位/进度/失败路径相同，就位时填充 doc 内容）。
         // docx 后台解析结果先收集（mpsc 无 peek；必须与其它事件一起纳入触发条件，
         // 否则「解析完成」那帧若无其它编辑器事件，下方块不执行 → 永远停在「渲染中」）
-        let parsed: Vec<(
-            u64,
-            Result<
-                (
-                    crate::ui::docx::Doc,
-                    std::collections::HashMap<String, egui::TextureHandle>,
-                ),
-                String,
-            >,
-        )> = self.doc_parse_rx.try_iter().collect();
+        let parsed: Vec<super::DocParseMsg> = self.doc_parse_rx.try_iter().collect();
         let opened_editor = !new_placeholders.is_empty()
             || !filled.is_empty()
             || !load_progress.is_empty()
@@ -93,15 +86,27 @@ impl App {
                 }
             }
             // 2) 下载进度 → 占位标签
-            for (id, done, total) in load_progress {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+            // 这里以及下面几处都必须按 (uid, load_id) 匹配，不能只看 load_id：id 来自各会话
+            // **独立**的 next_xfer 计数器（见 file_actions.rs），跨会话必然重号，而编辑器
+            // 标签是全局一张表——只按 id 找会命中另一个会话的同号标签，把内容/路径填错地方
+            // （两个文件同名同内容时表面完全看不出来，保存却会写到错误的服务器）。
+            for (uid, id, done, total) in load_progress {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.load_id == Some(id))
+                {
                     t.load_done = done;
                     t.load_total = total;
                 }
             }
             // 3) 内容就位：占位标签变为可编辑、填入内容；恢复上次光标位置
-            for (id, path, content, encoding, eol, mtime) in filled {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+            for (uid, id, path, content, encoding, eol, mtime) in filled {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.load_id == Some(id))
+                {
                     let key = format!("{}|{}", t.server, path);
                     let large = content.len() > crate::limits::LARGE_FILE_BYTES;
                     let mut editor = crate::ui::editor::Editor::new(path, content);
@@ -118,8 +123,12 @@ impl App {
                 }
             }
             // 3.5) 文档就位：占位标签变为 PDF / Word 查看器
-            for (id, pages) in pdf_infos {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+            for (uid, id, pages) in pdf_infos {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.load_id == Some(id))
+                {
                     t.doc = Some(DocKind::Pdf {
                         pages,
                         cur: 1,
@@ -139,8 +148,12 @@ impl App {
             }
             // docx 下载完成 → 后台线程解析 + 解码纹理（ctx.load_texture 线程安全），
             // UI 不冻结；占位文案切换为「渲染中 …」。结果经 doc_parse 通道回来装配。
-            for (id, data) in new_docs {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+            for (uid, id, data) in new_docs {
+                if let Some(t) = ed
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.uid == uid && t.load_id == Some(id))
+                {
                     t.editor.loading_note = Some(crate::i18n::tr("渲染中 …", "Rendering …").into());
                     // 进度条置满（下载已完成）
                     t.load_done = t.load_total.max(1);
@@ -149,10 +162,14 @@ impl App {
                 }
             }
             // 后台解析完成 → 装配文档标签
-            for (id, res) in parsed {
+            for (uid, id, res) in parsed {
                 match res {
                     Ok((doc, images)) => {
-                        if let Some(t) = ed.tabs.iter_mut().find(|t| t.load_id == Some(id)) {
+                        if let Some(t) = ed
+                            .tabs
+                            .iter_mut()
+                            .find(|t| t.uid == uid && t.load_id == Some(id))
+                        {
                             let n = doc.blocks.len();
                             t.doc = Some(DocKind::Docx {
                                 doc,
@@ -176,7 +193,7 @@ impl App {
                             },
                             ui.input(|i| i.time),
                         ));
-                        load_fail.push(id);
+                        load_fail.push((uid, id));
                     }
                 }
             }
@@ -240,8 +257,12 @@ impl App {
                 }
             }
             // 4) 失败：移除对应占位标签（含 TextEditState，避免加载失败仍占内存）
-            for id in load_fail {
-                if let Some(i) = ed.tabs.iter().position(|t| t.load_id == Some(id)) {
+            for (uid, id) in load_fail {
+                if let Some(i) = ed
+                    .tabs
+                    .iter()
+                    .position(|t| t.uid == uid && t.load_id == Some(id))
+                {
                     ed.remove_tab_at(ui.ctx(), i);
                 }
             }
