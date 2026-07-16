@@ -54,8 +54,33 @@ jobs:
       - name: System deps (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev pkg-config
+          # ARM64 runner 的 apt 必挂根因：GitHub 的 ubuntu-22.04-arm runner 没有 IPv6 出口，
+          # 但 apt 会优先连 ports.ubuntu.com 解析出的 IPv6 地址 → "Cannot initiate the
+          # connection to ports.ubuntu.com:80 (2620:2d:4000:1::17) - Network is unreachable"，
+          # 于是这条 leg 每次都失败、重跑也没用（v0.16.7/v0.16.8 都栽在这）。强制 IPv4 即可
+          # 根治；再叠加 apt 内建重试 + 外层重试兜底镜像偶发抖动，仍失败则切到 Azure 镜像
+          # （runner 本身就跑在 Azure 上，同网更快更稳）最后再试一轮。
+          printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-network >/dev/null
+
+          retry() {
+            for i in 1 2 3; do
+              "$@" && return 0
+              echo "::warning::「$*」第 $i 次失败，10s 后重试"
+              sleep 10
+            done
+            return 1
+          }
+
+          # 主镜像失败就换 Azure 同网镜像重来（两者路径布局一致，直接改 host 即可）。
+          if ! retry sudo apt-get update; then
+            echo "::warning::默认镜像不可用，切换到 Azure 镜像重试"
+            sudo sed -i -e 's|//ports\.ubuntu\.com|//azure.ports.ubuntu.com|g' \
+                        -e 's|//archive\.ubuntu\.com|//azure.archive.ubuntu.com|g' \
+                        /etc/apt/sources.list
+            retry sudo apt-get update
+          fi
+          retry sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev pkg-config
 
       - name: Use crates.io (drop China mirror)
         shell: bash
