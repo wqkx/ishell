@@ -113,6 +113,15 @@ pub enum McpReqKind {
         remote_path: String,
         timeout_ms: u64,
     },
+    /// 与 `CopyToRemote` 语义相同，但源文件由运行 `ishell-mcp` 的调用方机器以原始字节流
+    /// 紧跟在本请求后发送。这个变体不是 MCP tool 的公开参数，而是代理与 GUI 间的内部协议，
+    /// 用来避免把工作机文件全文塞进 JSON/LLM 上下文。
+    CopyToRemoteFromCaller {
+        session_uid: u64,
+        remote_path: String,
+        size: u64,
+        timeout_ms: u64,
+    },
     /// 把远端文件/目录复制到本地（走 SFTP 下载通道），是 `CopyToRemote` 的反方向。
     CopyFromRemote {
         session_uid: u64,
@@ -154,4 +163,29 @@ pub struct McpResponse {
     pub id: u64,
     /// `Err` 携带人类可读的错误信息（会话不存在、已有命令在跑、socket 未连上等）。
     pub result: Result<McpReqResult, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_stream_upload_request_round_trips_without_content_field() {
+        let request = McpRequest {
+            id: 7,
+            kind: McpReqKind::CopyToRemoteFromCaller {
+                session_uid: 11,
+                remote_path: "/srv/project/cuda_eri.py".into(),
+                size: 95_232,
+                timeout_ms: 300_000,
+            },
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("content"));
+        let decoded: McpRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded.kind,
+            McpReqKind::CopyToRemoteFromCaller { size: 95_232, .. }
+        ));
+    }
 }

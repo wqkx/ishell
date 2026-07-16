@@ -19,7 +19,7 @@ use super::UiSink;
 
 use direct::direct_transfer;
 use download::download;
-use upload::upload;
+use upload::{upload, upload_from_mcp};
 
 /// 同一会话同时进行的最大传输数（不同会话各自独立）。
 pub(super) const MAX_CONCURRENT_XFER: usize = 6;
@@ -39,6 +39,12 @@ pub(super) enum PendingXfer {
         remote_name: Option<String>,
         policy: ConflictPolicy,
     },
+    UploadFromMcp {
+        id: u64,
+        source: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        size: u64,
+        remote_path: String,
+    },
     /// 跨主机直传：在本（源）主机上 rsync/scp 直推到目标主机
     Direct(Box<crate::proto::DirectSpec>),
 }
@@ -46,7 +52,9 @@ pub(super) enum PendingXfer {
 impl PendingXfer {
     pub(super) fn id(&self) -> u64 {
         match self {
-            PendingXfer::Download { id, .. } | PendingXfer::Upload { id, .. } => *id,
+            PendingXfer::Download { id, .. }
+            | PendingXfer::Upload { id, .. }
+            | PendingXfer::UploadFromMcp { id, .. } => *id,
             PendingXfer::Direct(d) => d.id,
         }
     }
@@ -116,6 +124,17 @@ pub(super) fn start_xfer(
                                 policy,
                                 &s,
                                 cancel_work,
+                            )
+                            .await
+                        }
+                        PendingXfer::UploadFromMcp {
+                            id,
+                            source,
+                            size,
+                            remote_path,
+                        } => {
+                            upload_from_mcp(
+                                sftp.as_ref(), id, source, size, remote_path, &s, cancel_work,
                             )
                             .await
                         }

@@ -117,6 +117,85 @@ async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
     resp.result
 }
 
+/// 从运行 MCP client 的机器读取一个文件，并把原始字节紧随内部 JSON 请求写入 iShell。
+/// 该函数只在代理进程本地打开 `local_path`；iShell GUI 从未解析该路径，因此跨主机使用时
+/// 不会再把工作机路径错误地当成桌面机路径。
+#[cfg(unix)]
+async fn copy_to_remote_from_caller(
+    session_uid: u64,
+    local_path: String,
+    remote_path: String,
+    timeout_ms: u64,
+) -> Result<McpReqResult, String> {
+    let path = std::path::PathBuf::from(&local_path);
+    if !path.is_absolute() {
+        return Err("local_path 必须是运行 ishell-mcp 的调用方机器上的绝对路径".into());
+    }
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| format!("无法读取调用方文件 {local_path}: {error}"))?;
+    if !metadata.is_file() {
+        return Err("调用方流式上传当前只支持单个普通文件；目录请使用 git/rsync，或逐文件上传".into());
+    }
+
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let socket = socket_path().await;
+    let stream = tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(&socket))
+        .await
+        .map_err(|_| "连接 iShell 本地 socket 超时".to_string())?
+        .map_err(|_| "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".to_string())?;
+    let (read_half, mut write_half) = stream.into_split();
+    let request = McpRequest {
+        id,
+        kind: McpReqKind::CopyToRemoteFromCaller {
+            session_uid,
+            remote_path,
+            size: metadata.len(),
+            timeout_ms,
+        },
+    };
+    let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    header.push('\n');
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, write_half.write_all(header.as_bytes()))
+        .await
+        .map_err(|_| "发送上传请求给 iShell 超时".to_string())?
+        .map_err(|error| error.to_string())?;
+
+    let mut source = tokio::fs::File::open(&path)
+        .await
+        .map_err(|error| format!("无法打开调用方文件 {local_path}: {error}"))?;
+    tokio::io::copy(&mut source, &mut write_half)
+        .await
+        .map_err(|error| format!("发送调用方文件流失败: {error}"))?;
+    write_half
+        .shutdown()
+        .await
+        .map_err(|error| format!("结束调用方文件流失败: {error}"))?;
+
+    let mut response = String::new();
+    let mut reader = BufReader::new(read_half);
+    let read = tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut response))
+        .await
+        .map_err(|_| "等待 iShell 上传响应超时（可能是 GUI、SFTP 或连接异常）".to_string())?
+        .map_err(|error| error.to_string())?;
+    if read == 0 {
+        return Err("iShell 未返回上传结果就关闭了连接".into());
+    }
+    serde_json::from_str::<McpResponse>(response.trim())
+        .map_err(|error| error.to_string())?
+        .result
+}
+
+#[cfg(not(unix))]
+async fn copy_to_remote_from_caller(
+    _session_uid: u64,
+    _local_path: String,
+    _remote_path: String,
+    _timeout_ms: u64,
+) -> Result<McpReqResult, String> {
+    Err("ishell-mcp 目前仅支持 Unix（Linux/macOS）系统的本地 IPC，暂不支持 Windows".into())
+}
+
 #[cfg(not(unix))]
 async fn call(_kind: McpReqKind) -> Result<McpReqResult, String> {
     Err("ishell-mcp 目前仅支持 Unix（Linux/macOS）系统的本地 IPC，暂不支持 Windows".into())
@@ -146,6 +225,14 @@ pub struct RunCommandArgs {
     /// 等待命令结束的超时毫秒数；超时仍未结束会返回 finished=false + run_id，可用 poll_run 续等
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+/// 启动后立即返回的命令参数。它复用 `run_command` 的哨兵和 `poll_run` 状态机，
+/// 只是把等待窗口固定为协议允许的最小值，避免 MCP 客户端的空闲超时占住等待者。
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct StartCommandArgs {
+    pub session_uid: u64,
+    pub command: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -229,7 +316,7 @@ fn default_copy_timeout_ms() -> u64 {
 pub struct CopyToRemoteArgs {
     /// list_sessions 返回的会话 uid
     pub session_uid: u64,
-    /// 本地绝对路径（文件或目录）
+    /// 运行 ishell-mcp 的调用方机器上的单个文件绝对路径
     pub local_path: String,
     /// 远端目标绝对路径，文件名可以和 local_path 不同
     pub remote_path: String,
@@ -292,6 +379,25 @@ impl IshellMcp {
                 session_uid,
                 command,
                 timeout_ms,
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "启动一条可能很长的命令，并在至多 100ms 后返回，不会因 MCP 客户端的长时间\
+                        空闲限制而占住等待连接。返回 finished=false 时保存 run_id，之后用 poll_run\
+                        以较短 timeout_ms 查询；命令已很快结束时会直接返回 finished=true。"
+    )]
+    async fn start_command(
+        &self,
+        Parameters(StartCommandArgs { session_uid, command }): Parameters<StartCommandArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        text_result(
+            call(McpReqKind::RunCommand {
+                session_uid,
+                command,
+                timeout_ms: 100,
             })
             .await,
         )
@@ -469,16 +575,11 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "把本地文件/目录复制到远端（走 SFTP 上传，字节不经过这条 MCP 连接的 \
-                        JSON 传输）。同步大文件、整个目录、或任何体积明显超出「内联进一次 \
-                        JSON 请求」划算范围的内容都应该用这个，而不是 write_file——write_file \
-                        要求把全部内容内联传入，大文件会占用巨量上下文、还可能撑爆传输层。\
-                        local_path/remote_path 都必须是绝对路径（且不能含 \".\"/\"..\" 路径段）；\
-                        remote_path 的文件名可以和本地不同。远端目标存在会被直接覆盖，不做冲突\
-                        检测——这条通道只给你自己用，默认信任调用方，跟 write_file 的覆盖语义\
-                        一致；remote_path 是目录时按合并方式写入：只覆盖同名文件/新建缺失的，\
-                        远端目录里本地源没有的旧文件不会被清理（跟 copy_from_remote 反方向的\
-                        「镜像覆盖」不同，那边会先清空本地旧目录）。"
+        description = "把运行 ishell-mcp 的调用方机器上的单个文件流式复制到远端（走既有 SFTP \
+                        上传，文件字节不进入 MCP JSON 或模型上下文）。这是跨主机同步大源码/\
+                        二进制的首选，不要用 write_file。local_path 必须是调用方机器的绝对路径；\
+                        remote_path 必须是远端绝对路径且不能含 \".\"/\"..\" 路径段。当前流式模式\
+                        支持单个普通文件，目录请用 git/rsync 或逐文件上传；远端目标存在会直接覆盖。"
     )]
     async fn copy_to_remote(
         &self,
@@ -489,15 +590,7 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<CopyToRemoteArgs>,
     ) -> Result<CallToolResult, McpError> {
-        text_result(
-            call(McpReqKind::CopyToRemote {
-                session_uid,
-                local_path,
-                remote_path,
-                timeout_ms,
-            })
-            .await,
-        )
+        text_result(copy_to_remote_from_caller(session_uid, local_path, remote_path, timeout_ms).await)
     }
 
     #[tool(

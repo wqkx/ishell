@@ -276,6 +276,9 @@ fn connect_config_from_saved(c: &SavedConnection) -> ConnectConfig {
 pub(super) struct McpCall {
     req: McpRequest,
     resp_tx: oneshot::Sender<McpResponse>,
+    /// 仅内部 `CopyToRemoteFromCaller` 携带。读取端属于本条 socket，交给 SSH worker
+    /// 消费；常规 JSON 请求保持一问一答，不带任何额外数据。
+    upload_source: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
 }
 
 /// 某会话上一次正在等待的 AI 命令运行（`run_command` 武装，`poll_run` 续等）。
@@ -525,8 +528,28 @@ async fn handle_conn(
         }
     };
     let id = req.id;
+    let is_caller_upload = matches!(&req.kind, McpReqKind::CopyToRemoteFromCaller { .. });
+    if is_caller_upload {
+        // `Lines` 持有的 BufReader 可能已经预读了紧随 JSON 行的文件字节，不能丢掉它；
+        // 连同缓冲区一起转给 worker，才能保证二进制流不丢首块。
+        let upload_source = Some(Box::new(lines.into_inner()) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if tx.send(McpCall { req, resp_tx, upload_source }).is_err() {
+            return;
+        }
+        ctx.request_repaint();
+        let resp = resp_rx.await.unwrap_or(McpResponse {
+            id,
+            result: Err("iShell 未能处理该请求（可能已关闭）".into()),
+        });
+        if let Ok(mut json) = serde_json::to_string(&resp) {
+            json.push('\n');
+            let _ = w.write_all(json.as_bytes()).await;
+        }
+        return;
+    }
     let (resp_tx, mut resp_rx) = oneshot::channel();
-    if tx.send(McpCall { req, resp_tx }).is_err() {
+    if tx.send(McpCall { req, resp_tx, upload_source: None }).is_err() {
         return;
     }
     ctx.request_repaint(); // 唤醒 UI 线程尽快排空这条请求
@@ -721,7 +744,7 @@ impl App {
     }
 
     fn handle_mcp_call(&mut self, call: McpCall) {
-        let McpCall { req, resp_tx } = call;
+        let McpCall { req, resp_tx, upload_source } = call;
         let id = req.id;
         let send_err = |resp_tx: oneshot::Sender<McpResponse>, msg: String| {
             let _ = resp_tx.send(McpResponse {
@@ -1114,6 +1137,58 @@ impl App {
                         remote_dir,
                         remote_name,
                         policy: ConflictPolicy::Overwrite,
+                    })
+                    .is_ok();
+                if !sent {
+                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    return;
+                }
+                s.pending_file_op = Some(PendingAiFileOp {
+                    kind: FileOpKind::Copy { op_id },
+                    path: remote_path,
+                    resp_tx: Some(resp_tx),
+                    req_id: id,
+                    deadline: Instant::now() + clamp_timeout(timeout_ms),
+                });
+            }
+            McpReqKind::CopyToRemoteFromCaller {
+                session_uid,
+                remote_path,
+                size,
+                timeout_ms,
+            } => {
+                let Some(source) = upload_source else {
+                    send_err(resp_tx, "调用方上传请求缺少文件数据流".into());
+                    return;
+                };
+                let Some(idx) = self.session_idx_by_uid(session_uid) else {
+                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    return;
+                };
+                let s = &mut self.sessions[idx];
+                if !s.connected {
+                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    return;
+                }
+                if s.pending_file_op.is_some() {
+                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                    return;
+                }
+                if let Err(e) = validate_remote_path(&remote_path) {
+                    send_err(resp_tx, e);
+                    return;
+                }
+                let op_id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let sent = s
+                    .cmd_tx
+                    .send(UiCommand::UploadFromMcp {
+                        id: op_id,
+                        source,
+                        size,
+                        remote_path: remote_path.clone(),
                     })
                     .is_ok();
                 if !sent {

@@ -204,6 +204,8 @@ cargo run --release
   - `run_command`：执行一条命令并等待完成或超时，返回输出 + 退出码；`poll_run` 对超时未完成的
     命令继续等待、不重发；长任务直接传一个够大的 `timeout_ms`（最长 24 小时）即可，不需要
     `sleep` 轮询；
+  - `start_command`：立即启动长任务，至多等待 100ms 后返回 `run_id`；受 MCP 客户端空闲超时
+    限制时，用它配合短时 `poll_run` 查询，避免遗留等待者。
   - `send_input`：向交互式提示（`sudo` 密码、`vim`/REPL 里继续输入）直接发送原始按键，跳过
     完成检测；
   - `read_screen`：类似 `tmux capture-pane`，导出当前可见屏幕纯文本，适合看 `vim`/`top` 这类
@@ -212,8 +214,11 @@ cargo run --release
     AI 命令，卡住时调用一次 `interrupt` 即可立即释放（代价是丢失那条命令的结果）；
   - `write_file` / `read_file`：复用已有 SFTP 连接读写远端文本文件，**内容内联在请求/响应里**——
     小文件很方便，但整份内容都要经过这条 JSON-RPC 连接；
-  - `copy_to_remote` / `copy_from_remote`：复用同一条 SFTP 连接在本地/远端之间复制文件或目录，
-    **字节不经过 MCP 请求本身**——大文件、整个目录应该用这两个，而不是 `write_file`/`read_file`。
+  - `copy_to_remote`：从运行 `ishell-mcp` 的**调用方机器**流式读取单个文件，经 iShell 已有的
+    SFTP 会话上传到远端；文件字节不经过 MCP JSON，也不进入模型上下文。适合跨主机同步大源码和
+    二进制文件，替代 `write_file`。当前目录同步请使用 git/rsync 或逐文件调用。
+  - `copy_from_remote`：复用同一条 SFTP 连接下载到 **iShell 宿主机**；跨主机回传到 MCP 调用方
+    的流式数据通道尚未提供，不能把调用方路径当作 iShell 宿主机路径。
 - **远程访问，自动完成**。开关打开后，iShell 每次连上一台服务器，都会顺便把本机的 MCP socket
   经这条已认证加密的 SSH 连接反向转发到**那台服务器**上的 `~/.ishell-mcp-<随机后缀>.sock`
   （每次连接的后缀都不同，重连时不会跟服务器还没判定为死亡的上一条连接抢同一个路径）——

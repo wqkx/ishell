@@ -70,7 +70,6 @@ pub enum AuthMethod {
 }
 
 /// UI -> Worker 指令。
-#[derive(Debug)]
 pub enum UiCommand {
     /// 终端键盘输入（已编码为字节流）
     TerminalInput(Vec<u8>),
@@ -94,6 +93,14 @@ pub enum UiCommand {
         /// Some 时按这个名字落地，不必和本地文件名一致（AI/MCP `copy_to_remote` 改名用）。
         remote_name: Option<String>,
         policy: ConflictPolicy,
+    },
+    /// AI/MCP 调用方机器提供的单文件上传。`source` 是 Unix socket 上的原始字节流，
+    /// 不会经过 JSON-RPC 或模型上下文；`size` 用于精确校验，防止截断流被误报成功。
+    UploadFromMcp {
+        id: u64,
+        source: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        size: u64,
+        remote_path: String,
     },
     /// 取消某个传输任务（进行中或排队中）
     CancelTransfer(u64),

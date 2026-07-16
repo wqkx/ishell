@@ -332,6 +332,15 @@ pub async fn run(
                             pending_xfer.push_back(p);
                         }
                     }
+                    Some(UiCommand::UploadFromMcp { id, source, size, remote_path }) => {
+                        let p = PendingXfer::UploadFromMcp { id, source, size, remote_path };
+                        if active_xfer < MAX_CONCURRENT_XFER {
+                            start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
+                            active_xfer += 1;
+                        } else {
+                            pending_xfer.push_back(p);
+                        }
+                    }
                     Some(UiCommand::CancelTransfer(id)) => {
                         if let Some(c) = xfer_cancels.get_mut(&id) {
                             // 进行中：置协作标志 + 触发 stop 信号（drop 传输 future，

@@ -212,6 +212,97 @@ pub(super) async fn upload(
     }
 }
 
+/// 将运行 MCP 代理的调用方机器提供的原始字节流写入远端单文件。
+///
+/// 这条路径故意不落地 iShell 宿主机：代理进程直接读取工作机文件，字节经受权限保护的
+/// MCP Unix socket（或其 SSH 反向转发）流入现有 SFTP 会话。`size` 是协议承诺值，EOF
+/// 过早或多余字节都会报错，避免网络中断时把截断内容当成成功文件。
+pub(super) async fn upload_from_mcp(
+    sftp: &russh_sftp::client::SftpSession,
+    id: u64,
+    mut source: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    size: u64,
+    remote_path: String,
+    sink: &UiSink,
+    cancel: Arc<AtomicBool>,
+) {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let name = remote_path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("file")
+        .to_string();
+    sink.send(WorkerEvent::TransferStart {
+        id,
+        name,
+        total: size,
+        dir: crate::proto::TransferDir::Upload,
+        local: None,
+    });
+
+    let result: anyhow::Result<()> = async {
+        let mut remote = sftp
+            .open_with_flags(
+                &remote_path,
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+            )
+            .await?;
+        let mut buffer = vec![0_u8; 128 * 1024];
+        let mut written = 0_u64;
+        let mut last_reported = 0_u64;
+        while written < size {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("canceled");
+            }
+            let wanted = (size - written).min(buffer.len() as u64) as usize;
+            let read = source.read(&mut buffer[..wanted]).await?;
+            if read == 0 {
+                anyhow::bail!("调用方文件流提前结束：期望 {size} 字节，实际收到 {written} 字节");
+            }
+            remote.write_all(&buffer[..read]).await?;
+            written += read as u64;
+            if written.saturating_sub(last_reported) >= 256 * 1024 || written == size {
+                last_reported = written;
+                sink.send(WorkerEvent::TransferProgress { id, done: written });
+            }
+        }
+        // 再读一个字节，拒绝声明大小之外的尾随数据，防止下一次协议复用时发生串流。
+        let mut trailing = [0_u8; 1];
+        if source.read(&mut trailing).await? != 0 {
+            anyhow::bail!("调用方文件流超过声明的 {size} 字节");
+        }
+        remote.flush().await?;
+        remote.shutdown().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => sink.send(WorkerEvent::TransferDone {
+            id,
+            ok: true,
+            message: format!("Uploaded {remote_path}"),
+            refresh_dir: Some(
+                remote_path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+                    .unwrap_or("/")
+                    .to_string(),
+            ),
+        }),
+        Err(error) => sink.send(WorkerEvent::TransferDone {
+            id,
+            ok: false,
+            message: format!("Upload failed: {error}"),
+            refresh_dir: None,
+        }),
+    }
+}
+
 /// 上传单个文件：以远端已有大小为起点续传；带进度节流上报。
 pub(super) async fn upload_file_once(
     sftp: &russh_sftp::client::SftpSession,
