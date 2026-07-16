@@ -94,6 +94,10 @@ glutin = { path = "vendor/glutin" }
 # vt100 0.16.2 在任何 DECSTBM 滚动区域启用时都丢弃被推出顶部的行；Codex 等
 # inline TUI 使用从第 1 行开始的滚动区域写入原生历史，因此需要保留这些行。
 vt100 = { path = "vendor/vt100" }
+# egui-winit 0.34.3 把「带文本但没带光标位置」的组字事件（X11/fcitx 在组字中按下 Shift
+# 等修饰键时就发这种）的文本整个丢掉、并当组字结束上报 Disabled，导致所有输入框里已输入
+# 的拼音被抹掉、再敲一个字才重新冒出来。补丁：文本非空即照常转发 Preedit。
+egui-winit = { path = "vendor/egui-winit" }
 
 [profile.release]
 opt-level = "s"   # 优化体积（GUI 仅事件驱动重绘，活跃渲染影响可忽略）
