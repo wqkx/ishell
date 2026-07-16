@@ -73,17 +73,10 @@ pub struct FilePanelState {
     pub server_key: String,
     /// 「返回上一个目录」历史栈（浏览器式后退）。
     pub nav_history: Vec<String>,
-    /// 「前进」历史栈：点「后退」时把离开的目录压进来，供「前进」按钮回到刚才后退前的位置；
-    /// 任何非前进/后退触发的新导航（面包屑、路径栏、收藏夹、文件树等）都会清空它——
-    /// 与浏览器前进/后退的语义一致（走了新路径就没法再"前进"回旁支）。
-    pub nav_forward: Vec<String>,
     /// 上一帧末的 cwd，用于检测目录切换并把旧目录压入历史。
     pub nav_prev: String,
     /// 本次切换由「后退」触发（不再压栈，避免来回循环）。
     pub nav_pending_back: bool,
-    /// 本次切换由「前进」触发（压回 nav_history 供后续还能再次后退，但不清空 nav_forward
-    /// 之外的处理与普通导航不同）。
-    pub nav_pending_forward: bool,
     /// 面包屑「幽灵」子路径：从当前 cwd 点到某父级后，仍以淡色显示的原完整路径。
     /// 仅当 `cwd` 仍是其前缀时保留；点淡色段可回到子目录；cwd 切到旁支则清空。
     /// 双击进入编辑时仍编辑 `cwd`，不受此字段影响。

@@ -28,7 +28,11 @@ pub(super) fn toolbar(
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // 导航组：后退 + 前进（尖括号样式，浏览器式；上级目录改由面包屑点击）。
+                // 工具栏按钮：后退 / 刷新 / 复制路径 / 收藏夹（收藏放最后）。按钮之间不加
+                // 分割线，保持一条扁平图标条。上传 / 删除 / 粘贴均不放工具栏：上传走拖拽或
+                // 空白处右键菜单，删除走右键菜单或 Delete 键，粘贴走空白处右键菜单「粘贴到
+                // 此目录」（保持工具栏精简）。上级目录改由面包屑点击。
+                // 后退（浏览器式后退，可连续返回）
                 let back_enabled = !state.nav_history.is_empty();
                 let back_col = if back_enabled {
                     Palette::TEXT
@@ -44,39 +48,12 @@ pub(super) fn toolbar(
                 {
                     if let Some(prev) = state.nav_history.pop() {
                         state.nav_pending_back = true;
-                        // 记下离开的目录，供「前进」按钮回到这里。
-                        state.nav_forward.push(state.cwd.clone());
                         state.cwd = prev;
                         state.selected.clear();
                     }
                 }
-                let fwd_enabled = !state.nav_forward.is_empty();
-                let fwd_col = if fwd_enabled {
-                    Palette::TEXT
-                } else {
-                    Palette::TEXT_DIM
-                };
-                if tool_btn_color(
-                    ui,
-                    icon::CARET_RIGHT,
-                    crate::i18n::tr("前进", "Forward"),
-                    fwd_col,
-                ) && fwd_enabled
-                {
-                    if let Some(next) = state.nav_forward.pop() {
-                        state.nav_pending_forward = true;
-                        state.cwd = next;
-                        state.selected.clear();
-                    }
-                }
 
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                // 功能组：刷新 + 收藏 + 复制路径。
-                // 上传 / 删除 / 粘贴均不放工具栏：上传走拖拽或空白处右键菜单，删除走右键菜单或 Delete 键，
-                // 粘贴走空白处右键菜单「粘贴到此目录」（保持工具栏精简）
+                // 刷新
                 if tool_btn(
                     ui,
                     icon::ARROW_CLOCKWISE,
@@ -86,15 +63,40 @@ pub(super) fn toolbar(
                     actions.push(FileAction::List(state.cwd.clone()));
                 }
 
-                // 收藏夹：弹出可滚动路径列表，点路径进入、右侧删除，点其它处关闭。
-                // 图标：当前目录已收藏=实心灰 ★，未收藏=空心 ☆；弹窗打开时按钮显示按下态（灰底）。
+                // 复制路径：点击后短暂显示绿色对勾，再恢复
+                let now = ui.input(|i| i.time);
+                let copied = state.copy_flash.is_some_and(|t| now - t < 1.1);
+                let (ci, ctip, ccol) = if copied {
+                    (
+                        icon::CHECK,
+                        crate::i18n::tr("已复制", "Copied"),
+                        Palette::OK,
+                    )
+                } else {
+                    (
+                        icon::COPY,
+                        crate::i18n::tr("复制当前路径", "Copy path"),
+                        Palette::TEXT,
+                    )
+                };
+                if tool_btn_color(ui, ci, ctip, ccol) && !state.cwd.is_empty() {
+                    actions.push(FileAction::CopyPath(state.cwd.clone()));
+                    state.copy_flash = Some(now);
+                }
+                if copied {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(150));
+                }
+
+                // 收藏夹（最后一个按钮）：弹出可滚动路径列表，点路径进入、右侧删除，点其它处关闭。
+                // 用 phosphor STAR 图标（与刷新/复制等同一字体，笔画粗细一致）——已收藏用暖色
+                // 实心感的强调色标识，未收藏用普通文字色；弹窗打开时按钮显示按下态（灰底）。
                 let cwd_fav =
                     !state.cwd.is_empty() && state.favorites.iter().any(|f| f == &state.cwd);
                 let pop_id = ui.make_persistent_id("fav_popup");
                 let pop_open = ui.memory(|m| m.is_popup_open(pop_id));
-                let star_glyph = if cwd_fav { "★" } else { "☆" };
                 let star_col = if cwd_fav {
-                    Palette::TEXT_DIM
+                    Palette::ACCENT
                 } else {
                     Palette::TEXT
                 };
@@ -110,7 +112,7 @@ pub(super) fn toolbar(
                         v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
                         v.widgets.active.bg_stroke = egui::Stroke::NONE;
                         ui.add(
-                            egui::Button::new(RichText::new(star_glyph).size(16.0).color(star_col))
+                            egui::Button::new(RichText::new(icon::STAR).size(16.0).color(star_col))
                                 .min_size(egui::vec2(30.0, 26.0))
                                 .corner_radius(6.0),
                         )
@@ -211,31 +213,6 @@ pub(super) fn toolbar(
                     state.cwd = p;
                     state.selected.clear();
                     ui.memory_mut(|m| m.close_popup(pop_id));
-                }
-
-                // 复制路径：点击后短暂显示绿色对勾，再恢复
-                let now = ui.input(|i| i.time);
-                let copied = state.copy_flash.is_some_and(|t| now - t < 1.1);
-                let (ci, ctip, ccol) = if copied {
-                    (
-                        icon::CHECK,
-                        crate::i18n::tr("已复制", "Copied"),
-                        Palette::OK,
-                    )
-                } else {
-                    (
-                        icon::COPY,
-                        crate::i18n::tr("复制当前路径", "Copy path"),
-                        Palette::TEXT,
-                    )
-                };
-                if tool_btn_color(ui, ci, ctip, ccol) && !state.cwd.is_empty() {
-                    actions.push(FileAction::CopyPath(state.cwd.clone()));
-                    state.copy_flash = Some(now);
-                }
-                if copied {
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(150));
                 }
 
                 ui.add_space(4.0);
