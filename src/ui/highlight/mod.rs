@@ -180,4 +180,25 @@ mod tests {
         assert!(msg.is_some());
         assert!(!ranges.is_empty());
     }
+
+    /// 回归：高亮器不能因「错误范围落在多字节字符中间」而 panic。
+    /// 真实崩溃场景：编辑器同一帧里先算 lint_ranges、再由 handle_input 粘贴改内容、
+    /// 最后用**旧** lint_ranges 绘制新内容——旧字节偏移落进汉字中间，token.rs 按该边界
+    /// 切片直接 panic，整个应用闪退（未保存改动全丢）。根因已在 view.rs 用「缓存重算
+    /// 移到 handle_input 之后」修掉；这里锁住高亮器自身的防御：边界不同步也只影响
+    /// 下划线范围，绝不 crash。
+    #[test]
+    fn highlight_segment_survives_error_range_inside_multibyte_char() {
+        // '维' 占 3 字节；构造一个 end 落在它中间的错误范围（真实 panic 里就是 bytes 25..28 的 27）
+        let line = "x = [1, 2 3] # 这是多维数组";
+        let mid = line.find('维').unwrap() + 1; // 汉字内部，非字符边界
+        assert!(!line.is_char_boundary(mid), "用例前提：该偏移确实在字符中间");
+        // 不 panic 即通过（此前会 `end byte index N is not a char boundary`）
+        let job = highlight_segment(line, 0..line.len(), "py", 12.0, &[0..mid], LineState::Normal);
+        assert!(!job.sections.is_empty());
+        // 窗口边界本身落在字符中间时同样不能崩
+        let job2 = highlight_segment(line, 0..mid, "py", 12.0, &[], LineState::Normal);
+        let _ = job2;
+    }
+
 }

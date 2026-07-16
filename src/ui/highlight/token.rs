@@ -327,9 +327,28 @@ pub fn highlight_segment(
     state: LineState,
 ) -> LayoutJob {
     let lang = lang_for(ext);
+    // 防御性字符边界吸附：下面要按 `win` 与 `errors` 的边界切 `line`，一旦哪个边界落在多字节
+    // 字符（中文等）中间，切片会 panic —— 而这里是 UI 绘制路径，panic 会让整个应用闪退、
+    // 连带丢掉编辑器里未保存的改动，代价远高于「下划线范围略有出入」。调用方本应传入与
+    // `line` 同步的字符边界，但那依赖「内容改动后缓存已重算」这类时序前提（曾因此崩过：
+    // 粘贴含中文的文本时，本帧绘制用的还是改动前算出的 lint_ranges，旧偏移落进了汉字中间）。
+    // 这里统一向后吸附到最近的字符边界：单调、保序，不会让 start 越过 end。
+    let snap = |i: usize| -> usize {
+        let mut i = i.min(line.len());
+        while i < line.len() && !line.is_char_boundary(i) {
+            i += 1;
+        }
+        i
+    };
+    let win = snap(win.start)..snap(win.end);
+    let errors: Vec<Range<usize>> = errors
+        .iter()
+        .map(|r| snap(win.start + r.start) - win.start..snap(win.start + r.end) - win.start)
+        .collect();
+    let errors = &errors[..];
     // 只分词到窗口右界即可：窗口之后的 token 在下方 `s.min(win.end)` 全被裁掉、纯属浪费。
     // 超长行（日志/JSON/minified）只在左侧可见时，此举把每帧整行分词降为「仅可见前缀」，
-    // 根治「拖到底部有超长行时卡顿一下」。win.end 已是字符边界（调用方 char_to_byte 得到）。
+    // 根治「拖到底部有超长行时卡顿一下」。
     let scan_end = win.end.min(line.len());
     let toks = tokenize_with_state(&line[..scan_end], &lang, state);
     let font = FontId::monospace(font_size);
