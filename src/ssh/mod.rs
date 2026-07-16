@@ -155,10 +155,12 @@ pub async fn run(
     // 连通性探测（不依赖远端装了 nc/socat），单纯用时间兜底崩溃/异常退出导致的遗留，避免
     // 无限堆积。
     let mcp_forward_path: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    if crate::store::load_mcp_consent() {
+    // 保留注册任务句柄：连接收尾时要先给它一个收尾窗口，否则「连接先结束、注册后完成」会
+    // 把已注册的 socket 遗留在远端（槽位被 take 时还是 None）。见 run() 末尾清理处。
+    let mcp_forward_task: Option<tokio::task::JoinHandle<()>> = if crate::store::load_mcp_consent() {
         let fwd_handle = handle.clone();
         let path_slot = mcp_forward_path.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let home = match exec_capture(&fwd_handle, "echo -n $HOME").await {
                 Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
                 _ => return, // 探测不到远端 HOME：放弃转发，不影响其余功能
@@ -182,8 +184,10 @@ pub async fn run(
                 Ok(()) => *path_slot.lock().unwrap() = Some(remote_path),
                 Err(e) => log::debug!("AI/MCP 反向转发注册失败：{e}"),
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // 3) 系统信息采集任务（独立 handle 克隆，互不阻塞）
     // 先探测 uname：非 Linux 或无 /proc 则禁用监控，避免空数据/误杀进程。
@@ -738,6 +742,13 @@ pub async fn run(
     // drop，`Disconnect` 分支只 `shell.eof()` + `break`，仍可以再开一条 exec 通道）——
     // 照抄 `TmpKeyGuard`（xfer/direct.rs）"连接末尾再清理一次"的既有模式；失败/连接已经
     // 物理断开都 `let _ =` 吞掉，不阻塞退出。
+    // 反向转发注册在独立任务里异步完成；若本次连接在它注册完成之前就结束，直接 take 槽位会
+    // 读到 None → 漏清理，随后任务才把 socket 注册上去，就永久遗留（只能靠下次连接时的 24h
+    // 兜底清理）。这里先给注册任务一个短暂收尾窗口（注册可能卡在 streamlocal_forward，故带
+    // 超时、不无限等），让它有机会把 remote_path 落进槽位，再 take 清理。
+    if let Some(task) = mcp_forward_task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    }
     let forward_cleanup = mcp_forward_path.lock().unwrap().take();
     if let Some(remote_path) = forward_cleanup {
         let _ = exec_status(&handle, &format!("rm -f {}", sh_quote(&remote_path))).await;

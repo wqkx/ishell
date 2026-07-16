@@ -244,10 +244,15 @@ pub(super) async fn upload_from_mcp(
         local: None,
     });
 
+    // 事务写：先把调用方字节流写进**临时文件**，全部校验通过后才原子换入最终路径。
+    // 直接以 TRUNCATE 打开最终路径的旧写法，一旦断线 / 超时 / 源文件变化中途失败，就会在远端
+    // 留下一个空/半截文件、破坏原有内容——事务写保证「失败即原文件分毫未动」。
+    let tmp = format!("{remote_path}.ishell-mcp-tmp-{}", super::rand_hex(6));
     let result: anyhow::Result<()> = async {
+        // 1) 写入临时文件（绝不触碰最终路径）
         let mut remote = sftp
             .open_with_flags(
-                &remote_path,
+                &tmp,
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
             )
             .await?;
@@ -277,9 +282,43 @@ pub(super) async fn upload_from_mcp(
         }
         remote.flush().await?;
         remote.shutdown().await?;
+        drop(remote);
+        // 2) 换入前校验 tmp 落盘字节数（个别服务器会静默截断；不符则中止，原文件未动）
+        let tmp_size = sftp
+            .metadata(&tmp)
+            .await
+            .ok()
+            .and_then(|m| m.size)
+            .unwrap_or(0);
+        if tmp_size != size {
+            anyhow::bail!("临时文件落盘校验失败：应为 {size} 字节，实际 {tmp_size} 字节");
+        }
+        // 3) 原子换入：SFTP rename 在目标已存在时可能失败（非 POSIX rename），故先把已存在的
+        //    原文件挪到 .bak，再换入 tmp，失败则从 .bak 还原——任一步失败原文件都不丢。
+        let bak = format!("{remote_path}.ishell-mcp-bak-{}", super::rand_hex(6));
+        let backed_up = match sftp.rename(&remote_path, &bak).await {
+            Ok(()) => true,
+            Err(e) if is_sftp_not_found(&e) => false, // 原文件不存在：全新写入，无需备份
+            Err(e) => anyhow::bail!("无法确认原文件状态（备份步骤失败，非「文件不存在」）：{e}"),
+        };
+        if let Err(e) = sftp.rename(&tmp, &remote_path).await {
+            // 换入失败：尽力从备份还原原文件
+            let restored = backed_up && sftp.rename(&bak, &remote_path).await.is_ok();
+            if backed_up && !restored {
+                anyhow::bail!("换入失败且未能还原，原文件备份在 {bak}：{e}");
+            }
+            anyhow::bail!("换入失败，原文件未改动：{e}"); // 新建：目标仍不存在；有备份：已还原
+        }
+        if backed_up {
+            let _ = sftp.remove_file(&bak).await; // 换入成功：删除备份
+        }
         Ok(())
     }
     .await;
+    if result.is_err() {
+        // 写入 / 校验失败：清理半截临时文件（换入成功后 tmp 已不存在，remove 失败无害）
+        let _ = sftp.remove_file(&tmp).await;
+    }
 
     match result {
         Ok(()) => sink.send(WorkerEvent::TransferDone {

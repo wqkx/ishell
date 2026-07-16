@@ -266,21 +266,43 @@ async fn copy_from_remote_to_caller(
             .await
             .map_err(|error| format!("无法创建调用方目标目录 {}: {error}", parent.display()))?;
     }
-    let mut dest = tokio::fs::File::create(&path)
-        .await
-        .map_err(|error| format!("无法创建调用方文件 {local_path}: {error}"))?;
-    // 精确拷贝声明的 size 字节：这条协议里响应头之后不再有分隔符/trailer，只能用长度
-    // 而不是 EOF 来判断"这个文件读完了"——`take(size)` 保证既不少读也不多读。
-    let mut limited = (&mut reader).take(size);
-    let copied = tokio::io::copy(&mut limited, &mut dest)
-        .await
-        .map_err(|error| format!("接收调用方文件流失败: {error}"))?;
-    if copied != size {
-        return Err(format!(
-            "下载数据不完整：期望 {size} 字节，实际收到 {copied} 字节（iShell 一侧可能中途出错）"
-        ));
+    // 事务写：先写同目录临时文件，字节数校验通过后再原子改名换入。下载中断 / 不完整
+    // 绝不能破坏调用方已有的同名原文件——直接 File::create(local_path) 的旧写法会先把原文件
+    // 截断为 0，随后下载失败就只剩一个空/半截文件。改名在同一文件系统内原子，临时文件与目标
+    // 同目录保证这一点。
+    let tmp_path = std::path::PathBuf::from(format!(
+        "{local_path}.ishell-part-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let outcome: Result<(), String> = async {
+        let mut dest = tokio::fs::File::create(&tmp_path)
+            .await
+            .map_err(|error| format!("无法创建临时下载文件 {}: {error}", tmp_path.display()))?;
+        // 精确拷贝声明的 size 字节：这条协议里响应头之后不再有分隔符/trailer，只能用长度
+        // 而不是 EOF 来判断"这个文件读完了"——`take(size)` 保证既不少读也不多读。
+        let mut limited = (&mut reader).take(size);
+        let copied = tokio::io::copy(&mut limited, &mut dest)
+            .await
+            .map_err(|error| format!("接收调用方文件流失败: {error}"))?;
+        if copied != size {
+            return Err(format!(
+                "下载数据不完整：期望 {size} 字节，实际收到 {copied} 字节（iShell 一侧可能中途出错）"
+            ));
+        }
+        dest.flush().await.map_err(|error| format!("落盘调用方文件失败: {error}"))?;
+        let _ = dest.sync_all().await; // 尽力 fsync，换入前确保字节真正落盘
+        drop(dest);
+        // 原子换入：同目录改名，替换调用方已有的同名文件（Unix rename 原子且直接覆盖）
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .map_err(|error| format!("换入下载文件失败 {local_path}: {error}"))
     }
-    dest.flush().await.map_err(|error| format!("落盘调用方文件失败: {error}"))?;
+    .await;
+    if let Err(e) = outcome {
+        let _ = tokio::fs::remove_file(&tmp_path).await; // 失败：清理临时文件，原文件未动
+        return Err(e);
+    }
     Ok(McpReqResult::Copied { path: local_path })
 }
 
