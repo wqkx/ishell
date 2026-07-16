@@ -18,7 +18,8 @@ use super::auth::{open_sftp, ClientHandler};
 use super::UiSink;
 
 use direct::direct_transfer;
-use download::download;
+pub(crate) use direct::{direct_relay_copy, trust_temp_key, untrust_temp_key};
+use download::{download, download_to_mcp, relay_read_file};
 use upload::{upload, upload_from_mcp};
 
 /// 同一会话同时进行的最大传输数（不同会话各自独立）。
@@ -45,6 +46,26 @@ pub(super) enum PendingXfer {
         size: u64,
         remote_path: String,
     },
+    /// AI/MCP `copy_from_remote` 的对称方向：把远端单文件流式回传给调用方机器，不落地
+    /// iShell 宿主机磁盘（`UploadFromMcp` 的反向）。
+    DownloadToMcp {
+        id: u64,
+        remote_path: String,
+        download_sink: tokio::sync::oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>,
+    },
+    /// 跨会话拷贝-中转模式（源会话侧）：读远端单文件灌进内存管道。
+    RelayReadFile {
+        id: u64,
+        remote_path: String,
+        writer: tokio::io::DuplexStream,
+    },
+    /// 跨会话拷贝-中转模式（目标会话侧）：管道字节写入远端单文件（复用 `upload_from_mcp`）。
+    RelayWriteFile {
+        id: u64,
+        remote_path: String,
+        size: u64,
+        reader: tokio::io::DuplexStream,
+    },
     /// 跨主机直传：在本（源）主机上 rsync/scp 直推到目标主机
     Direct(Box<crate::proto::DirectSpec>),
 }
@@ -54,7 +75,10 @@ impl PendingXfer {
         match self {
             PendingXfer::Download { id, .. }
             | PendingXfer::Upload { id, .. }
-            | PendingXfer::UploadFromMcp { id, .. } => *id,
+            | PendingXfer::UploadFromMcp { id, .. }
+            | PendingXfer::DownloadToMcp { id, .. }
+            | PendingXfer::RelayReadFile { id, .. }
+            | PendingXfer::RelayWriteFile { id, .. } => *id,
             PendingXfer::Direct(d) => d.id,
         }
     }
@@ -135,6 +159,28 @@ pub(super) fn start_xfer(
                         } => {
                             upload_from_mcp(
                                 sftp.as_ref(), id, source, size, remote_path, &s, cancel_work,
+                            )
+                            .await
+                        }
+                        PendingXfer::DownloadToMcp {
+                            id,
+                            remote_path,
+                            download_sink,
+                        } => {
+                            download_to_mcp(sftp, id, remote_path, download_sink, &s, cancel_work).await
+                        }
+                        PendingXfer::RelayReadFile { id, remote_path, writer } => {
+                            relay_read_file(sftp, id, remote_path, writer, &s, cancel_work).await
+                        }
+                        PendingXfer::RelayWriteFile { id, remote_path, size, reader } => {
+                            upload_from_mcp(
+                                sftp.as_ref(),
+                                id,
+                                Box::new(reader),
+                                size,
+                                remote_path,
+                                &s,
+                                cancel_work,
                             )
                             .await
                         }

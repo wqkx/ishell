@@ -234,6 +234,80 @@ pub(super) struct PendingAiFileOp {
     deadline: Instant,
 }
 
+/// `copy_between_sessions` 的多阶段状态：优先尝试直连（生成一次性密钥对，临时信任源→目标，
+/// 直连 scp/rsync，无论成败都撤销信任），失败或超时再退化为中转（App 进程内存 duplex，
+/// 源读→目标写）。这个操作要同时驱动两个会话各自的 worker，单个会话的 `pending_file_op`
+/// 忙碌位不足以描述这个多阶段状态，所以单独用 `CrossCopyJob` 跟踪；两侧的 `pending_file_op`
+/// 从一开始就各自占位（复用忙碌保护 + 断线清理），但 `resp_tx` 都是 `None`——真正的响应
+/// 通道在这里的 `resp_tx` 字段上，跟问题 1 里 `CopyFromRemoteToCaller` 的处理方式是同一个
+/// 思路。阶段流转：`TrustingB` → `DirectCopying` →（无论成败）`UntrustingAfterDirect` →
+/// 直连成功则在这里直接 resolve；直连失败则转入 `RelayReading` → `RelayWriting`。
+enum CrossCopyPhase {
+    /// 已发 `TrustTempKey` 给目标会话，等 `TempKeyTrusted`。
+    TrustingB,
+    /// 已发 `DirectRelayCopy` 给源会话。`started=false` 时仍受 `phase_deadline`（较短的
+    /// "建连+开始传输"超时）约束；一旦收到 `DirectRelayStarted` 就说明数据已经在传，
+    /// 之后只受整个操作的总超时（`deadline`）约束，不再被这个短超时误杀。
+    DirectCopying { started: bool },
+    /// 已发 `UntrustTempKey` 给目标会话，等 `TempKeyUntrusted`（或 `phase_deadline` 到了
+    /// 直接放弃等待）——这一步只是清理，`direct_result` 已经确定了最终走向。
+    UntrustingAfterDirect,
+    /// 已发 `RelayReadFile` 给源会话，等 `RelaySourceResult`。
+    RelayReading,
+    /// 已发 `RelayWriteFile` 给目标会话，等它的 `TransferDone`（经 `pending.copy_done`）。
+    RelayWriting,
+}
+
+pub(super) struct CrossCopyJob {
+    op_id: u64,
+    req_id: u64,
+    resp_tx: Option<oneshot::Sender<McpResponse>>,
+    src_uid: u64,
+    dest_uid: u64,
+    src_remote_path: String,
+    dest_remote_path: String,
+    /// 中转模式要用的内存管道两端：直连尝试期间两个都还没发出去，直连失败时才真正派上
+    /// 用场（写端发给源会话、读端在拿到 size 后发给目标会话）。直连成功则始终用不上，
+    /// job 结束时随 `CrossCopyJob` 一起被丢弃。
+    pipe_writer: Option<tokio::io::DuplexStream>,
+    pipe_reader: Option<tokio::io::DuplexStream>,
+    /// 这次直连尝试的一次性标记（authorized_keys 注释 + 撤销时的精确匹配 key）。
+    marker: String,
+    /// 目标主机的 authorized_keys 是否已经真的写入过这次的临时公钥（`TempKeyTrusted{ok:true}`
+    /// 到达后置位）。之后任何提前退出/超时路径只要看到这个标志为真，都必须补发一次
+    /// `UntrustTempKey`，否则会永久残留一把免密公钥——不能像"从没建立过信任"的早期失败
+    /// 那样直接跳过撤销。
+    trust_established: bool,
+    /// 一次性私钥的 OpenSSH PEM 字节：只在 `TrustingB` 成功、真正发起直连尝试时取用一次
+    /// （`take_priv_key_pem`），用完随 `UiCommand::DirectRelayCopy` 一起移动给源会话 worker，
+    /// 不在 App 状态里滞留超过一次尝试所需的时间。
+    priv_key_pem: Option<Vec<u8>>,
+    /// 直连尝试的取消标志：`phase_deadline` 到了但还没收到 `DirectRelayStarted` 时置位，
+    /// 源会话侧的 `exec_direct_progress` 循环会尽快感知并退出，不会真的无限空等。
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// `DirectCopying` 收尾后暂存的直连结果，供 `UntrustingAfterDirect` 阶段结束时决定
+    /// 是直接 resolve 成功，还是转入中转。
+    direct_result: Option<Result<(), String>>,
+    phase: CrossCopyPhase,
+    /// 整个操作（含可能的中转）的总超时点，来自调用方 `timeout_ms`。
+    deadline: Instant,
+    /// 仅在 `DirectCopying{started:false}` / `UntrustingAfterDirect` 阶段生效的短超时点；
+    /// 其余阶段不受它约束。
+    phase_deadline: Instant,
+}
+
+impl CrossCopyJob {
+    fn take_priv_key_pem(&mut self) -> Option<Vec<u8>> {
+        self.priv_key_pem.take()
+    }
+}
+
+/// 直连尝试的短超时：只约束"发起到源会话真正建立连接、开始传输数据"这一段，一旦收到
+/// `DirectRelayStarted` 就不再受它约束（大文件直连不会被误杀）。
+const DIRECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+/// 撤销临时信任的等待上限：只是清理步骤，不需要等太久，超过就直接放弃等待、继续收尾。
+const UNTRUST_WAIT: Duration = Duration::from_secs(10);
+
 /// 把 `SavedConnection` 的 `auth_kind` 字符串 + 相应字段还原成 `AuthMethod`（跟
 /// `ui/connect/form.rs::build()` 里对同一套字段的映射保持一致）。
 fn auth_method(kind: &str, password: &str, key_path: &str, passphrase: &str) -> AuthMethod {
@@ -279,6 +353,11 @@ pub(super) struct McpCall {
     /// 仅内部 `CopyToRemoteFromCaller` 携带。读取端属于本条 socket，交给 SSH worker
     /// 消费；常规 JSON 请求保持一问一答，不带任何额外数据。
     upload_source: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    /// 仅内部 `CopyFromRemoteToCaller` 携带：worker 探测远端路径后，通过它把「文件大小 +
+    /// 内存管道读端」（成功）或错误信息（目录/远端不可访问）直接回给 `handle_conn`——
+    /// 这条通道自带成功/失败两种结果，`resp_tx` 对这个操作只在"App 层校验就失败"（会话
+    /// 不存在、路径非法等，根本没到 worker）时才会被用到，两者互斥、不会竞争。
+    download_sink: Option<oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>>,
 }
 
 /// 某会话上一次正在等待的 AI 命令运行（`run_command` 武装，`poll_run` 续等）。
@@ -393,6 +472,64 @@ fn cap_output_for_ai(output: String) -> String {
         start += 1;
     }
     format!("[输出过长，已截断保留末尾部分]\n{}", &output[start..])
+}
+
+/// 4 字节随机后缀（十六进制），拼进跨会话拷贝的一次性 marker——`op_id`（纳秒时间戳）本身
+/// 已经足够不重复，这里只是防止极端情况下同一纳秒内发起多次调用导致 marker 撞车。
+fn rand_marker_suffix() -> String {
+    let mut b = [0_u8; 4];
+    if getrandom::getrandom(&mut b).is_err() {
+        // 极罕见回退：不追求密码学随机性，只要求不同并发调用之间大概率不撞车即可。
+        let seed = (std::process::id() as u64) ^ (&b as *const _ as u64);
+        b.copy_from_slice(&seed.to_le_bytes()[..4]);
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// `ssh_key::PrivateKey::random` 需要一个实现 `rand_core::CryptoRng` 的生成器；
+/// `rand_core`（经 `ssh_key::rand_core` 重导出，保证跟 `ssh_key` 内部用的是同一份类型，
+/// 不会有版本不匹配问题）0.10 把 `Rng`/`CryptoRng` 都设计成基于 `TryRng`/`TryCryptoRng`
+/// 的 blanket impl（`Error = Infallible` 时自动获得），所以只需要实现 `TryRng`——
+/// 直接用项目已经在依赖的 `getrandom` crate 取系统随机源（跟 `ssh/xfer/mod.rs::rand_hex`
+/// 同一个随机源）。系统随机源在正常运行的操作系统上不会失败，一旦失败说明环境本身已经
+/// 严重异常，这里选择 panic 而不是静默退化为弱随机——密钥材料的随机性不能打折扣。
+struct SysRandom;
+
+impl russh::keys::ssh_key::rand_core::TryRng for SysRandom {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut buf = [0_u8; 4];
+        getrandom::getrandom(&mut buf).expect("系统随机数源不可用");
+        Ok(u32::from_le_bytes(buf))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut buf = [0_u8; 8];
+        getrandom::getrandom(&mut buf).expect("系统随机数源不可用");
+        Ok(u64::from_le_bytes(buf))
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        getrandom::getrandom(dst).expect("系统随机数源不可用");
+        Ok(())
+    }
+}
+impl russh::keys::ssh_key::rand_core::TryCryptoRng for SysRandom {}
+
+/// 生成跨会话拷贝-直连尝试用的一次性 ed25519 密钥对：返回（OpenSSH 格式私钥字节，待追加
+/// 进目标主机 authorized_keys 的公钥行）。公钥行带 `restrict`（OpenSSH 7.2+ 组合开关：
+/// 禁端口/agent/X11 转发 + 禁 PTY/login shell），把这把临时密钥的能力收紧到只能用于文件
+/// 传输；`marker` 写进公钥注释，供撤销时精确匹配、也方便万一撤销失败后人工识别清理。
+fn generate_temp_keypair(marker: &str) -> Result<(Vec<u8>, String), String> {
+    use russh::keys::ssh_key;
+    let mut rng = SysRandom;
+    let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519).map_err(|e| e.to_string())?;
+    key.set_comment(marker.to_string());
+    let priv_pem = key
+        .to_openssh(ssh_key::LineEnding::LF)
+        .map_err(|e| e.to_string())?
+        .as_bytes()
+        .to_vec();
+    let pub_line = key.public_key().to_openssh().map_err(|e| e.to_string())?;
+    Ok((priv_pem, format!("restrict {pub_line}")))
 }
 
 /// AI 调 `open_session` 时，若这条已保存连接本次运行期间还没被用户批准过，需要弹窗让用户
@@ -534,7 +671,7 @@ async fn handle_conn(
         // 连同缓冲区一起转给 worker，才能保证二进制流不丢首块。
         let upload_source = Some(Box::new(lines.into_inner()) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
         let (resp_tx, resp_rx) = oneshot::channel();
-        if tx.send(McpCall { req, resp_tx, upload_source }).is_err() {
+        if tx.send(McpCall { req, resp_tx, upload_source, download_sink: None }).is_err() {
             return;
         }
         ctx.request_repaint();
@@ -548,8 +685,62 @@ async fn handle_conn(
         }
         return;
     }
+    // `CopyFromRemoteToCaller`：对称方向，GUI 把字节流回代理进程本地落盘。响应形状和其他
+    // 请求不一样（成功时先写一行 header JSON 再紧跟原始字节，没有第二行 JSON），所以单独
+    // 处理，不复用下面的通用一问一答路径。
+    let is_caller_download = matches!(&req.kind, McpReqKind::CopyFromRemoteToCaller { .. });
+    if is_caller_download {
+        let McpReqKind::CopyFromRemoteToCaller { ref remote_path, .. } = req.kind else {
+            unreachable!()
+        };
+        let stream_path = remote_path.clone();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let (dl_tx, dl_rx) = oneshot::channel::<Result<crate::proto::DownloadStreamSource, String>>();
+        if tx
+            .send(McpCall { req, resp_tx, upload_source: None, download_sink: Some(dl_tx) })
+            .is_err()
+        {
+            return;
+        }
+        ctx.request_repaint();
+        // dl_rx 是这个操作的权威结果通道（worker 探测远端路径后精确回 Ok(流)/Err(消息)）；
+        // 它被 drop 且未发送，只会发生在 App 层校验就直接失败（会话不存在/路径非法等，
+        // 请求根本没送到 worker）——这种情况下真正的错误信息在 resp_rx 里，回落读它。
+        let outcome: Result<crate::proto::DownloadStreamSource, String> = match dl_rx.await {
+            Ok(o) => o,
+            Err(_) => match resp_rx.await {
+                Ok(McpResponse { result: Err(msg), .. }) => Err(msg),
+                Ok(McpResponse { result: Ok(_), .. }) => Err("iShell 返回了意料之外的响应".into()),
+                Err(_) => Err("iShell 未能处理该请求（可能已关闭）".into()),
+            },
+        };
+        match outcome {
+            Ok(source) => {
+                let header = McpResponse {
+                    id,
+                    result: Ok(McpReqResult::CopyStreamHeader { path: stream_path, size: source.size }),
+                };
+                if let Ok(mut json) = serde_json::to_string(&header) {
+                    json.push('\n');
+                    if w.write_all(json.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                let mut reader = source.reader;
+                let _ = tokio::io::copy(&mut reader, &mut w).await;
+            }
+            Err(msg) => {
+                let resp = McpResponse { id, result: Err(msg) };
+                if let Ok(mut json) = serde_json::to_string(&resp) {
+                    json.push('\n');
+                    let _ = w.write_all(json.as_bytes()).await;
+                }
+            }
+        }
+        return;
+    }
     let (resp_tx, mut resp_rx) = oneshot::channel();
-    if tx.send(McpCall { req, resp_tx, upload_source: None }).is_err() {
+    if tx.send(McpCall { req, resp_tx, upload_source: None, download_sink: None }).is_err() {
         return;
     }
     ctx.request_repaint(); // 唤醒 UI 线程尽快排空这条请求
@@ -679,6 +870,322 @@ impl App {
         }
     }
 
+    /// 推进 `copy_between_sessions` 作业：必须在每帧 `for s in &mut self.sessions
+    /// { s.drain_events(); .. }` 之后调用（原因同 `check_file_op_timeouts`）——
+    /// 所有传入的事件都是那个循环里从各会话 `pending` 里收集来的。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn advance_cross_copy_jobs(
+        &mut self,
+        temp_key_trusted: Vec<(u64, bool, String)>,
+        temp_key_untrusted: Vec<u64>,
+        direct_relay_started: Vec<u64>,
+        direct_relay_done: Vec<(u64, bool, String)>,
+        relay_source: Vec<(u64, Result<u64, String>)>,
+        copy_done: Vec<(u64, u64, bool, String)>,
+    ) {
+        for (op_id, ok, message) in temp_key_trusted {
+            let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
+                continue;
+            };
+            if !matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::TrustingB) {
+                continue;
+            }
+            if !ok {
+                // 建立临时信任本身就失败：不需要撤销（从没成功过），直接转中转。
+                log::debug!("copy_between_sessions 建立临时信任失败：{message}");
+                self.start_relay_fallback(idx);
+                continue;
+            }
+            // 从这一刻起，目标主机 authorized_keys 里真的多了一行临时公钥——之后任何
+            // 提前退出的路径都必须补发一次撤销，不能再直接调用 start_relay_fallback。
+            self.cross_copy_jobs[idx].trust_established = true;
+            self.start_direct_attempt(idx);
+        }
+        for op_id in direct_relay_started {
+            let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
+                continue;
+            };
+            if let CrossCopyPhase::DirectCopying { started } = &mut self.cross_copy_jobs[idx].phase {
+                *started = true;
+            }
+        }
+        for (op_id, ok, message) in direct_relay_done {
+            let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
+                continue;
+            };
+            if !matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::DirectCopying { .. }) {
+                continue; // 迟到事件（比如已经因超时转过一次中转）：直接忽略
+            }
+            self.finish_direct_attempt(idx, if ok { Ok(()) } else { Err(message) });
+        }
+        for op_id in temp_key_untrusted {
+            let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
+                continue;
+            };
+            if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
+                self.finish_after_untrust(idx);
+            }
+        }
+        for (op_id, result) in relay_source {
+            let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
+                continue;
+            };
+            if !matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::RelayReading) {
+                continue;
+            }
+            match result {
+                Ok(size) => {
+                    let dest_uid = self.cross_copy_jobs[idx].dest_uid;
+                    let dest_path = self.cross_copy_jobs[idx].dest_remote_path.clone();
+                    let Some(pipe_reader) = self.cross_copy_jobs[idx].pipe_reader.take() else {
+                        self.fail_cross_copy_job(idx, "内部错误：中转管道读端已丢失".into());
+                        continue;
+                    };
+                    let Some(dest_idx) = self.session_idx_by_uid(dest_uid) else {
+                        self.fail_cross_copy_job(idx, "目标会话已不存在".into());
+                        continue;
+                    };
+                    if !self.sessions[dest_idx].connected {
+                        self.fail_cross_copy_job(idx, "目标会话已断线".into());
+                        continue;
+                    }
+                    let sent = self.sessions[dest_idx]
+                        .cmd_tx
+                        .send(UiCommand::RelayWriteFile { id: op_id, remote_path: dest_path, size, reader: pipe_reader })
+                        .is_ok();
+                    if !sent {
+                        self.fail_cross_copy_job(idx, "目标会话的后台连接似乎已经断开".into());
+                        continue;
+                    }
+                    // 目标会话的 pending_file_op 从一开始（CopyBetweenSessions 请求刚到达时）
+                    // 就已经占位，这里不需要重新设置。
+                    self.cross_copy_jobs[idx].phase = CrossCopyPhase::RelayWriting;
+                }
+                Err(msg) => self.fail_cross_copy_job(idx, msg),
+            }
+        }
+        for (uid, op_id, ok, message) in copy_done {
+            let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
+                continue;
+            };
+            let job = &self.cross_copy_jobs[idx];
+            // 只有目标会话（写侧）的完成事件才代表整个跨会话拷贝结束；源会话自己的
+            // TransferDone 只影响它自己的 `pending_file_op`/Transfers 记账（已经由
+            // `try_resolve_file_copy`/`self.transfers` 独立处理），跟这里无关——即使源侧
+            // 中途失败，目标侧的管道读取也会随之出错并同样报 `ok:false`，由那次事件收尾。
+            if uid != job.dest_uid || !matches!(job.phase, CrossCopyPhase::RelayWriting) {
+                continue;
+            }
+            if ok {
+                self.resolve_cross_copy_job(idx, Ok(()), "relay");
+            } else {
+                self.resolve_cross_copy_job_err(idx, message);
+            }
+        }
+        // 阶段级短超时：直连尝试迟迟没开始传输数据 → 主动放弃直连转中转；
+        // 撤销临时信任迟迟没回执 → 不再等，直接按已确定的直连结果收尾。
+        // 倒序处理，避免 Vec::remove 导致的下标错位（resolve/fail 会整条移除 job）。
+        let now = Instant::now();
+        for idx in (0..self.cross_copy_jobs.len()).rev() {
+            let job = &self.cross_copy_jobs[idx];
+            if now >= job.deadline {
+                // 总超时必须按阶段处理，不能无条件直接判失败：
+                // - 已经在 UntrustingAfterDirect：direct_result 早就确定了（可能是成功！），
+                //   这里只是撤销回执迟迟不来——直接按已知结果收尾，而不是把"其实已经
+                //   成功"误报成超时失败。
+                // - 其余阶段但 trust_established 为真：目标主机上确实还留着一把临时公钥，
+                //   必须补发一次撤销（不等待结果，job 马上就要整体移除），否则会永久残留。
+                if matches!(job.phase, CrossCopyPhase::UntrustingAfterDirect) {
+                    self.finish_after_untrust(idx);
+                } else {
+                    if job.trust_established {
+                        let marker = job.marker.clone();
+                        let op_id = job.op_id;
+                        let dest_uid = job.dest_uid;
+                        if let Some(dest_idx) = self.session_idx_by_uid(dest_uid) {
+                            let _ = self.sessions[dest_idx]
+                                .cmd_tx
+                                .send(UiCommand::UntrustTempKey { op_id, marker });
+                        }
+                    }
+                    self.fail_cross_copy_job(idx, "跨会话拷贝超时（源或目标 worker 未在超时前返回结果）".into());
+                }
+                continue;
+            }
+            match job.phase {
+                CrossCopyPhase::DirectCopying { started: false } if now >= job.phase_deadline => {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.finish_direct_attempt(idx, Err("直连尝试超时（20s 内未建立连接），已转中转".into()));
+                }
+                CrossCopyPhase::UntrustingAfterDirect if now >= job.phase_deadline => {
+                    self.finish_after_untrust(idx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `TrustingB` 成功后：向源会话下发直连尝试。这个函数被调用时 `trust_established`
+    /// 已经是 true（目标主机上真的多了一行临时公钥），所以下面每一条提前退出都必须走
+    /// `untrust_then_relay_fallback`（补发撤销）而不是 `start_relay_fallback`（那个函数
+    /// 的语义是"信任从没建立过，不需要撤销"，用在这里会导致公钥永久残留）。
+    fn start_direct_attempt(&mut self, idx: usize) {
+        let job = &self.cross_copy_jobs[idx];
+        let op_id = job.op_id;
+        let src_uid = job.src_uid;
+        let dest_uid = job.dest_uid;
+        let src_path = job.src_remote_path.clone();
+        let dest_path = job.dest_remote_path.clone();
+        let cancel = job.cancel.clone();
+        let Some(src_idx) = self.session_idx_by_uid(src_uid) else {
+            self.untrust_then_relay_fallback(idx);
+            return;
+        };
+        let Some(dest_idx) = self.session_idx_by_uid(dest_uid) else {
+            self.untrust_then_relay_fallback(idx);
+            return;
+        };
+        if !self.sessions[src_idx].connected {
+            self.untrust_then_relay_fallback(idx);
+            return;
+        }
+        let (dest_host, dest_port, dest_user) = {
+            let d = &self.sessions[dest_idx];
+            (d.cfg.host.clone(), d.cfg.port, d.cfg.username.clone())
+        };
+        // 私钥字节仅在这一次尝试里短暂持有：CrossCopyJob 本身不保存密钥材料，用完即随
+        // UiCommand 一起移动走，不在 App 状态里长期滞留敏感数据。
+        let Some(priv_key_pem) = self.cross_copy_jobs[idx].take_priv_key_pem() else {
+            self.untrust_then_relay_fallback(idx);
+            return;
+        };
+        let sent = self.sessions[src_idx]
+            .cmd_tx
+            .send(UiCommand::DirectRelayCopy {
+                op_id,
+                src_path,
+                dest_user,
+                dest_host,
+                dest_port,
+                dest_path,
+                priv_key_pem,
+                cancel,
+            })
+            .is_ok();
+        if !sent {
+            self.untrust_then_relay_fallback(idx);
+            return;
+        }
+        self.cross_copy_jobs[idx].phase = CrossCopyPhase::DirectCopying { started: false };
+        self.cross_copy_jobs[idx].phase_deadline = Instant::now() + DIRECT_ATTEMPT_TIMEOUT;
+    }
+
+    /// `TrustingB` 已经成功、但源会话侧未能真正发起直连尝试（断线/不存在/发送失败等）：
+    /// 目标主机上确实已经写入了临时公钥，必须补发一次撤销（不等待结果——job 马上就要
+    /// 转中转继续跑，没必要为清理这一步阻塞主流程），再走中转 fallback。
+    fn untrust_then_relay_fallback(&mut self, idx: usize) {
+        let job = &self.cross_copy_jobs[idx];
+        let marker = job.marker.clone();
+        let op_id = job.op_id;
+        let dest_uid = job.dest_uid;
+        if let Some(dest_idx) = self.session_idx_by_uid(dest_uid) {
+            let _ = self.sessions[dest_idx]
+                .cmd_tx
+                .send(UiCommand::UntrustTempKey { op_id, marker });
+        }
+        self.start_relay_fallback(idx);
+    }
+
+    /// 直连信任建立失败（或没能发出尝试请求）：跳过撤销步骤（从没建立过信任），直接转中转。
+    fn start_relay_fallback(&mut self, idx: usize) {
+        let Some(pipe_writer) = self.cross_copy_jobs[idx].pipe_writer.take() else {
+            self.fail_cross_copy_job(idx, "内部错误：中转管道写端已丢失".into());
+            return;
+        };
+        let job = &self.cross_copy_jobs[idx];
+        let op_id = job.op_id;
+        let src_uid = job.src_uid;
+        let src_path = job.src_remote_path.clone();
+        let Some(src_idx) = self.session_idx_by_uid(src_uid) else {
+            self.fail_cross_copy_job(idx, "源会话已不存在".into());
+            return;
+        };
+        let sent = self.sessions[src_idx]
+            .cmd_tx
+            .send(UiCommand::RelayReadFile { id: op_id, remote_path: src_path, writer: pipe_writer })
+            .is_ok();
+        if !sent {
+            self.fail_cross_copy_job(idx, "源会话的后台连接似乎已经断开".into());
+            return;
+        }
+        self.cross_copy_jobs[idx].phase = CrossCopyPhase::RelayReading;
+    }
+
+    /// 直连尝试结束（无论真正完成还是被判定超时）：无条件进入撤销临时信任阶段——
+    /// 这一步用状态机的固定跳转保证"不管成不成功都会清理"，不依赖某个分支手动调用。
+    fn finish_direct_attempt(&mut self, idx: usize, result: Result<(), String>) {
+        let job = &mut self.cross_copy_jobs[idx];
+        job.direct_result = Some(result);
+        job.phase = CrossCopyPhase::UntrustingAfterDirect;
+        job.phase_deadline = Instant::now() + UNTRUST_WAIT;
+        let marker = job.marker.clone();
+        let op_id = job.op_id;
+        let dest_uid = job.dest_uid;
+        if let Some(dest_idx) = self.session_idx_by_uid(dest_uid) {
+            let _ = self.sessions[dest_idx]
+                .cmd_tx
+                .send(UiCommand::UntrustTempKey { op_id, marker });
+        }
+        // 发送失败或目标会话已经不存在都不额外处理：UNTRUST_WAIT 到了会自然收尾。
+    }
+
+    /// 撤销信任已完成（或等不到回执，超时放弃）：按之前确定的直连结果决定收尾——
+    /// 成功则直接 resolve；失败则转入中转（这次真正把管道发给源/目标会话）。
+    fn finish_after_untrust(&mut self, idx: usize) {
+        match self.cross_copy_jobs[idx].direct_result.take() {
+            Some(Ok(())) => self.resolve_cross_copy_job(idx, Ok(()), "direct"),
+            Some(Err(_)) => self.start_relay_fallback(idx),
+            None => {} // 不应该发生：还没收到 direct_result 就走到了这一步
+        }
+    }
+
+    fn fail_cross_copy_job(&mut self, idx: usize, message: String) {
+        self.resolve_cross_copy_job_err(idx, message);
+    }
+
+    fn resolve_cross_copy_job_err(&mut self, idx: usize, message: String) {
+        self.resolve_cross_copy_job(idx, Err(message), "");
+    }
+
+    fn resolve_cross_copy_job(&mut self, idx: usize, result: Result<(), String>, method: &str) {
+        let job = self.cross_copy_jobs.remove(idx);
+        // 保险起见清一次两侧的 pending_file_op：正常路径下 TransferDone 已经通过
+        // try_resolve_file_copy 自然清空了；这里只处理"某一侧因为提前失败/超时而从没走到
+        // 那一步"的情况，避免 busy-guard 永久占位。
+        for uid in [job.src_uid, job.dest_uid] {
+            if let Some(sidx) = self.session_idx_by_uid(uid) {
+                let s = &mut self.sessions[sidx];
+                if matches!(&s.pending_file_op, Some(op) if matches!(op.kind, FileOpKind::Copy { op_id } if op_id == job.op_id))
+                {
+                    s.pending_file_op = None;
+                }
+            }
+        }
+        if let Some(tx) = job.resp_tx {
+            let resp = match result {
+                Ok(()) => McpResponse {
+                    id: job.req_id,
+                    result: Ok(McpReqResult::CopiedBetweenSessions {
+                        path: job.dest_remote_path,
+                        method: method.to_string(),
+                    }),
+                },
+                Err(msg) => McpResponse { id: job.req_id, result: Err(msg) },
+            };
+            let _ = tx.send(resp);
+        }
+    }
+
     /// 真正建立会话：`open_session` 直接批准，或用户在确认弹窗里点了「允许」之后调用。
     fn do_open_session(&mut self, c: &SavedConnection, id: u64, resp_tx: oneshot::Sender<McpResponse>) {
         let cfg = connect_config_from_saved(c);
@@ -744,7 +1251,7 @@ impl App {
     }
 
     fn handle_mcp_call(&mut self, call: McpCall) {
-        let McpCall { req, resp_tx, upload_source } = call;
+        let McpCall { req, resp_tx, upload_source, download_sink } = call;
         let id = req.id;
         let send_err = |resp_tx: oneshot::Sender<McpResponse>, msg: String| {
             let _ = resp_tx.send(McpResponse {
@@ -1203,12 +1710,18 @@ impl App {
                     deadline: Instant::now() + clamp_timeout(timeout_ms),
                 });
             }
-            McpReqKind::CopyFromRemote {
+            McpReqKind::CopyFromRemoteToCaller {
                 session_uid,
                 remote_path,
-                local_path,
                 timeout_ms,
             } => {
+                // 这个操作的响应完全经 `download_sink` 送达（worker 探测远端路径后精确回
+                // Ok(流)/Err(消息)）；`resp_tx` 只在下面这几条前置校验失败时才会被用到——
+                // 两者互斥，见 handle_conn 里 `is_caller_download` 分支的说明。
+                let Some(download_sink) = download_sink else {
+                    send_err(resp_tx, "调用方下载请求缺少响应通道".into());
+                    return;
+                };
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
                     send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
@@ -1226,7 +1739,73 @@ impl App {
                     send_err(resp_tx, e);
                     return;
                 }
-                if let Err(e) = validate_local_path(&local_path) {
+                let op_id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let sent = s
+                    .cmd_tx
+                    .send(UiCommand::DownloadToMcp {
+                        id: op_id,
+                        remote_path: remote_path.clone(),
+                        download_sink,
+                    })
+                    .is_ok();
+                if !sent {
+                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    return;
+                }
+                // resp_tx 就此不再使用（响应已经交给 download_sink 那条路），直接丢弃；
+                // pending_file_op 仍然占位以复用忙碌保护 + TransferDone 收尾记账。
+                drop(resp_tx);
+                s.pending_file_op = Some(PendingAiFileOp {
+                    kind: FileOpKind::Copy { op_id },
+                    path: remote_path,
+                    resp_tx: None,
+                    req_id: id,
+                    deadline: Instant::now() + clamp_timeout(timeout_ms),
+                });
+            }
+            McpReqKind::CopyBetweenSessions {
+                src_session_uid,
+                src_remote_path,
+                dest_session_uid,
+                dest_remote_path,
+                timeout_ms,
+            } => {
+                if src_session_uid == dest_session_uid {
+                    send_err(resp_tx, "源和目标不能是同一个会话；同会话内复制请用 run_command 执行 cp".into());
+                    return;
+                }
+                let Some(src_idx) = self.session_idx_by_uid(src_session_uid) else {
+                    send_err(resp_tx, self.session_not_found_msg(src_session_uid));
+                    return;
+                };
+                if !self.sessions[src_idx].connected {
+                    send_err(resp_tx, "源会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    return;
+                }
+                if self.sessions[src_idx].pending_file_op.is_some() {
+                    send_err(resp_tx, "源会话已有一个文件读写操作正在进行，请稍候重试".into());
+                    return;
+                }
+                let Some(dest_idx) = self.session_idx_by_uid(dest_session_uid) else {
+                    send_err(resp_tx, self.session_not_found_msg(dest_session_uid));
+                    return;
+                };
+                if !self.sessions[dest_idx].connected {
+                    send_err(resp_tx, "目标会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    return;
+                }
+                if self.sessions[dest_idx].pending_file_op.is_some() {
+                    send_err(resp_tx, "目标会话已有一个文件读写操作正在进行，请稍候重试".into());
+                    return;
+                }
+                if let Err(e) = validate_remote_path(&src_remote_path) {
+                    send_err(resp_tx, e);
+                    return;
+                }
+                if let Err(e) = validate_remote_path(&dest_remote_path) {
                     send_err(resp_tx, e);
                     return;
                 }
@@ -1234,26 +1813,67 @@ impl App {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
-                // download() 内部会按 local 的父目录 create_dir_all，不需要预先建目录。
-                let sent = s
+                let deadline = Instant::now() + clamp_timeout(timeout_ms);
+                let marker = format!(
+                    "ishell-ai-relay-{op_id}-{}",
+                    rand_marker_suffix()
+                );
+                // 一次性 ed25519 密钥对：只用于这一次直连尝试，成功与否都会在
+                // UntrustingAfterDirect 阶段撤销公钥、源会话侧的私钥文件也会被清理，
+                // 不留长期可用的免密信任。
+                let (priv_key_pem, pub_key_line) = match generate_temp_keypair(&marker) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        send_err(resp_tx, format!("生成一次性密钥对失败：{e}"));
+                        return;
+                    }
+                };
+                // duplex 内存管道：直连尝试期间两端都先不发出去，只有直连失败转中转时
+                // 才真正派上用场；字节全程只经过 iShell 进程内存，不落盘任何一方。
+                let (pipe_writer, pipe_reader) = tokio::io::duplex(128 * 1024);
+                let sent = self.sessions[dest_idx]
                     .cmd_tx
-                    .send(UiCommand::Download {
-                        id: op_id,
-                        remote: remote_path,
-                        local: local_path.clone(),
-                        policy: ConflictPolicy::Overwrite,
-                    })
+                    .send(UiCommand::TrustTempKey { op_id, pub_key_line })
                     .is_ok();
                 if !sent {
-                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    send_err(resp_tx, "目标会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
                     return;
                 }
-                s.pending_file_op = Some(PendingAiFileOp {
+                self.sessions[src_idx].pending_file_op = Some(PendingAiFileOp {
                     kind: FileOpKind::Copy { op_id },
-                    path: local_path,
-                    resp_tx: Some(resp_tx),
+                    path: src_remote_path.clone(),
+                    resp_tx: None,
                     req_id: id,
-                    deadline: Instant::now() + clamp_timeout(timeout_ms),
+                    deadline,
+                });
+                self.sessions[dest_idx].pending_file_op = Some(PendingAiFileOp {
+                    kind: FileOpKind::Copy { op_id },
+                    path: dest_remote_path.clone(),
+                    resp_tx: None,
+                    req_id: id,
+                    deadline,
+                });
+                self.cross_copy_jobs.push(CrossCopyJob {
+                    op_id,
+                    req_id: id,
+                    resp_tx: Some(resp_tx),
+                    src_uid: src_session_uid,
+                    dest_uid: dest_session_uid,
+                    src_remote_path,
+                    dest_remote_path,
+                    pipe_writer: Some(pipe_writer),
+                    pipe_reader: Some(pipe_reader),
+                    marker,
+                    trust_established: false,
+                    cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    direct_result: None,
+                    phase: CrossCopyPhase::TrustingB,
+                    deadline,
+                    // TrustingB 阶段没有独立的短超时——建立信任本身很快，等到真正失败/
+                    // 成功都由 TempKeyTrusted 事件驱动；这里先随便给个不会被用到的占位值
+                    // （只有进入 DirectCopying/UntrustingAfterDirect 才会被重新赋值）。
+                    phase_deadline: deadline,
+                    priv_key_pem: Some(priv_key_pem),
                 });
             }
         }

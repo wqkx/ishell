@@ -38,6 +38,21 @@ pub(super) struct SessionPending {
     pub load_fail: Vec<(u64, String)>,
     /// 已读取待打开到看图工具的图片（path, 原始字节）
     pub image: Vec<(String, Vec<u8>)>,
+    /// 跨会话拷贝-中转模式：源会话侧探测远端路径的结果（op_id, Ok(size)/Err(message)），
+    /// 驱动 App 层 `cross_copy_jobs` 状态机进入下一步或判失败。
+    pub relay_source: Vec<(u64, Result<u64, String>)>,
+    /// 每次 `TransferDone` 的副本（op_id, ok, message），供 App 层跨会话拷贝状态机匹配自己
+    /// 关心的 op_id；跟这次拷贝无关的 id 由 App 侧忽略，不影响既有的单会话
+    /// `try_resolve_file_copy` 流程（那条路径独立走自己的 `pending_file_op` 匹配）。
+    pub copy_done: Vec<(u64, bool, String)>,
+    /// 跨会话拷贝-直连优先模式：`TrustTempKey` 的结果（op_id, ok, message）。
+    pub temp_key_trusted: Vec<(u64, bool, String)>,
+    /// 跨会话拷贝-直连优先模式：`UntrustTempKey` 已执行完（op_id）。
+    pub temp_key_untrusted: Vec<u64>,
+    /// 跨会话拷贝-直连优先模式：直连传输已经真正开始跑（op_id）。
+    pub direct_relay_started: Vec<u64>,
+    /// 跨会话拷贝-直连优先模式：直连传输的最终结果（op_id, ok, message）。
+    pub direct_relay_done: Vec<(u64, bool, String)>,
 }
 
 impl SessionPending {
@@ -60,6 +75,12 @@ impl SessionPending {
             && self.load_progress.is_empty()
             && self.load_fail.is_empty()
             && self.image.is_empty()
+            && self.relay_source.is_empty()
+            && self.copy_done.is_empty()
+            && self.temp_key_trusted.is_empty()
+            && self.temp_key_untrusted.is_empty()
+            && self.direct_relay_started.is_empty()
+            && self.direct_relay_done.is_empty()
     }
 }
 

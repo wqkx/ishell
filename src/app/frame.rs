@@ -39,6 +39,12 @@ impl App {
         let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
         let mut pdf_searches: Vec<FramePdfSearch> = Vec::new();
         let mut new_docs: Vec<(u64, Vec<u8>)> = Vec::new(); // 占位 id, docx 字节
+        let mut relay_source: Vec<(u64, Result<u64, String>)> = Vec::new(); // op_id, Ok(size)/Err(msg)
+        let mut copy_done: Vec<(u64, u64, bool, String)> = Vec::new(); // uid, op_id, ok, message
+        let mut temp_key_trusted: Vec<(u64, bool, String)> = Vec::new();
+        let mut temp_key_untrusted: Vec<u64> = Vec::new();
+        let mut direct_relay_started: Vec<u64> = Vec::new();
+        let mut direct_relay_done: Vec<(u64, bool, String)> = Vec::new();
         let mut evt_backlog = false;
         for s in &mut self.sessions {
             // 事件积压未排空（每帧预算保护渲染）时安排下一帧继续消化
@@ -99,10 +105,36 @@ impl App {
             for x in s.pending.doc.drain(..) {
                 new_docs.push(x);
             }
+            for x in s.pending.relay_source.drain(..) {
+                relay_source.push(x);
+            }
+            for (id, ok, message) in s.pending.copy_done.drain(..) {
+                copy_done.push((s.uid, id, ok, message));
+            }
+            for x in s.pending.temp_key_trusted.drain(..) {
+                temp_key_trusted.push(x);
+            }
+            for x in s.pending.temp_key_untrusted.drain(..) {
+                temp_key_untrusted.push(x);
+            }
+            for x in s.pending.direct_relay_started.drain(..) {
+                direct_relay_started.push(x);
+            }
+            for x in s.pending.direct_relay_done.drain(..) {
+                direct_relay_done.push(x);
+            }
         }
         // 必须在上面这个 drain_events 循环之后调用：文件读写超时判定要晚于"本帧事件是否
         // 已经带来真正结果"的判断，否则会跟刚好本帧到达的完成事件打时序竞争（见该方法注释）。
         self.check_file_op_timeouts();
+        self.advance_cross_copy_jobs(
+            temp_key_trusted,
+            temp_key_untrusted,
+            direct_relay_started,
+            direct_relay_done,
+            relay_source,
+            copy_done,
+        );
         if evt_backlog {
             self.ctx.request_repaint();
         }

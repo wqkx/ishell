@@ -181,7 +181,7 @@ pub(super) async fn direct_transfer_inner(
     };
 
     // 临时私钥的清理交由 _key_guard 在作用域结束（含取消时的 future drop）异步完成
-    let (code, err) = exec_direct_progress(handle, &cmd, spec.id, sink, cancel).await?;
+    let (code, err) = exec_direct_progress(handle, &cmd, spec.id, sink, cancel, None).await?;
     if code != 0 {
         let reason = err.trim();
         anyhow::bail!(
@@ -211,15 +211,23 @@ pub(super) async fn direct_transfer_inner(
 
 /// 执行直传命令并解析 rsync `--info=progress2` 的「已传字节」（首列），按字节上报进度。
 /// 返回 (退出码, stderr)。被取消时（cancel 置位）提前结束读取，外层 select 也会 drop 整个 future。
+/// `on_exec_started`：`channel_open_session`/`exec` 都成功之后（意味着已经真正连上目标
+/// 主机并提交了命令）才调用一次——`copy_between_sessions` 用它来在这个时刻才发
+/// `DirectRelayStarted`，解除 App 层"20s 内未建立连接就转中转"的短超时；`direct_transfer`
+/// 这条既有调用路径不需要这个信号，传 `None`。
 pub(super) async fn exec_direct_progress(
     handle: &Handle<ClientHandler>,
     cmd: &str,
     id: u64,
     sink: &UiSink,
     cancel: &Arc<AtomicBool>,
+    on_exec_started: Option<fn(&UiSink, u64)>,
 ) -> anyhow::Result<(i32, String)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
+    if let Some(cb) = on_exec_started {
+        cb(sink, id);
+    }
     let mut code = -1i32;
     let mut err = Vec::new();
     let mut tail = String::new();
@@ -258,4 +266,155 @@ pub(super) fn last_rsync_bytes(s: &str) -> Option<u64> {
         return None;
     }
     digits.parse::<u64>().ok()
+}
+
+/// 跨会话拷贝-直连优先模式（目标会话侧）：临时把一次性公钥追加进这台主机的
+/// authorized_keys，建立"源主机可以免密连过来"的单向信任。带 `restrict`（OpenSSH 7.2+
+/// 组合开关：禁端口/agent/X11 转发 + 禁 PTY/login shell）收紧这把临时密钥的能力——
+/// 即便撤销失败遗留，能做的事也严格限定在文件传输，不会变成一把可以任意登录的钥匙。
+pub(crate) async fn trust_temp_key(handle: &Handle<ClientHandler>, pub_key_line: &str) -> anyhow::Result<()> {
+    let home = exec_capture(handle, "echo -n $HOME").await?;
+    let home = home.trim();
+    if home.is_empty() {
+        anyhow::bail!("探测不到远端 HOME");
+    }
+    let ssh_dir = format!("{home}/.ssh");
+    let auth_keys = format!("{ssh_dir}/authorized_keys");
+    let cmd = format!(
+        "mkdir -p -m 700 {} && touch {} && chmod 600 {} && printf '%s\\n' {} >> {}",
+        sh_quote(&ssh_dir),
+        sh_quote(&auth_keys),
+        sh_quote(&auth_keys),
+        sh_quote(pub_key_line),
+        sh_quote(&auth_keys),
+    );
+    let (code, err) = exec_status(handle, &cmd).await?;
+    if code != 0 {
+        anyhow::bail!("写入 authorized_keys 失败（码 {code}）：{}", err.trim());
+    }
+    Ok(())
+}
+
+/// 撤销 `trust_temp_key` 追加的那一行：按 marker 注释精确匹配删除（不按整行文本匹配，
+/// 避免公钥内容里出现 shell 特殊字符时 `grep -v` 出问题）。尽力而为——失败只在调用方
+/// 记日志，不向上抛，因为清理失败不应该掩盖"传输本身成功/失败"这个对用户更重要的结果。
+pub(crate) async fn untrust_temp_key(handle: &Handle<ClientHandler>, marker: &str) -> anyhow::Result<()> {
+    let home = exec_capture(handle, "echo -n $HOME").await?;
+    let home = home.trim();
+    if home.is_empty() {
+        anyhow::bail!("探测不到远端 HOME");
+    }
+    let auth_keys = format!("{home}/.ssh/authorized_keys");
+    let tmp_path = format!("{auth_keys}.ishell_tmp");
+    // 注意：不能写成 `grep ... && mv ... || true`——`grep -v` 在“每一行都匹配 marker”
+    // （比如这个临时公钥恰好是 authorized_keys 里唯一一行，常见于纯密码认证账户第一次
+    // 建立信任的场景）时不会有任何输出，退出码是 1（非 0），`&&` 直接短路、`mv` 被跳过，
+    // 公钥这一行就永远删不掉——即便走的是正常撤销路径也会遗留。grep 退出码 0/1 都表示
+    // 命令本身成功执行（1 只是“没有匹配到应保留的行”，输出为空文件也是合法结果），
+    // 只有 2+ 才是真正的执行错误（比如文件不可读），此时不应该用这个空/错误的临时文件
+    // 覆盖原文件。
+    let cmd = format!(
+        "grep -vF {} {} > {} 2>/dev/null; code=$?; \
+         if [ \"$code\" -le 1 ]; then mv {} {}; else rm -f {}; fi",
+        sh_quote(marker),
+        sh_quote(&auth_keys),
+        sh_quote(&tmp_path),
+        sh_quote(&tmp_path),
+        sh_quote(&auth_keys),
+        sh_quote(&tmp_path),
+    );
+    let _ = exec_status(handle, &cmd).await;
+    Ok(())
+}
+
+/// 跨会话拷贝-直连优先模式（源会话侧）：把一次性私钥投放到本主机、直接 scp/rsync 到目标
+/// 主机，字节完全不经过运行 iShell 的机器。主机密钥策略固定 `accept-new`——这是程序化的
+/// 一次性操作，没有人工确认目标指纹的界面，工具描述里会明确告知调用方这一点。
+pub(crate) async fn direct_relay_copy(
+    handle: Arc<Handle<ClientHandler>>,
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    op_id: u64,
+    src_path: String,
+    dest_user: String,
+    dest_host: String,
+    dest_port: u16,
+    dest_path: String,
+    priv_key_pem: Vec<u8>,
+    cancel: Arc<AtomicBool>,
+    sink: &UiSink,
+) {
+    let tmp_dir = format!("/tmp/.ishell_relay_{op_id}_{}", rand_hex(8));
+    if !matches!(
+        exec_status(&handle, &format!("mkdir -m 700 {}", sh_quote(&tmp_dir))).await,
+        Ok((0, _))
+    ) {
+        sink.send(WorkerEvent::DirectRelayDone {
+            op_id,
+            ok: false,
+            message: "创建临时密钥目录失败".into(),
+        });
+        return;
+    }
+    let _key_guard = TmpKeyGuard { handle: handle.clone(), dir: tmp_dir.clone() };
+    let tmp_key = format!("{tmp_dir}/key");
+    if let Err(e) = sftp_overwrite(&sftp, &tmp_key, &priv_key_pem).await {
+        sink.send(WorkerEvent::DirectRelayDone {
+            op_id,
+            ok: false,
+            message: format!("投放临时密钥失败：{e}"),
+        });
+        return;
+    }
+    let _ = exec_status(&handle, &format!("chmod 600 {}", sh_quote(&tmp_key))).await; // 纵深防御（目录已 700）
+
+    let dest = sh_quote(&format!("{dest_user}@{dest_host}:{dest_path}"));
+    let src = sh_quote(&src_path);
+    let ssh_opt = format!(
+        "ssh -p {dest_port} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15",
+        sh_quote(&tmp_key),
+    );
+    let has_rsync = matches!(
+        exec_status(&handle, "command -v rsync >/dev/null 2>&1").await,
+        Ok((0, _))
+    );
+    let cmd = if has_rsync {
+        format!("rsync -a --info=progress2 -e {} -- {src} {dest}", sh_quote(&ssh_opt))
+    } else {
+        format!(
+            "scp -P {dest_port} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -- {src} {dest}",
+            sh_quote(&tmp_key),
+        )
+    };
+
+    // 临时私钥的清理交由 _key_guard 在作用域结束（含超时取消时的 future drop）异步完成。
+    // `DirectRelayStarted` 必须在 exec_direct_progress 内部真正 `channel_open_session`+
+    // `exec` 成功之后才发（见该函数的 `on_exec_started` 回调）——如果像这里曾经写的那样
+    // 在调用前就无条件发送，会让 App 层"20s 内未建连就转中转"的短超时形同虚设（`started`
+    // 瞬间变 true，短超时永远不会命中，网络不通时只能死等到总超时才降级）。
+    fn announce_started(sink: &UiSink, op_id: u64) {
+        sink.send(WorkerEvent::DirectRelayStarted { op_id });
+    }
+    match exec_direct_progress(&handle, &cmd, op_id, sink, &cancel, Some(announce_started)).await {
+        Ok((0, _)) => sink.send(WorkerEvent::DirectRelayDone {
+            op_id,
+            ok: true,
+            message: "直连完成".into(),
+        }),
+        Ok((code, err)) => {
+            let reason = err.trim();
+            sink.send(WorkerEvent::DirectRelayDone {
+                op_id,
+                ok: false,
+                message: format!(
+                    "直连失败（码 {code}）：{}",
+                    if reason.is_empty() { "源主机无法连到目标主机" } else { reason }
+                ),
+            });
+        }
+        Err(e) => sink.send(WorkerEvent::DirectRelayDone {
+            op_id,
+            ok: false,
+            message: format!("直连执行失败：{e}"),
+        }),
+    }
 }

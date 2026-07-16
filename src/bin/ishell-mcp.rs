@@ -14,7 +14,7 @@ use rmcp::model::*;
 use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
@@ -54,8 +54,10 @@ async fn newest_connectable(dir: &std::path::Path, prefix: &str, suffix: &str) -
 ///   1. `ISHELL_MCP_SOCKET` 显式指定（手动隧道场景，最明确，始终优先）；
 ///   2. `~/.config/ishell/mcp-*.sock` 里 mtime 最新且连得上的一个（同机场景：iShell 和这个
 ///      代理跑在同一台机器上；每个 iShell 进程一个独立文件，不用猜具体 pid）；
-///   3. `~/.ishell-mcp-*.sock` 里 mtime 最新且连得上的一个（iShell 反向转发到「这个代理
-///      所在的机器」时会落在这里；每次重连都是新文件，取最新的即可自动跟上）。
+///   3. `~/.ishell-mcp/mcp-*.sock` 里 mtime 最新且连得上的一个（iShell 反向转发到「这个代理
+///      所在的机器」时会落在这里；每次重连都是新文件，取最新的即可自动跟上——这些文件统一放
+///      进这个子目录而不是散落在 `$HOME` 根，且 iShell 那边在连接正常断开时会主动清理，
+///      见 `src/ssh/mod.rs`）。
 /// 都没找到时回退到本机默认目录下的固定占位路径，让错误信息保持原样好懂（不会是任何一个
 /// 真实存在的进程的路径，纯粹是给 `call()` 里的 connect 失败提供一个统一的报错落点）。
 #[cfg(unix)]
@@ -68,7 +70,8 @@ async fn socket_path() -> std::path::PathBuf {
     if let Some(p) = newest_connectable(&config_dir, "mcp-", ".sock").await {
         return p;
     }
-    if let Some(p) = newest_connectable(std::path::Path::new(&home), ".ishell-mcp-", ".sock").await {
+    let forward_dir = std::path::PathBuf::from(&home).join(".ishell-mcp");
+    if let Some(p) = newest_connectable(&forward_dir, "mcp-", ".sock").await {
         return p;
     }
     config_dir.join("mcp.sock")
@@ -117,6 +120,23 @@ async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
     resp.result
 }
 
+/// 校验一个调用方本机路径：必须绝对、不含 `.`/`..` 路径段。跟 GUI 侧
+/// `mcp_bridge.rs::validate_local_path` 是同一套规则（包括"按原始字符串拆分而不是
+/// `Path::components()`"这个细节——后者会把非开头的 "." 直接规整掉，导致
+/// "/tmp/./notes.txt" 这类路径检测不到）——那一份校验的是"GUI 所在机器"的路径，
+/// 这里校验的是"ishell-mcp 代理进程所在机器"的路径，两者解析点不同、代码没法共享，
+/// 但规则本身应该保持一致。
+fn validate_caller_path(path_str: &str, field: &str) -> Result<(), String> {
+    let path = std::path::Path::new(path_str);
+    if !path.is_absolute() {
+        return Err(format!("{field} 必须是运行 ishell-mcp 的调用方机器上的绝对路径"));
+    }
+    if path_str.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(format!("{field} 不能包含 \".\" 或 \"..\" 路径段"));
+    }
+    Ok(())
+}
+
 /// 从运行 MCP client 的机器读取一个文件，并把原始字节紧随内部 JSON 请求写入 iShell。
 /// 该函数只在代理进程本地打开 `local_path`；iShell GUI 从未解析该路径，因此跨主机使用时
 /// 不会再把工作机路径错误地当成桌面机路径。
@@ -127,10 +147,8 @@ async fn copy_to_remote_from_caller(
     remote_path: String,
     timeout_ms: u64,
 ) -> Result<McpReqResult, String> {
+    validate_caller_path(&local_path, "local_path")?;
     let path = std::path::PathBuf::from(&local_path);
-    if !path.is_absolute() {
-        return Err("local_path 必须是运行 ishell-mcp 的调用方机器上的绝对路径".into());
-    }
     let metadata = tokio::fs::metadata(&path)
         .await
         .map_err(|error| format!("无法读取调用方文件 {local_path}: {error}"))?;
@@ -191,6 +209,86 @@ async fn copy_to_remote_from_caller(
     _session_uid: u64,
     _local_path: String,
     _remote_path: String,
+    _timeout_ms: u64,
+) -> Result<McpReqResult, String> {
+    Err("ishell-mcp 目前仅支持 Unix（Linux/macOS）系统的本地 IPC，暂不支持 Windows".into())
+}
+
+/// 把远端单文件流式下载到运行 MCP client 的机器，原始字节紧随 iShell 回的响应头之后收取。
+/// 对称 `copy_to_remote_from_caller`：这个函数在代理进程本地打开/写 `local_path`，
+/// iShell GUI 从未解析该路径——避免 `copy_from_remote` 和 `copy_to_remote` 的"本地"分别落在
+/// 两台不同机器上这个此前存在的不一致 bug（GUI 侧只负责探测远端路径、把字节流回本连接）。
+#[cfg(unix)]
+async fn copy_from_remote_to_caller(
+    session_uid: u64,
+    remote_path: String,
+    local_path: String,
+    timeout_ms: u64,
+) -> Result<McpReqResult, String> {
+    validate_caller_path(&local_path, "local_path")?;
+    let path = std::path::PathBuf::from(&local_path);
+
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let socket = socket_path().await;
+    let stream = tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(&socket))
+        .await
+        .map_err(|_| "连接 iShell 本地 socket 超时".to_string())?
+        .map_err(|_| "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".to_string())?;
+    let (read_half, mut write_half) = stream.into_split();
+    let request = McpRequest {
+        id,
+        kind: McpReqKind::CopyFromRemoteToCaller { session_uid, remote_path, timeout_ms },
+    };
+    let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    header.push('\n');
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, write_half.write_all(header.as_bytes()))
+        .await
+        .map_err(|_| "发送下载请求给 iShell 超时".to_string())?
+        .map_err(|error| error.to_string())?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut header_line = String::new();
+    let read = tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut header_line))
+        .await
+        .map_err(|_| "等待 iShell 下载响应超时（可能是 GUI、SFTP 或连接异常）".to_string())?
+        .map_err(|error| error.to_string())?;
+    if read == 0 {
+        return Err("iShell 未返回下载结果就关闭了连接".into());
+    }
+    let resp: McpResponse = serde_json::from_str(header_line.trim()).map_err(|error| error.to_string())?;
+    let size = match resp.result? {
+        McpReqResult::CopyStreamHeader { size, .. } => size,
+        _ => return Err("iShell 返回了意料之外的下载响应".into()),
+    };
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("无法创建调用方目标目录 {}: {error}", parent.display()))?;
+    }
+    let mut dest = tokio::fs::File::create(&path)
+        .await
+        .map_err(|error| format!("无法创建调用方文件 {local_path}: {error}"))?;
+    // 精确拷贝声明的 size 字节：这条协议里响应头之后不再有分隔符/trailer，只能用长度
+    // 而不是 EOF 来判断"这个文件读完了"——`take(size)` 保证既不少读也不多读。
+    let mut limited = (&mut reader).take(size);
+    let copied = tokio::io::copy(&mut limited, &mut dest)
+        .await
+        .map_err(|error| format!("接收调用方文件流失败: {error}"))?;
+    if copied != size {
+        return Err(format!(
+            "下载数据不完整：期望 {size} 字节，实际收到 {copied} 字节（iShell 一侧可能中途出错）"
+        ));
+    }
+    dest.flush().await.map_err(|error| format!("落盘调用方文件失败: {error}"))?;
+    Ok(McpReqResult::Copied { path: local_path })
+}
+
+#[cfg(not(unix))]
+async fn copy_from_remote_to_caller(
+    _session_uid: u64,
+    _remote_path: String,
+    _local_path: String,
     _timeout_ms: u64,
 ) -> Result<McpReqResult, String> {
     Err("ishell-mcp 目前仅支持 Unix（Linux/macOS）系统的本地 IPC，暂不支持 Windows".into())
@@ -332,6 +430,20 @@ pub struct CopyFromRemoteArgs {
     pub remote_path: String,
     /// 本地目标绝对路径，文件名可以和 remote_path 不同；所在目录不存在会自动创建
     pub local_path: String,
+    #[serde(default = "default_copy_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CopyBetweenSessionsArgs {
+    /// 源会话 uid（list_sessions 返回），文件从它的远端主机读出
+    pub src_session_uid: u64,
+    /// 源会话远端主机上的绝对路径（当前仅支持单个文件，目录会报错）
+    pub src_remote_path: String,
+    /// 目标会话 uid，文件写入它的远端主机
+    pub dest_session_uid: u64,
+    /// 目标会话远端主机上的绝对路径，可以和源文件名不同；所在目录不存在会自动创建
+    pub dest_remote_path: String,
     #[serde(default = "default_copy_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -594,15 +706,14 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "把远端文件/目录复制到本地（走 SFTP 下载），是 copy_to_remote 的反方向。\
-                        拉取大文件/整个目录时用这个，而不是 read_file——read_file 会把全部内容\
-                        内联进响应 JSON，大文件既浪费上下文又可能被截断。local_path/remote_path \
-                        都必须是绝对路径（且不能含 \".\"/\"..\" 路径段）；local_path 的文件名\
-                        可以和远端不同，所在目录不存在会自动创建。本地目标存在会被直接覆盖，\
-                        不做冲突检测——这条通道只给你自己用，默认信任调用方，跟 write_file 的\
-                        覆盖语义一致；remote_path 是目录时为镜像覆盖：本地目标最终只包含这次\
-                        拉取的内容，目标里原有、远端已经不存在的文件/子目录会被一并清除，\
-                        不是逐文件合并。"
+        description = "把远端单个文件流式复制到运行 ishell-mcp 的调用方机器（走既有 SFTP 下载，\
+                        文件字节不进入 MCP JSON 或模型上下文），是 copy_to_remote 的反方向。\
+                        拉取大文件时用这个，而不是 read_file——read_file 会把全部内容内联进\
+                        响应 JSON，大文件既浪费上下文又可能被截断。local_path 必须是调用方机器\
+                        的绝对路径；remote_path 必须是远端绝对路径，且不能含 \".\"/\"..\" 路径段。\
+                        当前流式模式仅支持单个文件，remote_path 是目录会报错——目录请多次调用\
+                        本工具逐文件拉取，或用 run_command 执行 tar/rsync。本地目标存在会被\
+                        直接覆盖，不做冲突检测；所在目录不存在会自动创建。"
     )]
     async fn copy_from_remote(
         &self,
@@ -613,11 +724,42 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<CopyFromRemoteArgs>,
     ) -> Result<CallToolResult, McpError> {
+        text_result(copy_from_remote_to_caller(session_uid, remote_path, local_path, timeout_ms).await)
+    }
+
+    #[tool(
+        description = "把一个已打开远端会话（源）上的文件复制到另一个已打开远端会话（目标），\
+                        两边都必须是已连接的远端主机——不是本地文件，本地文件请用 copy_to_remote/\
+                        copy_from_remote。会优先尝试源主机直连目标主机（不经过运行 iShell 的\
+                        机器中转，适合两台主机在同一局域网/集群、直连明显更快的场景）：iShell 会\
+                        生成一个仅限本次使用的一次性密钥对，临时授权源主机免密连接目标主机，\
+                        传输完成后立即撤销这个临时授权、删除临时密钥，不留长期可用的免密信任；\
+                        因为是程序化操作、没有人工确认目标主机指纹的环节，直连时主机密钥策略是\
+                        accept-new。如果直连不可行（网络不通、权限受限等），会自动降级为经 \
+                        iShell 进程内存中转（不落盘任何一方磁盘）；调用方不需要关心具体走了哪条\
+                        路径，返回结果里的 method 字段会标明（\"direct\" 或 \"relay\"）。当前仅\
+                        支持单个文件，src_remote_path 是目录会报错——目录请多次调用本工具逐文件\
+                        复制，或用 run_command 执行 rsync/scp。src_remote_path/dest_remote_path \
+                        都必须是各自远端主机上的绝对路径，且不能含 \".\"/\"..\" 路径段；目标已\
+                        存在会被直接覆盖；源和目标不能是同一个会话（同会话内复制请用 \
+                        run_command 执行 cp）。"
+    )]
+    async fn copy_between_sessions(
+        &self,
+        Parameters(CopyBetweenSessionsArgs {
+            src_session_uid,
+            src_remote_path,
+            dest_session_uid,
+            dest_remote_path,
+            timeout_ms,
+        }): Parameters<CopyBetweenSessionsArgs>,
+    ) -> Result<CallToolResult, McpError> {
         text_result(
-            call(McpReqKind::CopyFromRemote {
-                session_uid,
-                remote_path,
-                local_path,
+            call(McpReqKind::CopyBetweenSessions {
+                src_session_uid,
+                src_remote_path,
+                dest_session_uid,
+                dest_remote_path,
                 timeout_ms,
             })
             .await,

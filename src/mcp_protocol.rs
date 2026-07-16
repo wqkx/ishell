@@ -122,12 +122,24 @@ pub enum McpReqKind {
         size: u64,
         timeout_ms: u64,
     },
-    /// 把远端文件/目录复制到本地（走 SFTP 下载通道），是 `CopyToRemote` 的反方向。
-    CopyFromRemote {
+    /// 与 `CopyToRemoteFromCaller` 对称：`copy_from_remote` 工具真正的实现。GUI 侧把远端单文件内容
+    /// 通过本条 socket 流回代理进程，由代理进程在自己的机器上落盘到 `local_path`——不是
+    /// MCP tool 的公开参数，是代理与 GUI 间的内部协议，用来避免"代理进程本地"和
+    /// "GUI 所在机器"这两个不同机器对 `local_path` 的解析点不一致（此前 `CopyFromRemote`
+    /// 直接由 GUI 自己写盘，跟 `copy_to_remote` 的解析点对不上）。仅支持单个文件，
+    /// 目录场景由 GUI 侧探测后直接回错误。
+    CopyFromRemoteToCaller {
         session_uid: u64,
         remote_path: String,
-        /// 本地目标绝对路径，可以和 `remote_path` 的文件名不同；所在目录不存在会自动创建
-        local_path: String,
+        timeout_ms: u64,
+    },
+    /// 把一个已打开远端会话（源）上的文件复制到另一个已打开远端会话（目标），两边都是远端
+    /// 主机，不经过运行 iShell 的机器落盘（内存中转）。当前仅支持单个文件。
+    CopyBetweenSessions {
+        src_session_uid: u64,
+        src_remote_path: String,
+        dest_session_uid: u64,
+        dest_remote_path: String,
         timeout_ms: u64,
     },
 }
@@ -156,6 +168,14 @@ pub enum McpReqResult {
     FileContent { path: String, content: String },
     /// `CopyToRemote`/`CopyFromRemote` 成功后的目标路径。
     Copied { path: String },
+    /// `CopyFromRemoteToCaller` 的响应头：先以这一行 JSON 单独送达，代理进程解析出 `size`
+    /// 后再从同一条 socket 连接上读取紧随其后的 `size` 字节原始文件内容（无额外分隔符/
+    /// trailer）。GUI 侧提前判定失败（远端不存在/是目录等）时仍按普通 `Err` 响应，不会
+    /// 发送这个变体，代理进程据此区分两种情况，不需要另外猜测。
+    CopyStreamHeader { path: String, size: u64 },
+    /// `CopyBetweenSessions` 成功后的目标路径；`method` 目前恒为 `"relay"`（经 iShell 内存
+    /// 中转，两端都不落盘）——为直连优先模式预留，届时会出现 `"direct"`。
+    CopiedBetweenSessions { path: String, method: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

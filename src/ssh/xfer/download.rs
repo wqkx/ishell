@@ -382,6 +382,220 @@ pub(super) async fn download(
     }
 }
 
+/// `copy_from_remote` 对称方向：把远端单文件流式回传给运行 ishell-mcp 的调用方机器，不落地
+/// iShell 宿主机磁盘。探测到目录/远端不可访问时，直接经 `download_sink` 回错误（不发送
+/// `DownloadStreamSource`，调用方据此得知这条路径当前只支持单文件）；探测到普通文件后，
+/// 用 `tokio::io::duplex` 建一条内存管道，读端连同文件大小一并通过 `download_sink` 交给
+/// `mcp_bridge::handle_conn`，本函数自己继续把 SFTP 读到的字节写进管道写端——分块大小、
+/// 进度节流写法都照抄 `upload_from_mcp` 的对称实现。
+pub(super) async fn download_to_mcp(
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    id: u64,
+    remote_path: String,
+    download_sink: tokio::sync::oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>,
+    sink: &UiSink,
+    cancel: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let meta = sftp.metadata(&remote_path).await;
+    let size = match meta {
+        Ok(m) if m.is_dir() => {
+            let _ = download_sink.send(Err(match crate::i18n::current() {
+                crate::i18n::Lang::Zh => {
+                    "copy_from_remote 流式模式仅支持单个文件；目录请多次调用，或用 run_command 执行 tar/rsync".to_string()
+                }
+                crate::i18n::Lang::En => {
+                    "copy_from_remote streaming mode only supports a single file; for directories, call it per-file or use run_command with tar/rsync".to_string()
+                }
+            }));
+            return;
+        }
+        Ok(m) => m.size.unwrap_or(0),
+        Err(e) => {
+            let _ = download_sink.send(Err(match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("远端文件不存在或无法访问：{e}"),
+                crate::i18n::Lang::En => format!("Remote file missing or inaccessible: {e}"),
+            }));
+            return;
+        }
+    };
+
+    let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+    if download_sink
+        .send(Ok(crate::proto::DownloadStreamSource {
+            size,
+            reader: Box::new(reader),
+        }))
+        .is_err()
+    {
+        // 调用方（socket 对端）已经断开，没人会读这个管道，直接放弃，不发起 SFTP 读取。
+        return;
+    }
+    sink.send(WorkerEvent::TransferStart {
+        id,
+        name: basename(&remote_path),
+        total: size,
+        dir: crate::proto::TransferDir::Download,
+        local: None,
+    });
+
+    let result: anyhow::Result<()> = async {
+        let mut remote = sftp.open(&remote_path).await?;
+        let mut buffer = vec![0_u8; 128 * 1024];
+        let mut sent = 0_u64;
+        let mut last_reported = 0_u64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("canceled");
+            }
+            let read = remote.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..read]).await?;
+            sent += read as u64;
+            if sent.saturating_sub(last_reported) >= 256 * 1024 || sent == size {
+                last_reported = sent;
+                sink.send(WorkerEvent::TransferProgress { id, done: sent });
+            }
+        }
+        writer.flush().await?;
+        writer.shutdown().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => sink.send(WorkerEvent::TransferDone {
+            id,
+            ok: true,
+            message: format!("Downloaded {remote_path}"),
+            refresh_dir: None,
+        }),
+        Err(error) => {
+            let message = if cancel.load(Ordering::Relaxed) {
+                crate::i18n::tr("已取消", "Canceled").to_string()
+            } else {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("下载失败：{error}"),
+                    crate::i18n::Lang::En => format!("Download failed: {error}"),
+                }
+            };
+            sink.send(WorkerEvent::TransferDone {
+                id,
+                ok: false,
+                message,
+                refresh_dir: None,
+            });
+        }
+    }
+}
+
+/// 跨会话拷贝-中转模式（源会话侧）：把远端单文件读到 `writer` 这条内存管道里（App 层已经
+/// 创建好 duplex 并把另一半发给目标会话）。探测到目录/远端不可访问时，经
+/// `WorkerEvent::RelaySourceResult` 直接回错误（此时还没有 `TransferStart`，不需要
+/// `TransferDone` 收尾）；探测到普通文件后，先回 `Ok(size)` 让 App 层去驱动目标会话，
+/// 再照抄 `download_to_mcp` 的分块读取/进度节流写法把字节灌进 `writer`。
+pub(super) async fn relay_read_file(
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    id: u64,
+    remote_path: String,
+    mut writer: tokio::io::DuplexStream,
+    sink: &UiSink,
+    cancel: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let meta = sftp.metadata(&remote_path).await;
+    let size = match meta {
+        Ok(m) if m.is_dir() => {
+            sink.send(WorkerEvent::RelaySourceResult {
+                id,
+                result: Err(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => {
+                        "copy_between_sessions 当前仅支持单个文件；目录请多次调用，或用 run_command 执行 rsync/scp".to_string()
+                    }
+                    crate::i18n::Lang::En => {
+                        "copy_between_sessions currently only supports a single file; for directories, call it per-file or use run_command with rsync/scp".to_string()
+                    }
+                }),
+            });
+            return;
+        }
+        Ok(m) => m.size.unwrap_or(0),
+        Err(e) => {
+            sink.send(WorkerEvent::RelaySourceResult {
+                id,
+                result: Err(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("远端文件不存在或无法访问：{e}"),
+                    crate::i18n::Lang::En => format!("Remote file missing or inaccessible: {e}"),
+                }),
+            });
+            return;
+        }
+    };
+    sink.send(WorkerEvent::RelaySourceResult { id, result: Ok(size) });
+    sink.send(WorkerEvent::TransferStart {
+        id,
+        name: basename(&remote_path),
+        total: size,
+        dir: crate::proto::TransferDir::Upload,
+        local: None,
+    });
+
+    let result: anyhow::Result<()> = async {
+        let mut remote = sftp.open(&remote_path).await?;
+        let mut buffer = vec![0_u8; 128 * 1024];
+        let mut sent = 0_u64;
+        let mut last_reported = 0_u64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("canceled");
+            }
+            let read = remote.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..read]).await?;
+            sent += read as u64;
+            if sent.saturating_sub(last_reported) >= 256 * 1024 || sent == size {
+                last_reported = sent;
+                sink.send(WorkerEvent::TransferProgress { id, done: sent });
+            }
+        }
+        writer.flush().await?;
+        writer.shutdown().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => sink.send(WorkerEvent::TransferDone {
+            id,
+            ok: true,
+            message: format!("Relayed {remote_path}"),
+            refresh_dir: None,
+        }),
+        Err(error) => {
+            let message = if cancel.load(Ordering::Relaxed) {
+                crate::i18n::tr("已取消", "Canceled").to_string()
+            } else {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("读取失败：{error}"),
+                    crate::i18n::Lang::En => format!("Read failed: {error}"),
+                }
+            };
+            sink.send(WorkerEvent::TransferDone {
+                id,
+                ok: false,
+                message,
+                refresh_dir: None,
+            });
+        }
+    }
+}
+
 /// 同一文件内的并发分段数（流水线深度）。8 路足以在常见高延迟链路上跑满带宽。
 pub(super) async fn download_file(
     sftp: &Arc<russh_sftp::client::SftpSession>,

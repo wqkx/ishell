@@ -368,6 +368,21 @@ impl Session {
                         t.note = note;
                     }
                 }
+                WorkerEvent::RelaySourceResult { id, result } => {
+                    self.pending.relay_source.push((id, result));
+                }
+                WorkerEvent::TempKeyTrusted { op_id, ok, message } => {
+                    self.pending.temp_key_trusted.push((op_id, ok, message));
+                }
+                WorkerEvent::TempKeyUntrusted { op_id } => {
+                    self.pending.temp_key_untrusted.push(op_id);
+                }
+                WorkerEvent::DirectRelayStarted { op_id } => {
+                    self.pending.direct_relay_started.push(op_id);
+                }
+                WorkerEvent::DirectRelayDone { op_id, ok, message } => {
+                    self.pending.direct_relay_done.push((op_id, ok, message));
+                }
                 WorkerEvent::TransferDone {
                     id,
                     ok,
@@ -379,6 +394,9 @@ impl Session {
                     if self.file_copy_op_would_resolve(id) {
                         self.try_resolve_file_copy(id, if ok { Ok(()) } else { Err(message.clone()) });
                     }
+                    // 跨会话拷贝（copy_between_sessions）状态机匹配自己关心的 op_id 用；
+                    // 无关 id 由 App 层驱动函数直接忽略。
+                    self.pending.copy_done.push((id, ok, message.clone()));
                     let connected = self.connected;
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                         t.note = String::new();

@@ -22,7 +22,10 @@ use sysinfo::{SysSampler, PROBE_CMD};
 pub(super) use auth::ClientHandler;
 use auth::{connect, exec_capture, exec_status, open_sftp, open_shell};
 use sftp::{handle_fs_op, list_dir, read_file_chunked, read_image_file, remote_parent, tail_file};
-use xfer::{start_xfer, PendingXfer, XferCancel, MAX_CONCURRENT_XFER};
+use xfer::{
+    direct_relay_copy, start_xfer, trust_temp_key, untrust_temp_key, PendingXfer, XferCancel,
+    MAX_CONCURRENT_XFER,
+};
 
 /// 发往 UI 的事件通道（std mpsc），附带 egui 上下文用于主动请求重绘。
 #[derive(Clone)]
@@ -139,24 +142,45 @@ pub async fn run(
     // 的人"也能连到转发出来的 socket 控制本机 iShell（复用这条已认证/加密的 SSH 连接，
     // 不额外开监听端口）。仅当设置里已开启 AI/MCP 控制时才注册；失败不影响正常连接使用。
     //
-    // 远端路径带随机后缀（而非固定的 ~/.ishell-mcp.sock）：同一台主机短时间内被反复连接/
-    // 重连时，服务器端可能因为迟迟未判定旧连接已死（无 keepalive 时 TCP 层探测很慢）而拒绝
-    // 复用同一个固定路径的新注册请求（"rejected by the other party"）。加上随机后缀后各次
-    // 连接互不冲突；对端按 `~/.ishell-mcp-*.sock` 通配、取最新一个即可发现当前有效的路径。
+    // 远端路径带随机后缀（而非固定名字）：同一台主机短时间内被反复连接/重连时，服务器端
+    // 可能因为迟迟未判定旧连接已死（无 keepalive 时 TCP 层探测很慢）而拒绝复用同一个固定
+    // 路径的新注册请求（"rejected by the other party"）。加上随机后缀后各次连接互不冲突；
+    // 对端按 `~/.ishell-mcp/mcp-*.sock` 通配、取最新一个即可发现当前有效的路径。
+    //
+    // 这些 socket 文件统一放进 `~/.ishell-mcp/` 子目录（而不是散落在 `$HOME` 根），且在本次
+    // 连接正常断开时（见下方 `run()` 收尾处）主动删除本次注册的那一个——用一个共享的
+    // `Option<String>` 槽位把闭包里算出的 remote_path 带到 `run()` 的外层作用域，因为
+    // `streamlocal_forward` 的注册发生在一个独立 `tokio::spawn` 任务里，算出的路径出不了
+    // 这个闭包。同时在注册前顺手清理这个子目录里 mtime 超过 24 小时的旧 socket 文件——不做
+    // 连通性探测（不依赖远端装了 nc/socat），单纯用时间兜底崩溃/异常退出导致的遗留，避免
+    // 无限堆积。
+    let mcp_forward_path: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     if crate::store::load_mcp_consent() {
         let fwd_handle = handle.clone();
+        let path_slot = mcp_forward_path.clone();
         tokio::spawn(async move {
             let home = match exec_capture(&fwd_handle, "echo -n $HOME").await {
                 Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
                 _ => return, // 探测不到远端 HOME：放弃转发，不影响其余功能
             };
+            let dir = format!("{home}/.ishell-mcp");
+            let _ = exec_status(
+                &fwd_handle,
+                &format!(
+                    "mkdir -p -m 700 {} && find {} -maxdepth 1 -name 'mcp-*.sock' -mmin +1440 -delete",
+                    sh_quote(&dir),
+                    sh_quote(&dir)
+                ),
+            )
+            .await;
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or_default();
-            let remote_path = format!("{home}/.ishell-mcp-{nonce}.sock");
-            if let Err(e) = fwd_handle.streamlocal_forward(remote_path).await {
-                log::debug!("AI/MCP 反向转发注册失败：{e}");
+            let remote_path = format!("{dir}/mcp-{nonce}.sock");
+            match fwd_handle.streamlocal_forward(remote_path.clone()).await {
+                Ok(()) => *path_slot.lock().unwrap() = Some(remote_path),
+                Err(e) => log::debug!("AI/MCP 反向转发注册失败：{e}"),
             }
         });
     }
@@ -339,6 +363,83 @@ pub async fn run(
                             active_xfer += 1;
                         } else {
                             pending_xfer.push_back(p);
+                        }
+                    }
+                    Some(UiCommand::DownloadToMcp { id, remote_path, download_sink }) => {
+                        let p = PendingXfer::DownloadToMcp { id, remote_path, download_sink };
+                        if active_xfer < MAX_CONCURRENT_XFER {
+                            start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
+                            active_xfer += 1;
+                        } else {
+                            pending_xfer.push_back(p);
+                        }
+                    }
+                    Some(UiCommand::RelayReadFile { id, remote_path, writer }) => {
+                        let p = PendingXfer::RelayReadFile { id, remote_path, writer };
+                        if active_xfer < MAX_CONCURRENT_XFER {
+                            start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
+                            active_xfer += 1;
+                        } else {
+                            pending_xfer.push_back(p);
+                        }
+                    }
+                    Some(UiCommand::RelayWriteFile { id, remote_path, size, reader }) => {
+                        let p = PendingXfer::RelayWriteFile { id, remote_path, size, reader };
+                        if active_xfer < MAX_CONCURRENT_XFER {
+                            start_xfer(&handle, &sink, &xfer_done_tx, &mut xfer_cancels, p);
+                            active_xfer += 1;
+                        } else {
+                            pending_xfer.push_back(p);
+                        }
+                    }
+                    // 跨会话拷贝-直连优先模式：这三条都是轻量的一次性操作（几条 exec 命令，
+                    // 或一次 scp/rsync 直传），不经过 PendingXfer/active_xfer 那套 SFTP 传输
+                    // 排队机制，直接各自 spawn 一个任务、结果经 WorkerEvent 回报即可。
+                    Some(UiCommand::TrustTempKey { op_id, pub_key_line }) => {
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        tokio::spawn(async move {
+                            match trust_temp_key(&h, &pub_key_line).await {
+                                Ok(()) => s.send(WorkerEvent::TempKeyTrusted { op_id, ok: true, message: String::new() }),
+                                Err(e) => s.send(WorkerEvent::TempKeyTrusted { op_id, ok: false, message: e.to_string() }),
+                            }
+                        });
+                    }
+                    Some(UiCommand::UntrustTempKey { op_id, marker }) => {
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        tokio::spawn(async move {
+                            let _ = untrust_temp_key(&h, &marker).await;
+                            s.send(WorkerEvent::TempKeyUntrusted { op_id });
+                        });
+                    }
+                    Some(UiCommand::DirectRelayCopy {
+                        op_id,
+                        src_path,
+                        dest_user,
+                        dest_host,
+                        dest_port,
+                        dest_path,
+                        priv_key_pem,
+                        cancel,
+                    }) => {
+                        if let Some(sftp) = &sftp {
+                            let h = handle.clone();
+                            let sftp = sftp.clone();
+                            let s = sink.clone();
+                            tokio::spawn(async move {
+                                direct_relay_copy(
+                                    h, sftp, op_id, src_path, dest_user, dest_host, dest_port,
+                                    dest_path, priv_key_pem, cancel, &s,
+                                )
+                                .await;
+                            });
+                        } else {
+                            sink.send(WorkerEvent::DirectRelayDone {
+                                op_id,
+                                ok: false,
+                                message: crate::i18n::tr("SFTP 未就绪", "SFTP not ready").into(),
+                            });
                         }
                     }
                     Some(UiCommand::CancelTransfer(id)) => {
@@ -633,6 +734,14 @@ pub async fn run(
         }
     }
 
+    // 连接生命周期末尾清理本次注册的 AI/MCP 反向转发 socket 文件（`handle` 此时尚未被
+    // drop，`Disconnect` 分支只 `shell.eof()` + `break`，仍可以再开一条 exec 通道）——
+    // 照抄 `TmpKeyGuard`（xfer/direct.rs）"连接末尾再清理一次"的既有模式；失败/连接已经
+    // 物理断开都 `let _ =` 吞掉，不阻塞退出。
+    let forward_cleanup = mcp_forward_path.lock().unwrap().take();
+    if let Some(remote_path) = forward_cleanup {
+        let _ = exec_status(&handle, &format!("rm -f {}", sh_quote(&remote_path))).await;
+    }
     for (_, task) in forwards {
         task.abort();
     }

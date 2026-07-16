@@ -102,6 +102,52 @@ pub enum UiCommand {
         size: u64,
         remote_path: String,
     },
+    /// AI/MCP `copy_from_remote` 的对称方向：把远端单文件流式下载回运行 ishell-mcp 的调用方
+    /// 机器。worker 探测远端路径后，经 `download_sink` 直接回一个结果：`Ok` 携带「文件大小 +
+    /// 内存管道读端」交给 `mcp_bridge::handle_conn` 写响应头后转发字节；`Err`（目录/远端不可
+    /// 访问）则携带错误信息，由 `handle_conn` 直接回一条普通错误响应——这条通道自带成功/
+    /// 失败两种结果，不需要额外经 `WorkerEvent`/`resp_tx` 绕一圈。
+    DownloadToMcp {
+        id: u64,
+        remote_path: String,
+        download_sink: tokio::sync::oneshot::Sender<Result<DownloadStreamSource, String>>,
+    },
+    /// 跨会话拷贝-中转模式（源会话侧）：把远端单文件读到 `writer` 这条内存管道里，探测到
+    /// 大小后先经 `WorkerEvent::RelaySourceReady` 上报，让 App 层把 size 转告目标会话；
+    /// 目录/远端不可访问时直接经 `WorkerEvent::TransferDone{ok:false,..}` 报错。
+    RelayReadFile {
+        id: u64,
+        remote_path: String,
+        writer: tokio::io::DuplexStream,
+    },
+    /// 跨会话拷贝-中转模式（目标会话侧）：把 `reader` 管道里的字节写入远端单文件，
+    /// 是 `UploadFromMcp` 的直接复用（同样的分块/精确长度校验语义）。
+    RelayWriteFile {
+        id: u64,
+        remote_path: String,
+        size: u64,
+        reader: tokio::io::DuplexStream,
+    },
+    /// 跨会话拷贝-直连优先模式（目标会话侧）：临时把一次性公钥追加进这台主机的
+    /// authorized_keys，让源主机能免密直连过来。仅在尝试直连时使用，完成后
+    /// （无论直连成功与否）都会紧跟一条 `UntrustTempKey` 撤销这次临时信任。
+    TrustTempKey { op_id: u64, pub_key_line: String },
+    /// 撤销 `TrustTempKey` 建立的临时信任（按 marker 注释精确匹配删除那一行）。
+    UntrustTempKey { op_id: u64, marker: String },
+    /// 跨会话拷贝-直连优先模式（源会话侧）：把临时私钥投放到本机、直接 scp/rsync 到目标
+    /// 主机，不经过运行 iShell 的机器中转。主机密钥策略固定 accept-new——这是程序化的
+    /// 一次性操作，没有人工确认目标指纹的界面。`cancel` 用于 App 层判定直连尝试超时后
+    /// 主动放弃（源会话仍可能已经在传输数据，这时不应该被打断，见 mcp_bridge.rs 的说明）。
+    DirectRelayCopy {
+        op_id: u64,
+        src_path: String,
+        dest_user: String,
+        dest_host: String,
+        dest_port: u16,
+        dest_path: String,
+        priv_key_pem: Vec<u8>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     /// 取消某个传输任务（进行中或排队中）
     CancelTransfer(u64),
     /// 新建目录
@@ -166,6 +212,14 @@ pub enum UiCommand {
     RemoveForward(u64),
     /// 主动断开
     Disconnect,
+}
+
+/// `DownloadToMcp` 探测到非目录文件后，一次性交给 `mcp_bridge::handle_conn` 的「文件大小 +
+/// 内存管道读端」：handle_conn 写一行 JSON 响应头（含 size）后，直接把 reader 里的字节转发
+/// 进 socket，不落地 iShell 宿主机磁盘。
+pub struct DownloadStreamSource {
+    pub size: u64,
+    pub reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
 }
 
 /// 跨主机直传的目标主机参数（由 UI 据目标会话配置构造，交源会话 worker 执行）。
@@ -338,6 +392,21 @@ pub enum WorkerEvent {
         message: String,
         refresh_dir: Option<String>,
     },
+    /// 跨会话拷贝-中转模式：源会话侧探测远端路径的结果。`Ok(size)` 通知 App 层可以把
+    /// `size` 转告目标会话、下发 `RelayWriteFile`（目标会话在此之前不知道文件大小）；
+    /// `Err(message)`（目录/远端不可访问）此时还没有 `TransferStart` 过，App 层直接据此
+    /// 判定整个跨会话拷贝失败，不需要等任何 `TransferDone`。
+    RelaySourceResult { id: u64, result: Result<u64, String> },
+    /// `TrustTempKey` 的执行结果。
+    TempKeyTrusted { op_id: u64, ok: bool, message: String },
+    /// `UntrustTempKey` 已执行完（结果不影响主流程成败判定，仅供日志）。
+    TempKeyUntrusted { op_id: u64 },
+    /// `DirectRelayCopy` 已经真正开始跑 scp/rsync 传输数据（SSH 连接和认证都已成功）——
+    /// App 层收到后应解除直连尝试的短超时窗口，改用整个操作的总超时，避免大文件直连
+    /// 一半被误杀。
+    DirectRelayStarted { op_id: u64 },
+    /// `DirectRelayCopy` 的最终结果。
+    DirectRelayDone { op_id: u64, ok: bool, message: String },
     /// 进程详情返回
     ProcDetail {
         pid: u32,

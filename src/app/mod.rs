@@ -136,6 +136,10 @@ pub struct App {
     pending_open_consent: Option<mcp_bridge::PendingOpenConsent>,
     /// 本次运行期间已被用户允许过的已保存连接名（内存态，不持久化；重启后需要重新确认）
     mcp_open_approved: std::collections::HashSet<String>,
+    /// `copy_between_sessions` 进行中的跨会话拷贝作业：这类操作要同时驱动两个会话各自的
+    /// worker（源读、目标写），单个会话的 `pending_file_op` 忙碌位不足以描述多阶段状态，
+    /// 所以单独用这个列表跟踪（见 mcp_bridge.rs 的 `CrossCopyJob`）。
+    cross_copy_jobs: Vec<mcp_bridge::CrossCopyJob>,
 }
 
 impl App {
@@ -220,6 +224,7 @@ impl App {
             mcp_rx,
             pending_open_consent: None,
             mcp_open_approved: std::collections::HashSet::new(),
+            cross_copy_jobs: Vec::new(),
         };
 
         app.apply_demo_flags(cc);
