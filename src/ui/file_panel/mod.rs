@@ -256,11 +256,22 @@ pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Ve
         update_path_trail(state);
         if state.nav_pending_back {
             state.nav_pending_back = false;
+        } else if state.nav_pending_forward {
+            // 前进：离开的目录要能再次「后退」回来，压回后退栈；不清空前进栈本身
+            // （前进栈的弹出已经在按钮点击处完成）。
+            state.nav_pending_forward = false;
+            state.nav_history.push(state.nav_prev.clone());
+            if state.nav_history.len() > 100 {
+                state.nav_history.remove(0);
+            }
         } else if !state.nav_prev.is_empty() {
             state.nav_history.push(state.nav_prev.clone());
             if state.nav_history.len() > 100 {
                 state.nav_history.remove(0);
             }
+            // 普通的「新」导航（面包屑/路径栏/收藏夹/文件树等，非前进后退触发）：
+            // 使旧的前进历史失效——跟浏览器语义一致，走了新路径就不能再前进回旁支了。
+            state.nav_forward.clear();
         }
         state.nav_prev = state.cwd.clone();
     }
