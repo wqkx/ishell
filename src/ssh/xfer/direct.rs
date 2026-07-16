@@ -280,13 +280,19 @@ pub(crate) async fn trust_temp_key(handle: &Handle<ClientHandler>, pub_key_line:
     }
     let ssh_dir = format!("{home}/.ssh");
     let auth_keys = format!("{ssh_dir}/authorized_keys");
+    let lock = format!("{ssh_dir}/.ishell-relay.lock");
+    // 先建 ~/.ssh（flock 的锁文件要落在这里），再在文件锁保护下追加公钥——与并发的
+    // untrust_temp_key 互斥。多个直连拷贝并发写同一台目标主机时，untrust 的 grep→mv
+    // 读改写若和另一次 trust 的追加/另一次 untrust 交错，会丢标记（残留）或互相覆盖；
+    // 用同一把 flock 串行化两者即可根治。flock 缺失（极少见）时 `|| true` 退化为无锁执行
+    //——单次操作本身仍正确（追加是原子的），只是失去跨并发操作的串行保证。
     let cmd = format!(
-        "mkdir -p -m 700 {} && touch {} && chmod 600 {} && printf '%s\\n' {} >> {}",
-        sh_quote(&ssh_dir),
-        sh_quote(&auth_keys),
-        sh_quote(&auth_keys),
-        sh_quote(pub_key_line),
-        sh_quote(&auth_keys),
+        "mkdir -p -m 700 {ssh_dir} && ( flock 9 2>/dev/null || true; \
+         touch {ak} && chmod 600 {ak} && printf '%s\\n' {line} >> {ak} ) 9>{lock}",
+        ssh_dir = sh_quote(&ssh_dir),
+        ak = sh_quote(&auth_keys),
+        line = sh_quote(pub_key_line),
+        lock = sh_quote(&lock),
     );
     let (code, err) = exec_status(handle, &cmd).await?;
     if code != 0 {
@@ -304,8 +310,14 @@ pub(crate) async fn untrust_temp_key(handle: &Handle<ClientHandler>, marker: &st
     if home.is_empty() {
         anyhow::bail!("探测不到远端 HOME");
     }
-    let auth_keys = format!("{home}/.ssh/authorized_keys");
-    let tmp_path = format!("{auth_keys}.ishell_tmp");
+    let ssh_dir = format!("{home}/.ssh");
+    let auth_keys = format!("{ssh_dir}/authorized_keys");
+    let lock = format!("{ssh_dir}/.ishell-relay.lock");
+    // 临时文件名带随机后缀：即使 flock 缺失退化为无锁，并发 untrust 也不会互相踩同一个
+    // 临时文件（叠加下面的 flock 是双保险）。
+    let tmp_path = format!("{auth_keys}.ishell_tmp.{}", super::rand_hex(6));
+    // 与 trust_temp_key 用同一把 flock 串行化，避免并发直连拷贝对同一台目标主机的
+    // authorized_keys 做读改写时互相覆盖/丢标记（见 trust_temp_key 注释）。
     // 注意：不能写成 `grep ... && mv ... || true`——`grep -v` 在“每一行都匹配 marker”
     // （比如这个临时公钥恰好是 authorized_keys 里唯一一行，常见于纯密码认证账户第一次
     // 建立信任的场景）时不会有任何输出，退出码是 1（非 0），`&&` 直接短路、`mv` 被跳过，
@@ -314,14 +326,13 @@ pub(crate) async fn untrust_temp_key(handle: &Handle<ClientHandler>, marker: &st
     // 只有 2+ 才是真正的执行错误（比如文件不可读），此时不应该用这个空/错误的临时文件
     // 覆盖原文件。
     let cmd = format!(
-        "grep -vF {} {} > {} 2>/dev/null; code=$?; \
-         if [ \"$code\" -le 1 ]; then mv {} {}; else rm -f {}; fi",
-        sh_quote(marker),
-        sh_quote(&auth_keys),
-        sh_quote(&tmp_path),
-        sh_quote(&tmp_path),
-        sh_quote(&auth_keys),
-        sh_quote(&tmp_path),
+        "( flock 9 2>/dev/null || true; \
+         grep -vF {marker} {ak} > {tmp} 2>/dev/null; code=$?; \
+         if [ \"$code\" -le 1 ]; then mv {tmp} {ak}; else rm -f {tmp}; fi ) 9>{lock}",
+        marker = sh_quote(marker),
+        ak = sh_quote(&auth_keys),
+        tmp = sh_quote(&tmp_path),
+        lock = sh_quote(&lock),
     );
     let _ = exec_status(handle, &cmd).await;
     Ok(())
