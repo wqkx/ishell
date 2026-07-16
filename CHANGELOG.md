@@ -2,7 +2,7 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
-## [未发布]
+## [0.16.10] - 2026-07-16
 
 ### Fixed
 - **中文输入过程中按下 Shift，已输入的拼音会从输入框里消失**（再敲/删一个字符才重新冒出来），
