@@ -35,18 +35,16 @@ impl Session {
     /// 匹配"而白白 clone 一份内容。
     pub(super) fn file_write_op_would_resolve(&self, id: u64) -> bool {
         self.file_op_tombstones.contains(&id)
-            || matches!(
-                &self.pending_file_op,
-                Some(op) if matches!(op.kind, FileOpKind::Write { op_id } if op_id == id)
+            || self.pending_file_ops.iter().any(
+                |op| matches!(op.kind, FileOpKind::Write { op_id } if op_id == id),
             )
     }
 
     /// 同上，读操作版本。
     pub(super) fn file_read_op_would_resolve(&self, id: u64) -> bool {
         self.file_op_tombstones.contains(&id)
-            || matches!(
-                &self.pending_file_op,
-                Some(op) if matches!(op.kind, FileOpKind::Read { op_id } if op_id == id)
+            || self.pending_file_ops.iter().any(
+                |op| matches!(op.kind, FileOpKind::Read { op_id } if op_id == id),
             )
     }
 
@@ -73,10 +71,10 @@ impl Session {
         self.terminal.cancel_ai_capture();
     }
 
-    /// 放弃当前挂起的文件读写（write_file/read_file）：给等待中的响应通道一个明确的
-    /// "未完成"错误，而不是让它一直空等到超时。用于断线等场景。
+    /// 放弃**全部**挂起的文件读写（write_file/read_file/copy_*）：给每个还在等待的响应
+    /// 通道一个明确的"未完成"错误，而不是让它们一直空等到超时。用于断线等场景。
     pub(super) fn cancel_pending_file_op(&mut self) {
-        if let Some(mut op) = self.pending_file_op.take() {
+        for mut op in self.pending_file_ops.drain(..) {
             if let Some(tx) = op.resp_tx.take() {
                 let _ = tx.send(McpResponse {
                     id: op.req_id,
@@ -98,16 +96,12 @@ impl Session {
         if self.file_op_tombstones.contains(&id) {
             return true;
         }
-        let matches = matches!(
-            &self.pending_file_op,
-            Some(op) if matches!(op.kind, FileOpKind::Write { op_id } if op_id == id)
-        );
-        if !matches {
-            return false;
-        }
-        let Some(mut op) = self.pending_file_op.take() else {
+        let Some(pos) = self.pending_file_ops.iter().position(
+            |op| matches!(op.kind, FileOpKind::Write { op_id } if op_id == id),
+        ) else {
             return false;
         };
+        let mut op = self.pending_file_ops.remove(pos);
         if let Some(tx) = op.resp_tx.take() {
             let req_id = op.req_id;
             let resp = match result {
@@ -131,23 +125,19 @@ impl Session {
         if self.file_op_tombstones.contains(&id) {
             return true;
         }
-        let matches = matches!(
-            &self.pending_file_op,
-            Some(op) if matches!(op.kind, FileOpKind::Read { op_id } if op_id == id)
-        );
-        if !matches {
-            return false;
-        }
-        let Some(mut op) = self.pending_file_op.take() else {
+        let Some(pos) = self.pending_file_ops.iter().position(
+            |op| matches!(op.kind, FileOpKind::Read { op_id } if op_id == id),
+        ) else {
             return false;
         };
+        let mut op = self.pending_file_ops.remove(pos);
         if let Some(tx) = op.resp_tx.take() {
             let req_id = op.req_id;
             let resp = match result {
                 Ok(content) => McpResponse {
                     id: req_id,
                     result: Ok(McpReqResult::FileContent {
-                        // op 已经是从 pending_file_op 里取走的本地所有权、之后不再使用，
+                        // op 已经是从 pending_file_ops 里取走的本地所有权、之后不再使用，
                         // 直接移动 path 而不是 clone。
                         path: op.path,
                         // read_file 允许放宽到 128MB（force），远超单条 JSON 响应该带的量，
@@ -172,9 +162,8 @@ impl Session {
     /// MCP 响应，不影响事件其余部分的处理。
     pub(super) fn file_copy_op_would_resolve(&self, id: u64) -> bool {
         self.file_op_tombstones.contains(&id)
-            || matches!(
-                &self.pending_file_op,
-                Some(op) if matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id)
+            || self.pending_file_ops.iter().any(
+                |op| matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id),
             )
     }
 
@@ -182,16 +171,12 @@ impl Session {
         if self.file_op_tombstones.contains(&id) {
             return true;
         }
-        let matches = matches!(
-            &self.pending_file_op,
-            Some(op) if matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id)
-        );
-        if !matches {
-            return false;
-        }
-        let Some(mut op) = self.pending_file_op.take() else {
+        let Some(pos) = self.pending_file_ops.iter().position(
+            |op| matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id),
+        ) else {
             return false;
         };
+        let mut op = self.pending_file_ops.remove(pos);
         if let Some(tx) = op.resp_tx.take() {
             let req_id = op.req_id;
             let resp = match result {
@@ -223,8 +208,8 @@ pub(super) enum FileOpKind {
     Copy { op_id: u64 },
 }
 
-/// AI 的 `write_file`/`read_file` 请求，正等待 worker 侧 SFTP 操作完成的事件
-/// （同一会话同一时刻只允许一个，跟 `PendingAiRun` 的忙碌保护是同一个思路）。
+/// AI 的 `write_file`/`read_file`/`copy_*` 请求，正等待 worker 侧 SFTP 操作完成的事件。
+/// 同一会话可同时挂多个（见 `Session::pending_file_ops`），各条用 `op_id` 区分。
 pub(super) struct PendingAiFileOp {
     kind: FileOpKind,
     /// 请求的远端路径：Write 用它匹配事件，Read 用于响应里回填 `FileContent.path`。
@@ -233,6 +218,13 @@ pub(super) struct PendingAiFileOp {
     req_id: u64,
     deadline: Instant,
 }
+
+/// 单个会话同时挂起的 AI 文件操作上限。SFTP 天然支持并发、worker 侧的
+/// `MAX_CONCURRENT_XFER` 也会把 copy 类操作限流+排队，所以这里给一个宽松但有界的上限——
+/// 既让 AI 能一次并行发起多文件传输，又防止某个会话上无限堆积 resp_tx/占满 MCP 连接
+/// 信号量（`MAX_MCP_CONNECTIONS`）而饿死 run_command 等其它调用。超过上限的新请求返回
+/// "该会话并发文件操作已达上限，请稍候重试"，由 AI 侧自行退避。
+const MAX_CONCURRENT_FILE_OPS: usize = 16;
 
 /// `copy_between_sessions` 的多阶段状态：优先尝试直连（生成一次性密钥对，临时信任源→目标，
 /// 直连 scp/rsync，无论成败都撤销信任），失败或超时再退化为中转（App 进程内存 duplex，
@@ -842,29 +834,37 @@ impl App {
     /// 清空 pending_file_op，随后姗姗来迟的 drain_events 才处理那个事件，此时已经找不到
     /// 挂起记录去 resolve 了，AI 会收到一个错误的"超时"而不是正确的结果。
     pub(super) fn check_file_op_timeouts(&mut self) {
-        const MAX_TOMBSTONES: usize = 32;
+        // 允许每会话最多 MAX_CONCURRENT_FILE_OPS(16) 个并发操作，一次可能整批超时——墓碑
+        // 缓冲给到 4 波的量，确保迟到事件在被挤出缓冲前几乎总能被识别为"已超时判定过"。
+        const MAX_TOMBSTONES: usize = 64;
+        let now = Instant::now();
         for s in &mut self.sessions {
-            if let Some(op) = s.pending_file_op.as_mut() {
-                if Instant::now() >= op.deadline {
-                    if let Some(tx) = op.resp_tx.take() {
-                        let _ = tx.send(McpResponse {
-                            id: op.req_id,
-                            result: Err("文件操作超时（worker 未在超时前返回结果）".into()),
-                        });
-                    }
-                    // worker 侧的 SFTP 操作没法取消，超时不代表它已经停止——记一个"墓碑"，
-                    // 这样迟到的真实完成事件到达时能被认出来直接丢弃，不会因为
-                    // pending_file_op 已经是 None 就被误路由进普通编辑器 UI。
-                    let op_id = match op.kind {
-                        FileOpKind::Write { op_id }
-                        | FileOpKind::Read { op_id }
-                        | FileOpKind::Copy { op_id } => op_id,
-                    };
-                    s.file_op_tombstones.push_back(op_id);
-                    if s.file_op_tombstones.len() > MAX_TOMBSTONES {
-                        s.file_op_tombstones.pop_front();
-                    }
-                    s.pending_file_op = None;
+            // 就地移除本会话里所有已超时的挂起文件操作（可能有多个并发在跑）；remove 会左移
+            // 后续元素，故命中时不推进下标。
+            let mut i = 0;
+            while i < s.pending_file_ops.len() {
+                if now < s.pending_file_ops[i].deadline {
+                    i += 1;
+                    continue;
+                }
+                let mut op = s.pending_file_ops.remove(i);
+                if let Some(tx) = op.resp_tx.take() {
+                    let _ = tx.send(McpResponse {
+                        id: op.req_id,
+                        result: Err("文件操作超时（worker 未在超时前返回结果）".into()),
+                    });
+                }
+                // worker 侧的 SFTP 操作没法取消，超时不代表它已经停止——记一个"墓碑"，
+                // 这样迟到的真实完成事件到达时能被认出来直接丢弃，不会因为这条已经从
+                // pending_file_ops 移除就被误路由进普通编辑器 UI。
+                let op_id = match op.kind {
+                    FileOpKind::Write { op_id }
+                    | FileOpKind::Read { op_id }
+                    | FileOpKind::Copy { op_id } => op_id,
+                };
+                s.file_op_tombstones.push_back(op_id);
+                if s.file_op_tombstones.len() > MAX_TOMBSTONES {
+                    s.file_op_tombstones.pop_front();
                 }
             }
         }
@@ -1159,16 +1159,14 @@ impl App {
 
     fn resolve_cross_copy_job(&mut self, idx: usize, result: Result<(), String>, method: &str) {
         let job = self.cross_copy_jobs.remove(idx);
-        // 保险起见清一次两侧的 pending_file_op：正常路径下 TransferDone 已经通过
-        // try_resolve_file_copy 自然清空了；这里只处理"某一侧因为提前失败/超时而从没走到
-        // 那一步"的情况，避免 busy-guard 永久占位。
+        // 保险起见清一次两侧为这次 op_id 占位的 pending_file_op：正常路径下 TransferDone
+        // 已经通过 try_resolve_file_copy 自然移除了；这里只处理"某一侧因为提前失败/超时而
+        // 从没走到那一步"的情况，避免占位项永久占着并发名额。
         for uid in [job.src_uid, job.dest_uid] {
             if let Some(sidx) = self.session_idx_by_uid(uid) {
-                let s = &mut self.sessions[sidx];
-                if matches!(&s.pending_file_op, Some(op) if matches!(op.kind, FileOpKind::Copy { op_id } if op_id == job.op_id))
-                {
-                    s.pending_file_op = None;
-                }
+                self.sessions[sidx]
+                    .pending_file_ops
+                    .retain(|op| !matches!(op.kind, FileOpKind::Copy { op_id } if op_id == job.op_id));
             }
         }
         if let Some(tx) = job.resp_tx {
@@ -1515,8 +1513,8 @@ impl App {
                     send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
                     return;
                 }
-                if s.pending_file_op.is_some() {
-                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
+                    send_err(resp_tx, "该会话并发文件操作已达上限，请稍候重试".into());
                     return;
                 }
                 let op_id = std::time::SystemTime::now()
@@ -1541,7 +1539,7 @@ impl App {
                     send_err(resp_tx, "会话的后台连接似乎已经断开，写入未发送，请稍后重试".into());
                     return;
                 }
-                s.pending_file_op = Some(PendingAiFileOp {
+                s.pending_file_ops.push(PendingAiFileOp {
                     kind: FileOpKind::Write { op_id },
                     path,
                     resp_tx: Some(resp_tx),
@@ -1564,8 +1562,8 @@ impl App {
                     send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
                     return;
                 }
-                if s.pending_file_op.is_some() {
-                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
+                    send_err(resp_tx, "该会话并发文件操作已达上限，请稍候重试".into());
                     return;
                 }
                 let op_id = std::time::SystemTime::now()
@@ -1587,7 +1585,7 @@ impl App {
                     send_err(resp_tx, "会话的后台连接似乎已经断开，读取未发送，请稍后重试".into());
                     return;
                 }
-                s.pending_file_op = Some(PendingAiFileOp {
+                s.pending_file_ops.push(PendingAiFileOp {
                     kind: FileOpKind::Read { op_id },
                     path,
                     resp_tx: Some(resp_tx),
@@ -1610,8 +1608,8 @@ impl App {
                     send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
                     return;
                 }
-                if s.pending_file_op.is_some() {
-                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
+                    send_err(resp_tx, "该会话并发文件操作已达上限，请稍候重试".into());
                     return;
                 }
                 if let Err(e) = validate_local_path(&local_path) {
@@ -1650,7 +1648,7 @@ impl App {
                     send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
                     return;
                 }
-                s.pending_file_op = Some(PendingAiFileOp {
+                s.pending_file_ops.push(PendingAiFileOp {
                     kind: FileOpKind::Copy { op_id },
                     path: remote_path,
                     resp_tx: Some(resp_tx),
@@ -1677,8 +1675,8 @@ impl App {
                     send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
                     return;
                 }
-                if s.pending_file_op.is_some() {
-                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
+                    send_err(resp_tx, "该会话并发文件操作已达上限，请稍候重试".into());
                     return;
                 }
                 if let Err(e) = validate_remote_path(&remote_path) {
@@ -1702,7 +1700,7 @@ impl App {
                     send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
                     return;
                 }
-                s.pending_file_op = Some(PendingAiFileOp {
+                s.pending_file_ops.push(PendingAiFileOp {
                     kind: FileOpKind::Copy { op_id },
                     path: remote_path,
                     resp_tx: Some(resp_tx),
@@ -1731,8 +1729,8 @@ impl App {
                     send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
                     return;
                 }
-                if s.pending_file_op.is_some() {
-                    send_err(resp_tx, "该会话已有一个文件读写操作正在进行，请稍候重试".into());
+                if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
+                    send_err(resp_tx, "该会话并发文件操作已达上限，请稍候重试".into());
                     return;
                 }
                 if let Err(e) = validate_remote_path(&remote_path) {
@@ -1758,7 +1756,7 @@ impl App {
                 // resp_tx 就此不再使用（响应已经交给 download_sink 那条路），直接丢弃；
                 // pending_file_op 仍然占位以复用忙碌保护 + TransferDone 收尾记账。
                 drop(resp_tx);
-                s.pending_file_op = Some(PendingAiFileOp {
+                s.pending_file_ops.push(PendingAiFileOp {
                     kind: FileOpKind::Copy { op_id },
                     path: remote_path,
                     resp_tx: None,
@@ -1785,8 +1783,8 @@ impl App {
                     send_err(resp_tx, "源会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
                     return;
                 }
-                if self.sessions[src_idx].pending_file_op.is_some() {
-                    send_err(resp_tx, "源会话已有一个文件读写操作正在进行，请稍候重试".into());
+                if self.sessions[src_idx].pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
+                    send_err(resp_tx, "源会话并发文件操作已达上限，请稍候重试".into());
                     return;
                 }
                 let Some(dest_idx) = self.session_idx_by_uid(dest_session_uid) else {
@@ -1797,8 +1795,8 @@ impl App {
                     send_err(resp_tx, "目标会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
                     return;
                 }
-                if self.sessions[dest_idx].pending_file_op.is_some() {
-                    send_err(resp_tx, "目标会话已有一个文件读写操作正在进行，请稍候重试".into());
+                if self.sessions[dest_idx].pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
+                    send_err(resp_tx, "目标会话并发文件操作已达上限，请稍候重试".into());
                     return;
                 }
                 if let Err(e) = validate_remote_path(&src_remote_path) {
@@ -1839,14 +1837,14 @@ impl App {
                     send_err(resp_tx, "目标会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
                     return;
                 }
-                self.sessions[src_idx].pending_file_op = Some(PendingAiFileOp {
+                self.sessions[src_idx].pending_file_ops.push(PendingAiFileOp {
                     kind: FileOpKind::Copy { op_id },
                     path: src_remote_path.clone(),
                     resp_tx: None,
                     req_id: id,
                     deadline,
                 });
-                self.sessions[dest_idx].pending_file_op = Some(PendingAiFileOp {
+                self.sessions[dest_idx].pending_file_ops.push(PendingAiFileOp {
                     kind: FileOpKind::Copy { op_id },
                     path: dest_remote_path.clone(),
                     resp_tx: None,
