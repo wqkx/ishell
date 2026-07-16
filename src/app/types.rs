@@ -369,7 +369,25 @@ pub(super) struct EditorTab {
     pub(super) tail_carry: Vec<u8>,
     /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
     pub(super) save_done_at: Option<f64>,
+    /// 本次在途保存的唯一操作 id（每次 begin_save 递增分配，作为 WriteFile.id 下发；
+    /// worker 回报的 FileSaved/FileSaveFailed/FileSaveConflict 按它匹配回本标签）。
+    /// 0 = 当前无在途保存。超时判定后置 0：迟到的旧事件因匹配不到任何标签而被安全丢弃，
+    /// 不会误更新一个可能已关闭 / 已重试保存的标签（重试会分配一个新的 save_op）。
+    pub(super) save_op: u64,
+    /// 在途保存的截止时刻（stall 超时：每收到一次写入进度就顺延，见 process_editor_save_events）。
+    /// None = 无在途保存。到点仍未收到结果 → 判定保存超时，转空闲失败态并收尾动画。
+    pub(super) save_deadline: Option<std::time::Instant>,
 }
+
+/// 保存超时阈值（stall 超时：自最后一次写入进度起算）。略高于底层 SFTP 单请求 20s 超时
+/// （见 auth.rs `sftp.set_timeout(20)`），让「SFTP 层超时 → FileSaveFailed」这条能给出精确
+/// 失败原因的路径在常态下优先生效；此处仅兜底 TCP 静默失联（Windows 休眠唤醒 / Wi-Fi 切换 /
+/// VPN 抖动）导致 spawn 出去的 handle_fs_op 长期不返回、标签永久卡在「保存中」的场景。
+pub(super) const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 全局单调递增的保存操作 id 分配器（见 EditorTab::save_op）。每次 begin_save 取一个新值，
+/// 保证任一在途保存的 id 全局唯一——迟到事件据此被可靠地识别、丢弃。
+static SAVE_OP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl EditorTab {
     /// 保存进行中（已发 WriteFile、未收到结果）——期间屏蔽再次保存。
@@ -391,12 +409,16 @@ impl EditorTab {
             }
         )
     }
-    /// 进入「保存中」：记录发出时的修订签名与是否保存后关闭。
+    /// 进入「保存中」：记录发出时的修订签名与是否保存后关闭，并分配本次保存的唯一
+    /// `save_op`（供随后的 WriteFile.id 使用）+ 设定 stall 超时截止时刻。
+    /// 注意：调用方必须在 begin_save **之后**再发送 WriteFile，且 `id` 取本方法赋好的 `self.save_op`。
     pub(super) fn begin_save(&mut self, close_after: bool) {
         self.save = SaveState::Saving {
             rev: self.editor.save_rev(),
             close_after,
         };
+        self.save_op = SAVE_OP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.save_deadline = Some(std::time::Instant::now() + SAVE_TIMEOUT);
     }
     /// 若处于保存中，标记「完成后关闭」（用于保存进行时用户点『保存并关闭』）。
     pub(super) fn request_close_on_saved(&mut self) {
@@ -426,6 +448,10 @@ pub(super) struct EditorState {
     pub(super) tab_drag: Option<usize>,
     pub(super) tab_grab_dx: f32,
     pub(super) tab_total_w: f32,
+    /// 已判定「保存超时」的保存操作 id 墓碑（有界滚动窗口）。迟到的真实
+    /// FileSaved/FileSaveFailed/FileSaveConflict 若命中此表即识别为「超时后的迟到事件」直接丢弃，
+    /// 不再据其更新标签状态（标签可能已被用户关闭 / 已重试保存）。仿 mcp_bridge::file_op_tombstones。
+    pub(super) save_tombstones: std::collections::VecDeque<u64>,
 }
 
 impl EditorState {
@@ -569,6 +595,8 @@ mod save_fsm_tests {
             doc: None,
             tail_carry: Vec::new(),
             save_done_at: None,
+            save_op: 0,
+            save_deadline: None,
         }
     }
 

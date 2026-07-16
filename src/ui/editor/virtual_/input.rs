@@ -249,7 +249,18 @@ pub(super) fn handle_input(
                         v_insert(ed, &t);
                     }
                 }
-                egui::Event::Paste(t) if !t.is_empty() => v_insert(ed, &t),
+                egui::Event::Paste(t) if !t.is_empty() => {
+                    // 编辑器内部内容统一用 LF（保存时按 tab.eol 换行还原，见
+                    // ssh/sftp_write.rs）；粘贴源（尤其 Windows 上的记事本/Office/浏览器）
+                    // 几乎总是 CRLF，不归一化会让裸 \r 混进 content，读起来正常但保存后
+                    // 文件里带杂散 \r，且后续每次比对内容是否变化都会被这些字符干扰。
+                    let t = if t.contains('\r') {
+                        t.replace("\r\n", "\n").replace('\r', "\n")
+                    } else {
+                        t
+                    };
+                    v_insert(ed, &t);
+                }
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => v_insert(ed, &t),
                 egui::Event::Copy => {
                     if let Some(s) = v_sel_range(ed).map(|(a, b)| ed.content[a..b].to_string()) {

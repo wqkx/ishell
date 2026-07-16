@@ -7,7 +7,7 @@ mod widgets;
 pub(in crate::app) use types::{
     DirectFallback, DirectJob, DocKind, EditorState, EditorTab, FileClip, ForwardEntry, ForwardUi,
     ImageTab, ImageView, KbdPrompt, PendingPaste, Popups, ProcPopup, Relay, RelayPhase, SaveState,
-    Shot, Snippets, TabBar, Transfer, Transfers, XferFilter,
+    Shot, Snippets, TabBar, Transfer, Transfers, XferFilter, SAVE_TIMEOUT,
 };
 #[allow(unused_imports)]
 use util::*;

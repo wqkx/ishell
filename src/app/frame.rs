@@ -281,6 +281,10 @@ impl App {
             pdf_searches,
         );
         self.process_editor_save_events(ui, saved, conflicts, save_progress, save_failed);
+        // 必须在 process_editor_save_events 之后：保存超时判定要晚于「本帧是否已带来真正的
+        // 保存结果」的处理，否则会与刚好本帧到达的 FileSaved/Failed/Conflict 打时序竞争
+        //（明明已成功却先被判超时）。理由同 check_file_op_timeouts。
+        self.check_editor_save_timeouts(ui);
 
         // 断线自动重连：到点的执行重连，并安排下次唤醒（即使无交互也能触发）
         let now = std::time::Instant::now();

@@ -81,6 +81,8 @@ impl App {
                         save_done: 0,
                         save_total: 0,
                         save_done_at: None,
+                        save_op: 0,
+                        save_deadline: None,
                         tail_offset: u64::MAX,
                         tail_pending: false,
                         tail_last: 0.0,
@@ -274,12 +276,23 @@ impl App {
                 {
                     t.save_done = done;
                     t.save_total = total;
+                    // 收到写入进度即视为链路仍在推进：顺延 stall 超时截止，避免大文件上传
+                    //（合法地耗时 > SAVE_TIMEOUT）被误判超时。
+                    if t.is_saving() {
+                        t.save_deadline = Some(std::time::Instant::now() + super::SAVE_TIMEOUT);
+                    }
                 }
             }
             let mut close_after_save: Vec<(u64, u64)> = Vec::new(); // (uid, tid)
-            // path 只是事件携带的上下文信息，实际匹配标签靠 (uid, id)——不再需要它，前缀下划线。
+            // 实际匹配标签靠 (uid, id)，其中 id = 本次保存的 save_op（每次 begin_save 唯一分配）。
+            // 用 save_op 而非 tid 匹配，是为了让「超时判定后姗姗来迟」的旧事件天然匹配不到任何
+            // 标签（超时时已把 save_op 清零、重试又分配了新的 save_op）而被安全丢弃。
+            // save_tombstones 是显式识别：命中即「已超时判定过」，直接跳过，不做任何状态更新。
             for (uid, id, _path, mtime) in saved {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.tid == id) {
+                if ed.save_tombstones.contains(&id) {
+                    continue; // 超时后姗姗来迟的成功事件：已判超时，丢弃（标签或已关闭 / 已重试）
+                }
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.save_op == id) {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
                                                // 取出本次保存发出时的签名与关闭意图（Saving 状态里）；非 Saving 则忽略这条确认。
                     let (sent_rev, close_after) = match &t.save {
@@ -290,6 +303,8 @@ impl App {
                     //（保存期间用户又编辑、或切了编码/行尾 → 远端并非该状态，不能清 dirty，也不能关闭）
                     if t.editor.save_rev() == sent_rev {
                         t.save = SaveState::Idle;
+                        t.save_op = 0; // 结束在途保存：清 save_op / deadline（避免被误判超时）
+                        t.save_deadline = None;
                         t.editor.mark_saved();
                         if close_after {
                             close_after_save.push((uid, t.tid));
@@ -297,8 +312,9 @@ impl App {
                     } else if close_after {
                         // 保存期间内容又变了但用户要「保存并关闭」：用最新内容再存一次，
                         // 存完（届时签名一致）再关闭；否则「保存并关闭」会静默不生效。
+                        t.begin_save(true); // 重新进入保存中（新的 save_op / deadline），保持关闭意图
                         let _ = t.cmd_tx.send(UiCommand::WriteFile {
-                            id: t.tid,
+                            id: t.save_op,
                             path: t.editor.path.clone(),
                             content: t.editor.content.clone(),
                             encoding: t.editor.encoding().to_string(),
@@ -306,24 +322,35 @@ impl App {
                             expect_mtime: t.editor.mtime(),
                             force: false,
                         });
-                        t.begin_save(true); // 重新进入保存中，保持关闭意图
                     } else {
                         // 保存成功但内容已变、无关闭意图：解锁，保留 dirty 交用户再存
                         t.save = SaveState::Idle;
+                        t.save_op = 0;
+                        t.save_deadline = None;
                     }
                 }
             }
             for (uid, id, _path) in conflicts {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.tid == id) {
+                if ed.save_tombstones.contains(&id) {
+                    continue; // 超时后姗姗来迟的冲突事件：丢弃
+                }
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.save_op == id) {
                     // 冲突：进入 Conflict（未写入，保留 dirty）；「保存并关闭」意图自然丢弃，交用户处理
                     t.save = SaveState::Conflict;
+                    t.save_op = 0; // 结束在途保存
+                    t.save_deadline = None;
                     t.save_at = None; // 冲突未写入：中止「已保存」动画
                     t.save_done_at = None;
                 }
             }
             for (uid, id, _path, message) in save_failed {
-                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.tid == id) {
+                if ed.save_tombstones.contains(&id) {
+                    continue; // 超时后姗姗来迟的失败事件：已判超时并已提示，丢弃（避免重复报错 / 打扰已重试的保存）
+                }
+                if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.save_op == id) {
                     t.save = SaveState::Idle; // 失败：解锁重试；dirty 未被清，标签仍显示未保存；关闭意图丢弃
+                    t.save_op = 0; // 结束在途保存
+                    t.save_deadline = None;
                     t.save_at = None; // 中止保存动画
                     t.save_done_at = None;
                 }
@@ -343,5 +370,60 @@ impl App {
             }
             ui.ctx()
                 .request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
-        }    }
+        }
+    }
+
+    /// 检查各编辑器标签是否有「保存超时」：进入保存中后（或最后一次写入进度后）超过
+    /// `SAVE_TIMEOUT` 仍未收到 FileSaved/FileSaveFailed/FileSaveConflict。**必须在本帧
+    /// `process_editor_save_events`（真正消化保存结果事件、resolve 在途保存的地方）之后调用**
+    /// ——否则会与「本帧恰好到达的保存完成事件」打时序竞争：明明已成功却先被判超时
+    /// （原因同 mcp_bridge::check_file_op_timeouts）。
+    ///
+    /// 超时判定：把标签从 Saving 解锁回 Idle（保留 dirty，交用户重试）、清 save_op/deadline、
+    /// 收尾「珊瑚→绿」保存动画（复用失败分支的 save_at/save_done_at 清理），并把该 save_op
+    /// 记入 save_tombstones——这样即便底层 SFTP 操作最终返回，那条迟到事件也会被识别、丢弃，
+    /// 不会误更新一个可能已被用户关闭 / 已重试保存的标签。
+    pub(super) fn check_editor_save_timeouts(&mut self, ui: &mut egui::Ui) {
+        const MAX_TOMBSTONES: usize = 32;
+        let now_i = std::time::Instant::now();
+        let mut ed = lock_mutex(&self.editor_state);
+        // 先收集本帧超时的 save_op（借用期内不能同时改 ed.save_tombstones），再统一登记墓碑。
+        let mut expired_ops: Vec<u64> = Vec::new();
+        for t in ed.tabs.iter_mut() {
+            if !t.is_saving() {
+                continue;
+            }
+            if t.save_deadline.map(|d| now_i >= d) != Some(true) {
+                continue;
+            }
+            expired_ops.push(t.save_op);
+            // 解锁 + 收尾动画（与 save_failed 分支完全一致：保留 dirty、清动画状态）
+            t.save = SaveState::Idle;
+            t.save_op = 0;
+            t.save_deadline = None;
+            t.save_at = None;
+            t.save_done_at = None;
+            t.save_done = 0;
+            t.save_total = 0;
+        }
+        if expired_ops.is_empty() {
+            return; // 无超时：不加锁 toast、不请求重绘
+        }
+        for op in expired_ops {
+            ed.save_tombstones.push_back(op);
+        }
+        while ed.save_tombstones.len() > MAX_TOMBSTONES {
+            ed.save_tombstones.pop_front();
+        }
+        drop(ed); // 释放编辑器状态锁后再动 self.toast（不同字段，本可并存；显式 drop 更清晰）
+        self.toast = Some((
+            match crate::i18n::current() {
+                crate::i18n::Lang::Zh => "保存超时，请检查网络连接".to_string(),
+                crate::i18n::Lang::En => "Save timed out; check your network connection".to_string(),
+            },
+            ui.input(|i| i.time),
+        ));
+        ui.ctx()
+            .request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+    }
 }

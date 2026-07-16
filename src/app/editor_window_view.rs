@@ -314,8 +314,10 @@ impl App {
                                                     )
                                                     .clicked()
                                                 {
+                                                    // 先进入「保存中」（分配本次 save_op / 超时截止），再据此发送 WriteFile
+                                                    tab.begin_save(false); // 覆盖保存进行中，屏蔽再次保存直至结果返回或超时
                                                     let _ = tab.cmd_tx.send(UiCommand::WriteFile {
-                                                        id: tab.tid,
+                                                        id: tab.save_op,
                                                         path: tab.editor.path.clone(),
                                                         content: tab.editor.content.clone(),
                                                         encoding: tab.editor.encoding().to_string(),
@@ -323,7 +325,6 @@ impl App {
                                                         expect_mtime: tab.editor.mtime(),
                                                         force: true,
                                                     });
-                                                    tab.begin_save(false); // 覆盖保存进行中，屏蔽再次保存直至结果返回
                                                 }
                                             },
                                         );
@@ -385,9 +386,13 @@ impl App {
                     .get(active)
                     .is_some_and(|t| t.editor.dirty() && !t.is_saving() && !t.editor.is_readonly());
                 if should {
-                    if let Some(tab) = ed.tabs.get(active) {
+                    if let Some(tab) = ed.tabs.get_mut(active) {
+                        // 先进入「保存中」（分配本次 save_op / 超时截止），再据此发送 WriteFile。
+                        // 不在此处 mark_saved：只有收到服务器 FileSaved 确认（且签名一致）
+                        // 才清 dirty——发送失败/远端写失败时标签必须仍是「未保存」。
+                        tab.begin_save(false); // 保存进行中，收到 FileSaved/Conflict/Failed 或超时前屏蔽再次保存
                         let _ = tab.cmd_tx.send(UiCommand::WriteFile {
-                            id: tab.tid,
+                            id: tab.save_op,
                             path: tab.editor.path.clone(),
                             content: tab.editor.content.clone(),
                             encoding: tab.editor.encoding().to_string(),
@@ -395,12 +400,7 @@ impl App {
                             expect_mtime: tab.editor.mtime(),
                             force: false,
                         });
-                    }
-                    if let Some(tab) = ed.tabs.get_mut(active) {
-                        // 不在此处 mark_saved：只有收到服务器 FileSaved 确认（且签名一致）
-                        // 才清 dirty——发送失败/远端写失败时标签必须仍是「未保存」
-                        tab.begin_save(false); // 保存进行中，收到 FileSaved/Conflict/Failed 前屏蔽再次保存
-                                               // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画（重置进度，跟随本次写入）
+                        // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画（重置进度，跟随本次写入）
                         tab.save_at = Some(vctx.input(|i| i.time));
                         tab.save_done_at = None;
                         tab.save_done = 0;
@@ -485,8 +485,9 @@ impl App {
                         // 失败/冲突则保留标签（否则本地修改的唯一副本会随标签一起消失）
                         if let Some(t) = ed.tabs.get_mut(ti) {
                             if !t.is_saving() {
+                                t.begin_save(true); // 保存中，且完成后关闭（先分配 save_op / 超时截止）
                                 let _ = t.cmd_tx.send(UiCommand::WriteFile {
-                                    id: t.tid,
+                                    id: t.save_op,
                                     path: t.editor.path.clone(),
                                     content: t.editor.content.clone(),
                                     encoding: t.editor.encoding().to_string(),
@@ -494,7 +495,6 @@ impl App {
                                     expect_mtime: t.editor.mtime(),
                                     force: false,
                                 });
-                                t.begin_save(true); // 保存中，且完成后关闭
                                 t.save_at = Some(vctx.input(|i| i.time));
                                 t.save_done_at = None;
                                 t.save_done = 0;
