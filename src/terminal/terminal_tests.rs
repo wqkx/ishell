@@ -449,3 +449,35 @@ fn copy_paste_shortcuts_are_not_sent_to_terminal() {
     assert!(enc(egui::Key::C, cs, false).is_empty());
     assert!(enc(egui::Key::V, cs, false).is_empty());
 }
+
+/// 回归：从终端复制被「软换行」折断的长行时，不能凭空插入换行符。
+/// 现象：一条没有换行的长命令/URL 被终端折到多屏幕行，复制粘贴出来却带了 \n，
+/// 把命令拆断。根因是 selected_text 无条件在行间补 \n，没区分软换行与真实换行。
+#[test]
+fn selection_does_not_insert_newline_across_soft_wrap() {
+    let mut t = Terminal::new();
+    assert!(t.resize(10, 4)); // 10 列，方便构造折行
+    // 24 个字符、中间没有任何 \n：终端会把它折成 3 个屏幕行，并给前两行置 wrapped
+    t.feed(b"abcdefghijklmnopqrstuvwx");
+    assert!(t.parser.screen().row_wrapped(0), "前提：第 0 行应是软换行");
+    assert!(t.parser.screen().row_wrapped(1), "前提：第 1 行应是软换行");
+
+    t.sel_anchor = Some((0, 0));
+    t.sel_cursor = Some((2, 3)); // 选到第三行的 'x'
+    let s = t.selected_text().unwrap();
+    assert_eq!(s, "abcdefghijklmnopqrstuvwx", "软换行不该变成 \\n");
+    assert!(!s.contains('\n'));
+}
+
+/// 对照：真实换行（收到 \n）仍要保留换行符，别把两条命令粘成一条。
+#[test]
+fn selection_keeps_newline_for_real_line_break() {
+    let mut t = Terminal::new();
+    assert!(t.resize(20, 4));
+    t.feed(b"line-one\r\nline-two");
+    assert!(!t.parser.screen().row_wrapped(0), "前提：第 0 行是真实换行、非软换行");
+
+    t.sel_anchor = Some((0, 0));
+    t.sel_cursor = Some((1, 7));
+    assert_eq!(t.selected_text().unwrap(), "line-one\nline-two");
+}
