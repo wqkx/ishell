@@ -605,6 +605,70 @@ impl App {
             });
         });
     }
+
+    /// AI 想对**用户自己打开的**会话做写入类操作时的授权弹窗（见 `PendingUseConsent`）。
+    ///
+    /// 和上面「新开会话」那个确认框是两回事：那个批准的是"动用某条已保存连接的凭据"，
+    /// 这个批准的是"往我正在用的这个 shell 里插手"——AI 开的会话是只读的、不会和用户抢
+    /// 输入，用户自己的会话没这层保护，所以要单独确认，且授权只对这一个会话生效。
+    pub(super) fn handle_ai_use_consent(&mut self, ctx: &egui::Context) {
+        let Some((title, action)) = self
+            .pending_use_consent
+            .as_ref()
+            .map(|p| (p.title.clone(), p.action.clone()))
+        else {
+            return;
+        };
+        egui::Modal::new(egui::Id::new("ai_use_consent_modal")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(crate::i18n::tr(
+                        "AI 请求操作你的终端会话",
+                        "AI wants to act in your terminal session",
+                    ))
+                    .size(16.0)
+                    .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!(
+                        "“{title}” 是你自己打开的会话，AI 想在里面{action}。\n\n\
+                         允许后你和 AI 会同时能往这个 shell 里输入，两边的按键可能互相打断。\
+                         更稳妥的做法是拒绝，让 AI 用 open_session 开一个它专用的只读会话。"
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "“{title}” is a session you opened yourself, and AI wants to {action} in it.\n\n\
+                         If you allow this, you and AI can both type into the same shell and your \
+                         keystrokes may interleave. Denying is usually safer: AI can call \
+                         open_session to get a read-only session of its own."
+                    ),
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(crate::i18n::tr(
+                        "允许后这个会话在本次运行期间不再询问（重启 iShell 后失效）",
+                        "Allowing stops the prompts for this session until iShell restarts",
+                    ))
+                    .size(11.0)
+                    .color(Palette::TEXT_DIM),
+                );
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let bw = 96.0;
+                let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                let space = ((ui.available_width() - total) / 2.0).max(0.0);
+                ui.add_space(space);
+                if dialog_button(ui, crate::i18n::tr("允许", "Allow"), Some(Palette::ACCENT), bw) {
+                    self.resolve_use_consent(true);
+                }
+                if dialog_button(ui, crate::i18n::tr("拒绝", "Deny"), Some(Palette::DANGER), bw) {
+                    self.resolve_use_consent(false);
+                }
+            });
+        });
+    }
 }
 
 impl App {}

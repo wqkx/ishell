@@ -476,7 +476,18 @@ impl IshellMcp {
         Self
     }
 
-    #[tool(description = "列出 iShell 当前打开的所有终端会话（uid、标题、主机、连接状态、远端工作目录）")]
+    #[tool(
+        description = "列出 iShell 当前打开的所有终端会话（uid、标题、主机、连接状态、远端工作目录、\
+                        是否为 AI 自己开的会话）。\
+                        注意 ai_owned 字段：true = 你自己用 open_session 开的专用会话，只读给用户看、\
+                        用户的键盘输入不会进去，你可以随便用；false = **用户本人正在用的会话**，他随时\
+                        可能在里面敲字。默认不要往 ai_owned=false 的会话里写（run_command / send_input / \
+                        interrupt / write_file / copy_to_remote 等）——两路输入会在同一个 shell 里交织，\
+                        轻则互相打断、重则把 run_command 判断命令结束用的哨兵标记搅乱，还可能误操作用户\
+                        正在做的事。需要执行东西就用 open_session 开一个自己的会话。确实必须用用户那个\
+                        会话时（比如要复用他已经 cd 到的目录、已经激活的 venv、已经 sudo 的状态），调用\
+                        会照常发出，但 iShell 会弹窗让用户当面授权一次，用户同意后该会话不再询问。"
+    )]
     async fn list_sessions(&self) -> Result<CallToolResult, McpError> {
         text_result(call(McpReqKind::ListSessions).await)
     }
@@ -798,17 +809,25 @@ impl IshellMcp {
                     直接开 ssh 会丢失用户已经建立的会话上下文（cwd、环境变量、shell 历史、\
                     已登录状态），也不会显示给用户看。只有确认 iShell 没在跑、或用户明确要求\
                     你自己开一条独立 ssh 连接时，才退回直接用 ssh。\
-                    用法：list_sessions 看有哪些已打开的会话 → 需要的目标不在列表里时先用 \
-                    list_saved_connections 核对有哪些已保存连接、名字怎么拼，再用 open_session\
-                    （首次使用某条连接会让用户当面确认）新开一个（这类会话只读，仅供你操作，\
-                    用户不能往里打字）→ run_command 执行命令并等待完成 → 超时用 poll_run 续等\
+                    用法：list_sessions 看有哪些已打开的会话，重点看 ai_owned 字段 → **默认给自己\
+                    开一个专用会话**，而不是接管列表里现成的：用 list_saved_connections 核对有哪些\
+                    已保存连接、名字怎么拼，再用 open_session（首次使用某条连接会让用户当面确认）\
+                    新开一个（这类会话 ai_owned=true，只读，仅供你操作，用户不能往里打字，你怎么\
+                    折腾都不会干扰到他）→ run_command 执行命令并等待完成 → 超时用 poll_run 续等\
                     （不会重发命令）→ 遇到 run_command/poll_run 覆盖不到的交互式提示（sudo 密码、\
                     vim/REPL 里继续输入）用 send_input 直接发原始按键 → read_screen 看当前屏幕\
                     （适合 vim/top 等交互式程序）→ read_history 看这个会话从头到现在的完整历史\
                     （不止当前一屏）→ interrupt 发 Ctrl+C 中断。用 open_session 开的会话不再需要\
                     时应主动用 close_session 关掉（只能关自己开的，不能关用户自己的会话），\
-                    避免一直占着连接。用户自己在用的会话里，命令和输出会实时显示在其正在看的\
-                    终端标签里。\
+                    避免一直占着连接。\
+                    不要直接拿用户自己打开的会话（list_sessions 里 ai_owned=false 的那些）执行命令\
+                    或写文件：他随时可能正在里面敲字，两路输入会在同一个 shell 里交织，轻则互相\
+                    打断、重则把 run_command 用来判断命令结束的哨兵标记搅乱，也容易误操作他正在\
+                    做的事。确实必须复用他那个会话的上下文时（比如要用他已经 cd 到的目录、已经\
+                    激活的 venv、已经 sudo 的状态），照常发调用即可——iShell 会弹窗让用户当面授权\
+                    一次，同意后这个会话不再询问；用户拒绝或 5 分钟没响应你会收到报错，那就改用 \
+                    open_session 开自己的会话。只读类操作（read_screen/read_history/read_file）\
+                    不受此限，随时可以用来看用户会话里发生了什么。\
                     需要同步/生成远端文件时用 write_file/read_file（复用 SFTP，不用另开 scp）。\
                     长任务不要用 `sleep N` 反复轮询——run_command/poll_run 的 timeout_ms 最长支持\
                     24 小时，直接传一个足够长的值（比如几十分钟），一次调用等到跑完更省事。\

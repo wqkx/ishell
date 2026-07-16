@@ -533,6 +533,102 @@ pub(super) struct PendingOpenConsent {
     deadline: Instant,
 }
 
+/// AI 想对**用户自己打开的**会话做写入类操作（往 shell 里打字、改远端文件），而这个会话
+/// 本次运行期间还没被授权过——弹窗让用户当面确认。
+///
+/// 这里扣住的是**整个** `McpCall`（连同 `upload_source`/`download_sink` 两条字节流通道），
+/// 用户点「允许」后原样丢回 `handle_mcp_call` 重跑一遍即可，不需要把请求拆开重建：那样既
+/// 要为每个变体写一遍恢复逻辑，也很容易在新增变体时漏掉。重跑时 uid 已进批准集合，不会
+/// 再次落到这个分支，所以不会递归。
+pub(super) struct PendingUseConsent {
+    call: McpCall,
+    /// 待授权的会话 uid（`write_target_uids` 里第一个未获批的）。
+    pub(super) uid: u64,
+    /// 会话标签名，给弹窗显示用（发起时刻的快照）。
+    pub(super) title: String,
+    /// 给用户看的一句话：AI 具体想干什么。
+    pub(super) action: String,
+    deadline: Instant,
+}
+
+/// 给用户看的一句话：AI 具体想拿这个会话干什么。
+///
+/// 授权弹窗必须靠它做到知情同意——只说一句「AI 想操作这个会话」，用户没有任何依据判断该不该
+/// 点允许；把真实的命令/路径摆出来，才谈得上"当面确认"。
+fn action_summary(kind: &McpReqKind) -> String {
+    /// 命令和文件内容可能很长、还可能带换行，弹窗里要能一眼看完：压成单行再按**字符**截断
+    /// （不能按字节切，中文会切出半个字导致 panic）。
+    fn brief(s: &str, max: usize) -> String {
+        let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        match one.char_indices().nth(max) {
+            None => one,
+            Some((i, _)) => format!("{}…", &one[..i]),
+        }
+    }
+    let zh = matches!(crate::i18n::current(), crate::i18n::Lang::Zh);
+    match kind {
+        McpReqKind::RunCommand { command, .. } => {
+            let c = brief(command, 80);
+            if zh {
+                format!("执行命令：{c}")
+            } else {
+                format!("run the command: {c}")
+            }
+        }
+        McpReqKind::SendInput { text, .. } => {
+            let t = brief(text, 40);
+            if zh {
+                format!("直接发送按键/文本：{t}")
+            } else {
+                format!("send raw keystrokes/text: {t}")
+            }
+        }
+        McpReqKind::Interrupt { .. } => {
+            if zh {
+                "发送 Ctrl+C 中断当前前台程序".into()
+            } else {
+                "send Ctrl+C to interrupt the foreground program".into()
+            }
+        }
+        McpReqKind::WriteFile { path, .. } => {
+            if zh {
+                format!("覆盖写入远端文件：{path}")
+            } else {
+                format!("overwrite the remote file: {path}")
+            }
+        }
+        McpReqKind::CopyToRemote { remote_path, .. }
+        | McpReqKind::CopyToRemoteFromCaller { remote_path, .. } => {
+            if zh {
+                format!("复制文件到远端：{remote_path}")
+            } else {
+                format!("copy a file to: {remote_path}")
+            }
+        }
+        McpReqKind::CopyBetweenSessions {
+            src_remote_path,
+            dest_remote_path,
+            ..
+        } => {
+            if zh {
+                format!("跨主机复制文件：{src_remote_path} → {dest_remote_path}")
+            } else {
+                format!("copy a file across hosts: {src_remote_path} → {dest_remote_path}")
+            }
+        }
+        // 只读类操作的 `write_target_uids` 返回空，根本走不到授权弹窗。这里给兜底文案而不是
+        // `unreachable!()`：万一将来改动漏了判定，弹一句"未知操作"让用户去拒绝，比让整个
+        // 应用 panic 掉安全得多。
+        _ => {
+            if zh {
+                "未知操作".into()
+            } else {
+                "an unrecognised operation".into()
+            }
+        }
+    }
+}
+
 /// 启动 socket 监听（若用户未在设置里开启 AI 控制，返回一个永远收不到数据的空通道）。
 /// 整套本地 IPC 建立在 Unix domain socket 上，tokio 的 UnixListener/UnixStream 只在 unix
 /// 平台提供——Windows 上这个特性眼下确实不支持，下面 `#[cfg(not(unix))]` 版本直接返回一个
@@ -823,6 +919,22 @@ impl App {
                     });
                 }
                 self.pending_open_consent = None;
+            }
+        }
+        if let Some(pending) = self.pending_use_consent.as_ref() {
+            if Instant::now() >= pending.deadline {
+                // 整个 McpCall 被扣在这里，超时必须把它取出来回一条错，否则调用方那边就是
+                // 一条永远不回的请求（只能干等到它自己的 timeout_ms）。
+                let pending = self.pending_use_consent.take().expect("上一行刚确认是 Some");
+                let id = pending.call.req.id;
+                let _ = pending.call.resp_tx.send(McpResponse {
+                    id,
+                    result: Err(
+                        "等待用户确认超时（5 分钟），已自动拒绝：这是用户自己打开的会话，需要\
+                         用户当面授权。请改用 open_session 开一个 AI 专用会话，或让用户切回\
+                         iShell 点击确认弹窗后重试".into(),
+                    ),
+                });
             }
         }
     }
@@ -1196,6 +1308,7 @@ impl App {
             host: s.cfg.host.clone(),
             connected: s.connected,
             cwd: s.terminal.cwd().map(|c| c.to_string()),
+            ai_owned: s.ai_owned,
         };
         let _ = resp_tx.send(McpResponse {
             id,
@@ -1248,7 +1361,70 @@ impl App {
         )
     }
 
+    /// 写入类操作的会话门禁：目标若是**用户自己打开的**会话且本次运行还没授权过，扣下请求
+    /// 弹窗等用户当面确认。放行则原样返回 `call`；扣下（或直接回错）返回 `None`。
+    fn gate_user_session_write(&mut self, call: McpCall) -> Option<McpCall> {
+        // 目标会话不存在时不在这里拦：让它照常走下去，由各分支回「会话不存在 + 当前可用
+        // 会话列表」那条更有用的报错，而不是在这里含混地说一句"需要授权"。
+        let Some(uid) = call.req.kind.write_target_uids().into_iter().find(|uid| {
+            !self.mcp_use_approved.contains(uid)
+                && self
+                    .session_idx_by_uid(*uid)
+                    .is_some_and(|idx| !self.sessions[idx].ai_owned)
+        }) else {
+            return Some(call);
+        };
+        let id = call.req.id;
+        // 同一时刻只挂一个确认框：两个叠在一起用户根本分不清在批准哪个。
+        if self.pending_use_consent.is_some() || self.pending_open_consent.is_some() {
+            let _ = call.resp_tx.send(McpResponse {
+                id,
+                result: Err("已有一个请求正在等待用户确认，请稍候重试".into()),
+            });
+            return None;
+        }
+        let idx = self.session_idx_by_uid(uid).expect("上面刚确认过这个会话存在");
+        let title = self.sessions[idx].title.clone();
+        let action = action_summary(&call.req.kind);
+        self.pending_use_consent = Some(PendingUseConsent {
+            call,
+            uid,
+            title,
+            action,
+            // 与 open_session 的确认框同样给 5 分钟：用户可能不在电脑前。
+            deadline: Instant::now() + Duration::from_secs(300),
+        });
+        None
+    }
+
+    /// 用户在写入授权弹窗里点了「允许」/「拒绝」。
+    pub(super) fn resolve_use_consent(&mut self, allow: bool) {
+        let Some(pending) = self.pending_use_consent.take() else {
+            return;
+        };
+        if !allow {
+            let id = pending.call.req.id;
+            let _ = pending.call.resp_tx.send(McpResponse {
+                id,
+                result: Err(format!(
+                    "用户拒绝了对会话 uid={} 的这次操作。这是用户自己打开的会话，AI 不应直接\
+                     使用——请改用 open_session 开一个自己的专用会话",
+                    pending.uid
+                )),
+            });
+            return;
+        }
+        // 记住这个会话 uid，后续写入不再打扰用户。uid 由 next_uid 单调分配、只增不复用
+        // （session.rs），且这个集合只活在进程内存里，所以不存在"授权被后开的会话捡到"。
+        self.mcp_use_approved.insert(pending.uid);
+        self.handle_mcp_call(pending.call);
+    }
+
     fn handle_mcp_call(&mut self, call: McpCall) {
+        // 先过会话门禁：放行的才继续。重跑时 uid 已在批准集合里，不会再落回这里，不递归。
+        let Some(call) = self.gate_user_session_write(call) else {
+            return;
+        };
         let McpCall { req, resp_tx, upload_source, download_sink } = call;
         let id = req.id;
         let send_err = |resp_tx: oneshot::Sender<McpResponse>, msg: String| {
@@ -1268,6 +1444,7 @@ impl App {
                         host: s.cfg.host.clone(),
                         connected: s.connected,
                         cwd: s.terminal.cwd().map(|c| c.to_string()),
+                        ai_owned: s.ai_owned,
                     })
                     .collect();
                 let _ = resp_tx.send(McpResponse {
@@ -1422,8 +1599,10 @@ impl App {
                     self.do_open_session(&c, id, resp_tx);
                     return;
                 }
-                if self.pending_open_consent.is_some() {
-                    send_err(resp_tx, "已有一个连接请求正在等待用户确认，请稍候重试".into());
+                // 两种确认框（新开会话 / 写入用户会话）任一挂着就不再叠第二个：两个 modal
+                // 同时弹出来，用户根本分不清自己在批准哪一个。
+                if self.pending_open_consent.is_some() || self.pending_use_consent.is_some() {
+                    send_err(resp_tx, "已有一个请求正在等待用户确认，请稍候重试".into());
                     return;
                 }
                 // 首次用这条已保存连接给 AI 开会话：弹窗等用户当面批准，而不是仅凭 AI 传的

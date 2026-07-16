@@ -131,6 +131,12 @@ pub struct App {
     mcp_rx: tokio::sync::mpsc::UnboundedReceiver<mcp_bridge::McpCall>,
     /// AI 请求 `open_session` 时待用户确认的一条连接请求（同一时刻只允许一条待确认）
     pending_open_consent: Option<mcp_bridge::PendingOpenConsent>,
+    /// AI 想对用户自己打开的会话做写入类操作，正等用户当面授权。
+    pending_use_consent: Option<mcp_bridge::PendingUseConsent>,
+    /// 用户已授权 AI 写入的会话 uid（即用户自己打开、但明确授权过的那些）。只活在进程
+    /// 内存里，重启 iShell 一律重新授权；uid 由 `next_uid` 单调分配、不复用，所以不存在
+    /// 授权被后开的会话捡到的问题。
+    mcp_use_approved: std::collections::HashSet<u64>,
     /// 本次运行期间已被用户允许过的已保存连接名（内存态，不持久化；重启后需要重新确认）
     mcp_open_approved: std::collections::HashSet<String>,
     /// `copy_between_sessions` 进行中的跨会话拷贝作业：这类操作要同时驱动两个会话各自的
@@ -220,6 +226,8 @@ impl App {
             logo: std::env::var("ISHELL_LOGO").is_ok() || std::env::var("ISHELL_ICON").is_ok(),
             mcp_rx,
             pending_open_consent: None,
+            pending_use_consent: None,
+            mcp_use_approved: std::collections::HashSet::new(),
             mcp_open_approved: std::collections::HashSet::new(),
             cross_copy_jobs: Vec::new(),
         };
@@ -520,6 +528,7 @@ impl eframe::App for App {
         // 关闭确认：仍有会话连接时，先弹确认
         self.handle_close(&ctx);
         self.handle_ai_open_consent(&ctx);
+        self.handle_ai_use_consent(&ctx);
 
         // 自检截图驱动
         self.drive_screenshot(&ctx);

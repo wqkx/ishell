@@ -4,6 +4,28 @@
 
 ## [未发布]
 
+### Security
+- **AI 可以不经任何确认，直接往用户自己打开的会话里执行命令**（用户和 AI 同时能往同一个
+  shell 里打字）：`open_session` 那道「让用户当面确认」的门禁只挂在开会话这一条路上，而
+  `run_command`/`send_input`/`interrupt`/`write_file`/`copy_to_remote` 等全都是拿 `session_uid`
+  直接找会话就干活——`ai_owned` 这个标记此前**只有 `close_session` 一处在检查**。于是 AI 只要
+  `list_sessions` 看到用户已经打开的会话，直接 `run_command` 上去即可，完全绕过确认。雪上加霜
+  的是 `McpSessionInfo` 根本没有 `ai_owned` 字段，AI 连"这是用户的会话、不该碰"都无从判断。
+  而用户的会话没有 `ai_owned` 会话那层「不转发用户键盘输入」的只读保护，两路输入会在同一个
+  shell 里交织：轻则互相打断，重则把 `run_command` 用来判断命令结束的哨兵标记行搅乱。
+  现在：写入类操作若目标是用户自己打开的会话，弹窗让用户当面授权一次（授权按会话 uid 记住，
+  内存态，重启 iShell 失效），弹窗里会写明 AI 具体要执行的命令/要覆盖的路径，而不是只说一句
+  「AI 想操作这个会话」；`copy_between_sessions` 的源和目标两个会话都要授权（直连模式会往源
+  主机落临时私钥、往目标主机的 `authorized_keys` 临时写一行，两边都在改远端状态）。只读操作
+  （`read_screen`/`read_history`/`read_file`/`poll_run`）不受限——它们不碰用户的 shell、也不改
+  远端状态。`close_session` 维持原样的**直接拒绝**（关闭权限不应该超过打开权限，不接受授权）
+
+### Added
+- `list_sessions` 返回值新增 `ai_owned` 字段，AI 终于能分辨哪些会话是用户自己打开的；工具
+  描述与服务器说明也相应改口：此前写的是「list_sessions 看有哪些已打开的会话 → 需要的目标
+  **不在列表里时**再 open_session」，等于明说「列表里有就直接拿来用」，现在改为默认给自己开
+  专用会话、不要接管用户的窗口
+
 ### Removed
 - **回退 0.16.10 引入的 vendor `egui-winit` 补丁**（连同 `vendor/egui-winit` 整个目录）：实测
   证明它在目标环境下**从未生效**，0.16.10 记载的根因是错的。真实根因不在 iShell 也不在

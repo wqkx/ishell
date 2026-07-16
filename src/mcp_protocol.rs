@@ -14,6 +14,13 @@ pub struct McpSessionInfo {
     pub connected: bool,
     /// 远端当前工作目录（需用户已同意过 OSC 7 注入才有值）。
     pub cwd: Option<String>,
+    /// 这个会话是不是 AI 自己用 `open_session` 开的。
+    ///
+    /// `false` = 用户自己打开的会话。这类会话用户本人随时可能在里面敲字，AI 再往同一个
+    /// shell 里写就是两路输入交织：轻则互相打断，重则把 `run_command` 用来判断命令结束的
+    /// 哨兵标记行搅乱。所以写入类操作（见 `McpReqKind::write_target_uids`）默认走不通，
+    /// 需要用户当面授权一次。调用方应当优先 `open_session` 开自己的专用会话。
+    pub ai_owned: bool,
 }
 
 /// 一条已保存连接的摘要（`list_saved_connections` 的返回项）。不含密码/密钥等敏感字段——
@@ -142,6 +149,145 @@ pub enum McpReqKind {
         dest_remote_path: String,
         timeout_ms: u64,
     },
+}
+
+impl McpReqKind {
+    /// 本请求会「往 shell 里打字」或「改远端状态」的目标会话 uid。
+    ///
+    /// 用户自己打开的会话，对这些操作要用户当面一次性授权后才放行；只读类操作不在此列——
+    /// 它们既不干扰用户的 shell、也不改远端状态，而「让 AI 看看你会话里出了什么事」本身
+    /// 是有用的能力，没必要拦。
+    ///
+    /// 集中判定放在这里、而不是散在各分支里，是为了让「新加一个工具要不要授权」变成一个
+    /// **必须显式回答**的问题：下面的 match 故意不写 `_ =>` 通配，新增变体时编译器会在这里
+    /// 报错，逼着作者表态，而不是默默继承「不需要授权」。
+    pub fn write_target_uids(&self) -> Vec<u64> {
+        match self {
+            McpReqKind::RunCommand { session_uid, .. }
+            | McpReqKind::SendInput { session_uid, .. }
+            | McpReqKind::Interrupt { session_uid }
+            | McpReqKind::WriteFile { session_uid, .. }
+            | McpReqKind::CopyToRemote { session_uid, .. }
+            | McpReqKind::CopyToRemoteFromCaller { session_uid, .. } => vec![*session_uid],
+            // 源和目标都要授权：直连模式会往「源」主机落一份临时私钥、往「目标」主机的
+            // authorized_keys 里临时写一行，两边都是在改远端状态。
+            McpReqKind::CopyBetweenSessions {
+                src_session_uid,
+                dest_session_uid,
+                ..
+            } => vec![*src_session_uid, *dest_session_uid],
+            // 只读：不往 shell 里发东西，也不改远端。
+            McpReqKind::ListSessions
+            | McpReqKind::ListSavedConnections
+            | McpReqKind::OpenSession { .. }
+            | McpReqKind::PollRun { .. }
+            | McpReqKind::ReadScreen { .. }
+            | McpReqKind::ReadHistory { .. }
+            | McpReqKind::ReadFile { .. }
+            | McpReqKind::CopyFromRemoteToCaller { .. } => Vec::new(),
+            // CloseSession 走的是更严的门禁（只能关 AI 自己开的，不接受授权——关闭权限不
+            // 应该超过打开权限），不走这条授权路。
+            McpReqKind::CloseSession { .. } => Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_gate_tests {
+    use super::*;
+
+    /// 会往 shell 里打字或改远端状态的操作，必须报出目标会话——漏一个，AI 就能不经用户授权
+    /// 插手用户正在用的 shell。
+    #[test]
+    fn write_ops_report_their_target_session() {
+        let cases: Vec<McpReqKind> = vec![
+            McpReqKind::RunCommand {
+                session_uid: 7,
+                command: "rm -rf /tmp/x".into(),
+                timeout_ms: 0,
+            },
+            McpReqKind::SendInput {
+                session_uid: 7,
+                text: "y\n".into(),
+            },
+            McpReqKind::Interrupt { session_uid: 7 },
+            McpReqKind::WriteFile {
+                session_uid: 7,
+                path: "/etc/hosts".into(),
+                content: String::new(),
+                timeout_ms: 0,
+            },
+            McpReqKind::CopyToRemote {
+                session_uid: 7,
+                local_path: "/a".into(),
+                remote_path: "/b".into(),
+                timeout_ms: 0,
+            },
+            McpReqKind::CopyToRemoteFromCaller {
+                session_uid: 7,
+                remote_path: "/b".into(),
+                size: 1,
+                timeout_ms: 0,
+            },
+        ];
+        for kind in cases {
+            assert_eq!(kind.write_target_uids(), vec![7], "漏判写入操作：{kind:?}");
+        }
+    }
+
+    /// 直连模式会往「源」主机落临时私钥、往「目标」主机的 authorized_keys 临时写一行——
+    /// 两边都在改远端状态，所以两个 uid 都得授权，不能只拦目标。
+    #[test]
+    fn cross_session_copy_gates_both_hosts() {
+        let kind = McpReqKind::CopyBetweenSessions {
+            src_session_uid: 3,
+            src_remote_path: "/src".into(),
+            dest_session_uid: 9,
+            dest_remote_path: "/dst".into(),
+            timeout_ms: 0,
+        };
+        assert_eq!(kind.write_target_uids(), vec![3, 9]);
+    }
+
+    /// 只读操作不该要授权：它们不碰用户的 shell、也不改远端，而「让 AI 看看用户会话里出了
+    /// 什么事」本身有用。拦了它们只会逼 AI 绕路，并不会更安全。
+    #[test]
+    fn read_only_ops_need_no_authorisation() {
+        let cases: Vec<McpReqKind> = vec![
+            McpReqKind::ListSessions,
+            McpReqKind::ListSavedConnections,
+            McpReqKind::OpenSession { name: "s2".into() },
+            McpReqKind::PollRun {
+                session_uid: 7,
+                run_id: None,
+                timeout_ms: 0,
+            },
+            McpReqKind::ReadScreen { session_uid: 7 },
+            McpReqKind::ReadHistory {
+                session_uid: 7,
+                max_lines: 0,
+            },
+            McpReqKind::ReadFile {
+                session_uid: 7,
+                path: "/a".into(),
+                force: false,
+                timeout_ms: 0,
+            },
+            McpReqKind::CopyFromRemoteToCaller {
+                session_uid: 7,
+                remote_path: "/a".into(),
+                timeout_ms: 0,
+            },
+            // 关会话走的是更严的 ai_owned 门禁（只能关 AI 自己开的，不接受授权），不是这条路。
+            McpReqKind::CloseSession { session_uid: 7 },
+        ];
+        for kind in cases {
+            assert!(
+                kind.write_target_uids().is_empty(),
+                "只读操作被误判成需要授权：{kind:?}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
