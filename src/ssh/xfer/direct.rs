@@ -378,7 +378,20 @@ pub(crate) async fn direct_relay_copy(
     }
     let _ = exec_status(&handle, &format!("chmod 600 {}", sh_quote(&tmp_key))).await; // 纵深防御（目录已 700）
 
-    let dest = sh_quote(&format!("{dest_user}@{dest_host}:{dest_path}"));
+    // 直连**绝不**直接写 dest_path：先传到目标主机上的一个临时名，传完才 mv 就位。
+    //
+    // 因为 cancel 拦不住已经发出去的远端命令：App 层的 20s 短超时只是置位 cancel 然后转中转，
+    // 而 exec_direct_progress 是先 channel_open_session + exec（命令已经在目标主机上跑起来了）
+    // 才在收数据的循环里看 cancel。最坏的排序是——中转已经把完整文件原子换入 dest_path
+    // （upload_from_mcp 是事务写），姗姗来迟的 scp 这时才以 O_TRUNC 打开 dest_path、写了半截、
+    // 随通道关闭而死：留下一个半截文件，而调用方收到的是「中转成功」。
+    //
+    // 传临时名 + 成功才 mv 之后，这个排序最坏只留下一个孤儿临时文件，dest_path 分毫未动。
+    // 这是靠**构造**消除竞争，而不是靠证明「远端进程已经死了」——后者根本证不出来：跳出
+    // exec_direct_progress 的收数据循环只是本地不再读，远端的 scp 进程照样在跑。
+    let dest_tmp = format!("{dest_path}.ishell-direct-tmp-{}", rand_hex(6));
+    let dest_spec = sh_quote(&format!("{dest_user}@{dest_host}:{dest_tmp}"));
+    let host_spec = sh_quote(&format!("{dest_user}@{dest_host}"));
     let src = sh_quote(&src_path);
     let ssh_opt = format!(
         "ssh -p {dest_port} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15",
@@ -388,14 +401,28 @@ pub(crate) async fn direct_relay_copy(
         exec_status(&handle, "command -v rsync >/dev/null 2>&1").await,
         Ok((0, _))
     );
-    let cmd = if has_rsync {
-        format!("rsync -a --info=progress2 -e {} -- {src} {dest}", sh_quote(&ssh_opt))
+    let xfer = if has_rsync {
+        format!("rsync -a --info=progress2 -e {} -- {src} {dest_spec}", sh_quote(&ssh_opt))
     } else {
         format!(
-            "scp -P {dest_port} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -- {src} {dest}",
+            "scp -P {dest_port} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -- {src} {dest_spec}",
             sh_quote(&tmp_key),
         )
     };
+    // 就位与清理都在目标主机上执行，所以远端命令要再包一层引号（sh_quote 可安全嵌套：多一跳
+    // shell 就多包一层）。`mv -f` 在同目录内是原子的——临时名就是在 dest_path 后面缀出来的。
+    // 任一步失败都顺手清掉临时文件，再以非 0 退出交给 App 层转中转；清理是尽力而为（此刻临时
+    // 公钥可能已经被撤销，这条 ssh 会连不上），失败不改变判定结果，孤儿文件的名字也带着
+    // `.ishell-direct-tmp-` 前缀，便于人工识别。
+    let commit = format!(
+        "{ssh_opt} -- {host_spec} {}",
+        sh_quote(&format!("mv -f {} {}", sh_quote(&dest_tmp), sh_quote(&dest_path))),
+    );
+    let discard = format!(
+        "{ssh_opt} -- {host_spec} {}",
+        sh_quote(&format!("rm -f {}", sh_quote(&dest_tmp))),
+    );
+    let cmd = format!("{{ {xfer} && {commit}; }} || {{ {discard} >/dev/null 2>&1; exit 1; }}");
 
     // 临时私钥的清理交由 _key_guard 在作用域结束（含超时取消时的 future drop）异步完成。
     // `DirectRelayStarted` 必须在 exec_direct_progress 内部真正 `channel_open_session`+
@@ -404,6 +431,18 @@ pub(crate) async fn direct_relay_copy(
     // 瞬间变 true，短超时永远不会命中，网络不通时只能死等到总超时才降级）。
     fn announce_started(sink: &UiSink, op_id: u64) {
         sink.send(WorkerEvent::DirectRelayStarted { op_id });
+    }
+    // 已经被放弃了就别再把命令发出去：上面几步（mkdir/投私钥/探测 rsync）都是 await，20s 的
+    // 短超时完全可能在这期间到点。这一下**不是**正确性所依赖的——cancel 和 exec 之间永远存在
+    // 窗口，正确性靠的是上面「传临时名、成功才 mv」的构造——它只是避免平白无故在目标主机上
+    // 起一条注定要被丢弃的传输、少留一个孤儿临时文件。
+    if cancel.load(Ordering::Relaxed) {
+        sink.send(WorkerEvent::DirectRelayDone {
+            op_id,
+            ok: false,
+            message: "直连尝试在发起前已被放弃（短超时到点，转中转）".into(),
+        });
+        return;
     }
     match exec_direct_progress(&handle, &cmd, op_id, sink, &cancel, Some(announce_started)).await {
         Ok((0, _)) => sink.send(WorkerEvent::DirectRelayDone {
