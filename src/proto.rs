@@ -220,6 +220,14 @@ pub enum UiCommand {
 pub struct DownloadStreamSource {
     pub size: u64,
     pub reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    /// 字节流的**最终判定**：worker 把文件读完（或中途出错）之后经这里回一条结果。
+    ///
+    /// 必须有这条通道，否则 `size` 是一个无法被推翻的承诺：它取自传输**开始前**的
+    /// `metadata`，而远端文件可能正在增长。读到 EOF 时 worker 就算发现「实际读出的字节数
+    /// 和 size 对不上」，此刻 socket 上的字节早已发完、对端也早已按 size 收满并认定成功，
+    /// worker 再 bail 也无处可说——调用方拿到的是一个「成功」的、被静默截断的文件。
+    /// 有了它，`handle_conn` 会在字节流之后再写一行 trailer，对端据此决定换入还是报错。
+    pub outcome: tokio::sync::oneshot::Receiver<Result<(), String>>,
 }
 
 /// 跨主机直传的目标主机参数（由 UI 据目标会话配置构造，交源会话 worker 执行）。

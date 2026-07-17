@@ -436,17 +436,30 @@ async fn copy_from_remote_to_caller(
         let mut dest = tokio::fs::File::create(&tmp_path)
             .await
             .map_err(|error| format!("无法创建临时下载文件 {}: {error}", tmp_path.display()))?;
-        // 精确拷贝声明的 size 字节：这条协议里响应头之后不再有分隔符/trailer，只能用长度
-        // 而不是 EOF 来判断"这个文件读完了"——`take(size)` 保证既不少读也不多读。
+        // 精确拷贝声明的 size 字节：响应头之后是裸字节流，没有分隔符，只能用长度而不是 EOF
+        // 来判断"这个文件读完了"——`take(size)` 保证既不少读也不多读。
         let mut limited = (&mut reader).take(size);
         let copied = tokio::io::copy(&mut limited, &mut dest)
             .await
             .map_err(|error| format!("接收调用方文件流失败: {error}"))?;
+        drop(limited); // 交还 reader 的可变借用，下面还要用它读 trailer
         if copied != size {
             return Err(format!(
                 "下载数据不完整：期望 {size} 字节，实际收到 {copied} 字节（iShell 一侧可能中途出错）"
             ));
         }
+        // 字节数对得上**不等于**这次传输是对的：size 取自传输开始前的 metadata，远端文件在
+        // 传输期间长大的话，我们恰好收满 size 字节、校验通过，落到本地的却是个被静默截断的
+        // 文件。所以字节流之后还有一行 trailer，是 iShell 那侧读完源文件后给出的最终判定；
+        // 拿到它才敢换入。
+        let mut trailer = String::new();
+        tokio::time::timeout(CONNECT_WRITE_TIMEOUT, reader.read_line(&mut trailer))
+            .await
+            .map_err(|_| "等待 iShell 的传输判定超时".to_string())?
+            .map_err(|error| format!("读取 iShell 的传输判定失败: {error}"))?;
+        let verdict: McpResponse = serde_json::from_str(trailer.trim())
+            .map_err(|error| format!("iShell 的传输判定无法解析（{error}）：{trailer}"))?;
+        verdict.result?;
         dest.flush().await.map_err(|error| format!("落盘调用方文件失败: {error}"))?;
         let _ = dest.sync_all().await; // 尽力 fsync，换入前确保字节真正落盘
         drop(dest);

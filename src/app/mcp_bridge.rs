@@ -864,7 +864,21 @@ async fn handle_conn(
                     }
                 }
                 let mut reader = source.reader;
-                let _ = tokio::io::copy(&mut reader, &mut w).await;
+                if tokio::io::copy(&mut reader, &mut w).await.is_err() {
+                    return; // 对端走了，trailer 也没人要了
+                }
+                // trailer：字节流之后再写一行判定。没有它，header 里的 size 就是一个无法被
+                // 推翻的承诺——它取自传输开始前的 metadata，而远端文件可能正在增长；worker
+                // 读到 EOF 时才发现对不上，那时字节早发完了，对端按 size 收满、认定成功。
+                // 有了这一行，对端在换入之前还能听到「别换」。
+                let verdict = match source.outcome.await {
+                    Ok(Ok(())) => Ok(McpReqResult::Ok),
+                    Ok(Err(msg)) => Err(msg),
+                    // worker 没吭声就没了（panic/被 drop）：只能按失败算。宁可让调用方重试，
+                    // 也不能让它把一个来路不明的字节流换入原文件。
+                    Err(_) => Err("iShell 未能给出这次传输的最终判定（worker 已退出）".to_string()),
+                };
+                reply(&mut w, id, verdict).await;
             }
             Err(msg) => {
                 let resp = McpResponse { id, result: Err(msg) };

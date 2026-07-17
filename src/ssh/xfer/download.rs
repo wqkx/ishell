@@ -422,10 +422,12 @@ pub(super) async fn download_to_mcp(
     };
 
     let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
     if download_sink
         .send(Ok(crate::proto::DownloadStreamSource {
             size,
             reader: Box::new(reader),
+            outcome: outcome_rx,
         }))
         .is_err()
     {
@@ -460,11 +462,24 @@ pub(super) async fn download_to_mcp(
                 sink.send(WorkerEvent::TransferProgress { id, done: sent });
             }
         }
+        // size 取自传输开始前的 metadata，它是发给对端的**长度承诺**。远端文件在这期间被追加
+        // 过的话，这里读出来的字节数就不是那个数——而对端只按 size 收，多出来的它根本不读，
+        // 于是「文件传输中长大了」表现为：调用方拿到一个成功返回的、被静默截断的文件。这里
+        // 判出来，经 trailer 告诉对端别换入（见 DownloadStreamSource::outcome）。
+        if sent != size {
+            anyhow::bail!(
+                "远端文件在传输期间发生了变化：开始时 {size} 字节，实际读出 {sent} 字节。\
+                 这次拷贝已放弃，调用方本地的同名文件未被改动；请重试"
+            );
+        }
         writer.flush().await?;
         writer.shutdown().await?;
         Ok(())
     }
     .await;
+    // trailer：把最终判定送给 handle_conn，由它写在字节流之后。对端已经断开时这里发不出去，
+    // 无所谓——那种情况下也没人再需要这个判定。
+    let _ = outcome_tx.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
 
     match result {
         Ok(()) => sink.send(WorkerEvent::TransferDone {
