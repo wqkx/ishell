@@ -1757,8 +1757,27 @@ impl App {
                     send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
+                // Ctrl-C 没送出去就**绝不能**丢掉这条运行的跟踪状态：远端命令多半还在跑，
+                // 而 pending_ai_run 一旦取消，poll_run 就再也认领不回它，调用方既中断不了、
+                // 也查不到它到底怎么样了。此前这里不看 connected、也不看 send 的结果，
+                // 一律先取消再回 Ok——断线时就是「谎报中断成功 + 丢掉运行状态」。
+                if !self.sessions[idx].connected {
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），Ctrl-C 没有发出；\
+                         远端命令可能仍在运行，这条运行的状态已保留，可用 poll_run 继续查".into(),
+                    );
+                    return;
+                }
                 let s = &mut self.sessions[idx];
-                let _ = s.cmd_tx.send(UiCommand::TerminalInput(vec![0x03]));
+                if s.cmd_tx.send(UiCommand::TerminalInput(vec![0x03])).is_err() {
+                    send_err(
+                        resp_tx,
+                        "这个会话的后台连接似乎已经断开，Ctrl-C 没有送达；远端命令可能仍在\
+                         运行，这条运行的状态已保留，可用 poll_run 继续查".into(),
+                    );
+                    return;
+                }
                 // 打断意味着放弃这条命令的哨兵检测：被打断的程序（比如 `cat`）很可能会把
                 // 紧跟着排的标记行当成自己的输入吃掉，哨兵永远等不到。
                 s.cancel_pending_ai_run("命令已被 interrupt 中断");
@@ -1847,9 +1866,21 @@ impl App {
                     send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
-                let _ = self.sessions[idx]
+                // 和 run_command 同样的前置检查。此前这里既不看 connected、也不看 send 的
+                // 结果，一律回 Ok——断线时按键根本没送到远端，调用方却以为发出去了，接着
+                // 按「已经输入过了」往下走（比如以为 sudo 密码已提交，继续等提示符）。
+                if !self.sessions[idx].connected {
+                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    return;
+                }
+                if self.sessions[idx]
                     .cmd_tx
-                    .send(UiCommand::TerminalInput(text.into_bytes()));
+                    .send(UiCommand::TerminalInput(text.into_bytes()))
+                    .is_err()
+                {
+                    send_err(resp_tx, "这个会话的后台连接似乎已经断开，输入没有送达".into());
+                    return;
+                }
                 let _ = resp_tx.send(McpResponse {
                     id,
                     result: Ok(McpReqResult::Ok),
