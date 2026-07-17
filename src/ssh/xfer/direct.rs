@@ -354,6 +354,31 @@ pub(crate) async fn direct_relay_copy(
     cancel: Arc<AtomicBool>,
     sink: &UiSink,
 ) {
+    // 源类型必须先探一次：copy_between_sessions 的契约是「仅支持单个文件」，中转那侧靠
+    // relay_read_file 的 metadata.is_dir() 挡住目录，但**直连这侧此前什么都不查**——而
+    // 首选的 rsync 是递归的，目录源会被原样传成 `dest_path.ishell-direct-tmp-X` 目录，
+    // 紧接着 `[ ! -d dest ]` 成立、mv 改名成功、exit 0，AI 收到 method="direct" 的成功。
+    // 同一个工具、同一个入参，走直连是成功、走中转是报错——契约得由两条路径共同兑现。
+    // 这里报失败即可，App 层会转中转，由中转给出那句标准的「仅支持单个文件」。
+    match sftp.metadata(&src_path).await {
+        Ok(m) if m.is_dir() => {
+            sink.send(WorkerEvent::DirectRelayDone {
+                op_id,
+                ok: false,
+                message: "源是一个目录，直连不支持（仅支持单个文件）".into(),
+            });
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            sink.send(WorkerEvent::DirectRelayDone {
+                op_id,
+                ok: false,
+                message: format!("源文件不存在或无法访问：{e}"),
+            });
+            return;
+        }
+    }
     let tmp_dir = format!("/tmp/.ishell_relay_{op_id}_{}", rand_hex(8));
     if !matches!(
         exec_status(&handle, &format!("mkdir -m 700 {}", sh_quote(&tmp_dir))).await,
