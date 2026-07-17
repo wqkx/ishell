@@ -1828,6 +1828,14 @@ impl App {
                 content,
                 timeout_ms,
             } => {
+                // 与 copy 家族同一套路径规则：绝对、无 `.`/`..` 段。此前这里不校验，于是同一个
+                // MCP 接口里 copy_to_remote("foo.txt") 会被当场拒掉，write_file("foo.txt")
+                // 却能落到 SFTP 的默认 cwd（通常是 $HOME）——同样是「远端相对路径」，两个工具
+                // 一个报错一个照写，调用方无从预期。
+                if let Err(e) = validate_remote_path(&path) {
+                    send_err(resp_tx, e);
+                    return;
+                }
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
                     send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
@@ -1877,6 +1885,12 @@ impl App {
                 force,
                 timeout_ms,
             } => {
+                // 同 WriteFile：与 copy 家族保持同一套远端路径规则，避免同一接口里两个工具对
+                // 「相对路径」给出不同答案。
+                if let Err(e) = validate_remote_path(&path) {
+                    send_err(resp_tx, e);
+                    return;
+                }
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
                     send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
