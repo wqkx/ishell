@@ -893,7 +893,14 @@ async fn handle_conn(
             id,
             result: Err("iShell 未能处理该请求（可能已关闭）".into()),
         }),
-        _ = lines.next_line() => return,
+        _ = lines.next_line() => {
+            // 丢弃 resp_rx（return 即可）会让 App 那侧的 resp_tx.is_closed() 变真，但**没人会
+            // 去看**：egui 按需重绘，此刻这个窗口没有任何输入事件，帧循环根本不转，清扫逻辑
+            // 就永远不执行。绑定弹窗正是靠这条挂断感知自动消失的（见 sweep_pending_consents），
+            // 少了这一下，落选窗口的框会一直杵到用户手动关掉——实测如此。
+            ctx.request_repaint();
+            return;
+        }
     };
     if let Ok(mut json) = serde_json::to_string(&resp) {
         json.push('\n');
@@ -997,12 +1004,29 @@ impl App {
                 let _ = pending.resp_tx.send(McpResponse {
                     id: pending.req_id,
                     result: Err(
-                        "等待用户选择 iShell 窗口超时（5 分钟）：本机同时开着多个 iShell，\
-                         需要用户在想让你操作的那个窗口上点「允许」。请让用户切回 iShell 处理\
+                        "等待用户选择 iShell 窗口超时（5 分钟）：用户同时开着多个 iShell，\
+                         需要他在想让你操作的那个窗口上点「允许」。请让用户切回 iShell 处理\
                          后重试".into(),
                     ),
                 });
             }
+        }
+        // 上面三个确认框的超时全靠这段清扫触发，而清扫只在有帧时才跑。egui 是按需重绘的：
+        // 一个空闲窗口（没有终端输出、用户也没碰鼠标）根本不转帧循环，于是「5 分钟自动
+        // 拒绝」永远等不到，调用方那边就是一条挂到它自己 timeout_ms 才结束的请求。按最近
+        // 的那个 deadline 排一次定时重绘，保证到点必有一帧。每帧重排是幂等的，pending 增删
+        // 也能自动跟上。
+        let next_deadline = [
+            self.pending_open_consent.as_ref().map(|p| p.deadline),
+            self.pending_use_consent.as_ref().map(|p| p.deadline),
+            self.pending_bind_consent.as_ref().map(|p| p.deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if let Some(deadline) = next_deadline {
+            self.ctx
+                .request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -1525,11 +1549,13 @@ impl App {
                 send_err(resp_tx, "Identify 不应该到达 App 层".into());
             }
             McpReqKind::Bind => {
-                if self.pending_bind_consent.is_some()
-                    || self.pending_open_consent.is_some()
-                    || self.pending_use_consent.is_some()
-                {
-                    send_err(resp_tx, "已有一个请求正在等待用户确认，请稍候重试".into());
+                // 只跟「另一个绑定请求」互斥。这里**不能**因为恰好挂着一个 open/use 授权框
+                // 就把 Bind 顶回去：代理会把那条 Err 当成「这个窗口不是胜出者」，于是用户想
+                // 选的那个窗口压根不弹绑定框，他连点的机会都没有；若每个窗口都恰好忙着，
+                // 整次绑定还会以「没有任何一个窗口批准」告终，而用户一个框都没见过。
+                // 两个框不同时显示是**渲染**层的事，交给 handle_ai_bind_consent 去排队。
+                if self.pending_bind_consent.is_some() {
+                    send_err(resp_tx, "已有另一个 AI 客户端正在等待用户选择窗口，请稍候重试".into());
                     return;
                 }
                 self.pending_bind_consent = Some(PendingBindConsent {

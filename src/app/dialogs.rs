@@ -682,6 +682,12 @@ impl App {
         if self.pending_bind_consent.is_none() {
             return;
         }
+        // 另外两个授权框优先：它们问的是「要不要动这个具体会话」，用户正在回答；绑定框只问
+        // 「你想让我用哪个窗口」，可以等。两个 Modal 叠在一起只会让人不知道自己在答哪个。
+        // 等它们结束后这个框会在后续帧里自然出现（清扫每帧都在按 deadline 排定时重绘）。
+        if self.pending_open_consent.is_some() || self.pending_use_consent.is_some() {
+            return;
+        }
         egui::Modal::new(egui::Id::new("ai_bind_consent_modal")).show(ctx, |ui| {
             ui.set_width(400.0);
             ui.vertical_centered(|ui| {

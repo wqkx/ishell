@@ -126,13 +126,6 @@ pub fn save_mcp_consent(on: bool) {
     }
 }
 
-/// AI/MCP 控制通道用的本地 Unix domain socket 路径（`~/.config/ishell/mcp.sock`）。
-/// 每个进程一个独立路径（带 pid），不再是全实例共享的固定文件名：如果多个 iShell 实例
-/// 共用同一个固定路径，新实例启动时 remove_file+bind 会顶掉旧实例已经绑定的 listener——
-/// 删文件不会让旧 listener 停止接受连接，但此后所有连到这个路径的请求都会进新实例，
-/// 导致旧实例的 SSH 反向转发 MCP 通道被错误地路由到新实例、操作到旧实例都不认识的会话。
-/// 每个进程用自己的 pid 命名，从根本上消除这个路由冲突，不需要任何"探测占用"之类的运行时
-/// 逻辑。`ishell-mcp` 代理侧的同机发现相应地改成按前缀 glob、取最新的一个。
 /// 本进程的 AI/MCP 实例标识：`<pid>-<8 位随机十六进制>`，进程内全局唯一且固定。
 ///
 /// 为什么不是纯 pid：pid 会被系统回收。iShell 退出后若残留了 socket 文件（崩溃、或反向
@@ -163,6 +156,14 @@ pub fn mcp_instance_id() -> &'static str {
 
 /// 本进程独占的 AI/MCP 控制 socket 路径。文件名带上实例标识，这样同机多开的几个 iShell
 /// 各自监听各自的 socket，互不覆盖；代理进程按 `mcp-*.sock` 通配即可枚举出本机所有实例。
+///
+/// 为什么不是全实例共享一个固定文件名：新实例启动时 remove_file+bind 会顶掉旧实例已经绑定
+/// 的 listener——删文件并不会让旧 listener 停止接受连接，但此后所有连到这个路径的请求都会
+/// 进新实例，导致旧实例的 SSH 反向转发 MCP 通道被错误地路由到新实例、操作到旧实例都不认识
+/// 的会话。每进程一个独立路径从根本上消除这个冲突，不需要任何「探测占用」之类的运行时逻辑。
+///
+/// 注意路径只是**发现**用的候选，不是身份：认人靠 `McpReqKind::Identify` 问出来的实例标识
+/// （见 `src/mcp_protocol.rs`）。同一个 iShell 可能对应多条路径，残留的死文件也还躺在目录里。
 pub fn mcp_socket_path() -> Option<PathBuf> {
     Some(config_dir()?.join(format!("mcp-{}.sock", mcp_instance_id())))
 }

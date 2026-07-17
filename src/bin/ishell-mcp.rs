@@ -86,18 +86,47 @@ fn candidate_paths() -> Vec<std::path::PathBuf> {
     out
 }
 
+/// 带超时的 connect。同机 Unix socket 上 connect 基本瞬时，这个护栏平时轮不到触发；但反向
+/// 转发的 socket 背后是一条 SSH 通道，对端成了网络黑洞时 connect 会一直挂着，谁都不该无限等。
+#[cfg(unix)]
+async fn connect_timeout(
+    path: &std::path::Path,
+) -> Result<std::io::Result<UnixStream>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(path)).await
+}
+
 /// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时——一律返回
 /// `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
 #[cfg(unix)]
 async fn identify(path: &std::path::Path) -> Option<String> {
-    let stream = tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(path))
-        .await
-        .ok()?
-        .ok()?;
+    let stream = connect_timeout(path).await.ok()?.ok()?;
     match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
         Ok(McpReqResult::Instance { id }) => Some(id),
         _ => None,
     }
+}
+
+/// 并发问遍所有候选路径，收齐「答得上话的」实例及其路径。
+///
+/// 必须并发：候选里混着崩溃残留的死文件，更要命的是反向转发的 socket 背后是一条 SSH 通道，
+/// 对端网络黑洞时 connect/读响应会各挂满 `CONNECT_WRITE_TIMEOUT`。串行探测的话，几个卡住的
+/// 候选就能把「弹出选择框」推迟几十秒，期间工具调用毫无动静。
+///
+/// 同一个实例可能从多条路径答话（见 `candidate_paths`），这里不去重——去重规则由调用方定：
+/// `bind_instance` 要按 id 收敛成实例列表，`connect_bound` 只关心某个特定 id。
+#[cfg(unix)]
+async fn identify_all() -> Vec<(String, std::path::PathBuf)> {
+    let mut set = tokio::task::JoinSet::new();
+    for path in candidate_paths() {
+        set.spawn(async move { identify(&path).await.map(|id| (id, path)) });
+    }
+    let mut out = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(hit)) = joined {
+            out.push(hit);
+        }
+    }
+    out
 }
 
 /// 决定这个代理这辈子只操作哪个 iShell 实例。只在首次需要连接时跑一次。
@@ -115,12 +144,10 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         return Ok((id, path));
     }
     let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for path in candidate_paths() {
-        if let Some(id) = identify(&path).await {
-            // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
-            if !found.iter().any(|(known, _)| *known == id) {
-                found.push((id, path));
-            }
+    for (id, path) in identify_all().await {
+        // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
+        if !found.iter().any(|(known, _)| *known == id) {
+            found.push((id, path));
         }
     }
     match found.len() {
@@ -148,7 +175,10 @@ async fn choose_instance(
     let mut set = tokio::task::JoinSet::new();
     for (id, path) in found {
         set.spawn(async move {
-            let stream = UnixStream::connect(&path).await.map_err(|e| e.to_string())?;
+            let stream = connect_timeout(&path)
+                .await
+                .map_err(|_| "连接 iShell socket 超时".to_string())?
+                .map_err(|e| e.to_string())?;
             exchange(stream, Some(id.clone()), McpReqKind::Bind, BIND_TIMEOUT).await?;
             Ok::<_, String>((id, path))
         });
@@ -159,8 +189,10 @@ async fn choose_instance(
         }
     }
     Err(format!(
-        "本机同时开着 {count} 个 iShell，但没有任何一个窗口批准这次连接（用户拒绝，或 5 分钟\
-         没有响应）。请让用户在他想让你操作的那个 iShell 窗口上点「允许」，然后重试。"
+        "发现 {count} 个 iShell 实例，但没有任何一个窗口批准这次连接（用户拒绝，或 5 分钟\
+         没有响应）。请让用户在他想让你操作的那个 iShell 窗口上点「允许」，然后重试。\
+         注意这些窗口未必在你这台机器上：iShell 是经 SSH 反向转发接进来的，窗口在用户\
+         自己的电脑上。"
     ))
 }
 
@@ -177,15 +209,15 @@ async fn connect_bound() -> Result<(UnixStream, String), String> {
         .clone();
     let cached = PATH_CACHE.lock().unwrap().clone();
     if let Some(path) = cached {
-        if let Ok(stream) = UnixStream::connect(&path).await {
+        if let Ok(Ok(stream)) = connect_timeout(&path).await {
             return Ok((stream, id));
         }
     }
     // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。在候选里重新找回**同一个
     // 实例**——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上。
-    for path in candidate_paths() {
-        if identify(&path).await.as_deref() == Some(id.as_str()) {
-            if let Ok(stream) = UnixStream::connect(&path).await {
+    for (found_id, path) in identify_all().await {
+        if found_id == id {
+            if let Ok(Ok(stream)) = connect_timeout(&path).await {
                 *PATH_CACHE.lock().unwrap() = Some(path);
                 return Ok((stream, id));
             }
