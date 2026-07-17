@@ -133,8 +133,38 @@ pub fn save_mcp_consent(on: bool) {
 /// 导致旧实例的 SSH 反向转发 MCP 通道被错误地路由到新实例、操作到旧实例都不认识的会话。
 /// 每个进程用自己的 pid 命名，从根本上消除这个路由冲突，不需要任何"探测占用"之类的运行时
 /// 逻辑。`ishell-mcp` 代理侧的同机发现相应地改成按前缀 glob、取最新的一个。
+/// 本进程的 AI/MCP 实例标识：`<pid>-<8 位随机十六进制>`，进程内全局唯一且固定。
+///
+/// 为什么不是纯 pid：pid 会被系统回收。iShell 退出后若残留了 socket 文件（崩溃、或反向
+/// 转发那侧还没来得及清），而后来某个新 iShell 恰好拿到同一个 pid，代理就会认为「我绑定
+/// 的那个实例还在」并接着往下发命令——实际上换了一个毫不相干的实例，且不会有任何报错。
+/// 随机后缀让这种撞车不可能发生。
+///
+/// 为什么不持久化到磁盘：绑定关系活在代理进程的内存里，随 AI 客户端一起生灭，跨 iShell
+/// 重启保持稳定没有意义；反倒是持久化会让「同机多开」的两个实例共用一个 id，直接摧毁隔离。
+/// 这个值只需要在本进程活着期间唯一。
+pub fn mcp_instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let mut buf = [0u8; 4];
+        // 熵源不可用（极罕见）时退化到纳秒时间戳：仍能保证同机多开的几个实例互不相同，
+        // 这正是这段后缀要解决的问题，没必要为此让 iShell 起不来。
+        if getrandom::getrandom(&mut buf).is_err() {
+            let ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            buf = ns.to_le_bytes();
+        }
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{}-{}", std::process::id(), hex)
+    })
+}
+
+/// 本进程独占的 AI/MCP 控制 socket 路径。文件名带上实例标识，这样同机多开的几个 iShell
+/// 各自监听各自的 socket，互不覆盖；代理进程按 `mcp-*.sock` 通配即可枚举出本机所有实例。
 pub fn mcp_socket_path() -> Option<PathBuf> {
-    Some(config_dir()?.join(format!("mcp-{}.sock", std::process::id())))
+    Some(config_dir()?.join(format!("mcp-{}.sock", mcp_instance_id())))
 }
 
 // ---------- 终端配色（多套主题，按索引存储） ----------

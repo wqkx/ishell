@@ -133,6 +133,8 @@ pub struct App {
     pending_open_consent: Option<mcp_bridge::PendingOpenConsent>,
     /// AI 想对用户自己打开的会话做写入类操作，正等用户当面授权。
     pending_use_consent: Option<mcp_bridge::PendingUseConsent>,
+    /// 一个尚未绑定的 AI 客户端正请求接管本窗口（仅在用户同时开着多个 iShell 时出现）。
+    pending_bind_consent: Option<mcp_bridge::PendingBindConsent>,
     /// 用户已授权 AI 写入的会话 uid（即用户自己打开、但明确授权过的那些）。只活在进程
     /// 内存里，重启 iShell 一律重新授权；uid 由 `next_uid` 单调分配、不复用，所以不存在
     /// 授权被后开的会话捡到的问题。
@@ -227,6 +229,7 @@ impl App {
             mcp_rx,
             pending_open_consent: None,
             pending_use_consent: None,
+            pending_bind_consent: None,
             mcp_use_approved: std::collections::HashSet::new(),
             mcp_open_approved: std::collections::HashSet::new(),
             cross_copy_jobs: Vec::new(),
@@ -529,6 +532,7 @@ impl eframe::App for App {
         self.handle_close(&ctx);
         self.handle_ai_open_consent(&ctx);
         self.handle_ai_use_consent(&ctx);
+        self.handle_ai_bind_consent(&ctx);
 
         // 自检截图驱动
         self.drive_screenshot(&ctx);

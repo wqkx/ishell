@@ -1,9 +1,20 @@
 //! iShell 的 AI/MCP 控制通道代理：Claude Code 等 AI 客户端按 stdio 方式 spawn 的独立小进程。
-//! 本身不持有任何状态，只是把工具调用转发到本机正在运行的 iShell 主进程（经本地 Unix
-//! domain socket，一次连接一问一答），主进程再落到它已经持有的 SSH 会话上执行。
+//! 只是把工具调用转发到本机正在运行的 iShell 主进程（经本地 Unix domain socket，一次连接
+//! 一问一答），主进程再落到它已经持有的 SSH 会话上执行。
+//!
+//! 唯一的进程状态是**绑定**：这个代理一辈子只操作一个 iShell 实例（见 `BOUND_INSTANCE`）。
+//! 用户可能同时开着多个 iShell——本机的、以及别的机器上反向转发过来的——而每个实例的会话
+//! uid 都从 1 开始，所以「这次调用发给谁」绝不能靠猜。首次连接时定下实例，此后每条请求都
+//! 点名，由对端自己校验（`McpRequest::instance`）。选哪个实例由用户当场点窗口决定，不靠
+//! 配置文件里的名字，也不靠 socket 文件的 mtime。
 //! 与主二进制共享同一份线协议类型（见 src/mcp_protocol.rs），这里用 #[path] 直接纳入，
 //! 避免为共享几个 struct 拆出独立的 lib crate。
 
+// 这一份是「代理侧」的编译产物：同一个文件也被主二进制编一遍，两边用到的子集不同——
+// 授权门禁（`write_target_uids`）和实例校验（`is_addressed_to`）都只在 GUI 那侧执行，
+// 代理这边只用到线协议类型本身。故只在这个 crate 上整模块 allow(dead_code)，否则每加一个
+// 「只有 GUI 用得到」的协议方法就要多一条假警告；主二进制那侧不 allow，真正的死代码照样抓得到。
+#[allow(dead_code)]
 #[path = "../mcp_protocol.rs"]
 mod mcp_protocol;
 
@@ -22,59 +33,203 @@ use mcp_protocol::{McpReqKind, McpReqResult, McpRequest, McpResponse};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// 找目录下匹配前缀/后缀的文件里，mtime 最新且真的连得上的那一个（探测连接立刻丢弃）。
-/// 用于同机发现（`mcp-*.sock`，每进程一个独立文件）和反向转发发现
-/// （`.ishell-mcp-*.sock`）——两处逻辑完全一样，抽出来共用。
+/// 本代理进程绑定的 iShell 实例标识。一经确定，进程生命周期内永不改变。
+///
+/// 「不改绑」是这里最重要的性质，不是优化：每个 iShell 实例的会话 uid 都从 1 开始
+/// （见 `src/app/session.rs`），所以中途换一个实例执行，`session_uid=1` 会安静地落到
+/// 另一台机器上，不报任何错。此前按 socket 文件 mtime 挑实例、且**每次调用都重挑**，
+/// 正是这个 bug：用户在对话中途新开一个 iShell，后续调用就跟着跑了。
 #[cfg(unix)]
-async fn newest_connectable(dir: &std::path::Path, prefix: &str, suffix: &str) -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
+static BOUND_INSTANCE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+/// 绑定实例当前的 socket 路径缓存。**路径会变，实例不会**：反向转发的 socket 每次 SSH
+/// 重连都换一个随机名（见 `src/ssh/mod.rs`，固定名字会被服务器当成尚未失效的旧注册而
+/// 拒绝）。所以路径只是缓存，失效了就按实例标识重新找回来。
+#[cfg(unix)]
+static PATH_CACHE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// 等用户在某个 iShell 窗口上点「允许」的超时。GUI 侧的确认框自己有 5 分钟上限、到点会回
+/// 一条 Err，正常情况下轮不到这个超时——它只防「GUI 卡死导致工具调用永远挂起」，所以比
+/// 5 分钟稍宽一点即可。
+#[cfg(unix)]
+const BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60);
+
+/// 枚举本机所有**可能**通向某个 iShell 实例的 socket 路径。
+///
+/// 两个来源：`~/.config/ishell/mcp-*.sock`（同机场景，每个 iShell 进程一个）和
+/// `~/.ishell-mcp/mcp-*.sock`（iShell 反向转发到「这个代理所在的机器」时落在这里）。
+///
+/// 返回的是**候选路径，不是实例列表**——两者不是一一对应的：同一个 iShell 对同一台远端
+/// 主机开两个会话，就会在那台主机上注册出两个通向它自己的转发 socket；崩溃残留的死文件也
+/// 还躺在目录里。谁是谁、有几个，必须靠 `identify()` 一个个问出来再按 id 去重，不能从文件名
+/// 推断——否则会把一个 iShell 当成两个，凭空要求用户去选。
+#[cfg(unix)]
+fn candidate_paths() -> Vec<std::path::PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let dirs = [
+        std::path::PathBuf::from(&home).join(".config").join("ishell"),
+        std::path::PathBuf::from(&home).join(".ishell-mcp"),
+    ];
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue; // 目录不存在很正常（没用过反向转发/没装过 iShell）
+        };
+        out.extend(entries.flatten().map(|e| e.path()).filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
-        })
-        .filter_map(|p| p.metadata().and_then(|m| m.modified()).ok().map(|t| (t, p)))
-        .collect();
-    candidates.sort_by_key(|(t, _)| std::cmp::Reverse(*t)); // 新的在前，优先试
-    for (_, p) in candidates {
-        if UnixStream::connect(&p).await.is_ok() {
-            return Some(p);
-        }
+                .is_some_and(|n| n.starts_with("mcp-") && n.ends_with(".sock"))
+        }));
     }
-    None
+    out
 }
 
-/// 每次调用都重新探测（而非启动时定死一个路径），因为反向转发的 socket 路径每次 iShell
-/// 重连都会换一个带随机后缀的新名字（见 `src/ssh/mod.rs`），本机 socket 路径也是每个 iShell
-/// 进程各带一个 pid（见 `src/store/settings.rs::mcp_socket_path`）——固定住任何一个都只会
-/// 导致每次重连/重启都要手动改 `ISHELL_MCP_SOCKET`，体验很差。按优先级探测：
-///   1. `ISHELL_MCP_SOCKET` 显式指定（手动隧道场景，最明确，始终优先）；
-///   2. `~/.config/ishell/mcp-*.sock` 里 mtime 最新且连得上的一个（同机场景：iShell 和这个
-///      代理跑在同一台机器上；每个 iShell 进程一个独立文件，不用猜具体 pid）；
-///   3. `~/.ishell-mcp/mcp-*.sock` 里 mtime 最新且连得上的一个（iShell 反向转发到「这个代理
-///      所在的机器」时会落在这里；每次重连都是新文件，取最新的即可自动跟上——这些文件统一放
-///      进这个子目录而不是散落在 `$HOME` 根，且 iShell 那边在连接正常断开时会主动清理，
-///      见 `src/ssh/mod.rs`）。
-/// 都没找到时回退到本机默认目录下的固定占位路径，让错误信息保持原样好懂（不会是任何一个
-/// 真实存在的进程的路径，纯粹是给 `call()` 里的 connect 失败提供一个统一的报错落点）。
+/// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时——一律返回
+/// `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
 #[cfg(unix)]
-async fn socket_path() -> std::path::PathBuf {
+async fn identify(path: &std::path::Path) -> Option<String> {
+    let stream = tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(path))
+        .await
+        .ok()?
+        .ok()?;
+    match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
+        Ok(McpReqResult::Instance { id }) => Some(id),
+        _ => None,
+    }
+}
+
+/// 决定这个代理这辈子只操作哪个 iShell 实例。只在首次需要连接时跑一次。
+#[cfg(unix)]
+async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
+    // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
     if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
-        return std::path::PathBuf::from(p);
+        let path = std::path::PathBuf::from(p);
+        let id = identify(&path).await.ok_or_else(|| {
+            format!(
+                "ISHELL_MCP_SOCKET 指定的 socket 连不上、或对面不是 iShell：{}",
+                path.display()
+            )
+        })?;
+        return Ok((id, path));
     }
-    let home = std::env::var_os("HOME").expect("HOME 环境变量未设置");
-    let config_dir = std::path::PathBuf::from(&home).join(".config").join("ishell");
-    if let Some(p) = newest_connectable(&config_dir, "mcp-", ".sock").await {
-        return p;
+    let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for path in candidate_paths() {
+        if let Some(id) = identify(&path).await {
+            // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
+            if !found.iter().any(|(known, _)| *known == id) {
+                found.push((id, path));
+            }
+        }
     }
-    let forward_dir = std::path::PathBuf::from(&home).join(".ishell-mcp");
-    if let Some(p) = newest_connectable(&forward_dir, "mcp-", ".sock").await {
-        return p;
+    match found.len() {
+        0 => Err(
+            "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".into(),
+        ),
+        1 => Ok(found.pop().expect("上一行刚确认只有一个")),
+        _ => choose_instance(found).await,
     }
-    config_dir.join("mcp.sock")
+}
+
+/// 用户同时开着多个 iShell：让他用鼠标选。
+///
+/// 向**每一个**实例各发一条 `Bind`，于是每个 iShell 窗口上都弹出确认框，用户在想用的那个
+/// 窗口上点「允许」即可。第一个应允的胜出，随即丢弃 `JoinSet`——其余任务被 abort、连接关闭，
+/// 落选窗口的弹窗据此自动消失，不用逼用户挨个去点「拒绝」。
+///
+/// 为什么是「点窗口」而不是「报出实例名让用户去填配置」：用户本来就是看着窗口决定的。实例
+/// 标识是纯内部的东西，把它抬到用户面前只会要求他先给窗口取个名、再把名字念给 AI 听。
+#[cfg(unix)]
+async fn choose_instance(
+    found: Vec<(String, std::path::PathBuf)>,
+) -> Result<(String, std::path::PathBuf), String> {
+    let count = found.len();
+    let mut set = tokio::task::JoinSet::new();
+    for (id, path) in found {
+        set.spawn(async move {
+            let stream = UnixStream::connect(&path).await.map_err(|e| e.to_string())?;
+            exchange(stream, Some(id.clone()), McpReqKind::Bind, BIND_TIMEOUT).await?;
+            Ok::<_, String>((id, path))
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Ok(winner)) = joined {
+            return Ok(winner); // set 在这里被丢弃 → 其余任务 abort → 落选窗口的框自动消失
+        }
+    }
+    Err(format!(
+        "本机同时开着 {count} 个 iShell，但没有任何一个窗口批准这次连接（用户拒绝，或 5 分钟\
+         没有响应）。请让用户在他想让你操作的那个 iShell 窗口上点「允许」，然后重试。"
+    ))
+}
+
+/// 拿一条连向**绑定实例**的连接，外加要填进请求的实例标识。
+#[cfg(unix)]
+async fn connect_bound() -> Result<(UnixStream, String), String> {
+    let id = BOUND_INSTANCE
+        .get_or_try_init(|| async {
+            let (id, path) = bind_instance().await?;
+            *PATH_CACHE.lock().unwrap() = Some(path);
+            Ok::<_, String>(id)
+        })
+        .await?
+        .clone();
+    let cached = PATH_CACHE.lock().unwrap().clone();
+    if let Some(path) = cached {
+        if let Ok(stream) = UnixStream::connect(&path).await {
+            return Ok((stream, id));
+        }
+    }
+    // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。在候选里重新找回**同一个
+    // 实例**——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上。
+    for path in candidate_paths() {
+        if identify(&path).await.as_deref() == Some(id.as_str()) {
+            if let Ok(stream) = UnixStream::connect(&path).await {
+                *PATH_CACHE.lock().unwrap() = Some(path);
+                return Ok((stream, id));
+            }
+        }
+    }
+    Err("找不到当初绑定的那个 iShell 实例了（它可能已经退出）。代理不会自动改绑到别的实例——\
+         多开时静默换一个实例执行，命令就会落到你没预期的机器上。请重新发起 MCP 连接。"
+        .into())
+}
+
+/// 在一条已建立的连接上完成一问一答：写一行请求 JSON，读一行响应 JSON。
+///
+/// `instance` 点名这条请求发给谁，由对端自己校验（见 `McpRequest::is_addressed_to`）。
+/// 只有 `Identify` 填 `None`——那时还不知道对面是谁。
+#[cfg(unix)]
+async fn exchange(
+    stream: UnixStream,
+    instance: Option<String>,
+    kind: McpReqKind,
+    response_timeout: std::time::Duration,
+) -> Result<McpReqResult, String> {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let (r, mut w) = stream.into_split();
+    let mut line = serde_json::to_string(&McpRequest { id, instance, kind })
+        .map_err(|e| e.to_string())?;
+    line.push('\n');
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, w.write_all(line.as_bytes()))
+        .await
+        .map_err(|_| "发送请求给 iShell 超时".to_string())?
+        .map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(r);
+    let mut resp_line = String::new();
+    let read = tokio::time::timeout(response_timeout, reader.read_line(&mut resp_line))
+        .await
+        .map_err(|_| {
+            "等待 iShell 响应超时（远超请求本身的 timeout_ms，可能是 GUI 卡死或连接异常）"
+                .to_string()
+        })?
+        .map_err(|e| e.to_string())?;
+    if read == 0 {
+        return Err("iShell 未返回任何响应就关闭了连接".into());
+    }
+    let resp: McpResponse = serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())?;
+    resp.result
 }
 
 /// 本地 socket connect/写请求的超时：正常情况下应该是瞬时的（同机 Unix socket，GUI 活着的
@@ -92,32 +247,8 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 
 /// 在所有平台上都能正常编译。
 #[cfg(unix)]
 async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let path = socket_path().await;
-    let stream = tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(&path))
-        .await
-        .map_err(|_| "连接 iShell 本地 socket 超时".to_string())?
-        .map_err(|_| {
-            "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".to_string()
-        })?;
-    let (r, mut w) = stream.into_split();
-    let mut line = serde_json::to_string(&McpRequest { id, kind }).map_err(|e| e.to_string())?;
-    line.push('\n');
-    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, w.write_all(line.as_bytes()))
-        .await
-        .map_err(|_| "发送请求给 iShell 超时".to_string())?
-        .map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(r);
-    let mut resp_line = String::new();
-    let read = tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut resp_line))
-        .await
-        .map_err(|_| "等待 iShell 响应超时（远超请求本身的 timeout_ms，可能是 GUI 卡死或连接异常）".to_string())?
-        .map_err(|e| e.to_string())?;
-    if read == 0 {
-        return Err("iShell 未返回任何响应就关闭了连接".into());
-    }
-    let resp: McpResponse = serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())?;
-    resp.result
+    let (stream, instance) = connect_bound().await?;
+    exchange(stream, Some(instance), kind, RESPONSE_TIMEOUT).await
 }
 
 /// 校验一个调用方本机路径：必须绝对、不含 `.`/`..` 路径段。跟 GUI 侧
@@ -157,14 +288,11 @@ async fn copy_to_remote_from_caller(
     }
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let socket = socket_path().await;
-    let stream = tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(&socket))
-        .await
-        .map_err(|_| "连接 iShell 本地 socket 超时".to_string())?
-        .map_err(|_| "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".to_string())?;
+    let (stream, instance) = connect_bound().await?;
     let (read_half, mut write_half) = stream.into_split();
     let request = McpRequest {
         id,
+        instance: Some(instance),
         kind: McpReqKind::CopyToRemoteFromCaller {
             session_uid,
             remote_path,
@@ -229,14 +357,11 @@ async fn copy_from_remote_to_caller(
     let path = std::path::PathBuf::from(&local_path);
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let socket = socket_path().await;
-    let stream = tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(&socket))
-        .await
-        .map_err(|_| "连接 iShell 本地 socket 超时".to_string())?
-        .map_err(|_| "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".to_string())?;
+    let (stream, instance) = connect_bound().await?;
     let (read_half, mut write_half) = stream.into_split();
     let request = McpRequest {
         id,
+        instance: Some(instance),
         kind: McpReqKind::CopyFromRemoteToCaller { session_uid, remote_path, timeout_ms },
     };
     let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;

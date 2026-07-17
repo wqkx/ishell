@@ -551,6 +551,20 @@ pub(super) struct PendingUseConsent {
     deadline: Instant,
 }
 
+/// 一个尚未绑定的 AI 客户端请求接管本 iShell 窗口——弹窗让用户当面选。
+///
+/// 只在用户同时开着多个 iShell 时才会出现：代理发现多个实例后，会向**每一个**都发一条
+/// `Bind`，于是每个窗口上都弹出这个框，用户在想用的那个窗口上点「允许」即可。选择因此
+/// 发生在用户的眼睛和鼠标上，而不是配置文件里——实例标识是纯内部的，不该让用户去认。
+///
+/// 落选的那些窗口不需要用户逐个点「拒绝」：代理拿到第一个「允许」后就挂断其余连接，
+/// `resp_tx.is_closed()` 随即为真，弹窗自动消失（见 `sweep_pending_consents`）。
+pub(super) struct PendingBindConsent {
+    resp_tx: oneshot::Sender<McpResponse>,
+    req_id: u64,
+    deadline: Instant,
+}
+
 /// 给用户看的一句话：AI 具体想拿这个会话干什么。
 ///
 /// 授权弹窗必须靠它做到知情同意——只说一句「AI 想操作这个会话」，用户没有任何依据判断该不该
@@ -720,6 +734,20 @@ const MAX_MCP_LINE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(unix)]
 const FIRST_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 往连接上写一行 JSON 响应。失败一律忽略：对端已经走了的话，这里没有任何补救可做。
+#[cfg(unix)]
+async fn reply(
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    id: u64,
+    result: Result<McpReqResult, String>,
+) {
+    let resp = McpResponse { id, result };
+    if let Ok(mut json) = serde_json::to_string(&resp) {
+        json.push('\n');
+        let _ = w.write_all(json.as_bytes()).await;
+    }
+}
+
 /// 一条连接只处理一问一答：读一行 JSON 请求，转发进 mpsc，等 App 帧循环回填后写一行 JSON 响应。
 /// `_permit` 只用来在这个连接存活期间占着信号量里的一个名额，函数退出时自动释放。
 #[cfg(unix)]
@@ -753,6 +781,27 @@ async fn handle_conn(
         }
     };
     let id = req.id;
+    // 实例校验：先于任何会话逻辑，也先于把请求递进 App 帧循环。这里是「一个代理只操作一个
+    // iShell」的执行点——校验放在被叫的一方，代理侧无论探测出什么错路径都越不过来。
+    let own = crate::store::mcp_instance_id();
+    if !req.is_addressed_to(own) {
+        reply(
+            &mut w,
+            id,
+            Err("这条请求点名的是另一个 iShell 实例（或没有点名）。请重新发起 MCP 连接：\
+                 你绑定的那个 iShell 可能已经退出了，代理不会自动改绑到别的实例上——\
+                 多开时静默换一个实例执行，命令就会落到你没预期的机器上"
+                .to_string()),
+        )
+        .await;
+        return;
+    }
+    // Identify 在连接层就地回答：它只是「你是谁」，不碰任何会话状态，没必要绕一趟 App
+    // 帧循环。代理发现多个实例时会向每一个都问一次，让这条路尽量轻。
+    if matches!(req.kind, McpReqKind::Identify) {
+        reply(&mut w, id, Ok(McpReqResult::Instance { id: own.to_string() })).await;
+        return;
+    }
     let is_caller_upload = matches!(&req.kind, McpReqKind::CopyToRemoteFromCaller { .. });
     if is_caller_upload {
         // `Lines` 持有的 BufReader 可能已经预读了紧随 JSON 行的文件字节，不能丢掉它；
@@ -933,6 +982,24 @@ impl App {
                         "等待用户确认超时（5 分钟），已自动拒绝：这是用户自己打开的会话，需要\
                          用户当面授权。请改用 open_session 开一个 AI 专用会话，或让用户切回\
                          iShell 点击确认弹窗后重试".into(),
+                    ),
+                });
+            }
+        }
+        // 绑定弹窗的清扫比另外两个多一条「对端走了」：代理把 Bind 同时发给了每一个实例，
+        // 用户在某个窗口点「允许」之后，代理立刻挂断其余连接。落选的窗口据此静默收起弹窗，
+        // 用户不必挨个去点「拒绝」——他已经用点击表达过选择了，再逼他关掉 N-1 个框是骚扰。
+        if let Some(pending) = self.pending_bind_consent.as_ref() {
+            if pending.resp_tx.is_closed() {
+                self.pending_bind_consent = None;
+            } else if Instant::now() >= pending.deadline {
+                let pending = self.pending_bind_consent.take().expect("上一行刚确认是 Some");
+                let _ = pending.resp_tx.send(McpResponse {
+                    id: pending.req_id,
+                    result: Err(
+                        "等待用户选择 iShell 窗口超时（5 分钟）：本机同时开着多个 iShell，\
+                         需要用户在想让你操作的那个窗口上点「允许」。请让用户切回 iShell 处理\
+                         后重试".into(),
                     ),
                 });
             }
@@ -1316,6 +1383,25 @@ impl App {
         });
     }
 
+    /// 用户在绑定弹窗里点了「允许」/「拒绝」——即在这个窗口上决定「让那个 AI 客户端操作我」。
+    ///
+    /// 注意这里**不需要**在 App 里记任何绑定状态：绑定活在代理进程的内存里（它记住 id，此后
+    /// 每条请求都点名），而 iShell 只做「这条请求是不是在叫我」的校验（`is_addressed_to`）。
+    /// 把绑定同时记在两侧只会多出一份能和对方失配的状态，却换不来任何额外保证。
+    pub(super) fn resolve_bind_consent(&mut self, allow: bool) {
+        let Some(pending) = self.pending_bind_consent.take() else {
+            return;
+        };
+        let _ = pending.resp_tx.send(McpResponse {
+            id: pending.req_id,
+            result: if allow {
+                Ok(McpReqResult::Ok)
+            } else {
+                Err("用户在这个 iShell 窗口上拒绝了绑定请求".into())
+            },
+        });
+    }
+
     /// 用户在 `open_session` 确认弹窗里点了「允许」/「拒绝」。
     pub(super) fn resolve_open_consent(&mut self, allow: bool) {
         let Some(pending) = self.pending_open_consent.take() else {
@@ -1434,6 +1520,25 @@ impl App {
             });
         };
         match req.kind {
+            // Identify 在连接层就地答完了（见 handle_conn），根本到不了这里。
+            McpReqKind::Identify => {
+                send_err(resp_tx, "Identify 不应该到达 App 层".into());
+            }
+            McpReqKind::Bind => {
+                if self.pending_bind_consent.is_some()
+                    || self.pending_open_consent.is_some()
+                    || self.pending_use_consent.is_some()
+                {
+                    send_err(resp_tx, "已有一个请求正在等待用户确认，请稍候重试".into());
+                    return;
+                }
+                self.pending_bind_consent = Some(PendingBindConsent {
+                    resp_tx,
+                    req_id: id,
+                    // 与另外两个确认框同样给 5 分钟：用户可能不在电脑前。
+                    deadline: Instant::now() + Duration::from_secs(300),
+                });
+            }
             McpReqKind::ListSessions => {
                 let list = self
                     .sessions

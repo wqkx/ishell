@@ -48,6 +48,24 @@ pub struct McpRunResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqKind {
+    /// 询问对端 iShell 的实例标识。这是**唯一**允许 `McpRequest::instance` 为 `None` 的请求：
+    /// 代理进程在还不知道对面是谁的时候，只能先问一句。
+    ///
+    /// 为什么身份必须靠问、不能靠 socket 路径推断：反向转发出来的 socket 路径每次 SSH
+    /// 重连都会换一个随机名字（这是刻意的，见 `src/ssh/mod.rs` 里的说明——固定路径会被
+    /// 服务器当成尚未失效的旧注册而拒绝），而且同一个 iShell 对同一台远端主机开两个会话时，
+    /// 会在那台主机上注册出**两个通向同一个实例**的 socket。所以路径既不稳定、也不唯一，
+    /// 代理必须按这里返回的 id 去重和认人。
+    Identify,
+    /// 请求把发起方这个 AI 客户端绑定到本 iShell 实例——弹窗让用户当面确认。
+    ///
+    /// 只在代理发现**多个不同实例**时才会发出：代理向每一个实例各发一条，于是每个 iShell
+    /// 窗口上都会弹出确认框，用户在想用的那个窗口上点「允许」即可。代理拿到第一个 `Ok`
+    /// 之后就挂断其余连接，落选窗口的弹窗随之自动消失（GUI 侧靠对端连接关闭来感知）。
+    ///
+    /// 选择之所以做成「点窗口」而不是「报出实例名让用户填配置」：用户本来就是看着窗口决定
+    /// 的，实例 id 是纯内部标识，不该出现在任何 UI 或配置里。
+    Bind,
     ListSessions,
     RunCommand {
         session_uid: u64,
@@ -176,8 +194,12 @@ impl McpReqKind {
                 dest_session_uid,
                 ..
             } => vec![*src_session_uid, *dest_session_uid],
+            // 连接级握手，根本不涉及任何会话（连 session_uid 字段都没有），自然谈不上授权。
+            // Bind 本身就是一个弹窗确认，再套一层会话授权既无对象也无意义。
+            McpReqKind::Identify
+            | McpReqKind::Bind
             // 只读：不往 shell 里发东西，也不改远端。
-            McpReqKind::ListSessions
+            | McpReqKind::ListSessions
             | McpReqKind::ListSavedConnections
             | McpReqKind::OpenSession { .. }
             | McpReqKind::PollRun { .. }
@@ -280,6 +302,9 @@ mod write_gate_tests {
             },
             // 关会话走的是更严的 ai_owned 门禁（只能关 AI 自己开的，不接受授权），不是这条路。
             McpReqKind::CloseSession { session_uid: 7 },
+            // 连接级握手，不涉及任何会话。
+            McpReqKind::Identify,
+            McpReqKind::Bind,
         ];
         for kind in cases {
             assert!(
@@ -293,11 +318,91 @@ mod write_gate_tests {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpRequest {
     pub id: u64,
+    /// 这条请求点名要发给哪个 iShell 实例（`store::mcp_instance_id()` 的值）。收到的实例
+    /// 一旦发现不是在叫自己，直接拒绝执行。
+    ///
+    /// 这是「一个代理只操作一个 iShell」这条隔离承诺的**唯一硬保证**，而且刻意放在权威侧
+    /// （目标进程自己校验），不是放在代理侧。代理的路径探测无论怎么错——缓存的路径失效后
+    /// 被另一个实例复用、反向转发目录里混进了别人的 socket——请求都到不了错误的实例身上。
+    /// 隔离不能指望发起方自觉。
+    ///
+    /// 只有 `Identify` 允许填 `None`（那时还不知道对面是谁）。其余请求带 `None` 一律拒绝：
+    /// 「没点名」不等于「随便谁都行」，那正是要根除的静默走错实例。
+    pub instance: Option<String>,
     pub kind: McpReqKind,
+}
+
+impl McpRequest {
+    /// 这条请求是不是该由标识为 `own_instance` 的实例来执行。
+    ///
+    /// 规则只有三条，故意写得极简——这是隔离的最后一道闸，越简单越查得清：
+    ///   1. `Identify` 永远放行：它就是用来问「你是谁」的，那时对方当然还填不出名字；
+    ///   2. 点名点中自己 → 放行；
+    ///   3. 其余（点了别人、或压根没点名）→ 拒绝。
+    ///
+    /// 第 3 条里「没点名也拒绝」是关键：把 `None` 当成「随便谁都行」正是要根除的那个
+    /// bug——今天代理按 socket 文件的 mtime 挑一个实例，挑中谁纯属偶然，而多开时
+    /// 每个实例的会话 uid 都从 1 开始，走错实例不会报错，只会安静地操作错的机器。
+    pub fn is_addressed_to(&self, own_instance: &str) -> bool {
+        match (&self.kind, &self.instance) {
+            (McpReqKind::Identify, _) => true,
+            (_, Some(named)) => named == own_instance,
+            (_, None) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod addressing_tests {
+    use super::*;
+
+    fn req(instance: Option<&str>, kind: McpReqKind) -> McpRequest {
+        McpRequest {
+            id: 1,
+            instance: instance.map(str::to_string),
+            kind,
+        }
+    }
+
+    /// 点名点中自己才执行——这是「一个代理只操作一个 iShell」的硬保证。
+    #[test]
+    fn only_requests_naming_this_instance_are_executed() {
+        let kind = McpReqKind::RunCommand {
+            session_uid: 1,
+            command: "rm -rf /".into(),
+            timeout_ms: 0,
+        };
+        assert!(req(Some("me"), kind.clone()).is_addressed_to("me"));
+        assert!(!req(Some("someone-else"), kind).is_addressed_to("me"));
+    }
+
+    /// 不点名 ≠ 随便谁都行。多开时每个实例的会话 uid 都从 1 开始，放行一条没点名的
+    /// `RunCommand` 就等于允许命令落到一台完全不相干的机器上，而且不会有任何报错。
+    #[test]
+    fn unaddressed_requests_are_refused() {
+        let kind = McpReqKind::RunCommand {
+            session_uid: 1,
+            command: "echo hi".into(),
+            timeout_ms: 0,
+        };
+        assert!(!req(None, kind).is_addressed_to("me"));
+    }
+
+    /// 唯一的例外：Identify 就是用来问「你是谁」的，此时对方还没法点名。
+    #[test]
+    fn identify_is_the_only_unaddressed_request_allowed() {
+        assert!(req(None, McpReqKind::Identify).is_addressed_to("me"));
+        // 连 Bind 都不例外：代理只会在 Identify 问出 id 之后才发 Bind，填得出名字。
+        assert!(!req(None, McpReqKind::Bind).is_addressed_to("me"));
+        assert!(req(Some("me"), McpReqKind::Bind).is_addressed_to("me"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {
+    /// `Identify` 的结果：对端 iShell 的实例标识，代理据此去重、认人、填进后续每条请求的
+    /// `McpRequest::instance`。纯内部标识，不面向用户。
+    Instance { id: String },
     Sessions(Vec<McpSessionInfo>),
     Run(McpRunResult),
     Screen(String),
@@ -339,6 +444,7 @@ mod tests {
     fn caller_stream_upload_request_round_trips_without_content_field() {
         let request = McpRequest {
             id: 7,
+            instance: Some("1234-a1b2c3d4".into()),
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 11,
                 remote_path: "/srv/project/cuda_eri.py".into(),

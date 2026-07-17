@@ -669,6 +669,64 @@ impl App {
             });
         });
     }
+
+    /// 一个 AI 客户端想接管这个 iShell 窗口——只在本机同时开着多个 iShell 时才会弹。
+    ///
+    /// 代理进程把这个请求同时发给了**每一个** iShell 实例，所以此刻每个窗口上都有一个一样
+    /// 的框。用户在想用的那个窗口上点「允许」即可；其余窗口的框会在代理挂断连接后自动消失
+    /// （见 `sweep_pending_consents`），不需要挨个去点「拒绝」。
+    ///
+    /// 之所以让用户「点窗口」而不是「读出实例名去填配置」：他本来就是看着窗口决定的，实例
+    /// 标识是纯内部的东西，不该爬到 UI 上来。
+    pub(super) fn handle_ai_bind_consent(&mut self, ctx: &egui::Context) {
+        if self.pending_bind_consent.is_none() {
+            return;
+        }
+        egui::Modal::new(egui::Id::new("ai_bind_consent_modal")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(crate::i18n::tr(
+                        "AI 请求连接这个 iShell 窗口",
+                        "AI wants to connect to this iShell window",
+                    ))
+                    .size(16.0)
+                    .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(crate::i18n::tr(
+                    "你同时开着多个 iShell，AI 无法自己判断该用哪一个。\n\n\
+                     如果你就是想让它操作这个窗口，点「允许」；想用别的窗口，就去那个窗口上点\
+                     「允许」——这里不用管，框会自己消失。",
+                    "You have several iShell windows open, and AI cannot tell which one you mean.\n\n\
+                     Click Allow if this is the window you want it to use. If you meant another \
+                     window, click Allow there instead — this prompt will dismiss itself.",
+                ));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(crate::i18n::tr(
+                        "允许后，这个 AI 客户端只能操作本窗口，碰不到其它 iShell 窗口",
+                        "Once allowed, this AI client can only act in this window, never the others",
+                    ))
+                    .size(11.0)
+                    .color(Palette::TEXT_DIM),
+                );
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let bw = 96.0;
+                let total = bw * 2.0 + ui.spacing().item_spacing.x;
+                let space = ((ui.available_width() - total) / 2.0).max(0.0);
+                ui.add_space(space);
+                if dialog_button(ui, crate::i18n::tr("允许", "Allow"), Some(Palette::ACCENT), bw) {
+                    self.resolve_bind_consent(true);
+                }
+                if dialog_button(ui, crate::i18n::tr("拒绝", "Deny"), Some(Palette::DANGER), bw) {
+                    self.resolve_bind_consent(false);
+                }
+            });
+        });
+    }
 }
 
 impl App {}
