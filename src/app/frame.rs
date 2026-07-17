@@ -140,6 +140,9 @@ impl App {
         if evt_backlog {
             self.ctx.request_repaint();
         }
+        // 必须在上面所有超时判定之后：那些判定全是每帧轮询的，而 egui 按需重绘——空闲窗口
+        // 不转帧，它们就永远不被求值。这一下按最近的 deadline 排定时重绘，保证到点必有一帧。
+        self.arm_timeout_repaint();
         // 警告（如编码丢字）弹顶部 toast
         if let Some(w) = warns.into_iter().next_back() {
             self.toast = Some((w, self.ctx.input(|i| i.time)));

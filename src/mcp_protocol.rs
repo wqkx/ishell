@@ -5,6 +5,76 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 分块字节流的一块最多这么大。纯粹是缓冲区尺寸，读端不依赖它——每块的长度都在线上写明。
+pub const STREAM_CHUNK_BYTES: usize = 128 * 1024;
+
+/// 写一段**分块字节流**：每块 `<len>\n` + len 字节，最后以 `0\n` 收尾。
+///
+/// `CopyFromRemoteToCaller` 的响应体用这个格式：header JSON 行 → 分块字节流 → 一行判定 JSON。
+///
+/// 为什么要分帧，而不是「按 header 里的 size 裸发 size 字节」：**判定必须能被对端找到**。
+/// 裸字节流没有边界，读端只能靠 size 去数——可发送端中途失败时（用户取消、远端文件被截断、
+/// SFTP 出错）只发得出 M < size 字节，读端却还在按 size 收，于是紧随其后的那行判定会被当成
+/// 文件字节一起吞掉，读端只能报一句笼统的「数据不完整」，真正的原因彻底丢失。有了显式边界，
+/// 判定的位置就和「实际发了多少字节」无关了。
+///
+/// 收尾的 `0\n` 只表示「字节流到此为止」，**不表示成功**——成功与否一律由后面那行判定说了算。
+pub async fn write_framed_stream<R, W>(src: &mut R, w: &mut W) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0_u8; STREAM_CHUNK_BYTES];
+    loop {
+        let n = src.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(format!("{n}\n").as_bytes()).await?;
+        w.write_all(&buf[..n]).await?;
+    }
+    w.write_all(b"0\n").await
+}
+
+/// 读一段 `write_framed_stream` 写出来的分块字节流，写进 `dest`，返回总字节数。
+///
+/// 读到 `0\n` 就停，`r` 停在判定行的开头。只有代理侧用得到（GUI 侧是写端），但格式定义必须
+/// 和写端待在同一个文件里——两侧各自手写一遍循环、靠「都记得对方怎么写的」来保持一致，正是
+/// 这类协议出静默 bug 的地方。
+#[allow(dead_code)] // 只有 ishell-mcp 那个 crate 用；本文件被两个 crate 各编一遍
+pub async fn read_framed_stream<R, W>(r: &mut R, dest: &mut W) -> Result<u64, String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut total = 0_u64;
+    loop {
+        let mut len_line = String::new();
+        r.read_line(&mut len_line)
+            .await
+            .map_err(|e| format!("接收文件流失败：{e}"))?;
+        let n: u64 = len_line
+            .trim()
+            .parse()
+            .map_err(|_| format!("分块长度无法解析：{len_line:?}"))?;
+        if n == 0 {
+            return Ok(total);
+        }
+        let mut chunk = r.take(n);
+        let copied = tokio::io::copy(&mut chunk, dest)
+            .await
+            .map_err(|e| format!("接收文件流失败：{e}"))?;
+        if copied != n {
+            return Err(format!(
+                "文件流在一个分块中途断了：这块应有 {n} 字节，只收到 {copied} 字节"
+            ));
+        }
+        total += n;
+    }
+}
+
 /// 单个终端会话的摘要（`list_sessions` 的返回项）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionInfo {
@@ -349,6 +419,80 @@ impl McpRequest {
             (_, Some(named)) => named == own_instance,
             (_, None) => false,
         }
+    }
+}
+
+/// 分帧字节流的读写是一对必须严丝合缝的实现，而它们分别跑在两个进程里——出了分歧不会有人
+/// 报错，只会是「文件内容不对」或「判定读成了乱码」。这个文件被两个 crate 各编一遍，所以
+/// 这些往返测试也会在两侧各跑一遍。
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    /// 往返：写进去什么，读出来就该是什么，一个字节不差。
+    async fn round_trip(payload: &[u8]) -> (u64, Vec<u8>) {
+        let mut wire = Vec::new();
+        write_framed_stream(&mut &payload[..], &mut wire).await.expect("写不该失败");
+        let mut got = Vec::new();
+        let total = read_framed_stream(&mut std::io::Cursor::new(wire), &mut got)
+            .await
+            .expect("读不该失败");
+        (total, got)
+    }
+
+    #[tokio::test]
+    async fn round_trips_payloads_of_every_shape() {
+        for payload in [
+            Vec::new(),                                 // 空文件：只有一个 `0\n`
+            b"hello".to_vec(),                          // 单块
+            vec![0xAB; STREAM_CHUNK_BYTES],             // 恰好一块
+            vec![0xCD; STREAM_CHUNK_BYTES + 1],         // 跨块边界
+            vec![0x00; STREAM_CHUNK_BYTES * 2 + 7],     // 多块 + 零字节（不能被当成结束符）
+            b"12\n34\n0\n".to_vec(),                    // 内容长得像帧头：必须靠长度而非内容分帧
+        ] {
+            let (total, got) = round_trip(&payload).await;
+            assert_eq!(total, payload.len() as u64, "长度不符（payload {} 字节）", payload.len());
+            assert_eq!(got, payload, "内容不符（payload {} 字节）", payload.len());
+        }
+    }
+
+    /// 收尾的 `0\n` 之后，读端必须**恰好**停在判定行开头——判定能不能被找到，全靠这一点。
+    #[tokio::test]
+    async fn leaves_the_reader_exactly_at_the_verdict_line() {
+        use tokio::io::AsyncBufReadExt;
+        let mut wire = Vec::new();
+        write_framed_stream(&mut &b"body"[..], &mut wire).await.unwrap();
+        wire.extend_from_slice(b"{\"id\":1,\"result\":{\"Ok\":\"Ok\"}}\n");
+
+        let mut r = std::io::Cursor::new(wire);
+        let mut got = Vec::new();
+        read_framed_stream(&mut r, &mut got).await.unwrap();
+        assert_eq!(got, b"body");
+
+        let mut verdict = String::new();
+        r.read_line(&mut verdict).await.unwrap();
+        let parsed: McpResponse = serde_json::from_str(verdict.trim()).expect("判定应能原样解析出来");
+        assert!(parsed.result.is_ok());
+    }
+
+    /// 流在分块中途断掉：必须报错，绝不能把半截内容当成读完了。
+    #[tokio::test]
+    async fn refuses_a_stream_cut_mid_chunk() {
+        let mut got = Vec::new();
+        let err = read_framed_stream(&mut std::io::Cursor::new(b"10\nshort".to_vec()), &mut got)
+            .await
+            .expect_err("分块只有 5 字节却声明 10 字节，必须报错");
+        assert!(err.contains("中途断了"), "错误信息应指明是分块断流：{err}");
+    }
+
+    /// 帧头是垃圾（比如把裸字节流喂进来）：报错，而不是把它当数据读。
+    #[tokio::test]
+    async fn refuses_a_garbled_chunk_header() {
+        let mut got = Vec::new();
+        let err = read_framed_stream(&mut std::io::Cursor::new(b"not-a-number\n".to_vec()), &mut got)
+            .await
+            .expect_err("帧头无法解析时必须报错");
+        assert!(err.contains("分块长度无法解析"), "{err}");
     }
 }
 

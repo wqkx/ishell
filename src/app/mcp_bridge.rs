@@ -734,6 +734,11 @@ const MAX_MCP_LINE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(unix)]
 const FIRST_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 等 worker 给出下载传输判定（trailer）的上限。字节流都已经发完才轮到它，正常是立等可取；
+/// 这个超时只防「worker 卡死导致连接和信号量名额被永久占住」，不该在正常使用中被触发。
+#[cfg(unix)]
+const VERDICT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 往连接上写一行 JSON 响应。失败一律忽略：对端已经走了的话，这里没有任何补救可做。
 #[cfg(unix)]
 async fn reply(
@@ -863,20 +868,27 @@ async fn handle_conn(
                         return;
                     }
                 }
+                // 分块发（线格式与理由见 mcp_protocol::write_framed_stream）：判定必须能被
+                // 对端找到，而裸字节流没有边界——中途失败少发一个字节，那行判定就会被当成
+                // 文件内容吞掉。收尾的 `0\n` 只表示字节到此为止，成不成功由后面那行判定说。
                 let mut reader = source.reader;
-                if tokio::io::copy(&mut reader, &mut w).await.is_err() {
-                    return; // 对端走了，trailer 也没人要了
+                if crate::mcp_protocol::write_framed_stream(&mut reader, &mut w)
+                    .await
+                    .is_err()
+                {
+                    return; // 对端走了，或管道坏了——后者对端会因为收不到 `0\n` 而报错，不会误换入
                 }
-                // trailer：字节流之后再写一行判定。没有它，header 里的 size 就是一个无法被
-                // 推翻的承诺——它取自传输开始前的 metadata，而远端文件可能正在增长；worker
-                // 读到 EOF 时才发现对不上，那时字节早发完了，对端按 size 收满、认定成功。
-                // 有了这一行，对端在换入之前还能听到「别换」。
-                let verdict = match source.outcome.await {
-                    Ok(Ok(())) => Ok(McpReqResult::Ok),
-                    Ok(Err(msg)) => Err(msg),
+                // 给判定一个上限：worker 在 shutdown() 之后、送出判定之前卡死的话，这里会
+                // 无限等下去，连同这条连接持有的信号量名额一起——名额被一点点吃光之后，新的
+                // MCP 连接就再也排不进来了。字节流都发完了才轮到这一步，正常情况下判定是
+                // 立等可取的，撞上这个超时基本可以断定 worker 出了问题。
+                let verdict = match tokio::time::timeout(VERDICT_TIMEOUT, source.outcome).await {
+                    Ok(Ok(Ok(()))) => Ok(McpReqResult::Ok),
+                    Ok(Ok(Err(msg))) => Err(msg),
                     // worker 没吭声就没了（panic/被 drop）：只能按失败算。宁可让调用方重试，
                     // 也不能让它把一个来路不明的字节流换入原文件。
-                    Err(_) => Err("iShell 未能给出这次传输的最终判定（worker 已退出）".to_string()),
+                    Ok(Err(_)) => Err("iShell 未能给出这次传输的最终判定（worker 已退出）".to_string()),
+                    Err(_) => Err("iShell 未能在字节流发完后及时给出传输判定（worker 可能已卡死）".to_string()),
                 };
                 reply(&mut w, id, verdict).await;
             }
@@ -1025,20 +1037,41 @@ impl App {
                 });
             }
         }
-        // 上面三个确认框的超时全靠这段清扫触发，而清扫只在有帧时才跑。egui 是按需重绘的：
-        // 一个空闲窗口（没有终端输出、用户也没碰鼠标）根本不转帧循环，于是「5 分钟自动
-        // 拒绝」永远等不到，调用方那边就是一条挂到它自己 timeout_ms 才结束的请求。按最近
-        // 的那个 deadline 排一次定时重绘，保证到点必有一帧。每帧重排是幂等的，pending 增删
-        // 也能自动跟上。
-        let next_deadline = [
+    }
+
+    /// 给「最近的那个超时」排一次定时重绘。每帧末尾调用一次（见 frame.rs）。
+    ///
+    /// 这里所有的超时判定——AI 命令运行、文件读写、跨会话拷贝、三个确认框——全都是**每帧
+    /// 轮询**的，而 egui 按需重绘：一个空闲窗口（终端没输出、用户也没碰鼠标）根本不转帧
+    /// 循环，于是这些 deadline 到点都不会被求值。表现出来就是调用方那边一条请求挂到自己的
+    /// timeout_ms 之后仍然不返回，直到有别的什么东西碰巧叫醒了 UI 线程。
+    ///
+    /// 最典型的例子：对一个空闲会话跑 `run_command("sleep 300", timeout_ms=5000)`——命令
+    /// 回显那一波事件重绘了一帧，之后 300 秒里终端零输出，5 秒的超时到点没有任何东西叫醒
+    /// UI 线程，AI 就一直挂着。
+    ///
+    /// 之所以在这里统一扫一遍、而不是给每处超时各打一个补丁：新加的超时只要挂在这些字段
+    /// 上就自动被覆盖，不会重蹈「只想起了自己刚写的那个」的覆辙。每帧重排是幂等的，pending
+    /// 的增删也能自动跟上。
+    pub(super) fn arm_timeout_repaint(&self) {
+        let consents = [
             self.pending_open_consent.as_ref().map(|p| p.deadline),
             self.pending_use_consent.as_ref().map(|p| p.deadline),
             self.pending_bind_consent.as_ref().map(|p| p.deadline),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
-        if let Some(deadline) = next_deadline {
+        ];
+        let sessions = self.sessions.iter().flat_map(|s| {
+            s.pending_ai_run
+                .as_ref()
+                .map(|p| p.deadline)
+                .into_iter()
+                .chain(s.pending_file_ops.iter().map(|op| op.deadline))
+        });
+        let jobs = self
+            .cross_copy_jobs
+            .iter()
+            .flat_map(|j| [j.deadline, j.phase_deadline]);
+        let next = consents.into_iter().flatten().chain(sessions).chain(jobs).min();
+        if let Some(deadline) = next {
             self.ctx
                 .request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }

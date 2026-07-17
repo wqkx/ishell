@@ -436,30 +436,32 @@ async fn copy_from_remote_to_caller(
         let mut dest = tokio::fs::File::create(&tmp_path)
             .await
             .map_err(|error| format!("无法创建临时下载文件 {}: {error}", tmp_path.display()))?;
-        // 精确拷贝声明的 size 字节：响应头之后是裸字节流，没有分隔符，只能用长度而不是 EOF
-        // 来判断"这个文件读完了"——`take(size)` 保证既不少读也不多读。
-        let mut limited = (&mut reader).take(size);
-        let copied = tokio::io::copy(&mut limited, &mut dest)
-            .await
-            .map_err(|error| format!("接收调用方文件流失败: {error}"))?;
-        drop(limited); // 交还 reader 的可变借用，下面还要用它读 trailer
-        if copied != size {
-            return Err(format!(
-                "下载数据不完整：期望 {size} 字节，实际收到 {copied} 字节（iShell 一侧可能中途出错）"
-            ));
-        }
-        // 字节数对得上**不等于**这次传输是对的：size 取自传输开始前的 metadata，远端文件在
-        // 传输期间长大的话，我们恰好收满 size 字节、校验通过，落到本地的却是个被静默截断的
-        // 文件。所以字节流之后还有一行 trailer，是 iShell 那侧读完源文件后给出的最终判定；
-        // 拿到它才敢换入。
-        let mut trailer = String::new();
-        tokio::time::timeout(CONNECT_WRITE_TIMEOUT, reader.read_line(&mut trailer))
+        // 分块收（线格式与理由见 mcp_protocol::read_framed_stream）。有了帧，判定的位置就与
+        // 「实际收了多少字节」无关——iShell 中途失败时也能把真正的原因原样送到这里。
+        let received = tokio::time::timeout(
+            RESPONSE_TIMEOUT,
+            mcp_protocol::read_framed_stream(&mut reader, &mut dest),
+        )
+        .await
+        .map_err(|_| "等待 iShell 发送文件数据超时".to_string())??;
+        // 判定：iShell 读完源文件后给出的最终结论，拿到它才敢换入。字节数对得上**不等于**
+        // 这次传输是对的——size 取自传输开始前的 metadata，远端文件在传输期间长大的话，
+        // 光看字节数是发现不了的（那正是这条判定要解决的问题）。
+        let mut verdict_line = String::new();
+        tokio::time::timeout(CONNECT_WRITE_TIMEOUT, reader.read_line(&mut verdict_line))
             .await
             .map_err(|_| "等待 iShell 的传输判定超时".to_string())?
             .map_err(|error| format!("读取 iShell 的传输判定失败: {error}"))?;
-        let verdict: McpResponse = serde_json::from_str(trailer.trim())
-            .map_err(|error| format!("iShell 的传输判定无法解析（{error}）：{trailer}"))?;
+        let verdict: McpResponse = serde_json::from_str(verdict_line.trim())
+            .map_err(|error| format!("iShell 的传输判定无法解析（{error}）：{verdict_line}"))?;
         verdict.result?;
+        // 判定说成功，就该恰好是 header 里承诺的那个数。对不上说明两侧对协议的理解有分歧，
+        // 属于程序错误而非传输故障——宁可报错也不能把一个来路不明的文件换入。
+        if received != size {
+            return Err(format!(
+                "iShell 判定传输成功，但字节数与它自己声明的不符：应为 {size}，实收 {received}"
+            ));
+        }
         dest.flush().await.map_err(|error| format!("落盘调用方文件失败: {error}"))?;
         let _ = dest.sync_all().await; // 尽力 fsync，换入前确保字节真正落盘
         drop(dest);
