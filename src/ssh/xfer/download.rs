@@ -447,13 +447,20 @@ pub(super) async fn download_to_mcp(
         let mut buffer = vec![0_u8; 128 * 1024];
         let mut sent = 0_u64;
         let mut last_reported = 0_u64;
-        loop {
+        // 按**长度**读，不是读到 EOF：size 取自传输开始前的 metadata，它是发给对端的长度
+        // 承诺。多写进管道的字节会挤在字节流后面被对端当成 trailer 读走（表现为一条莫名
+        // 其妙的「判定无法解析」），所以一个字节都不能多写。形状照抄 upload_from_mcp。
+        while sent < size {
             if cancel.load(Ordering::Relaxed) {
                 anyhow::bail!("canceled");
             }
-            let read = remote.read(&mut buffer).await?;
+            let wanted = (size - sent).min(buffer.len() as u64) as usize;
+            let read = remote.read(&mut buffer[..wanted]).await?;
             if read == 0 {
-                break;
+                anyhow::bail!(
+                    "远端文件在传输期间被截断：开始时 {size} 字节，只读到 {sent} 字节。\
+                     这次拷贝已放弃，调用方本地的同名文件未被改动；请重试"
+                );
             }
             writer.write_all(&buffer[..read]).await?;
             sent += read as u64;
@@ -462,13 +469,13 @@ pub(super) async fn download_to_mcp(
                 sink.send(WorkerEvent::TransferProgress { id, done: sent });
             }
         }
-        // size 取自传输开始前的 metadata，它是发给对端的**长度承诺**。远端文件在这期间被追加
-        // 过的话，这里读出来的字节数就不是那个数——而对端只按 size 收，多出来的它根本不读，
-        // 于是「文件传输中长大了」表现为：调用方拿到一个成功返回的、被静默截断的文件。这里
-        // 判出来，经 trailer 告诉对端别换入（见 DownloadStreamSource::outcome）。
-        if sent != size {
+        // 再读一个字节：还有数据就说明远端文件在这期间长大了，size 这个承诺已经不成立。
+        // 对端只按 size 收，不判出来的话它会拿到一个「成功」的、被静默截断的文件——这正是
+        // 这次要修的 bug。判定经 trailer 告诉对端别换入（见 DownloadStreamSource::outcome）。
+        let mut trailing = [0_u8; 1];
+        if remote.read(&mut trailing).await? != 0 {
             anyhow::bail!(
-                "远端文件在传输期间发生了变化：开始时 {size} 字节，实际读出 {sent} 字节。\
+                "远端文件在传输期间发生了变化（已超过开始时的 {size} 字节）。\
                  这次拷贝已放弃，调用方本地的同名文件未被改动；请重试"
             );
         }
