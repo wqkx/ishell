@@ -414,9 +414,19 @@ pub(crate) async fn direct_relay_copy(
     // 任一步失败都顺手清掉临时文件，再以非 0 退出交给 App 层转中转；清理是尽力而为（此刻临时
     // 公钥可能已经被撤销，这条 ssh 会连不上），失败不改变判定结果，孤儿文件的名字也带着
     // `.ishell-direct-tmp-` 前缀，便于人工识别。
+    // `mv -f tmp dest` 在 dest 是**已存在的目录**时不会失败，而是把临时文件挪进那个目录、
+    // 保留它的临时名——落成 `dest/dest.ishell-direct-tmp-ab12` 这种垃圾名字，还 exit 0，
+    // 调用方收到的是「直连成功」。先判一下目录：不成立就让整条命令非 0 退出、转中转，由
+    // 中转那侧给出正常的报错（upload_from_mcp 往目录上开写会失败）——两条路径的行为因此
+    // 一致。用 `[ ! -d ]` 而不是 GNU 的 `mv -T`：目标主机不保证是 GNU coreutils。
     let commit = format!(
         "{ssh_opt} -- {host_spec} {}",
-        sh_quote(&format!("mv -f {} {}", sh_quote(&dest_tmp), sh_quote(&dest_path))),
+        sh_quote(&format!(
+            "[ ! -d {} ] && mv -f {} {}",
+            sh_quote(&dest_path),
+            sh_quote(&dest_tmp),
+            sh_quote(&dest_path)
+        )),
     );
     let discard = format!(
         "{ssh_opt} -- {host_spec} {}",
