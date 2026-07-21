@@ -12,7 +12,7 @@ Let Claude Code, Codex CLI, or any MCP-compatible agent drive a real, persistent
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-> **Latest release:** [v0.16.11](https://github.com/wqkx/ishell/releases/tag/v0.16.11)
+> **Latest release:** [v0.16.12](https://github.com/wqkx/ishell/releases/tag/v0.16.12)
 
 </div>
 
