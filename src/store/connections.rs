@@ -187,11 +187,35 @@ fn parse_proxyjump(
         Some((u, r)) => (u.to_string(), r),
         None => (default_user.to_string(), first),
     };
-    let (host, port) = match rest.split_once(':') {
+    let (host, port) = split_host_port(rest);
+    (true, host, port, user)
+}
+
+/// 从 `host` / `host:port` / `[v6]` / `[v6]:port` / 裸 `v6` 中拆出 (host, port)，端口缺省 22。
+///
+/// 直接 `split_once(':')` 会在 IPv6 地址内部的第一个冒号处误拆（`[2001:db8::1]:2222` →
+/// host=`[2001`、端口解析失败静默回退 22），生成不可连接的跳板机配置。这里显式处理方括号
+/// 形式与裸 IPv6 字面量（冒号多于一个即判为无端口的 v6）。
+fn split_host_port(rest: &str) -> (String, u16) {
+    // `[v6]` 或 `[v6]:port`
+    if let Some(after) = rest.strip_prefix('[') {
+        if let Some((h, tail)) = after.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(22);
+            return (h.to_string(), port);
+        }
+        return (rest.to_string(), 22); // 畸形（有 [ 无 ]）：整体当主机
+    }
+    // 无方括号且冒号多于一个 → 裸 IPv6 字面量，无端口，整体当主机
+    if rest.matches(':').count() > 1 {
+        return (rest.to_string(), 22);
+    }
+    match rest.split_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(22)),
         None => (rest.to_string(), 22),
-    };
-    (true, host, port, user)
+    }
 }
 
 /// 解析 `~/.ssh/config`，产出可导入的连接列表（跳过通配 Host；无 IdentityFile 默认用 agent）。
@@ -351,5 +375,25 @@ Host pat-*
         assert_eq!(h, "gw.example.com");
         assert_eq!(p, 2200);
         assert_eq!(u, "bastion");
+    }
+
+    #[test]
+    fn parse_proxyjump_ipv6() {
+        // 带端口的方括号 IPv6：host 应是纯地址、端口正确解析（旧实现会拆成 host=`[2001`、端口回退 22）
+        let (_, h, p, _) = parse_proxyjump("u@[2001:db8::1]:2222", &[], "me");
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, 2222);
+        // 方括号无端口 → 缺省 22
+        let (_, h, p, _) = parse_proxyjump("[2001:db8::1]", &[], "me");
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, 22);
+        // 裸 IPv6 字面量（无端口）：整体当主机，不被内部冒号误拆
+        let (_, h, p, _) = parse_proxyjump("fe80::1", &[], "me");
+        assert_eq!(h, "fe80::1");
+        assert_eq!(p, 22);
+        // 常规 host:port 不受影响
+        let (_, h, p, _) = parse_proxyjump("gw:2200", &[], "me");
+        assert_eq!(h, "gw");
+        assert_eq!(p, 2200);
     }
 }

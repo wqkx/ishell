@@ -16,7 +16,14 @@ use crate::proto::{ForwardKind, ForwardSpec, WorkerEvent};
 
 /// 运行一条转发监听，直到任务被 abort。
 pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, sink: UiSink) {
-    let bind = format!("{}:{}", spec.bind_host, spec.bind_port);
+    // 稳健构造监听地址：bind_host 是 IP 字面量时走结构化 `SocketAddr`（IPv6 会自动加方括号，
+    // 得到 `[::1]:8080` 而非手工拼接的 `::1:8080`）；否则按 `host:port` 交给解析器（支持主机名）。
+    // `TcpListener::bind` 的字符串路径虽有「按末冒号拆分」的兜底、多能容忍裸 IPv6，但显示与
+    // 严格解析处（UI label、其它消费方）会因缺方括号而出错，这里从源头规整。
+    let bind = match spec.bind_host.parse::<std::net::IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, spec.bind_port).to_string(),
+        Err(_) => format!("{}:{}", spec.bind_host, spec.bind_port),
+    };
     let listener = match TcpListener::bind(&bind).await {
         Ok(l) => l,
         Err(e) => {

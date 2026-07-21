@@ -2,6 +2,17 @@ use std::path::PathBuf;
 
 use super::paths::config_dir;
 
+/// 写一个设置文件。失败不再静默吞掉，而是 `log::warn!` 记下来（磁盘满 / 只读 / 权限等）——
+/// 否则「UI 显示已切换、实际没落盘、重启又变回旧值」会毫无线索。注：目前仅记日志、尚未回传
+/// UI 弹提示（那需要把这些 fire-and-forget setter 改成 Result 并接到 UI，作更大的后续项）；
+/// 但对 MCP 同意态这类安全相关设置，至少日志里能查到「以为关了其实没关成功」。
+fn write_setting(path: impl AsRef<std::path::Path>, data: impl AsRef<[u8]>) {
+    let path = path.as_ref();
+    if let Err(e) = std::fs::write(path, data) {
+        log::warn!("写入设置失败 {}：{e}", path.display());
+    }
+}
+
 // ---------- 默认下载目录设置 ----------
 
 fn download_dir_path() -> Option<PathBuf> {
@@ -26,7 +37,7 @@ pub fn save_download_dir(dir: &str) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, dir);
+        write_setting(p, dir);
     }
 }
 
@@ -53,7 +64,7 @@ pub fn save_lang(code: &str) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, code);
+        write_setting(p, code);
     }
 }
 
@@ -78,7 +89,7 @@ pub fn save_force_x11(on: bool) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, if on { "1" } else { "0" });
+        write_setting(p, if on { "1" } else { "0" });
     }
 }
 
@@ -100,7 +111,7 @@ pub fn save_osc7_consent(on: bool) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, if on { "1" } else { "0" });
+        write_setting(p, if on { "1" } else { "0" });
     }
 }
 
@@ -122,7 +133,7 @@ pub fn save_mcp_consent(on: bool) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, if on { "1" } else { "0" });
+        write_setting(p, if on { "1" } else { "0" });
     }
 }
 
@@ -198,7 +209,7 @@ pub fn save_term_theme(i: u8) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, i.to_string());
+        write_setting(p, i.to_string());
     }
 }
 
@@ -223,7 +234,7 @@ pub fn save_conflict_policy(policy: &str) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, policy);
+        write_setting(p, policy);
     }
 }
 
@@ -248,7 +259,7 @@ pub fn save_zoom(zoom: f32) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, format!("{zoom:.2}"));
+        write_setting(p, format!("{zoom:.2}"));
     }
 }
 
@@ -275,7 +286,7 @@ pub fn save_file_cols(cols: &[f32; 5]) {
             let _ = std::fs::create_dir_all(d);
         }
         let s = cols.map(|w| format!("{w:.0}")).join(" ");
-        let _ = std::fs::write(p, s);
+        write_setting(p, s);
     }
 }
 
@@ -307,6 +318,6 @@ pub fn save_cursor_line(key: &str, line: usize) {
         list.drain(..cut);
     }
     if let Ok(s) = serde_json::to_string(&list) {
-        let _ = std::fs::write(p, s);
+        write_setting(p, s);
     }
 }

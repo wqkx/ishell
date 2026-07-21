@@ -192,17 +192,42 @@ pub(super) fn local_basename(path: &str) -> String {
         .to_string()
 }
 
-/// 把解压出来的目录 `extracted` 原子移动到 `target`：目标已存在则先整体清空
-/// （镜像覆盖——目标最终只包含这次传输的内容，不残留旧目录里源端已经不存在的文件/
-/// 子目录），保证不管压缩包顶层目录名（固定是远端 basename）和调用方要求的目标名
-/// 是否一致，最终都落在 `target` 这个确切路径上。
+/// 把解压出来的目录 `extracted` 移到 `target`，做**镜像覆盖**（目标最终只含这次传输的内容，
+/// 不残留旧目录里源端已删除的文件），并保证不管压缩包顶层目录名与调用方要求的目标名是否一致，
+/// 最终都落在 `target` 这个确切路径上。
+///
+/// **不先删旧目标再换新的**：那样一旦「删成功、换新失败」就两头皆空、旧数据不可恢复。改为
+/// 先把旧目标 rename 到同目录的备份名（原子、可回滚），换上新目录成功后才删备份，失败则把
+/// 备份换回——「成功前不破坏原目标」。备份与目标同目录、故同文件系统内 rename，不涉及跨盘拷贝。
 pub(super) fn place_extracted_dir(extracted: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(target) {
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target)?,
-        Ok(_) => std::fs::remove_file(target)?,
-        Err(_) => {}
+    // 目标不存在：直接换上即可。
+    if std::fs::symlink_metadata(target).is_err() {
+        return std::fs::rename(extracted, target);
     }
-    std::fs::rename(extracted, target)
+    // 目标存在：旧目标 → 备份（原子）。
+    let mut backup = target.as_os_str().to_os_string();
+    backup.push(format!(".ishelldl-bak-{}", super::rand_hex(6)));
+    let backup = std::path::PathBuf::from(backup);
+    std::fs::rename(target, &backup)?;
+    match std::fs::rename(extracted, target) {
+        Ok(()) => {
+            // 换上成功：清理备份（残留无害，失败忽略）。
+            let is_dir = std::fs::symlink_metadata(&backup)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            let _ = if is_dir {
+                std::fs::remove_dir_all(&backup)
+            } else {
+                std::fs::remove_file(&backup)
+            };
+            Ok(())
+        }
+        Err(e) => {
+            // 换上失败：把备份换回原位，尽量恢复原状后再上报错误。
+            let _ = std::fs::rename(&backup, target);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
