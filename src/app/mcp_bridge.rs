@@ -725,11 +725,13 @@ pub(super) fn spawn_mcp_listener(
 /// 并发连接数上限（见 spawn_mcp_listener 里的信号量）。
 #[cfg(unix)]
 const MAX_MCP_CONNECTIONS: usize = 32;
-/// 首行请求的最大字节数：write_file 的 content 可能是个不小的源码/日志文件，读大文件场景
-/// 也不该被卡得太死，但也不能真的无界——给一个远大于任何正常请求、又能兜住"恶意/异常连接
-/// 持续灌数据不换行"这种情况的上限。
+/// 首行请求的最大字节数：整条请求（含 write_file 的 content）作为一行 JSON 读入内存，故这个
+/// 上限同时是「单连接请求缓冲的峰值」。32 MiB 对 write_file 的文本/源码同步已绰绰有余（真正的
+/// 大文件/二进制走 copy_to_remote 的分块字节流，不塞进 JSON 行），又把「MAX_MCP_CONNECTIONS
+/// 条连接同时灌满大请求」的最坏并发内存从 256MiB×32≈8GiB 压到 32MiB×32≈1GiB；同时兜住「恶意/
+/// 异常连接持续灌数据不换行」。注意该 socket 可能经 SSH 反向转发暴露到远端主机，攻击面不止本机。
 #[cfg(unix)]
-const MAX_MCP_LINE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_MCP_LINE_BYTES: u64 = 32 * 1024 * 1024;
 /// 首行读取超时：连上但迟迟不发完整一行的连接（占位攻击/半开连接）不能无限占着任务和 fd。
 #[cfg(unix)]
 const FIRST_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
