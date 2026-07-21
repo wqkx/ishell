@@ -2,14 +2,34 @@ use std::path::PathBuf;
 
 use super::paths::config_dir;
 
-/// 写一个设置文件。失败不再静默吞掉，而是 `log::warn!` 记下来（磁盘满 / 只读 / 权限等）——
-/// 否则「UI 显示已切换、实际没落盘、重启又变回旧值」会毫无线索。注：目前仅记日志、尚未回传
-/// UI 弹提示（那需要把这些 fire-and-forget setter 改成 Result 并接到 UI，作更大的后续项）；
-/// 但对 MCP 同意态这类安全相关设置，至少日志里能查到「以为关了其实没关成功」。
+/// 设置写入失败的消息队列。这些 setter 是 fire-and-forget、拿不到 UI 句柄，故把失败冒泡进一个
+/// 全局队列，由 App 每帧 `take_setting_write_errors()` 取走弹顶部 toast——避免「UI 显示已切换、
+/// 实际没落盘（磁盘满/只读/权限）、重启又变回旧值」这种毫无反馈的静默失败。
+static WRITE_ERRORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 取走并清空累积的设置写入错误（App 帧循环调用，转成顶部 toast）。
+pub fn take_setting_write_errors() -> Vec<String> {
+    WRITE_ERRORS
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
+/// 写一个设置文件。失败不再静默吞掉：既 `log::warn!`，也冒泡进 `WRITE_ERRORS` 让 UI 弹提示。
 fn write_setting(path: impl AsRef<std::path::Path>, data: impl AsRef<[u8]>) {
     let path = path.as_ref();
     if let Err(e) = std::fs::write(path, data) {
         log::warn!("写入设置失败 {}：{e}", path.display());
+        let msg = match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("⚠ 设置未能保存（{}）：{e}", path.display()),
+            crate::i18n::Lang::En => format!("⚠ Failed to save setting ({}): {e}", path.display()),
+        };
+        if let Ok(mut v) = WRITE_ERRORS.lock() {
+            if v.len() < 16 {
+                // 兜底防无限堆积（磁盘持续满 + 用户反复点开关）
+                v.push(msg);
+            }
+        }
     }
 }
 

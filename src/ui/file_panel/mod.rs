@@ -501,48 +501,42 @@ pub(super) fn perm_string(perm: u32, is_dir: bool, is_link: bool) -> String {
     )
 }
 
-/// 简单的 unix 时间格式化：按本地时区偏移换算后展示（SFTP 的 mtime 为 UTC 纪元秒）。
+/// 时间格式化：把 SFTP 的 UTC 纪元秒 `secs` 按**该时刻实际生效**的本地时区/夏令时换算后展示。
+/// 逐时间戳换算（而非「取当前偏移套到所有文件」），故跨夏令时边界的历史文件也不会差 1 小时。
 pub(super) fn fmt_mtime(secs: u64) -> String {
     if secs == 0 {
         return "-".into();
     }
-    // 加上本地 UTC 偏移（东区为正）得到本地墙钟秒；偏移取负仍越界则视为无效
-    let local = secs as i64 + local_offset_seconds();
-    if local < 0 {
-        return "-".into();
+    match local_datetime(secs) {
+        Some((y, mo, d, h, m)) => format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}"),
+        None => "-".into(),
     }
-    let local = local as u64;
-    let days = local / 86400;
-    let rem = local % 86400;
-    let (h, m) = (rem / 3600, (rem % 3600) / 60);
-    let (y, mo, d) = civil_from_days(days as i64);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
 }
 
-/// 本地时区相对 UTC 的偏移（秒，东区为正）。首次查询后缓存，避免逐行重复系统调用。
-/// DST 仅按「当前」状态取一次，跨夏令时边界的历史文件可能差 1 小时，于文件列表足够。
-fn local_offset_seconds() -> i64 {
-    use std::sync::OnceLock;
-    static OFFSET: OnceLock<i64> = OnceLock::new();
-    *OFFSET.get_or_init(query_local_offset_seconds)
-}
-
+/// 把 UTC 纪元秒换算成**本地**墙钟的 `(年, 月, 日, 时, 分)`，按该时刻真实的时区/夏令时。
 #[cfg(unix)]
-fn query_local_offset_seconds() -> i64 {
-    // libc::localtime_r 填充的 tm_gmtoff 即「本地相对 UTC 的秒数偏移」
+fn local_datetime(secs: u64) -> Option<(i64, u32, u32, u32, u32)> {
+    // localtime_r 按 `secs` 这一刻的时区规则（含当时的夏令时状态）填充本地分解时间。
     unsafe {
-        let t: libc::time_t = libc::time(std::ptr::null_mut());
+        let t = secs as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
-            return 0;
+            return None;
         }
-        tm.tm_gmtoff as i64
+        Some((
+            tm.tm_year as i64 + 1900,
+            tm.tm_mon as u32 + 1,
+            tm.tm_mday as u32,
+            tm.tm_hour as u32,
+            tm.tm_min as u32,
+        ))
     }
 }
 
 #[cfg(windows)]
-fn query_local_offset_seconds() -> i64 {
-    // 直接声明 Win32 FFI，免引入额外 crate。TIME_ZONE_INFORMATION 布局固定且稳定。
+fn local_datetime(secs: u64) -> Option<(i64, u32, u32, u32, u32)> {
+    // 直接声明 Win32 FFI，免引入额外 crate。SystemTimeToTzSpecificLocalTime 会按给定的 UTC
+    // 时刻应用**当时正确**的时区/夏令时规则（而非「当前状态套所有时间」）。
     #[repr(C)]
     struct WinSystemTime {
         w_year: u16,
@@ -554,39 +548,53 @@ fn query_local_offset_seconds() -> i64 {
         w_second: u16,
         w_milliseconds: u16,
     }
-    #[repr(C)]
-    struct TimeZoneInformation {
-        bias: i32,
-        standard_name: [u16; 32],
-        standard_date: WinSystemTime,
-        standard_bias: i32,
-        daylight_name: [u16; 32],
-        daylight_date: WinSystemTime,
-        daylight_bias: i32,
-    }
     extern "system" {
-        fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
+        fn SystemTimeToTzSpecificLocalTime(
+            tz: *const core::ffi::c_void,
+            utc: *const WinSystemTime,
+            local: *mut WinSystemTime,
+        ) -> i32;
     }
-    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    // secs -> UTC 的分解时间（复用 civil_from_days 求年月日）
+    let (y, mo, d) = civil_from_days((secs / 86400) as i64);
+    let rem = secs % 86400;
+    let utc = WinSystemTime {
+        w_year: y as u16,
+        w_month: mo as u16,
+        w_day_of_week: 0,
+        w_day: d as u16,
+        w_hour: (rem / 3600) as u16,
+        w_minute: ((rem % 3600) / 60) as u16,
+        w_second: (rem % 60) as u16,
+        w_milliseconds: 0,
+    };
     unsafe {
-        let mut tzi: TimeZoneInformation = std::mem::zeroed();
-        let r = GetTimeZoneInformation(&mut tzi);
-        // UTC = local + bias(分钟)；夏令时生效时再叠加 daylight_bias，否则用 standard_bias
-        let extra = if r == TIME_ZONE_ID_DAYLIGHT {
-            tzi.daylight_bias
-        } else {
-            tzi.standard_bias
-        };
-        -((tzi.bias + extra) as i64) * 60
+        let mut local: WinSystemTime = std::mem::zeroed();
+        // NULL 时区 → 用系统当前时区（含其 DST 规则），按 utc 这一刻正确判定夏令时
+        if SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 {
+            return None;
+        }
+        Some((
+            local.w_year as i64,
+            local.w_month as u32,
+            local.w_day as u32,
+            local.w_hour as u32,
+            local.w_minute as u32,
+        ))
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn query_local_offset_seconds() -> i64 {
-    0
+fn local_datetime(secs: u64) -> Option<(i64, u32, u32, u32, u32)> {
+    // 无本地时区接口的平台：按 UTC 展示（不加偏移），至少年月日时分正确。
+    let (y, mo, d) = civil_from_days((secs / 86400) as i64);
+    let rem = secs % 86400;
+    Some((y, mo, d, (rem / 3600) as u32, ((rem % 3600) / 60) as u32))
 }
 
 /// 自 1970-01-01 起的天数 -> (年,月,日)。算法源自 Howard Hinnant。
+/// unix 走 `localtime_r` 直接拿分解时间、用不到本函数，故仅在其余平台编译（避免 dead_code）。
+#[cfg(not(unix))]
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;

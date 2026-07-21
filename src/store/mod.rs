@@ -26,5 +26,6 @@ pub use settings::{
     mcp_socket_path,
     save_conflict_policy, save_cursor_line, save_download_dir, save_file_cols, save_force_x11,
     save_lang, save_mcp_consent, save_osc7_consent, save_term_theme, save_zoom,
+    take_setting_write_errors,
 };
 pub use snippets::{load_snippets, save_snippets, Snippet};
