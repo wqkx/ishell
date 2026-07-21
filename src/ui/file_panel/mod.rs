@@ -319,10 +319,18 @@ pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Ve
         }
         let mut retry: Vec<String> = Vec::new();
         let mut give_up: Vec<String> = Vec::new();
+        let mut clear_stuck: Vec<String> = Vec::new();
         for p in &loading_now {
             let (t0, att) = *state.load_at.entry(p.clone()).or_insert((now, 1));
             if state.listings.contains_key(p) {
-                continue; // 已有数据（预取叠加等），不必超时
+                // 已有数据：用户不被阻塞，通常不必超时重发。但若这条 loading 登记迟迟不被结果
+                // 清除——最新请求的结果丢失、或被 gen 乱序防护判为陈旧而未清 loading——会永久
+                // 卡在 loading，从而压制该路径后续的预取/弹簧自动重列。超时后直接清掉这条卡住
+                // 的登记（已有数据，不必再发请求，manual 刷新仍随时可用）。
+                if now - t0 >= LIST_TIMEOUT {
+                    clear_stuck.push(p.clone());
+                }
+                continue;
             }
             if now - t0 >= LIST_TIMEOUT {
                 if att < LIST_MAX_TRIES {
@@ -331,6 +339,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Ve
                     give_up.push(p.clone());
                 }
             }
+        }
+        for p in clear_stuck {
+            state.loading.remove(&p);
+            state.load_at.remove(&p);
         }
         for p in retry {
             let att = state.load_at.get(&p).map(|v| v.1).unwrap_or(1);

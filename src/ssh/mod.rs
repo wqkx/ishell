@@ -203,18 +203,17 @@ pub async fn run(
             // 超过 24h，其 socket 就满足上面兜底清扫的 `-mmin +1440` 条件，会被后来任一条新连接
             // 误删，导致这个仍存活的实例在 MCP 里静默失联。定期 touch 自己的 socket，把 mtime
             // 变成「最后存活时间」心跳：活着的持续刷新、永不被误删；崩溃的停止刷新、超 24h
-            // 自然被回收。touch 失败通常意味着连接已断，退出循环由收尾去 rm。
+            // 自然被回收。单次 touch 失败**不代表连接已断**（可能只是通道打开撞上服务端
+            // MaxSessions 等瞬时情况），容错继续下一拍即可；连接真断时由 run() 收尾主动
+            // abort 本任务，无需自行检测——若在此 break，一次瞬时失败就会永久停掉心跳，
+            // 长连接的 socket 反而会被 24h 兜底清扫误删，正是本机制要防的事。
             if let Some(remote_path) = registered {
                 let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
                 tick.tick().await; // 首个 tick 立即返回，消费掉（注册刚完成，mtime 尚新）
                 loop {
                     tick.tick().await;
-                    if exec_status(&fwd_handle, &format!("touch -c {}", sh_quote(&remote_path)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                    let _ = exec_status(&fwd_handle, &format!("touch -c {}", sh_quote(&remote_path)))
+                        .await;
                 }
             }
         }))
