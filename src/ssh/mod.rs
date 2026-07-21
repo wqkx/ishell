@@ -155,34 +155,67 @@ pub async fn run(
     // 连通性探测（不依赖远端装了 nc/socat），单纯用时间兜底崩溃/异常退出导致的遗留，避免
     // 无限堆积。
     let mcp_forward_path: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    // 保留注册任务句柄：连接收尾时要先给它一个收尾窗口，否则「连接先结束、注册后完成」会
-    // 把已注册的 socket 遗留在远端（槽位被 take 时还是 None）。见 run() 末尾清理处。
+    // 注册在独立任务里异步完成。收尾时要先等它把 remote_path 落进槽位再清理，否则「连接先
+    // 结束、注册后完成」会把已注册的 socket 遗留在远端（槽位被 take 时还是 None）。注册任务
+    // 成功后会转入 keepalive 心跳循环、永不自行结束，所以收尾不能死等它完成——改用一个
+    // oneshot 通知「注册尝试已结束」，收尾等这个有界的短窗口，到点后 abort 掉心跳。
+    let (reg_done_tx, reg_done_rx) = tokio::sync::oneshot::channel::<()>();
     let mcp_forward_task: Option<tokio::task::JoinHandle<()>> = if crate::store::load_mcp_consent() {
         let fwd_handle = handle.clone();
         let path_slot = mcp_forward_path.clone();
         Some(tokio::spawn(async move {
-            let home = match exec_capture(&fwd_handle, "echo -n $HOME").await {
-                Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
-                _ => return, // 探测不到远端 HOME：放弃转发，不影响其余功能
-            };
-            let dir = format!("{home}/.ishell-mcp");
-            let _ = exec_status(
-                &fwd_handle,
-                &format!(
-                    "mkdir -p -m 700 {} && find {} -maxdepth 1 -name 'mcp-*.sock' -mmin +1440 -delete",
-                    sh_quote(&dir),
-                    sh_quote(&dir)
-                ),
-            )
+            // 注册尝试的结论：成功则返回落地的 remote_path，放弃/失败则 None。
+            let registered: Option<String> = async {
+                let home = match exec_capture(&fwd_handle, "echo -n $HOME").await {
+                    Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
+                    _ => return None, // 探测不到远端 HOME：放弃转发，不影响其余功能
+                };
+                let dir = format!("{home}/.ishell-mcp");
+                let _ = exec_status(
+                    &fwd_handle,
+                    &format!(
+                        "mkdir -p -m 700 {} && find {} -maxdepth 1 -name 'mcp-*.sock' -mmin +1440 -delete",
+                        sh_quote(&dir),
+                        sh_quote(&dir)
+                    ),
+                )
+                .await;
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default();
+                let remote_path = format!("{dir}/mcp-{nonce}.sock");
+                match fwd_handle.streamlocal_forward(remote_path.clone()).await {
+                    Ok(()) => {
+                        *path_slot.lock().unwrap() = Some(remote_path.clone());
+                        Some(remote_path)
+                    }
+                    Err(e) => {
+                        log::debug!("AI/MCP 反向转发注册失败：{e}");
+                        None
+                    }
+                }
+            }
             .await;
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            let remote_path = format!("{dir}/mcp-{nonce}.sock");
-            match fwd_handle.streamlocal_forward(remote_path.clone()).await {
-                Ok(()) => *path_slot.lock().unwrap() = Some(remote_path),
-                Err(e) => log::debug!("AI/MCP 反向转发注册失败：{e}"),
+            // 注册尝试有结论了（路径已落槽位或已放弃）：让收尾停止空等。
+            let _ = reg_done_tx.send(());
+            // keepalive：socket 文件的 mtime 是创建时刻、不随流量刷新（已实测），若连接存活
+            // 超过 24h，其 socket 就满足上面兜底清扫的 `-mmin +1440` 条件，会被后来任一条新连接
+            // 误删，导致这个仍存活的实例在 MCP 里静默失联。定期 touch 自己的 socket，把 mtime
+            // 变成「最后存活时间」心跳：活着的持续刷新、永不被误删；崩溃的停止刷新、超 24h
+            // 自然被回收。touch 失败通常意味着连接已断，退出循环由收尾去 rm。
+            if let Some(remote_path) = registered {
+                let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
+                tick.tick().await; // 首个 tick 立即返回，消费掉（注册刚完成，mtime 尚新）
+                loop {
+                    tick.tick().await;
+                    if exec_status(&fwd_handle, &format!("touch -c {}", sh_quote(&remote_path)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }))
     } else {
@@ -747,7 +780,10 @@ pub async fn run(
     // 兜底清理）。这里先给注册任务一个短暂收尾窗口（注册可能卡在 streamlocal_forward，故带
     // 超时、不无限等），让它有机会把 remote_path 落进槽位，再 take 清理。
     if let Some(task) = mcp_forward_task {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+        // 等注册尝试落地（成功则路径已进槽位），最多 3 秒；到点或提前完成后停掉 keepalive
+        // 心跳（注册成功时任务会一直循环，不会自行结束，必须主动 abort）。
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), reg_done_rx).await;
+        task.abort();
     }
     let forward_cleanup = mcp_forward_path.lock().unwrap().take();
     if let Some(remote_path) = forward_cleanup {
