@@ -55,7 +55,7 @@ impl App {
                 } else {
                     path
                 };
-                let _ = s.cmd_tx.send(UiCommand::ListDir(p));
+                let _ = s.cmd_tx.send(crate::proto::list_dir_cmd(p));
             }
             FileAction::Download(remote) => {
                 let name = remote.rsplit('/').next().unwrap_or("download").to_string();

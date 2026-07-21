@@ -11,6 +11,11 @@ pub struct FilePanelState {
     pub cwd: String,
     /// 路径 -> 该目录的条目（树与右栏共用）
     pub listings: HashMap<String, Vec<FileEntry>>,
+    /// canon 路径 -> 已应用的最大目录列举序号（gen）。同一目录可能有多个 List 请求在飞
+    /// （删除后自动刷新 + 手动刷新 + 弱网超时重发），乱序返回时用它丢弃「后到的旧结果」，
+    /// 避免陈旧列表覆盖较新列表（曾致刷新后新建的同名目录不显示、只能靠过滤框才看到）。
+    /// 全局单调，故只增不删也安全——新请求 gen 必然更大，陈旧结果永远比不过。
+    pub applied_list_gen: HashMap<String, u64>,
     /// 树中已展开的目录
     pub expanded: HashSet<String>,
     /// 正在加载的目录

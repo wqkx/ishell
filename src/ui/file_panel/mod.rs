@@ -121,7 +121,22 @@ pub(in crate::ui::file_panel) fn open_intent(e: &FileEntry, full: &str) -> OpenI
 
 impl FilePanelState {
     /// 收到目录列表后由 App 调用：写入缓存并清除 loading；首次自动设为 cwd。
-    pub fn on_listing(&mut self, path: String, entries: Vec<FileEntry>) {
+    ///
+    /// `gen` 是发起该请求时的全局单调序号（见 `proto::next_list_gen`）。同一目录可能有多个
+    /// List 请求在飞（删除后自动刷新 + 手动刷新 + 弱网超时重发），且各自独立 `tokio::spawn`
+    /// 乱序返回——只接受序号 >= 已应用者的结果，丢弃「后到的旧结果」，避免陈旧列表覆盖较新
+    /// 列表（曾致刷新后外部新建的同名目录不显示、只有过滤框才搜得到）。
+    pub fn on_listing(&mut self, path: String, entries: Vec<FileEntry>, gen: u64) {
+        if self
+            .applied_list_gen
+            .get(&path)
+            .is_some_and(|&applied| gen < applied)
+        {
+            // 陈旧结果：更新的结果已抢先应用（并已清 loading）。直接丢弃，且**不动 loading**
+            // ——此刻的 loading 若还在，多半属于又一次更新的在飞请求，不能被这条旧结果误清。
+            return;
+        }
+        self.applied_list_gen.insert(path.clone(), gen);
         self.loading.remove(&path);
         self.nav_error.remove(&path); // 列出成功 → 清除该路径的「无效」标记
                                       // 选择防错位：行选择存的是「排序后行索引」，刷新后条目集或排序键字段一旦变化，

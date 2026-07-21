@@ -168,8 +168,8 @@ impl Session {
                         self.last_cwd = c.to_string();
                     }
                 }
-                WorkerEvent::DirListing { path, entries } => {
-                    self.files.on_listing(path, entries);
+                WorkerEvent::DirListing { path, entries, gen } => {
+                    self.files.on_listing(path, entries, gen);
                 }
                 WorkerEvent::DirListFailed {
                     path,

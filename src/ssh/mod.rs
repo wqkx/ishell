@@ -326,7 +326,7 @@ pub async fn run(
                     Some(UiCommand::Resize { cols, rows }) => {
                         let _ = shell.window_change(cols as u32, rows as u32, 0, 0).await;
                     }
-                    Some(UiCommand::ListDir(path)) => {
+                    Some(UiCommand::ListDir { path, gen: list_gen }) => {
                         // 独立任务执行，避免慢/挂起的目录卡死整个 worker
                         if let Some(sftp) = &sftp {
                             let sftp = sftp.clone();
@@ -341,7 +341,7 @@ pub async fn run(
                                 // 只回失败；会话级错误（超时/通道关闭/IO）判为假死，上报代号触发 SFTP 重连。
                                 match list_dir(&sftp, &path).await {
                                     Ok((canon, entries)) => {
-                                        s.send(WorkerEvent::DirListing { path: canon, entries });
+                                        s.send(WorkerEvent::DirListing { path: canon, entries, gen: list_gen });
                                     }
                                     Err(e) => {
                                         use russh_sftp::client::error::Error as SftpErr;

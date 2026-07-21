@@ -90,7 +90,7 @@ impl Session {
     pub(super) fn refresh_dir(&mut self, dir: Option<String>) {
         if let Some(dir) = dir {
             self.files.loading.insert(dir.clone());
-            let _ = self.cmd_tx.send(UiCommand::ListDir(dir));
+            let _ = self.cmd_tx.send(crate::proto::list_dir_cmd(dir));
         }
     }
 
@@ -100,7 +100,7 @@ impl Session {
         self.files.expanded.insert("/".into());
         // 只请求 "."（服务端解析为家目录）作为 cwd；树的其余层级由 sync_tree 自动补全。
         // 不预先请求 "/"，避免它先返回把 cwd 设成根目录。
-        let _ = self.cmd_tx.send(UiCommand::ListDir(".".into()));
+        let _ = self.cmd_tx.send(crate::proto::list_dir_cmd(".".into()));
     }
 }
 

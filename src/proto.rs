@@ -69,14 +69,35 @@ pub enum AuthMethod {
     Interactive,
 }
 
+/// 目录列举请求的全局单调序号源。所有 `UiCommand::ListDir` 的 `gen` 都取自这里，保证
+/// 「后发起的请求 gen 更大」，UI 便能用它丢弃乱序/陈旧的旧结果（见 `next_list_gen`）。
+static LIST_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 取下一个目录列举序号（单调递增，跨所有会话/目录共用一个计数器即可——只需保证同一目录
+/// 的多次请求先后有序，全局单调是其充分条件）。
+pub fn next_list_gen() -> u64 {
+    LIST_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 构造一条带新序号的 `ListDir` 指令：所有列目录请求都应经此发出，别手动填 `gen`，
+/// 以免忘记取号导致乱序防护失效。
+pub fn list_dir_cmd(path: String) -> UiCommand {
+    UiCommand::ListDir {
+        path,
+        gen: next_list_gen(),
+    }
+}
+
 /// UI -> Worker 指令。
 pub enum UiCommand {
     /// 终端键盘输入（已编码为字节流）
     TerminalInput(Vec<u8>),
     /// 终端尺寸变化（字符列/行）
     Resize { cols: u16, rows: u16 },
-    /// 请求列出远程目录（SFTP）
-    ListDir(String),
+    /// 请求列出远程目录（SFTP）。`gen` 是发起序号（全局单调，取自 `next_list_gen()`），
+    /// 结果 `DirListing` 会原样带回，供 UI 丢弃乱序/陈旧的旧结果——同一目录可能有多个 List
+    /// 在飞（删除后自动刷新 + 手动刷新 + 弱网超时重发），后到的旧结果不得覆盖新结果。
+    ListDir { path: String, gen: u64 },
     /// 下载远程文件到本地路径
     Download {
         id: u64,
@@ -286,10 +307,11 @@ pub enum WorkerEvent {
     TerminalData(Vec<u8>),
     /// 远端是否支持 Linux /proc 系统监控（连接后探测一次）
     MonitorSupport(bool),
-    /// 目录列表结果
+    /// 目录列表结果。`gen` 原样回传自对应的 `ListDir` 请求，UI 据此丢弃乱序/陈旧结果。
     DirListing {
         path: String,
         entries: Vec<FileEntry>,
+        gen: u64,
     },
     /// 目录列举失败。`retryable`=true 表示会话级错误（弱网/SFTP 通道重连中），UI 应保留
     /// loading 并稍后自动重试；=false 表示路径级错误（不存在/无权限），UI 标记该路径无效。

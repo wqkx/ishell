@@ -223,7 +223,7 @@ impl App {
                     if let Some(didx) = self.session_idx_by_uid(job.dest_uid) {
                         let _ = self.sessions[didx]
                             .cmd_tx
-                            .send(UiCommand::ListDir(job.dest_dir.clone()));
+                            .send(crate::proto::list_dir_cmd(job.dest_dir.clone()));
                     }
                 }
                 Some(false) => {
