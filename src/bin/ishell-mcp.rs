@@ -98,12 +98,27 @@ async fn connect_timeout(
 /// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时——一律返回
 /// `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
 #[cfg(unix)]
-async fn identify(path: &std::path::Path) -> Option<String> {
+async fn identify(path: &std::path::Path) -> Option<(String, u32)> {
     let stream = connect_timeout(path).await.ok()?.ok()?;
     match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
-        Ok(McpReqResult::Instance { id }) => Some(id),
+        Ok(McpReqResult::Instance { id, proto_version }) => Some((id, proto_version)),
         _ => None,
     }
+}
+
+/// 校验对端 iShell 的 MCP 协议版本与本代理是否一致；不一致给出可操作的重新部署提示。
+/// 旧版 iShell 不带版本字段 → 经 serde 默认收到 0 → 判为不一致（正是所需行为）。
+#[cfg(unix)]
+fn check_proto_version(peer: u32) -> Result<(), String> {
+    if peer == mcp_protocol::MCP_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    Err(format!(
+        "iShell 与 ishell-mcp 版本不一致（iShell 端 MCP 协议 v{peer}，本代理 v{}）。二者的线\
+         协议是配套编译的，版本错位会导致静默错误——请用与当前 iShell 配套的 ishell-mcp 重新\
+         部署（默认位置 ~/.ishell-mcp/bin/ishell-mcp）后，重新连接 MCP。",
+        mcp_protocol::MCP_PROTOCOL_VERSION
+    ))
 }
 
 /// 并发问遍所有候选路径，收齐「答得上话的」实例及其路径。
@@ -115,10 +130,10 @@ async fn identify(path: &std::path::Path) -> Option<String> {
 /// 同一个实例可能从多条路径答话（见 `candidate_paths`），这里不去重——去重规则由调用方定：
 /// `bind_instance` 要按 id 收敛成实例列表，`connect_bound` 只关心某个特定 id。
 #[cfg(unix)]
-async fn identify_all() -> Vec<(String, std::path::PathBuf)> {
+async fn identify_all() -> Vec<(String, u32, std::path::PathBuf)> {
     let mut set = tokio::task::JoinSet::new();
     for path in candidate_paths() {
-        set.spawn(async move { identify(&path).await.map(|id| (id, path)) });
+        set.spawn(async move { identify(&path).await.map(|(id, ver)| (id, ver, path)) });
     }
     let mut out = Vec::new();
     while let Some(joined) = set.join_next().await {
@@ -135,26 +150,31 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
     // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
     if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
         let path = std::path::PathBuf::from(p);
-        let id = identify(&path).await.ok_or_else(|| {
+        let (id, ver) = identify(&path).await.ok_or_else(|| {
             format!(
                 "ISHELL_MCP_SOCKET 指定的 socket 连不上、或对面不是 iShell：{}",
                 path.display()
             )
         })?;
+        check_proto_version(ver)?;
         return Ok((id, path));
     }
-    let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for (id, path) in identify_all().await {
+    let mut found: Vec<(String, u32, std::path::PathBuf)> = Vec::new();
+    for (id, ver, path) in identify_all().await {
         // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
-        if !found.iter().any(|(known, _)| *known == id) {
-            found.push((id, path));
+        if !found.iter().any(|(known, _, _)| *known == id) {
+            found.push((id, ver, path));
         }
     }
     match found.len() {
         0 => Err(
             "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".into(),
         ),
-        1 => Ok(found.pop().expect("上一行刚确认只有一个")),
+        1 => {
+            let (id, ver, path) = found.pop().expect("上一行刚确认只有一个");
+            check_proto_version(ver)?;
+            Ok((id, path))
+        }
         _ => choose_instance(found).await,
     }
 }
@@ -169,23 +189,25 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
 /// 标识是纯内部的东西，把它抬到用户面前只会要求他先给窗口取个名、再把名字念给 AI 听。
 #[cfg(unix)]
 async fn choose_instance(
-    found: Vec<(String, std::path::PathBuf)>,
+    found: Vec<(String, u32, std::path::PathBuf)>,
 ) -> Result<(String, std::path::PathBuf), String> {
     let count = found.len();
     let mut set = tokio::task::JoinSet::new();
-    for (id, path) in found {
+    for (id, ver, path) in found {
         set.spawn(async move {
             let stream = connect_timeout(&path)
                 .await
                 .map_err(|_| "连接 iShell socket 超时".to_string())?
                 .map_err(|e| e.to_string())?;
             exchange(stream, Some(id.clone()), McpReqKind::Bind, BIND_TIMEOUT).await?;
-            Ok::<_, String>((id, path))
+            Ok::<_, String>((id, ver, path))
         });
     }
     while let Some(joined) = set.join_next().await {
-        if let Ok(Ok(winner)) = joined {
-            return Ok(winner); // set 在这里被丢弃 → 其余任务 abort → 落选窗口的框自动消失
+        if let Ok(Ok((id, ver, path))) = joined {
+            // set 在这里被丢弃 → 其余任务 abort → 落选窗口的框自动消失。
+            check_proto_version(ver)?;
+            return Ok((id, path));
         }
     }
     Err(format!(
@@ -215,7 +237,7 @@ async fn connect_bound() -> Result<(UnixStream, String), String> {
     }
     // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。在候选里重新找回**同一个
     // 实例**——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上。
-    for (found_id, path) in identify_all().await {
+    for (found_id, _ver, path) in identify_all().await {
         if found_id == id {
             if let Ok(Ok(stream)) = connect_timeout(&path).await {
                 *PATH_CACHE.lock().unwrap() = Some(path);
@@ -1024,7 +1046,35 @@ impl ServerHandler for IshellMcp {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `--version`：打印 crate 版本与 MCP 线协议版本。安装脚本与（后续）GUI 自动部署都靠它
+    // 比对「已部署的代理」与「当前 iShell」是否配套——协议版本才是决定线格式兼容性的关键。
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!(
+            "ishell-mcp {} proto {}",
+            env!("CARGO_PKG_VERSION"),
+            mcp_protocol::MCP_PROTOCOL_VERSION
+        );
+        return Ok(());
+    }
     let service = IshellMcp::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::check_proto_version;
+    use super::mcp_protocol::MCP_PROTOCOL_VERSION;
+
+    #[test]
+    fn accepts_matching_version() {
+        assert!(check_proto_version(MCP_PROTOCOL_VERSION).is_ok());
+    }
+
+    #[test]
+    fn rejects_mismatch_and_legacy_zero() {
+        assert!(check_proto_version(MCP_PROTOCOL_VERSION + 1).is_err());
+        // 旧版 iShell 不带版本字段 → serde 默认收到 0 → 必须判为不一致。
+        assert!(check_proto_version(0).is_err());
+    }
 }

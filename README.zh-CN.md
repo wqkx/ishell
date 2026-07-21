@@ -180,22 +180,31 @@ cargo run --release
   Unix domain socket（每个 iShell 进程各一份 `~/.config/ishell/mcp-<pid>.sock`，权限 `0600`），
   不监听任何网络端口。
 - **共享可见终端**。AI 执行的命令和产生的输出会实时显示在对应终端标签里，效果等同于人亲自输入。
-- **接入方式**：编译一次配套的独立二进制（`cargo build --release --bin ishell-mcp`）——它走标准
-  MCP stdio 传输，不绑定任何特定客户端：
+- **接入方式**：编译一次配套的独立二进制（`cargo build --release --bin ishell-mcp`），再安装到
+  标准位置。在**运行 AI 客户端的那台机器**上执行：
+  ```bash
+  scripts/install-mcp.sh target/release/ishell-mcp
+  ```
+  它会把二进制拷到 **`~/.ishell-mcp/bin/ishell-mcp`**（稳定、自命名空间的路径，不随仓库位置/
+  重建变化）并打印注册命令。二进制走标准 MCP stdio 传输，不绑定任何客户端——把下面任一客户端
+  指向这个路径即可：
   - **Claude Code** —— 直接注册为全局可用（不限于某个项目目录）：
     ```bash
-    claude mcp add ishell -s user -- /path/to/ishell-mcp
+    claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp
     ```
   - **Codex CLI** —— 用法类似：
     ```bash
-    codex mcp add ishell -- /path/to/ishell-mcp
+    codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp
     ```
-    （或手动加到 `~/.codex/config.toml`：`[mcp_servers.ishell]` / `command = "/path/to/ishell-mcp"`——
+    （或手动加到 `~/.codex/config.toml`：`[mcp_servers.ishell]` / `command = "~/.ishell-mcp/bin/ishell-mcp"`——
     如果 CLI/配置格式有变化，以 `codex mcp --help` 为准）
   - **其它兼容 MCP 的客户端**（Cursor、Windsurf、Cline……）—— 大多接受通用写法：
     ```json
-    { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
+    { "mcpServers": { "ishell": { "command": "~/.ishell-mcp/bin/ishell-mcp" } } }
     ```
+  - **两者要同版本**：GUI 与 `ishell-mcp` 的线协议是编译在一起的，必须同一版本。升级 iShell 后
+    重跑 `install-mcp.sh` 覆盖代理即可；若忘了升级代理，它会在连接时以「版本不一致，请重新
+    部署」明确报错，而不是静默出错。（`ishell-mcp --version` 会打印其 crate 与协议版本。）
 - **暴露的工具**：
   - `list_sessions` / `list_saved_connections`：列出当前打开的会话 / 所有已保存的连接配置；
   - `open_session`：用一个已保存的连接新开一个只读会话供 AI 专用；首次使用某条连接会弹窗让你

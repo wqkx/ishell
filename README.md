@@ -183,21 +183,32 @@ take over a tab you already have open, or open a brand-new one itself from a sav
   iShell process (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port is opened.
 - **Shared, visible terminal.** Commands the AI runs — and their output — appear in the
   corresponding terminal tab in real time, exactly as if you'd typed them yourself.
-- **Setup**: build the companion binary once (`cargo build --release --bin ishell-mcp`) — it
-  speaks the standard MCP stdio transport, so it isn't tied to any one client:
+- **Setup**: build the companion binary once (`cargo build --release --bin ishell-mcp`), then
+  install it to the standard location. On the machine that runs your AI client, run:
+  ```bash
+  scripts/install-mcp.sh target/release/ishell-mcp
+  ```
+  This copies it to **`~/.ishell-mcp/bin/ishell-mcp`** (a stable, self-namespaced path that
+  survives repo moves/rebuilds) and prints the register command. It speaks the standard MCP stdio
+  transport, so it isn't tied to any one client — point any of these at that path:
   - **Claude Code** — register it globally (not scoped to one project) in one line:
     ```bash
-    claude mcp add ishell -s user -- /path/to/ishell-mcp
+    claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp
     ```
   - **Codex CLI** — same idea:
     ```bash
-    codex mcp add ishell -- /path/to/ishell-mcp
+    codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp
     ```
-    (or add it by hand to `~/.codex/config.toml`: `[mcp_servers.ishell]` / `command = "/path/to/ishell-mcp"` — check `codex mcp --help` if the CLI/config format has changed since this was written)
+    (or add it by hand to `~/.codex/config.toml`: `[mcp_servers.ishell]` / `command = "~/.ishell-mcp/bin/ishell-mcp"` — check `codex mcp --help` if the CLI/config format has changed since this was written)
   - **Any other MCP-compatible client** (Cursor, Windsurf, Cline, …) — most accept the generic form:
     ```json
-    { "mcpServers": { "ishell": { "command": "/path/to/ishell-mcp" } } }
+    { "mcpServers": { "ishell": { "command": "~/.ishell-mcp/bin/ishell-mcp" } } }
     ```
+  - **Keep the two in sync**: the GUI and `ishell-mcp` share a wire protocol compiled into both,
+    so they must be the same build. When you upgrade iShell, re-run `install-mcp.sh` to refresh the
+    proxy. If you forget, the proxy detects the version mismatch on connect and fails with a clear
+    "redeploy ishell-mcp" message instead of misbehaving silently. (`ishell-mcp --version` prints
+    its crate + protocol version.)
 - **Tools exposed**:
   - `list_sessions` / `list_saved_connections`: list currently open sessions / all saved
     connection configs;

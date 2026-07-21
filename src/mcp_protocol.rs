@@ -542,11 +542,22 @@ mod addressing_tests {
     }
 }
 
+/// MCP 线协议版本。GUI(`ishell`)与代理(`ishell-mcp`)把本文件各编一遍，二者的线协议必须
+/// 配套；**任何会改变线格式/语义的改动都要给这个数 +1**。代理在 `Identify` 时拿到 GUI 的版本，
+/// 与自身比对，不一致即拒绝并提示重新部署——根治「升了 GUI 忘换代理 → 静默错」这类问题。
+pub const MCP_PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {
     /// `Identify` 的结果：对端 iShell 的实例标识，代理据此去重、认人、填进后续每条请求的
     /// `McpRequest::instance`。纯内部标识，不面向用户。
-    Instance { id: String },
+    Instance {
+        id: String,
+        /// 对端 iShell 的 MCP 线协议版本（`MCP_PROTOCOL_VERSION`）。旧版 iShell 不带此字段
+        /// → serde 默认落 0 → 必与当前版本不符 → 触发代理侧的「重新部署」提示（正是所需）。
+        #[serde(default)]
+        proto_version: u32,
+    },
     Sessions(Vec<McpSessionInfo>),
     Run(McpRunResult),
     Screen(String),

@@ -804,7 +804,15 @@ async fn handle_conn(
     // Identify 在连接层就地回答：它只是「你是谁」，不碰任何会话状态，没必要绕一趟 App
     // 帧循环。代理发现多个实例时会向每一个都问一次，让这条路尽量轻。
     if matches!(req.kind, McpReqKind::Identify) {
-        reply(&mut w, id, Ok(McpReqResult::Instance { id: own.to_string() })).await;
+        reply(
+            &mut w,
+            id,
+            Ok(McpReqResult::Instance {
+                id: own.to_string(),
+                proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+            }),
+        )
+        .await;
         return;
     }
     let is_caller_upload = matches!(&req.kind, McpReqKind::CopyToRemoteFromCaller { .. });
