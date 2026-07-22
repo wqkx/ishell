@@ -1,30 +1,9 @@
 //! SFTP read/open helpers.
 
 use crate::proto::WorkerEvent;
+use crate::textcodec::decode_text;
 
 use crate::ssh::UiSink;
-
-/// 探测字节的字符编码并解码为 String，返回 (文本, 编码名)。
-/// UTF-8(含 BOM) 优先；非 UTF-8 用 chardetng 猜测（中文环境多为 GBK/GB18030）。
-pub(in crate::ssh) fn decode_text(data: &[u8]) -> (String, String) {
-    // UTF-8 BOM
-    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return (
-            String::from_utf8_lossy(&data[3..]).into_owned(),
-            "UTF-8".into(),
-        );
-    }
-    // 无损 UTF-8 直接用
-    if let Ok(s) = std::str::from_utf8(data) {
-        return (s.to_string(), "UTF-8".into());
-    }
-    // 非 UTF-8：探测后解码
-    let mut det = chardetng::EncodingDetector::new();
-    det.feed(data, true);
-    let enc = det.guess(None, true);
-    let (cow, actual, _) = enc.decode(data);
-    (cow.into_owned(), actual.name().to_string())
-}
 
 /// 分块读取远程文本文件并上报进度（驱动占位标签上的珊瑚色进度条），与下载文件一致地分块读取。
 /// 非 force 时限制 20MB 并拒绝含 NUL 的二进制；force（用户确认后）放宽到 128MB 且跳过二进制检查。

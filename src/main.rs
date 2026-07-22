@@ -15,6 +15,7 @@ mod proto;
 mod ssh;
 mod store;
 mod terminal;
+mod textcodec;
 mod theme;
 mod ui;
 mod version;

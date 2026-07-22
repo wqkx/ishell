@@ -15,9 +15,7 @@ impl App {
         // 右下文件操作区（可拖动调整高度）
         let mut file_actions: Vec<FileAction> = Vec::new();
         let has_clip = self.xfer.file_clip.is_some();
-        // Phase 1：本机会话的文件区尚未接本地 FS，先整块隐藏（避免空白/转圈）。后续阶段接上后移除。
-        let show_files = !files_collapsed() && !self.sessions[idx].cfg.is_local();
-        if show_files {
+        if !files_collapsed() {
             egui::Panel::bottom("files")
                 .resizable(true)
                 .default_size(250.0)

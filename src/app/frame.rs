@@ -53,11 +53,9 @@ impl App {
             evt_backlog |= s.drain_events();
             if s.connected && !s.initialized {
                 s.initialized = true;
-                // Phase 1：本机会话的文件浏览尚未接本地 FS，先不初始化文件树（否则会发
-                // ListDir，本机 worker 目前忽略，文件面板会一直转圈）。后续阶段接上后移除此 gate。
-                if !s.cfg.is_local() {
-                    s.init_files();
-                }
+                // 本机会话也初始化文件树：init_files 发 ListDir("."), 本机 worker 解析到家目录
+                // （见 local::files）。SSH 会话则由 SFTP 解析到远端家目录。
+                s.init_files();
             }
             for (id, path) in s.pending.placeholder.drain(..) {
                 new_placeholders.push((id, path, s.title.clone(), s.uid, s.cmd_tx.clone()));

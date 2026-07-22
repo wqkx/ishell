@@ -8,8 +8,10 @@
 //! 下面的异步 select 循环；另一条 std 线程阻塞写 PTY，从 std 通道收键盘输入。master 句柄留在
 //! 异步循环里做 resize，child 留着退出时 kill。
 //!
-//! 目前只实现终端（Phase 1）。本地文件浏览 / 传输是后续阶段——那时 local worker 会再处理
-//! `ListDir`/`ReadFile`/... 等命令（对本地文件系统），此处先一律忽略。
+//! 终端见本模块；本地文件浏览/读写/增删改（Phase 2）在 `files` 子模块，产出与 SFTP 侧相同的
+//! `WorkerEvent`。传输（Phase 3）尚未支持，相关命令暂被忽略。
+
+mod files;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, SlavePty};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -79,8 +81,14 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
                     ));
                     break;
                 }
-                // Phase 1：文件浏览 / 传输 / 端口转发等命令本机会话尚不支持，忽略。
-                Some(_) => {}
+                // 文件浏览/读写/增删改（Phase 2）：交给本地文件处理器，独立任务执行不阻塞终端 I/O。
+                // 尚不支持的命令（传输/转发/进程/PDF 等）由 files::handle 内部忽略。
+                Some(other) => {
+                    let s = sink.clone();
+                    tokio::spawn(async move {
+                        files::handle(other, &s).await;
+                    });
+                }
             },
         }
     }
@@ -171,7 +179,7 @@ fn default_shell() -> String {
 }
 
 /// 本机家目录：unix `$HOME`，Windows `%USERPROFILE%`。取不到则 None（PTY 用继承的 cwd）。
-fn home_dir() -> Option<String> {
+pub(super) fn home_dir() -> Option<String> {
     #[cfg(unix)]
     {
         std::env::var("HOME").ok()
