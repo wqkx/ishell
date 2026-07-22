@@ -196,8 +196,8 @@ pub(super) fn find_widget(
                 .corner_radius(6)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    // 输入框/按钮行高较矮不易操作：整体加高约 30%（24 → 31）。
-                    ui.spacing_mut().interact_size.y = 31.0;
+                    // 行高较矮不易操作：加高（24 → 28，比初版 31 略收 ~10%）。
+                    ui.spacing_mut().interact_size.y = 28.0;
                     ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
                     // 输入框用近白底，和卡片/边框区分开（默认会和 PANEL_2 同色看不清）
                     ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(252, 252, 250);
@@ -227,10 +227,10 @@ pub(super) fn find_widget(
                         let fr = ui.add(
                             egui::TextEdit::singleline(&mut ed.find)
                                 .desired_width(150.0)
-                                // 单行 TextEdit 的高度 = 字体行高 + 2×margin.y（不看 interact_size）：
-                                // 加大字体 + 纵向 margin 才能真正把输入框加高 ~30%。
-                                .font(egui::FontId::proportional(15.0))
-                                .margin(egui::Margin::symmetric(6, 7))
+                                // 单行 TextEdit 的高度 = 字体行高 + 2×margin.y（不看 interact_size）。
+                                // 字体较初版小 2 号（15→13），margin 略收，行高随之下降 ~10%。
+                                .font(egui::FontId::proportional(13.0))
+                                .margin(egui::Margin::symmetric(6, 6))
                                 .hint_text(crate::i18n::tr("查找", "Find")),
                         );
                         if ed.find_focus {
@@ -337,8 +337,8 @@ pub(super) fn find_widget(
                             ui.add(
                                 egui::TextEdit::singleline(&mut ed.replace)
                                     .desired_width(150.0)
-                                    .font(egui::FontId::proportional(15.0))
-                                    .margin(egui::Margin::symmetric(6, 7))
+                                    .font(egui::FontId::proportional(13.0))
+                                    .margin(egui::Margin::symmetric(6, 6))
                                     .hint_text(crate::i18n::tr("替换", "Replace")),
                             );
                             if ui
