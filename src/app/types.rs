@@ -95,6 +95,9 @@ pub(super) struct Transfers {
     pub(super) pending_direct_fallback: Vec<DirectFallback>,
     /// 直传目标不在本机 known_hosts：待用户确认首次 TOFU（在源机 accept-new）后再执行
     pub(super) pending_direct_hostkey: Option<PendingPaste>,
+    /// 本机↔远端传输追踪：一端是本机会话时不走中转/直连，直接在远端 peer 上 Upload/Download，
+    /// 这里追踪那条传输，完成后做剪切删源 / 刷新本机落地目录。
+    pub(super) local_xfers: Vec<LocalPeerXfer>,
 }
 
 /// 命令片段库状态（从 App 抽出的内聚字段组）。
@@ -124,6 +127,8 @@ pub(super) struct FileClip {
     pub(super) src_host: String,
     pub(super) src_port: u16,
     pub(super) src_label: String,
+    /// 源会话是否为本机 PTY 会话（复制时记下，粘贴到远端时据此走「直接 Upload」而非中转）。
+    pub(super) src_local: bool,
 }
 
 /// 待确认的粘贴计划（剪切，或跨服务器复制/剪切，执行前二次确认）。
@@ -142,6 +147,26 @@ pub(super) struct PendingPaste {
     pub(super) dest_label: String,
     /// 跨服务器时是否走「直传」（true=源主机直推目标；false=经本地中转）。一级确认后才据传输方式设定。
     pub(super) direct: bool,
+    /// 源 / 目标是否为本机会话。恰好一端为本机时（本机↔远端）不走中转/直连，直接在远端 peer
+    /// 上做 Upload/Download（本机文件本就在 iShell 宿主机上）。两端皆本机则是同机 `!cross` 复制。
+    pub(super) src_local: bool,
+    pub(super) dest_local: bool,
+}
+
+/// 本机↔远端传输的善后追踪：远端 peer 上那条 Upload/Download 完成后，剪切则删源、
+/// 远端→本机则刷新本机落地目录（本机不像远端上传那样能靠 TransferDone.refresh_dir 自动刷新）。
+pub(super) struct LocalPeerXfer {
+    /// 跑 Upload/Download 的会话 uid（远端 peer）
+    pub(super) xfer_uid: u64,
+    /// 该会话里的传输 id
+    pub(super) xfer_id: u64,
+    pub(super) is_cut: bool,
+    /// 剪切成功后从这个会话删源（远端源=远端会话；本机源=本机会话）
+    pub(super) del_uid: u64,
+    pub(super) del_path: String,
+    /// 成功后需刷新目录的会话 uid（本机下载落地目录）；0 = 不刷新（远端上传会自动刷新）
+    pub(super) refresh_uid: u64,
+    pub(super) refresh_dir: String,
 }
 
 /// 直传任务追踪（App 侧）：源会话里一条直传传输（id）的归属与善后信息。

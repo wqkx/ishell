@@ -1,9 +1,9 @@
 //! Clipboard paste and same-host/cross-host paste dispatch.
 
-use crate::proto::{ConflictPolicy, UiCommand};
+use crate::proto::{ConflictPolicy, TransferDir, UiCommand};
 
 use super::super::util::parent_dir;
-use super::super::{App, FileClip, PendingPaste, Relay, RelayPhase, Transfer};
+use super::super::{App, FileClip, LocalPeerXfer, PendingPaste, Relay, RelayPhase, Transfer, XferSpec};
 
 impl App {
     /// 复制 / 剪切选中项到 App 级剪贴板（跨 tab 共享）。
@@ -13,8 +13,14 @@ impl App {
         items: Vec<(String, bool)>,
         is_cut: bool,
     ) {
-        let (uid, host, port, label) = match self.sessions.get(idx) {
-            Some(s) => (s.uid, s.cfg.host.clone(), s.cfg.port, s.title.clone()),
+        let (uid, host, port, label, src_local) = match self.sessions.get(idx) {
+            Some(s) => (
+                s.uid,
+                s.cfg.host.clone(),
+                s.cfg.port,
+                s.title.clone(),
+                s.cfg.is_local(),
+            ),
             None => return,
         };
         let n = items.len();
@@ -25,6 +31,7 @@ impl App {
             src_host: host,
             src_port: port,
             src_label: label,
+            src_local,
         });
         if let Some(s) = self.sessions.get_mut(idx) {
             s.status = match (is_cut, crate::i18n::current()) {
@@ -45,6 +52,8 @@ impl App {
             return;
         };
         let cross = clip.src_host != dest.cfg.host || clip.src_port != dest.cfg.port;
+        let src_local = clip.src_local;
+        let dest_local = dest.cfg.is_local();
         let src_dir = clip
             .items
             .first()
@@ -61,10 +70,15 @@ impl App {
             src_label: clip.src_label.clone(),
             dest_label: dest.title.clone(),
             direct: false, // 传输方式由确认弹框里的互斥选择决定
+            src_local,
+            dest_local,
         };
-        // 仅「跨服务器」需执行前确认（重操作 + 选直传/中转）；同机无论复制还是移动都直接执行——
-        // 同机移动是原子 mv，源在目标写成功前不会丢，无需二次确认。
-        if plan.cross {
+        // 本机↔远端（恰好一端是本机）：本机文件就在 iShell 宿主机上，直接在远端 peer 上
+        // Upload/Download 即可，不涉及「直传暴露私钥/中转落盘」的取舍，无需二次确认，直接执行。
+        let one_local = cross && (src_local != dest_local);
+        // 仅「跨远端服务器」需执行前确认（重操作 + 选直传/中转）；同机 / 本机↔远端都直接执行——
+        // 同机移动是原子 mv、本机↔远端是普通上传下载，源在目标写成功前都不会丢，无需二次确认。
+        if plan.cross && !one_local {
             self.xfer.confirm_direct = false; // 每次打开确认默认「中转」(更安全，直传会暴露私钥)
             self.xfer.pending_paste = Some(plan);
         } else {
@@ -92,6 +106,9 @@ impl App {
                     (false, crate::i18n::Lang::En) => format!("Copying {n} …"),
                 };
             }
+        } else if plan.src_local != plan.dest_local {
+            // 本机↔远端：直接在远端 peer 上 Upload/Download（本机文件本就在宿主机上）。
+            self.execute_local_remote_paste(plan);
         } else if plan.direct {
             self.execute_direct(plan);
         } else {
@@ -206,5 +223,129 @@ impl App {
         if is_cut {
             self.xfer.file_clip = None;
         }
+    }
+
+    /// 本机↔远端粘贴：一端是本机会话、另一端是远端会话时执行。本机文件就在 iShell 宿主机上，
+    /// 故**只在远端 peer 上**做一条普通 Upload / Download（本机侧只是提供/接收一个它本就能用
+    /// std/tokio fs 读写的路径），不涉及中转落盘或直连密钥。剪切在传输**成功后**才删源（安全）；
+    /// 远端→本机成功后刷新本机落地目录（远端上传方向则由 TransferDone.refresh_dir 自动刷新）。
+    fn execute_local_remote_paste(&mut self, plan: PendingPaste) {
+        let Some(di) = self.session_idx_by_uid(plan.dest_uid) else {
+            return;
+        };
+        let Some(si) = self.session_idx_by_uid(plan.src_uid) else {
+            self.sessions[di].status =
+                crate::i18n::tr("源会话已关闭，无法粘贴", "Source session closed").into();
+            return;
+        };
+        let n = plan.items.len();
+
+        if plan.src_local {
+            // 本机 → 远端：在远端目标会话上传本机文件（远端 worker 直接读本机路径）。
+            let dest_uid = self.sessions[di].uid;
+            for (src_path, _is_dir) in &plan.items {
+                let name = src_path
+                    .rsplit(['/', '\\'])
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("upload")
+                    .to_string();
+                let id = {
+                    let s = &mut self.sessions[di];
+                    let id = s.next_xfer;
+                    s.next_xfer += 1;
+                    s.transfers.push(Transfer::new(
+                        id,
+                        name,
+                        TransferDir::Upload,
+                        0,
+                        None,
+                        Some(XferSpec::Upload {
+                            local: src_path.clone(),
+                            remote_dir: plan.dest_dir.clone(),
+                        }),
+                    ));
+                    let _ = s.cmd_tx.send(UiCommand::Upload {
+                        id,
+                        local: src_path.clone(),
+                        remote_dir: plan.dest_dir.clone(),
+                        remote_name: None,
+                        policy: ConflictPolicy::Overwrite,
+                    });
+                    id
+                };
+                // 剪切：上传成功后删本机源（远端目录由 Upload 的 refresh_dir 自动刷新）。
+                if plan.is_cut {
+                    self.xfer.local_xfers.push(LocalPeerXfer {
+                        xfer_uid: dest_uid,
+                        xfer_id: id,
+                        is_cut: true,
+                        del_uid: plan.src_uid,
+                        del_path: src_path.clone(),
+                        refresh_uid: 0,
+                        refresh_dir: String::new(),
+                    });
+                }
+            }
+            self.sessions[di].status = match (plan.is_cut, crate::i18n::current()) {
+                (true, crate::i18n::Lang::Zh) => format!("从本机移动 {n} 项到远端 …"),
+                (false, crate::i18n::Lang::Zh) => format!("从本机复制 {n} 项到远端 …"),
+                (true, crate::i18n::Lang::En) => format!("Moving {n} from local to remote …"),
+                (false, crate::i18n::Lang::En) => format!("Copying {n} from local to remote …"),
+            };
+        } else {
+            // 远端 → 本机：在远端源会话下载到本机目标目录；成功后刷新本机目录（+剪切删远端源）。
+            let src_uid = self.sessions[si].uid;
+            for (src_path, _is_dir) in &plan.items {
+                let base = src_path
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("download")
+                    .to_string();
+                let local = std::path::Path::new(&plan.dest_dir)
+                    .join(&base)
+                    .to_string_lossy()
+                    .into_owned();
+                let id = {
+                    let s = &mut self.sessions[si];
+                    let id = s.next_xfer;
+                    s.next_xfer += 1;
+                    s.transfers.push(Transfer::new(
+                        id,
+                        base,
+                        TransferDir::Download,
+                        0,
+                        Some(local.clone()),
+                        Some(XferSpec::Download {
+                            remote: src_path.clone(),
+                            local: local.clone(),
+                        }),
+                    ));
+                    let _ = s.cmd_tx.send(UiCommand::Download {
+                        id,
+                        remote: src_path.clone(),
+                        local,
+                        policy: ConflictPolicy::Overwrite,
+                    });
+                    id
+                };
+                self.xfer.local_xfers.push(LocalPeerXfer {
+                    xfer_uid: src_uid,
+                    xfer_id: id,
+                    is_cut: plan.is_cut,
+                    del_uid: plan.src_uid,
+                    del_path: src_path.clone(),
+                    refresh_uid: plan.dest_uid,
+                    refresh_dir: plan.dest_dir.clone(),
+                });
+            }
+            self.sessions[si].status = match (plan.is_cut, crate::i18n::current()) {
+                (true, crate::i18n::Lang::Zh) => format!("从远端移动 {n} 项到本机 …"),
+                (false, crate::i18n::Lang::Zh) => format!("从远端复制 {n} 项到本机 …"),
+                (true, crate::i18n::Lang::En) => format!("Moving {n} from remote to local …"),
+                (false, crate::i18n::Lang::En) => format!("Copying {n} from remote to local …"),
+            };
+        }
+        self.show_transfers = true;
+        self.xfer_just_opened = true;
     }
 }

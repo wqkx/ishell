@@ -234,6 +234,8 @@ impl App {
         self.process_relays();
         // 跨服务器直传任务推进（完成则删源/刷新；失败则弹「转中转」）
         self.process_direct_jobs();
+        // 本机↔远端传输善后推进（成功后剪切删源 / 刷新本机落地目录）
+        self.process_local_xfers();
         for (path, data, server, uid) in new_images {
             self.image.focus = true; // 打开/切换后聚焦看图窗口
                                      // 同一会话同一图片已打开则切到该标签（身份用 uid，不用可能重名的 title）

@@ -259,6 +259,9 @@ impl App {
                                 src_label: job.src_label,
                                 dest_label: job.dest_label,
                                 direct: false,
+                                // 直传只发生在远端↔远端之间，两端都非本机。
+                                src_local: false,
+                                dest_local: false,
                             },
                             reason: crate::i18n::tr(
                                 "直传失败（源主机无法直推到目标主机）。",

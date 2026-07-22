@@ -70,6 +70,40 @@ impl App {
         }
     }
 
+    /// 推进本机↔远端传输的善后：远端 peer 上那条 Upload/Download 成功后，剪切则删源、
+    /// 远端→本机则刷新本机落地目录；失败/会话消失则丢弃（保留源，不删不刷新）。
+    pub(in crate::app) fn process_local_xfers(&mut self) {
+        let mut i = 0;
+        while i < self.xfer.local_xfers.len() {
+            let x = &self.xfer.local_xfers[i];
+            let status = self.transfer_ok(x.xfer_uid, x.xfer_id);
+            let gone = self.session_idx_by_uid(x.xfer_uid).is_none();
+            match (status, gone) {
+                (Some(true), _) => {
+                    let x = self.xfer.local_xfers.remove(i);
+                    // 剪切：传输成功后才删源（安全——目标写成功前源分毫不动）。
+                    if x.is_cut {
+                        if let Some(di) = self.session_idx_by_uid(x.del_uid) {
+                            let _ = self.sessions[di].cmd_tx.send(UiCommand::DeleteMany {
+                                paths: vec![x.del_path],
+                            });
+                        }
+                    }
+                    // 远端→本机下载：本机落地目录不会靠 TransferDone.refresh_dir 自动刷新，手动刷。
+                    if x.refresh_uid != 0 {
+                        if let Some(ri) = self.session_idx_by_uid(x.refresh_uid) {
+                            self.sessions[ri].refresh_dir(Some(x.refresh_dir));
+                        }
+                    }
+                }
+                (Some(false), _) | (None, true) => {
+                    self.xfer.local_xfers.remove(i); // 失败或会话消失：保留源，丢弃追踪
+                }
+                (None, false) => i += 1, // 仍在传输
+            }
+        }
+    }
+
     /// 推进跨服务器中转任务：下载完成→发起上传；上传完成→（剪切则删源）+ 清理临时。
     pub(in crate::app) fn process_relays(&mut self) {
         let mut i = 0;
