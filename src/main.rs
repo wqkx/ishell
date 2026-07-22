@@ -9,6 +9,7 @@
 mod app;
 mod i18n;
 mod limits;
+mod local;
 mod mcp_protocol;
 mod proto;
 mod ssh;

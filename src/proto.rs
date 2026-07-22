@@ -3,7 +3,20 @@
 //! - UI -> Worker：使用 `tokio::sync::mpsc`（`send` 为非阻塞同步调用，UI 线程可直接用）
 //! - Worker -> UI：使用 `std::sync::mpsc`（UI 每帧 `try_recv` 排空）
 
-/// 一次 SSH 连接的配置。
+/// 会话的传输类型：远程 SSH（默认）或本机 PTY。
+///
+/// 本机会话不连接任何主机，直接在运行 iShell 的这台机器上起一个本地 shell（PTY），
+/// 与 SSH 会话共用同一套 `UiCommand`/`WorkerEvent` 协议——终端模型、会话结构、重连
+/// 逻辑因此完全复用。为 `Local` 时 `ConnectConfig` 的 host/port/username/auth/jump
+/// 全部无意义（仅填占位值供标签/标识使用）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Transport {
+    #[default]
+    Ssh,
+    Local,
+}
+
+/// 一次会话连接的配置（SSH 或本机）。
 #[derive(Clone, Debug)]
 pub struct ConnectConfig {
     pub host: String,
@@ -16,6 +29,33 @@ pub struct ConnectConfig {
     pub jump: Option<JumpHost>,
     /// 转发本机 ssh-agent（OpenSSH 的 `-A`）：远端进程可复用本机 agent 私钥
     pub forward_agent: bool,
+    /// 传输类型（默认 SSH）。为 `Local` 时忽略上面所有 SSH 专有字段，改由本机 PTY worker 处理。
+    pub transport: Transport,
+}
+
+impl ConnectConfig {
+    /// 构造一个「本机终端」配置：不连接任何远程主机，直接在本地起一个 PTY shell。
+    /// host/username 仅作占位（用于标签与会话标识），本机 worker 不会使用它们。
+    pub fn local() -> Self {
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "local".into());
+        Self {
+            host: "localhost".into(),
+            port: 0,
+            username,
+            auth: AuthMethod::Agent, // 占位，本机传输不使用
+            label: crate::i18n::tr("本机", "Local").into(),
+            jump: None,
+            forward_agent: false,
+            transport: Transport::Local,
+        }
+    }
+
+    /// 是否为本机 PTY 会话。
+    pub fn is_local(&self) -> bool {
+        matches!(self.transport, Transport::Local)
+    }
 }
 
 /// 跳板机（堡垒机）连接信息。

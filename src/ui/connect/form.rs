@@ -247,6 +247,7 @@ impl ConnectForm {
             label: self.name.trim().to_string(),
             jump,
             forward_agent: self.forward_agent,
+            transport: crate::proto::Transport::Ssh,
         })
     }
 }

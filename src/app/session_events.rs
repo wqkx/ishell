@@ -126,9 +126,10 @@ impl Session {
                                     .into();
                         }
                     }
-                    // 仅对"曾连上又掉线"的会话自动重连，最多 5 次，指数退避
+                    // 仅对"曾连上又掉线"的会话自动重连，最多 5 次，指数退避。本机会话不自动
+                    // 重连：shell 退出（用户敲 exit）是明确的关闭意图，自动重开会让人永远关不掉。
                     const MAX_TRIES: u32 = 5;
-                    if self.was_connected && self.reconnect_tries < MAX_TRIES {
+                    if self.was_connected && !self.cfg.is_local() && self.reconnect_tries < MAX_TRIES {
                         let secs = (2u64 << self.reconnect_tries.min(4)).min(30); // 2,4,8,16,30
                         self.reconnect_at =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
@@ -148,7 +149,9 @@ impl Session {
                 }
                 WorkerEvent::MonitorSupport(ok) => {
                     self.monitor_ok = Some(ok);
-                    if !ok {
+                    // 本机会话本就不提供 /proc 系统监控（那是远端 Linux 采样），MonitorSupport(false)
+                    // 是预期状态，不该弹「远端非 Linux」这句误导性提示。
+                    if !ok && !self.cfg.is_local() {
                         self.pending.warn.push(
                             crate::i18n::tr(
                                 "远端非 Linux 或缺少 /proc，系统监控已禁用",

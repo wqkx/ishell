@@ -40,9 +40,16 @@ impl App {
                             })
                         }),
                         forward_agent: false,
+                        transport: crate::proto::Transport::Ssh,
                     });
                 }
             }
+        }
+
+        // 自检：ISHELL_LOCAL=1 时启动即开一个本机 PTY 终端（用于本机会话的截图自检）
+        if std::env::var("ISHELL_LOCAL").is_ok() {
+            self.connect_form.open = false;
+            self.spawn_session(ConnectConfig::local());
         }
 
         // 自检：直接打开新建表单（截图核对输入框样式）
@@ -253,6 +260,7 @@ impl App {
                     label: String::new(),
                     jump: None,
                     forward_agent: false,
+                    transport: crate::proto::Transport::Ssh,
                 });
             }
         }

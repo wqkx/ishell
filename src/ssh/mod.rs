@@ -50,7 +50,7 @@ impl UiSink {
             sysinfo_tx,
         }
     }
-    fn send(&self, ev: WorkerEvent) {
+    pub(crate) fn send(&self, ev: WorkerEvent) {
         let _ = self.tx.send(ev);
         self.ctx.request_repaint();
     }

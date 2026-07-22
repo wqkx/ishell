@@ -70,6 +70,57 @@ impl ConnectForm {
         ui.separator();
         ui.set_min_width(500.0);
 
+        // 固定「本机」入口：始终在最上方，单击直接开本地终端。它不写入 connections.json，
+        // 不占用户保存的连接，也不会被误删；点一下即产出一个本机 ConnectConfig。
+        {
+            let row_h = 36.0;
+            let full_w = ui.available_width();
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(rect, 6.0, Palette::PANEL_2);
+            }
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.label(
+                        RichText::new(icon::HOUSE)
+                            .color(Palette::ACCENT)
+                            .size(18.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(crate::i18n::tr("本机", "Local machine"))
+                                .color(Palette::TEXT)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(crate::i18n::tr(
+                                "打开本机终端（本地 shell，无需 SSH）",
+                                "Open a local terminal (local shell, no SSH)",
+                            ))
+                            .color(Palette::TEXT_DIM)
+                            .size(11.0),
+                        );
+                    });
+                },
+            );
+            if resp
+                .on_hover_text(crate::i18n::tr(
+                    "在本机直接打开一个终端",
+                    "Open a terminal on this computer",
+                ))
+                .clicked()
+            {
+                *result = Some(crate::proto::ConnectConfig::local());
+            }
+            ui.add_space(4.0);
+            ui.separator();
+        }
+
         if !self.saved.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(Palette::TEXT_DIM));

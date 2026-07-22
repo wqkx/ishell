@@ -128,7 +128,13 @@ impl App {
         let (sysinfo_tx, sysinfo_rx) = tokio::sync::watch::channel(None);
         let (hostkey_tx, hostkey_rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = UiSink::new(evt_tx, self.ctx.clone(), std::sync::Arc::new(sysinfo_tx));
-        self.runtime.spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx));
+        // 按传输类型分叉：本机会话跑本地 PTY worker（不连任何主机），其余走 SSH worker。
+        // 本机 worker 不需要 hostkey_rx（无 TOFU 主机密钥确认），忽略即可。
+        if cfg.is_local() {
+            self.runtime.spawn(crate::local::run(cfg, cmd_rx, sink));
+        } else {
+            self.runtime.spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx));
+        }
         (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx)
     }
 
@@ -144,7 +150,13 @@ impl App {
             } else {
                 cfg.label.trim().to_string()
             },
-            tip: format!("{}@{}:{}", cfg.username, cfg.host, cfg.port),
+            // 本机会话的 host/port 只是占位（见 ConnectConfig::local），不拿去拼 user@host:port
+            // 这种毫无意义的悬停提示；给一个明确的「本机」标识。
+            tip: if cfg.is_local() {
+                format!("{} · {}", crate::i18n::tr("本机", "Local machine"), cfg.username)
+            } else {
+                format!("{}@{}:{}", cfg.username, cfg.host, cfg.port)
+            },
             cmd_tx,
             evt_rx,
             sysinfo_rx,
@@ -154,7 +166,13 @@ impl App {
             sysinfo: None,
             net_hist: NetHistory::default(),
             files: {
-                let key = format!("{}@{}:{}", cfg.username, cfg.host, cfg.port);
+                // 收藏夹/文件面板的持久化键：本机会话用一个稳定的合成键（host/port 无意义），
+                // 避免和某台真实主机的 "user@host:port" 撞键。
+                let key = if cfg.is_local() {
+                    format!("local:{}", cfg.username)
+                } else {
+                    format!("{}@{}:{}", cfg.username, cfg.host, cfg.port)
+                };
                 FilePanelState {
                     favorites: crate::store::load_favorites(&key),
                     server_key: key,

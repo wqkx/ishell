@@ -28,6 +28,10 @@ russh-sftp = "2.3"
 # 终端模拟（VT100 屏幕模型）
 vt100 = "0.16"
 
+# 本机终端：跨平台 PTY（Linux/macOS openpty、Windows ConPTY），用于「本机」会话直接起本地 shell，
+# 无需经 SSH。只用它开 PTY + spawn 子进程，读写走阻塞线程，桥接到 worker 的异步 select 循环。
+portable-pty = "0.8"
+
 # 编辑器查找/替换：大小写 / 全字 / 正则
 regex = "1"
 
