@@ -140,7 +140,10 @@ impl App {
                 let mut open_dir: Option<String> = None;
                 let mut shown = 0usize; // 当前筛选下实际展示的条数（用于「无匹配」提示）
                 // 列表过长时滚动：约 8 条高度封顶，其余可滚动查看
-                egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true]).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true])
+                    // 传输框不显示滚动条（内容仍可滚轮滚动）——条数多时靠滚轮，界面更干净。
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
                 for (uid, t) in items.iter().copied().filter(|(_, t)| match filter {
                     XferFilter::All => true,
                     XferFilter::Active => t.ok.is_none(),
