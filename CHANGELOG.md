@@ -4,6 +4,21 @@
 
 ## [未发布]
 
+## [0.16.13] - 2026-07-22
+
+### Fixed
+- **AI/MCP 控制下，窗口空闲后 MCP 请求会积压数分钟**：请求到达 socket 后由后台线程
+  `request_repaint()` 唤醒 UI 线程处理，但 eframe 停在 `ControlFlow::Wait` 时跨线程唤醒会丢，
+  请求只能干等到别的事件偶然唤起一帧——实测单条 `list_sessions` 卡 157 秒。且代理每次工具调用
+  新开一条连接，故每个调用都可能中招。改用可靠的 `request_repaint_after`（OS 层定时唤醒，窗口
+  被最小化/遮挡也照样触发）：仅在 AI 控制启用且有已连接会话时维持低频兜底节奏，保证请求
+  ≤150ms 被处理；普通用户/无会话时零开销
+- **同时下载多个文件时偶尔某个失败（网络无恙）**：每个传输各开一条新 SSH channel，6 路并发叠加
+  基线 channel 与已完成传输 channel 关闭的回收延迟，瞬时并发数会偶尔撞上服务器 `MaxSessions`
+  上限（OpenSSH 默认 10），第 11 条 `channel_open` 返回 `ConnectFailed`，而此前对该失败零重试，
+  那个文件便永久失败。现对「服务器暂时给不出 channel」（`ChannelOpenFailure`）做有界退避重试
+  （≤6 次、≤2s），等兄弟 channel 关闭腾出槽位即成；连接真死等其余错误仍立即失败、不空等
+
 ## [0.16.12] - 2026-07-21
 
 ### Security
