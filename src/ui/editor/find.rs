@@ -227,6 +227,10 @@ pub(super) fn find_widget(
                         let fr = ui.add(
                             egui::TextEdit::singleline(&mut ed.find)
                                 .desired_width(150.0)
+                                // 单行 TextEdit 的高度 = 字体行高 + 2×margin.y（不看 interact_size）：
+                                // 加大字体 + 纵向 margin 才能真正把输入框加高 ~30%。
+                                .font(egui::FontId::proportional(15.0))
+                                .margin(egui::Margin::symmetric(6, 7))
                                 .hint_text(crate::i18n::tr("查找", "Find")),
                         );
                         if ed.find_focus {
@@ -333,6 +337,8 @@ pub(super) fn find_widget(
                             ui.add(
                                 egui::TextEdit::singleline(&mut ed.replace)
                                     .desired_width(150.0)
+                                    .font(egui::FontId::proportional(15.0))
+                                    .margin(egui::Margin::symmetric(6, 7))
                                     .hint_text(crate::i18n::tr("替换", "Replace")),
                             );
                             if ui
