@@ -110,7 +110,16 @@ impl Terminal {
                 } => {
                     let plain =
                         !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.shift;
-                    if !alt && plain && matches!(key, Key::ArrowUp | Key::ArrowDown) {
+                    // 裸上下键：默认走 iShell 的本地前缀历史（对普通 shell 提示符很好用）。但**应用
+                    // 光标模式**（DECCKM，ipython/prompt_toolkit、vim、fzf、less 等前台程序会开启）
+                    // 是「前台程序要自己接管方向键」的明确信号——此时绝不能拦成本地历史，否则
+                    // ipython 的补全菜单、vim 的光标移动等全用不了。让它透传给 encode_key（会按
+                    // app_cursor 发 `ESC O A`/`ESC O B`，正是这些程序期待的）。
+                    if !alt
+                        && plain
+                        && !self.parser.screen().application_cursor()
+                        && matches!(key, Key::ArrowUp | Key::ArrowDown)
+                    {
                         out.extend_from_slice(&self.history_nav(key == Key::ArrowUp));
                         continue;
                     }

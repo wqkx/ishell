@@ -397,6 +397,18 @@ fn modified_arrows_carry_modifier_param() {
 }
 
 #[test]
+fn plain_up_down_use_ss3_in_app_cursor_mode() {
+    // ipython/prompt_toolkit、vim、fzf 等在应用光标模式(DECCKM)下靠 SS3 形式(`ESC O A/B`)的
+    // 方向键导航（补全菜单/光标）；普通模式(bash 提示符)是 CSI(`ESC [ A/B`)。collect_input 在
+    // 应用光标模式下不再把裸上下键拦成本地历史，透传到这里编码——这两组序列必须对得上，
+    // 否则 ipython 补全菜单按上下键无效（只能 Tab），正是本次修复的现象。
+    assert_eq!(enc(egui::Key::ArrowUp, NONE, false), b"\x1b[A");
+    assert_eq!(enc(egui::Key::ArrowUp, NONE, true), b"\x1bOA");
+    assert_eq!(enc(egui::Key::ArrowDown, NONE, false), b"\x1b[B");
+    assert_eq!(enc(egui::Key::ArrowDown, NONE, true), b"\x1bOB");
+}
+
+#[test]
 fn tilde_keys_carry_modifier_param() {
     assert_eq!(enc(egui::Key::Delete, NONE, false), b"\x1b[3~");
     assert_eq!(enc(egui::Key::Delete, CTRL, false), b"\x1b[3;5~");
