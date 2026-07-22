@@ -55,7 +55,7 @@ impl UiSink {
         self.ctx.request_repaint();
     }
     /// 周期性系统信息快照：覆盖式发送（只留最新），不进入 mpsc 队列。
-    fn send_sysinfo(&self, info: crate::proto::SysInfo) {
+    pub(crate) fn send_sysinfo(&self, info: crate::proto::SysInfo) {
         let _ = self.sysinfo_tx.send(Some(info));
         self.ctx.request_repaint();
     }

@@ -39,7 +39,10 @@ pub(super) async fn handle(cmd: UiCommand, sink: &UiSink) {
             dest_dir,
             do_move,
         } => copy_move(srcs, &dest_dir, do_move, sink).await,
-        // 传输 / 端口转发 / 进程监控 / PDF / MCP 中转等：本机会话尚不支持（后续阶段），忽略。
+        // 系统监控侧栏的进程详情 / 结束进程：本机直接读 /proc、本机 kill。
+        UiCommand::ProcDetail(pid) => super::sys::proc_detail(pid, sink).await,
+        UiCommand::KillProc(pid) => super::sys::kill_proc(pid, sink).await,
+        // 传输 / 端口转发 / PDF / MCP 中转等：本机会话尚不支持（或不适用），忽略。
         _ => {}
     }
 }

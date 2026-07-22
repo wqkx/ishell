@@ -12,6 +12,7 @@
 //! `WorkerEvent`。传输（Phase 3）尚未支持，相关命令暂被忽略。
 
 mod files;
+mod sys;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, SlavePty};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -41,9 +42,19 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
     };
     let mut out_rx = out_rx;
 
-    // 本机会话没有 /proc 系统监控这一路（那是远端 Linux 采样），明确告知 UI 隐藏监控侧栏；
-    // session_events 对本机会话不会因此弹「远端非 Linux」的误导性提示。
-    sink.send(WorkerEvent::MonitorSupport(false));
+    // 本机系统监控：Linux 直接采本地 /proc（与 SSH 会话同一套 PROBE_CMD + 解析器，侧栏一致）；
+    // 非 Linux 无 /proc → 关闭监控（session_events 对本机会话不会弹「远端非 Linux」的误导提示）。
+    let sysinfo_task: Option<tokio::task::JoinHandle<()>> = {
+        #[cfg(target_os = "linux")]
+        {
+            Some(tokio::spawn(sys::run_sampler(sink.clone())))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            sink.send(WorkerEvent::MonitorSupport(false));
+            None
+        }
+    };
     sink.send(WorkerEvent::Connected);
 
     loop {
@@ -92,7 +103,11 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
             },
         }
     }
-    // 循环退出：master/in_tx 在此 drop → PTY 关闭、写线程结束；out_rx drop → 读线程下次发送失败退出。
+    // 循环退出：停掉系统信息采样任务；master/in_tx 在此 drop → PTY 关闭、写线程结束；
+    // out_rx drop → 读线程下次发送失败退出。
+    if let Some(t) = sysinfo_task {
+        t.abort();
+    }
 }
 
 /// 起一个本地 PTY + shell 子进程，返回 (master 句柄, child 句柄, PTY 输出接收端, PTY 输入发送端)。
