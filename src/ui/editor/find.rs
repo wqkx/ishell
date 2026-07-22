@@ -196,8 +196,9 @@ pub(super) fn find_widget(
                 .corner_radius(6)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.spacing_mut().interact_size.y = 24.0;
-                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                    // 输入框/按钮行高较矮不易操作：整体加高约 30%（24 → 31）。
+                    ui.spacing_mut().interact_size.y = 31.0;
+                    ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
                     // 输入框用近白底，和卡片/边框区分开（默认会和 PANEL_2 同色看不清）
                     ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(252, 252, 250);
                     ui.visuals_mut().widgets.inactive.bg_stroke =
@@ -274,14 +275,18 @@ pub(super) fn find_widget(
                             }
                         };
                         ui.label(RichText::new(count).color(Palette::TEXT_DIM).size(11.0));
+                        // 上一个/下一个/关闭：原来 frame(false) 且无 min_size，点击区只有 ~12px
+                        // 的字形本身，两个箭头又仅隔 5px，极难点中（尤其「上一个」）。给足
+                        // min_size 点击区（约 +30%）并放大图标，既解决点不中、也符合放大诉求。
                         if ui
                             .add(
                                 egui::Button::new(
                                     RichText::new(icon::ARROW_UP)
-                                        .size(12.0)
+                                        .size(16.0)
                                         .color(Palette::TEXT_DIM),
                                 )
-                                .frame(false),
+                                .frame(false)
+                                .min_size(egui::vec2(28.0, 28.0)),
                             )
                             .on_hover_text(crate::i18n::tr("上一个", "Previous"))
                             .clicked()
@@ -294,10 +299,11 @@ pub(super) fn find_widget(
                             .add(
                                 egui::Button::new(
                                     RichText::new(icon::ARROW_DOWN)
-                                        .size(12.0)
+                                        .size(16.0)
                                         .color(Palette::TEXT_DIM),
                                 )
-                                .frame(false),
+                                .frame(false)
+                                .min_size(egui::vec2(28.0, 28.0)),
                             )
                             .on_hover_text(crate::i18n::tr("下一个", "Next"))
                             .clicked()
@@ -309,9 +315,10 @@ pub(super) fn find_widget(
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM),
+                                    RichText::new(icon::X).size(16.0).color(Palette::TEXT_DIM),
                                 )
-                                .frame(false),
+                                .frame(false)
+                                .min_size(egui::vec2(28.0, 28.0)),
                             )
                             .on_hover_text(crate::i18n::tr("关闭 (Esc)", "Close (Esc)"))
                             .clicked()
@@ -332,10 +339,11 @@ pub(super) fn find_widget(
                                 .add(
                                     egui::Button::new(
                                         RichText::new(icon::ARROW_BEND_DOWN_LEFT)
-                                            .size(13.0)
+                                            .size(17.0)
                                             .color(Palette::TEXT_DIM),
                                     )
-                                    .frame(false),
+                                    .frame(false)
+                                    .min_size(egui::vec2(28.0, 28.0)),
                                 )
                                 .on_hover_text(crate::i18n::tr("替换", "Replace"))
                                 .clicked()
@@ -353,10 +361,11 @@ pub(super) fn find_widget(
                                 .add(
                                     egui::Button::new(
                                         RichText::new(icon::ARROWS_DOWN_UP)
-                                            .size(13.0)
+                                            .size(17.0)
                                             .color(Palette::TEXT_DIM),
                                     )
-                                    .frame(false),
+                                    .frame(false)
+                                    .min_size(egui::vec2(28.0, 28.0)),
                                 )
                                 .on_hover_text(crate::i18n::tr("全部替换", "Replace all"))
                                 .clicked()
