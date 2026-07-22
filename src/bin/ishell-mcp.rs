@@ -98,10 +98,10 @@ async fn connect_timeout(
 /// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时——一律返回
 /// `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
 #[cfg(unix)]
-async fn identify(path: &std::path::Path) -> Option<(String, u32)> {
+async fn identify(path: &std::path::Path) -> Option<(String, u32, String)> {
     let stream = connect_timeout(path).await.ok()?.ok()?;
     match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
-        Ok(McpReqResult::Instance { id, proto_version }) => Some((id, proto_version)),
+        Ok(McpReqResult::Instance { id, proto_version, token }) => Some((id, proto_version, token)),
         _ => None,
     }
 }
@@ -130,10 +130,10 @@ fn check_proto_version(peer: u32) -> Result<(), String> {
 /// 同一个实例可能从多条路径答话（见 `candidate_paths`），这里不去重——去重规则由调用方定：
 /// `bind_instance` 要按 id 收敛成实例列表，`connect_bound` 只关心某个特定 id。
 #[cfg(unix)]
-async fn identify_all() -> Vec<(String, u32, std::path::PathBuf)> {
+async fn identify_all() -> Vec<(String, u32, String, std::path::PathBuf)> {
     let mut set = tokio::task::JoinSet::new();
     for path in candidate_paths() {
-        set.spawn(async move { identify(&path).await.map(|(id, ver)| (id, ver, path)) });
+        set.spawn(async move { identify(&path).await.map(|(id, ver, token)| (id, ver, token, path)) });
     }
     let mut out = Vec::new();
     while let Some(joined) = set.join_next().await {
@@ -150,7 +150,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
     // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
     if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
         let path = std::path::PathBuf::from(p);
-        let (id, ver) = identify(&path).await.ok_or_else(|| {
+        let (id, ver, _token) = identify(&path).await.ok_or_else(|| {
             format!(
                 "ISHELL_MCP_SOCKET 指定的 socket 连不上、或对面不是 iShell：{}",
                 path.display()
@@ -159,23 +159,51 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         check_proto_version(ver)?;
         return Ok((id, path));
     }
-    let mut found: Vec<(String, u32, std::path::PathBuf)> = Vec::new();
-    for (id, ver, path) in identify_all().await {
+    // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就**只认
+    // token 匹配的实例**，请求绝不会串到别人的电脑上；没设则保持原有「多实例弹窗让用户选」
+    // 的行为，完全向后兼容。见 `store::mcp_pairing_token`。
+    let want_token = std::env::var("ISHELL_MCP_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut found: Vec<(String, u32, String, std::path::PathBuf)> = Vec::new();
+    for (id, ver, token, path) in identify_all().await {
         // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
-        if !found.iter().any(|(known, _, _)| *known == id) {
-            found.push((id, ver, path));
+        if !found.iter().any(|(known, _, _, _)| *known == id) {
+            found.push((id, ver, token, path));
         }
     }
+    if let Some(want) = &want_token {
+        // 只保留 token 匹配的实例。空 token 的实例（未启用配对的旧版/别家 iShell）一律不匹配，
+        // 不会被误绑。
+        found.retain(|(_, _, token, _)| token == want);
+    }
     match found.len() {
-        0 => Err(
-            "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".into(),
-        ),
+        0 => Err(if want_token.is_some() {
+            "配了 ISHELL_MCP_TOKEN，但没有找到配对 token 匹配的 iShell（它未运行、未在设置里\
+             开启「允许 AI 通过 MCP 控制终端」，或 token 填错了）。请在你自己那台 iShell 的\
+             MCP 设置里核对配对 token，确认与这里配置的一致。"
+                .into()
+        } else {
+            "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".into()
+        }),
         1 => {
-            let (id, ver, path) = found.pop().expect("上一行刚确认只有一个");
+            // 唯一实例（配了 token 时是唯一匹配者）：直接绑定，不弹窗——token 本身就是操作者
+            // 的显式配对意图，无需再点一次窗口。
+            let (id, ver, _token, path) = found.pop().expect("上一行刚确认只有一个");
             check_proto_version(ver)?;
             Ok((id, path))
         }
-        _ => choose_instance(found).await,
+        // 多个：没配 token 时是正常的「多开」，交给用户点窗口选；配了 token 却仍多个，说明有
+        // 两台 iShell 撞了同一个 token（极罕见），同样用弹窗消歧，让用户当面确定。
+        _ => choose_instance(
+            found
+                .into_iter()
+                .map(|(id, ver, _token, path)| (id, ver, path))
+                .collect(),
+        )
+        .await,
     }
 }
 
@@ -237,7 +265,7 @@ async fn connect_bound() -> Result<(UnixStream, String), String> {
     }
     // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。在候选里重新找回**同一个
     // 实例**——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上。
-    for (found_id, _ver, path) in identify_all().await {
+    for (found_id, _ver, _token, path) in identify_all().await {
         if found_id == id {
             if let Ok(Ok(stream)) = connect_timeout(&path).await {
                 *PATH_CACHE.lock().unwrap() = Some(path);

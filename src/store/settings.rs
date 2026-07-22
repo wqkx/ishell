@@ -218,6 +218,60 @@ pub fn mcp_socket_path() -> Option<PathBuf> {
     Some(config_dir()?.join(format!("mcp-{}.sock", mcp_instance_id())))
 }
 
+fn mcp_pairing_token_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("mcp_pairing_token"))
+}
+
+/// 本安装的 **MCP 配对 token**：稳定、每安装唯一、跨重启不变。首次调用时自动生成并持久化。
+///
+/// 用途：多台电脑共用同一台 AI 服务器的同一个账号时，各家 iShell 反向转发的 socket 会全堆在
+/// 同一个目录里，代理无从区分谁是谁（同账号、可能同来源 IP、进程树不相干，服务器上没有任何
+/// 自动信号能配对）。于是让每个操作者把自己这台 iShell 的 token 通过环境变量 `ISHELL_MCP_TOKEN`
+/// 填进自己那份 Claude Code 的 MCP server 配置——代理只绑定 token 匹配的那个实例，请求就只会
+/// 落到发起者自己的电脑上，互不串台。
+///
+/// 与 [`mcp_instance_id`] 的关键区别：instance_id 是**每进程**的、随进程生灭（用于同机多开
+/// 去重），**绝不持久化**；pairing token 是**每安装**的、必须**稳定持久**——它要被贴进 Claude
+/// 配置里，iShell 重启后若变了，操作者的配对就失效了。二者用途正交，不能相互替代。
+pub fn mcp_pairing_token() -> String {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            let Some(p) = mcp_pairing_token_path() else {
+                // 配置目录不可用（极罕见）：退化为本进程内一致的随机值，至少本次运行可用。
+                return gen_pairing_token();
+            };
+            // 已有则用已有的（持久稳定是这个 token 的全部意义）。
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            // 首次：生成并落盘。写盘失败会经 write_setting 冒泡提示，但本次仍返回该值。
+            let token = gen_pairing_token();
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            write_setting(&p, &token);
+            token
+        })
+        .clone()
+}
+
+/// 生成一个 16 位十六进制随机 token（8 字节熵）。熵源不可用（极罕见）时退化到纳秒时间戳。
+fn gen_pairing_token() -> String {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        buf[..4].copy_from_slice(&ns.to_le_bytes());
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // ---------- 终端配色（多套主题，按索引存储） ----------
 
 fn term_theme_path() -> Option<PathBuf> {

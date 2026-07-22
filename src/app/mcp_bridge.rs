@@ -812,6 +812,7 @@ async fn handle_conn(
             Ok(McpReqResult::Instance {
                 id: own.to_string(),
                 proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+                token: crate::store::mcp_pairing_token(),
             }),
         )
         .await;

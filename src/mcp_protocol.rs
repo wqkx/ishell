@@ -545,7 +545,9 @@ mod addressing_tests {
 /// MCP 线协议版本。GUI(`ishell`)与代理(`ishell-mcp`)把本文件各编一遍，二者的线协议必须
 /// 配套；**任何会改变线格式/语义的改动都要给这个数 +1**。代理在 `Identify` 时拿到 GUI 的版本，
 /// 与自身比对，不一致即拒绝并提示重新部署——根治「升了 GUI 忘换代理 → 静默错」这类问题。
-pub const MCP_PROTOCOL_VERSION: u32 = 1;
+///
+/// v2：`McpReqResult::Instance` 新增 `token` 字段（多机配对，见 `store::mcp_pairing_token`）。
+pub const MCP_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {
@@ -557,6 +559,12 @@ pub enum McpReqResult {
         /// → serde 默认落 0 → 必与当前版本不符 → 触发代理侧的「重新部署」提示（正是所需）。
         #[serde(default)]
         proto_version: u32,
+        /// 对端 iShell 的**配对 token**（`store::mcp_pairing_token()`，每安装稳定唯一）。
+        /// 多台电脑共用同一 AI 服务器账号时，代理据环境变量 `ISHELL_MCP_TOKEN` 只绑定 token
+        /// 匹配的实例，避免请求串到别人的电脑上。旧版 iShell 不带此字段 → serde 默认空串；
+        /// 空串表示「这台 iShell 没启用配对」，代理侧对空 token 的实例不做 token 过滤。
+        #[serde(default)]
+        token: String,
     },
     Sessions(Vec<McpSessionInfo>),
     Run(McpRunResult),
@@ -594,6 +602,38 @@ pub struct McpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 配对 token 的线协议契约：新格式原样往返；旧格式（没有 token 字段）经 serde 默认落成
+    /// 空串——代理侧对空 token 的实例不做过滤，从而向后兼容。这条协议横跨 GUI 与代理两个
+    /// crate（本文件各编一遍），字段名/默认值任何一处对不上都会在这里被抓住。
+    #[test]
+    fn instance_result_carries_token_and_defaults_empty_for_legacy() {
+        let inst = McpReqResult::Instance {
+            id: "1234-abcd".into(),
+            proto_version: MCP_PROTOCOL_VERSION,
+            token: "deadbeef".into(),
+        };
+        let json = serde_json::to_string(&inst).unwrap();
+        let back: McpReqResult = serde_json::from_str(&json).unwrap();
+        match back {
+            McpReqResult::Instance {
+                id,
+                proto_version,
+                token,
+            } => {
+                assert_eq!(id, "1234-abcd");
+                assert_eq!(proto_version, MCP_PROTOCOL_VERSION);
+                assert_eq!(token, "deadbeef");
+            }
+            other => panic!("应解析回 Instance，实际：{other:?}"),
+        }
+        // 旧格式（无 token 字段）：token 默认空串。
+        let legacy = r#"{"Instance":{"id":"x","proto_version":1}}"#;
+        match serde_json::from_str::<McpReqResult>(legacy).unwrap() {
+            McpReqResult::Instance { token, .. } => assert_eq!(token, ""),
+            other => panic!("应解析回 Instance，实际：{other:?}"),
+        }
+    }
 
     #[test]
     fn caller_stream_upload_request_round_trips_without_content_field() {

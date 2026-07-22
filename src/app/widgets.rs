@@ -140,6 +140,42 @@ pub fn view_context_menu(resp: &egui::Response) {
             ui.close();
         }
 
+        // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的 socket
+        // 会堆在一起、代理无从区分谁是谁。把这个 token 填进各自 Claude Code 的 MCP server
+        // `env`（ISHELL_MCP_TOKEN），代理便只绑定 token 匹配的这台 iShell，请求不会串到别人
+        // 电脑上（见 store::mcp_pairing_token）。只在开启 MCP 后才有意义，故随开关一起显示。
+        if mcp_on {
+            let token = crate::store::mcp_pairing_token();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(crate::i18n::tr("配对 token：", "Pairing token: "))
+                        .color(Palette::TEXT_DIM)
+                        .size(12.0),
+                );
+                ui.label(RichText::new(&token).monospace().size(12.0));
+            });
+            if ui
+                .button(format!(
+                    "{}  {}",
+                    egui_phosphor::regular::COPY,
+                    crate::i18n::tr("复制多机配对配置", "Copy pairing config")
+                ))
+                .on_hover_text(crate::i18n::tr(
+                    "多台电脑共用同一台 AI 服务器账号时，把复制出来的这行填进你自己那份 \
+                     Claude Code 的 MCP server env，代理就只会连到你这台 iShell、请求不会\
+                     串到别人电脑上。每台电脑各配一次即可。",
+                    "When several computers share one AI-server account, paste the copied line \
+                     into your own Claude Code MCP server env so the proxy binds only to your \
+                     iShell and requests never land on someone else's computer. Configure once \
+                     per computer.",
+                ))
+                .clicked()
+            {
+                ui.ctx().copy_text(format!("ISHELL_MCP_TOKEN={token}"));
+                ui.close();
+            }
+        }
+
         // —— 关于 ——
         ui.separator();
         if ui
