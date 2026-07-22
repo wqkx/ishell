@@ -140,15 +140,34 @@ fn mcp_consent_path() -> Option<PathBuf> {
 }
 
 /// 是否已开启「允许 AI 通过本地 MCP server 控制终端」（默认关闭，需用户在设置里显式开启）。
+/// AI/MCP 控制开关的进程内缓存：`-1` 未知（还没读过盘），`0`/`1` 已知值。
+/// 引入缓存的原因：帧循环要每帧读一次 consent 来决定是否维持 MCP 响应性重绘节奏
+///（见 `frame.rs`），而原实现每次 `load_mcp_consent()` 都同步读文件——每帧一次磁盘 I/O
+/// 不可接受。开关只经本进程的 `save_mcp_consent` 变更（UI 里唯一入口），故进程内缓存与磁盘
+/// 天然一致，无需担心外部改文件不被感知。
+static MCP_CONSENT_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
 pub fn load_mcp_consent() -> bool {
-    mcp_consent_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false)
+    use std::sync::atomic::Ordering;
+    match MCP_CONSENT_CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = mcp_consent_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim() == "1")
+                .unwrap_or(false);
+            MCP_CONSENT_CACHE.store(on as i8, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 /// 保存 AI/MCP 控制开关。
 pub fn save_mcp_consent(on: bool) {
+    // 先更新缓存，保证同帧内后续 `load_mcp_consent()` 立即反映新值（即便写盘失败也以用户
+    // 意图为准；写盘失败会经 `write_setting` 冒泡 toast 提示）。
+    MCP_CONSENT_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
     if let Some(p) = mcp_consent_path() {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);

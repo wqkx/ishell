@@ -396,5 +396,24 @@ impl App {
                 }
             }
         }
+
+        // AI/MCP 控制的响应性兜底节奏。
+        //
+        // 背景：MCP 请求（list_sessions/run_command/…）到达 socket 后由后台 tokio 线程
+        // `ctx.request_repaint()` 唤醒 UI 线程来 `drain_mcp_calls()`。但实测发现——窗口彻底
+        // 空闲、eframe 停在 `ControlFlow::Wait` 时，**跨线程的 `request_repaint()` 唤醒会丢**：
+        // 请求只能干等到别的事件（SSH keepalive/定时器）偶然唤起一帧才被处理，实测单条
+        // `list_sessions` 因此卡了 157 秒。而 MCP 代理是「每次工具调用新开一条连接」，所以
+        // 这不是首次连接的一次性问题，而是每个调用都可能中招。
+        //
+        // 修法：不依赖那个会丢的跨线程唤醒，改用可靠的 `request_repaint_after`——它设的
+        // `WaitUntil` 是 OS 层定时唤醒，连窗口被最小化/遮挡（compositor 停发重绘）时也照样
+        // 触发。只要 AI 控制已启用且有已连接会话（此时反向转发 socket 正暴露、随时可能来
+        // 请求），就每帧续一个短定时重绘，形成稳定的低频节奏，保证请求 ≤150ms 被排空。
+        // 门控条件为假（普通用户没开 AI 控制，或没有活跃会话）时完全不介入，零额外开销。
+        if crate::store::load_mcp_consent() && self.sessions.iter().any(|s| s.connected) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(150));
+        }
     }
 }
