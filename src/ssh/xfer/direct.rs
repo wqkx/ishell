@@ -9,7 +9,7 @@ use russh::ChannelMsg;
 use crate::proto::WorkerEvent;
 
 use super::super::auth::{exec_capture, exec_status, ClientHandler};
-use super::super::sftp::sftp_overwrite;
+use super::super::sftp::{remote_parent, sftp_overwrite};
 use super::super::{sh_quote, UiSink};
 use super::rand_hex;
 use super::util::join_quoted;
@@ -457,7 +457,16 @@ pub(crate) async fn direct_relay_copy(
         "{ssh_opt} -- {host_spec} {}",
         sh_quote(&format!("rm -f {}", sh_quote(&dest_tmp))),
     );
-    let cmd = format!("{{ {xfer} && {commit}; }} || {{ {discard} >/dev/null 2>&1; exit 1; }}");
+    // 传输前先在目标主机建好目标父目录（copy_between_sessions 承诺"目录不存在自动创建"）：
+    // scp/rsync 都不会替你补建缺失的父目录，缺了就直接失败。这一步失败（如无权限）会让整条
+    // 链非 0 退出 → App 转中转，中转侧 upload_from_mcp 会以同样方式尝试建目录并给出清晰错误，
+    // 两条路径行为一致。`mkdir -p` 对已存在目录 / 根目录 "/" 都是幂等的无害操作。
+    let mkpath = format!(
+        "{ssh_opt} -- {host_spec} {}",
+        sh_quote(&format!("mkdir -p {}", sh_quote(&remote_parent(&dest_path)))),
+    );
+    let cmd =
+        format!("{{ {mkpath} && {xfer} && {commit}; }} || {{ {discard} >/dev/null 2>&1; exit 1; }}");
 
     // 临时私钥的清理交由 _key_guard 在作用域结束（含超时取消时的 future drop）异步完成。
     // `DirectRelayStarted` 必须在 exec_direct_progress 内部真正 `channel_open_session`+

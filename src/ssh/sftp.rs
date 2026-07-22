@@ -38,3 +38,26 @@ pub(super) fn remote_parent(path: &str) -> String {
         Some(i) => trimmed[..i].to_string(),
     }
 }
+
+/// 递归创建远端目录（`mkdir -p` 语义）：SFTP 没有原生的递归建目录，只能把绝对路径按 `/`
+/// 分段、从根往下逐级 `create_dir`。已存在的层会让 `create_dir` 报错，这里一律忽略——真正
+/// 的权限/占位（同名文件挡路）等问题会在随后打开/写入文件那步以清晰的错误暴露，不必在这里
+/// 抢先判定。best-effort 语义：本函数只负责"尽量把目录建出来"，成败由后续写操作定夺。
+pub(super) async fn create_remote_dir_all(
+    sftp: &russh_sftp::client::SftpSession,
+    dir: &str,
+) {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() {
+        return; // 根目录 "/"：无需创建
+    }
+    let mut cur = String::new();
+    for seg in dir.split('/') {
+        if seg.is_empty() {
+            continue; // 跳过前导 '/' 切出的空段
+        }
+        cur.push('/');
+        cur.push_str(seg);
+        let _ = sftp.create_dir(cur.clone()).await;
+    }
+}

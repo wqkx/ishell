@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::proto::{ConflictPolicy, WorkerEvent};
 
-use super::super::sftp::{is_sftp_not_found, join_remote};
+use super::super::sftp::{create_remote_dir_all, is_sftp_not_found, join_remote, remote_parent};
 use super::super::UiSink;
 use super::util::{local_basename, remote_nonexistent, xfer_backoff, XFER_RETRIES};
 
@@ -243,6 +243,15 @@ pub(super) async fn upload_from_mcp(
         dir: crate::proto::TransferDir::Upload,
         local: None,
     });
+
+    // 目标父目录不存在时先递归建好（copy_from_remote_to_caller/copy_between_sessions 的
+    // 中转落盘承诺"目录不存在自动创建"；copy_to_remote 一并受益）。先探一次 metadata，仅在
+    // 确实缺失时才逐级建，避免对已存在的深路径做无谓的多次 create_dir 往返。best-effort：
+    // 建目录若因权限等失败，紧接着 open_with_flags 会以清晰错误报出，不在这里抢先判定。
+    let parent = remote_parent(&remote_path);
+    if sftp.metadata(&parent).await.is_err() {
+        create_remote_dir_all(sftp, &parent).await;
+    }
 
     // 事务写：先把调用方字节流写进**临时文件**，全部校验通过后才原子换入最终路径。
     // 直接以 TRUNCATE 打开最终路径的旧写法，一旦断线 / 超时 / 源文件变化中途失败，就会在远端
