@@ -498,7 +498,17 @@ pub(super) fn paint_visible_rows(
                                 f.layout_no_wrap(seg.clone(), mono.clone(), Palette::TEXT)
                             });
                             let cc = g.cursor_from_pos(egui::vec2(p.x - gx, 0.0)).index;
-                            ls + seg_a + char_to_byte(&seg, cc)
+                            // 行末选择：指针超出「行末文本右缘」1 个字符宽以上时，才把换行符也选进去
+                            // （= 选中整行）；否则止于行末文本，不把换行符/行末空白卷进来。仅当本段
+                            // 覆盖到行末、且不是最后一行（有换行符可选）时适用。
+                            if seg_b >= line_full.len()
+                                && li + 1 < ed.vlines.len()
+                                && p.x - gx > g.size().x + char_w
+                            {
+                                le + 1
+                            } else {
+                                ls + seg_a + char_to_byte(&seg, cc)
+                            }
                         };
                         let b = byte_at(pos);
                         // 拖拽需移动超过阈值才激活，此刻指针已离开按下点——锚点必须用「按下位置」，

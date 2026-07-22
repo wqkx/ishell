@@ -200,8 +200,11 @@ pub(super) fn paint_text_row(
     for &(sa, sb) in ctx.sels {
         if sb > sa && sb > ls && sa <= le {
             let ax = x_of(sa.clamp(ls, le) - ls);
-            // 选区越过本段末尾(含跨到下一视觉行/下一逻辑行) → 填到本段右缘
-            let bx = if sb >= ls + seg_b {
+            // 只有当选区确实越过「本逻辑行末」——含换行符(sb>le，跨到下一行)，或本行还有内容
+            // 折到下一视觉行(本段没覆盖到行末) → 才把高亮填到本段右缘；若选区恰好止于行末文本
+            // (sb==le，未含换行符)，就画到实际文本末尾，不把行末空白一起涂上。
+            let seg_end = ls + seg_b;
+            let bx = if sb > le || (sb >= seg_end && seg_end < le) {
                 seg_right
             } else {
                 x_of(sb.clamp(ls, le) - ls)
