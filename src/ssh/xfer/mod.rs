@@ -8,6 +8,7 @@ mod util;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use russh::client::Handle;
 use tokio::sync::mpsc::UnboundedSender;
@@ -93,6 +94,55 @@ pub(super) struct XferCancel {
     pub(super) stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+/// 服务器拒开新 channel（撞 `MaxSessions`/资源上限）时，russh 报 `Error::ChannelOpenFailure`——
+/// 连接仍活着、只是暂时没有 channel 槽，是**瞬时**状况；连接真死则是别的错误变体（IO/断连/
+/// 发送端关闭）。据此区分「该退避重试」与「该立即失败」。
+fn is_channel_exhaustion(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<russh::Error>(),
+        Some(russh::Error::ChannelOpenFailure(_))
+    )
+}
+
+/// 有界退避重试地打开一条 SFTP 会话。
+///
+/// 每个传输都新开一条 SSH channel（见 `auth::open_sftp`）。并发下载多文件时（最多
+/// `MAX_CONCURRENT_XFER` 路），叠加 shell/列目录等基线 channel、以及**已完成传输的 channel
+/// 关闭尚未被服务器回收的那点往返延迟**，瞬时并发 channel 数会偶尔撞上 SSH 服务器的
+/// `MaxSessions` 上限（OpenSSH 默认 10），此时 `channel_open_session` 立即返回
+/// `ChannelOpenFailure(ConnectFailed)`。实测：纯多文件并发下载（无额外基线）就有约 2% 的传输
+/// 因此失败，基线 channel 越多越频繁——这正是「同时下载很多个文件时偶尔出错、但网络毫无问题」
+/// 的根因。
+///
+/// 修法：**仅对这类 channel 耗尽**做有界退避重试（等在途 channel 关闭腾出槽位即可），而不是让
+/// 这个文件直接报「SFTP 不可用」。其余错误（连接真死等）立即返回，避免一批下载对着死连接空等
+/// 数秒。期间用户取消也立即放弃。open_sftp 失败时不残留副作用（通道未建立），重试安全。
+async fn open_sftp_resilient(
+    handle: &Handle<ClientHandler>,
+    cancel: &Arc<AtomicBool>,
+) -> anyhow::Result<russh_sftp::client::SftpSession> {
+    const MAX_ATTEMPTS: u32 = 6;
+    let mut attempt = 0u32;
+    loop {
+        match open_sftp(handle).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                // 只对「服务器暂时给不出 channel」退避重试；连接真死等其余错误立即失败。
+                if cancel.load(Ordering::Relaxed)
+                    || attempt >= MAX_ATTEMPTS
+                    || !is_channel_exhaustion(&e)
+                {
+                    return Err(e);
+                }
+                // 150ms·2^n 退避（封顶 ~2s）：给在途 channel 的关闭留出被服务器回收的时间。
+                let ms = 150u64.saturating_mul(1 << attempt.min(4)).min(2000);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// 启动一个传输任务：登记取消句柄，spawn 后台任务，完成时通过 `done_tx` 通知主循环。
 pub(super) fn start_xfer(
     handle: &Arc<Handle<ClientHandler>>,
@@ -119,7 +169,7 @@ pub(super) fn start_xfer(
     tokio::spawn(async move {
         // 实际传输；被取消时整个 future 在 select 中被 drop，正在进行的 SFTP 写/flush 立即中止
         let work = async move {
-            match open_sftp(&h).await {
+            match open_sftp_resilient(&h, &cancel_work).await {
                 Ok(sftp) => {
                     let sftp = Arc::new(sftp);
                     match p {
