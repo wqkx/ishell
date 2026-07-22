@@ -99,7 +99,19 @@ async fn connect_timeout(
 /// `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
 #[cfg(unix)]
 async fn identify(path: &std::path::Path) -> Option<(String, u32, String)> {
-    let stream = connect_timeout(path).await.ok()?.ok()?;
+    let stream = match connect_timeout(path).await {
+        Ok(Ok(s)) => s,
+        // 连接被拒（ECONNREFUSED）= 这个 socket 文件没有监听者：反向转发的 SSH 连接已断（或
+        // 同机 iShell 进程已退），是**孤儿**文件。当场删掉，避免在服务器 `~/.ishell-mcp/` 里越
+        // 堆越多——iShell 侧的「断开清理」在连接已物理断开时 rm 不掉（发不出 exec）、只能靠 24h
+        // 兜底扫；这里每次扫描（每次 MCP 会话建立时都会 identify 一遍候选）就即时回收。**只对
+        // 明确的“拒绝”删**：超时/其它错误可能是活着但慢、或反向转发成了黑洞，绝不删。
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+        _ => return None,
+    };
     match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
         Ok(McpReqResult::Instance { id, proto_version, token }) => Some((id, proto_version, token)),
         _ => None,
