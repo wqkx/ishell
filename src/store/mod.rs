@@ -21,11 +21,11 @@ pub use connections::{import_ssh_config, load, save, SavedConnection};
 pub use crypto::{decrypt_secret, encrypt_secret, key_perms_were_loose, key_storage, KeyStorage};
 pub use favorites::{load_favorites, save_favorites};
 pub use settings::{
-    load_conflict_policy, load_cursor_line, load_download_dir, load_file_cols, load_force_x11,
-    load_lang, load_mcp_consent, load_osc7_consent, load_term_theme, load_zoom, mcp_instance_id,
-    mcp_pairing_token, mcp_socket_path,
-    save_conflict_policy, save_cursor_line, save_download_dir, save_file_cols, save_force_x11,
-    save_lang, save_mcp_consent, save_osc7_consent, save_term_theme, save_zoom,
+    load_conflict_policy, load_cursor_line, load_download_dir, load_editor_font, load_file_cols,
+    load_force_x11, load_lang, load_mcp_consent, load_osc7_consent, load_term_theme, load_zoom,
+    mcp_instance_id, mcp_pairing_token, mcp_socket_path,
+    save_conflict_policy, save_cursor_line, save_download_dir, save_editor_font, save_file_cols,
+    save_force_x11, save_lang, save_mcp_consent, save_osc7_consent, save_term_theme, save_zoom,
     take_setting_write_errors,
 };
 pub use snippets::{load_snippets, save_snippets, Snippet};

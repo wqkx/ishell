@@ -52,6 +52,38 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                         ed.wrap = !ed.wrap;
                         ed.vgoal_col = None; // 列语义改变，重置目标列
                     }
+                    // —— 字号缩放：A- / 当前值 / A+（点击数字恢复默认）。仅影响编辑器，持久化。——
+                    let base = egui::TextStyle::Monospace.resolve(ui.style()).size; // 未设置时的默认字号
+                    let cur = ed.font_pt.unwrap_or(base);
+                    let set_font = |ed: &mut Editor, pt: f32| {
+                        let n = pt.clamp(8.0, 40.0);
+                        ed.font_pt = Some(n);
+                        crate::store::save_editor_font(n);
+                    };
+                    ui.add_space(10.0);
+                    if ui
+                        .add(egui::Label::new(RichText::new("A-").color(Palette::TEXT_DIM).size(12.0)).sense(egui::Sense::click()))
+                        .on_hover_text(crate::i18n::tr("缩小字号", "Decrease font size"))
+                        .clicked()
+                    {
+                        set_font(ed, cur - 1.0);
+                    }
+                    ui.add_space(5.0);
+                    if ui
+                        .add(egui::Label::new(RichText::new(format!("{}", cur.round() as i32)).color(Palette::TEXT_DIM).size(11.0)).sense(egui::Sense::click()))
+                        .on_hover_text(crate::i18n::tr("点击恢复默认字号", "Click to reset font size"))
+                        .clicked()
+                    {
+                        set_font(ed, base);
+                    }
+                    ui.add_space(5.0);
+                    if ui
+                        .add(egui::Label::new(RichText::new("A+").color(Palette::TEXT_DIM).size(13.0)).sense(egui::Sense::click()))
+                        .on_hover_text(crate::i18n::tr("放大字号", "Increase font size"))
+                        .clicked()
+                    {
+                        set_font(ed, cur + 1.0);
+                    }
                 });
                 if !ed.status.is_empty() {
                     ui.add_space(8.0);

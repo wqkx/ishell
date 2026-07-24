@@ -356,6 +356,28 @@ pub fn save_zoom(zoom: f32) {
     }
 }
 
+fn editor_font_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("editor_font"))
+}
+
+/// 读取编辑器字号（pt）；未设置返回 None（表示沿用全局等宽字号），有值时夹在 [8, 40]。
+pub fn load_editor_font() -> Option<f32> {
+    editor_font_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|z| z.clamp(8.0, 40.0))
+}
+
+/// 保存编辑器字号（pt）。
+pub fn save_editor_font(pt: f32) {
+    if let Some(p) = editor_font_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        write_setting(p, format!("{pt:.1}"));
+    }
+}
+
 fn file_cols_path() -> Option<PathBuf> {
     Some(config_dir()?.join("file_cols"))
 }

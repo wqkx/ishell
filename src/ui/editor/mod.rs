@@ -78,6 +78,8 @@ pub struct Editor {
     vmax: usize,
     /// 自动换行（word-wrap）开关：开启时长行折行显示、无横向滚动
     wrap: bool,
+    /// 编辑器字号（pt）：None 表示沿用全局等宽字号；有值时覆盖。可在底部状态栏放大/缩小，持久化。
+    font_pt: Option<f32>,
     /// 内容版本号（每次 v_recompute +1，用于失效换行行数缓存）
     vver: u64,
     /// 换行缓存：vrow_pre[i] = 第 i 逻辑行之前的累计视觉行数；末元素为总视觉行数
@@ -198,6 +200,7 @@ impl Editor {
             vlines: Vec::new(),
             vmax: 0,
             wrap: false,
+            font_pt: crate::store::load_editor_font(),
             vver: 0,
             vrow_pre: Vec::new(),
             vrow_cols: 0,

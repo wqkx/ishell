@@ -19,6 +19,11 @@ pub fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -
     ed.vcaret = ed.vcaret.min(ed.content.len());
 
     let mut mono = egui::TextStyle::Monospace.resolve(ui.style());
+    // 编辑器专属字号（放大/缩小）：仅覆盖本编辑器的 mono 副本，不动全局 Monospace（那也驱动终端字号）。
+    // 必须在下面的「对齐物理像素」取整之前设置，hinting 网格才对齐。
+    if let Some(pt) = ed.font_pt {
+        mono.size = pt;
+    }
     // 字号对齐到整数物理像素：让 hinting 网格与像素对齐，分数缩放（zoom/HiDPI）下笔画更锐
     let ppp = ui.ctx().pixels_per_point().max(0.5);
     mono.size = ((mono.size * ppp).round().max(1.0)) / ppp;
