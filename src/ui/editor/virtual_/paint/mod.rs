@@ -480,7 +480,9 @@ pub(super) fn paint_visible_rows(
                                             // 坐标 → 内容字节位（行号 = top_line + 视口内行偏移；
                                             // 只布局窗口片段，避免在超长行上拖拽选择时每帧整行 layout）
                         let ctx = ui.ctx().clone();
-                        let byte_at = |p: egui::Pos2| -> usize {
+                        // include_nl：仅拖拽选择时为真——指针超出行末文本时把换行符也纳入（= 选中整行）。
+                        // 普通点击必须为假，否则点击行末空白会落到「下一行首字符」（le+1 = 下一行起点）。
+                        let byte_at = |p: egui::Pos2, include_nl: bool| -> usize {
                             let k = ((p.y - clip.top()) / row_h).floor().max(0.0) as usize;
                             let row = (top_row + k).min(nrows.saturating_sub(1));
                             let (l, seg2) = v_line_of_vrow(ed, row);
@@ -501,7 +503,8 @@ pub(super) fn paint_visible_rows(
                             // 行末选择：指针超出「行末文本右缘」1 个字符宽以上时，才把换行符也选进去
                             // （= 选中整行）；否则止于行末文本，不把换行符/行末空白卷进来。仅当本段
                             // 覆盖到行末、且不是最后一行（有换行符可选）时适用。
-                            if seg_b >= line_full.len()
+                            if include_nl
+                                && seg_b >= line_full.len()
                                 && li + 1 < ed.vlines.len()
                                 && p.x - gx > g.size().x + char_w
                             {
@@ -510,11 +513,14 @@ pub(super) fn paint_visible_rows(
                                 ls + seg_a + char_to_byte(&seg, cc)
                             }
                         };
-                        let b = byte_at(pos);
+                        // 拖拽（含拖拽起始）时才允许把换行符选进来；普通/双击/三击点击不含换行符
+                        let allow_nl = resp.drag_started() || resp.dragged();
+                        let b = byte_at(pos, allow_nl);
                         // 拖拽需移动超过阈值才激活，此刻指针已离开按下点——锚点必须用「按下位置」，
                         // 否则起始字符会被漏选（从左往右拖丢第一个字，从右往左拖丢按下处字符）
                         let ob = if resp.drag_started() {
-                            ui.input(|i| i.pointer.press_origin()).map(byte_at)
+                            ui.input(|i| i.pointer.press_origin())
+                                .map(|p| byte_at(p, true))
                         } else {
                             None
                         };
