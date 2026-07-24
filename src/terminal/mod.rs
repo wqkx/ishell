@@ -96,6 +96,10 @@ pub struct Terminal {
     local_scroll_accum: f32,
     /// 终端查询序列可能跨 SSH 数据块；暂存尚不能确定是否为完整查询的短尾。
     query_tail: Vec<u8>,
+    /// resize 去抖：拖拽窗口时每帧尺寸都在变，若每帧都真正 resize（普通屏会序列化整缓冲+重建
+    /// 解析器重放，且向远端连发 SIGWINCH）会导致 codex 等自绘 TUI 反复重绘「历史从头刷到尾」。
+    /// 这里只记录目标尺寸+首次出现时刻，稳定 ~130ms 后才真正 resize（本地重排 + 上报远端一次）。
+    pending_resize: Option<((u16, u16), std::time::Instant)>,
 }
 
 struct AiCapture {
@@ -154,6 +158,7 @@ impl Terminal {
             sb_dragging: false,
             ai_capture: None,
             ai_done: None,
+            pending_resize: None,
         }
     }
 
@@ -327,10 +332,31 @@ impl Terminal {
             });
         }
 
-        // 根据可用区域换算行列，必要时上报 resize（由调用方读 size 比较）
+        // 根据可用区域换算行列，必要时上报 resize（由调用方读 size 比较）。
+        // 去抖：拖拽窗口时尺寸每帧都变，稳定 ~130ms 后才真正 resize——避免普通屏每帧序列化+重建
+        // 解析器、以及向远端连发 SIGWINCH 触发 codex 等 TUI 反复重绘（表现为历史从头刷到尾）。
+        // 注意：worker 侧的 Resize 上报读的是 self.size()，本地推迟 resize 后上报自然一并去抖。
         let new_cols = (avail.x / char_w).floor().max(2.0) as u16;
         let new_rows = (avail.y / char_h).floor().max(1.0) as u16;
-        self.resize(new_cols, new_rows);
+        const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(130);
+        if (new_cols, new_rows) == (self.cols, self.rows) {
+            self.pending_resize = None; // 已是目标尺寸，无待决
+        } else {
+            let now = std::time::Instant::now();
+            let started = match self.pending_resize {
+                Some((sz, at)) if sz == (new_cols, new_rows) => at, // 目标未变：沿用计时起点
+                _ => now, // 首次出现该目标（或目标变了）：重置计时
+            };
+            if now.duration_since(started) >= RESIZE_DEBOUNCE {
+                self.resize(new_cols, new_rows);
+                self.pending_resize = None;
+            } else {
+                self.pending_resize = Some(((new_cols, new_rows), started));
+                // egui 无变化时不会自动重绘 → 主动安排在稳定时刻醒来应用，否则卡在旧尺寸
+                ui.ctx()
+                    .request_repaint_after(RESIZE_DEBOUNCE - now.duration_since(started));
+            }
+        }
 
         // 单元格定位（屏幕字符坐标）。捕获 cols/rows 副本以免与后续 &mut self 冲突。
         let (cols, rows) = (self.cols, self.rows);
