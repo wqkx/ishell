@@ -181,6 +181,25 @@ mod tests {
         assert!(!ranges.is_empty());
     }
 
+    /// 回归：lint 标记位置落在多字节字符内部时不得 panic（真实闪退：lint.rs:144
+    /// `start byte index N is not a char boundary; it is inside '有'`）。
+    /// 未闭合字符串以多字节字符结尾时，`e-1` 落在字符中间；py 缺缩进块检查里
+    /// `trimmed.len()-1` 在行尾是中文（含中文注释）时同理。修复：bad 位置统一
+    /// 下沉到字符边界（lint.rs `floor_char_boundary`）。
+    #[test]
+    fn lint_survives_multibyte_at_marked_position() {
+        // 未闭合字符串以 CJK 结尾（'有' 占 3 字节）
+        let (_, ranges, msg) = lint_syntax("s = '有", "py");
+        assert!(msg.is_some());
+        assert!(!ranges.is_empty());
+        // 未闭合字符串以 emoji 结尾（4 字节）
+        let (_, _, msg2) = lint_syntax("s = \"😀", "py");
+        assert!(msg2.is_some());
+        // py 缺缩进块 + 行尾为中文注释：`trimmed.len()-1` 落在行尾汉字中间
+        let (_, _, msg3) = lint_syntax("def f():  # 中文注释\nx = 1\n", "py");
+        assert!(msg3.is_some());
+    }
+
     /// 回归：高亮器不能因「错误范围落在多字节字符中间」而 panic。
     /// 真实崩溃场景：编辑器同一帧里先算 lint_ranges、再由 handle_input 粘贴改内容、
     /// 最后用**旧** lint_ranges 绘制新内容——旧字节偏移落进汉字中间，token.rs 按该边界

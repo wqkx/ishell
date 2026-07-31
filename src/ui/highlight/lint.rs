@@ -108,6 +108,12 @@ pub fn lint_syntax(text: &str, ext: &str) -> (Vec<usize>, Vec<Range<usize>>, Opt
         _ => {}
     }
 
+    // 各 lint 规则标记的「最后一个字节」位置（如 `e-1`、`len-1`）在多字节字符结尾时
+    // 会落在字符内部；下游按这些位置切片（行号统计/下划线范围）会直接 panic。
+    // 统一下沉到字符边界再排序去重（对齐后可能产生重复项）。
+    for b in &mut bad {
+        *b = floor_char_boundary(text, *b);
+    }
     bad.sort_unstable();
     bad.dedup();
     let ranges: Vec<Range<usize>> = bad
@@ -146,6 +152,15 @@ fn next_utf8_end(text: &str, b: usize) -> usize {
         .next()
         .map(|c| b + c.len_utf8())
         .unwrap_or(b + 1)
+}
+
+/// 把字节位置下沉到 ≤ 它的最近字符边界（先钳到文本末尾）。
+fn floor_char_boundary(text: &str, mut b: usize) -> usize {
+    b = b.min(text.len());
+    while b > 0 && !text.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
 }
 
 /// 判断字符串 token 是否未正确闭合。
