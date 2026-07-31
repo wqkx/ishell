@@ -21,15 +21,43 @@ impl ConnectForm {
         } else {
             380.0
         };
+        // 自绘标题栏，不用 `Window::open` 的内置关闭按钮：那个 ✕ 的判定区就是图标本身那
+        // 一小块，必须点正中心才关得掉。这里给它一块明确的 26×26 按钮区域（图标仍是小的，
+        // 只是可点范围变大），并与「传输浮窗」的自定义紧凑标题栏保持同一做法。
         egui::Window::new(title)
-            .open(&mut open)
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .default_width(win_width)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| match self.mode {
-                Mode::List => self.list_view(ui, &mut result),
-                Mode::Form => self.form_view(ui, &mut result),
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .strong()
+                            .size(crate::theme::FS_TITLE)
+                            .color(crate::theme::Palette::TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = ui.add_sized(
+                            egui::vec2(26.0, 26.0),
+                            egui::Button::new(
+                                egui::RichText::new(egui_phosphor::regular::X)
+                                    .size(13.0)
+                                    .color(crate::theme::Palette::TEXT_DIM),
+                            )
+                            .frame(false),
+                        );
+                        if btn.clicked() {
+                            open = false;
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                match self.mode {
+                    Mode::List => self.list_view(ui, &mut result),
+                    Mode::Form => self.form_view(ui, &mut result),
+                }
             });
 
         self.delete_confirm_dialog(ctx);

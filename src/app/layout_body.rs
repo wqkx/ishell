@@ -59,6 +59,11 @@ impl App {
                     .outer_margin(egui::Margin { left: 6, right: 6, top: 6, bottom: 0 }),
             )
             .show_inside(root, |ui| {
+                // 记下终端内容区的矩形，供右上角通知浮层贴着终端摆（而不是贴窗口边）。
+                // `max_rect` 已经是 frame 的内外边距之内，正好是 shell 可见区域本身。
+                // 不用 `ctx.available_rect()`：那个在 egui 0.34 已弃用，官方建议换成
+                // `content_rect()`——但后者是整个窗口内容区、不扣面板，语义对不上。
+                self.term_rect = Some(ui.max_rect());
                 // 当前所有 AI（open_session）打开的会话 uid，AI 提示条里要报全，方便 AI
                 // 自己核对哪些会话还在。
                 let ai_uids: Vec<u64> = self

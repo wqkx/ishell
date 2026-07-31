@@ -8,12 +8,9 @@ use super::{ConnectForm, Mode};
 impl ConnectForm {
     pub(super) fn list_view(&mut self, ui: &mut egui::Ui, result: &mut Option<ConnectConfig>) {
         use egui_phosphor::regular as icon;
+        // 标题「快速连接」已由窗口自绘的标题栏显示（见 ui.rs），这里不再重复一遍大标题，
+        // 只留右侧的操作按钮——省一行高度，也免得同一句话在窗口里出现两次。
         ui.horizontal(|ui| {
-            ui.heading(
-                RichText::new(crate::i18n::tr("快速连接", "Quick Connect"))
-                    .size(18.0)
-                    .color(Palette::TEXT),
-            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(
@@ -73,7 +70,10 @@ impl ConnectForm {
         // 固定「本机」入口：始终在最上方，单击直接开本地终端。它不写入 connections.json，
         // 不占用户保存的连接，也不会被误删；点一下即产出一个本机 ConnectConfig。
         {
-            let row_h = 36.0;
+            // 行高/图标/间距全部与下面的已保存主机行一致（30 / 默认字号 / 2px）——它只是
+            // 列表里的一项，没有理由长得比别人大。说明文字移到 hover 提示里：常驻显示是
+            // 第二行，既撑高行高又对老用户毫无信息量。
+            let row_h = 30.0;
             let full_w = ui.available_width();
             let (rect, resp) =
                 ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::click());
@@ -85,33 +85,18 @@ impl ConnectForm {
                     .max_rect(rect.shrink2(egui::vec2(8.0, 0.0)))
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 |ui| {
+                    ui.label(RichText::new(icon::HOUSE).color(Palette::ACCENT));
+                    ui.add_space(2.0);
                     ui.label(
-                        RichText::new(icon::HOUSE)
-                            .color(Palette::ACCENT)
-                            .size(18.0),
+                        RichText::new(crate::i18n::tr("本机", "Local machine"))
+                            .color(Palette::TEXT),
                     );
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(crate::i18n::tr("本机", "Local machine"))
-                                .color(Palette::TEXT)
-                                .strong(),
-                        );
-                        ui.label(
-                            RichText::new(crate::i18n::tr(
-                                "打开本机终端（本地 shell，无需 SSH）",
-                                "Open a local terminal (local shell, no SSH)",
-                            ))
-                            .color(Palette::TEXT_DIM)
-                            .size(11.0),
-                        );
-                    });
                 },
             );
             if resp
                 .on_hover_text(crate::i18n::tr(
-                    "在本机直接打开一个终端",
-                    "Open a terminal on this computer",
+                    "在本机直接打开一个终端（本地 shell，无需 SSH）",
+                    "Open a terminal on this computer (local shell, no SSH)",
                 ))
                 .clicked()
             {

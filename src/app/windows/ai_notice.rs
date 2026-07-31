@@ -21,17 +21,15 @@ impl App {
         let mut remove_one: Option<usize> = None;
         let mut clear_all = false;
 
-        // 贴着**终端区**摆，而不是贴着窗口边。`available_rect` 是去掉各侧栏/标签栏之后
-        // 剩给 CentralPanel 的那块，也就是终端所在的区域；终端内容还要再往里 12px
-        // （CentralPanel 的 outer_margin 6 + inner_margin 6，见 layout_body），在此基础上
-        // 再留一道 GAP，卡片就不会压在终端边框上。
-        const TERM_INSET: f32 = 12.0;
+        // 贴着**终端内容区**摆，而不是贴着窗口边。矩形由 layout_body 每帧记下
+        // （CentralPanel 的 `ui.max_rect()`，已扣掉它自己的内外边距），再留一道 GAP，
+        // 卡片就不会压在终端边框上。没画终端时（欢迎页）退回窗口内容区。
         const GAP: f32 = 12.0;
-        let area = ctx.available_rect();
-        let screen = ctx.screen_rect();
-        // Area::anchor 的偏移是相对**屏幕**的，所以把目标位置换算成相对屏幕右上角的偏移。
-        let dx = (area.right() - TERM_INSET - GAP) - screen.right();
-        let dy = (area.top() + TERM_INSET + GAP) - screen.top();
+        let content = ctx.content_rect();
+        let area = self.term_rect.unwrap_or(content);
+        // Area::anchor 的偏移是相对窗口内容区的，把目标位置换算成相对其右上角的偏移。
+        let dx = (area.right() - GAP) - content.right();
+        let dy = (area.top() + GAP) - content.top();
         egui::Area::new(egui::Id::new("ai_notice_overlay"))
             .anchor(egui::Align2::RIGHT_TOP, [dx, dy])
             .order(egui::Order::Foreground)

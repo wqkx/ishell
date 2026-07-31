@@ -148,6 +148,9 @@ pub struct App {
     /// 终端通知浮层（BEL 响铃 / OSC 9/777：AI CLI 等待确认、任务完成、脚本通知）。
     /// 右上角纵排，点击跳转对应会话，右键可逐条/全部删除。
     ai_notices: Vec<AiNotice>,
+    /// 终端内容区在本帧的矩形（由 layout_body 记录）：通知浮层据此贴着终端摆，
+    /// 而不是贴窗口边。None = 本帧没画终端（欢迎页等）。
+    term_rect: Option<egui::Rect>,
 }
 
 /// 一条终端通知浮层卡片。
@@ -253,6 +256,7 @@ impl App {
             mcp_open_approved: std::collections::HashSet::new(),
             cross_copy_jobs: Vec::new(),
             ai_notices: Vec::new(),
+            term_rect: None,
         };
 
         app.apply_demo_flags(cc);

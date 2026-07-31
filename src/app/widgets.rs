@@ -13,169 +13,188 @@ pub fn view_context_menu(resp: &egui::Response) {
         // 菜单项不换行，避免较长英文项折行
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
-        // —— 语言 ——
-        ui.label(
-            RichText::new(crate::i18n::tr("语言", "Language"))
-                .color(Palette::TEXT_DIM)
-                .size(11.0),
-        );
-        crate::i18n::language_menu(ui);
-        ui.separator();
-
-        // —— 字体大小（全局界面缩放）——
-        ui.label(
-            RichText::new(format!(
-                "{}  {:.0}%",
-                crate::i18n::tr("字体大小", "Font size"),
-                ui_zoom() * 100.0
-            ))
-            .color(Palette::TEXT_DIM)
-            .size(11.0),
-        );
-        ui.horizontal(|ui| {
-            // +/- 不关闭菜单，便于连续调整；百分比实时更新
-            if ui
-                .button(RichText::new(egui_phosphor::regular::MINUS).size(13.0))
-                .clicked()
-            {
-                set_ui_zoom(ui_zoom() - 0.1);
-            }
-            if ui
-                .button(RichText::new(egui_phosphor::regular::PLUS).size(13.0))
-                .clicked()
-            {
-                set_ui_zoom(ui_zoom() + 0.1);
-            }
-            if ui.button(crate::i18n::tr("复位", "Reset")).clicked() {
-                set_ui_zoom(1.0);
-            }
-        });
-        ui.separator();
-
-        // —— 视图折叠 ——
-        let s_label = if sidebar_collapsed() {
+        // 菜单按主题收进二级子菜单：平铺时这里有近十项 + 内嵌的加减按钮/token 行，
+        // 右键一下糊一屏。分组后顶层只剩四项，具体设置进子菜单再看（与终端右键菜单
+        // 「终端配色」等的做法一致）。
+        ui.menu_button(
             format!(
                 "{}  {}",
                 egui_phosphor::regular::SIDEBAR_SIMPLE,
-                crate::i18n::tr("显示系统监控栏", "Show monitor sidebar")
-            )
-        } else {
+                crate::i18n::tr("视图", "View")
+            ),
+            |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                let s_label = if sidebar_collapsed() {
+                    crate::i18n::tr("显示系统监控栏", "Show monitor sidebar")
+                } else {
+                    crate::i18n::tr("隐藏系统监控栏", "Hide monitor sidebar")
+                };
+                if ui.button(s_label).clicked() {
+                    set_sidebar_collapsed(!sidebar_collapsed());
+                    ui.close();
+                }
+                let f_label = if files_collapsed() {
+                    crate::i18n::tr("显示文件栏", "Show file panel")
+                } else {
+                    crate::i18n::tr("隐藏文件栏", "Hide file panel")
+                };
+                if ui.button(f_label).clicked() {
+                    set_files_collapsed(!files_collapsed());
+                    ui.close();
+                }
+            },
+        );
+
+        ui.menu_button(
             format!(
                 "{}  {}",
-                egui_phosphor::regular::SIDEBAR_SIMPLE,
-                crate::i18n::tr("隐藏系统监控栏", "Hide monitor sidebar")
-            )
-        };
-        if ui.button(s_label).clicked() {
-            set_sidebar_collapsed(!sidebar_collapsed());
-            ui.close();
-        }
-        let f_label = if files_collapsed() {
-            format!(
-                "{}  {}",
-                egui_phosphor::regular::TREE_VIEW,
-                crate::i18n::tr("显示文件栏", "Show file panel")
-            )
-        } else {
-            format!(
-                "{}  {}",
-                egui_phosphor::regular::TREE_VIEW,
-                crate::i18n::tr("隐藏文件栏", "Hide file panel")
-            )
-        };
-        if ui.button(f_label).clicked() {
-            set_files_collapsed(!files_collapsed());
-            ui.close();
-        }
-
-        // —— 强制 X11（仅 Linux；修复 Wayland 下输入法）——
-        #[cfg(target_os = "linux")]
-        {
-            ui.separator();
-            let mut fx = crate::store::load_force_x11();
-            if ui
-                .checkbox(
-                    &mut fx,
-                    crate::i18n::tr(
-                        "强制 X11（修复输入法·重启生效）",
-                        "Force X11 (fix IME · restart)",
-                    ),
-                )
-                .on_hover_text(crate::i18n::tr(
-                    "Wayland 下输入法常失效；开启后下次启动改走 X11",
-                    "IME often fails on Wayland; enabling switches to X11 on next launch",
-                ))
-                .clicked()
-            {
-                crate::store::save_force_x11(fx);
-                ui.close();
-            }
-        }
-
-        // —— AI/MCP 控制（本地 socket，供 AI 助手驱动终端·重启生效）——
-        ui.separator();
-        let mut mcp_on = crate::store::load_mcp_consent();
-        if ui
-            .checkbox(
-                &mut mcp_on,
-                crate::i18n::tr(
-                    "允许 AI 通过 MCP 控制终端（重启生效）",
-                    "Allow AI to control terminal via MCP (restart)",
-                ),
-            )
-            .on_hover_text(crate::i18n::tr(
-                "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
-                 · 写入操作需当面确认\n\
-                 · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
-                 · 多机共用一台 AI 服务器时：配对标识会在会话空闲时自动注入，请求只回本电脑",
-                "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
-                 read/write files.\n\
-                 · Writes need on-screen confirmation\n\
-                 · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
-                 · Sharing one AI server: the pairing token is auto-injected once the session \
-                 goes idle, so requests only reach THIS computer",
-            ))
-            .clicked()
-        {
-            crate::store::save_mcp_consent(mcp_on);
-            ui.close();
-        }
-
-        // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的 socket
-        // 会堆在一起、代理无从区分谁是谁（见 store::mcp_pairing_token）。iShell 终端会话会
-        // 在空闲时自动注入它（export ISHELL_MCP_TOKEN），多数情况无需
-        // 手动配置；只有 AI 跑在 iShell 终端之外时才需要把下面这行填进那份 AI 的配置。
-        if mcp_on {
-            let token = crate::store::mcp_pairing_token();
-            ui.horizontal(|ui| {
+                egui_phosphor::regular::PALETTE,
+                crate::i18n::tr("外观", "Appearance")
+            ),
+            |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 ui.label(
-                    RichText::new(crate::i18n::tr("配对 token：", "Pairing token: "))
+                    RichText::new(crate::i18n::tr("语言", "Language"))
                         .color(Palette::TEXT_DIM)
-                        .size(12.0),
+                        .size(11.0),
                 );
-                ui.label(RichText::new(&token).monospace().size(12.0));
-            });
-            if ui
-                .button(format!(
-                    "{}  {}",
-                    egui_phosphor::regular::COPY,
-                    crate::i18n::tr("复制配对配置", "Copy pairing config")
-                ))
-                .on_hover_text(crate::i18n::tr(
-                    "iShell 终端会自动注入 ISHELL_MCP_TOKEN，多数情况无需手动配置。\n\
-                     仅当 AI 不在 iShell 终端里跑时，把这行写进该 AI 的 MCP server 环境变量，\
-                     代理便只绑定你这台电脑。",
-                    "iShell terminals auto-inject ISHELL_MCP_TOKEN; manual setup is usually \
-                     unnecessary.\n\
-                     Only if the AI is not started inside an iShell terminal, put this line in \
-                     that AI's MCP server env so the proxy binds only to YOUR computer.",
-                ))
-                .clicked()
-            {
-                ui.ctx().copy_text(format!("ISHELL_MCP_TOKEN={token}"));
-                ui.close();
-            }
-        }
+                crate::i18n::language_menu(ui);
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "{}  {:.0}%",
+                        crate::i18n::tr("字体大小", "Font size"),
+                        ui_zoom() * 100.0
+                    ))
+                    .color(Palette::TEXT_DIM)
+                    .size(11.0),
+                );
+                ui.horizontal(|ui| {
+                    // +/- 不关闭菜单，便于连续调整；百分比实时更新
+                    if ui
+                        .button(RichText::new(egui_phosphor::regular::MINUS).size(13.0))
+                        .clicked()
+                    {
+                        set_ui_zoom(ui_zoom() - 0.1);
+                    }
+                    if ui
+                        .button(RichText::new(egui_phosphor::regular::PLUS).size(13.0))
+                        .clicked()
+                    {
+                        set_ui_zoom(ui_zoom() + 0.1);
+                    }
+                    if ui.button(crate::i18n::tr("复位", "Reset")).clicked() {
+                        set_ui_zoom(1.0);
+                    }
+                });
+            },
+        );
+
+        ui.menu_button(
+            format!(
+                "{}  {}",
+                egui_phosphor::regular::ROBOT,
+                crate::i18n::tr("AI 控制", "AI control")
+            ),
+            |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                let mut mcp_on = crate::store::load_mcp_consent();
+                if ui
+                    .checkbox(
+                        &mut mcp_on,
+                        crate::i18n::tr(
+                            "允许 AI 通过 MCP 控制终端（重启生效）",
+                            "Allow AI to control terminal via MCP (restart)",
+                        ),
+                    )
+                    .on_hover_text(crate::i18n::tr(
+                        "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
+                         · 写入操作需当面确认\n\
+                         · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
+                         · 多机共用一台 AI 服务器时：配对标识会在会话空闲时自动注入，请求只回本电脑",
+                        "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
+                         read/write files.\n\
+                         · Writes need on-screen confirmation\n\
+                         · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
+                         · Sharing one AI server: the pairing token is auto-injected once the session \
+                         goes idle, so requests only reach THIS computer",
+                    ))
+                    .clicked()
+                {
+                    crate::store::save_mcp_consent(mcp_on);
+                    ui.close();
+                }
+
+                // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的
+                // socket 会堆在一起、代理无从区分谁是谁（见 store::mcp_pairing_token）。
+                // iShell 终端会话会在空闲时自动注入它（export ISHELL_MCP_TOKEN），多数情况
+                // 无需手动配置；只有 AI 跑在 iShell 终端之外时才需要把下面这行填进那份 AI
+                // 的配置。
+                if mcp_on {
+                    let token = crate::store::mcp_pairing_token();
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(crate::i18n::tr("配对 token：", "Pairing token: "))
+                                .color(Palette::TEXT_DIM)
+                                .size(12.0),
+                        );
+                        ui.label(RichText::new(&token).monospace().size(12.0));
+                    });
+                    if ui
+                        .button(format!(
+                            "{}  {}",
+                            egui_phosphor::regular::COPY,
+                            crate::i18n::tr("复制配对配置", "Copy pairing config")
+                        ))
+                        .on_hover_text(crate::i18n::tr(
+                            "iShell 终端会自动注入 ISHELL_MCP_TOKEN，多数情况无需手动配置。\n\
+                             仅当 AI 不在 iShell 终端里跑时，把这行写进该 AI 的 MCP server 环境\
+                             变量，代理便只绑定你这台电脑。",
+                            "iShell terminals auto-inject ISHELL_MCP_TOKEN; manual setup is usually \
+                             unnecessary.\n\
+                             Only if the AI is not started inside an iShell terminal, put this line \
+                             in that AI's MCP server env so the proxy binds only to YOUR computer.",
+                        ))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(format!("ISHELL_MCP_TOKEN={token}"));
+                        ui.close();
+                    }
+                }
+            },
+        );
+
+        // 强制 X11：仅 Linux 有意义（修复 Wayland 下输入法），其它平台连这一项都不该出现。
+        #[cfg(target_os = "linux")]
+        ui.menu_button(
+            format!(
+                "{}  {}",
+                egui_phosphor::regular::GEAR,
+                crate::i18n::tr("启动选项", "Startup")
+            ),
+            |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                let mut fx = crate::store::load_force_x11();
+                if ui
+                    .checkbox(
+                        &mut fx,
+                        crate::i18n::tr(
+                            "强制 X11（修复输入法·重启生效）",
+                            "Force X11 (fix IME · restart)",
+                        ),
+                    )
+                    .on_hover_text(crate::i18n::tr(
+                        "Wayland 下输入法常失效；开启后下次启动改走 X11",
+                        "IME often fails on Wayland; enabling switches to X11 on next launch",
+                    ))
+                    .clicked()
+                {
+                    crate::store::save_force_x11(fx);
+                    ui.close();
+                }
+            },
+        );
 
         // —— 关于 ——
         ui.separator();
