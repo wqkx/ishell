@@ -94,10 +94,73 @@ pub(super) fn file_table(
         });
     ui.add_space(2.0);
 
-    let mut entries = match state.listings.get(&cwd) {
-        Some(e) => e.clone(),
-        None => return,
+    // 排序+过滤后的视图缓存：命中（listing 版本/排序/过滤均未变）时仅一次 Rc clone，
+    // 避免每帧全量 clone + sort_by（比较器内每次 to_lowercase 都是一次分配）。
+    let gen = state.applied_list_gen.get(&cwd).copied().unwrap_or(0);
+    let cache_hit = state.view_cache.as_ref().is_some_and(|c| {
+        c.cwd == cwd
+            && c.gen == gen
+            && c.sort_key == state.sort_key
+            && c.sort_desc == state.sort_desc
+            && c.filter == state.filter
+    });
+    let entries_rc = if cache_hit {
+        state.view_cache.as_ref().unwrap().entries.clone()
+    } else {
+        let mut entries = match state.listings.get(&cwd) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        // 排序：目录始终在前，组内按所选键升/降序。
+        // sort_by_cached_key：小写名每行只算一次（此前比较器内每对比较都算两次）。
+        {
+            let key = state.sort_key;
+            let desc = state.sort_desc;
+            match key {
+                SortKey::Name => entries.sort_by_cached_key(|e| {
+                    (e.is_dir, e.name.to_lowercase())
+                }),
+                SortKey::Size => entries.sort_by_key(|e| (e.is_dir, e.size)),
+                SortKey::Mtime => entries.sort_by_key(|e| (e.is_dir, e.mtime)),
+            }
+            if desc {
+                // 目录分组不受升降影响：逐组反转（保持目录在前、组内反向）
+                let dir_end = entries.iter().take_while(|e| e.is_dir).count();
+                entries[..dir_end].reverse();
+                entries[dir_end..].reverse();
+            }
+        }
+        // 应用名称过滤
+        if !state.filter.trim().is_empty() {
+            let f = state.filter.to_lowercase();
+            entries.retain(|e| e.name.to_lowercase().contains(&f));
+        }
+        let rc = std::rc::Rc::new(entries);
+        state.view_cache = Some(super::super::ViewCache {
+            cwd: cwd.clone(),
+            gen,
+            sort_key: state.sort_key,
+            sort_desc: state.sort_desc,
+            filter: state.filter.clone(),
+            entries: rc.clone(),
+        });
+        rc
     };
+    let entries: &Vec<crate::proto::FileEntry> = &entries_rc;
+    // 过滤后无匹配的提示（在渲染前提示，列表本体为空）
+    if entries.is_empty() && !state.filter.trim().is_empty() {
+        ui.add_space(8.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("无匹配（共 {total_count} 项）"),
+                    crate::i18n::Lang::En => format!("No match ({total_count} items)"),
+                })
+                .color(Palette::TEXT_DIM)
+                .size(12.0),
+            );
+        });
+    }
     // 预取：进入目录后顺带请求各「直接子文件夹」的列表，点进下一级时即时显示（命中缓存）。
     // 每个子目录只在未缓存且未加载时请求一次；上限避免极端目录发起过多请求。
     {
@@ -112,43 +175,6 @@ pub(super) fn file_table(
                 actions.push(FileAction::List(sub));
                 prefetched += 1;
             }
-        }
-    }
-    // 排序：目录始终在前，组内按所选键升/降序
-    {
-        let key = state.sort_key;
-        let desc = state.sort_desc;
-        entries.sort_by(|a, b| {
-            (!a.is_dir).cmp(&!b.is_dir).then_with(|| {
-                let ord = match key {
-                    SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                    SortKey::Size => a.size.cmp(&b.size),
-                    SortKey::Mtime => a.mtime.cmp(&b.mtime),
-                };
-                if desc {
-                    ord.reverse()
-                } else {
-                    ord
-                }
-            })
-        });
-    }
-    // 应用名称过滤
-    if !state.filter.trim().is_empty() {
-        let f = state.filter.to_lowercase();
-        entries.retain(|e| e.name.to_lowercase().contains(&f));
-        if entries.is_empty() {
-            ui.add_space(8.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new(match crate::i18n::current() {
-                        crate::i18n::Lang::Zh => format!("无匹配（共 {total_count} 项）"),
-                        crate::i18n::Lang::En => format!("No match ({total_count} items)"),
-                    })
-                    .color(Palette::TEXT_DIM)
-                    .size(12.0),
-                );
-            });
         }
     }
 

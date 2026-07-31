@@ -23,6 +23,26 @@ const HL_RULES: &[(&str, Color32)] = &[
     ("warn", Color32::from_rgb(0xc8, 0x8a, 0x20)),
 ];
 
+/// 行内容哈希：URL / 关键字高亮缓存的键。逐格喂入与 find_row_urls / highlight_colors
+/// 完全一致的字符序列（续格跳过、宽字符取首字符、空 cell 记空格）+ 列宽——哈希相同
+/// 必然对应相同的扫描输入，无需再构建 String 验证。64 位碰撞率对装饰性高亮可忽略。
+pub(super) fn row_content_hash(screen: &vt100::Screen, row: u16, cols: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut col = 0u16;
+    while col < cols {
+        let wide = screen.cell(row, col).is_some_and(|c| c.is_wide());
+        match screen.cell(row, col) {
+            Some(c) if c.is_wide_continuation() => {}
+            Some(c) => c.contents().chars().next().unwrap_or(' ').hash(&mut h),
+            None => ' '.hash(&mut h),
+        }
+        col += if wide { 2 } else { 1 };
+    }
+    cols.hash(&mut h);
+    h.finish()
+}
+
 /// 计算一行各单元格的高亮覆盖色（None=不覆盖）。关键字为 ASCII，按 1 列/字符。
 pub(super) fn highlight_colors(
     screen: &vt100::Screen,

@@ -4,7 +4,7 @@ use egui::{Color32, FontId, Rect, Response, Stroke, Vec2};
 
 use super::{
     osc::open_url,
-    paint::{cell_format, find_row_urls, highlight_colors, paint_row_backgrounds},
+    paint::{cell_format, find_row_urls, highlight_colors, paint_row_backgrounds, row_content_hash},
     theme::TermColors,
     Terminal,
 };
@@ -26,7 +26,7 @@ pub(super) struct PaintParams<'a> {
 }
 
 impl Terminal {
-    pub(super) fn paint_terminal(&self, ui: &egui::Ui, params: PaintParams<'_>) {
+    pub(super) fn paint_terminal(&mut self, ui: &egui::Ui, params: PaintParams<'_>) {
         let PaintParams {
             rect,
             resp,
@@ -57,17 +57,26 @@ impl Terminal {
             (rect.min.y * ppp).round() / ppp,
         );
 
-        // 可见行中的链接：用于悬停下划线 + 点击打开（鼠标上报模式下让位给 TUI）
+        // 可见行中的链接：用于悬停下划线 + 点击打开（鼠标上报模式下让位给 TUI）。
+        // 行内容缓存：命中后跳过每帧逐行的正则扫描（此前是满帧率时的主要 CPU 热点）。
         let mut link_rects: Vec<(Rect, String)> = Vec::new();
         if !report_mouse {
             for row in 0..self.rows {
-                for (sc, ec, url) in find_row_urls(screen, row, self.cols) {
-                    let x0 = origin.x + sc as f32 * char_w;
-                    let x1 = origin.x + (ec as f32 + 1.0) * char_w;
+                let h = row_content_hash(screen, row, self.cols);
+                if self.url_cache.len() >= 1024 && !self.url_cache.contains_key(&h) {
+                    self.url_cache.clear();
+                }
+                let urls = self
+                    .url_cache
+                    .entry(h)
+                    .or_insert_with(|| find_row_urls(screen, row, self.cols));
+                for (sc, ec, url) in urls.iter() {
+                    let x0 = origin.x + *sc as f32 * char_w;
+                    let x1 = origin.x + (*ec as f32 + 1.0) * char_w;
                     let y = origin.y + row as f32 * char_h;
                     link_rects.push((
                         Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)),
-                        url,
+                        url.clone(),
                     ));
                 }
             }
@@ -121,9 +130,17 @@ impl Terminal {
             }
             // 逐格绘制字形：固定网格定位，避免 CJK / 宽字符的字形步进破坏对齐。
             // 空内容（含宽字符的续格）跳过；宽字符自身在本格绘制，自然跨两格。
-            // 关键字高亮：覆盖匹配单元格的文字颜色
+            // 关键字高亮：覆盖匹配单元格的文字颜色。同样走行内容缓存（命中零扫描；
+            // 克隆 Vec<Option<Color32>> 仅数百字节 memcpy，远廉于关键字扫描）。
             let hl = if self.highlight {
-                highlight_colors(screen, row, self.cols)
+                let h = row_content_hash(screen, row, self.cols);
+                if self.hl_cache.len() >= 1024 && !self.hl_cache.contains_key(&h) {
+                    self.hl_cache.clear();
+                }
+                self.hl_cache
+                    .entry(h)
+                    .or_insert_with(|| highlight_colors(screen, row, self.cols))
+                    .clone()
             } else {
                 Vec::new()
             };

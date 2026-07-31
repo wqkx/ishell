@@ -14,7 +14,7 @@ mod types;
 
 use dialogs::dialogs;
 use list::file_list;
-pub use types::{Dialog, FileAction, FilePanelState};
+pub use types::{Dialog, FileAction, FilePanelState, ViewCache};
 use types::{MoveRecord, OpenIntent, Renaming, SortKey};
 
 impl FilePanelState {

@@ -432,15 +432,23 @@ fn strip_py_line_comment(line: &str) -> &str {
 }
 
 fn lint_json(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Vec<usize>) {
-    // 尾逗号：`,` 后仅空白再遇 `]`/`}`
+    // 尾逗号：`,` 后仅空白再遇 `]`/`}`。
+    // 单遍归并跳过字符串段（segs 按起点有序、互不重叠）：此前每个字节都从头 find
+    // 字符串段，O(字节数 × token 数)，256KB JSON 每次按键都要秒级卡顿。
     let mut i = 0usize;
     let bytes = text.as_bytes();
+    let mut seg_i = 0usize;
     while i < bytes.len() {
-        // 跳过字符串段
-        if let Some(&(s, e, Tok::Str)) = segs.iter().find(|&&(s, e, _)| s <= i && i < e) {
-            i = e;
-            let _ = s;
-            continue;
+        // 推进到第一个「结束位置 > i」的段；它若覆盖 i 且是字符串段，直接整段跳过
+        while seg_i < segs.len() && segs[seg_i].1 <= i {
+            seg_i += 1;
+        }
+        if seg_i < segs.len() {
+            let (s, e, t) = segs[seg_i];
+            if t == Tok::Str && s <= i && i < e {
+                i = e;
+                continue;
+            }
         }
         if bytes[i] == b',' {
             let mut j = i + 1;

@@ -56,6 +56,7 @@ pub(super) fn handle_input(
                     ed.vcaret = end;
                     ed.vsel = None;
                     ed.msel.clear();
+                    ed.dirty_flag = true; // 组字内容已上屏（取消时由 Disabled 分支重算）
                     ed.vime_preedit = if t.is_empty() { None } else { Some((s, end)) };
                     v_recompute(ed);
                 }
@@ -83,6 +84,8 @@ pub(super) fn handle_input(
                         ed.content.replace_range(s..e, "");
                         ed.vcaret = s;
                         ed.vsel = None;
+                        // 组字取消：内容恢复到组字前，可能恰在保存点上——全量重算
+                        ed.recompute_dirty();
                         v_recompute(ed);
                     }
                 }

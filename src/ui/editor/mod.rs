@@ -16,6 +16,9 @@ pub struct Editor {
     pub content: String,
     pub language: String,
     orig: String,
+    /// 「有改动」标记：由各内容/编码/行尾变更点维护（undo/redo 后全量重算），
+    /// 避免 dirty() 每帧全文 memcmp（20MB 文件曾每帧比较一次）。
+    dirty_flag: bool,
     find: String,
     replace: String,
     show_find: bool,
@@ -160,6 +163,7 @@ impl Editor {
         let indent = highlight::detect_indent(&content);
         Self {
             orig: content.clone(),
+            dirty_flag: false,
             path,
             content,
             language,
@@ -257,15 +261,22 @@ impl Editor {
     }
     pub fn dirty(&self) -> bool {
         // 内容、编码、行尾任一与打开/上次保存时不同都算「有改动」——
-        // 仅切换 GBK/UTF-8 或 LF/CRLF 也必须能保存、关闭时也要警告
-        self.content != self.orig
+        // 仅切换 GBK/UTF-8 或 LF/CRLF 也必须能保存、关闭时也要警告。
+        // 标记由各变更点维护（v_apply/set_encoding/set_eol 置位、mark_saved 复位、
+        // undo/redo 与初始化时全量重算），此处 O(1) 读取。
+        self.dirty_flag
+    }
+    /// 全量重算 dirty 标记（undo/redo 可能精确回到保存点，必须重新比较）。
+    pub(crate) fn recompute_dirty(&mut self) {
+        self.dirty_flag = self.content != self.orig
             || self.encoding != self.orig_encoding
-            || self.eol != self.orig_eol
+            || self.eol != self.orig_eol;
     }
     pub fn mark_saved(&mut self) {
         self.orig = self.content.clone();
         self.orig_encoding = self.encoding.clone();
         self.orig_eol = self.eol;
+        self.dirty_flag = false;
     }
     /// 保存修订签名 = (正文版本, 编码, 行尾)。保存确认据此判断「是否仍是当时发出去的那份」：
     /// 只有内容、编码、行尾都未变才算已保存——单独切换编码/行尾也不会被旧的成功事件误标干净。
@@ -332,10 +343,16 @@ impl Editor {
         self.mtime = m;
     }
     pub fn set_eol(&mut self, e: crate::proto::Eol) {
-        self.eol = e;
+        if self.eol != e {
+            self.eol = e;
+            self.dirty_flag = true;
+        }
     }
     pub fn set_encoding(&mut self, enc: String) {
-        self.encoding = enc;
+        if self.encoding != enc {
+            self.encoding = enc;
+            self.dirty_flag = true;
+        }
     }
 }
 
@@ -385,4 +402,5 @@ mod dirty_tests {
         ed.mark_saved();
         assert!(!ed.dirty());
     }
+
 }

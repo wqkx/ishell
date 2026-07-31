@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::proto::FileEntry;
 
@@ -91,6 +92,22 @@ pub struct FilePanelState {
     /// 仅当 `cwd` 仍是其前缀时保留；点淡色段可回到子目录；cwd 切到旁支则清空。
     /// 双击进入编辑时仍编辑 `cwd`，不受此字段影响。
     pub path_trail: Option<String>,
+    /// 排序+过滤后的条目视图缓存：命中时渲染零成本（Rc clone）。
+    /// 此前每帧全量 clone 整个目录再 sort_by（比较器内每次 to_lowercase 分配），
+    /// 万条目录下是主要 CPU 热点；现在仅在 listing/排序/过滤变化时重建一次。
+    pub view_cache: Option<ViewCache>,
+}
+
+/// 排序+过滤后的条目视图（见 `view_cache` 字段）。
+pub struct ViewCache {
+    /// 缓存键：目录、listing 版本（applied_list_gen）、排序、过滤串——全等才命中
+    pub cwd: String,
+    pub gen: u64,
+    pub sort_key: SortKey,
+    pub sort_desc: bool,
+    pub filter: String,
+    /// 排序+过滤后的完整条目（Rc 共享：命中路径仅一次 Rc clone，O(1)）
+    pub entries: Rc<Vec<FileEntry>>,
 }
 
 /// 一次「移动」的撤销记录：被移动项的原始绝对路径 + 落入的目标目录。

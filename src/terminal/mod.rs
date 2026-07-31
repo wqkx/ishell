@@ -109,6 +109,10 @@ pub struct Terminal {
     last_output_at: Option<std::time::Instant>,
     /// 待上报的终端通知（BEL 响铃 / OSC 9 / OSC 777 notify），由 App 每帧取走渲染浮层
     notices: Vec<TermNotice>,
+    /// URL / 关键字高亮的行内容缓存（key=行内容哈希）：命中后跳过每帧逐行的正则/关键字
+    /// 扫描——高速输出满帧率时的主要 CPU 热点之一。容量封顶，满时清空重建（代价一次扫描）。
+    url_cache: std::collections::HashMap<u64, Vec<(u16, u16, String)>>,
+    hl_cache: std::collections::HashMap<u64, Vec<Option<egui::Color32>>>,
     /// 终端查询序列可能跨 SSH 数据块；暂存尚不能确定是否为完整查询的短尾。
     query_tail: Vec<u8>,
     /// resize 去抖：拖拽窗口时每帧尺寸都在变，若每帧都真正 resize（普通屏会序列化整缓冲+重建
@@ -170,6 +174,8 @@ impl Terminal {
             local_scroll_accum: 0.0,
             last_output_at: None,
             notices: Vec::new(),
+            url_cache: std::collections::HashMap::new(),
+            hl_cache: std::collections::HashMap::new(),
             query_tail: Vec::new(),
             prev_alt: false,
             sb_dragging: false,

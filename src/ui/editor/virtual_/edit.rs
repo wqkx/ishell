@@ -117,6 +117,7 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
                 last.inserted.push_str(inserted);
                 last.caret_after = ed.vcaret;
                 ed.vredo.clear();
+                ed.dirty_flag = true;
                 v_recompute(ed);
                 return;
             }
@@ -133,6 +134,7 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
         ed.vundo.remove(0);
     }
     ed.vredo.clear();
+    ed.dirty_flag = true; // 任何编辑必然离开保存点（回到保存点只能靠 undo，由 v_undo 重算）
     v_recompute(ed);
 }
 pub(super) fn v_delete_selection(ed: &mut Editor) -> bool {
@@ -254,6 +256,8 @@ pub(super) fn v_undo(ed: &mut Editor) {
         ed.vcaret = op.caret_before.min(ed.content.len());
         ed.vsel = None;
         ed.vgoal_col = None;
+        // 撤销可能精确回到保存点（或离开它）——必须全量重算而非简单置位
+        ed.recompute_dirty();
         v_recompute(ed);
         ed.vredo.push(op);
     }
@@ -266,6 +270,7 @@ pub(super) fn v_redo(ed: &mut Editor) {
         ed.vcaret = op.caret_after.min(ed.content.len());
         ed.vsel = None;
         ed.vgoal_col = None;
+        ed.recompute_dirty();
         v_recompute(ed);
         ed.vundo.push(op);
     }
@@ -572,4 +577,24 @@ pub(super) fn v_move_doc(ed: &mut Editor, end: bool, shift: bool) {
         ed.vsel = Some(ed.vcaret);
     }
     ed.vcaret = if end { ed.content.len() } else { 0 };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// dirty 标记（O(1) 读取，替代每帧全文 memcmp）的关键正确性：
+    /// 编辑置位、撤销精确回到保存点时必须复位、重做再次置位。
+    #[test]
+    fn undo_back_to_saved_point_clears_dirty() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "hello\n".into());
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        assert!(!ed.dirty());
+        v_insert(&mut ed, "x");
+        assert!(ed.dirty(), "编辑后应有改动");
+        v_undo(&mut ed);
+        assert!(!ed.dirty(), "撤销回到保存点应恢复干净");
+        v_redo(&mut ed);
+        assert!(ed.dirty(), "重做应再次有改动");
+    }
 }
