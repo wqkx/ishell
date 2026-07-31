@@ -21,8 +21,19 @@ impl App {
         let mut remove_one: Option<usize> = None;
         let mut clear_all = false;
 
+        // 贴着**终端区**摆，而不是贴着窗口边。`available_rect` 是去掉各侧栏/标签栏之后
+        // 剩给 CentralPanel 的那块，也就是终端所在的区域；终端内容还要再往里 12px
+        // （CentralPanel 的 outer_margin 6 + inner_margin 6，见 layout_body），在此基础上
+        // 再留一道 GAP，卡片就不会压在终端边框上。
+        const TERM_INSET: f32 = 12.0;
+        const GAP: f32 = 12.0;
+        let area = ctx.available_rect();
+        let screen = ctx.screen_rect();
+        // Area::anchor 的偏移是相对**屏幕**的，所以把目标位置换算成相对屏幕右上角的偏移。
+        let dx = (area.right() - TERM_INSET - GAP) - screen.right();
+        let dy = (area.top() + TERM_INSET + GAP) - screen.top();
         egui::Area::new(egui::Id::new("ai_notice_overlay"))
-            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 40.0])
+            .anchor(egui::Align2::RIGHT_TOP, [dx, dy])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.set_max_width(CARD_W);
@@ -30,18 +41,21 @@ impl App {
                 // 最新在上：倒序展示前 MAX_VISIBLE 条
                 for i in (0..n.min(MAX_VISIBLE)).rev() {
                     let no = &self.ai_notices[i];
-                    let frame = egui::Frame::new()
-                        .fill(Palette::PANEL_2)
-                        .stroke(egui::Stroke::new(1.0, Palette::ACCENT))
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::symmetric(8, 4))
+                    // 用与「传输浮窗」同一套窗口外观（阴影 + 描边 + 圆角来自全局 style），
+                    // 只把底色提到 PANEL——它比终端底色亮，卡片因此"浮"在终端之上。
+                    // 原先是 PANEL_2 + 一整圈 ACCENT 描边：那是 toast 的用法（转瞬即逝、
+                    // 需要抢眼），常驻卡片套上就显得吵，橙色留给铃铛图标做点缀即可。
+                    let frame = egui::Frame::window(&ctx.global_style())
+                        .fill(Palette::PANEL)
+                        .corner_radius(crate::theme::R_SM)
+                        .inner_margin(egui::Margin::symmetric(9, 6))
                         .show(ui, |ui| {
-                            ui.set_width(CARD_W - 16.0);
+                            ui.set_width(CARD_W - 18.0);
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 5.0;
+                                ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(
                                     RichText::new(egui_phosphor::regular::BELL)
-                                        .color(Palette::WARN)
+                                        .color(Palette::ACCENT)
                                         .size(13.0),
                                 );
                                 // 关闭按钮先摆到最右，剩下的宽度全留给正文——反过来的话
@@ -107,7 +121,8 @@ impl App {
                             ui.close();
                         }
                     });
-                    ui.add_space(4.0);
+                    // 卡片自带阴影，间距给足一点才不显得糊在一起
+                    ui.add_space(6.0);
                 }
                 if n > MAX_VISIBLE {
                     ui.label(
