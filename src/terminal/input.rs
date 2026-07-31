@@ -26,6 +26,16 @@ impl Terminal {
             self.hist = None;
         }
         for ev in events {
+            // 记录用户输入时刻：自动注入（如 MCP 配对 export）必须等用户停笔的安全信号
+            match &ev {
+                egui::Event::Text(_)
+                | egui::Event::Paste(_)
+                | egui::Event::Ime(egui::ImeEvent::Commit(_))
+                | egui::Event::Key { pressed: true, .. } => {
+                    self.last_input_at = Some(std::time::Instant::now());
+                }
+                _ => {}
+            }
             // 诊断（`RUST_LOG=ishell=trace` 可见）：把到达终端的按键/文本/IME 事件原样记下。
             // 输入法类问题（组字不显示、按 Shift 丢字等）光看现象必然靠猜——必须先知道
             // 「输入法到底发了什么、走的哪条通道」。只记这三类，鼠标移动等不记，避免刷屏。

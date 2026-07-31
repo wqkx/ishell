@@ -20,7 +20,7 @@ Let Claude Code, Codex CLI, or any MCP-compatible agent drive a real, persistent
 
 Everything you need for daily SSH work in **one window** — and it stays out of your way.
 
-- 🤖 **Let AI drive the terminal (MCP)** — Claude Code, Codex CLI, and any other MCP-compatible agent can operate a real, persistent terminal session (cwd/env/history intact) instead of spawning a throwaway `ssh host cmd` that loses all context every time; commands and output show up in real time in the tab you're looking at. Off by default, opt-in when you want it. See "AI / MCP integration" below.
+- 🤖 **Let AI drive the terminal (MCP)** — Claude Code / Codex operate a real persistent session (cwd/env/history intact); commands appear live in the tab. Off by default. When several computers share one AI server, enable pairing. See "AI / MCP integration".
 - ⚡ **Fast & lightweight** — pure Rust + GPU immediate-mode UI. A single binary (~8–12 MB), instant startup, **~0% idle CPU**, **~80 MB RAM**. No Electron / JVM / Python, no daemon, no runtime deps.
 - 🎯 **Refined user experience** — a clean, warm light theme; smooth drag-to-reorder tabs; no toolbar clutter; English / 中文 switchable on the fly; sensible defaults so it just works.
 - 📁 **Effortless file operations** — multi-select rubber-band, batch delete/download, server-side copy/move, **resumable** transfers that **auto-resume after reconnect**, and folder **compress-download** (tar.gz) for thousands of small files.
@@ -41,10 +41,9 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 ## 🚀 Features
 
 **AI / MCP integration** (off by default — see "AI / MCP integration" below)
-- Let an AI assistant drive a real terminal session directly — shared, visible tab, commands and output in real time, instead of another SSH connection that loses all context
-- Works with **Claude Code, Codex CLI, and any other MCP-compatible client** — one binary, standard MCP stdio transport
-- Full tool set: run a command and wait for completion, keep waiting on long tasks, read screen/history, send raw keystrokes (for interactive prompts), interrupt, open/close sessions, read/write remote files
-- **Automatic reverse-forward** over your existing SSH connection so the AI can reach back and control this iShell from the remote server too, no extra setup needed
+- Let Claude Code / Codex CLI drive a **real terminal session** (cwd/env/history intact), with live commands and output
+- Full tool set: run commands, read screen/history, interactive input, interrupt, open/close sessions, read/write/transfer remote files
+- SSH reverse-forward lets the AI on a remote server reach back to this iShell; **enable pairing when several computers share one AI server** (see below)
 
 **Connections & sessions**
 - Multi-session tabs: status dots, **smooth drag-to-reorder animation**, overflow fade, close confirmation
@@ -172,91 +171,65 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 
 ## 🤖 AI / MCP integration
 
-Let an AI assistant (Claude Code, Codex CLI, or any other MCP-compatible agent) drive a real terminal session — instead of spawning a
-throwaway `ssh host cmd` that loses your shell's cwd, env, and history every time. It can either
-take over a tab you already have open, or open a brand-new one itself from a saved connection
-(read-only, for the AI's own use — a human can't type into it). Either way, the tab gets a clear
-🤖 indicator in the tab bar.
+Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal session — cwd / env / history intact — instead of a throwaway `ssh host cmd`. It can take over a tab you already have open, or open a read-only AI-only session from a saved connection (a human can't type into it). Tabs show a 🤖 badge.
 
-- **Off by default.** Enable it via the right-click settings menu → "Allow AI to control terminal
-  via MCP" (takes effect after restart). It only listens on a local Unix domain socket — one per
-  iShell process (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port is opened.
-- **Shared, visible terminal.** Commands the AI runs — and their output — appear in the
-  corresponding terminal tab in real time, exactly as if you'd typed them yourself.
-- **Setup**: build the companion binary once (`cargo build --release --bin ishell-mcp`), then
-  install it to the standard location. On the machine that runs your AI client, run:
-  ```bash
-  scripts/install-mcp.sh target/release/ishell-mcp
-  ```
-  This copies it to **`~/.ishell-mcp/bin/ishell-mcp`** (a stable, self-namespaced path that
-  survives repo moves/rebuilds) and prints the register command. It speaks the standard MCP stdio
-  transport, so it isn't tied to any one client — point any of these at that path:
-  - **Claude Code** — register it globally (not scoped to one project) in one line:
-    ```bash
-    claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp
-    ```
-  - **Codex CLI** — same idea:
-    ```bash
-    codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp
-    ```
-    (or add it by hand to `~/.codex/config.toml`: `[mcp_servers.ishell]` / `command = "~/.ishell-mcp/bin/ishell-mcp"` — check `codex mcp --help` if the CLI/config format has changed since this was written)
-  - **Any other MCP-compatible client** (Cursor, Windsurf, Cline, …) — most accept the generic form:
-    ```json
-    { "mcpServers": { "ishell": { "command": "~/.ishell-mcp/bin/ishell-mcp" } } }
-    ```
-  - **Keep the two in sync**: the GUI and `ishell-mcp` share a wire protocol compiled into both,
-    so they must be the same build. When you upgrade iShell, re-run `install-mcp.sh` to refresh the
-    proxy. If you forget, the proxy detects the version mismatch on connect and fails with a clear
-    "redeploy ishell-mcp" message instead of misbehaving silently. (`ishell-mcp --version` prints
-    its crate + protocol version.)
-- **Tools exposed**:
-  - `list_sessions` / `list_saved_connections`: list currently open sessions / all saved
-    connection configs;
-  - `open_session`: open a new read-only session from a saved connection for the AI's own use;
-    first use of a given connection pops a confirmation dialog for you to approve, no repeat
-    prompt for the rest of that run;
-  - `close_session`: close a session the AI itself opened (it can't close yours);
-  - `run_command`: run a command and wait for completion or a timeout, returning output + exit
-    code; `poll_run` keeps waiting on a timed-out command without resending it; for long tasks,
-    just pass a large `timeout_ms` directly (up to 24h) instead of polling with `sleep`;
-  - `send_input`: send raw keystrokes straight to an interactive prompt (a `sudo` password,
-    continuing input inside `vim`/a REPL), bypassing completion detection;
-  - `read_screen`: a tmux `capture-pane`-style dump of the visible screen, for interactive
-    programs like `vim`/`top`; `read_history` reads that session's full scrollback from the start,
-    not just one screen;
-  - `interrupt`: send Ctrl+C — also the escape hatch for the concurrency guard: a session only
-    ever allows one pending AI command at a time, and calling `interrupt` immediately frees it up
-    if stuck (at the cost of losing that command's result);
-  - `write_file` / `read_file`: read/write a remote text file **inlined in the request/response**,
-    over the existing SFTP connection — convenient for small files, but the whole content goes
-    through the JSON-RPC payload;
-  - `copy_to_remote` / `copy_from_remote`: copy a local file/directory to/from the remote side over
-    the same SFTP connection **without inlining bytes into the MCP request** — use these instead of
-    `write_file`/`read_file` for large files or whole directories.
-- **Remote access, automatic.** Whenever iShell opens an SSH session to a server (with this
-  setting on), it also reverse-forwards its local MCP socket to `~/.ishell-mcp-<nonce>.sock`
-  **on that remote server** (a random suffix per connection, so a reconnect never collides with
-  a not-yet-expired previous forward), over the very same authenticated/encrypted SSH connection
-  (no new listening port anywhere, no extra credentials to manage). Anyone who can already SSH
-  into that server can reach iShell through the forwarded socket — so only enable this for
-  servers you'd trust with that level of access. `ishell-mcp` auto-discovers the current forwarded
-  socket on its own (it re-probes on every call, picking the newest connectable `mcp-*.sock` /
-  `~/.ishell-mcp-*.sock`) — just run it on (or with SSH access to) that server, no path to
-  configure and no need to reconnect the MCP client after iShell reconnects:
-  ```bash
-  /path/to/ishell-mcp
-  ```
-- **Manual alternative**: forward the socket yourself with plain SSH instead of relying on the
-  automatic reverse-forward above (substitute the actual pid in the socket name):
-  ```bash
-  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
-  ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
-  ```
+### Enable & setup
+
+1. Settings → “Allow AI to control terminal via MCP” (**restart required**). Listens only on a local Unix socket (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port.
+2. On the machine that runs the AI, install and register the proxy:
+   ```bash
+   scripts/install-mcp.sh target/release/ishell-mcp   # → ~/.ishell-mcp/bin/ishell-mcp
+   claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
+   # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
+   ```
+   Other clients just point `command` at the same path. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
+
+### Tools
+
+| Tool | Purpose |
+|------|---------|
+| `list_sessions` / `list_saved_connections` | Open sessions / saved connections |
+| `open_session` / `close_session` | Open/close an AI-only read-only session (first use needs on-screen consent) |
+| `run_command` / `poll_run` / `start_command` | Run & wait / keep waiting / start long jobs (up to 24h) |
+| `send_input` / `interrupt` | Interactive input; Ctrl+C (also frees a stuck pending command) |
+| `read_screen` / `read_history` | Visible screen / full scrollback |
+| `write_file` / `read_file` | Small text inlined over JSON (don't use for large files) |
+| `copy_to_remote` / `copy_from_remote` | Streaming transfer (bytes stay out of MCP JSON); downloads land on the **iShell host** |
+
+### Remote reach-back (reverse forward)
+
+With the switch on, each SSH connect reverse-forwards the local MCP socket to `~/.ishell-mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). Remote `ishell-mcp` auto-discovers it — usually no path to configure.
+
+**Anyone who can SSH into that server can reach this iShell through the forwarded socket — enable only for servers you trust.**
+
+### ⚠️ Several computers sharing one AI server (read this)
+
+Typical setup: the AI runs on a shared server; several people connect with their own iShell. Forwarded sockets then pile up on that server, and the proxy can only ask someone to click which window — **that bothers others, and a wrong click can change someone else's environment**.
+
+Do one of these (prefer 1):
+
+1. **In your iShell terminal: right-click → “Enable AI pairing”** (or wait for idle auto-inject). That shell gets `export ISHELL_MCP_TOKEN=…`; AI / `ishell-mcp` started there binds only to *your* computer — no more pick-a-window for others.
+2. If the AI is *not* started inside an iShell terminal: Settings → “Copy pairing config”, put `ISHELL_MCP_TOKEN=…` into that AI's MCP server env.
+3. Without pairing you can still click the consent dialog, but **on a shared account you should pair** so you never hit the wrong machine.
+
+Manual tunnel (skip auto reverse-forward):
+
+```bash
+ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
+ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
+```
+
+### Other notes
+
+- **Writes** (run command, write file, …) need your on-screen confirmation; listing/reading usually don't.
+- AI commands appear live in the target tab — check which session you're approving.
+- Version mismatch fails loudly; the proxy won't silently bind the wrong build.
 
 ## 🔒 Security
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
-- **Saved-password encryption**: stored encrypted with ChaCha20-Poly1305; the key lives locally at `~/.config/ishell/key` (0600). This is at-rest encryption.
+- **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
+- **MCP**: off by default; local socket only; writes need confirmation; when several computers share one AI server, use the pairing token so requests never hit the wrong machine.
 
 ## 📄 License
 

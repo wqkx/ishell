@@ -20,7 +20,7 @@
 
 日常 SSH 运维需要的一切都在**同一个窗口**里——而且不打扰你。
 
-- 🤖 **让 AI 直接驱动终端（MCP）** —— Claude Code、Codex CLI，以及任何兼容 MCP 的 AI 助手都可以直接操作一个真实、持久的终端会话（保留 cwd/环境/历史），而不是每次都开一条丢光上下文的 `ssh host cmd`；命令和输出实时显示在你看的到的标签里，默认关闭、按需开启。详见下文「AI / MCP 集成」一节。
+- 🤖 **让 AI 直接驱动终端（MCP）** —— Claude Code / Codex 等可操作真实持久会话（cwd/环境/历史保留），命令实时出现在标签里；默认关闭。多机共用一台 AI 服务器时请启用配对。详见「AI / MCP 集成」。
 - ⚡ **快、占用低** —— 纯 Rust + GPU 即时模式 UI。单文件（约 8–12 MB）、秒开、**空闲 CPU ≈ 0%**、**内存约 80 MB**。无 Electron / JVM / Python，无守护进程，无运行时依赖。
 - 🎯 **用心打磨的体验** —— 干净的暖色浅色主题、标签平滑拖拽排序、不堆砌工具栏、中文 / English 随时切换、默认值合理，开箱即用。
 - 📁 **便捷的文件操作** —— 框选多选、批量删除/下载、远端服务器侧复制/移动、**下载断点续传**且**断线后自动续传**、文件夹 **压缩下载**（tar.gz）应对成千上万小文件。
@@ -41,10 +41,9 @@
 ## 🚀 功能
 
 **AI / MCP 集成**（默认关闭，详见下文「AI / MCP 集成」一节）
-- 让 AI 助手直接驱动一个真实终端会话——共享可见标签、命令与输出实时可见，而不是另开一条丢光上下文的 SSH 连接
-- 支持 **Claude Code、Codex CLI，以及任何兼容 MCP 的客户端**——一个二进制，标准 MCP stdio 传输
-- 完整工具集：执行命令并等待完成、继续等待长任务、读屏幕/历史、发送原始按键（应对交互式提示）、中断、开关会话、读写远端文件
-- 通过已有 SSH 连接**自动反向转发**到远端服务器，AI 在远端也能连回来控制本机 iShell，无需额外配置
+- 让 Claude Code / Codex CLI 等 AI **驱动真实终端会话**（保留 cwd/环境/历史），命令与输出实时可见
+- 完整工具集：跑命令、读屏幕/历史、交互输入、中断、开关会话、读写/传输远端文件
+- SSH 反向转发到远端后，AI 在服务器上也能回控本机 iShell；**多机共用一台 AI 服务器时务必启用配对**（见下文）
 
 **连接与会话**
 - 多会话标签：状态圆点、**平滑拖拽排序动画**、溢出渐隐、关闭确认
@@ -172,82 +171,65 @@ cargo run --release
 
 ## 🤖 AI / MCP 集成
 
-让 AI 助手（Claude Code、Codex CLI，或任何其它兼容 MCP 的智能体）直接驱动一个真实的终端会话——而不是每次都另开一条丢光 cwd/环境/
-历史的 `ssh host cmd`。既可以接管你已经打开的标签，也可以让 AI 用一个已保存的连接自己新开一个
-（只读，仅供 AI 操作，人不能往里打字），两种会话在标签栏都会有醒目的 🤖 标识。
+让 AI（Claude Code、Codex CLI 等）驱动**真实、持久**的终端会话——保留 cwd / 环境 / 历史，而不是每次另开一条丢光上下文的 `ssh host cmd`。可接管你已打开的标签，也可按已保存连接新开只读 AI 会话（人不能往里打字）；标签栏有 🤖 标识。
 
-- **默认关闭**。在右键设置菜单里打开"允许 AI 通过 MCP 控制终端"（需重启生效）。只监听本地
-  Unix domain socket（每个 iShell 进程各一份 `~/.config/ishell/mcp-<pid>.sock`，权限 `0600`），
-  不监听任何网络端口。
-- **共享可见终端**。AI 执行的命令和产生的输出会实时显示在对应终端标签里，效果等同于人亲自输入。
-- **接入方式**：编译一次配套的独立二进制（`cargo build --release --bin ishell-mcp`），再安装到
-  标准位置。在**运行 AI 客户端的那台机器**上执行：
-  ```bash
-  scripts/install-mcp.sh target/release/ishell-mcp
-  ```
-  它会把二进制拷到 **`~/.ishell-mcp/bin/ishell-mcp`**（稳定、自命名空间的路径，不随仓库位置/
-  重建变化）并打印注册命令。二进制走标准 MCP stdio 传输，不绑定任何客户端——把下面任一客户端
-  指向这个路径即可：
-  - **Claude Code** —— 直接注册为全局可用（不限于某个项目目录）：
-    ```bash
-    claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp
-    ```
-  - **Codex CLI** —— 用法类似：
-    ```bash
-    codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp
-    ```
-    （或手动加到 `~/.codex/config.toml`：`[mcp_servers.ishell]` / `command = "~/.ishell-mcp/bin/ishell-mcp"`——
-    如果 CLI/配置格式有变化，以 `codex mcp --help` 为准）
-  - **其它兼容 MCP 的客户端**（Cursor、Windsurf、Cline……）—— 大多接受通用写法：
-    ```json
-    { "mcpServers": { "ishell": { "command": "~/.ishell-mcp/bin/ishell-mcp" } } }
-    ```
-  - **两者要同版本**：GUI 与 `ishell-mcp` 的线协议是编译在一起的，必须同一版本。升级 iShell 后
-    重跑 `install-mcp.sh` 覆盖代理即可；若忘了升级代理，它会在连接时以「版本不一致，请重新
-    部署」明确报错，而不是静默出错。（`ishell-mcp --version` 会打印其 crate 与协议版本。）
-- **暴露的工具**：
-  - `list_sessions` / `list_saved_connections`：列出当前打开的会话 / 所有已保存的连接配置；
-  - `open_session`：用一个已保存的连接新开一个只读会话供 AI 专用；首次使用某条连接会弹窗让你
-    当面确认，之后同一进程生命周期内不再重复确认；
-  - `close_session`：关闭一个 AI 自己开的会话（不能关用户自己的会话）；
-  - `run_command`：执行一条命令并等待完成或超时，返回输出 + 退出码；`poll_run` 对超时未完成的
-    命令继续等待、不重发；长任务直接传一个够大的 `timeout_ms`（最长 24 小时）即可，不需要
-    `sleep` 轮询；
-  - `start_command`：立即启动长任务，至多等待 100ms 后返回 `run_id`；受 MCP 客户端空闲超时
-    限制时，用它配合短时 `poll_run` 查询，避免遗留等待者。
-  - `send_input`：向交互式提示（`sudo` 密码、`vim`/REPL 里继续输入）直接发送原始按键，跳过
-    完成检测；
-  - `read_screen`：类似 `tmux capture-pane`，导出当前可见屏幕纯文本，适合看 `vim`/`top` 这类
-    交互式程序；`read_history` 读取该会话从开始至今的完整回滚历史（不止一屏）；
-  - `interrupt`：发送 Ctrl+C；同时也是并发保护的退出口——一个会话同一时刻只允许一条挂起的
-    AI 命令，卡住时调用一次 `interrupt` 即可立即释放（代价是丢失那条命令的结果）；
-  - `write_file` / `read_file`：复用已有 SFTP 连接读写远端文本文件，**内容内联在请求/响应里**——
-    小文件很方便，但整份内容都要经过这条 JSON-RPC 连接；
-  - `copy_to_remote`：从运行 `ishell-mcp` 的**调用方机器**流式读取单个文件，经 iShell 已有的
-    SFTP 会话上传到远端；文件字节不经过 MCP JSON，也不进入模型上下文。适合跨主机同步大源码和
-    二进制文件，替代 `write_file`。当前目录同步请使用 git/rsync 或逐文件调用。
-  - `copy_from_remote`：复用同一条 SFTP 连接下载到 **iShell 宿主机**；跨主机回传到 MCP 调用方
-    的流式数据通道尚未提供，不能把调用方路径当作 iShell 宿主机路径。
-- **远程访问，自动完成**。开关打开后，iShell 每次连上一台服务器，都会顺便把本机的 MCP socket
-  经这条已认证加密的 SSH 连接反向转发到**那台服务器**上的 `~/.ishell-mcp-<随机后缀>.sock`
-  （每次连接的后缀都不同，重连时不会跟服务器还没判定为死亡的上一条连接抢同一个路径）——
-  不额外开监听端口，也不需要单独管理一套凭据。谁能 SSH 到那台服务器，谁就能通过转发出来的
-  socket 控制这边的 iShell，所以只对你真正信任的服务器开启这个开关。`ishell-mcp` 自己会动态
-  探测当前有效的转发 socket（每次调用都重新找一遍最新可连接的 `mcp-*.sock`/`~/.ishell-mcp-*.sock`），
-  不需要配置路径，iShell 重连后也不用重连 MCP client：
-  ```bash
-  /path/to/ishell-mcp
-  ```
-- **手动方式**：不依赖上面的自动反向转发，自己用 SSH 转发（socket 名按实际 pid 替换）：
-  ```bash
-  ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
-  ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
-  ```
+### 开启与接入
+
+1. 设置菜单勾选「允许 AI 通过 MCP 控制终端」（**重启生效**）。仅本机 Unix socket（`~/.config/ishell/mcp-<pid>.sock`，`0600`），不监听网络端口。
+2. 在**跑 AI 的那台机器**上安装代理并注册：
+   ```bash
+   scripts/install-mcp.sh target/release/ishell-mcp   # → ~/.ishell-mcp/bin/ishell-mcp
+   claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
+   # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
+   ```
+   其它客户端把 `command` 指到同一路径即可。GUI 与 `ishell-mcp` **必须同版本**；升级后重跑安装脚本。
+
+### 工具一览
+
+| 工具 | 作用 |
+|------|------|
+| `list_sessions` / `list_saved_connections` | 列出打开中的会话 / 已保存连接 |
+| `open_session` / `close_session` | 按已保存连接开/关 AI 专用只读会话（首次连接需当面确认） |
+| `run_command` / `poll_run` / `start_command` | 执行并等待 / 继续等待 / 立即启动长任务（最长 24h） |
+| `send_input` / `interrupt` | 交互输入；Ctrl+C（同时释放卡住的挂起命令） |
+| `read_screen` / `read_history` | 可见屏 / 完整回滚历史 |
+| `write_file` / `read_file` | 小文本经 JSON 内联读写（大文件勿用） |
+| `copy_to_remote` / `copy_from_remote` | 流式传输（字节不进 MCP JSON）；下载落在 **iShell 本机** |
+
+### 远端回控（反向转发）
+
+开关打开后，连上 SSH 时会把本机 MCP socket 反向转发到远端 `~/.ishell-mcp-<随机>.sock`（走现有加密通道，无额外端口）。远端的 `ishell-mcp` 会自动探测，一般无需配路径。
+
+**谁能 SSH 到那台服务器，谁就能经转发 socket 触达这边的 iShell——只对你信任的服务器开这个开关。**
+
+### ⚠️ 多机共用一台 AI 服务器（必读）
+
+典型场景：AI（Claude Code 等）跑在一台共享服务器上，多台电脑各自用 iShell 连过去。此时各电脑的转发 socket 会堆在同一远端目录，代理默认只能弹窗让人点选——**容易打扰别人，点错还会改到别人的环境**。
+
+正确做法（任选其一，推荐 1）：
+
+1. **在本机 iShell 终端右键 →「启用 AI 配对」**（或等会话空闲时的自动注入）。会向该 shell `export ISHELL_MCP_TOKEN=…`；之后在此终端里启动的 AI / `ishell-mcp` 只绑定你这台电脑，不再弹窗打扰他人。
+2. AI 不在 iShell 终端里跑时：设置里「复制配对配置」，把 `ISHELL_MCP_TOKEN=…` 写进那份 AI 的 MCP server 环境变量。
+3. 未配对时仍可点确认窗选机器，但**共享账号下务必配对**，避免误操作他人会话。
+
+手动隧道（不用自动转发时）：
+
+```bash
+ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
+ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
+```
+
+### 其它注意
+
+- 执行命令、写文件等**写入操作**需你在窗口当面确认；读列表/读屏一般不需要。
+- AI 跑的命令会实时出现在对应标签里，等同于人在打字——确认前请看清目标会话。
+- 版本不一致时代理会明确报错，不会静默乱连。
 
 ## 🔒 安全
 
 - **主机密钥校验**：known_hosts 校验，未知主机首次连接弹窗确认 SHA256 指纹（TOFU）并写入；密钥改变则拒绝告警。
-- **保存密码加密**：以 ChaCha20-Poly1305 加密落盘，密钥存于本地 `~/.config/ishell/key`（0600）；属 at-rest 加密。
+- **保存密码加密**：以 ChaCha20-Poly1305 加密落盘，密钥优先系统钥匙串，不可用时回退本地 `~/.config/ishell/key`（0600）。
+- **MCP**：默认关闭；仅本机 socket；写入需确认；多机共享 AI 服务器时请用配对 token，避免串台。
 
 ## 📄 许可证
 

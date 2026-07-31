@@ -142,6 +142,42 @@ impl App {
                         s.osc7_confirm = true;
                     }
                 }
+                // 右键菜单「启用 AI 配对」：立即注入配对 token（不等静止窗口——用户显式点的，
+                // 他自己知道此刻提示符闲置；与 OSC 7 注入同款策略），并标记本会话已配对。
+                // 有挂起的 AI 命令/哨兵捕获时拒绝：expect_echo 会覆盖哨兵回显吞除状态。
+                if s.terminal.take_pair_request() && !s.ai_owned {
+                    if s.pending_ai_run.is_none() && !s.terminal.ai_capture_pending() {
+                        inject_mcp_token(s);
+                        s.mcp_token_injected = true;
+                    } else {
+                        s.status = crate::i18n::tr(
+                            "AI 命令正在执行，稍后再启用配对",
+                            "AI command in flight; retry pairing later",
+                        )
+                        .into();
+                    }
+                }
+                // MCP 配对 token 自动注入：多台电脑共用同一台 AI 服务器时，让本会话里启动的
+                // AI（及其 ishell-mcp 子进程）自动携带配对标识——MCP 请求经既有的 token 匹配
+                // 精确路由回本电脑，不再弹窗打扰其他人（未注入时维持原有「多实例弹窗选择」）。
+                //
+                // 只在「提示符几乎确定闲置」时注入，信号缺一不可（等下一帧重试）：
+                // 终端不忙（无全屏程序/1s 内无输出）、远端输出静止 2s+、用户停笔 2s+ 且
+                // 本地输入行为空；且无挂起的 AI 命令/哨兵捕获（expect_echo 会覆盖其吞除状态）。
+                // ai_owned 会话（AI 专用）不注入。
+                if crate::store::load_mcp_consent()
+                    && s.connected
+                    && !s.ai_owned
+                    && !s.mcp_token_injected
+                    && s.pending_ai_run.is_none()
+                    && !s.terminal.ai_capture_pending()
+                    && !s.terminal.appears_busy()
+                    && s.terminal.output_idle_for(std::time::Duration::from_secs(2))
+                    && s.terminal.input_idle_for(std::time::Duration::from_secs(2))
+                {
+                    inject_mcp_token(s);
+                    s.mcp_token_injected = true;
+                }
                 if s.osc7_confirm {
                     let mut decided: Option<bool> = None;
                     egui::Modal::new(egui::Id::new("osc7_confirm_modal")).show(ui.ctx(), |ui| {
@@ -200,4 +236,20 @@ impl App {
             self.reconnect_session(idx);
         }
     }
+}
+
+/// 往会话终端注入 `export ISHELL_MCP_TOKEN=<本机配对 token>`（回显吞除）。
+/// 此后该 shell 里启动的 AI / ishell-mcp 子进程自动继承这个环境变量，MCP 绑定走
+/// ishell-mcp 既有的 token 匹配路径（`bind_instance`），请求精确路由回这台电脑。
+/// 前导空格：配合 bash/zsh 常见的 HISTCONTROL=ignorespace，不进 shell 历史。
+/// token 是 16 位 hex（无 shell 特殊字符），无需引号。
+fn inject_mcp_token(s: &mut super::Session) {
+    let cmd = format!(
+        " export ISHELL_MCP_TOKEN={}",
+        crate::store::mcp_pairing_token()
+    );
+    let _ = s
+        .cmd_tx
+        .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
+    s.terminal.expect_echo(&cmd);
 }

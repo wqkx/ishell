@@ -64,6 +64,9 @@ pub(super) struct Session {
     /// 「在终端打开当前目录」忙碌拦截的强制窗口：首次点击若终端疑似在跑任务则 toast 拦截，
     /// 在此刻之前再次点击视为用户确认、强制注入 cd（应对任务已停但判定信号未消失的误拦）
     pub(super) cd_force_until: Option<std::time::Instant>,
+    /// 本会话是否已注入过 MCP 配对 token（export ISHELL_MCP_TOKEN）。断线重连后远端是
+    /// 新 shell（env 已丢），Connected 时复位以便重新注入。
+    pub(super) mcp_token_injected: bool,
     /// 远端是否支持 /proc 系统监控（None=尚未探测；false 时侧栏提示并跳过杀进程等）
     pub(super) monitor_ok: Option<bool>,
     /// AI/MCP 控制通道正在等待完成的一次命令运行（同一会话同一时刻只允许一条）
@@ -204,6 +207,7 @@ impl App {
             osc7_confirm: false,
             osc7_pending_reveal: false,
             cd_force_until: None,
+            mcp_token_injected: false,
             monitor_ok: None,
             pending_ai_run: None,
             ai_owned: false,

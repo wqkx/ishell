@@ -124,15 +124,16 @@ pub fn view_context_menu(resp: &egui::Response) {
                 ),
             )
             .on_hover_text(crate::i18n::tr(
-                "开启后本机可通过本地 MCP server 驱动已打开的终端会话（发命令、读输出）；\
-                 本身不监听网络端口，但会把这个控制通道反向转发到你连接的每一台服务器\
-                 （复用该 SSH 连接）——谁能 SSH 到那台服务器，谁就能借此控制本机 iShell，\
-                 只对可信的服务器开启",
-                "Lets an AI client drive your open terminal sessions via a local MCP server \
-                 (run commands, read output); doesn't open a network port itself, but reverse-\
-                 forwards this control channel to every server you connect to (over that SSH \
-                 session) — anyone who can SSH into that server can control this iShell through \
-                 it, so only enable this for servers you trust",
+                "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
+                 · 写入操作需当面确认\n\
+                 · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
+                 · 多机共用一台 AI 服务器时：终端右键「启用 AI 配对」，请求只回本电脑",
+                "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
+                 read/write files.\n\
+                 · Writes need on-screen confirmation\n\
+                 · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
+                 · Sharing one AI server: right-click \"Enable AI pairing\" so requests only \
+                 reach THIS computer",
             ))
             .clicked()
         {
@@ -141,9 +142,9 @@ pub fn view_context_menu(resp: &egui::Response) {
         }
 
         // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的 socket
-        // 会堆在一起、代理无从区分谁是谁。把这个 token 填进各自 Claude Code 的 MCP server
-        // `env`（ISHELL_MCP_TOKEN），代理便只绑定 token 匹配的这台 iShell，请求不会串到别人
-        // 电脑上（见 store::mcp_pairing_token）。只在开启 MCP 后才有意义，故随开关一起显示。
+        // 会堆在一起、代理无从区分谁是谁（见 store::mcp_pairing_token）。iShell 终端会话会
+        // 自动注入它（export ISHELL_MCP_TOKEN，也可右键「启用 AI 配对」重注），多数情况无需
+        // 手动配置；只有 AI 跑在 iShell 终端之外时才需要把下面这行填进那份 AI 的配置。
         if mcp_on {
             let token = crate::store::mcp_pairing_token();
             ui.horizontal(|ui| {
@@ -158,16 +159,16 @@ pub fn view_context_menu(resp: &egui::Response) {
                 .button(format!(
                     "{}  {}",
                     egui_phosphor::regular::COPY,
-                    crate::i18n::tr("复制多机配对配置", "Copy pairing config")
+                    crate::i18n::tr("复制配对配置", "Copy pairing config")
                 ))
                 .on_hover_text(crate::i18n::tr(
-                    "多台电脑共用同一台 AI 服务器账号时，把复制出来的这行填进你自己那份 \
-                     Claude Code 的 MCP server env，代理就只会连到你这台 iShell、请求不会\
-                     串到别人电脑上。每台电脑各配一次即可。",
-                    "When several computers share one AI-server account, paste the copied line \
-                     into your own Claude Code MCP server env so the proxy binds only to your \
-                     iShell and requests never land on someone else's computer. Configure once \
-                     per computer.",
+                    "iShell 终端会自动注入 ISHELL_MCP_TOKEN，多数情况无需手动配置。\n\
+                     仅当 AI 不在 iShell 终端里跑时，把这行写进该 AI 的 MCP server 环境变量，\
+                     代理便只绑定你这台电脑。",
+                    "iShell terminals auto-inject ISHELL_MCP_TOKEN; manual setup is usually \
+                     unnecessary.\n\
+                     Only if the AI is not started inside an iShell terminal, put this line in \
+                     that AI's MCP server env so the proxy binds only to YOUR computer.",
                 ))
                 .clicked()
             {

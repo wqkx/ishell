@@ -33,13 +33,19 @@ mv -f "$tmp" "$dest"
 echo "已安装：$dest"
 "$dest" --version 2>/dev/null || true
 
-# 3) 打印注册命令（只需一次；已注册过则跳过）
+# 3) 打印注册命令与多机配对提示（只需一次；已注册过则跳过）
 cat <<EOF
 
 在这台机器上执行以下命令，把 iShell 注册给 Claude Code（只需一次）：
 
-  claude mcp add ishell -- "$dest"
+  claude mcp add ishell -s user -- "$dest"
+
+其它客户端（Codex 等）把 command 指到同一路径即可。
 
 之后升级 iShell 时，重跑本脚本覆盖同一位置即可；若忘记升级代理，代理会在连接时
 以「版本不一致，请重新部署」明确报错，不会静默出错。
+
+多机共用一台 AI 服务器时：在各自 iShell 终端右键「启用 AI 配对」（或设置里
+「复制配对配置」把 ISHELL_MCP_TOKEN 写进 MCP 环境变量），避免请求串到别人的窗口。
+详见 README「AI / MCP 集成」。
 EOF
