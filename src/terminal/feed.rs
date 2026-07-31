@@ -217,8 +217,11 @@ impl Terminal {
         if let Some(p) = parse_osc7(bytes) {
             self.osc7_cwd = Some(p);
         }
-        // OSC 9/777 桌面通知（AI CLI 通知 hook、`printf '\e]9;done\a'` 类脚本）
+        // OSC 9/777 桌面通知（codex 走这条、`printf '\e]9;done\a'` 类脚本也是）。
+        // **不设门槛**：发这个序列本身就是程序在明确要求"提醒用户"，不像裸 BEL 那样含糊。
         for (title, body) in parse_osc_notify(bytes) {
+            // 会主动发通知的程序，其后续的裸 BEL 也值得提醒（同一个程序在说同一件事）。
+            self.ai_cli_seen = true;
             self.notices.push(super::TermNotice { title, body });
         }
         // BEL 响铃：Claude Code 等 AI CLI 等待确认/任务完成时的标准提示信号。
@@ -265,7 +268,14 @@ impl Terminal {
     }
 
     /// BEL 响铃 → 生成一条待上报通知，预览取光标所在行文本（确认菜单/提示语常在这行）。
+    ///
+    /// 只在本标签跑过 AI CLI 时才生成（见 `Terminal::ai_cli_seen`）：裸 BEL 和 shell 补全
+    /// 失败、readline 报错发的是同一个字节，不加这道门每个标签都会不停弹提醒——那正是这个
+    /// 功能此前难用的根因。
     fn push_bel_notice(&mut self) {
+        if !self.ai_cli_seen {
+            return;
+        }
         // 光标行属于当前屏幕区：用户回看历史时 scrollback 偏移会让 cell() 读到
         // 错误的历史行——临时归零偏移再读，读后恢复。
         let saved = self.parser.screen().scrollback();

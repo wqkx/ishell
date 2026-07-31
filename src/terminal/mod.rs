@@ -112,6 +112,14 @@ pub struct Terminal {
     last_input_at: Option<std::time::Instant>,
     /// 待上报的终端通知（BEL 响铃 / OSC 9 / OSC 777 notify），由 App 每帧取走渲染浮层
     notices: Vec<TermNotice>,
+    /// 本标签里是否**跑过** AI CLI（claude/codex 等）。裸 BEL 只有在这个标志为真时才当通知，
+    /// 否则普通 shell 的补全失败/readline 报错会让每个标签都在弹提醒。见 `is_ai_cli_command`。
+    ///
+    /// 为什么只能是**粘性**的（一旦置位就不再撤销）：`commit_line` 对任何裸回车都会触发，
+    /// 包括你在 claude 里敲提示词后按的那个回车——iShell 分不出这个回车是给 shell 的还是给
+    /// 前台程序的。所以「下一条非 AI 命令就清除」行不通：claude 自己的提示词会立刻把标志清掉。
+    /// 代价是 claude 退出后同一标签的 BEL 噪音会回来，换新标签即可。
+    ai_cli_seen: bool,
     /// URL / 关键字高亮的行内容缓存（key=行内容哈希）：命中后跳过每帧逐行的正则/关键字
     /// 扫描——高速输出满帧率时的主要 CPU 热点之一。容量封顶，满时清空重建（代价一次扫描）。
     url_cache: std::collections::HashMap<u64, Vec<(u16, u16, String)>>,
@@ -178,6 +186,7 @@ impl Terminal {
             last_output_at: None,
             last_input_at: None,
             notices: Vec::new(),
+            ai_cli_seen: false,
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
             query_tail: Vec::new(),

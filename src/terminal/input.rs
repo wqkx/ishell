@@ -251,6 +251,10 @@ impl Terminal {
     }
 
     pub(super) fn commit_line(&mut self) {
+        // 本标签跑过 AI CLI → 此后允许裸 BEL 当通知（见 `Terminal::ai_cli_seen`）。
+        if is_ai_cli_command(&self.input_line) {
+            self.ai_cli_seen = true;
+        }
         if !self.input_line.trim().is_empty()
             && self
                 .history
@@ -265,5 +269,87 @@ impl Terminal {
         }
         self.input_line.clear();
         self.hist = None;
+    }
+}
+
+/// 已知的 AI CLI 可执行名。**只做 basename 精确匹配,不做子串/模糊匹配**——`q`、`amp`
+/// 这类短名一旦用子串匹配会命中半数普通命令,把"仅 AI 标签提醒"直接废掉。
+///
+/// claude 与 codex 是实测过通知行为的:codex 发 OSC 9,Claude Code 只发裸 BEL
+/// (`preferredNotifChannel` 在 Linux 上只有 `terminal_bell`)——正是后者让"哪个标签算 AI"
+/// 变成必须回答的问题。其余几个是同类工具,按同一形状收录。
+const AI_CLI_NAMES: &[&str] = &[
+    "claude",
+    "claude-code",
+    "codex",
+    "aider",
+    "gemini",
+    "cursor-agent",
+];
+
+/// 这条命令行是不是在启动一个 AI CLI。
+///
+/// 只看**解析出来的可执行名**:跳过前置的 `VAR=value` 环境赋值,跳过 `env`/`npx` 之类的
+/// 包装器,再按最后一段路径名比对——`/usr/local/bin/claude`、`./claude`、`claude -c`、
+/// `FOO=1 npx @anthropic-ai/claude-code` 都该算数。
+pub(super) fn is_ai_cli_command(line: &str) -> bool {
+    const WRAPPERS: &[&str] = &[
+        "env", "command", "exec", "nohup", "npx", "bunx", "pnpx", "uvx", "time",
+    ];
+    for tok in line.split_whitespace() {
+        // 前置环境赋值(`FOO=1 claude`):跳过继续看下一个词。要求 `=` 前非空且不含 `/`,
+        // 免得把 `./a=b` 这种路径当成赋值。
+        if let Some(eq) = tok.find('=') {
+            if eq > 0 && !tok[..eq].contains('/') {
+                continue;
+            }
+        }
+        let name = tok.rsplit('/').next().unwrap_or(tok);
+        if WRAPPERS.contains(&name) {
+            continue;
+        }
+        // 第一个"既不是赋值也不是包装器"的词就是可执行名,判完即止——后面全是参数,
+        // 再往下找会把 `git commit -m "ask claude"` 里的 claude 也算上。
+        return AI_CLI_NAMES.contains(&name);
+    }
+    false
+}
+
+#[cfg(test)]
+mod ai_cli_tests {
+    use super::is_ai_cli_command;
+
+    #[test]
+    fn recognises_ai_cli_launches() {
+        for line in [
+            "claude",
+            "claude -c",
+            "codex",
+            "/usr/local/bin/claude --resume",
+            "./codex",
+            "FOO=1 BAR=2 claude",
+            "npx @anthropic-ai/claude-code",
+            "env claude -c",
+            "aider --model gpt-4",
+        ] {
+            assert!(is_ai_cli_command(line), "应识别为 AI CLI:{line:?}");
+        }
+    }
+
+    /// 参数里出现 AI CLI 的名字不算——否则 `git commit -m "ask claude"` 会把普通标签
+    /// 误标成 AI 标签,BEL 噪音又全回来了。
+    #[test]
+    fn does_not_fire_on_the_name_appearing_as_an_argument() {
+        for line in [
+            "",
+            "ls",
+            "git commit -m \"ask claude\"",
+            "echo codex",
+            "vim claude.py",
+            "grep claude *.log",
+            "which claude",
+        ] {
+            assert!(!is_ai_cli_command(line), "不该识别为 AI CLI:{line:?}");
+        }
     }
 }

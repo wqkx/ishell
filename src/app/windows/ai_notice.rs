@@ -15,6 +15,8 @@ impl App {
             return;
         }
         const MAX_VISIBLE: usize = 6;
+        /// 卡片宽度：单行显示，够放「会话名·一句提示」即可，不再占掉右上角一大块。
+        const CARD_W: f32 = 268.0;
         let mut jump_to: Option<u64> = None;
         let mut remove_one: Option<usize> = None;
         let mut clear_all = false;
@@ -23,7 +25,7 @@ impl App {
             .anchor(egui::Align2::RIGHT_TOP, [-12.0, 40.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.set_max_width(340.0);
+                ui.set_max_width(CARD_W);
                 let n = self.ai_notices.len();
                 // 最新在上：倒序展示前 MAX_VISIBLE 条
                 for i in (0..n.min(MAX_VISIBLE)).rev() {
@@ -31,25 +33,19 @@ impl App {
                     let frame = egui::Frame::new()
                         .fill(Palette::PANEL_2)
                         .stroke(egui::Stroke::new(1.0, Palette::ACCENT))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(8, 4))
                         .show(ui, |ui| {
-                            ui.set_width(316.0);
+                            ui.set_width(CARD_W - 16.0);
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
                                 ui.label(
                                     RichText::new(egui_phosphor::regular::BELL)
                                         .color(Palette::WARN)
-                                        .size(15.0),
+                                        .size(13.0),
                                 );
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} · {}",
-                                        no.session_title, no.title
-                                    ))
-                                    .color(Palette::TEXT)
-                                    .size(13.0)
-                                    .strong(),
-                                );
+                                // 关闭按钮先摆到最右，剩下的宽度全留给正文——反过来的话
+                                // 正文会把按钮挤出卡片（一行布局里先排的先占宽）。
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -57,7 +53,7 @@ impl App {
                                             .add(
                                                 egui::Button::new(
                                                     RichText::new(egui_phosphor::regular::X)
-                                                        .size(12.0)
+                                                        .size(11.0)
                                                         .color(Palette::TEXT_DIM),
                                                 )
                                                 .frame(false),
@@ -66,17 +62,28 @@ impl App {
                                         {
                                             remove_one = Some(i);
                                         }
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(format!("{}·", no.session_title))
+                                                        .color(Palette::TEXT_DIM)
+                                                        .size(12.0),
+                                                );
+                                                // 超长正文省略成一行，不换行撑高卡片
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&no.text)
+                                                            .color(Palette::TEXT)
+                                                            .size(12.0),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
                                     },
                                 );
                             });
-                            if !no.body.is_empty() {
-                                let preview: String = no.body.chars().take(80).collect();
-                                ui.label(
-                                    RichText::new(preview)
-                                        .color(Palette::TEXT_DIM)
-                                        .size(12.0),
-                                );
-                            }
                         });
                     let resp = frame.response.interact(egui::Sense::click());
                     if resp.clicked() {
@@ -100,7 +107,7 @@ impl App {
                             ui.close();
                         }
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                 }
                 if n > MAX_VISIBLE {
                     ui.label(

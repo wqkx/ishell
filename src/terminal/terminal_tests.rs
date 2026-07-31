@@ -576,15 +576,78 @@ fn osc_notify_produces_notices() {
     assert!(t.take_notices().is_empty(), "取走后应清空");
 }
 
+/// 在本标签里"跑过 AI CLI"：走真实路径（敲命令 + 回车），不直接改字段。
+fn run_ai_cli(t: &mut Terminal, cmd: &str) {
+    t.input_line = cmd.to_string();
+    t.commit_line();
+}
+
 /// BEL 响铃 → 生成通知，预览取光标所在行的提示文本（确认菜单常见于此）。
 #[test]
 fn bell_notice_previews_cursor_line() {
     let mut t = Terminal::new();
+    run_ai_cli(&mut t, "claude");
     t.feed(b"1. Yes  2. No\x07");
     let ns = t.take_notices();
     assert_eq!(ns.len(), 1);
     assert_eq!(ns[0].title, None);
     assert_eq!(ns[0].body, "1. Yes  2. No");
+}
+
+/// 普通 shell 标签里的 BEL **不该**产生通知。
+///
+/// 裸 BEL 和补全失败、readline 报错发的是同一个字节——不加这道门，每个标签都会不停弹提醒，
+/// 这正是这个功能此前难用的根因。Claude Code 在 Linux 上只发裸 BEL（不发 OSC 9），所以门
+/// 不能简单地"只认 OSC"，只能靠"本标签跑过 AI CLI"来分辨。
+#[test]
+fn bell_in_a_plain_shell_tab_is_not_a_notice() {
+    let mut t = Terminal::new();
+    run_ai_cli(&mut t, "ls -la"); // 普通命令，不该开门
+    t.feed(b"bash: no match for glob\x07"); // 字节串字面量只能是 ASCII
+    assert!(
+        t.take_notices().is_empty(),
+        "普通 shell 标签的响铃被当成了通知"
+    );
+}
+
+/// OSC 9/777 **不受**上面那道门限制：发这个序列本身就是程序在明确要求提醒用户。
+/// 且它会顺带把本标签标记为 AI 标签，此后该程序的裸 BEL 也算数。
+#[test]
+fn osc_notify_needs_no_ai_gate_and_opens_it() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]9;task done\x07");
+    assert_eq!(t.take_notices().len(), 1, "OSC 通知不该被 AI 门拦下");
+    t.feed(b"continue? [y/N]\x07");
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 1, "发过 OSC 通知的程序，其后续 BEL 也该算数");
+    assert_eq!(ns[0].body, "continue? [y/N]");
+}
+
+/// codex 在 tmux 下发的是 DCS 透传变体：`ESC P tmux ; ESC ESC ] 9 ; <msg> BEL ESC \`。
+///
+/// 两件事都要对：内容要解析出来（双写的 ESC 让 OSC 扫描器在第二个 ESC 上对上 `ESC ]`），
+/// 而且**只能弹一条**——里面那个 BEL 是 OSC 的终止符，不是响铃。`count_bel` 起初不认得
+/// DCS，把它算成真响铃，同一条通知弹了两遍。
+#[test]
+fn codex_tmux_passthrough_notification_is_parsed_once() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1bPtmux;\x1b\x1b]9;codex done\x07\x1b\\");
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 1, "tmux 透传的 OSC 9 应当且只当一条通知");
+    assert_eq!(ns[0].body, "codex done");
+}
+
+/// DCS 内部的 BEL 不是响铃：哪怕本标签已是 AI 标签（BEL 门是开的），也不能因为一段
+/// DCS 里夹了 0x07 就弹提醒。
+#[test]
+fn bel_inside_a_dcs_string_is_not_a_bell() {
+    let mut t = Terminal::new();
+    run_ai_cli(&mut t, "claude");
+    t.feed(b"\x1bPsome\x07payload\x1b\\");
+    assert!(
+        t.take_notices().is_empty(),
+        "DCS 内部的 0x07 被当成了响铃"
+    );
 }
 
 /// 空闲的 zsh 提示符**不是**「忙」。

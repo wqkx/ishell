@@ -156,10 +156,12 @@ pub struct AiNotice {
     pub session_uid: u64,
     /// 来源会话标签名（卡片上显示，便于多会话时辨认）
     pub session_title: String,
-    /// 标题（OSC 通知标题；BEL 时为「响铃提醒」）
-    pub title: String,
-    /// 正文/预览（OSC 通知正文；BEL 时为光标行文本预览）
-    pub body: String,
+    /// 单行提示文本：OSC 通知的正文（有标题则 `标题：正文`），或 BEL 时的光标行预览。
+    ///
+    /// 从前是 title + body 两个字段、两行渲染，其中 BEL 的 title 恒为「响铃提醒」——一个
+    /// 没有任何信息量的占位词，真正有用的是 body（光标行文本，通常就是那句待确认的提示）。
+    /// 合成一行既省地方，也不会再出现「标题是占位词、正文才是内容」的别扭排版。
+    pub text: String,
     /// 收到时刻（egui time；同会话去抖与排序用）
     pub at: f64,
 }

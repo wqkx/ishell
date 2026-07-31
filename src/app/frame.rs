@@ -48,6 +48,9 @@ impl App {
         let mut direct_relay_started: Vec<u64> = Vec::new();
         let mut direct_relay_done: Vec<(u64, bool, String)> = Vec::new();
         let mut evt_backlog = false;
+        // 终端通知的「当前标签」判据：必须在借用 sessions 之前算好。
+        let active_uid = self.active.and_then(|i| self.sessions.get(i).map(|s| s.uid));
+        let looking_at_this_tab = self.ctx.input(|i| i.focused);
         for s in &mut self.sessions {
             // 事件积压未排空（每帧预算保护渲染）时安排下一帧继续消化
             evt_backlog |= s.drain_events();
@@ -112,25 +115,33 @@ impl App {
             // 终端通知（BEL 响铃 / OSC 9/777）：AI CLI 等待确认或完成时提醒用户。
             // 同会话 3 秒内的连续通知合并为最新一条（AI 连续响铃不刷屏）。
             for n in s.terminal.take_notices() {
+                // 你正看着的那个标签不必再弹——人就在这儿。仅当 iShell 窗口本身也在前台时
+                // 才算"正看着"：窗口切到后台时，即便它是活动标签，你也确实需要被提醒。
+                if looking_at_this_tab && Some(s.uid) == active_uid {
+                    continue;
+                }
                 let now = self.ctx.input(|i| i.time);
-                let title = n.title.unwrap_or_else(|| {
-                    crate::i18n::tr("响铃提醒", "Bell").to_string()
-                });
+                // 一行文本：OSC 带标题就 `标题：正文`，否则取有内容的那个；BEL 的正文是
+                // 光标行预览，可能整行是空的（比如响铃时屏幕刚好被清），给一句兜底。
+                let text = match (n.title, n.body.trim()) {
+                    (Some(t), b) if !b.is_empty() => format!("{}：{b}", t.trim()),
+                    (Some(t), _) => t.trim().to_string(),
+                    (None, b) if !b.is_empty() => b.to_string(),
+                    (None, _) => crate::i18n::tr("需要你处理", "Needs your attention").to_string(),
+                };
                 let dup = self
                     .ai_notices
                     .iter()
                     .rposition(|x| x.session_uid == s.uid && now - x.at < 3.0);
                 if let Some(i) = dup {
                     let x = &mut self.ai_notices[i];
-                    x.title = title;
-                    x.body = n.body;
+                    x.text = text;
                     x.at = now;
                 } else {
                     self.ai_notices.push(super::AiNotice {
                         session_uid: s.uid,
                         session_title: s.title.clone(),
-                        title,
-                        body: n.body,
+                        text,
                         at: now,
                     });
                 }

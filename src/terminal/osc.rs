@@ -159,6 +159,21 @@ pub(super) fn count_bel(data: &[u8]) -> usize {
                             }
                         }
                     }
+                    // DCS / SOS / PM / APC：同属「字符串类」转义序列，一律以 ST(`ESC \`) 收尾，
+                    // 内容可以是任意字节——**包括 BEL**。少了这一支，tmux 的透传形式
+                    // （`ESC P tmux ; ESC ESC ] 9 ; <msg> BEL ESC \`，codex 在 tmux 里就这么发
+                    // 通知）会被当成「ESC+1 字节」跳过，里面那个 OSC 终止用的 BEL 就被算成真
+                    // 响铃，于是同一条通知既走 OSC 又走 BEL，弹两遍。
+                    Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+                        i += 2;
+                        while i < data.len() {
+                            if data[i] == 0x1b && data.get(i + 1) == Some(&b'\\') {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
                     _ => i += 2,
                 }
             }
