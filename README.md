@@ -232,7 +232,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
-- **MCP**: off by default; local socket only (`0600`); writes into your sessions need confirmation; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and is never returned by Identify to whoever can reach the socket.
+- **MCP**: off by default; local socket only (`0600`); writes into your sessions need confirmation; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
 
 ## 📄 License
 

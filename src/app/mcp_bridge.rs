@@ -823,22 +823,100 @@ async fn handle_conn(
             .await;
             return;
         }
-        McpReqKind::IdentifyPair { token } => {
-            let ok = token == &crate::store::mcp_pairing_token();
+        // v3 的旧代理才会发这个。**故意忽略 token、照常答话**：它带来的 id/版本，普通
+        // `Identify` 本来就对任何人都给，不构成额外泄露；而答了它，v3 代理才能走到自己的
+        // `check_proto_version`、打印「请重新部署 ishell-mcp」——不答的话它会把这条连接当成
+        // 死 socket 跳过，最后报成「配对 token 不匹配」，把用户引向完全错误的排查方向。
+        // v4 代理不发这个变体，真正的配对一律走下面的双向握手。
+        McpReqKind::IdentifyPair { .. } => {
             reply(
                 &mut w,
                 id,
-                if ok {
-                    Ok(McpReqResult::Instance {
-                        id: own.to_string(),
-                        proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
-                        token: String::new(),
-                    })
-                } else {
-                    Err("pairing token mismatch".into())
-                },
+                Ok(McpReqResult::Instance {
+                    id: own.to_string(),
+                    proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+                    token: String::new(),
+                }),
             )
             .await;
+            return;
+        }
+        // 配对握手（v4）：本进程先出示 `Server` 证明，对端验过再送 `Client` 证明上来。
+        // 全协议唯一一处「一条连接两问两答」——双向证明必须共用同一对随机数。
+        McpReqKind::PairHello { nonce_c } => {
+            let nonce_c = nonce_c.clone();
+            let token = crate::store::mcp_pairing_token();
+            // 熵源失败一律拒绝握手，绝不用可预测的值凑合（那等于把挑战-应答降级成静态口令）。
+            let Some(nonce_s) = crate::mcp_protocol::pair_nonce() else {
+                reply(&mut w, id, Err("本机熵源不可用，无法完成配对握手".into())).await;
+                return;
+            };
+            reply(
+                &mut w,
+                id,
+                Ok(McpReqResult::PairChallenge {
+                    id: own.to_string(),
+                    proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+                    nonce_s: nonce_s.clone(),
+                    server_proof: crate::mcp_protocol::pair_proof(
+                        &token,
+                        &nonce_c,
+                        &nonce_s,
+                        crate::mcp_protocol::PairRole::Server,
+                    ),
+                }),
+            )
+            .await;
+            // 第二行必须带超时：对端开了个头就赖着不说话的话，这条连接会一直占着信号量里的
+            // 名额（`_permit`），几条半开握手就能把整个 MCP 通道堵死。
+            let second = tokio::time::timeout(FIRST_LINE_TIMEOUT, lines.next_line()).await;
+            let Ok(Ok(Some(line2))) = second else {
+                return; // 超时/断开：没什么可回的，直接收工
+            };
+            let ok = match serde_json::from_str::<McpRequest>(&line2) {
+                Ok(McpRequest {
+                    id: id2,
+                    kind: McpReqKind::PairProve { client_proof },
+                    ..
+                }) => {
+                    let pass = crate::mcp_protocol::pair_proof_matches(
+                        &token,
+                        &nonce_c,
+                        &nonce_s,
+                        crate::mcp_protocol::PairRole::Client,
+                        &client_proof,
+                    );
+                    Some((id2, pass))
+                }
+                // 握手中途改发别的请求：不接受。握手没走完就不算配对成功，
+                // 更不能让一条没证明过身份的连接顺势去执行别的东西。
+                _ => None,
+            };
+            match ok {
+                Some((id2, true)) => {
+                    reply(
+                        &mut w,
+                        id2,
+                        Ok(McpReqResult::Instance {
+                            id: own.to_string(),
+                            proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+                            token: String::new(),
+                        }),
+                    )
+                    .await;
+                }
+                Some((id2, false)) => {
+                    reply(&mut w, id2, Err("配对证明不符".into())).await;
+                }
+                None => {
+                    reply(&mut w, 0, Err("配对握手第二步应当是 PairProve".into())).await;
+                }
+            }
+            return;
+        }
+        // 没先握手就直接出示证明：无从校验（这一步必须用本连接第一步约定的那对随机数），拒绝。
+        McpReqKind::PairProve { .. } => {
+            reply(&mut w, id, Err("配对握手未开始（应先发 PairHello）".into())).await;
             return;
         }
         _ => {}
@@ -1627,9 +1705,13 @@ impl App {
             });
         };
         match req.kind {
-            // Identify / IdentifyPair 在连接层就地答完了（见 handle_conn），根本到不了这里。
-            McpReqKind::Identify | McpReqKind::IdentifyPair { .. } => {
-                send_err(resp_tx, "Identify 不应该到达 App 层".into());
+            // Identify / IdentifyPair / 配对握手都在连接层就地答完了（见 handle_conn），
+            // 根本到不了这里。
+            McpReqKind::Identify
+            | McpReqKind::IdentifyPair { .. }
+            | McpReqKind::PairHello { .. }
+            | McpReqKind::PairProve { .. } => {
+                send_err(resp_tx, "Identify/配对握手 不应该到达 App 层".into());
             }
             McpReqKind::Bind => {
                 // 只跟「另一个绑定请求」互斥。这里**不能**因为恰好挂着一个 open/use 授权框
@@ -2390,5 +2472,195 @@ mod tests {
             trim_leading_echo(out, "hostname && whoami && pwd"),
             "s3-server\ns3\n/home/s3\n(env) s3@s3-server:~\n$ "
         );
+    }
+}
+
+/// 配对握手（v4）在**真 socket 上**的行为测试。
+///
+/// 为什么非要开真连接、把 `handle_conn` 整个拉起来跑：握手是全协议唯一一处「一条连接两问
+/// 两答」，它的分帧、第二行的超时、以及"证明不过就不放行"这些性质，全都不在纯函数里——
+/// `mcp_protocol` 那几个单测只证明 HMAC 算得对，证明不了这条连接会不会在第二行上挂死、
+/// 或者干脆把没证明过的连接放过去。编译绿 ≠ 能用。
+///
+/// 仍然没被覆盖的部分（必须由人在真机上过）：`ishell-mcp` 那半边的时序，以及跨 SSH 反向
+/// 转发时的实际行为。这里的客户端是照协议手写的，与真代理共用 `mcp_protocol` 的证明算法，
+/// 但发包顺序是各写各的。
+#[cfg(all(test, unix))]
+mod pair_handshake_tests {
+    use super::*;
+    use crate::mcp_protocol::{pair_nonce, pair_proof, PairRole};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// 起一个只服务一条连接的 `handle_conn`，返回客户端那一端。
+    async fn serve_one() -> UnixStream {
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-pair-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let listener = UnixListener::bind(&dir).expect("绑定测试 socket");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = egui::Context::default();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = sem.acquire_owned().await.expect("permit");
+            handle_conn(stream, tx, ctx, permit).await;
+        });
+        let s = UnixStream::connect(&dir).await.expect("连接测试 socket");
+        let _ = std::fs::remove_file(&dir); // 路径已不需要，连接照常存活
+        s
+    }
+
+    /// 发一行请求、收一行响应。
+    async fn round(
+        r: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        w: &mut tokio::net::unix::OwnedWriteHalf,
+        id: u64,
+        kind: McpReqKind,
+    ) -> Result<McpReqResult, String> {
+        let mut line = serde_json::to_string(&McpRequest {
+            id,
+            instance: None,
+            kind,
+        })
+        .unwrap();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.expect("写请求");
+        let mut resp = String::new();
+        r.read_line(&mut resp).await.expect("读响应");
+        assert!(!resp.is_empty(), "对端没回任何东西就断了");
+        serde_json::from_str::<McpResponse>(resp.trim())
+            .expect("响应应能解析")
+            .result
+    }
+
+    /// 走完整条握手；`token` 是客户端用来算证明的密钥。返回最终那一步的结果。
+    async fn handshake_with(token: &str) -> Result<McpReqResult, String> {
+        let (r, mut w) = serve_one().await.into_split();
+        let mut r = BufReader::new(r);
+        let nonce_c = pair_nonce().expect("熵源");
+        let challenge = round(
+            &mut r,
+            &mut w,
+            1,
+            McpReqKind::PairHello {
+                nonce_c: nonce_c.clone(),
+            },
+        )
+        .await?;
+        let (nonce_s, server_proof) = match challenge {
+            McpReqResult::PairChallenge {
+                nonce_s,
+                server_proof,
+                ..
+            } => (nonce_s, server_proof),
+            other => panic!("第一步应回 PairChallenge，实际：{other:?}"),
+        };
+        // 客户端本该在这里验服务器证明；测试里按需分别断言，所以此处只把它带出去。
+        assert_eq!(
+            server_proof,
+            pair_proof(
+                &crate::store::mcp_pairing_token(),
+                &nonce_c,
+                &nonce_s,
+                PairRole::Server
+            ),
+            "服务器证明与共享算法算出来的不一致"
+        );
+        round(
+            &mut r,
+            &mut w,
+            2,
+            McpReqKind::PairProve {
+                client_proof: pair_proof(token, &nonce_c, &nonce_s, PairRole::Client),
+            },
+        )
+        .await
+    }
+
+    /// 正路：知道 token 的调用方能走完握手，拿到实例标识。
+    #[tokio::test]
+    async fn correct_token_completes_the_handshake() {
+        let token = crate::store::mcp_pairing_token();
+        match handshake_with(&token).await {
+            Ok(McpReqResult::Instance { id, .. }) => {
+                assert_eq!(id, crate::store::mcp_instance_id())
+            }
+            other => panic!("正确 token 应握手成功，实际：{other:?}"),
+        }
+    }
+
+    /// 反路：token 不对就必须被拒——这是整条隔离的意义所在。
+    #[tokio::test]
+    async fn wrong_token_is_refused() {
+        let err = handshake_with("definitely-not-the-token")
+            .await
+            .expect_err("错误 token 必须被拒");
+        assert!(err.contains("证明不符"), "错误信息应指明是证明不符：{err}");
+    }
+
+    /// 每条连接的服务器随机数必须是新的：复用随机数会让抓到的证明可以重放。
+    #[tokio::test]
+    async fn each_connection_gets_a_fresh_server_nonce() {
+        async fn nonce_of() -> String {
+            let (r, mut w) = serve_one().await.into_split();
+            let mut r = BufReader::new(r);
+            match round(
+                &mut r,
+                &mut w,
+                1,
+                McpReqKind::PairHello {
+                    nonce_c: "fixed".into(),
+                },
+            )
+            .await
+            .expect("第一步应成功")
+            {
+                McpReqResult::PairChallenge { nonce_s, .. } => nonce_s,
+                other => panic!("应回 PairChallenge：{other:?}"),
+            }
+        }
+        assert_ne!(nonce_of().await, nonce_of().await, "服务器随机数被复用了");
+    }
+
+    /// 没先握手就直接出示证明：拒绝。否则调用方就能自选挑战，双向证明形同虚设。
+    #[tokio::test]
+    async fn prove_without_hello_is_refused() {
+        let (r, mut w) = serve_one().await.into_split();
+        let mut r = BufReader::new(r);
+        let err = round(
+            &mut r,
+            &mut w,
+            1,
+            McpReqKind::PairProve {
+                client_proof: "whatever".into(),
+            },
+        )
+        .await
+        .expect_err("未开始握手就出示证明必须被拒");
+        assert!(err.contains("未开始"), "{err}");
+    }
+
+    /// 握手中途改发别的请求：不放行。没走完握手的连接不该顺势拿到执行能力。
+    #[tokio::test]
+    async fn switching_to_another_request_mid_handshake_is_refused() {
+        let (r, mut w) = serve_one().await.into_split();
+        let mut r = BufReader::new(r);
+        let _ = round(
+            &mut r,
+            &mut w,
+            1,
+            McpReqKind::PairHello {
+                nonce_c: pair_nonce().expect("熵源"),
+            },
+        )
+        .await
+        .expect("第一步应成功");
+        let err = round(&mut r, &mut w, 2, McpReqKind::ListSessions)
+            .await
+            .expect_err("握手第二步只接受 PairProve");
+        assert!(err.contains("PairProve"), "{err}");
     }
 }

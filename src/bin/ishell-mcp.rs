@@ -25,7 +25,7 @@ use rmcp::model::*;
 use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
@@ -95,13 +95,146 @@ async fn connect_timeout(
     tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(path)).await
 }
 
-/// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时、配对不符——
-/// 一律返回 `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
-///
-/// `prove_token`：`Some` 时发 `IdentifyPair`（只有 token 匹配的实例会答 Ok）；`None` 时发
-/// 普通 `Identify`（发现全部实例，供多机弹窗选择）。v3 起对端**不再**在响应里回传 token。
+/// 探测一条候选 socket 的结果。**三态而不是 `Option`**：把「没人应答」和「应答了但配对/
+/// 版本不合」混成同一个 `None`，就没法给出对症的错误信息——版本不匹配会被报成「token 不
+/// 匹配」，用户照着去核对 token，怎么核都对，实际该做的是重新部署 ishell-mcp。
 #[cfg(unix)]
-async fn identify(path: &std::path::Path, prove_token: Option<&str>) -> Option<(String, u32)> {
+#[derive(Debug)]
+enum Probe {
+    /// 连不上/超时/对面不是 iShell：目录里躺着崩溃残留的死文件是常态，静默跳过。
+    Dead,
+    /// 答话了，但没通过配对（token 不符），或压根没配 token 时的普通发现。
+    Answered { id: String, ver: u32 },
+    /// 答话了，且双向配对握手通过。
+    Paired { id: String, ver: u32 },
+}
+
+#[cfg(unix)]
+impl Probe {
+    fn ident(&self) -> Option<(String, u32)> {
+        match self {
+            Probe::Dead => None,
+            Probe::Answered { id, ver } | Probe::Paired { id, ver } => Some((id.clone(), *ver)),
+        }
+    }
+}
+
+/// 连一条 socket 问出对端 iShell 的实例标识（可选地完成配对握手）。
+///
+/// `prove_token`：
+/// - `None` → 发普通 `Identify`，发现全部实例（供多机弹窗选择）。
+/// - `Some` → 走 v4 **双向挑战-应答**握手（`PairHello` → 验对端的 `Server` 证明 →
+///   `PairProve`）。token 本身绝不过线；对端证明不过就地放弃，**不发**自己的证明——
+///   否则一个不知道 token 的假 socket 也能把本代理钓过去（见 `mcp_protocol` 的说明）。
+///   握手不过仍返回 `Answered`（对方是个活着的 iShell，只是不是"我的"），
+///   好让上层区分「没找到人」和「找到了但都不是我的」。
+#[cfg(unix)]
+async fn probe(path: &std::path::Path, prove_token: Option<&str>) -> Probe {
+    let Some((id, ver)) = identify(path).await else {
+        return Probe::Dead;
+    };
+    let Some(token) = prove_token else {
+        return Probe::Answered { id, ver };
+    };
+    // 版本对不上就别做握手了：对端解不出 PairHello，只会白等一个超时。直接报 Answered，
+    // 让上层按版本给出「重新部署」的提示。
+    if ver != mcp_protocol::MCP_PROTOCOL_VERSION {
+        return Probe::Answered { id, ver };
+    }
+    match pair_handshake(path, token).await {
+        Some((id, ver)) => Probe::Paired { id, ver },
+        None => Probe::Answered { id, ver },
+    }
+}
+
+/// 在一条**新连接**上跑完双向配对握手，成功返回对端的 (id, 版本)。
+///
+/// 两问两答共用同一条连接：两个方向的证明必须绑定同一对随机数，拆连接就绑不住了。
+#[cfg(unix)]
+async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, u32)> {
+    let nonce_c = mcp_protocol::pair_nonce()?; // 熵源不可用：中止，绝不用可预测值凑合
+    let stream = connect_timeout(path).await.ok()?.ok()?;
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+
+    let send = |kind: McpReqKind| -> Option<String> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut line = serde_json::to_string(&McpRequest {
+            id,
+            instance: None,
+            kind,
+        })
+        .ok()?;
+        line.push('\n');
+        Some(line)
+    };
+
+    // 第一步：送上本方随机数，请对端先证明它知道 token。
+    let hello = send(McpReqKind::PairHello {
+        nonce_c: nonce_c.clone(),
+    })?;
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, w.write_all(hello.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+    let mut line = String::new();
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .ok()?
+        .ok()?;
+    let resp: McpResponse = serde_json::from_str(line.trim()).ok()?;
+    let (id, ver, nonce_s, server_proof) = match resp.result.ok()? {
+        McpReqResult::PairChallenge {
+            id,
+            proto_version,
+            nonce_s,
+            server_proof,
+        } => (id, proto_version, nonce_s, server_proof),
+        _ => return None,
+    };
+    // **验过才证明自己**。这一步是整个握手的要害：跳过它，任何假 socket 都能收走本方证明。
+    if !mcp_protocol::pair_proof_matches(
+        token,
+        &nonce_c,
+        &nonce_s,
+        mcp_protocol::PairRole::Server,
+        &server_proof,
+    ) {
+        return None;
+    }
+
+    // 第二步：出示本方证明。
+    let prove = send(McpReqKind::PairProve {
+        client_proof: mcp_protocol::pair_proof(
+            token,
+            &nonce_c,
+            &nonce_s,
+            mcp_protocol::PairRole::Client,
+        ),
+    })?;
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, w.write_all(prove.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+    let mut line2 = String::new();
+    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, reader.read_line(&mut line2))
+        .await
+        .ok()?
+        .ok()?;
+    let resp2: McpResponse = serde_json::from_str(line2.trim()).ok()?;
+    match resp2.result.ok()? {
+        McpReqResult::Instance { .. } => Some((id, ver)),
+        _ => None,
+    }
+}
+
+/// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时——一律返回
+/// `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
+///
+/// 只发无字段的 `Identify`：它的线格式跨所有协议版本逐字节相同，是**唯一**一个连版本不
+/// 匹配的对端也解得开的请求，因而也是「问出对方版本、给出重新部署提示」的唯一途径。
+#[cfg(unix)]
+async fn identify(path: &std::path::Path) -> Option<(String, u32)> {
     let stream = match connect_timeout(path).await {
         Ok(Ok(s)) => s,
         // 连接被拒（ECONNREFUSED）= 这个 socket 文件没有监听者：反向转发的 SSH 连接已断（或
@@ -115,13 +248,7 @@ async fn identify(path: &std::path::Path, prove_token: Option<&str>) -> Option<(
         }
         _ => return None,
     };
-    let kind = match prove_token {
-        Some(t) => McpReqKind::IdentifyPair {
-            token: t.to_string(),
-        },
-        None => McpReqKind::Identify,
-    };
-    match exchange(stream, None, kind, CONNECT_WRITE_TIMEOUT).await {
+    match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
         Ok(McpReqResult::Instance { id, proto_version, .. }) => Some((id, proto_version)),
         _ => None,
     }
@@ -151,22 +278,22 @@ fn check_proto_version(peer: u32) -> Result<(), String> {
 /// 同一个实例可能从多条路径答话（见 `candidate_paths`），这里不去重——去重规则由调用方定：
 /// `bind_instance` 要按 id 收敛成实例列表，`connect_bound` 只关心某个特定 id。
 ///
-/// `prove_token`：见 [`identify`]——配对场景只收匹配者，避免多机弹窗串台。
+/// `prove_token`：见 [`probe`]——配对场景对每个候选跑一遍双向握手，token 不过线。
+/// 返回值保留 [`Probe`] 的三态，调用方据此区分「没人应答」「应答了但版本不对」「应答了但
+/// 不是我的」——混成一个 `Option` 就只能给出笼统且往往误导的错误信息。
 #[cfg(unix)]
-async fn identify_all(prove_token: Option<String>) -> Vec<(String, u32, std::path::PathBuf)> {
+async fn identify_all(prove_token: Option<String>) -> Vec<(Probe, std::path::PathBuf)> {
     let mut set = tokio::task::JoinSet::new();
     for path in candidate_paths() {
         let prove = prove_token.clone();
-        set.spawn(async move {
-            identify(&path, prove.as_deref())
-                .await
-                .map(|(id, ver)| (id, ver, path))
-        });
+        set.spawn(async move { (probe(&path, prove.as_deref()).await, path) });
     }
     let mut out = Vec::new();
     while let Some(joined) = set.join_next().await {
-        if let Ok(Some(hit)) = joined {
-            out.push(hit);
+        if let Ok((p, path)) = joined {
+            if !matches!(p, Probe::Dead) {
+                out.push((p, path));
+            }
         }
     }
     out
@@ -178,7 +305,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
     // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
     if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
         let path = std::path::PathBuf::from(p);
-        let (id, ver) = identify(&path, None).await.ok_or_else(|| {
+        let (id, ver) = identify(&path).await.ok_or_else(|| {
             format!(
                 "ISHELL_MCP_SOCKET 指定的 socket 连不上、或对面不是 iShell：{}",
                 path.display()
@@ -187,24 +314,47 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         check_proto_version(ver)?;
         return Ok((id, path));
     }
-    // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就用
-    // `IdentifyPair` **只认匹配的实例**，请求绝不会串到别人的电脑上；没设则保持原有
+    // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就走双向
+    // 挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；没设则保持原有
     // 「多实例弹窗让用户选」。见 `store::mcp_pairing_token`。
     let want_token = std::env::var("ISHELL_MCP_TOKEN")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let all = identify_all(want_token.clone()).await;
+    // 答话了但**版本不符**的实例：单独记下来。它们是「重新部署 ishell-mcp」这条提示的依据，
+    // 混进下面的候选里只会让用户去核对一个根本没错的 token。
+    let stale: Vec<u32> = all
+        .iter()
+        .filter_map(|(p, _)| p.ident())
+        .map(|(_, ver)| ver)
+        .filter(|v| *v != mcp_protocol::MCP_PROTOCOL_VERSION)
+        .collect();
+    // 配了 token 就只收握手通过的；没配 token 则一律是候选（原有的多开弹窗行为）。
     let mut found: Vec<(String, u32, std::path::PathBuf)> = Vec::new();
-    for (id, ver, path) in identify_all(want_token.clone()).await {
+    for (p, path) in all {
+        let keep = match (&p, want_token.is_some()) {
+            (Probe::Paired { .. }, _) => true,
+            (Probe::Answered { .. }, false) => true,
+            _ => false,
+        };
+        if !keep {
+            continue;
+        }
+        let Some((id, ver)) = p.ident() else { continue };
         // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
         if !found.iter().any(|(known, _, _)| *known == id) {
             found.push((id, ver, path));
         }
     }
     match found.len() {
-        0 => Err(if want_token.is_some() {
-            "配了 ISHELL_MCP_TOKEN，但没有找到配对 token 匹配的 iShell（它未运行、未在设置里\
+        0 => Err(if let Some(&ver) = stale.first() {
+            // 有活着的 iShell 答了话，只是版本对不上——这是最常见的「升了 GUI 忘换代理」，
+            // 报成 token 不匹配会把用户引向死胡同（怎么核对 token 都是对的）。
+            check_proto_version(ver).unwrap_err()
+        } else if want_token.is_some() {
+            "配了 ISHELL_MCP_TOKEN，但没有一台 iShell 通过配对握手（它未运行、未在设置里\
              开启「允许 AI 通过 MCP 控制终端」，或 token 填错了）。请在你自己那台 iShell 的\
              MCP 设置里核对配对 token，确认与这里配置的一致。"
                 .into()
@@ -282,9 +432,24 @@ async fn connect_bound() -> Result<(UnixStream, String), String> {
     }
     // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。在候选里重新找回**同一个
     // 实例**——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上。
-    // 路径刷新只按已绑定的 instance id 找回，不再带配对 token（绑定关系已在进程内确定）。
-    for (found_id, _ver, path) in identify_all(None).await {
-        if found_id == id {
+    //
+    // ⚠ 配了 token 就必须**重新走一遍握手**，不能只比对 id：instance id 不是秘密，任何人发
+    // 一句普通 `Identify` 就能问到。只认 id 的话，同账号的攻击者只要拿到受害者的 id、再摆一个
+    // 会冒充该 id 的 socket，就能在受害者 SSH 重连（缓存路径失效）的那一刻把后续所有
+    // `run_command`/`read_file` 接管过去。没配 token 时保持只认 id 的既有行为——那时本来
+    // 就没有更强的凭据可用。
+    let want_token = std::env::var("ISHELL_MCP_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    for (p, path) in identify_all(want_token.clone()).await {
+        let ok = match (&p, want_token.is_some()) {
+            (Probe::Paired { id: found, .. }, _) => *found == id,
+            // 没配 token：退回只认 id（既有行为，也是此时唯一可用的判据）。
+            (Probe::Answered { id: found, .. }, false) => *found == id,
+            _ => false,
+        };
+        if ok {
             if let Ok(Ok(stream)) = connect_timeout(&path).await {
                 *PATH_CACHE.lock().unwrap() = Some(path);
                 return Ok((stream, id));

@@ -227,9 +227,14 @@ fn mcp_pairing_token_path() -> Option<PathBuf> {
 ///
 /// 用途：多台电脑共用同一台 AI 服务器的同一个账号时，各家 iShell 反向转发的 socket 会全堆在
 /// 同一个目录里，代理无从区分谁是谁。操作者把本机 token 放进环境变量 `ISHELL_MCP_TOKEN`
-/// （终端自动注入，或手动写进 AI 的 MCP server env）——代理用 `IdentifyPair` **出示**该
-/// token 过滤实例，请求只落到自己电脑。对端**不会**在 Identify 响应里回传 token（防同账号
-/// 他人连上转发 socket 后偷密钥并静默绑定）。
+/// （终端自动注入，或手动写进 AI 的 MCP server env）——代理与 iShell 之间跑一次**双向
+/// 挑战-应答**握手（`McpReqKind::PairHello`/`PairProve`）来互证知道该 token，请求只落到
+/// 自己电脑。**token 本身永不过线**：线上只出现 `HMAC(token, 两个随机数)`，任何一方都不会
+/// 把密钥出示给尚未证明过身份的对端。
+///
+/// 因此这个 token 是货真价实的 HMAC 密钥，长度就是安全边界：新生成的是 128 位。更早版本
+/// 生成的是 64 位（16 个十六进制字符），仍然可用，但若在意离线暴力破解，删掉
+/// `mcp_pairing_token` 文件让它重新生成、并同步更新各处的 `ISHELL_MCP_TOKEN` 即可。
 ///
 /// 与 [`mcp_instance_id`] 的关键区别：instance_id 是**每进程**的、随进程生灭（用于同机多开
 /// 去重），**绝不持久化**；pairing token 是**每安装**的、必须**稳定持久**。二者用途正交。
@@ -303,15 +308,22 @@ fn write_pairing_token_file(path: &std::path::Path, token: &str) {
     }
 }
 
-/// 生成一个 16 位十六进制随机 token（8 字节熵）。熵源不可用（极罕见）时退化到纳秒时间戳。
+/// 生成新的配对 token：32 位十六进制（128 位熵）。v4 起它是 HMAC 的密钥——攻击者向任一
+/// iShell 发一句 `PairHello` 就能换到一条 `(随机数, 证明)` 拿去离线暴力破解，密钥长度就是
+/// 这里的安全边界。旧安装留下的 64 位 token 继续可用（见 `mcp_pairing_token`），只是余量小些。
+///
+/// 熵源不可用（极罕见）时退化到**完整的**纪元纳秒（128 位里填满 16 字节中的 12 字节），
+/// 而不是只填 4 字节 subsec——后者会留下 12 字节恒零，把密钥实际熵压到 32 位。这仍然是个
+/// 可猜测的退化路径（时间戳终究不是随机数），只是不至于差到荒谬；配对功能本身是可选的，
+/// 为它让 iShell 起不来不划算。
 fn gen_pairing_token() -> String {
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 16];
     if getrandom::getrandom(&mut buf).is_err() {
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
-        buf[..4].copy_from_slice(&ns.to_le_bytes());
+        buf[..12].copy_from_slice(&ns.to_le_bytes()[..12]);
     }
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }

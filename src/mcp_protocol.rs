@@ -1,7 +1,8 @@
 //! AI/MCP 控制通道的本地线协议：iShell 主进程与独立的 `ishell-mcp` stdio 代理进程之间，
 //! 经 Unix domain socket 传输的请求/响应类型。一次 socket 连接 = 一问一答（换行分隔的 JSON），
-//! 不做多路复用。本文件被 `main.rs` 和 `src/bin/mcp_stdio.rs` 各自 `include!` 一份，
-//! 避免为共享这几个类型而拆出独立的 lib crate。
+//! 不做多路复用——**唯一的例外**是 v4 的配对握手（`PairHello`→`PairProve`，一条连接两问两答），
+//! 因为双向证明必须绑定同一对随机数，拆成两条连接就绑不住了。本文件被 `main.rs` 和
+//! `src/bin/mcp_stdio.rs` 各自 `include!` 一份，避免为共享这几个类型而拆出独立的 lib crate。
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +76,91 @@ where
     }
 }
 
+// ---------- MCP 配对握手（v4）：双向挑战-应答 ----------
+//
+// 解决的问题：v3 让代理把 `ISHELL_MCP_TOKEN` **明文发给每一条候选 socket**（见
+// `candidate_paths`，共用账号时那个目录里躺着别人的转发 socket）。方向虽然从"服务器公布
+// 密钥"翻成了"调用方出示密钥"，但向一个**未经认证的验证方**出示 bearer secret 同样是泄露，
+// 而且是一次泄露给所有验证方。改成挑战-应答后，线上只出现 `HMAC(token, nonce)`，token 本身
+// 永不过线。
+//
+// 为什么必须**双向**、且服务器先证：只让客户端出示证明的话，一个假 socket 完全不需要知道
+// token 就能把代理钓过来——它照答 `PairChallenge`、照收证明、照回 Ok，代理就绑到了它身上。
+// （靠"真假两个实例 → 弹窗选"兜不住：实例 id 靠普通 `Identify` 就能问到，假 socket 冒用真
+// id，`bind_instance` 按 id 去重后只剩一条，而同机假 socket 必然赢过 SSH 反向转发的真
+// socket。）所以先由服务器出示 `Server` 证明，代理**验过才**发自己的 `Client` 证明。
+//
+// ⚠ 残留风险（明说，不粉饰）：同账号的攻击者若在受害者的代理与其真 iShell 之间**实时中继**
+// 双方的挑战与证明，仍可冒充。这在这类 socket 上无解——没有信道绑定可用，`SO_PEERCRED`
+// 在"大家共用同一个 uid"的威胁模型下也毫无意义。本次修的是**被动窃取一个永久有效的静态
+// 密钥**，攻击门槛从"捡一次密钥、以后随便用"抬到"在正确的时刻跑一个实时中继"。
+
+/// 握手中出示证明的角色。两个方向的证明必须**互不可换**——否则攻击者把服务器发来的证明
+/// 原样反射回去就能冒充客户端（经典反射攻击）。下面的域分隔标签就是堵这个的，别去掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRole {
+    Server,
+    Client,
+}
+
+impl PairRole {
+    fn tag(self) -> &'static str {
+        match self {
+            PairRole::Server => "S",
+            PairRole::Client => "C",
+        }
+    }
+}
+
+/// 生成握手随机数（32 字节 → 64 位十六进制）。
+///
+/// **熵源失败一律返回 `None`，绝不退化成时间戳**——这一点刻意与 `store::mcp_instance_id`
+/// 相反：那个是用来给同机多开去重的后缀，可预测也只是撞车；这个是安全随机数，可预测的
+/// nonce 会让挑战-应答退化成一句可重放的静态口令，等于白改。拿到 `None` 的一方必须中止握手。
+#[allow(dead_code)] // 两个 crate 各编一遍，各自只用得到其中一部分
+pub fn pair_nonce() -> Option<String> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).ok()?;
+    Some(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// 计算某一方的配对证明：`HMAC-SHA256(token, "<role>:<nonce_c>:<nonce_s>")`，十六进制。
+///
+/// 两个 nonce 都进 MAC：只带服务器的 nonce，客户端就无法确认对面是"这一次"在答话；只带
+/// 客户端的 nonce，服务器同理。
+#[allow(dead_code)]
+pub fn pair_proof(token: &str, nonce_c: &str, nonce_s: &str, role: PairRole) -> String {
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(token.as_bytes())
+        .expect("HMAC-SHA256 接受任意长度密钥");
+    mac.update(format!("{}:{nonce_c}:{nonce_s}", role.tag()).as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 常量时间比对收到的证明。
+#[allow(dead_code)]
+pub fn pair_proof_matches(
+    token: &str,
+    nonce_c: &str,
+    nonce_s: &str,
+    role: PairRole,
+    got: &str,
+) -> bool {
+    let want = pair_proof(token, nonce_c, nonce_s, role);
+    let (a, b) = (want.as_bytes(), got.as_bytes());
+    // 逐字节 OR 累积差异、**不提前返回**：`==` 会在首个不同的字节处短路，攻击者据此可以
+    // 一个字节一个字节地把正确证明试出来。长度本身是公开常量（固定 64 位十六进制），
+    // 先比长度不泄露任何信息。
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0_u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
 /// 单个终端会话的摘要（`list_sessions` 的返回项）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionInfo {
@@ -131,11 +217,32 @@ pub enum McpReqKind {
     /// 能连上该 socket 的人都能发 Identify，泄露 token 等于让对方跳过多机选择弹窗、静默绑
     /// 定到你的电脑。
     Identify,
-    /// v3：带配对 token 探测实例。仅当 `token` 与对端 `mcp_pairing_token` 一致时返回
-    /// `Instance`，否则 `Err`。代理用它在多机场景过滤候选，且对端**不会**把真实 token
-    /// 放进响应——证明方向是「调用方出示密钥」，不是「服务器公布密钥」。
+    /// **已废弃（v3 的配对方式）**：把配对 token 明文发给对端。v4 起代理不再发送它——
+    /// 明文出示密钥给一个尚未认证的对端，本身就是泄露（见本文件「配对握手」一节）。
+    ///
+    /// 变体保留、且 v4 的 GUI 仍会答话（但**忽略 token**、不做任何配对判定），纯粹是为了让
+    /// v3 的旧代理能走到它自己的版本校验、打印「请重新部署 ishell-mcp」而不是误报成
+    /// 「token 不匹配」。不构成泄露：它回的 id 与版本，普通 `Identify` 本来就照给。
     IdentifyPair {
         token: String,
+    },
+    /// 配对握手第一步（代理 → GUI）：代理送上自己的随机数，请对端先证明它知道配对 token。
+    ///
+    /// 对端答 [`McpReqResult::PairChallenge`]（含它的随机数与 `Server` 证明），代理**验过
+    /// 之后**才在**同一条连接**上发第二行 [`McpReqKind::PairProve`]。
+    ///
+    /// 这是全协议里唯一一处「一条连接两问两答」，与本文件开头那条「一次连接 = 一问一答」的
+    /// 约定不同——双向证明必须共享同一对随机数，拆成两条连接就没法把两次交换绑在一起了。
+    PairHello {
+        nonce_c: String,
+    },
+    /// 配对握手第二步（代理 → GUI，同一条连接的第二行）：代理出示自己的 `Client` 证明。
+    /// 对端验过回 `Instance`，不符回 `Err`。
+    ///
+    /// 不带随机数：这一步必须用**本连接第一步**约定的那对随机数，让调用方在这里重新报一遍
+    /// 等于允许它自选挑战，双向证明就白做了。
+    PairProve {
+        client_proof: String,
     },
     /// 请求把发起方这个 AI 客户端绑定到本 iShell 实例——弹窗让用户当面确认。
     ///
@@ -278,6 +385,8 @@ impl McpReqKind {
             // Bind 本身就是一个弹窗确认，再套一层会话授权既无对象也无意义。
             McpReqKind::Identify
             | McpReqKind::IdentifyPair { .. }
+            | McpReqKind::PairHello { .. }
+            | McpReqKind::PairProve { .. }
             | McpReqKind::Bind
             // 只读：不往 shell 里发东西，也不改远端。
             | McpReqKind::ListSessions
@@ -388,6 +497,12 @@ mod write_gate_tests {
             McpReqKind::IdentifyPair {
                 token: "x".into(),
             },
+            McpReqKind::PairHello {
+                nonce_c: "n".into(),
+            },
+            McpReqKind::PairProve {
+                client_proof: "p".into(),
+            },
             McpReqKind::Bind,
         ];
         for kind in cases {
@@ -420,7 +535,8 @@ impl McpRequest {
     /// 这条请求是不是该由标识为 `own_instance` 的实例来执行。
     ///
     /// 规则只有三条，故意写得极简——这是隔离的最后一道闸，越简单越查得清：
-    ///   1. `Identify` / `IdentifyPair` 永远放行：用来问「你是谁」/证明配对，那时对方还填不出名字；
+    ///   1. `Identify` / `IdentifyPair` / `PairHello` / `PairProve` 永远放行：用来问「你是谁」
+    ///      或走配对握手，那时对方还填不出名字；
     ///   2. 点名点中自己 → 放行；
     ///   3. 其余（点了别人、或压根没点名）→ 拒绝。
     ///
@@ -429,7 +545,13 @@ impl McpRequest {
     /// 每个实例的会话 uid 都从 1 开始，走错实例不会报错，只会安静地操作错的机器。
     pub fn is_addressed_to(&self, own_instance: &str) -> bool {
         match (&self.kind, &self.instance) {
-            (McpReqKind::Identify | McpReqKind::IdentifyPair { .. }, _) => true,
+            (
+                McpReqKind::Identify
+                | McpReqKind::IdentifyPair { .. }
+                | McpReqKind::PairHello { .. }
+                | McpReqKind::PairProve { .. },
+                _,
+            ) => true,
             (_, Some(named)) => named == own_instance,
             (_, None) => false,
         }
@@ -557,6 +679,21 @@ mod addressing_tests {
             }
         )
         .is_addressed_to("me"));
+        // 配对握手的两步同理：那时代理还没问出 id，填不了 instance。
+        assert!(req(
+            None,
+            McpReqKind::PairHello {
+                nonce_c: "n".into()
+            }
+        )
+        .is_addressed_to("me"));
+        assert!(req(
+            None,
+            McpReqKind::PairProve {
+                client_proof: "p".into()
+            }
+        )
+        .is_addressed_to("me"));
         // 连 Bind 都不例外：代理只会在 Identify 问出 id 之后才发 Bind，填得出名字。
         assert!(!req(None, McpReqKind::Bind).is_addressed_to("me"));
         assert!(req(Some("me"), McpReqKind::Bind).is_addressed_to("me"));
@@ -570,7 +707,14 @@ mod addressing_tests {
 /// v2：`McpReqResult::Instance` 新增 `token` 字段（多机配对，见 `store::mcp_pairing_token`）。
 /// v3：新增 `IdentifyPair`；`Instance.token` **不再回传真实配对 token**（恒为空），配对改由
 /// 调用方出示 token 证明，避免反向转发 socket 上的 Identify 把密钥泄露给同机其它人。
-pub const MCP_PROTOCOL_VERSION: u32 = 3;
+/// v4：配对改为**双向挑战-应答**（`PairHello`/`PairProve` + `PairChallenge`），token 本身
+/// 不再过线；`IdentifyPair` 降为「只为让 v3 旧代理走到版本校验」的兼容答话，不再做配对判定。
+///
+/// 注意 `Identify` 的线格式在所有版本里**逐字节相同**（无字段的单元变体），这是刻意的：
+/// 它是唯一一个跨版本都解得开的请求，版本不一致时全靠它问出对端版本、给出「重新部署」的
+/// 提示。给它加字段会把 JSON 从 `"Identify"` 变成 `{"Identify":{…}}`，旧端直接解析失败、
+/// 被当成死 socket 跳过，于是版本不匹配又会伪装成别的错误——别加。
+pub const MCP_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {
@@ -587,6 +731,18 @@ pub enum McpReqResult {
         /// token）。字段保留仅为线格式兼容；代理不得再依赖此字段做过滤。
         #[serde(default)]
         token: String,
+    },
+    /// `PairHello` 的应答：对端的随机数 + 它的 `Server` 证明。代理**先验这个证明**，
+    /// 通过了才在同一条连接上发 `PairProve`——否则一个连 token 都不知道的假 socket 就能把
+    /// 代理钓过去（见本文件「配对握手」一节）。
+    ///
+    /// 同时带上 `id`/`proto_version`：握手成功后代理正好拿它们去重与校验版本，不必再问一遍。
+    /// 这两项本来就是 `Identify` 对任何人都给的，放在证明之前不构成额外泄露。
+    PairChallenge {
+        id: String,
+        proto_version: u32,
+        nonce_s: String,
+        server_proof: String,
     },
     Sessions(Vec<McpSessionInfo>),
     Run(McpRunResult),
@@ -651,6 +807,51 @@ mod tests {
         match serde_json::from_str::<McpReqResult>(legacy).unwrap() {
             McpReqResult::Instance { token, .. } => assert_eq!(token, ""),
             other => panic!("应解析回 Instance，实际：{other:?}"),
+        }
+    }
+
+    /// 配对证明的正路：同一个 token + 同一对随机数 + 同一个角色 → 对得上。
+    #[test]
+    fn pair_proof_verifies_for_the_matching_token() {
+        let p = pair_proof("tok", "NC", "NS", PairRole::Server);
+        assert!(pair_proof_matches("tok", "NC", "NS", PairRole::Server, &p));
+        assert!(!pair_proof_matches("other", "NC", "NS", PairRole::Server, &p));
+    }
+
+    /// 换掉任何一个随机数，证明都必须失效——否则挑战-应答退化成可重放的静态口令，
+    /// 攻击者抓一次就能永久冒充。
+    #[test]
+    fn pair_proof_is_bound_to_both_nonces() {
+        let p = pair_proof("tok", "NC", "NS", PairRole::Client);
+        assert!(!pair_proof_matches("tok", "NC2", "NS", PairRole::Client, &p));
+        assert!(!pair_proof_matches("tok", "NC", "NS2", PairRole::Client, &p));
+    }
+
+    /// 反射攻击：把服务器的证明原样当成客户端的证明送回去，必须不通过。
+    /// 这正是 `PairRole` 的域分隔标签存在的唯一理由——去掉它这条会挂。
+    #[test]
+    fn server_proof_cannot_be_reflected_as_the_client_proof() {
+        let server = pair_proof("tok", "NC", "NS", PairRole::Server);
+        assert!(
+            !pair_proof_matches("tok", "NC", "NS", PairRole::Client, &server),
+            "服务器证明被当成客户端证明接受了——域分隔标签丢了"
+        );
+        assert_ne!(server, pair_proof("tok", "NC", "NS", PairRole::Client));
+    }
+
+    /// 随机数每次都不一样，且长度固定（常量时间比对依赖这一点）。
+    #[test]
+    fn pair_nonce_is_fresh_and_fixed_width() {
+        let (a, b) = (pair_nonce().expect("熵源应可用"), pair_nonce().expect("熵源应可用"));
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b, "两次生成的随机数相同——熵源有问题");
+    }
+
+    /// 畸形/截断的证明不能因为长度不同就 panic 或误判。
+    #[test]
+    fn malformed_proofs_are_rejected_not_panicking() {
+        for got in ["", "zz", &"a".repeat(63), &"a".repeat(65)] {
+            assert!(!pair_proof_matches("tok", "NC", "NS", PairRole::Server, got));
         }
     }
 
