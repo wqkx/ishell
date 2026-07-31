@@ -50,6 +50,7 @@ impl Terminal {
                     if meta_held {
                         continue; // Alt 组合交给 encode_key 发 ESC 前缀形式，见上面 meta_held
                     }
+                    self.clear_selection(); // 输入字符即取消选择（与按键分支一致）
                     if !alt {
                         self.input_line.push_str(&t);
                         self.hist = None;
@@ -110,6 +111,31 @@ impl Terminal {
                 } => {
                     let plain =
                         !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.shift;
+                    // Shift+选择键：主屏且远端未接管键盘时做本地键盘选区（Shift+↑↓ 跨行选择
+                    // 多行文本；远端程序开了应用光标/备用屏/bracketed paste 时透传——
+                    // vim 里 Shift+↑ 是翻页，nano 里 Shift+方向是选区，不能拦）
+                    if !alt
+                        && modifiers.shift
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                        && !self.parser.screen().application_cursor()
+                        && !self.parser.screen().bracketed_paste()
+                        && matches!(
+                            key,
+                            Key::ArrowUp
+                                | Key::ArrowDown
+                                | Key::PageUp
+                                | Key::PageDown
+                                | Key::Home
+                                | Key::End
+                        )
+                    {
+                        self.shift_select(key);
+                        continue;
+                    }
+                    // 其余按键取消选区（主流终端行为：键盘输入即撤销选择；鼠标点击处另有清除）
+                    self.clear_selection();
                     // 裸上下键：默认走 iShell 的本地前缀历史（对普通 shell 提示符很好用）。但当前台
                     // 程序**自己在做行编辑**时绝不能拦，否则它的方向键功能（ipython 的补全菜单、
                     // vim 的光标移动、fzf 选择等）全废。两个信号任一置位即「让程序自己接管方向键」，

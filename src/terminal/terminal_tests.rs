@@ -539,3 +539,23 @@ fn selection_follows_content_across_scroll_and_new_output() {
     t.scrollback = 0;
     assert_eq!(t.selected_text().unwrap(), "L3");
 }
+
+/// Shift+Home/↑ 键盘选区：首次以终端光标为锚，之后垂直扩展，复制内容随之增长。
+#[test]
+fn shift_select_via_keyboard() {
+    let mut t = Terminal::new();
+    assert!(t.resize(20, 4));
+    t.feed(b"cmd\r\nout1\r\nout2\r\nout3$ ");
+    assert_eq!(t.parser.screen().cursor_position().0, 3, "前提：光标在末行");
+
+    // Shift+Home：以光标（末行）为锚、游标移到行首 → 选中整行
+    t.shift_select(egui::Key::Home);
+    assert!(t.has_selection());
+    assert_eq!(t.selected_text().unwrap(), "out3$");
+
+    // Shift+↑：锚不动、游标逐行上移，选区向上一行行扩展
+    t.shift_select(egui::Key::ArrowUp);
+    assert_eq!(t.selected_text().unwrap(), "out2\nout3$");
+    t.shift_select(egui::Key::ArrowUp);
+    assert_eq!(t.selected_text().unwrap(), "out1\nout2\nout3$");
+}

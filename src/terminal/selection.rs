@@ -84,6 +84,59 @@ impl Terminal {
         matches!((self.sel_anchor, self.sel_cursor), (Some(a), Some(b)) if a != b)
     }
 
+    /// Shift+方向/Home/End/PageUp/PageDown 的本地键盘选区（Windows Terminal 式）。
+    /// 首次按下以终端光标位置为锚，之后垂直/翻页扩展；游标移出视图时滚动跟随。
+    /// 仅在「主屏且远端未接管键盘」时由 input.rs 调用（vim 等程序下该组合键需透传）。
+    pub(super) fn shift_select(&mut self, key: egui::Key) {
+        use egui::Key;
+        // 键盘交互先回底（与「输入即回底」的既有行为一致）——回看中光标位置的
+        // 绝对行换算会错（光标属于当前屏幕区而非历史区）
+        if self.scrollback != 0 {
+            self.parser.screen_mut().set_scrollback(0);
+            self.scrollback = 0;
+        }
+        let (rows, cols) = (self.rows as usize, self.cols);
+        // 首次按下：锚定终端光标处（无选区时 Shift+点击/拖动已建的选区上继续扩展亦可）
+        if self.sel_anchor.is_none() {
+            let (cr, cc) = self.parser.screen().cursor_position();
+            let a = self.abs_of_view(cr);
+            self.sel_anchor = Some((a, cc));
+            self.sel_cursor = Some((a, cc));
+        }
+        let Some((mut ar, mut ac)) = self.sel_cursor else {
+            return;
+        };
+        let (total, kept) = {
+            let s = self.parser.screen();
+            (s.scrollback_total(), s.scrollback_rows())
+        };
+        let abs_min = total - kept; // 最早可读历史行（再早已被修剪）
+        let abs_max = total + rows - 1; // 当前屏幕最后一行
+        match key {
+            Key::ArrowUp => ar = ar.saturating_sub(1).max(abs_min),
+            Key::ArrowDown => ar = (ar + 1).min(abs_max),
+            Key::PageUp => ar = ar.saturating_sub(rows).max(abs_min),
+            Key::PageDown => ar = (ar + rows).min(abs_max),
+            Key::Home => ac = 0,
+            Key::End => ac = cols.saturating_sub(1),
+            _ => {}
+        }
+        self.sel_cursor = Some((ar, ac));
+        // 游标越出视图时滚动跟随：上越顶则上滚，下越底则下滚
+        let s = self.parser.screen().scrollback();
+        let view_top = total - s;
+        if ar < view_top {
+            let ns = total - ar;
+            self.parser.screen_mut().set_scrollback(ns);
+            self.scrollback = ns;
+        } else if ar >= view_top + rows {
+            // view_top_new = ar - rows + 1 → ns = total - view_top_new
+            let ns = (total + rows - 1).saturating_sub(ar);
+            self.parser.screen_mut().set_scrollback(ns);
+            self.scrollback = ns;
+        }
+    }
+
     pub(super) fn word_range_at(&self, row: u16, col: u16) -> Option<(u16, u16)> {
         let screen = self.parser.screen();
         let is_word = |c: u16| -> bool {
