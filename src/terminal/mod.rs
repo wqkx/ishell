@@ -112,6 +112,8 @@ pub struct Terminal {
     last_input_at: Option<std::time::Instant>,
     /// 待上报的终端通知（BEL 响铃 / OSC 9 / OSC 777 notify），由 App 每帧取走渲染浮层
     notices: Vec<TermNotice>,
+    /// 右键菜单「配置 AI 完成通知」请求：App 取走后往本终端打一条安装命令（见 layout_body）。
+    notify_setup_request: bool,
     /// 本标签里是否**跑过** AI CLI（claude/codex 等）。裸 BEL 只有在这个标志为真时才当通知，
     /// 否则普通 shell 的补全失败/readline 报错会让每个标签都在弹提醒。见 `is_ai_cli_command`。
     ///
@@ -186,6 +188,7 @@ impl Terminal {
             last_output_at: None,
             last_input_at: None,
             notices: Vec::new(),
+            notify_setup_request: false,
             ai_cli_seen: false,
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
@@ -284,6 +287,11 @@ impl Terminal {
     /// 取走待上报的终端通知（BEL / OSC 9 / OSC 777），供 App 渲染通知浮层。
     pub fn take_notices(&mut self) -> Vec<TermNotice> {
         std::mem::take(&mut self.notices)
+    }
+
+    /// 取走「配置 AI 完成通知」请求（右键菜单触发）。
+    pub fn take_notify_setup_request(&mut self) -> bool {
+        std::mem::take(&mut self.notify_setup_request)
     }
 
     /// 远端输出是否已静止至少 `d`（None=连接后尚未有输出，视为静止）。
@@ -792,6 +800,33 @@ impl Terminal {
             // 「启用 AI 配对」曾经在这里。已去掉：配对 token 由 App 在会话空闲时自动注入
             // （见 layout_body 的自动注入分支），不需要用户自己在菜单里点一下——那一项只是
             // 把同一件事又摆到用户面前，还得由他判断"现在能不能点"。
+            //
+            // 「配置 AI 完成通知」则相反，必须由用户显式点：它要**改对方机器上的配置文件**
+            // （`~/.claude/settings.json`），不像 token 注入那样只是设个环境变量、关掉终端
+            // 就没了。程序不该在用户不知情时动他的 AI 配置——尤其同一台服务器可能被多台
+            // 电脑的 iShell 连着。所以做成一条注入到终端里的安装命令：你看得见它执行了什么，
+            // 也留了备份。
+            if ui
+                .button(crate::i18n::tr(
+                    "配置 AI 完成通知…",
+                    "Set up AI completion alerts…",
+                ))
+                .on_hover_text(crate::i18n::tr(
+                    "往这台机器的 Claude Code 配置里加两个 hook：任务完成 / 需要你确认时，\
+                     发一条 OSC 9 通知，iShell 会显示成右上角卡片。\n\
+                     命令会打进本终端，你能看清它做了什么；原配置自动备份为 settings.json.bak。\n\
+                     需要对端有 python3。codex 自带 OSC 9 通知，不需要这一步。",
+                    "Adds two hooks to Claude Code's config on THIS machine: on task completion / \
+                     when it needs you, emit an OSC 9 notification that iShell shows as a card.\n\
+                     The command is typed into this terminal so you can see exactly what it does; \
+                     the old config is backed up to settings.json.bak.\n\
+                     Needs python3 on the far side. codex emits OSC 9 natively — not needed there.",
+                ))
+                .clicked()
+            {
+                self.notify_setup_request = true;
+                ui.close();
+            }
             ui.separator();
             // 终端配色：多套主题（深/浅/近白/柔和深/经典浅），选中即全局同步并存盘
             ui.menu_button(crate::i18n::tr("终端配色", "Terminal theme"), |ui| {

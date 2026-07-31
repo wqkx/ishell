@@ -147,6 +147,10 @@ impl App {
                         s.osc7_confirm = true;
                     }
                 }
+                // 右键菜单「配置 AI 完成通知」：把安装命令打进终端（不自动执行）。
+                if s.terminal.take_notify_setup_request() {
+                    inject_notify_setup(s);
+                }
                 // MCP 配对 token 自动注入：多台电脑共用同一台 AI 服务器时，让本会话里启动的
                 // AI（及其 ishell-mcp 子进程）自动携带配对标识——MCP 请求经既有的 token 匹配
                 // 精确路由回本电脑，不再弹窗打扰其他人（未注入时维持原有「多实例弹窗选择」）。
@@ -228,6 +232,56 @@ impl App {
     }
 }
 
+/// hook 本体。`MSG` 是占位符，合并脚本按事件替换成具体文案。
+///
+/// **只用双引号，绝不含单引号**：整段要塞进外层的单引号里传给 python，而 sh 没有"在单引号
+/// 内转义单引号"的写法——出现一个就会把命令从那里截断。有测试守着这条约束。
+pub(super) const NOTIFY_HOOK: &str = concat!(
+        r#"p=$$; i=0; while [ $i -lt 6 ]; do p=$(ps -o ppid= -p $p 2>/dev/null | tr -d " "); "#,
+        r#"[ -z "$p" ] && break; t=$(ps -o tty= -p $p 2>/dev/null | tr -d " "); "#,
+        r#"case $t in ""|"?") ;; *) [ -w /dev/$t ] && "#,
+        r#"printf "\033]9;%s\007" "MSG" > /dev/$t; break;; esac; "#,
+        r#"i=$((i+1)); done; exit 0 # ishell-osc9"#,
+);
+
+/// 合并脚本。同样只用双引号；hook 本体经环境变量 `ISHW` 传入，避免两层引号互相打架。
+pub(super) const NOTIFY_MERGE: &str = concat!(
+        r#"import json,os,shutil; p=os.path.expanduser("~/.claude/settings.json"); "#,
+        r#"os.makedirs(os.path.dirname(p),exist_ok=True); "#,
+        r#"d=json.load(open(p,encoding="utf-8")) if os.path.exists(p) else {}; "#,
+        r#"os.path.exists(p) and shutil.copy2(p,p+".bak"); w=os.environ["ISHW"]; "#,
+        r#"h=d.setdefault("hooks",{}); "#,
+        r#"h["Notification"]=[x for x in h.get("Notification",[]) if "ishell-osc9" not in json.dumps(x)]"#,
+        r#"+[{"hooks":[{"type":"command","command":w.replace("MSG","Claude Code 需要你确认")}]}]; "#,
+        r#"h["Stop"]=[x for x in h.get("Stop",[]) if "ishell-osc9" not in json.dumps(x)]"#,
+        r#"+[{"hooks":[{"type":"command","command":w.replace("MSG","Claude Code 任务完成")}]}]; "#,
+        r#"json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2); "#,
+        r#"print("iShell 通知 hook 已写入 "+p+"（原配置备份为 settings.json.bak）")"#,
+);
+
+/// 把「配置 AI 完成通知」的安装命令打进终端。
+///
+/// 刻意**不吞回显**（对比 `inject_mcp_token`）：token 是密钥，看见反而不好；这条命令要改的是
+/// 对方机器上的 `~/.claude/settings.json`，用户有权在按回车之前看清它到底做了什么。
+///
+/// 也刻意**不自动执行**（结尾不发 `\r`）：改别人 AI 配置这种事，最后那一下必须由人来按。
+///
+/// 命令做三件事：备份原配置 → 合并两个 hook（Notification / Stop）→ 写回。合并按注释标记
+/// `# ishell-osc9` 去重，重复执行不会堆出多条。hook 本体是一段 sh：沿父进程链向上找到第一个
+/// 有 tty 的祖先（通常就是 claude 进程本身）再发 OSC 9——不能用常见的 `> /dev/tty`，实测
+/// Claude Code 起的子进程没有控制终端，那条路会静默失败。
+fn inject_notify_setup(s: &mut super::Session) {
+    let cmd = format!("ISHW='{NOTIFY_HOOK}' python3 -c '{NOTIFY_MERGE}'");
+    let _ = s
+        .cmd_tx
+        .send(UiCommand::TerminalInput(cmd.into_bytes()));
+    s.status = crate::i18n::tr(
+        "安装命令已打进终端：看一眼没问题再按回车执行",
+        "Install command typed into the terminal — review it, then press Enter",
+    )
+    .into();
+}
+
 /// 往会话终端注入 `export ISHELL_MCP_TOKEN=<本机配对 token>`（回显吞除）。
 /// 此后该 shell 里启动的 AI / ishell-mcp 子进程自动继承这个环境变量，MCP 绑定走
 /// ishell-mcp 既有的 token 匹配路径（`bind_instance`），请求精确路由回这台电脑。
@@ -242,4 +296,40 @@ fn inject_mcp_token(s: &mut super::Session) {
         .cmd_tx
         .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
     s.terminal.expect_echo(&cmd);
+}
+
+#[cfg(test)]
+mod notify_setup_tests {
+    /// 安装命令是「外层单引号包住两大段」的形状：
+    /// `ISHW='<hook>' python3 -c '<merge>'`。
+    /// 只要这两段里出现**任何一个单引号**，shell 的引号就会在那里断开，后半段被当成别的
+    /// 参数甚至别的命令——注入到用户终端里的东西必须不可能这样炸。sh 也没有"在单引号里
+    /// 转义单引号"的写法，所以这不是"注意点"，是硬约束。
+    #[test]
+    fn installer_segments_contain_no_single_quotes() {
+        for (name, seg) in [
+            ("HOOK", super::NOTIFY_HOOK),
+            ("MERGE", super::NOTIFY_MERGE),
+        ] {
+            assert!(
+                !seg.contains('\''),
+                "{name} 里出现了单引号，会把外层引号截断：{seg}"
+            );
+        }
+    }
+
+    /// 去重标记必须在 hook 命令里：合并脚本靠它认出"这条是 iShell 装的"，
+    /// 丢了就会每点一次菜单堆一条新 hook。
+    #[test]
+    fn hook_carries_the_dedup_marker() {
+        assert!(super::NOTIFY_HOOK.contains("ishell-osc9"));
+        assert!(super::NOTIFY_MERGE.contains("ishell-osc9"));
+    }
+
+    /// hook 里必须有 MSG 占位符供合并脚本替换成具体文案；替换后不该再剩下占位符。
+    #[test]
+    fn message_placeholder_is_present_and_replaceable() {
+        assert!(super::NOTIFY_HOOK.contains("MSG"));
+        assert!(!super::NOTIFY_HOOK.replace("MSG", "x").contains("MSG"));
+    }
 }
