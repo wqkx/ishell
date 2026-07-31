@@ -3,7 +3,13 @@
 use super::Terminal;
 
 impl Terminal {
-    pub(super) fn ordered_selection(&self) -> Option<((u16, u16), (u16, u16))> {
+    /// 视图行 → 绝对历史行（锚定内容：滚动/新输出/修剪均不漂移）。
+    pub(super) fn abs_of_view(&self, view_row: u16) -> usize {
+        let screen = self.parser.screen();
+        screen.scrollback_total() - screen.scrollback() + view_row as usize
+    }
+
+    pub(super) fn ordered_selection(&self) -> Option<((usize, u16), (usize, u16))> {
         let (a, b) = (self.sel_anchor?, self.sel_cursor?);
         if (a.0, a.1) <= (b.0, b.1) {
             Some((a, b))
@@ -12,20 +18,34 @@ impl Terminal {
         }
     }
 
-    pub(super) fn selected_text(&self) -> Option<String> {
+    pub(super) fn selected_text(&mut self) -> Option<String> {
         let ((sr, sc), (er, ec)) = self.ordered_selection()?;
-        let screen = self.parser.screen();
+        let (total, kept, saved) = {
+            let s = self.parser.screen();
+            (s.scrollback_total(), s.scrollback_rows(), s.scrollback())
+        };
         let mut out = String::new();
-        for row in sr..=er {
-            let c0 = if row == sr { sc } else { 0 };
-            let c1 = if row == er {
+        for abs in sr..=er {
+            // 已被修剪丢弃的历史行（abs < total - kept）读不到——跳过
+            if abs + kept < total {
+                continue;
+            }
+            // 把目标行切到视图第 0 行再读：abs > total 时它在当前屏幕区（偏移 0，
+            // 视图行 = abs - total）；否则偏移 total - abs 使其成为视图第 0 行。
+            // set_scrollback 是 O(1)（仅改偏移），逐行调整代价可忽略。
+            let s_prime = total.saturating_sub(abs);
+            self.parser.screen_mut().set_scrollback(s_prime);
+            let view_row = (abs - (total - s_prime)) as u16;
+            let c0 = if abs == sr { sc } else { 0 };
+            let c1 = if abs == er {
                 ec
             } else {
                 self.cols.saturating_sub(1)
             };
             let mut line = String::new();
+            let screen = self.parser.screen();
             for col in c0..=c1 {
-                let Some(cell) = screen.cell(row, col) else {
+                let Some(cell) = screen.cell(view_row, col) else {
                     line.push(' ');
                     continue;
                 };
@@ -39,7 +59,7 @@ impl Terminal {
             // 它在原文里根本没有 \n，粘贴时凭空多出的换行会把一条命令/一个 URL 拆断。
             // vt100 给每行记了 wrapped 标志（行满后自动折行时置位，真正收到 \n 则清零），
             // 据此区分：软换行只把两行首尾相接，真实换行才补 \n。
-            let soft_wrap = screen.row_wrapped(row);
+            let soft_wrap = screen.row_wrapped(view_row);
             // 软换行行是被字符填满才折的，行尾没有真实空白可言；trim_end 会把「刚好在行尾
             // 的空格」这种有意义的内容吃掉，导致接起来的两段粘连（如 `ls -la` 变 `ls-la`）。
             if soft_wrap {
@@ -47,10 +67,12 @@ impl Terminal {
             } else {
                 out.push_str(line.trim_end());
             }
-            if row != er && !soft_wrap {
+            if abs != er && !soft_wrap {
                 out.push('\n');
             }
         }
+        // 恢复用户当前的回看位置（上面的逐行偏移调整只是临时探测）
+        self.parser.screen_mut().set_scrollback(saved);
         if out.is_empty() {
             None
         } else {

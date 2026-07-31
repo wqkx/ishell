@@ -493,3 +493,49 @@ fn selection_keeps_newline_for_real_line_break() {
     t.sel_cursor = Some((1, 7));
     assert_eq!(t.selected_text().unwrap(), "line-one\nline-two");
 }
+
+/// 回归：选区锚定**内容**（绝对历史行）——本地滚动与远端新输出后，
+/// 复制到的仍是当初选中的那几行。此前选区存视图坐标：滚动后高亮停在
+/// 屏幕原位、复制到的是位移后的其他行（需重新选择）。
+#[test]
+fn selection_follows_content_across_scroll_and_new_output() {
+    let mut t = Terminal::new();
+    assert!(t.resize(10, 4));
+    // 10 条真实行：前几行被推入历史
+    t.feed(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9");
+    assert!(t.parser.screen().scrollback_total() > 0, "前提：已有历史行");
+
+    // L3 已推入历史：先滚到最旧历史处，在视图中找到它并换算成绝对行
+    t.parser.screen_mut().set_scrollback(usize::MAX);
+    t.scrollback = t.parser.screen().scrollback();
+    let mut row_l3 = None;
+    for r in 0..4 {
+        let s = t.parser.screen();
+        if s.cell(r, 0).map(|c| c.contents()) == Some("L")
+            && s.cell(r, 1).map(|c| c.contents()) == Some("3")
+        {
+            row_l3 = Some(r);
+            break;
+        }
+    }
+    let abs = t.abs_of_view(row_l3.expect("L3 应在历史视图中"));
+    // 回到底部（模拟用户选完后的常态）
+    t.parser.screen_mut().set_scrollback(0);
+    t.scrollback = 0;
+    t.sel_anchor = Some((abs, 0));
+    t.sel_cursor = Some((abs, 9));
+
+    // 1) 用户上滚查看历史（scrollback 偏移变化）→ 复制内容不变
+    t.parser.screen_mut().set_scrollback(2);
+    t.scrollback = 2;
+    assert_eq!(t.selected_text().unwrap(), "L3");
+
+    // 2) 远端有新输出（历史行数增长、内容上滚）→ 复制内容仍不变
+    t.feed(b"\r\nNEW1\r\nNEW2");
+    assert_eq!(t.selected_text().unwrap(), "L3");
+
+    // 3) 回到底部后依然不变
+    t.parser.screen_mut().set_scrollback(0);
+    t.scrollback = 0;
+    assert_eq!(t.selected_text().unwrap(), "L3");
+}

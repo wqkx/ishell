@@ -170,6 +170,9 @@ impl Terminal {
 
     /// 喂入来自远程的原始字节。
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        // 「疑似前台任务」判定信号：任何远端到达都算输出（含回显/查询应答——
+        // 注入式操作自身的回显会让 1s 窗口内判 busy，恰好挡住连点，可接受）
+        self.last_output_at = Some(std::time::Instant::now());
         // 注入命令的回显吞除（仅当有待吞内容时）
         let stripped;
         let bytes: &[u8] = if self.echo_pos < self.echo_expect.len() || self.echo_tail {

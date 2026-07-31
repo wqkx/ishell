@@ -13,6 +13,10 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
     scrollback_offset: usize,
+    /// ishell 补丁：累计推入过 scrollback 的总行数（单调递增，修剪不减）。
+    /// 「历史绝对坐标」= scrollback_total - scrollback_offset + 视图行；
+    /// 修剪（pop_front）不改变它，因此选区等锚定在内容上的状态跨修剪也不漂移。
+    scrollback_total: usize,
 }
 
 impl Grid {
@@ -29,6 +33,7 @@ impl Grid {
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
             scrollback_offset: 0,
+            scrollback_total: 0,
         }
     }
 
@@ -189,6 +194,16 @@ impl Grid {
 
     pub fn scrollback_len(&self) -> usize {
         self.scrollback_len
+    }
+
+    /// ishell 补丁：当前保留的历史行数（≤ scrollback_len，达到上限后封顶）。
+    pub fn scrollback_rows(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// ishell 补丁：累计推入过的历史总行数（单调递增，修剪不减）。
+    pub fn scrollback_total(&self) -> usize {
+        self.scrollback_total
     }
 
     pub fn scrollback(&self) -> usize {
@@ -570,6 +585,7 @@ impl Grid {
             // Regions starting below row zero remain isolated from scrollback.
             if self.scrollback_len > 0 && self.scroll_top == 0 {
                 self.scrollback.push_back(removed);
+                self.scrollback_total += 1; // ishell 补丁：累计历史行数（修剪不减）
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
                 }

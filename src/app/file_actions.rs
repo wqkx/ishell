@@ -258,11 +258,28 @@ impl App {
                 // 以 POSIX 单引号转义路径后在终端 cd，并聚焦终端
                 // ai_owned 会话是只读的（AI 专用），这个入口不能往里面灌命令
                 if !s.ai_owned {
-                    let quoted = format!("'{}'", path.replace('\'', "'\\''"));
-                    let _ = s.cmd_tx.send(UiCommand::TerminalInput(
-                        format!("cd {quoted}\r").into_bytes(),
-                    ));
-                    s.terminal.request_focus();
+                    // 前台疑似在跑任务（全屏 TUI/持续输出）时不注入：字符会被任务吃掉或
+                    // 排队到任务结束后才执行。拦截并提示；4 秒内再次点击视为确认、强制注入。
+                    let forced = s
+                        .cd_force_until
+                        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(4));
+                    if !forced && s.terminal.appears_busy() {
+                        s.cd_force_until = Some(std::time::Instant::now());
+                        let msg: String = crate::i18n::tr(
+                            "终端似乎正在运行任务，未发送 cd；再次点击强制发送",
+                            "Terminal looks busy; click again to force cd",
+                        )
+                        .into();
+                        s.status = msg.clone();
+                        self.toast = Some((msg, self.ctx.input(|i| i.time)));
+                    } else {
+                        s.cd_force_until = None;
+                        let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+                        let _ = s.cmd_tx.send(UiCommand::TerminalInput(
+                            format!("cd {quoted}\r").into_bytes(),
+                        ));
+                        s.terminal.request_focus();
+                    }
                 }
             }
             // 已在函数开头前置处理并 return，此处仅为穷尽匹配

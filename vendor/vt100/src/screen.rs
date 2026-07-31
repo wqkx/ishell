@@ -123,6 +123,19 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// ishell 补丁：当前保留的历史行数（达到 scrollback 上限后封顶）。
+    #[must_use]
+    pub fn scrollback_rows(&self) -> usize {
+        self.grid().scrollback_rows()
+    }
+
+    /// ishell 补丁：累计推入过的历史总行数（单调递增，修剪不减）。
+    /// 「历史绝对坐标」锚定内容用：abs = scrollback_total - scrollback() + view_row。
+    #[must_use]
+    pub fn scrollback_total(&self) -> usize {
+        self.grid().scrollback_total()
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

@@ -49,6 +49,8 @@ impl Terminal {
 
         let sel = self.ordered_selection();
         let screen = self.parser.screen();
+        // 视图第 0 行对应的绝对历史行（选区坐标反算的基准）
+        let view_top = screen.scrollback_total() - screen.scrollback();
         // origin 也吸附到物理像素网格，使每个单元格都落在整数像素上（配合上面 char_w/char_h 吸附）
         let origin = egui::pos2(
             (rect.min.x * ppp).round() / ppp,
@@ -96,11 +98,13 @@ impl Terminal {
                     Color32::from_rgba_unmultiplied(w.r(), w.g(), w.b(), 90),
                 );
             }
-            // 选区高亮（半透明，文字仍可见）
+            // 选区高亮（半透明，文字仍可见）。选区存的是绝对历史行：按当前 scrollback
+            // 偏移反算每个可视行的绝对行号再匹配——滚动/新输出后高亮跟随内容移动。
             if let Some(((sr, sc), (er, ec))) = sel {
-                if row >= sr && row <= er {
-                    let c0 = if row == sr { sc } else { 0 };
-                    let c1 = if row == er {
+                let abs = view_top + row as usize;
+                if abs >= sr && abs <= er {
+                    let c0 = if abs == sr { sc } else { 0 };
+                    let c1 = if abs == er {
                         ec
                     } else {
                         self.cols.saturating_sub(1)

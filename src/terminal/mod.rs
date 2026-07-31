@@ -35,9 +35,11 @@ pub struct Terminal {
     scrollback: usize,
     /// 可调字号（Ctrl+滚轮）
     font_size: f32,
-    /// 选区两端（屏幕字符坐标 row,col）；None 表示无选区
-    sel_anchor: Option<(u16, u16)>,
-    sel_cursor: Option<(u16, u16)>,
+    /// 选区两端（**绝对历史行** row + 屏幕列 col）；None 表示无选区。
+    /// 绝对行锚定内容本身：本地滚动、远端新输出上滚、scrollback 修剪后选区都不漂移
+    /// （视图坐标会随 scrollback 偏移变化，曾致「滚动后选区停在屏幕原位、复制到错位内容」）。
+    sel_anchor: Option<(usize, u16)>,
+    sel_cursor: Option<(usize, u16)>,
     /// 系统剪贴板（懒初始化，用于右键粘贴）
     clipboard: Option<arboard::Clipboard>,
     /// 终端配色索引（见 TERM_THEMES）；全局共享，切一个即全部同步
@@ -94,6 +96,8 @@ pub struct Terminal {
     /// round 会一直得 0（触控板/平滑滚轮尤其明显），导致"滚了但纹丝不动"。这里跨帧
     /// 累计，凑够一整行才真正推动 vt100 scrollback，不足一行的余量保留到下一帧。
     local_scroll_accum: f32,
+    /// 最近一次收到远端输出的时刻（feed 更新）：「是否疑似在跑前台任务」的判定信号之一
+    last_output_at: Option<std::time::Instant>,
     /// 终端查询序列可能跨 SSH 数据块；暂存尚不能确定是否为完整查询的短尾。
     query_tail: Vec<u8>,
     /// resize 去抖：拖拽窗口时每帧尺寸都在变，若每帧都真正 resize（普通屏会序列化整缓冲+重建
@@ -153,6 +157,7 @@ impl Terminal {
             ime_preedit: String::new(),
             prev_focused: false,
             local_scroll_accum: 0.0,
+            last_output_at: None,
             query_tail: Vec::new(),
             prev_alt: false,
             sb_dragging: false,
@@ -243,6 +248,24 @@ impl Terminal {
     /// 请求下一帧让终端区域获得键盘焦点。
     pub fn request_focus(&mut self) {
         self.focus_req = true;
+    }
+
+    /// 终端是否**疑似**正在运行前台任务。用于「在终端打开当前目录」等注入式操作：
+    /// 任务运行时注入的字符会被前台程序吃掉或排队到任务结束后才执行，行为不可预期。
+    /// 信号（启发式，无法确知远端状态，按可靠性组合）：
+    /// - 备用屏 / 应用光标 / 鼠标上报：vim/htop/tmux 等全屏程序的确切信号
+    /// - 最近 1s 内有输出：主屏上 gromacs/编译等持续刷日志的任务
+    /// 长时间无输出的静默任务无法检测——注入方应配合「再次点击强制执行」的逃生口。
+    pub fn appears_busy(&self) -> bool {
+        let s = self.parser.screen();
+        if s.alternate_screen()
+            || s.application_cursor()
+            || s.mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        {
+            return true;
+        }
+        self.last_output_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -586,14 +609,17 @@ impl Terminal {
                     if max_sb > 0 && press.x >= sb_track.left() {
                         self.sb_dragging = true;
                     } else {
-                        let cur = cell_at(p);
-                        self.sel_anchor = Some(cell_at(press));
-                        self.sel_cursor = Some(cur);
+                        let (ar, ac) = cell_at(press);
+                        let (cr, cc) = cell_at(p);
+                        // 锚点/游标都换算成绝对历史行：之后滚动/新输出选区跟随内容
+                        self.sel_anchor = Some((self.abs_of_view(ar), ac));
+                        self.sel_cursor = Some((self.abs_of_view(cr), cc));
                     }
                 }
             } else if resp.dragged() && !self.sb_dragging {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    self.sel_cursor = Some(cell_at(p));
+                    let (r, c) = cell_at(p);
+                    self.sel_cursor = Some((self.abs_of_view(r), c));
                 }
             }
             if self.sb_dragging {
@@ -612,15 +638,17 @@ impl Terminal {
             if resp.triple_clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let (r, _) = cell_at(p);
-                    self.sel_anchor = Some((r, 0));
-                    self.sel_cursor = Some((r, self.cols.saturating_sub(1)));
+                    let a = self.abs_of_view(r);
+                    self.sel_anchor = Some((a, 0));
+                    self.sel_cursor = Some((a, self.cols.saturating_sub(1)));
                 }
             } else if resp.double_clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let (r, c) = cell_at(p);
                     if let Some((c0, c1)) = self.word_range_at(r, c) {
-                        self.sel_anchor = Some((r, c0));
-                        self.sel_cursor = Some((r, c1));
+                        let a = self.abs_of_view(r);
+                        self.sel_anchor = Some((a, c0));
+                        self.sel_cursor = Some((a, c1));
                     }
                 }
             } else if resp.clicked() && !self.sb_dragging {
