@@ -127,13 +127,13 @@ pub fn view_context_menu(resp: &egui::Response) {
                 "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
                  · 写入操作需当面确认\n\
                  · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
-                 · 多机共用一台 AI 服务器时：终端右键「启用 AI 配对」，请求只回本电脑",
+                 · 多机共用一台 AI 服务器时：配对标识会在会话空闲时自动注入，请求只回本电脑",
                 "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
                  read/write files.\n\
                  · Writes need on-screen confirmation\n\
                  · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
-                 · Sharing one AI server: right-click \"Enable AI pairing\" so requests only \
-                 reach THIS computer",
+                 · Sharing one AI server: the pairing token is auto-injected once the session \
+                 goes idle, so requests only reach THIS computer",
             ))
             .clicked()
         {
@@ -143,7 +143,7 @@ pub fn view_context_menu(resp: &egui::Response) {
 
         // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的 socket
         // 会堆在一起、代理无从区分谁是谁（见 store::mcp_pairing_token）。iShell 终端会话会
-        // 自动注入它（export ISHELL_MCP_TOKEN，也可右键「启用 AI 配对」重注），多数情况无需
+        // 在空闲时自动注入它（export ISHELL_MCP_TOKEN），多数情况无需
         // 手动配置；只有 AI 跑在 iShell 终端之外时才需要把下面这行填进那份 AI 的配置。
         if mcp_on {
             let token = crate::store::mcp_pairing_token();

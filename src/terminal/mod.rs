@@ -110,8 +110,6 @@ pub struct Terminal {
     /// 最近一次用户键盘输入的时刻（Text/Key/Paste/IME）：自动注入类操作（MCP 配对
     /// export）必须等用户停笔，否则注入字符会插进用户正在输入的命令里
     last_input_at: Option<std::time::Instant>,
-    /// 右键菜单「启用 AI 配对」请求：App 取走后往该终端注入 export ISHELL_MCP_TOKEN
-    pair_request: bool,
     /// 待上报的终端通知（BEL 响铃 / OSC 9 / OSC 777 notify），由 App 每帧取走渲染浮层
     notices: Vec<TermNotice>,
     /// URL / 关键字高亮的行内容缓存（key=行内容哈希）：命中后跳过每帧逐行的正则/关键字
@@ -179,7 +177,6 @@ impl Terminal {
             local_scroll_accum: 0.0,
             last_output_at: None,
             last_input_at: None,
-            pair_request: false,
             notices: Vec::new(),
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
@@ -278,11 +275,6 @@ impl Terminal {
     /// 取走待上报的终端通知（BEL / OSC 9 / OSC 777），供 App 渲染通知浮层。
     pub fn take_notices(&mut self) -> Vec<TermNotice> {
         std::mem::take(&mut self.notices)
-    }
-
-    /// 取走「启用 AI 配对」请求（右键菜单触发）：App 据此注入 export ISHELL_MCP_TOKEN。
-    pub fn take_pair_request(&mut self) -> bool {
-        std::mem::take(&mut self.pair_request)
     }
 
     /// 远端输出是否已静止至少 `d`（None=连接后尚未有输出，视为静止）。
@@ -788,24 +780,9 @@ impl Terminal {
                 }
                 ui.close();
             }
-            // 启用 AI 配对：往本终端注入 export ISHELL_MCP_TOKEN——此后在本终端启动的 AI
-            // （及其 ishell-mcp 子进程）自动携带配对标识，多客户端共用 AI 服务器时请求
-            // 只回本电脑、不打扰他人。需要已开启「允许 AI 通过 MCP 控制终端」。
-            let mcp_on = crate::store::load_mcp_consent();
-            if ui
-                .add_enabled(
-                    mcp_on,
-                    egui::Button::new(crate::i18n::tr("启用 AI 配对（防多机串台）", "Enable AI pairing")),
-                )
-                .on_hover_text(crate::i18n::tr(
-                    "注入配对标识：在本终端启动的 AI 只操作本电脑。多机共用一台 AI 服务器时必做",
-                    "Inject pairing token: AI started here only controls THIS computer. Required when several computers share one AI server",
-                ))
-                .clicked()
-            {
-                self.pair_request = true;
-                ui.close();
-            }
+            // 「启用 AI 配对」曾经在这里。已去掉：配对 token 由 App 在会话空闲时自动注入
+            // （见 layout_body 的自动注入分支），不需要用户自己在菜单里点一下——那一项只是
+            // 把同一件事又摆到用户面前，还得由他判断"现在能不能点"。
             ui.separator();
             // 终端配色：多套主题（深/浅/近白/柔和深/经典浅），选中即全局同步并存盘
             ui.menu_button(crate::i18n::tr("终端配色", "Terminal theme"), |ui| {

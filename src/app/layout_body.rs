@@ -142,30 +142,6 @@ impl App {
                         s.osc7_confirm = true;
                     }
                 }
-                // 右键菜单「启用 AI 配对」：立即注入配对 token（不等 2s 静止窗口——用户显式点的）。
-                // 仍拒绝：挂起 AI 命令/哨兵（expect_echo 会覆盖吞除）、或终端疑似忙碌（注入会
-                // 打进 vim/REPL 等前台程序）。
-                if s.terminal.take_pair_request() && !s.ai_owned {
-                    if s.pending_ai_run.is_some() || s.terminal.ai_capture_pending() {
-                        s.status = crate::i18n::tr(
-                            "AI 命令正在执行，稍后再启用配对",
-                            "AI command in flight; retry pairing later",
-                        )
-                        .into();
-                    } else if s.terminal.appears_busy() {
-                        // 文案只说「有前台程序在跑」，不再说「请回到 shell 提示符」——用户点
-                        // 这个菜单时人就在提示符前，那句建议既做不到也自相矛盾。
-                        s.status = crate::i18n::tr(
-                            "终端里有前台程序在运行，配对注入会被它吃掉；等它结束后再启用配对",
-                            "A foreground program is running; it would swallow the pairing \
-                             injection. Enable pairing after it exits",
-                        )
-                        .into();
-                    } else {
-                        inject_mcp_token(s);
-                        s.mcp_token_injected = true;
-                    }
-                }
                 // MCP 配对 token 自动注入：多台电脑共用同一台 AI 服务器时，让本会话里启动的
                 // AI（及其 ishell-mcp 子进程）自动携带配对标识——MCP 请求经既有的 token 匹配
                 // 精确路由回本电脑，不再弹窗打扰其他人（未注入时维持原有「多实例弹窗选择」）。
