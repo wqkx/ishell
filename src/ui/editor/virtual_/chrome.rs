@@ -1,6 +1,8 @@
 use egui::RichText;
 
-use super::super::find::{build_find_regex, find_widget, goto_widget, FindOut};
+use super::super::find::{
+    build_find_regex, find_widget, goto_widget, nav_match, rebuild_matches, FindOut,
+};
 use super::super::Editor;
 use super::edit::{v_apply, v_insert};
 use super::geom::{v_line_of, v_line_range};
@@ -183,8 +185,22 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                 } else {
                     ed.replace.clone()
                 };
+                let at = a;
+                let rep_end = a + rep.len();
                 v_apply(ed, a, b - a, &rep);
-                ed.pending_scroll = Some(v_line_of(ed, ed.vcaret));
+                // VSCode 行为：替换后立即选中**下一处**匹配——光标落回匹配范围内，
+                // 计数即时刷新为「第 X 项」；此前光标停在被替换文本末尾（不在任何匹配内），
+                // 计数退化为总数，用户得再点一次「下一个」才恢复。
+                ed.find_sig = 0; // 强制 rebuild_matches 重算（签名里含内容版本）
+                rebuild_matches(ed);
+                if let Some((na, nb)) = nav_match(&ed.find_matches, rep_end.saturating_sub(1), true)
+                {
+                    ed.vsel = Some(na);
+                    ed.vcaret = nb;
+                    ed.pending_scroll = Some(v_line_of(ed, nb));
+                } else {
+                    ed.pending_scroll = Some(v_line_of(ed, ed.vcaret));
+                }
             }
             FindOut::ReplaceAll(newc) => {
                 let old = ed.content.len();

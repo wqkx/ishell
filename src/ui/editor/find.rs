@@ -40,7 +40,7 @@ pub(super) fn build_find_regex(
 }
 
 /// 按需重算全部匹配（字节范围）；缓存签名（查找词+选项+内容长度）不变则跳过。
-fn rebuild_matches(ed: &mut Editor) {
+pub(super) fn rebuild_matches(ed: &mut Editor) {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ed.find.hash(&mut h);
@@ -68,7 +68,11 @@ fn rebuild_matches(ed: &mut Editor) {
     }
 }
 
-fn nav_match(matches: &[(usize, usize)], caret: usize, forward: bool) -> Option<(usize, usize)> {
+pub(super) fn nav_match(
+    matches: &[(usize, usize)],
+    caret: usize,
+    forward: bool,
+) -> Option<(usize, usize)> {
     if matches.is_empty() {
         return None;
     }
@@ -79,10 +83,13 @@ fn nav_match(matches: &[(usize, usize)], caret: usize, forward: bool) -> Option<
             .copied()
             .or_else(|| matches.first().copied())
     } else {
+        // 反向必须以匹配**终点**判定：跳转后光标停在所选匹配的末尾（vcaret = b），
+        // 若按起点 `a < caret` 判定，当前匹配的起点永远小于光标——每按「上一个」
+        // 都命中自己、原地不动。`b < caret` 跳过光标所在的匹配，落到真正的上一处。
         matches
             .iter()
             .rev()
-            .find(|&&(a, _)| a < caret)
+            .find(|&&(_, b)| b < caret)
             .copied()
             .or_else(|| matches.last().copied())
     }
@@ -386,4 +393,30 @@ pub(super) fn find_widget(
                 });
         });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nav_match;
+
+    /// 「上一个」必须跳过光标所在的匹配（跳转后光标停在匹配末尾）：
+    /// 此前按起点 `a < caret` 判定会命中自己，表现为「上一个不管用」。
+    #[test]
+    fn nav_prev_skips_match_under_caret() {
+        let m = [(10, 15), (20, 25), (30, 35)];
+        // 光标在 [20,25] 末尾（选中该项后的落点）→ 上一个应到 [10,15]
+        assert_eq!(nav_match(&m, 25, false), Some((10, 15)));
+        // 光标在 [20,25] 起点 → 同样是上一处（当前项视为已选中）
+        assert_eq!(nav_match(&m, 20, false), Some((10, 15)));
+        // 光标在两匹配之间 → 最近的前一处
+        assert_eq!(nav_match(&m, 28, false), Some((20, 25)));
+        // 光标在匹配内部 → 上一处（与 VSCode 一致）
+        assert_eq!(nav_match(&m, 22, false), Some((10, 15)));
+        // 文首 → 回绕到最后一处
+        assert_eq!(nav_match(&m, 0, false), Some((30, 35)));
+        // 「下一个」行为不变
+        assert_eq!(nav_match(&m, 25, true), Some((30, 35)));
+        assert_eq!(nav_match(&m, 35, true), Some((10, 15))); // 回绕到首
+        assert_eq!(nav_match(&[], 5, false), None);
+    }
 }
