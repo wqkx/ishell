@@ -393,7 +393,7 @@ pub(super) fn file_table(
     table_rows::render_table_rows(
         ui,
         state,
-        &entries,
+        entries,
         &cwd,
         &favs,
         has_clip,
@@ -567,13 +567,13 @@ pub(super) fn file_table(
                 }
             }
             Menu::Copy(idx) => {
-                let items = clip_targets(state, &entries, &cwd, idx);
+                let items = clip_targets(state, entries, &cwd, idx);
                 if !items.is_empty() {
                     actions.push(FileAction::ClipCopy { items });
                 }
             }
             Menu::Cut(idx) => {
-                let items = clip_targets(state, &entries, &cwd, idx);
+                let items = clip_targets(state, entries, &cwd, idx);
                 if !items.is_empty() {
                     actions.push(FileAction::ClipCut { items });
                 }
@@ -601,7 +601,7 @@ pub(super) fn file_table(
         });
     }
 
-    table_tail::apply_table_tail_actions(ui, state, actions, &entries, &cwd, &bg, drop_move);
+    table_tail::apply_table_tail_actions(ui, state, actions, entries, &cwd, &bg, drop_move);
 
     // 弹簧式拖拽导航：在 Up / 文件夹上持续悬停则进入目标目录，并在指针处双闪
     spring_navigate(ui, state, spring_target, actions);
