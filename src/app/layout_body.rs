@@ -153,9 +153,12 @@ impl App {
                         )
                         .into();
                     } else if s.terminal.appears_busy() {
+                        // 文案只说「有前台程序在跑」，不再说「请回到 shell 提示符」——用户点
+                        // 这个菜单时人就在提示符前，那句建议既做不到也自相矛盾。
                         s.status = crate::i18n::tr(
-                            "终端正忙，请回到 shell 提示符后再启用配对",
-                            "Terminal busy; return to a shell prompt, then enable pairing",
+                            "终端里有前台程序在运行，配对注入会被它吃掉；等它结束后再启用配对",
+                            "A foreground program is running; it would swallow the pairing \
+                             injection. Enable pairing after it exits",
                         )
                         .into();
                     } else {

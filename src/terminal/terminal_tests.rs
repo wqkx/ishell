@@ -586,3 +586,38 @@ fn bell_notice_previews_cursor_line() {
     assert_eq!(ns[0].title, None);
     assert_eq!(ns[0].body, "1. Yes  2. No");
 }
+
+/// 空闲的 zsh 提示符**不是**「忙」。
+///
+/// zsh 的 zle 每进一次行编辑就发 `smkx`（含 DECCKM `\e[?1h`）、接受命令行时才发 `rmkx`
+/// 复位——实测序列 `?1h ?2004h` → `?1l ?2004l`。DECCKM 曾被当作 `appears_busy` 的"忙"信号，
+/// 于是对 zsh 用户语义完全反了：空闲判忙、真跑命令判闲，MCP 自动配对因此永久静默失效。
+/// 这条测试把语义钉住，防止 DECCKM 被当成全屏程序信号加回来。
+#[test]
+fn idle_zsh_prompt_is_not_busy() {
+    let mut t = Terminal::new();
+    // zsh 进入 zle：应用光标 + 括号粘贴，正是空闲提示符的状态
+    t.feed(b"\x1b[?1h\x1b=\x1b[?2004h user@host:~$ ");
+    // feed 会置 last_output_at，而「1s 内有输出」本身就算忙——清掉它，才测得到屏幕模式那条
+    // 规则（否则这条测试无论 DECCKM 算不算忙都会挂，验不出任何东西）。
+    t.last_output_at = None;
+    assert!(
+        !t.appears_busy(),
+        "空闲 zsh 提示符被判成忙 —— DECCKM 又被当成忙信号了"
+    );
+}
+
+/// 反向确认没留检测缺口：全屏程序（备用屏）和鼠标上报仍然算忙。
+/// 同样清掉 `last_output_at`，确保判定来自屏幕模式而不是「刚有输出」。
+#[test]
+fn fullscreen_and_mouse_reporting_still_count_as_busy() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1049h"); // 备用屏：vim/htop/tmux
+    t.last_output_at = None;
+    assert!(t.appears_busy(), "备用屏必须算忙");
+
+    let mut t2 = Terminal::new();
+    t2.feed(b"\x1b[?1000h"); // 鼠标上报
+    t2.last_output_at = None;
+    assert!(t2.appears_busy(), "鼠标上报必须算忙");
+}

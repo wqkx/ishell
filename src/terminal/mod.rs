@@ -297,18 +297,27 @@ impl Terminal {
         self.input_line.is_empty() && self.last_input_at.is_none_or(|t| t.elapsed() >= d)
     }
 
-    /// 终端是否**疑似**正在运行前台任务。用于「在终端打开当前目录」等注入式操作：
-    /// 任务运行时注入的字符会被前台程序吃掉或排队到任务结束后才执行，行为不可预期。
+    /// 终端是否**疑似**正在运行前台任务。用于「在终端打开当前目录」「注入 MCP 配对 token」
+    /// 等注入式操作：任务运行时注入的字符会被前台程序吃掉或排队到任务结束后才执行，
+    /// 行为不可预期。
+    ///
     /// 信号（启发式，无法确知远端状态，按可靠性组合）：
-    /// - 备用屏 / 应用光标 / 鼠标上报：vim/htop/tmux 等全屏程序的确切信号
+    /// - 备用屏 / 鼠标上报：vim/htop/tmux 等全屏程序的确切信号
     /// - 最近 1s 内有输出：主屏上 gromacs/编译等持续刷日志的任务
+    ///
     /// 长时间无输出的静默任务无法检测——注入方应配合「再次点击强制执行」的逃生口。
+    ///
+    /// ⚠ **不要**把应用光标模式（DECCKM，`\e[?1h`）加回来。它曾经在这里，是个反向指标：
+    /// zsh 的 zle 每次进入行编辑都发 `smkx`（xterm-256color 的 `smkx=\E[?1h\E=` 含 DECCKM），
+    /// 接受命令行时才发 `rmkx` 复位。实测一次 zsh 交互会话的私有模式序列正是
+    /// `?1h ?2004h`（进提示符）→ `?1l ?2004l`（开始跑命令）——**空闲提示符下恒置位、真正跑
+    /// 命令时反而复位**，语义与"忙"完全相反。带上它等于让所有 zsh 用户的注入类功能永久失效
+    /// （MCP 自动配对更是静默失效，因为那条路径没有强制逃生口）。bash 默认 readline
+    /// `enable-keypad` 为关，从不发 smkx，所以这个 bug 只在 zsh 用户身上出现。
+    /// 全屏程序（vim/htop/tmux）另有 `alternate_screen` 覆盖，去掉 DECCKM 不留检测缺口。
     pub fn appears_busy(&self) -> bool {
         let s = self.parser.screen();
-        if s.alternate_screen()
-            || s.application_cursor()
-            || s.mouse_protocol_mode() != vt100::MouseProtocolMode::None
-        {
+        if s.alternate_screen() || s.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
             return true;
         }
         self.last_output_at
