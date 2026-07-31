@@ -21,15 +21,19 @@ impl App {
         let mut remove_one: Option<usize> = None;
         let mut clear_all = false;
 
-        // 贴着**终端内容区**摆，而不是贴着窗口边。矩形由 layout_body 每帧记下
-        // （CentralPanel 的 `ui.max_rect()`，已扣掉它自己的内外边距），再留一道 GAP，
-        // 卡片就不会压在终端边框上。没画终端时（欢迎页）退回窗口内容区。
-        const GAP: f32 = 12.0;
+        // 摆在**终端内容区之内**，而不是贴着窗口边。矩形由 layout_body 每帧记下
+        // （CentralPanel 的 `ui.max_rect()`，已扣掉它自己的内外边距）。没画终端时
+        // （欢迎页）退回窗口内容区。
+        //
+        // 纵向留得比横向多：上方紧挨着的是标签栏和它右端那排按钮（新建/传输/设置等），
+        // 卡片贴太高就会压在它们身上——那些按钮在终端区之外，本来就不该被浮层盖住。
+        const GAP_X: f32 = 12.0;
+        const GAP_Y: f32 = 24.0;
         let content = ctx.content_rect();
         let area = self.term_rect.unwrap_or(content);
         // Area::anchor 的偏移是相对窗口内容区的，把目标位置换算成相对其右上角的偏移。
-        let dx = (area.right() - GAP) - content.right();
-        let dy = (area.top() + GAP) - content.top();
+        let dx = (area.right() - GAP_X) - content.right();
+        let dy = (area.top() + GAP_Y) - content.top();
         egui::Area::new(egui::Id::new("ai_notice_overlay"))
             .anchor(egui::Align2::RIGHT_TOP, [dx, dy])
             .order(egui::Order::Foreground)
