@@ -9,6 +9,9 @@ pub struct FilePanelState {
     pub root: String,
     /// 右栏当前目录（绝对路径）
     pub cwd: String,
+    /// 会话家目录（首个 listing 解析到的路径；SFTP "." 与本机 ListDir(".") 都落到 HOME）。
+    /// 供路径栏展开 `~`——SFTP 协议本身不做 shell 的 tilde 展开，必须在 UI 侧替换。
+    pub home: String,
     /// 路径 -> 该目录的条目（树与右栏共用）
     pub listings: HashMap<String, Vec<FileEntry>>,
     /// canon 路径 -> 已应用的最大目录列举序号（gen）。同一目录可能有多个 List 请求在飞
@@ -29,10 +32,12 @@ pub struct FilePanelState {
     pub selected: HashSet<usize>,
     /// 区间选择的锚点行
     pub anchor: Option<usize>,
-    /// 正在原地重命名的行（含输入缓冲与是否首帧）
+    /// 正在原地重命名的条目（含输入缓冲与是否首帧）。
+    /// 按**完整路径**标识而非行索引：索引在列表刷新/排序变化/切换目录后会指向别的条目
+    /// （曾致重命名作用于错误文件、编辑框出现在其他目录的同号行）。
     pub renaming: Option<Renaming>,
-    /// 待触发重命名（行索引, 单击时刻）——延时以避开双击打开
-    pub pending_rename: Option<(usize, f64)>,
+    /// 待触发重命名（条目完整路径, 单击时刻）——延时以避开双击打开
+    pub pending_rename: Option<(String, f64)>,
     /// 路径编辑模式（双击路径栏进入），Some 时显示输入框
     pub path_edit: Option<String>,
     /// 路径编辑框是否需要请求焦点（仅进入时一次）
@@ -106,9 +111,9 @@ pub enum SortKey {
     Mtime,
 }
 
-/// 原地重命名状态。
+/// 原地重命名状态。以条目完整路径为标识（渲染时按路径匹配行，与列表刷新/排序解耦）。
 pub struct Renaming {
-    pub idx: usize,
+    pub full: String,
     pub buf: String,
     pub init: bool,
     /// 行内重命名输入框的 IME 组字范围（与 dialog_ime 同理，绕开 egui Commit 门）

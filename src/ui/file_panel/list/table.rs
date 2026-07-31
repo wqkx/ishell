@@ -433,12 +433,13 @@ pub(super) fn file_table(
         state.pending_rename = None;
     }
 
-    // 延时重命名触发：单击后 0.4s 内无双击则进入重命名
-    if let Some((i, t)) = state.pending_rename {
+    // 延时重命名触发：单击后 0.4s 内无双击则进入重命名。
+    // 按完整路径匹配（pending 存的是路径）：期间列表刷新/排序/切目录都不会错位到别的条目。
+    if let Some((path, t)) = state.pending_rename.clone() {
         if now - t > 0.40 {
-            if let Some(e) = entries.get(i) {
+            if let Some(e) = entries.iter().find(|e| join_path(&cwd, &e.name) == path) {
                 state.renaming = Some(Renaming {
-                    idx: i,
+                    full: path.clone(),
                     buf: e.name.clone(),
                     init: true,
                     ime: None,

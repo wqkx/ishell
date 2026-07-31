@@ -179,7 +179,7 @@ pub(super) fn render_table_rows(
                             // 重命名中：显示输入框（默认选中后缀前的主名）
                             // 必须走 ime_singleline：与新建文件夹相同，绕开 egui 0.34 fcitx Commit 门
                             // （否则中文只能输一次 / 第二次无法组字）。
-                            let renaming_here = matches!(&state.renaming, Some(r) if r.idx == i);
+                            let renaming_here = matches!(&state.renaming, Some(r) if r.full == full);
                             if renaming_here {
                                 if let Some(r) = &mut state.renaming {
                                     let te_id = "file_rename_inline";
@@ -293,8 +293,9 @@ pub(super) fn render_table_rows(
                                 && state.selected.contains(&i)
                                 && state.renaming.is_none();
                             if was_sole && !mod_ctrl && !mod_shift {
-                                // 已选中的行再次单击 -> 计划重命名（延时以避开双击）
-                                state.pending_rename = Some((i, now));
+                                // 已选中的行再次单击 -> 计划重命名（延时以避开双击）；
+                                // 存完整路径而非索引，刷新/排序后不错位
+                                state.pending_rename = Some((full.clone(), now));
                             } else {
                                 clicks.push(i);
                             }

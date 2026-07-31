@@ -56,7 +56,8 @@ pub(super) async fn upload(
                             crate::i18n::Lang::Zh => format!("寻找可用文件名失败：{e}"),
                             crate::i18n::Lang::En => format!("Failed to find an available name: {e}"),
                         },
-                        refresh_dir: None,
+                        // 目录状态未知（可能已不存在），刷新一致化
+                        refresh_dir: Some(remote_dir.clone()),
                     });
                     return;
                 }
@@ -73,7 +74,8 @@ pub(super) async fn upload(
                     crate::i18n::Lang::Zh => format!("检查远端目标是否存在失败：{e}"),
                     crate::i18n::Lang::En => format!("Failed to check remote target: {e}"),
                 },
-                refresh_dir: None,
+                // 同上：刷新目标目录，暴露「目录已消失/权限变化」等真实状态
+                refresh_dir: Some(remote_dir.clone()),
             });
             return;
         }
@@ -206,7 +208,13 @@ pub(super) async fn upload(
                 id,
                 ok: false,
                 message,
-                refresh_dir: None,
+                // 失败（非用户取消）：目标目录可能已被外部删除/改动、或残留部分写入，
+                // 刷新做一致化，避免面板继续显示陈旧缓存（含此前乐观插入的占位）。
+                refresh_dir: if cancel.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    Some(remote_dir.clone())
+                },
             });
         }
     }
@@ -346,7 +354,14 @@ pub(super) async fn upload_from_mcp(
             id,
             ok: false,
             message: format!("Upload failed: {error}"),
-            refresh_dir: None,
+            // 失败也刷新目标父目录：写入/换入可能已部分生效，且目标目录可能已不存在
+            refresh_dir: Some(
+                remote_path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+                    .unwrap_or("/")
+                    .to_string(),
+            ),
         }),
     }
 }

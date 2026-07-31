@@ -511,9 +511,10 @@ async fn mkdir(path: &str, sink: &UiSink) {
                 crate::i18n::Lang::Zh => format!("已创建目录：{path}"),
                 crate::i18n::Lang::En => format!("Created dir: {path}"),
             },
-            Some(parent),
+            Some(parent.clone()),
         ),
-        Err(e) => op_err(sink, e.to_string()),
+        // 失败也刷新父目录：回收前端乐观插入的占位条目（insert_new），并一致化陈旧缓存
+        Err(e) => op_done(sink, format!("操作失败：{e}"), Some(parent)),
     }
 }
 
@@ -532,11 +533,16 @@ async fn create_file(path: &str, sink: &UiSink) {
                 crate::i18n::Lang::Zh => format!("已创建文件：{path}"),
                 crate::i18n::Lang::En => format!("Created file: {path}"),
             },
-            Some(parent),
+            Some(parent.clone()),
         ),
-        Err(_) => op_err(
+        Err(_) => op_done(
             sink,
-            crate::i18n::tr("同名文件已存在或无法创建", "File exists or cannot be created").into(),
+            format!(
+                "{}{}",
+                crate::i18n::tr("操作失败：", "Operation failed: "),
+                crate::i18n::tr("同名文件已存在或无法创建", "File exists or cannot be created")
+            ),
+            Some(parent),
         ),
     }
 }
@@ -554,9 +560,9 @@ async fn chmod(path: &str, mode: u32, sink: &UiSink) {
                     crate::i18n::Lang::Zh => format!("已修改权限：{:o}", mode & 0o777),
                     crate::i18n::Lang::En => format!("Chmod: {:o}", mode & 0o777),
                 },
-                Some(parent),
+                Some(parent.clone()),
             ),
-            Err(e) => op_err(sink, e.to_string()),
+            Err(e) => op_done(sink, format!("操作失败：{e}"), Some(parent)),
         }
     }
     #[cfg(not(unix))]
@@ -578,9 +584,11 @@ async fn rename(from: &str, to: &str, sink: &UiSink) {
                 crate::i18n::Lang::Zh => format!("已重命名为：{to}"),
                 crate::i18n::Lang::En => format!("Renamed to: {to}"),
             },
-            Some(parent),
+            Some(parent.clone()),
         ),
-        Err(e) => op_err(sink, e.to_string()),
+        // 失败刷新源父目录：重命名目标在不同目录时目标侧由下次进入时再拉，此处至少
+        // 保证源目录一致化（行内重命名不乐观改列表，但列表可能因其他原因陈旧）
+        Err(e) => op_done(sink, format!("操作失败：{e}"), Some(parent_of(from))),
     }
 }
 

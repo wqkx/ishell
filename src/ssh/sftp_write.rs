@@ -250,6 +250,14 @@ pub(in crate::ssh) async fn handle_fs_op(
     cmd: UiCommand,
     sink: &UiSink,
 ) {
+    // 记下操作目标路径：失败（Err）时刷新其父目录做一致化——前端「新建」会乐观插入
+    // 占位条目（insert_new），失败若不刷新，幽灵条目将永久残留在列表里。
+    let op_path = match &cmd {
+        UiCommand::Mkdir(p) | UiCommand::CreateFile(p) => Some(p.clone()),
+        UiCommand::Chmod { path, .. } => Some(path.clone()),
+        UiCommand::Rename { from, .. } => Some(from.clone()),
+        _ => None,
+    };
     let result: anyhow::Result<(String, Option<String>)> = match cmd {
         UiCommand::Mkdir(path) => {
             let parent = remote_parent(&path);
@@ -412,9 +420,19 @@ pub(in crate::ssh) async fn handle_fs_op(
             message,
             refresh_dir,
         }),
-        Err(e) => sink.send(WorkerEvent::Error(match crate::i18n::current() {
-            crate::i18n::Lang::Zh => format!("操作失败：{e}"),
-            crate::i18n::Lang::En => format!("Operation failed: {e}"),
-        })),
+        Err(e) => {
+            let message = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("操作失败：{e}"),
+                crate::i18n::Lang::En => format!("Operation failed: {e}"),
+            };
+            match op_path {
+                // 失败也可能改变了目录内容（部分创建/目标状态未知），刷新父目录一致化
+                Some(p) => sink.send(WorkerEvent::OpDone {
+                    message,
+                    refresh_dir: Some(remote_parent(&p)),
+                }),
+                None => sink.send(WorkerEvent::Error(message)),
+            }
+        }
     }
 }

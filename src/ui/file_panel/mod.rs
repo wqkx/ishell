@@ -155,12 +155,43 @@ impl FilePanelState {
             if !same {
                 self.selected.clear();
                 self.anchor = None;
+                // 重命名目标在新列表中已不存在（被外部删除/改名）→ 撤销编辑态；
+                // 仍存在则按路径继续匹配，行号变化不影响
+                if let Some(r) = &self.renaming {
+                    if !entries.iter().any(|e| join_path(&path, &e.name) == r.full) {
+                        self.renaming = None;
+                    }
+                }
+                if let Some((p, _)) = &self.pending_rename {
+                    if !entries.iter().any(|e| join_path(&path, &e.name) == *p) {
+                        self.pending_rename = None;
+                    }
+                }
             }
         }
         self.listings.insert(path.clone(), entries);
         if self.cwd.is_empty() {
-            self.cwd = path;
+            self.cwd = path.clone();
         }
+        // 首个列举路径即会话家目录（init_files 只请求 "."，由服务端/本机解析到 HOME）
+        if self.home.is_empty() {
+            self.home = path;
+        }
+    }
+
+    /// 展开路径开头的 `~` 为会话家目录（`~` 或 `~/...`；`~user/...` 不支持，原样返回）。
+    /// home 尚未解析到时原样返回（随后 List 会报「无效」并正确落占位，不会误拼路径）。
+    pub fn expand_tilde(&self, p: &str) -> String {
+        let t = p.trim();
+        if t == "~" {
+            return if self.home.is_empty() { p.to_string() } else { self.home.clone() };
+        }
+        if let Some(rest) = t.strip_prefix("~/") {
+            if !self.home.is_empty() {
+                return format!("{}/{rest}", self.home.trim_end_matches('/'));
+            }
+        }
+        p.to_string()
     }
 
     /// 列目录失败（无效/无权限路径）由 App 调用：标记该路径无效，并写入空列表占位
@@ -278,6 +309,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Ve
             }
         }
         state.nav_prev = state.cwd.clone();
+        // 目录切换统一清掉重命名状态：虽然 Renaming 已按路径标识（新目录不会误匹配），
+        // 但留着它切回原目录时编辑框会莫名复活——重命名是「即期」操作，离开即放弃。
+        state.renaming = None;
+        state.pending_rename = None;
     }
 
     // 拖入文件 -> 上传到当前目录

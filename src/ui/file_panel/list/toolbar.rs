@@ -581,8 +581,9 @@ pub(super) fn toolbar(
         });
     ui.add_space(2.0);
     if let Some(p) = bc_nav {
-        // 规范化：去掉末尾多余的 "/"（否则与 worker 返回的规范路径不匹配，无法进入）
-        state.cwd = normalize_path(&p);
+        // 展开 `~`（SFTP 不做 shell 的 tilde 展开）并规范化末尾多余的 "/"
+        // （否则与 worker 返回的规范路径不匹配，无法进入）
+        state.cwd = normalize_path(&state.expand_tilde(&p));
         state.selected.clear();
         // 「粘贴并转到」等跳转必须退出路径编辑态：否则若此前处于编辑态，路径栏会继续显示
         // 旧的编辑框内容，造成「列表变了、面包屑没变」的错觉。
