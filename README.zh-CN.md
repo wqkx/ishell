@@ -194,23 +194,26 @@ cargo run --release
 | `send_input` / `interrupt` | 交互输入；Ctrl+C（同时释放卡住的挂起命令） |
 | `read_screen` / `read_history` | 可见屏 / 完整回滚历史 |
 | `write_file` / `read_file` | 小文本经 JSON 内联读写（大文件勿用） |
-| `copy_to_remote` / `copy_from_remote` | 流式传输（字节不进 MCP JSON）；下载落在 **iShell 本机** |
+| `copy_to_remote` / `copy_from_remote` | 流式单文件传输（字节不进 MCP JSON）；`local_path` 在 **跑 ishell-mcp 的机器** |
+| `copy_between_sessions` | 两个已打开远端会话之间复制单文件 |
 
 ### 远端回控（反向转发）
 
-开关打开后，连上 SSH 时会把本机 MCP socket 反向转发到远端 `~/.ishell-mcp-<随机>.sock`（走现有加密通道，无额外端口）。远端的 `ishell-mcp` 会自动探测，一般无需配路径。
+开关打开后，连上 SSH 时会把本机 MCP socket 反向转发到远端 `~/.ishell-mcp/mcp-<随机>.sock`（走现有加密通道，无额外端口）。远端的 `ishell-mcp` 会自动探测，一般无需配路径。
 
-**谁能 SSH 到那台服务器，谁就能经转发 socket 触达这边的 iShell——只对你信任的服务器开这个开关。**
+**谁能 SSH 到那台服务器（同账号），谁就能经转发 socket 触达这边的 iShell——只对你信任的服务器开这个开关。** 写入用户会话仍要当面确认；能碰到 socket 本身就能发起绑定/只读请求。
 
 ### ⚠️ 多机共用一台 AI 服务器（必读）
 
-典型场景：AI（Claude Code 等）跑在一台共享服务器上，多台电脑各自用 iShell 连过去。此时各电脑的转发 socket 会堆在同一远端目录，代理默认只能弹窗让人点选——**容易打扰别人，点错还会改到别人的环境**。
+典型场景：AI 跑在共享服务器上，多台电脑各自用 iShell 连过去。转发 socket 会堆在同一远端目录，未配对时代理只能弹窗让人点选——**打扰别人，点错还会改到别人的环境**。
 
 正确做法（任选其一，推荐 1）：
 
-1. **在本机 iShell 终端右键 →「启用 AI 配对」**（或等会话空闲时的自动注入）。会向该 shell `export ISHELL_MCP_TOKEN=…`；之后在此终端里启动的 AI / `ishell-mcp` 只绑定你这台电脑，不再弹窗打扰他人。
-2. AI 不在 iShell 终端里跑时：设置里「复制配对配置」，把 `ISHELL_MCP_TOKEN=…` 写进那份 AI 的 MCP server 环境变量。
-3. 未配对时仍可点确认窗选机器，但**共享账号下务必配对**，避免误操作他人会话。
+1. **在本机 iShell 终端右键 →「启用 AI 配对」**（或等会话空闲时的自动注入）。向该 shell `export ISHELL_MCP_TOKEN=…`；此后在此终端启动的 AI / `ishell-mcp` 只绑定你这台电脑。
+2. AI 不在 iShell 终端里跑时：设置里「复制配对配置」，把 `ISHELL_MCP_TOKEN=…` 写进该 AI 的 MCP server 环境变量。
+3. 未配对仍可点确认窗选机器，但**共享账号下务必配对**。
+
+配对 token 会进入远端 shell 环境（及同 UID 可见的 `/proc/*/environ`）——这是共享账号上启用配对的代价；不要把 token 发到不可信主机，也不要贴进聊天。
 
 手动隧道（不用自动转发时）：
 
@@ -221,15 +224,15 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 ### 其它注意
 
-- 执行命令、写文件等**写入操作**需你在窗口当面确认；读列表/读屏一般不需要。
-- AI 跑的命令会实时出现在对应标签里，等同于人在打字——确认前请看清目标会话。
-- 版本不一致时代理会明确报错，不会静默乱连。
+- 对**用户自己的会话**写入（跑命令、写文件等）需当面确认一次；`ai_owned` 专用会话与只读一般不需要。
+- AI 命令实时出现在目标标签——确认前看清会话。
+- GUI 与 `ishell-mcp` 必须同版本；升级后重跑 `install-mcp.sh`。
 
 ## 🔒 安全
 
 - **主机密钥校验**：known_hosts 校验，未知主机首次连接弹窗确认 SHA256 指纹（TOFU）并写入；密钥改变则拒绝告警。
 - **保存密码加密**：以 ChaCha20-Poly1305 加密落盘，密钥优先系统钥匙串，不可用时回退本地 `~/.config/ishell/key`（0600）。
-- **MCP**：默认关闭；仅本机 socket；写入需确认；多机共享 AI 服务器时请用配对 token，避免串台。
+- **MCP**：默认关闭；仅本机 socket（`0600`）；对用户会话的写入需确认；多机共享 AI 服务器时用配对 token 避免串台。配对 token 以 `0600` 落盘，且不会经 Identify 回传给任意连上 socket 的人。
 
 ## 📄 许可证
 

@@ -142,19 +142,25 @@ impl App {
                         s.osc7_confirm = true;
                     }
                 }
-                // 右键菜单「启用 AI 配对」：立即注入配对 token（不等静止窗口——用户显式点的，
-                // 他自己知道此刻提示符闲置；与 OSC 7 注入同款策略），并标记本会话已配对。
-                // 有挂起的 AI 命令/哨兵捕获时拒绝：expect_echo 会覆盖哨兵回显吞除状态。
+                // 右键菜单「启用 AI 配对」：立即注入配对 token（不等 2s 静止窗口——用户显式点的）。
+                // 仍拒绝：挂起 AI 命令/哨兵（expect_echo 会覆盖吞除）、或终端疑似忙碌（注入会
+                // 打进 vim/REPL 等前台程序）。
                 if s.terminal.take_pair_request() && !s.ai_owned {
-                    if s.pending_ai_run.is_none() && !s.terminal.ai_capture_pending() {
-                        inject_mcp_token(s);
-                        s.mcp_token_injected = true;
-                    } else {
+                    if s.pending_ai_run.is_some() || s.terminal.ai_capture_pending() {
                         s.status = crate::i18n::tr(
                             "AI 命令正在执行，稍后再启用配对",
                             "AI command in flight; retry pairing later",
                         )
                         .into();
+                    } else if s.terminal.appears_busy() {
+                        s.status = crate::i18n::tr(
+                            "终端正忙，请回到 shell 提示符后再启用配对",
+                            "Terminal busy; return to a shell prompt, then enable pairing",
+                        )
+                        .into();
+                    } else {
+                        inject_mcp_token(s);
+                        s.mcp_token_injected = true;
                     }
                 }
                 // MCP 配对 token 自动注入：多台电脑共用同一台 AI 服务器时，让本会话里启动的

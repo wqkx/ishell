@@ -126,7 +126,17 @@ pub enum McpReqKind {
     /// 服务器当成尚未失效的旧注册而拒绝），而且同一个 iShell 对同一台远端主机开两个会话时，
     /// 会在那台主机上注册出**两个通向同一个实例**的 socket。所以路径既不稳定、也不唯一，
     /// 代理必须按这里返回的 id 去重和认人。
+    ///
+    /// **绝不**在响应里回传配对 token（见 `McpReqResult::Instance::token`）：反向转发后任何
+    /// 能连上该 socket 的人都能发 Identify，泄露 token 等于让对方跳过多机选择弹窗、静默绑
+    /// 定到你的电脑。
     Identify,
+    /// v3：带配对 token 探测实例。仅当 `token` 与对端 `mcp_pairing_token` 一致时返回
+    /// `Instance`，否则 `Err`。代理用它在多机场景过滤候选，且对端**不会**把真实 token
+    /// 放进响应——证明方向是「调用方出示密钥」，不是「服务器公布密钥」。
+    IdentifyPair {
+        token: String,
+    },
     /// 请求把发起方这个 AI 客户端绑定到本 iShell 实例——弹窗让用户当面确认。
     ///
     /// 只在代理发现**多个不同实例**时才会发出：代理向每一个实例各发一条，于是每个 iShell
@@ -267,6 +277,7 @@ impl McpReqKind {
             // 连接级握手，根本不涉及任何会话（连 session_uid 字段都没有），自然谈不上授权。
             // Bind 本身就是一个弹窗确认，再套一层会话授权既无对象也无意义。
             McpReqKind::Identify
+            | McpReqKind::IdentifyPair { .. }
             | McpReqKind::Bind
             // 只读：不往 shell 里发东西，也不改远端。
             | McpReqKind::ListSessions
@@ -374,6 +385,9 @@ mod write_gate_tests {
             McpReqKind::CloseSession { session_uid: 7 },
             // 连接级握手，不涉及任何会话。
             McpReqKind::Identify,
+            McpReqKind::IdentifyPair {
+                token: "x".into(),
+            },
             McpReqKind::Bind,
         ];
         for kind in cases {
@@ -396,8 +410,8 @@ pub struct McpRequest {
     /// 被另一个实例复用、反向转发目录里混进了别人的 socket——请求都到不了错误的实例身上。
     /// 隔离不能指望发起方自觉。
     ///
-    /// 只有 `Identify` 允许填 `None`（那时还不知道对面是谁）。其余请求带 `None` 一律拒绝：
-    /// 「没点名」不等于「随便谁都行」，那正是要根除的静默走错实例。
+    /// 只有 `Identify` / `IdentifyPair` 允许填 `None`（那时还不知道对面是谁）。其余请求带
+    /// `None` 一律拒绝：「没点名」不等于「随便谁都行」，那正是要根除的静默走错实例。
     pub instance: Option<String>,
     pub kind: McpReqKind,
 }
@@ -406,7 +420,7 @@ impl McpRequest {
     /// 这条请求是不是该由标识为 `own_instance` 的实例来执行。
     ///
     /// 规则只有三条，故意写得极简——这是隔离的最后一道闸，越简单越查得清：
-    ///   1. `Identify` 永远放行：它就是用来问「你是谁」的，那时对方当然还填不出名字；
+    ///   1. `Identify` / `IdentifyPair` 永远放行：用来问「你是谁」/证明配对，那时对方还填不出名字；
     ///   2. 点名点中自己 → 放行；
     ///   3. 其余（点了别人、或压根没点名）→ 拒绝。
     ///
@@ -415,7 +429,7 @@ impl McpRequest {
     /// 每个实例的会话 uid 都从 1 开始，走错实例不会报错，只会安静地操作错的机器。
     pub fn is_addressed_to(&self, own_instance: &str) -> bool {
         match (&self.kind, &self.instance) {
-            (McpReqKind::Identify, _) => true,
+            (McpReqKind::Identify | McpReqKind::IdentifyPair { .. }, _) => true,
             (_, Some(named)) => named == own_instance,
             (_, None) => false,
         }
@@ -536,6 +550,13 @@ mod addressing_tests {
     #[test]
     fn identify_is_the_only_unaddressed_request_allowed() {
         assert!(req(None, McpReqKind::Identify).is_addressed_to("me"));
+        assert!(req(
+            None,
+            McpReqKind::IdentifyPair {
+                token: "t".into()
+            }
+        )
+        .is_addressed_to("me"));
         // 连 Bind 都不例外：代理只会在 Identify 问出 id 之后才发 Bind，填得出名字。
         assert!(!req(None, McpReqKind::Bind).is_addressed_to("me"));
         assert!(req(Some("me"), McpReqKind::Bind).is_addressed_to("me"));
@@ -547,7 +568,9 @@ mod addressing_tests {
 /// 与自身比对，不一致即拒绝并提示重新部署——根治「升了 GUI 忘换代理 → 静默错」这类问题。
 ///
 /// v2：`McpReqResult::Instance` 新增 `token` 字段（多机配对，见 `store::mcp_pairing_token`）。
-pub const MCP_PROTOCOL_VERSION: u32 = 2;
+/// v3：新增 `IdentifyPair`；`Instance.token` **不再回传真实配对 token**（恒为空），配对改由
+/// 调用方出示 token 证明，避免反向转发 socket 上的 Identify 把密钥泄露给同机其它人。
+pub const MCP_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {
@@ -559,10 +582,9 @@ pub enum McpReqResult {
         /// → serde 默认落 0 → 必与当前版本不符 → 触发代理侧的「重新部署」提示（正是所需）。
         #[serde(default)]
         proto_version: u32,
-        /// 对端 iShell 的**配对 token**（`store::mcp_pairing_token()`，每安装稳定唯一）。
-        /// 多台电脑共用同一 AI 服务器账号时，代理据环境变量 `ISHELL_MCP_TOKEN` 只绑定 token
-        /// 匹配的实例，避免请求串到别人的电脑上。旧版 iShell 不带此字段 → serde 默认空串；
-        /// 空串表示「这台 iShell 没启用配对」，代理侧对空 token 的实例不做 token 过滤。
+        /// **已废弃（v3+ 恒为空）**。v2 曾在此回传配对 token，但反向转发后任何人都能
+        /// `Identify` 读走密钥并静默绑定——v3 起真实配对改走 `IdentifyPair`（调用方出示
+        /// token）。字段保留仅为线格式兼容；代理不得再依赖此字段做过滤。
         #[serde(default)]
         token: String,
     },
@@ -603,15 +625,13 @@ pub struct McpResponse {
 mod tests {
     use super::*;
 
-    /// 配对 token 的线协议契约：新格式原样往返；旧格式（没有 token 字段）经 serde 默认落成
-    /// 空串——代理侧对空 token 的实例不做过滤，从而向后兼容。这条协议横跨 GUI 与代理两个
-    /// crate（本文件各编一遍），字段名/默认值任何一处对不上都会在这里被抓住。
+    /// v3：Instance.token 仅作线格式兼容字段（恒空）；旧 JSON 缺省该字段时也落成空串。
     #[test]
-    fn instance_result_carries_token_and_defaults_empty_for_legacy() {
+    fn instance_token_field_defaults_empty() {
         let inst = McpReqResult::Instance {
             id: "1234-abcd".into(),
             proto_version: MCP_PROTOCOL_VERSION,
-            token: "deadbeef".into(),
+            token: String::new(),
         };
         let json = serde_json::to_string(&inst).unwrap();
         let back: McpReqResult = serde_json::from_str(&json).unwrap();
@@ -623,15 +643,27 @@ mod tests {
             } => {
                 assert_eq!(id, "1234-abcd");
                 assert_eq!(proto_version, MCP_PROTOCOL_VERSION);
-                assert_eq!(token, "deadbeef");
+                assert_eq!(token, "");
             }
             other => panic!("应解析回 Instance，实际：{other:?}"),
         }
-        // 旧格式（无 token 字段）：token 默认空串。
         let legacy = r#"{"Instance":{"id":"x","proto_version":1}}"#;
         match serde_json::from_str::<McpReqResult>(legacy).unwrap() {
             McpReqResult::Instance { token, .. } => assert_eq!(token, ""),
             other => panic!("应解析回 Instance，实际：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn identify_pair_round_trips() {
+        let kind = McpReqKind::IdentifyPair {
+            token: "aabbccdd".into(),
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: McpReqKind = serde_json::from_str(&json).unwrap();
+        match back {
+            McpReqKind::IdentifyPair { token } => assert_eq!(token, "aabbccdd"),
+            other => panic!("应解析回 IdentifyPair，实际：{other:?}"),
         }
     }
 

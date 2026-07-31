@@ -194,23 +194,26 @@ Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal se
 | `send_input` / `interrupt` | Interactive input; Ctrl+C (also frees a stuck pending command) |
 | `read_screen` / `read_history` | Visible screen / full scrollback |
 | `write_file` / `read_file` | Small text inlined over JSON (don't use for large files) |
-| `copy_to_remote` / `copy_from_remote` | Streaming transfer (bytes stay out of MCP JSON); downloads land on the **iShell host** |
+| `copy_to_remote` / `copy_from_remote` | Streaming single-file transfer (bytes stay out of MCP JSON); `local_path` is on the **ishell-mcp host** |
+| `copy_between_sessions` | Copy a single file between two open remote sessions |
 
 ### Remote reach-back (reverse forward)
 
-With the switch on, each SSH connect reverse-forwards the local MCP socket to `~/.ishell-mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). Remote `ishell-mcp` auto-discovers it — usually no path to configure.
+With the switch on, each SSH connect reverse-forwards the local MCP socket to `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). Remote `ishell-mcp` auto-discovers it — usually no path to configure.
 
-**Anyone who can SSH into that server can reach this iShell through the forwarded socket — enable only for servers you trust.**
+**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Writes into your own sessions still need on-screen confirmation; socket reach alone can initiate bind / read requests.
 
 ### ⚠️ Several computers sharing one AI server (read this)
 
-Typical setup: the AI runs on a shared server; several people connect with their own iShell. Forwarded sockets then pile up on that server, and the proxy can only ask someone to click which window — **that bothers others, and a wrong click can change someone else's environment**.
+Typical setup: the AI runs on a shared server; several people connect with their own iShell. Forwarded sockets then pile up on that server, and without pairing the proxy can only ask someone to click which window — **that bothers others, and a wrong click can change someone else's environment**.
 
 Do one of these (prefer 1):
 
-1. **In your iShell terminal: right-click → “Enable AI pairing”** (or wait for idle auto-inject). That shell gets `export ISHELL_MCP_TOKEN=…`; AI / `ishell-mcp` started there binds only to *your* computer — no more pick-a-window for others.
+1. **In your iShell terminal: right-click → “Enable AI pairing”** (or wait for idle auto-inject). That shell gets `export ISHELL_MCP_TOKEN=…`; AI / `ishell-mcp` started there binds only to *your* computer.
 2. If the AI is *not* started inside an iShell terminal: Settings → “Copy pairing config”, put `ISHELL_MCP_TOKEN=…` into that AI's MCP server env.
-3. Without pairing you can still click the consent dialog, but **on a shared account you should pair** so you never hit the wrong machine.
+3. Without pairing you can still click the consent dialog, but **on a shared account you should pair**.
+
+The pairing token ends up in the remote shell environment (and same-UID `/proc/*/environ`) — that's the cost of pairing on a shared account. Don't put the token on untrusted hosts or paste it into chat.
 
 Manual tunnel (skip auto reverse-forward):
 
@@ -221,15 +224,15 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 ### Other notes
 
-- **Writes** (run command, write file, …) need your on-screen confirmation; listing/reading usually don't.
+- Writes into **your** sessions need one on-screen confirmation; `ai_owned` sessions and reads usually don't.
 - AI commands appear live in the target tab — check which session you're approving.
-- Version mismatch fails loudly; the proxy won't silently bind the wrong build.
+- GUI and `ishell-mcp` must be the same version; re-run `install-mcp.sh` after upgrades.
 
 ## 🔒 Security
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
-- **MCP**: off by default; local socket only; writes need confirmation; when several computers share one AI server, use the pairing token so requests never hit the wrong machine.
+- **MCP**: off by default; local socket only (`0600`); writes into your sessions need confirmation; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and is never returned by Identify to whoever can reach the socket.
 
 ## 📄 License
 

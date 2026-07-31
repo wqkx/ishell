@@ -95,10 +95,13 @@ async fn connect_timeout(
     tokio::time::timeout(CONNECT_WRITE_TIMEOUT, UnixStream::connect(path)).await
 }
 
-/// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时——一律返回
-/// `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
+/// 连一条 socket 问出对端 iShell 的实例标识。连不上、对面不是 iShell、超时、配对不符——
+/// 一律返回 `None`：目录里躺着崩溃残留的死 socket 文件是常态，不值得报错，跳过就是了。
+///
+/// `prove_token`：`Some` 时发 `IdentifyPair`（只有 token 匹配的实例会答 Ok）；`None` 时发
+/// 普通 `Identify`（发现全部实例，供多机弹窗选择）。v3 起对端**不再**在响应里回传 token。
 #[cfg(unix)]
-async fn identify(path: &std::path::Path) -> Option<(String, u32, String)> {
+async fn identify(path: &std::path::Path, prove_token: Option<&str>) -> Option<(String, u32)> {
     let stream = match connect_timeout(path).await {
         Ok(Ok(s)) => s,
         // 连接被拒（ECONNREFUSED）= 这个 socket 文件没有监听者：反向转发的 SSH 连接已断（或
@@ -112,8 +115,14 @@ async fn identify(path: &std::path::Path) -> Option<(String, u32, String)> {
         }
         _ => return None,
     };
-    match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
-        Ok(McpReqResult::Instance { id, proto_version, token }) => Some((id, proto_version, token)),
+    let kind = match prove_token {
+        Some(t) => McpReqKind::IdentifyPair {
+            token: t.to_string(),
+        },
+        None => McpReqKind::Identify,
+    };
+    match exchange(stream, None, kind, CONNECT_WRITE_TIMEOUT).await {
+        Ok(McpReqResult::Instance { id, proto_version, .. }) => Some((id, proto_version)),
         _ => None,
     }
 }
@@ -141,11 +150,18 @@ fn check_proto_version(peer: u32) -> Result<(), String> {
 ///
 /// 同一个实例可能从多条路径答话（见 `candidate_paths`），这里不去重——去重规则由调用方定：
 /// `bind_instance` 要按 id 收敛成实例列表，`connect_bound` 只关心某个特定 id。
+///
+/// `prove_token`：见 [`identify`]——配对场景只收匹配者，避免多机弹窗串台。
 #[cfg(unix)]
-async fn identify_all() -> Vec<(String, u32, String, std::path::PathBuf)> {
+async fn identify_all(prove_token: Option<String>) -> Vec<(String, u32, std::path::PathBuf)> {
     let mut set = tokio::task::JoinSet::new();
     for path in candidate_paths() {
-        set.spawn(async move { identify(&path).await.map(|(id, ver, token)| (id, ver, token, path)) });
+        let prove = prove_token.clone();
+        set.spawn(async move {
+            identify(&path, prove.as_deref())
+                .await
+                .map(|(id, ver)| (id, ver, path))
+        });
     }
     let mut out = Vec::new();
     while let Some(joined) = set.join_next().await {
@@ -162,7 +178,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
     // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
     if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
         let path = std::path::PathBuf::from(p);
-        let (id, ver, _token) = identify(&path).await.ok_or_else(|| {
+        let (id, ver) = identify(&path, None).await.ok_or_else(|| {
             format!(
                 "ISHELL_MCP_SOCKET 指定的 socket 连不上、或对面不是 iShell：{}",
                 path.display()
@@ -171,25 +187,20 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         check_proto_version(ver)?;
         return Ok((id, path));
     }
-    // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就**只认
-    // token 匹配的实例**，请求绝不会串到别人的电脑上；没设则保持原有「多实例弹窗让用户选」
-    // 的行为，完全向后兼容。见 `store::mcp_pairing_token`。
+    // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就用
+    // `IdentifyPair` **只认匹配的实例**，请求绝不会串到别人的电脑上；没设则保持原有
+    // 「多实例弹窗让用户选」。见 `store::mcp_pairing_token`。
     let want_token = std::env::var("ISHELL_MCP_TOKEN")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let mut found: Vec<(String, u32, String, std::path::PathBuf)> = Vec::new();
-    for (id, ver, token, path) in identify_all().await {
+    let mut found: Vec<(String, u32, std::path::PathBuf)> = Vec::new();
+    for (id, ver, path) in identify_all(want_token.clone()).await {
         // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
-        if !found.iter().any(|(known, _, _, _)| *known == id) {
-            found.push((id, ver, token, path));
+        if !found.iter().any(|(known, _, _)| *known == id) {
+            found.push((id, ver, path));
         }
-    }
-    if let Some(want) = &want_token {
-        // 只保留 token 匹配的实例。空 token 的实例（未启用配对的旧版/别家 iShell）一律不匹配，
-        // 不会被误绑。
-        found.retain(|(_, _, token, _)| token == want);
     }
     match found.len() {
         0 => Err(if want_token.is_some() {
@@ -203,19 +214,13 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         1 => {
             // 唯一实例（配了 token 时是唯一匹配者）：直接绑定，不弹窗——token 本身就是操作者
             // 的显式配对意图，无需再点一次窗口。
-            let (id, ver, _token, path) = found.pop().expect("上一行刚确认只有一个");
+            let (id, ver, path) = found.pop().expect("上一行刚确认只有一个");
             check_proto_version(ver)?;
             Ok((id, path))
         }
         // 多个：没配 token 时是正常的「多开」，交给用户点窗口选；配了 token 却仍多个，说明有
         // 两台 iShell 撞了同一个 token（极罕见），同样用弹窗消歧，让用户当面确定。
-        _ => choose_instance(
-            found
-                .into_iter()
-                .map(|(id, ver, _token, path)| (id, ver, path))
-                .collect(),
-        )
-        .await,
+        _ => choose_instance(found).await,
     }
 }
 
@@ -277,7 +282,8 @@ async fn connect_bound() -> Result<(UnixStream, String), String> {
     }
     // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。在候选里重新找回**同一个
     // 实例**——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上。
-    for (found_id, _ver, _token, path) in identify_all().await {
+    // 路径刷新只按已绑定的 instance id 找回，不再带配对 token（绑定关系已在进程内确定）。
+    for (found_id, _ver, path) in identify_all(None).await {
         if found_id == id {
             if let Ok(Ok(stream)) = connect_timeout(&path).await {
                 *PATH_CACHE.lock().unwrap() = Some(path);
@@ -682,9 +688,9 @@ pub struct CopyToRemoteArgs {
 pub struct CopyFromRemoteArgs {
     /// list_sessions 返回的会话 uid
     pub session_uid: u64,
-    /// 远端绝对路径（文件或目录）
+    /// 远端绝对路径（仅单个文件；目录请逐文件拉取或用 tar/rsync）
     pub remote_path: String,
-    /// 本地目标绝对路径，文件名可以和 remote_path 不同；所在目录不存在会自动创建
+    /// 运行 ishell-mcp 的调用方机器上的目标绝对路径；所在目录不存在会自动创建
     pub local_path: String,
     #[serde(default = "default_copy_timeout_ms")]
     pub timeout_ms: u64,
@@ -1038,49 +1044,26 @@ impl IshellMcp {
 }
 
 #[tool_handler(
-    instructions = "涉及“在远端服务器上执行命令/查看文件/运行程序”这类需求时，优先用这个\
-                    工具集操作 iShell 已打开的终端会话，而不是自己直接跑 `ssh host cmd`——\
-                    直接开 ssh 会丢失用户已经建立的会话上下文（cwd、环境变量、shell 历史、\
-                    已登录状态），也不会显示给用户看。只有确认 iShell 没在跑、或用户明确要求\
-                    你自己开一条独立 ssh 连接时，才退回直接用 ssh。\
-                    用法：list_sessions 看有哪些已打开的会话，重点看 ai_owned 字段 → **默认给自己\
-                    开一个专用会话**，而不是接管列表里现成的：用 list_saved_connections 核对有哪些\
-                    已保存连接、名字怎么拼，再用 open_session（首次使用某条连接会让用户当面确认）\
-                    新开一个（这类会话 ai_owned=true，只读，仅供你操作，用户不能往里打字，你怎么\
-                    折腾都不会干扰到他）→ run_command 执行命令并等待完成 → 超时用 poll_run 续等\
-                    （不会重发命令）→ 遇到 run_command/poll_run 覆盖不到的交互式提示（sudo 密码、\
-                    vim/REPL 里继续输入）用 send_input 直接发原始按键 → read_screen 看当前屏幕\
-                    （适合 vim/top 等交互式程序）→ read_history 看这个会话从头到现在的完整历史\
-                    （不止当前一屏）→ interrupt 发 Ctrl+C 中断。用 open_session 开的会话不再需要\
-                    时应主动用 close_session 关掉（只能关自己开的，不能关用户自己的会话），\
-                    避免一直占着连接。\
-                    不要直接拿用户自己打开的会话（list_sessions 里 ai_owned=false 的那些）执行命令\
-                    或写文件：他随时可能正在里面敲字，两路输入会在同一个 shell 里交织，轻则互相\
-                    打断、重则把 run_command 用来判断命令结束的哨兵标记搅乱，也容易误操作他正在\
-                    做的事。确实必须复用他那个会话的上下文时（比如要用他已经 cd 到的目录、已经\
-                    激活的 venv、已经 sudo 的状态），照常发调用即可——iShell 会弹窗让用户当面授权\
-                    一次，同意后这个会话不再询问；用户拒绝或 5 分钟没响应你会收到报错，那就改用 \
-                    open_session 开自己的会话。只读类操作（read_screen/read_history/read_file）\
-                    不受此限，随时可以用来看用户会话里发生了什么。\
-                    需要同步/生成远端文件时用 write_file/read_file（复用 SFTP，不用另开 scp）。\
-                    长任务不要用 `sleep N` 反复轮询——run_command/poll_run 的 timeout_ms 最长支持\
-                    24 小时，直接传一个足够长的值（比如几十分钟），一次调用等到跑完更省事。\
-                    如果确实想先把任务丢到后台、之后再回来看结果（比如中途还要做别的事），\
-                    不要写 `sleep N; tail log` 这种盲等轮询，改用“等进程退出”的写法一步等到位：\
-                    `nohup cmd > out.log 2>&1 & echo $! > pid; ...`启动后，之后另开一次\
-                    run_command 执行 `tail --pid=$(cat pid) -f /dev/null; cat out.log`，\
-                    这一条命令会一直阻塞到目标进程真正退出才返回，配合足够大的 timeout_ms 用，\
-                    不需要猜测任务要跑多久、也不需要一遍遍轮询。注意 `&` 的优先级低于 `&&`：\
-                    写成 `md5sum f && nohup cmd &` 会把整条 `&&` 链一起丢进后台，md5sum \
-                    这半段的输出/退出码是否已经落地就变得不确定；要后台的只应该是 `nohup` \
-                    这一条命令本身，前面需要立刻确认结果的步骤请用 `;` 分成独立语句，或拆成两次\
-                    run_command 调用确认。\
-                    如果某次 run_command/poll_run 的返回意外丢失或报错（比如工具调用本身失败），\
-                    不确定命令有没有跑完时不要盲目重试有副作用的命令——先用 poll_run（不填 run_id）\
-                    去认领那个会话当前挂起的运行，能问出真实状态。\
-                    run_command 是往真实交互 shell 打字，不是独立执行通道：前台在跑全屏程序/\
-                    REPL，或命令本身语法不完整（未闭合引号、续行、heredoc）时完成检测可能永远\
-                    等不到，见 run_command 自己的详细说明。"
+    instructions = "远端命令/文件优先用本工具集操作 iShell 会话，不要另开 `ssh host cmd`（会丢\
+                    cwd/环境/历史，用户也看不见）。仅当 iShell 未运行或用户明确要求独立 ssh 时例外。\n\
+                    流程：list_sessions（看 ai_owned）→ **默认 open_session 开专用会话**\
+                    （先 list_saved_connections 核对名字；首次连接需用户确认；ai_owned=true，\
+                    用户不能打字）→ run_command 执行 → 超时用 poll_run 续等（不重发）→ 交互提示\
+                    （sudo/vim/REPL）用 send_input → 看屏用 read_screen，看完整历史用 \
+                    read_history → 中断用 interrupt → 用完 close_session（只能关自己开的）。\n\
+                    不要默认往 ai_owned=false（用户自己的会话）里写：两路输入会交织并破坏完成\
+                    检测。必须复用其 cwd/venv/sudo 状态时照常调用——会弹窗让用户授权一次，同意后\
+                    该会话本进程内不再问；拒绝或超时则改 open_session。只读\
+                    （read_screen/read_history/read_file/list_*）不需授权。\n\
+                    文件：小文本用 write_file/read_file；大文件/二进制用 copy_to_remote/\
+                    copy_from_remote（字节不进 JSON；local_path 在**运行 ishell-mcp 的机器**上）；\
+                    两台已打开远端之间用 copy_between_sessions。均为单文件，目录请逐文件或 \
+                    tar/rsync。\n\
+                    长任务：timeout_ms 最长 24h，直接等完；勿 sleep 轮询。后台任务用 \
+                    `tail --pid=… -f /dev/null` 等退出。`&` 优先级低于 `&&`，勿把前置步骤一并\
+                    丢进后台。工具调用结果丢失时先 poll_run（可省略 run_id）确认状态，勿盲目重试\
+                    有副作用的命令。run_command 是往交互 shell 打字：前台全屏/REPL/未闭合语法时\
+                    完成检测可能挂起，先 read_screen。"
 )]
 impl ServerHandler for IshellMcp {}
 

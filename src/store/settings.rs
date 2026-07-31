@@ -222,17 +222,17 @@ fn mcp_pairing_token_path() -> Option<PathBuf> {
     Some(config_dir()?.join("mcp_pairing_token"))
 }
 
-/// 本安装的 **MCP 配对 token**：稳定、每安装唯一、跨重启不变。首次调用时自动生成并持久化。
+/// 本安装的 **MCP 配对 token**：稳定、每安装唯一、跨重启不变。首次调用时自动生成并以
+/// `0600` 持久化。
 ///
 /// 用途：多台电脑共用同一台 AI 服务器的同一个账号时，各家 iShell 反向转发的 socket 会全堆在
-/// 同一个目录里，代理无从区分谁是谁（同账号、可能同来源 IP、进程树不相干，服务器上没有任何
-/// 自动信号能配对）。于是让每个操作者把自己这台 iShell 的 token 通过环境变量 `ISHELL_MCP_TOKEN`
-/// 填进自己那份 Claude Code 的 MCP server 配置——代理只绑定 token 匹配的那个实例，请求就只会
-/// 落到发起者自己的电脑上，互不串台。
+/// 同一个目录里，代理无从区分谁是谁。操作者把本机 token 放进环境变量 `ISHELL_MCP_TOKEN`
+/// （终端自动注入，或手动写进 AI 的 MCP server env）——代理用 `IdentifyPair` **出示**该
+/// token 过滤实例，请求只落到自己电脑。对端**不会**在 Identify 响应里回传 token（防同账号
+/// 他人连上转发 socket 后偷密钥并静默绑定）。
 ///
 /// 与 [`mcp_instance_id`] 的关键区别：instance_id 是**每进程**的、随进程生灭（用于同机多开
-/// 去重），**绝不持久化**；pairing token 是**每安装**的、必须**稳定持久**——它要被贴进 Claude
-/// 配置里，iShell 重启后若变了，操作者的配对就失效了。二者用途正交，不能相互替代。
+/// 去重），**绝不持久化**；pairing token 是**每安装**的、必须**稳定持久**。二者用途正交。
 pub fn mcp_pairing_token() -> String {
     static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOKEN
@@ -241,22 +241,66 @@ pub fn mcp_pairing_token() -> String {
                 // 配置目录不可用（极罕见）：退化为本进程内一致的随机值，至少本次运行可用。
                 return gen_pairing_token();
             };
-            // 已有则用已有的（持久稳定是这个 token 的全部意义）。
+            // 已有则用已有的（持久稳定是这个 token 的全部意义）。顺手收紧权限：旧版本可能
+            // 以默认 umask 写成 0644，同机其它账户可读走密钥。
             if let Ok(s) = std::fs::read_to_string(&p) {
                 let s = s.trim().to_string();
                 if !s.is_empty() {
+                    #[cfg(unix)]
+                    super::crypto::restrict_perms(&p);
                     return s;
                 }
             }
-            // 首次：生成并落盘。写盘失败会经 write_setting 冒泡提示，但本次仍返回该值。
+            // 首次：生成并以 0600 落盘（与主密钥同级敏感——能让代理跳过绑定弹窗）。
             let token = gen_pairing_token();
             if let Some(d) = p.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
-            write_setting(&p, &token);
+            write_pairing_token_file(&p, &token);
             token
         })
         .clone()
+}
+
+/// 以 0600 写入配对 token（unix）；失败时仍经 WRITE_ERRORS 冒泡。
+fn write_pairing_token_file(path: &std::path::Path, token: &str) {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let write = (|| {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(token.as_bytes())?;
+            let _ = f.sync_all();
+            drop(f);
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            log::warn!("写入配对 token 失败 {}：{e}", path.display());
+            let msg = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("⚠ 设置未能保存（{}）：{e}", path.display()),
+                crate::i18n::Lang::En => {
+                    format!("⚠ Failed to save setting ({}): {e}", path.display())
+                }
+            };
+            if let Ok(mut v) = WRITE_ERRORS.lock() {
+                if v.len() < 16 {
+                    v.push(msg);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        write_setting(path, token);
+    }
 }
 
 /// 生成一个 16 位十六进制随机 token（8 字节熵）。熵源不可用（极罕见）时退化到纳秒时间戳。

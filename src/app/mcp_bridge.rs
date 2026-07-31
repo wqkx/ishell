@@ -806,18 +806,42 @@ async fn handle_conn(
     }
     // Identify 在连接层就地回答：它只是「你是谁」，不碰任何会话状态，没必要绕一趟 App
     // 帧循环。代理发现多个实例时会向每一个都问一次，让这条路尽量轻。
-    if matches!(req.kind, McpReqKind::Identify) {
-        reply(
-            &mut w,
-            id,
-            Ok(McpReqResult::Instance {
-                id: own.to_string(),
-                proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
-                token: crate::store::mcp_pairing_token(),
-            }),
-        )
-        .await;
-        return;
+    // Identify / IdentifyPair：连接层就地回答，不进 App 帧循环。
+    // v3 起 Instance.token 恒为空——真实配对由 IdentifyPair 让调用方出示 token 证明，
+    // 绝不在响应里回传（反向转发后同账号他人也能连上 socket 发 Identify）。
+    match &req.kind {
+        McpReqKind::Identify => {
+            reply(
+                &mut w,
+                id,
+                Ok(McpReqResult::Instance {
+                    id: own.to_string(),
+                    proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+                    token: String::new(),
+                }),
+            )
+            .await;
+            return;
+        }
+        McpReqKind::IdentifyPair { token } => {
+            let ok = token == &crate::store::mcp_pairing_token();
+            reply(
+                &mut w,
+                id,
+                if ok {
+                    Ok(McpReqResult::Instance {
+                        id: own.to_string(),
+                        proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+                        token: String::new(),
+                    })
+                } else {
+                    Err("pairing token mismatch".into())
+                },
+            )
+            .await;
+            return;
+        }
+        _ => {}
     }
     let is_caller_upload = matches!(&req.kind, McpReqKind::CopyToRemoteFromCaller { .. });
     if is_caller_upload {
@@ -1603,8 +1627,8 @@ impl App {
             });
         };
         match req.kind {
-            // Identify 在连接层就地答完了（见 handle_conn），根本到不了这里。
-            McpReqKind::Identify => {
+            // Identify / IdentifyPair 在连接层就地答完了（见 handle_conn），根本到不了这里。
+            McpReqKind::Identify | McpReqKind::IdentifyPair { .. } => {
                 send_err(resp_tx, "Identify 不应该到达 App 层".into());
             }
             McpReqKind::Bind => {
