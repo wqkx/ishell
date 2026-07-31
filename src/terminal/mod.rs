@@ -28,6 +28,15 @@ const FONT_SIZE: f32 = 14.0;
 /// 回看缓冲行数（固定默认，不做配置以免右键菜单过重；够覆盖常见回看需求）。
 const DEFAULT_SCROLLBACK: usize = 5000;
 
+/// 一条待上报的「终端通知」：BEL 响铃（Claude Code 等 AI CLI 等待确认/任务完成时的
+/// 标准提示信号）或 OSC 9 / OSC 777 notify 序列。
+pub struct TermNotice {
+    /// OSC 通知标题（BEL 时 None，由 App 层生成「响铃提醒」类标题）
+    pub title: Option<String>,
+    /// 正文/预览（OSC 通知正文；BEL 时为光标所在行的文本预览——确认菜单常显示在这行）
+    pub body: String,
+}
+
 pub struct Terminal {
     parser: vt100::Parser,
     cols: u16,
@@ -98,6 +107,8 @@ pub struct Terminal {
     local_scroll_accum: f32,
     /// 最近一次收到远端输出的时刻（feed 更新）：「是否疑似在跑前台任务」的判定信号之一
     last_output_at: Option<std::time::Instant>,
+    /// 待上报的终端通知（BEL 响铃 / OSC 9 / OSC 777 notify），由 App 每帧取走渲染浮层
+    notices: Vec<TermNotice>,
     /// 终端查询序列可能跨 SSH 数据块；暂存尚不能确定是否为完整查询的短尾。
     query_tail: Vec<u8>,
     /// resize 去抖：拖拽窗口时每帧尺寸都在变，若每帧都真正 resize（普通屏会序列化整缓冲+重建
@@ -158,6 +169,7 @@ impl Terminal {
             prev_focused: false,
             local_scroll_accum: 0.0,
             last_output_at: None,
+            notices: Vec::new(),
             query_tail: Vec::new(),
             prev_alt: false,
             sb_dragging: false,
@@ -248,6 +260,11 @@ impl Terminal {
     /// 请求下一帧让终端区域获得键盘焦点。
     pub fn request_focus(&mut self) {
         self.focus_req = true;
+    }
+
+    /// 取走待上报的终端通知（BEL / OSC 9 / OSC 777），供 App 渲染通知浮层。
+    pub fn take_notices(&mut self) -> Vec<TermNotice> {
+        std::mem::take(&mut self.notices)
     }
 
     /// 终端是否**疑似**正在运行前台任务。用于「在终端打开当前目录」等注入式操作：

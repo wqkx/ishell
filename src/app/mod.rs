@@ -145,6 +145,23 @@ pub struct App {
     /// worker（源读、目标写），单个会话的 `pending_file_op` 忙碌位不足以描述多阶段状态，
     /// 所以单独用这个列表跟踪（见 mcp_bridge.rs 的 `CrossCopyJob`）。
     cross_copy_jobs: Vec<mcp_bridge::CrossCopyJob>,
+    /// 终端通知浮层（BEL 响铃 / OSC 9/777：AI CLI 等待确认、任务完成、脚本通知）。
+    /// 右上角纵排，点击跳转对应会话，右键可逐条/全部删除。
+    ai_notices: Vec<AiNotice>,
+}
+
+/// 一条终端通知浮层卡片。
+pub struct AiNotice {
+    /// 来源会话 uid（点击时按它跳转）
+    pub session_uid: u64,
+    /// 来源会话标签名（卡片上显示，便于多会话时辨认）
+    pub session_title: String,
+    /// 标题（OSC 通知标题；BEL 时为「响铃提醒」）
+    pub title: String,
+    /// 正文/预览（OSC 通知正文；BEL 时为光标行文本预览）
+    pub body: String,
+    /// 收到时刻（egui time；同会话去抖与排序用）
+    pub at: f64,
 }
 
 impl App {
@@ -233,6 +250,7 @@ impl App {
             mcp_use_approved: std::collections::HashSet::new(),
             mcp_open_approved: std::collections::HashSet::new(),
             cross_copy_jobs: Vec::new(),
+            ai_notices: Vec::new(),
         };
 
         app.apply_demo_flags(cc);
@@ -487,6 +505,9 @@ impl eframe::App for App {
 
         // 顶部浮层提示（撤销结果等醒目反馈）
         self.toast_overlay(&ctx);
+
+        // 右上角终端通知浮层（AI CLI 响铃 / OSC 9/777）
+        self.ai_notice_overlay(&ctx);
 
         // 传输进度浮窗
         self.transfer_window(&ctx);

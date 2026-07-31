@@ -109,6 +109,32 @@ impl App {
             for (id, data) in s.pending.doc.drain(..) {
                 new_docs.push((s.uid, id, data));
             }
+            // 终端通知（BEL 响铃 / OSC 9/777）：AI CLI 等待确认或完成时提醒用户。
+            // 同会话 3 秒内的连续通知合并为最新一条（AI 连续响铃不刷屏）。
+            for n in s.terminal.take_notices() {
+                let now = self.ctx.input(|i| i.time);
+                let title = n.title.unwrap_or_else(|| {
+                    crate::i18n::tr("响铃提醒", "Bell").to_string()
+                });
+                let dup = self
+                    .ai_notices
+                    .iter()
+                    .rposition(|x| x.session_uid == s.uid && now - x.at < 3.0);
+                if let Some(i) = dup {
+                    let x = &mut self.ai_notices[i];
+                    x.title = title;
+                    x.body = n.body;
+                    x.at = now;
+                } else {
+                    self.ai_notices.push(super::AiNotice {
+                        session_uid: s.uid,
+                        session_title: s.title.clone(),
+                        title,
+                        body: n.body,
+                        at: now,
+                    });
+                }
+            }
             for x in s.pending.relay_source.drain(..) {
                 relay_source.push(x);
             }

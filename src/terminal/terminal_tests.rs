@@ -559,3 +559,30 @@ fn shift_select_via_keyboard() {
     t.shift_select(egui::Key::ArrowUp);
     assert_eq!(t.selected_text().unwrap(), "out1\nout2\nout3$");
 }
+
+/// OSC 9 / OSC 777 通知序列 → 产出待上报通知（AI CLI 通知 hook 的载体）。
+#[test]
+fn osc_notify_produces_notices() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]9;build finished\x07"); // BEL 终止
+    t.feed(b"\x1b]777;notify;Claude Code;Task complete\x1b\\"); // ST 终止
+    t.feed(b"\x1b]9;\x07"); // 空内容：忽略
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 2);
+    assert_eq!(ns[0].title, None);
+    assert_eq!(ns[0].body, "build finished");
+    assert_eq!(ns[1].title.as_deref(), Some("Claude Code"));
+    assert_eq!(ns[1].body, "Task complete");
+    assert!(t.take_notices().is_empty(), "取走后应清空");
+}
+
+/// BEL 响铃 → 生成通知，预览取光标所在行的提示文本（确认菜单常见于此）。
+#[test]
+fn bell_notice_previews_cursor_line() {
+    let mut t = Terminal::new();
+    t.feed(b"1. Yes  2. No\x07");
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 1);
+    assert_eq!(ns[0].title, None);
+    assert_eq!(ns[0].body, "1. Yes  2. No");
+}

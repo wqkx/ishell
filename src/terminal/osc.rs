@@ -60,6 +60,118 @@ pub(super) fn parse_osc7(data: &[u8]) -> Option<String> {
     result
 }
 
+/// 解析 OSC 通知序列，返回 (标题, 正文) 列表：
+/// - OSC 9  ：`ESC ] 9 ; <message> BEL|ST`（iTerm2/ConEmu 式，仅正文）
+/// - OSC 777：`ESC ] 777 ; notify ; <title> ; <body> BEL|ST`（urxvt 式，标题+正文）
+/// Claude Code 等 AI CLI 的通知 hook、以及 `printf '\e]9;done\a'` 类脚本都走这两类。
+pub(super) fn parse_osc_notify(data: &[u8]) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    for (seq_start, body_start, end) in osc_sequences(data) {
+        let payload = &data[body_start..end];
+        let _ = seq_start;
+        if let Some(rest) = payload.strip_prefix(b"9;") {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    out.push((None, s.to_string()));
+                }
+            }
+        } else if let Some(rest) = payload.strip_prefix(b"777;notify;") {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                let (title, body) = match s.split_once(';') {
+                    Some((t, b)) => (t.trim(), b.trim()),
+                    None => (s.trim(), ""),
+                };
+                if !title.is_empty() || !body.is_empty() {
+                    out.push((
+                        if title.is_empty() {
+                            None
+                        } else {
+                            Some(title.to_string())
+                        },
+                        body.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 枚举数据块里的完整 OSC 序列：(序列起始, 负载起始(ESC]x; 的 `x` 处), 负载结束(BEL/ST 前))。
+/// 不完整序列（无终止符）跳过——与 parse_osc7 的既有行为一致。
+fn osc_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 <= data.len() {
+        let Some(rel) = data[i..].windows(2).position(|w| w == b"\x1b]") else {
+            break;
+        };
+        let start = i + rel;
+        let body = start + 2;
+        let mut end = body;
+        while end < data.len() {
+            if data[end] == 0x07 || (data[end] == 0x1b && data.get(end + 1) == Some(&b'\\')) {
+                break;
+            }
+            end += 1;
+        }
+        if end >= data.len() {
+            break; // 不完整：等下一块（与 osc7 处理一致，直接放弃本次）
+        }
+        out.push((start, body, end));
+        i = end + 1;
+    }
+    out
+}
+
+/// 统计**转义序列之外**的 BEL（0x07）数量。OSC 序列本身以 BEL 终止（`ESC]9;...\x07`），
+/// 直接 `contains(0x07)` 会把通知序列的终止符误当成响铃。
+pub(super) fn count_bel(data: &[u8]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            0x1b => {
+                // 跳过整段转义序列：OSC（到 BEL/ST）、CSI（到终结字节）、ESC+单字节
+                match data.get(i + 1) {
+                    Some(b']') => {
+                        i += 2;
+                        while i < data.len() {
+                            if data[i] == 0x07 {
+                                i += 1;
+                                break;
+                            }
+                            if data[i] == 0x1b && data.get(i + 1) == Some(&b'\\') {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    Some(b'[') => {
+                        i += 2;
+                        while i < data.len() {
+                            let done = (0x40..=0x7e).contains(&data[i]);
+                            i += 1;
+                            if done {
+                                break;
+                            }
+                        }
+                    }
+                    _ => i += 2,
+                }
+            }
+            0x07 => {
+                n += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    n
+}
+
 /// 简单 percent 解码（%XX -> 字节）。
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();

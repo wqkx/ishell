@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use super::{
-    osc::parse_osc7,
+    osc::{count_bel, parse_osc7, parse_osc_notify},
     vt::{find_sub, incomplete_utf8_tail, serialize_row, strip_ansi_to_text},
     Terminal, DEFAULT_SCROLLBACK,
 };
@@ -217,6 +217,14 @@ impl Terminal {
         if let Some(p) = parse_osc7(bytes) {
             self.osc7_cwd = Some(p);
         }
+        // OSC 9/777 桌面通知（AI CLI 通知 hook、`printf '\e]9;done\a'` 类脚本）
+        for (title, body) in parse_osc_notify(bytes) {
+            self.notices.push(super::TermNotice { title, body });
+        }
+        // BEL 响铃：Claude Code 等 AI CLI 等待确认/任务完成时的标准提示信号。
+        // 只统计转义序列之外的 BEL（OSC 通知序列自身的 BEL 终止符不算响铃）。
+        // 预览在 process 之后取（那时响铃前的提示文本已上屏）。
+        let bel = count_bel(bytes) > 0;
         // 合并上次暂存的不完整 UTF-8 前缀，并把本次结尾不完整的多字节序列暂存到下次，
         // 避免一个中文字符被拆在两个数据块里导致乱码。
         let mut data = std::mem::take(&mut self.utf8_pending);
@@ -250,7 +258,37 @@ impl Terminal {
         }
         let replies = self.process_with_replies(bytes);
         self.ensure_cursor_after_alt();
+        if bel {
+            self.push_bel_notice();
+        }
         replies
+    }
+
+    /// BEL 响铃 → 生成一条待上报通知，预览取光标所在行文本（确认菜单/提示语常在这行）。
+    fn push_bel_notice(&mut self) {
+        // 光标行属于当前屏幕区：用户回看历史时 scrollback 偏移会让 cell() 读到
+        // 错误的历史行——临时归零偏移再读，读后恢复。
+        let saved = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(0);
+        let (row, _) = self.parser.screen().cursor_position();
+        let mut line = String::new();
+        let screen = self.parser.screen();
+        for col in 0..self.cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let ch = cell.contents();
+            line.push_str(if ch.is_empty() { " " } else { ch });
+        }
+        self.parser.screen_mut().set_scrollback(saved);
+        let preview: String = line.trim().chars().take(80).collect();
+        self.notices.push(super::TermNotice {
+            title: None,
+            body: preview,
+        });
     }
 
     /// 离开备用屏（如退出 vim/less/htop）时，确保光标恢复可见——有些程序异常退出（被 Ctrl+C/
