@@ -323,14 +323,22 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         .filter(|s| !s.is_empty());
 
     let all = identify_all(want_token.clone()).await;
-    // 答话了但**版本不符**的实例：单独记下来。它们是「重新部署 ishell-mcp」这条提示的依据，
-    // 混进下面的候选里只会让用户去核对一个根本没错的 token。
-    let stale: Vec<u32> = all
+    // 答话了但**版本不符**的实例：它们是「重新部署 ishell-mcp」这条提示的依据，混进下面的
+    // 候选里只会让用户去核对一个根本没错的 token。
+    //
+    // 但只在**没有任何一个同版本对端**时才给这条提示：共用账号时同事跑着一台旧版 iShell 是
+    // 常态，拿别人的版本去解释「我这边配对没成」，就又变成一条误导性建议（和它要修的那个
+    // 问题同一个形状）。只要有同版本的对端答了话，配对没成就该往 token 上说。
+    let stale = all
         .iter()
         .filter_map(|(p, _)| p.ident())
         .map(|(_, ver)| ver)
-        .filter(|v| *v != mcp_protocol::MCP_PROTOCOL_VERSION)
-        .collect();
+        .find(|v| *v != mcp_protocol::MCP_PROTOCOL_VERSION)
+        .filter(|_| {
+            !all.iter()
+                .filter_map(|(p, _)| p.ident())
+                .any(|(_, v)| v == mcp_protocol::MCP_PROTOCOL_VERSION)
+        });
     // 配了 token 就只收握手通过的；没配 token 则一律是候选（原有的多开弹窗行为）。
     let mut found: Vec<(String, u32, std::path::PathBuf)> = Vec::new();
     for (p, path) in all {
@@ -349,7 +357,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         }
     }
     match found.len() {
-        0 => Err(if let Some(&ver) = stale.first() {
+        0 => Err(if let Some(ver) = stale {
             // 有活着的 iShell 答了话，只是版本对不上——这是最常见的「升了 GUI 忘换代理」，
             // 报成 token 不匹配会把用户引向死胡同（怎么核对 token 都是对的）。
             check_proto_version(ver).unwrap_err()
