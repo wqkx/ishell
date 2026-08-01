@@ -37,6 +37,11 @@ fn load_icon() -> egui::IconData {
     }
 }
 
+/// 窗口的应用标识。必须与 `assets/linux/ishell.desktop` 的 `StartupWMClass` 完全一致——
+/// 桌面环境靠这对值把「正在运行的窗口」认成「那个 .desktop 描述的应用」，对不上就会出现
+/// 「点系统通知又开一个新实例」这类现象。有测试守着两边不许走散。
+const APP_ID: &str = "ishell";
+
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("ishell {}", version::VERSION);
@@ -84,7 +89,7 @@ fn main() -> eframe::Result<()> {
             ))
             // app_id 必须与 Linux 桌面项 ishell.desktop 的基名/StartupWMClass 完全一致，
             // GNOME 等用它匹配 .desktop 取图标（不读窗口内嵌 _NET_WM_ICON）；统一小写避免大小写匹配失败
-            .with_app_id("ishell")
+            .with_app_id(APP_ID)
             .with_icon(load_icon())
     };
     let native_options = eframe::NativeOptions {
@@ -97,4 +102,50 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod desktop_entry_tests {
+    /// 直接编进测试里，改坏了当场挂——这个文件是被 `scripts/bump-version.sh` 自动改过的，
+    /// 靠人眼复查守不住。
+    const DESKTOP: &str = include_str!("../assets/linux/ishell.desktop");
+
+    fn value_of(key: &str) -> Option<&'static str> {
+        DESKTOP
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::trim))
+    }
+
+    /// `.desktop` 的 `Version=` 按规范是**桌面项规范的版本**，不是程序版本号。
+    ///
+    /// 早先 bump-version.sh 把应用版本写了进去（`Version=0.16.13`），
+    /// `desktop-file-validate` 直接报 error。非法的桌面项可能被桌面环境拒收或部分忽略，
+    /// 而 StartupWMClass 索引、菜单项都指着它。
+    #[test]
+    fn version_key_is_a_spec_version() {
+        let v = value_of("Version").expect("桌面项应有 Version");
+        assert!(
+            ["1.0", "1.1", "1.4", "1.5"].contains(&v),
+            "Version={v} 不是桌面项规范的版本号——是不是又把应用版本写进去了？"
+        );
+    }
+
+    /// 窗口的 app_id 与桌面项的 StartupWMClass 必须一字不差，否则桌面环境认不出
+    /// 「这个窗口就是那个应用」。
+    #[test]
+    fn startup_wm_class_matches_the_window_app_id() {
+        assert_eq!(value_of("StartupWMClass"), Some(super::APP_ID));
+    }
+
+    /// 只能有一个主类目，否则应用会在菜单里出现两次（desktop-file-validate 的 hint）。
+    #[test]
+    fn categories_declare_a_single_main_category() {
+        const MAIN: [&str; 12] = [
+            "AudioVideo", "Audio", "Video", "Development", "Education", "Game", "Graphics",
+            "Network", "Office", "Science", "Settings", "System",
+        ];
+        let cats = value_of("Categories").unwrap_or_default();
+        let n = cats.split(';').filter(|c| MAIN.contains(c)).count();
+        assert_eq!(n, 1, "Categories={cats} 里有 {n} 个主类目，应当只有一个");
+    }
 }

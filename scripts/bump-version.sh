@@ -29,12 +29,12 @@ for f in README.md README.zh-CN.md; do
   fi
 done
 
-# 3) Linux 桌面项
-if grep -q '^Version=' assets/linux/ishell.desktop; then
-  sed -i "s/^Version=.*/Version=$NEW/" assets/linux/ishell.desktop
-else
-  sed -i "/^Name=iShell/a Version=$NEW" assets/linux/ishell.desktop
-fi
+# 3) Linux 桌面项：**不要**在这里写应用版本。
+# .desktop 的 `Version=` 按规范指的是「桌面项规范的版本」（1.0/1.1/1.5），不是程序版本号。
+# 早先这里把应用版本写了进去，`desktop-file-validate` 直接报 error：
+#     value "0.16.13" for key "Version" ... is not a known version
+# 非法的桌面项可能被桌面环境拒收或部分忽略（StartupWMClass 索引、菜单项等都靠它）。
+# 应用版本已经在 Cargo.toml / README 里维护，桌面项不需要重复一份。
 
 # 4) 拒绝遗留旧版本字面量（排除动画常量 0.14 秒、依赖版本、vendor）
 if rg -n "0\\.14\\.[0-9]+" --glob '!vendor/**' --glob '!target/**' --glob '!Cargo.lock' . 2>/dev/null; then
