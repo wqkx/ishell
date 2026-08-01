@@ -59,23 +59,13 @@ fn main() -> eframe::Result<()> {
         log::info!("已强制 X11 后端（清空 WAYLAND_DISPLAY）以修复输入法");
     }
 
-    // X11 下把 WM_CLASS 的 instance 段钉成 "ishell"，与 ishell.desktop 的 StartupWMClass 对齐。
-    //
-    // 为什么需要这一手：下面的 `with_app_id("ishell")` **只在 Wayland 上生效**——egui-winit
-    // 把它转成 winit 的 Wayland `with_name`，X11 那条分支根本没调用对应的 X11 `with_name`
-    // （后者才写 WM_CLASS）。于是 X11 下 winit 退回默认值：**用 argv[0] 的文件名当 WM_CLASS**。
-    //
-    // 后果很具体：二进制若叫 `ishell-linux-x86_64`（发布产物就是这个名字），WM_CLASS 就成了
-    // `ishell-linux-x86_64`，与 StartupWMClass=ishell 对不上；GNOME 因此无法把桌面通知/任务栏
-    // 关联到**正在运行的那个窗口**，点通知只能按 .desktop 的 Exec= 再开一个新实例。
-    //
-    // winit 在取默认值时会先读 `RESOURCE_NAME` 作为 instance 段，而 GNOME 匹配
-    // StartupWMClass 时 class 与 instance 两段都认——所以设这个环境变量即可，且不必要求
-    // 用户把二进制改名。已显式设过的不覆盖（尊重用户/发行版的安排）。
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("RESOURCE_NAME").is_none() {
-        std::env::set_var("RESOURCE_NAME", "ishell");
-    }
+    // 关于 X11 下的 WM_CLASS：下面的 `with_app_id("ishell")` 在 X11 上**也是生效的**——
+    // winit 在 Linux 把 `platform_specific.name` 做成 x11/wayland 共用字段，egui-winit 虽然
+    // 只在 wayland 分支调 `with_name`，X11 后端读的是同一个值。实测 `xprop WM_CLASS` 得到
+    // `"", "ishell"`：instance 段空、class 段是 ishell，而 GNOME 匹配 StartupWMClass 用的
+    // 正是 class 段。曾经怀疑是"二进制文件名变成了 WM_CLASS"（winit 在 name 为 None 时确实
+    // 会退回 argv[0]）并试图用 RESOURCE_NAME 兜底——那条路走不通，name 永远是 Some，
+    // 环境变量根本不会被读。别再往这儿加。
 
     // Logo / 图标生成模式：窄长（logo）或方形（icon）画布，用于截图生成素材
     let logo = std::env::var("ISHELL_LOGO").is_ok();
