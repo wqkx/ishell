@@ -240,7 +240,7 @@ pub(super) const NOTIFY_HOOK: &str = concat!(
         r#"p=$$; i=0; while [ $i -lt 6 ]; do p=$(ps -o ppid= -p $p 2>/dev/null | tr -d " "); "#,
         r#"[ -z "$p" ] && break; t=$(ps -o tty= -p $p 2>/dev/null | tr -d " "); "#,
         r#"case $t in ""|"?") ;; *) [ -w /dev/$t ] && "#,
-        r#"printf "\033]9;%s\007" "MSG" > /dev/$t; break;; esac; "#,
+        r#"printf "\033]777;notify;%s;%s\007" "TAG" "MSG" > /dev/$t; break;; esac; "#,
         r#"i=$((i+1)); done; exit 0 # ishell-osc9"#,
 );
 
@@ -252,9 +252,9 @@ pub(super) const NOTIFY_MERGE: &str = concat!(
         r#"os.path.exists(p) and shutil.copy2(p,p+".bak"); w=os.environ["ISHW"]; "#,
         r#"h=d.setdefault("hooks",{}); "#,
         r#"h["Notification"]=[x for x in h.get("Notification",[]) if "ishell-osc9" not in json.dumps(x)]"#,
-        r#"+[{"hooks":[{"type":"command","command":w.replace("MSG","Claude Code 需要你确认")}]}]; "#,
+        r#"+[{"hooks":[{"type":"command","command":w.replace("TAG","ishell:need").replace("MSG","Claude Code 需要你确认")}]}]; "#,
         r#"h["Stop"]=[x for x in h.get("Stop",[]) if "ishell-osc9" not in json.dumps(x)]"#,
-        r#"+[{"hooks":[{"type":"command","command":w.replace("MSG","Claude Code 任务完成")}]}]; "#,
+        r#"+[{"hooks":[{"type":"command","command":w.replace("TAG","ishell:done").replace("MSG","Claude Code 任务完成")}]}]; "#,
         r#"json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2); "#,
         r#"print("iShell 通知 hook 已写入 "+p+"（原配置备份为 settings.json.bak）")"#,
 );
@@ -265,6 +265,10 @@ pub(super) const NOTIFY_MERGE: &str = concat!(
 /// 对方机器上的 `~/.claude/settings.json`，用户有权在按回车之前看清它到底做了什么。
 ///
 /// 也刻意**不自动执行**（结尾不发 `\r`）：改别人 AI 配置这种事，最后那一下必须由人来按。
+///
+/// 通知用 OSC 777（而不是 OSC 9）：它的标题位可以带一个类别标记（`ishell:need` /
+/// `ishell:done`），iShell 据此把「需要你确认」和「任务完成」分开，好让设置里的
+/// 「仅需要我处理时」这一档真的能滤掉每轮都来的完成提醒。标记只是内部用，显示时会被剥掉。
 ///
 /// 命令做三件事：备份原配置 → 合并两个 hook（Notification / Stop）→ 写回。合并按注释标记
 /// `# ishell-osc9` 去重，重复执行不会堆出多条。hook 本体是一段 sh：沿父进程链向上找到第一个

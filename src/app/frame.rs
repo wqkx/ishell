@@ -48,6 +48,10 @@ impl App {
         let mut direct_relay_started: Vec<u64> = Vec::new();
         let mut direct_relay_done: Vec<(u64, bool, String)> = Vec::new();
         let mut evt_backlog = false;
+        // 终端通知的判据：都要在借用 sessions 之前算好。
+        let active_uid = self.active.and_then(|i| self.sessions.get(i).map(|s| s.uid));
+        let window_focused = self.ctx.input(|i| i.focused);
+        let notify_mode = crate::store::load_ai_notify_mode();
         for s in &mut self.sessions {
             // 事件积压未排空（每帧预算保护渲染）时安排下一帧继续消化
             evt_backlog |= s.drain_events();
@@ -110,14 +114,26 @@ impl App {
                 new_docs.push((s.uid, id, data));
             }
             // 终端通知（BEL 响铃 / OSC 9/777）：AI CLI 等待确认或完成时提醒用户。
-            // 同会话 3 秒内的连续通知合并为最新一条（AI 连续响铃不刷屏）。
-            // 曾经在这里按「正看着的标签就不弹」丢过通知。别再加回来：它让通知**静默消失**，
-            // 而"人在这个标签上"完全不等于"人看见了"——盯着长任务跑的时候，眼睛多半在别处。
-            // 该功能一开始难用的毛病就是通知不可信，再补一条静默吞掉的规则只会更糟。
-            // 噪音已经由「只给 AI 标签」那道门解决（见 Terminal::ai_cli_seen）。
+            //
+            // 关于「不弹」的两条规则，写清楚免得日后又被当成 bug 来回改：
+            //  1. 按 `AiNotifyMode` 分档：默认只提醒「需要人干涉」的，滤掉每轮都来的
+            //     「任务完成」。判不出类别的一律当「需要处理」（见 TermNotice::done_kind）。
+            //  2. **窗口在前台、且通知来自你正看着的那个标签**才不弹——人就在那儿盯着。
+            //     条件必须是这两个的与：只看「窗口在前台」会把后台标签的通知也吞掉，
+            //     那才是真的丢消息。（曾经因为这条规则，用户在当前标签里 `printf '\a'`
+            //     测不出任何反应，误以为功能坏了——所以判据必须是"标签级"而非"窗口级"。）
             for n in s.terminal.take_notices() {
+                if matches!(notify_mode, crate::store::AiNotifyMode::Off)
+                    || (n.done_kind
+                        && matches!(notify_mode, crate::store::AiNotifyMode::NeedsInput))
+                {
+                    continue;
+                }
+                if window_focused && Some(s.uid) == active_uid {
+                    continue;
+                }
                 let now = self.ctx.input(|i| i.time);
-                // 一行文本：OSC 带标题就 `标题：正文`，否则取有内容的那个；BEL 的正文是
+                // 两行文本：OSC 带标题就 `标题：正文`，否则取有内容的那个；BEL 的正文是
                 // 光标行预览，可能整行是空的（比如响铃时屏幕刚好被清），给一句兜底。
                 let text = match (n.title, n.body.trim()) {
                     (Some(t), b) if !b.is_empty() => format!("{}：{b}", t.trim()),
@@ -125,22 +141,20 @@ impl App {
                     (None, b) if !b.is_empty() => b.to_string(),
                     (None, _) => crate::i18n::tr("需要你处理", "Needs your attention").to_string(),
                 };
-                let dup = self
-                    .ai_notices
-                    .iter()
-                    .rposition(|x| x.session_uid == s.uid && now - x.at < 3.0);
-                if let Some(i) = dup {
-                    let x = &mut self.ai_notices[i];
-                    x.text = text;
-                    x.at = now;
-                } else {
-                    self.ai_notices.push(super::AiNotice {
-                        session_uid: s.uid,
-                        session_title: s.title.clone(),
-                        text,
-                        at: now,
-                    });
+                // 同一会话只保留最新一条：上一条说的事已经被这一条取代了，留着只是让浮层
+                // 越堆越乱。不再按「3 秒内才合并」——间隔多久都一样是旧消息。
+                self.ai_notices.retain(|x| x.session_uid != s.uid);
+                // 焦点不在 iShell 上时顺带发一条系统通知（Ubuntu 的通知气泡 / macOS 通知
+                // 中心）：这时候用户多半在别的窗口里，浮层卡片他根本看不见。
+                if !window_focused {
+                    os_notify(&s.title, &text);
                 }
+                self.ai_notices.push(super::AiNotice {
+                    session_uid: s.uid,
+                    session_title: s.title.clone(),
+                    text,
+                    at: now,
+                });
             }
             for x in s.pending.relay_source.drain(..) {
                 relay_source.push(x);
@@ -452,5 +466,50 @@ impl App {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(150));
         }
+    }
+}
+
+/// 发一条**操作系统级**通知（Ubuntu 的通知气泡 / macOS 通知中心）。
+///
+/// 只在 iShell 窗口不在前台时调用——那时浮层卡片用户根本看不见，而"AI 在等你"这件事恰恰
+/// 是他离开窗口期间最需要知道的。
+///
+/// 不引第三方通知库：各平台自带的命令行入口就够，且省掉一整条 D-Bus/AppKit 依赖。
+/// 一律 `spawn` 不 `wait`——通知进程慢或卡住都不该拖住 UI 帧循环；失败（比如没装
+/// `notify-send`）静默忽略，浮层卡片仍在，不会因此丢消息。
+#[allow(unused_variables)]
+fn os_notify(session_title: &str, body: &str) {
+    let summary = match crate::i18n::current() {
+        crate::i18n::Lang::Zh => format!("iShell · {session_title}"),
+        crate::i18n::Lang::En => format!("iShell · {session_title}"),
+    };
+    #[cfg(target_os = "linux")]
+    {
+        // 参数直接传给进程，不经 shell——正文来自终端输出，绝不能有被解释成命令的机会。
+        let _ = std::process::Command::new("notify-send")
+            .args(["-a", "iShell", "-u", "normal", &summary, body])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // osascript 只能收一段脚本文本，所以必须自己转义：反斜杠在前、双引号在后，
+        // 顺序反了会把已转义的反斜杠再转一次。换行也要去掉（AppleScript 字符串不能跨行）。
+        fn esc(s: &str) -> String {
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace(['\n', '\r'], " ")
+        }
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            esc(body),
+            esc(&summary)
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }

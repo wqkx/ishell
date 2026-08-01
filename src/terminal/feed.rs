@@ -222,7 +222,19 @@ impl Terminal {
         for (title, body) in parse_osc_notify(bytes) {
             // 会主动发通知的程序，其后续的裸 BEL 也值得提醒（同一个程序在说同一件事）。
             self.ai_cli_seen = true;
-            self.notices.push(super::TermNotice { title, body });
+            // iShell 自己装的 hook 会把类别写在标题位（见 NOTICE_TAG_*）；这类标题是内部
+            // 标记，不该显示给用户，取出类别后就丢掉。别人发的通知没有标记——一律当
+            // 「需要人干涉」，宁可多提醒也不漏掉真正等着你的那条。
+            let done_kind = title.as_deref() == Some(super::NOTICE_TAG_DONE);
+            let title = match title.as_deref() {
+                Some(super::NOTICE_TAG_DONE) | Some(super::NOTICE_TAG_NEED) => None,
+                _ => title,
+            };
+            self.notices.push(super::TermNotice {
+                title,
+                body,
+                done_kind,
+            });
         }
         // BEL 响铃：Claude Code 等 AI CLI 等待确认/任务完成时的标准提示信号。
         // 只统计转义序列之外的 BEL（OSC 通知序列自身的 BEL 终止符不算响铃）。
@@ -298,6 +310,9 @@ impl Terminal {
         self.notices.push(super::TermNotice {
             title: None,
             body: preview,
+            // 裸响铃分不出类别（Claude Code 的确认提示和任务完成发的是同一个字节），
+            // 当「需要人干涉」处理——漏掉一条等你确认的，比多弹一条完成提醒糟糕得多。
+            done_kind: false,
         });
     }
 

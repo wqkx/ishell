@@ -15,8 +15,10 @@ impl App {
             return;
         }
         const MAX_VISIBLE: usize = 6;
-        /// 卡片宽度：单行显示，够放「会话名·一句提示」即可，不再占掉右上角一大块。
-        const CARD_W: f32 = 268.0;
+        /// 卡片宽度：够放「会话名 + 两行提示」即可，不占掉右上角一大块。
+        const CARD_W: f32 = 300.0;
+        /// 常态不透明度：通知是被动提示，压在终端上方长期发亮会碍眼；鼠标移上去才转不透明。
+        const IDLE_ALPHA: f32 = 0.72;
         let mut jump_to: Option<u64> = None;
         let mut remove_one: Option<usize> = None;
         let mut clear_all = false;
@@ -36,13 +38,22 @@ impl App {
         let dy = (area.top() + GAP_Y) - content.top();
         egui::Area::new(egui::Id::new("ai_notice_overlay"))
             .anchor(egui::Align2::RIGHT_TOP, [dx, dy])
-            .order(egui::Order::Foreground)
+            // 用 Middle（窗口的默认层）而不是 Foreground：右上角的传输浮窗等窗口也在这一层，
+            // 但它们在本浮层**之后**创建、且点击会被提到最前，于是永远压在通知之上——
+            // 那正是想要的：通知是被动提示，不该盖住用户正在操作的窗口。
+            .order(egui::Order::Middle)
             .show(ctx, |ui| {
                 ui.set_max_width(CARD_W);
                 let n = self.ai_notices.len();
                 // 最新在上：倒序展示前 MAX_VISIBLE 条
                 for i in (0..n.min(MAX_VISIBLE)).rev() {
                     let no = &self.ai_notices[i];
+                    // 半透明常态 + 悬停迅速转不透明。悬停状态取自**上一帧**（本帧的
+                    // response 要等画完才有），配上 0.12s 的过渡，这一帧的滞后看不出来。
+                    let anim_id = egui::Id::new(("ai_notice_hover", no.session_uid));
+                    let was_hovered = ui.data(|d| d.get_temp::<bool>(anim_id).unwrap_or(false));
+                    let t = ui.ctx().animate_bool_with_time(anim_id, was_hovered, 0.12);
+                    ui.set_opacity(IDLE_ALPHA + (1.0 - IDLE_ALPHA) * t);
                     // 用与「传输浮窗」同一套窗口外观（阴影 + 描边 + 圆角来自全局 style），
                     // 只把底色提到 PANEL——它比终端底色亮，卡片因此"浮"在终端之上。
                     // 原先是 PANEL_2 + 一整圈 ACCENT 描边：那是 toast 的用法（转瞬即逝、
@@ -50,9 +61,12 @@ impl App {
                     let frame = egui::Frame::window(&ctx.global_style())
                         .fill(Palette::PANEL)
                         .corner_radius(crate::theme::R_SM)
-                        .inner_margin(egui::Margin::symmetric(9, 6))
+                        .inner_margin(egui::Margin::symmetric(9, 7))
                         .show(ui, |ui| {
                             ui.set_width(CARD_W - 18.0);
+                            // 行距收紧：两行文字之间不需要控件之间那么宽的默认间距，
+                            // 但外面的 inner_margin 要留着，否则字贴着边框很难看。
+                            ui.spacing_mut().item_spacing.y = 1.0;
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(
@@ -60,8 +74,12 @@ impl App {
                                         .color(Palette::ACCENT)
                                         .size(13.0),
                                 );
-                                // 关闭按钮先摆到最右，剩下的宽度全留给正文——反过来的话
-                                // 正文会把按钮挤出卡片（一行布局里先排的先占宽）。
+                                ui.label(
+                                    RichText::new(&no.session_title)
+                                        .color(Palette::TEXT_DIM)
+                                        .size(11.0),
+                                );
+                                // 关闭按钮压到最右
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -78,29 +96,23 @@ impl App {
                                         {
                                             remove_one = Some(i);
                                         }
-                                        ui.with_layout(
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new(format!("{}·", no.session_title))
-                                                        .color(Palette::TEXT_DIM)
-                                                        .size(12.0),
-                                                );
-                                                // 超长正文省略成一行，不换行撑高卡片
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(&no.text)
-                                                            .color(Palette::TEXT)
-                                                            .size(12.0),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                            },
-                                        );
                                     },
                                 );
                             });
+                            // 正文另起一行、允许换行，但最多两行——通知里那句提示常常一行
+                            // 放不下（"是否允许执行 xxx？1. Yes 2. No"这种），一行截断等于
+                            // 把关键信息切掉了。超过两行才截断。
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&no.text).color(Palette::TEXT).size(12.0),
+                                )
+                                .wrap()
+                                .truncate(),
+                            );
                         });
+                    // 记下本帧悬停状态，供下一帧的动画使用。
+                    let hov = frame.response.hovered();
+                    ui.data_mut(|d| d.insert_temp(anim_id, hov));
                     let resp = frame.response.interact(egui::Sense::click());
                     if resp.clicked() {
                         jump_to = Some(no.session_uid);

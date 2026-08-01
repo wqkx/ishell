@@ -13,9 +13,19 @@ pub fn view_context_menu(resp: &egui::Response) {
         // 菜单项不换行，避免较长英文项折行
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
-        // 菜单按主题收进二级子菜单：平铺时这里有近十项 + 内嵌的加减按钮/token 行，
-        // 右键一下糊一屏。分组后顶层只剩四项，具体设置进子菜单再看（与终端右键菜单
-        // 「终端配色」等的做法一致）。
+        // —— 语言 ——
+        // 语言留在顶层平铺（不收进「外观」子菜单）：切换语言是最常用的一项，藏进二级菜单
+        // 反而比原来更难点。
+        ui.label(
+            RichText::new(crate::i18n::tr("语言", "Language"))
+                .color(Palette::TEXT_DIM)
+                .size(11.0),
+        );
+        crate::i18n::language_menu(ui);
+        ui.separator();
+
+        // 其余按主题收进二级子菜单：平铺时这里有近十项 + 内嵌的加减按钮/token 行，
+        // 右键一下糊一屏（与终端右键菜单「终端配色」等的做法一致）。
         ui.menu_button(
             format!(
                 "{}  {}",
@@ -54,13 +64,6 @@ pub fn view_context_menu(resp: &egui::Response) {
             |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 ui.label(
-                    RichText::new(crate::i18n::tr("语言", "Language"))
-                        .color(Palette::TEXT_DIM)
-                        .size(11.0),
-                );
-                crate::i18n::language_menu(ui);
-                ui.separator();
-                ui.label(
                     RichText::new(format!(
                         "{}  {:.0}%",
                         crate::i18n::tr("字体大小", "Font size"),
@@ -98,6 +101,55 @@ pub fn view_context_menu(resp: &egui::Response) {
             ),
             |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                // —— AI 通知 ——
+                // 放在 MCP 开关之前：通知与「是否让 AI 控制终端」互不依赖（BEL/OSC 9 是
+                // 终端里的程序自己发的，不经 MCP），所以不该藏在 mcp_on 之后。
+                use crate::store::AiNotifyMode;
+                let mode = crate::store::load_ai_notify_mode();
+                ui.label(
+                    RichText::new(crate::i18n::tr("AI 通知", "AI alerts"))
+                        .color(Palette::TEXT_DIM)
+                        .size(11.0),
+                );
+                for (m, zh, en, tip_zh, tip_en) in [
+                    (
+                        AiNotifyMode::NeedsInput,
+                        "仅需要我处理时",
+                        "Only when it needs me",
+                        "AI 在等你确认/输入时才提醒。「任务完成」那类每轮都来的提醒会被过滤掉。\n\
+                         判不出类别的（裸响铃、第三方 OSC 通知）一律按「需要处理」提醒——\
+                         宁可多弹一条，也不漏掉真正等着你的那条。",
+                        "Alert only when the AI is waiting on you. Per-turn \"task done\" \
+                         notices are filtered out.\n\
+                         Anything unclassifiable (bare bell, third-party OSC) counts as \
+                         \"needs you\" — better one extra card than a missed prompt.",
+                    ),
+                    (
+                        AiNotifyMode::All,
+                        "全部（含任务完成）",
+                        "Everything (incl. task done)",
+                        "每一条终端通知都提醒，包括每轮回答结束的「任务完成」。",
+                        "Alert on every terminal notification, including per-turn completions.",
+                    ),
+                    (
+                        AiNotifyMode::Off,
+                        "关闭",
+                        "Off",
+                        "完全不提醒（浮层和系统通知都不出现）。",
+                        "No alerts at all (neither the overlay card nor system notifications).",
+                    ),
+                ] {
+                    if ui
+                        .selectable_label(mode == m, crate::i18n::tr(zh, en))
+                        .on_hover_text(crate::i18n::tr(tip_zh, tip_en))
+                        .clicked()
+                    {
+                        crate::store::save_ai_notify_mode(m);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+
                 let mut mcp_on = crate::store::load_mcp_consent();
                 if ui
                     .checkbox(

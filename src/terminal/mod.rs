@@ -35,7 +35,17 @@ pub struct TermNotice {
     pub title: Option<String>,
     /// 正文/预览（OSC 通知正文；BEL 时为光标所在行的文本预览——确认菜单常显示在这行）
     pub body: String,
+    /// 是不是「任务完成」那一类。用于「只提醒需要人干涉的」这档过滤（见 store::AiNotifyMode）。
+    pub done_kind: bool,
 }
+
+/// iShell 自己装的 hook 用 OSC 777 的**标题位**打这个标记，好让通知能被分档过滤。
+///
+/// 为什么必须由发送方标注、不能靠内容猜：裸 BEL 和第三方的 OSC 9 里没有任何东西能区分
+/// 「AI 在等你确认」和「任务跑完了」——按关键字猜必然时对时错。iShell 装 hook 时既然自己
+/// 生成命令，就顺手把类别写进去；猜不出来的一律当「需要人干涉」，宁可多提醒也不漏掉。
+pub const NOTICE_TAG_DONE: &str = "ishell:done";
+pub const NOTICE_TAG_NEED: &str = "ishell:need";
 
 pub struct Terminal {
     parser: vt100::Parser,

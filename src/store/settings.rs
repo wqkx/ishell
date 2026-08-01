@@ -135,6 +135,81 @@ pub fn save_osc7_consent(on: bool) {
     }
 }
 
+/// AI 通知的范围。默认 `NeedsInput`——「任务完成」那类每轮都来的提醒最吵，而真正不能错过的
+/// 是「AI 在等你确认」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiNotifyMode {
+    /// 完全关闭
+    Off,
+    /// 只提醒「需要人干涉」（等待确认/等待输入）
+    NeedsInput,
+    /// 全部提醒（含任务完成）
+    All,
+}
+
+impl AiNotifyMode {
+    fn code(self) -> &'static str {
+        match self {
+            AiNotifyMode::Off => "off",
+            AiNotifyMode::NeedsInput => "need",
+            AiNotifyMode::All => "all",
+        }
+    }
+    fn from_code(s: &str) -> Self {
+        match s.trim() {
+            "off" => AiNotifyMode::Off,
+            "all" => AiNotifyMode::All,
+            _ => AiNotifyMode::NeedsInput,
+        }
+    }
+}
+
+fn ai_notify_mode_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("ai_notify_mode"))
+}
+
+/// 进程内缓存：与 `MCP_CONSENT_CACHE` 同理——每条终端通知到达都要查一次，不该每次读盘。
+/// `-1` = 还没读过盘。
+static AI_NOTIFY_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+pub fn load_ai_notify_mode() -> AiNotifyMode {
+    use std::sync::atomic::Ordering;
+    match AI_NOTIFY_CACHE.load(Ordering::Relaxed) {
+        0 => AiNotifyMode::Off,
+        1 => AiNotifyMode::NeedsInput,
+        2 => AiNotifyMode::All,
+        _ => {
+            let m = ai_notify_mode_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| AiNotifyMode::from_code(&s))
+                .unwrap_or(AiNotifyMode::NeedsInput);
+            AI_NOTIFY_CACHE.store(
+                match m {
+                    AiNotifyMode::Off => 0,
+                    AiNotifyMode::NeedsInput => 1,
+                    AiNotifyMode::All => 2,
+                },
+                Ordering::Relaxed,
+            );
+            m
+        }
+    }
+}
+
+pub fn save_ai_notify_mode(m: AiNotifyMode) {
+    AI_NOTIFY_CACHE.store(
+        match m {
+            AiNotifyMode::Off => 0,
+            AiNotifyMode::NeedsInput => 1,
+            AiNotifyMode::All => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if let Some(p) = ai_notify_mode_path() {
+        write_setting(p, m.code());
+    }
+}
+
 fn mcp_consent_path() -> Option<PathBuf> {
     Some(config_dir()?.join("mcp_consent"))
 }
