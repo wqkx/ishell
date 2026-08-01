@@ -486,8 +486,20 @@ fn os_notify(session_title: &str, body: &str) {
     #[cfg(target_os = "linux")]
     {
         // 参数直接传给进程，不经 shell——正文来自终端输出，绝不能有被解释成命令的机会。
+        // `desktop-entry` 提示告诉 GNOME 这条通知属于哪个 .desktop，点击时才谈得上
+        // 「激活已有窗口」而不是另开一个。它要和窗口的 WM_CLASS/app_id 一起对上才有效——
+        // 见 main.rs 里把 RESOURCE_NAME 钉成 ishell 的那段说明。
         let _ = std::process::Command::new("notify-send")
-            .args(["-a", "iShell", "-u", "normal", &summary, body])
+            .args([
+                "-a",
+                "iShell",
+                "-u",
+                "normal",
+                "-h",
+                "string:desktop-entry:ishell",
+                &summary,
+                body,
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
