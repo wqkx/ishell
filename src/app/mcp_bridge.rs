@@ -1304,7 +1304,7 @@ impl App {
                 continue;
             };
             if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
-                self.finish_after_untrust(idx);
+                self.finish_after_untrust(idx, true);
             }
         }
         for (op_id, result) in relay_source {
@@ -1377,7 +1377,7 @@ impl App {
                 // - 其余阶段但 trust_established 为真：目标主机上确实还留着一把临时公钥，
                 //   必须补发一次撤销（不等待结果，job 马上就要整体移除），否则会永久残留。
                 if matches!(job.phase, CrossCopyPhase::UntrustingAfterDirect) {
-                    self.finish_after_untrust(idx);
+                    self.finish_after_untrust(idx, false);
                 } else {
                     if job.trust_established {
                         let marker = job.marker.clone();
@@ -1399,7 +1399,8 @@ impl App {
                     self.finish_direct_attempt(idx, Err("直连尝试超时（20s 内未建立连接），已转中转".into()));
                 }
                 CrossCopyPhase::UntrustingAfterDirect if now >= job.phase_deadline => {
-                    self.finish_after_untrust(idx);
+                    // 只是撤销回执迟到，总超时还没到——时间预算还在，照常可以转中转。
+                    self.finish_after_untrust(idx, true);
                 }
                 _ => {}
             }
@@ -1522,11 +1523,28 @@ impl App {
 
     /// 撤销信任已完成（或等不到回执，超时放弃）：按之前确定的直连结果决定收尾——
     /// 成功则直接 resolve；失败则转入中转（这次真正把管道发给源/目标会话）。
-    fn finish_after_untrust(&mut self, idx: usize) {
+    ///
+    /// `allow_relay_fallback=false` 用于「总超时才走到这一步」的场合：此时已经没有时间预算
+    /// 了，再起一次中转纯属白干——它下一帧就会被总超时判失败、管道读端随 job 一起 drop，
+    /// 源会话那次 SFTP 打开注定作废。直连**成功**的情况仍然照常 resolve：结果早就确定了，
+    /// 不该因为撤销回执迟到就把一次已经成功的拷贝误报成超时失败。
+    fn finish_after_untrust(&mut self, idx: usize, allow_relay_fallback: bool) {
         match self.cross_copy_jobs[idx].direct_result.take() {
             Some(Ok(())) => self.resolve_cross_copy_job(idx, Ok(()), "direct"),
-            Some(Err(_)) => self.start_relay_fallback(idx),
-            None => {} // 不应该发生：还没收到 direct_result 就走到了这一步
+            Some(Err(e)) if allow_relay_fallback => {
+                log::debug!("copy_between_sessions 直连失败，转中转：{e}");
+                self.start_relay_fallback(idx)
+            }
+            Some(Err(e)) => self.fail_cross_copy_job(
+                idx,
+                format!("跨会话拷贝超时：直连未成功（{e}），且已无时间预算改走中转"),
+            ),
+            None => {
+                // 不应该发生：`UntrustingAfterDirect` 只由 `finish_direct_attempt` 进入，
+                // 而它必定先写好 direct_result。真到了这里就把 job 收掉，不能让它悬着
+                // 永远占着两侧的 pending_file_op。
+                self.fail_cross_copy_job(idx, "内部错误：直连结果丢失".into())
+            }
         }
     }
 
@@ -1540,11 +1558,27 @@ impl App {
 
     fn resolve_cross_copy_job(&mut self, idx: usize, result: Result<(), String>, method: &str) {
         let job = self.cross_copy_jobs.remove(idx);
-        // 保险起见清一次两侧为这次 op_id 占位的 pending_file_op：正常路径下 TransferDone
-        // 已经通过 try_resolve_file_copy 自然移除了；这里只处理"某一侧因为提前失败/超时而
-        // 从没走到那一步"的情况，避免占位项永久占着并发名额。
+        // 失败/超时收尾时必须**真的把还在跑的传输停掉**。此前只是移除 job 并回错误给调用方，
+        // 两侧 worker 的 RelayReadFile/RelayWriteFile 照跑不误——于是出现「告诉 AI 超时了，
+        // 远端文件其实写成功了」这种分歧，而 AI 多半会据此重试一次。
+        //
+        // 直连尝试早有 `cancel` 标志，中转这条路一直漏着；好在中转两侧都走 `start_xfer`、
+        // 按同一个 op_id 注册进 worker 的 `xfer_cancels`，所以一条既有的 `CancelTransfer`
+        // 就够，不需要新的协议。没有对应在跑的传输时它是空操作（早期失败路径常如此）。
+        //
+        // 只在失败路径发：成功时 TransferDone 已经到了，传输本就结束了。
+        let cancel_inflight = result.is_err();
         for uid in [job.src_uid, job.dest_uid] {
             if let Some(sidx) = self.session_idx_by_uid(uid) {
+                if cancel_inflight {
+                    let _ = self.sessions[sidx]
+                        .cmd_tx
+                        .send(UiCommand::CancelTransfer(job.op_id));
+                }
+                // 保险起见清一次两侧为这次 op_id 占位的 pending_file_op：正常路径下
+                // TransferDone 已经通过 try_resolve_file_copy 自然移除了；这里只处理
+                // "某一侧因为提前失败/超时而从没走到那一步"的情况，避免占位项永久占着
+                // 并发名额。
                 self.sessions[sidx]
                     .pending_file_ops
                     .retain(|op| !matches!(op.kind, FileOpKind::Copy { op_id } if op_id == job.op_id));

@@ -302,18 +302,6 @@ async fn identify_all(prove_token: Option<String>) -> Vec<(Probe, std::path::Pat
 /// 决定这个代理这辈子只操作哪个 iShell 实例。只在首次需要连接时跑一次。
 #[cfg(unix)]
 async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
-    // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
-    if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
-        let path = std::path::PathBuf::from(p);
-        let (id, ver) = identify(&path).await.ok_or_else(|| {
-            format!(
-                "ISHELL_MCP_SOCKET 指定的 socket 连不上、或对面不是 iShell：{}",
-                path.display()
-            )
-        })?;
-        check_proto_version(ver)?;
-        return Ok((id, path));
-    }
     // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就走双向
     // 挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；没设则保持原有
     // 「多实例弹窗让用户选」。见 `store::mcp_pairing_token`。
@@ -321,6 +309,48 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+
+    // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
+    //
+    // 但「指定了哪条 socket」和「这条 socket 后面是不是我的 iShell」是两件事：同时设了
+    // token 就必须照样过握手。此前这里走的是裸 `identify()`，于是一条过期的
+    // ISHELL_MCP_SOCKET（手工隧道留下的很常见）会让多机隔离**静默失效**——命令照常执行，
+    // 只是落到了别人的电脑上，而这正是 token 要防的唯一一件事。宁可报错也不能猜。
+    if let Some(p) = std::env::var_os("ISHELL_MCP_SOCKET") {
+        let path = std::path::PathBuf::from(p);
+        let dead = || {
+            format!(
+                "ISHELL_MCP_SOCKET 指定的 socket 连不上、或对面不是 iShell：{}",
+                path.display()
+            )
+        };
+        let Some(token) = want_token.as_deref() else {
+            // 没设 token：保持原有行为，连上问一句 id 就绑。
+            let (id, ver) = identify(&path).await.ok_or_else(dead)?;
+            check_proto_version(ver)?;
+            return Ok((id, path));
+        };
+        return match probe(&path, Some(token)).await {
+            Probe::Paired { id, ver } => {
+                check_proto_version(ver)?;
+                Ok((id, path))
+            }
+            // 活着但没通过握手。先看版本——版本不符时 `probe` 本来就跳过握手，
+            // 报成 token 不符会把人引向死胡同（怎么核对 token 都是对的）。
+            Probe::Answered { ver, .. } => {
+                check_proto_version(ver)?;
+                Err(format!(
+                    "ISHELL_MCP_SOCKET 指向的 iShell 没有通过配对握手：{}\n\
+                     同时设置了 ISHELL_MCP_TOKEN，说明你要求只连自己那台 iShell，\
+                     所以这里不会退而求其次去连它。常见原因是这条 ISHELL_MCP_SOCKET \
+                     是早先手工隧道留下的、已经指向别人（或别的）iShell——去掉它即可\
+                     改回按 token 自动发现；若确实要用这条 socket，请核对两边的配对 token。",
+                    path.display()
+                ))
+            }
+            Probe::Dead => Err(dead()),
+        };
+    }
 
     let all = identify_all(want_token.clone()).await;
     // 答话了但**版本不符**的实例：它们是「重新部署 ishell-mcp」这条提示的依据，混进下面的
