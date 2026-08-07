@@ -667,7 +667,9 @@ async fn create_with_perm(path: &Path, perm: Option<std::fs::Permissions>) -> st
     #[cfg(unix)]
     if let Some(p) = &perm {
         use std::os::unix::fs::PermissionsExt;
-        opts.mode(p.mode());
+        // `mode()` 返回的是完整 st_mode（含文件类型位）；`open` 只取权限位，
+        // 但显式掩掉更能说明意图。
+        opts.mode(p.mode() & 0o7777);
     }
     #[cfg(not(unix))]
     let _ = &perm;
