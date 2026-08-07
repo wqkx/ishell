@@ -731,6 +731,11 @@ const MAX_MCP_CONNECTIONS: usize = 32;
 /// 大文件/二进制走 copy_to_remote 的分块字节流，不塞进 JSON 行），又把「MAX_MCP_CONNECTIONS
 /// 条连接同时灌满大请求」的最坏并发内存从 256MiB×32≈8GiB 压到 32MiB×32≈1GiB；同时兜住「恶意/
 /// 异常连接持续灌数据不换行」。注意该 socket 可能经 SSH 反向转发暴露到远端主机，攻击面不止本机。
+///
+/// ⚠ 它是靠 `AsyncReadExt::take` 实现的，而 `take` 套的是**整条连接**，不是"一行"。
+/// `copy_to_remote` 的文件字节紧跟在请求行之后走同一个 reader，所以上传路径**必须**在读完
+/// 请求行后把 `Take` 摘掉（见 `handle_conn` 里 `is_caller_upload` 那段），否则这个上限会连
+/// 文件流一起限死。别把那段"多余的"拆包代码优化掉。
 #[cfg(unix)]
 const MAX_MCP_LINE_BYTES: u64 = 32 * 1024 * 1024;
 /// 首行读取超时：连上但迟迟不发完整一行的连接（占位攻击/半开连接）不能无限占着任务和 fd。
@@ -923,9 +928,21 @@ async fn handle_conn(
     }
     let is_caller_upload = matches!(&req.kind, McpReqKind::CopyToRemoteFromCaller { .. });
     if is_caller_upload {
-        // `Lines` 持有的 BufReader 可能已经预读了紧随 JSON 行的文件字节，不能丢掉它；
-        // 连同缓冲区一起转给 worker，才能保证二进制流不丢首块。
-        let upload_source = Some(Box::new(lines.into_inner()) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
+        // 这里必须把 `Take` 摘掉。`MAX_MCP_LINE_BYTES` 要限的是**请求行**，而文件字节紧跟在
+        // 那行 JSON 之后走同一个 reader——`Take` 套在整条连接上，于是这个"请求行上限"把
+        // 文件流也一起限死了：超过 32 MiB 的 `copy_to_remote` 必失败，报的还是「调用方文件流
+        // 提前结束」或裸 Broken pipe，跟真正的原因毫无关系。实测的分界线甚至不是整数，而是
+        // 32 MiB 减去那行请求 JSON 的长度（会随远端路径长短浮动）。
+        // 请求行此刻已经读完，上限该起的作用已经起过了；上传本身是分块读写、内存有界，
+        // 不需要长度上限。
+        //
+        // `Lines` 持有的 BufReader 可能已经预读了紧随 JSON 行的文件字节，不能丢掉它——
+        // 取出缓冲区里的首块，和摘掉 `Take` 后的裸读端接起来交给 worker。
+        let mut buffered_reader = lines.into_inner();
+        let head = buffered_reader.buffer().to_vec();
+        let rest = buffered_reader.into_inner().into_inner();
+        let source = tokio::io::AsyncReadExt::chain(std::io::Cursor::new(head), rest);
+        let upload_source = Some(Box::new(source) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
         let (resp_tx, resp_rx) = oneshot::channel();
         if tx.send(McpCall { req, resp_tx, upload_source, download_sink: None }).is_err() {
             return;
@@ -2662,5 +2679,106 @@ mod pair_handshake_tests {
             .await
             .expect_err("握手第二步只接受 PairProve");
         assert!(err.contains("PairProve"), "{err}");
+    }
+}
+
+#[cfg(all(unix, test))]
+mod upload_stream_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 起一个只服务一条连接的 `handle_conn`，把 `McpCall` 的接收端一并交回给测试
+    /// （握手测试那份 helper 丢掉了 rx，这里必须留着才能拿到 upload_source）。
+    async fn serve_one_keep_rx() -> (UnixStream, mpsc::UnboundedReceiver<McpCall>) {
+        let path = std::env::temp_dir().join(format!(
+            "ishell-upload-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("绑定测试 socket");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ctx = egui::Context::default();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = sem.acquire_owned().await.expect("permit");
+            handle_conn(stream, tx, ctx, permit).await;
+        });
+        let s = UnixStream::connect(&path).await.expect("连接测试 socket");
+        let _ = std::fs::remove_file(&path);
+        (s, rx)
+    }
+
+    /// 发一条 `CopyToRemoteFromCaller` 请求 + `size` 字节负载，返回 worker 侧实际收到的字节数。
+    async fn upload_bytes(size: usize) -> usize {
+        let (stream, mut rx) = serve_one_keep_rx().await;
+        let (_r, mut w) = stream.into_split();
+        let mut line = serde_json::to_string(&McpRequest {
+            id: 1,
+            // 非握手类请求必须点名实例，否则会被 `is_addressed_to` 挡在门外
+            instance: Some(crate::store::mcp_instance_id().to_string()),
+            kind: McpReqKind::CopyToRemoteFromCaller {
+                session_uid: 1,
+                remote_path: "/tmp/whatever".into(),
+                size: size as u64,
+                timeout_ms: 60_000,
+            },
+        })
+        .expect("序列化请求");
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.expect("写请求行");
+
+        // 负载分块写：写端要和下面的读端并发跑，否则 socket 缓冲区一满就双双卡死。
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0xABu8; 64 * 1024];
+            let mut left = size;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if w.write_all(&chunk[..n]).await.is_err() {
+                    break; // 对端提前不读了：正是要检测的失败，交给下面的字节数断言
+                }
+                left -= n;
+            }
+            let _ = w.shutdown().await;
+        });
+
+        let call = rx.recv().await.expect("handle_conn 应把请求转进来");
+        let mut src = call.upload_source.expect("上传请求必须带字节流");
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match src.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        // 必须 abort 而不是 await：一旦对端提前不读了（正是这个测试要抓的回归），
+        // 写端会永远卡在 `write_all` 上——`await` 它就把"断言失败"变成了"测试挂死"，
+        // CI 只会超时，给不出任何诊断。
+        writer.abort();
+        got
+    }
+
+    /// `MAX_MCP_LINE_BYTES` 只该限请求行，不该限跟在它后面的文件流。
+    ///
+    /// 这个上限是用 `take` 实现的，而 `take` 套的是整条连接——上传路径若不把它摘掉，
+    /// 超过 32 MiB 的 `copy_to_remote` 就必然失败（实测分界线是 32 MiB 减去请求行长度，
+    /// 报错还是「调用方文件流提前结束」这种指不到根因的话）。
+    #[tokio::test]
+    async fn upload_stream_is_not_capped_by_request_line_limit() {
+        let size = MAX_MCP_LINE_BYTES as usize + 5 * 1024 * 1024; // 稳稳越过上限
+        assert_eq!(
+            upload_bytes(size).await,
+            size,
+            "上传字节流被请求行上限截断了"
+        );
+    }
+
+    /// 顺带确认没把小文件搞坏（预读进 BufReader 的首块必须原样接上）。
+    #[tokio::test]
+    async fn small_upload_stream_is_intact() {
+        let size = 3 * 1024 * 1024;
+        assert_eq!(upload_bytes(size).await, size);
     }
 }
