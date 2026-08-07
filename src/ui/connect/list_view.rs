@@ -67,8 +67,11 @@ impl ConnectForm {
         ui.separator();
         ui.set_min_width(500.0);
 
-        // 固定「本机」入口：始终在最上方，单击直接开本地终端。它不写入 connections.json，
-        // 不占用户保存的连接，也不会被误删；点一下即产出一个本机 ConnectConfig。
+        // 固定「本机」入口：始终在最上方，**双击**开本地终端。它不写入 connections.json，
+        // 不占用户保存的连接，也不会被误删；双击即产出一个本机 ConnectConfig。
+        //
+        // 打开方式必须和下面的已保存主机一致（那些也是双击连接）：同一个列表里两种行序
+        // 一个单击一个双击，鼠标划过时很容易误开一个本机终端。
         {
             // 行高/图标/间距全部与下面的已保存主机行一致（30 / 默认字号 / 2px）——它只是
             // 列表里的一项，没有理由长得比别人大。说明文字移到 hover 提示里：常驻显示是
@@ -95,10 +98,10 @@ impl ConnectForm {
             );
             if resp
                 .on_hover_text(crate::i18n::tr(
-                    "在本机直接打开一个终端（本地 shell，无需 SSH）",
-                    "Open a terminal on this computer (local shell, no SSH)",
+                    "双击在本机直接打开一个终端（本地 shell，无需 SSH）",
+                    "Double-click to open a terminal on this computer (local shell, no SSH)",
                 ))
-                .clicked()
+                .double_clicked()
             {
                 *result = Some(crate::proto::ConnectConfig::local());
             }

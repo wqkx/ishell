@@ -8,10 +8,16 @@ use super::util::edge_fade;
 #[allow(unused_imports)]
 use super::view_state::*;
 
+/// 侧栏右键菜单的最小宽度（pt，随 UI 缩放一起放大）。
+const MENU_MIN_W: f32 = 190.0;
+
 pub fn view_context_menu(resp: &egui::Response) {
     resp.context_menu(|ui| {
         // 菜单项不换行，避免较长英文项折行
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        // 此前没设宽度、完全按内容自适应：顶层只有「视图/外观/AI 控制/启动选项」几个短词，
+        // 挤出来的菜单又窄又局促。给个下限撑开（终端右键菜单是 170，这里项更长些）。
+        ui.set_min_width(MENU_MIN_W);
 
         // —— 语言 ——
         // 语言留在顶层平铺（不收进「外观」子菜单）：切换语言是最常用的一项，藏进二级菜单

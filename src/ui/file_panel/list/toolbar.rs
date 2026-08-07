@@ -7,6 +7,10 @@ use super::super::{
 use super::helpers::{tool_btn, tool_btn_color, trailing_path};
 use crate::theme::Palette;
 
+/// 收藏夹弹窗最多同时显示几行（再多就在弹窗内滚动）。
+/// 五行是「一眼扫得完」和「不糊住半个文件区」之间的折中。
+const MAX_FAV_ROWS: usize = 5;
+
 pub(super) fn toolbar(
     ui: &mut egui::Ui,
     state: &mut FilePanelState,
@@ -94,7 +98,7 @@ pub(super) fn toolbar(
                 let cwd_fav =
                     !state.cwd.is_empty() && state.favorites.iter().any(|f| f == &state.cwd);
                 let pop_id = ui.make_persistent_id("fav_popup");
-                let pop_open = ui.memory(|m| m.is_popup_open(pop_id));
+                let pop_open = egui::Popup::is_id_open(ui.ctx(), pop_id);
                 let star_col = if cwd_fav {
                     Palette::ACCENT
                 } else {
@@ -119,17 +123,21 @@ pub(super) fn toolbar(
                         .on_hover_text(crate::i18n::tr("收藏夹", "Favorites"))
                     })
                     .inner;
-                if star.clicked() {
-                    ui.memory_mut(|m| m.toggle_popup(pop_id));
-                }
                 let mut fav_nav: Option<String> = None;
                 let mut fav_remove: Option<usize> = None;
-                egui::popup_below_widget(
-                    ui,
-                    pop_id,
-                    &star,
-                    egui::PopupCloseBehavior::CloseOnClickOutside,
-                    |ui| {
+                // 收藏数量决定弹窗高度，最多五行；再多就滚动。
+                let fav_rows = state.favorites.len().clamp(1, MAX_FAV_ROWS);
+                let fav_row_h = ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
+                let fav_max_h = fav_row_h * fav_rows as f32;
+                // 用 `Popup` 而不是 `popup_below_widget`：后者内部写死 `AboveOrBelow::Below`，
+                // 不会翻转。文件区工具栏本就靠近窗口下沿，弹窗被屏幕底边裁掉后无论收藏多少
+                // 都只剩两三行——这才是「收藏很多却只展开 2 行」的真正原因，跟高度设多少无关。
+                // `Popup` 默认会在放不下时依次试 `RectAlign::symmetries` / `MENU_ALIGNS`，
+                // 下方不够就自动翻到按钮上方。
+                egui::Popup::from_toggle_button_response(&star)
+                    .id(pop_id)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
                         ui.set_min_width(280.0);
                         if state.favorites.is_empty() {
                             crate::ui::empty_state(
@@ -143,7 +151,7 @@ pub(super) fn toolbar(
                             );
                         } else {
                             egui::ScrollArea::vertical()
-                                .max_height(300.0)
+                                .max_height(fav_max_h)
                                 .show(ui, |ui| {
                                     for (i, p) in state.favorites.iter().enumerate() {
                                         ui.horizontal(|ui| {
@@ -201,8 +209,7 @@ pub(super) fn toolbar(
                                     }
                                 });
                         }
-                    },
-                );
+                    });
                 if let Some(i) = fav_remove {
                     if i < state.favorites.len() {
                         state.favorites.remove(i);
@@ -212,7 +219,7 @@ pub(super) fn toolbar(
                 if let Some(p) = fav_nav {
                     state.cwd = p;
                     state.selected.clear();
-                    ui.memory_mut(|m| m.close_popup(pop_id));
+                    egui::Popup::close_id(ui.ctx(), pop_id);
                 }
 
                 ui.add_space(4.0);
