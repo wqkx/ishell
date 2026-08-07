@@ -18,6 +18,27 @@ mod table_selection;
 #[path = "table_tail.rs"]
 mod table_tail;
 
+/// 排序：目录始终在前，组内按所选键升/降序。
+///
+/// 主键取 `!is_dir`：`false`(目录) < `true`(文件)，目录因此排在前面。写成 `is_dir` 会整个
+/// 反过来，而降序分支的 `dir_end` 又会算成 0 把数组整体翻转、看似"修好"——两处错误互相
+/// 抵消，只在切换升降序时露馅（0.17.0 就是这么错的）。别改这个取反。
+///
+/// `sort_by_cached_key`：小写名每行只算一次（此前比较器内每对比较都算两次）。
+pub(in crate::ui::file_panel) fn sort_entries(entries: &mut [crate::proto::FileEntry], key: SortKey, desc: bool) {
+    match key {
+        SortKey::Name => entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase())),
+        SortKey::Size => entries.sort_by_key(|e| (!e.is_dir, e.size)),
+        SortKey::Mtime => entries.sort_by_key(|e| (!e.is_dir, e.mtime)),
+    }
+    if desc {
+        // 目录分组不受升降影响：逐组反转（保持目录在前、组内反向）
+        let dir_end = entries.iter().take_while(|e| e.is_dir).count();
+        entries[..dir_end].reverse();
+        entries[dir_end..].reverse();
+    }
+}
+
 pub(super) fn file_table(
     ui: &mut egui::Ui,
     state: &mut FilePanelState,
@@ -111,25 +132,7 @@ pub(super) fn file_table(
             Some(e) => e.clone(),
             None => return,
         };
-        // 排序：目录始终在前，组内按所选键升/降序。
-        // sort_by_cached_key：小写名每行只算一次（此前比较器内每对比较都算两次）。
-        {
-            let key = state.sort_key;
-            let desc = state.sort_desc;
-            match key {
-                SortKey::Name => entries.sort_by_cached_key(|e| {
-                    (e.is_dir, e.name.to_lowercase())
-                }),
-                SortKey::Size => entries.sort_by_key(|e| (e.is_dir, e.size)),
-                SortKey::Mtime => entries.sort_by_key(|e| (e.is_dir, e.mtime)),
-            }
-            if desc {
-                // 目录分组不受升降影响：逐组反转（保持目录在前、组内反向）
-                let dir_end = entries.iter().take_while(|e| e.is_dir).count();
-                entries[..dir_end].reverse();
-                entries[dir_end..].reverse();
-            }
-        }
+        sort_entries(&mut entries, state.sort_key, state.sort_desc);
         // 应用名称过滤
         if !state.filter.trim().is_empty() {
             let f = state.filter.to_lowercase();

@@ -85,3 +85,80 @@ use super::{normalize_path, path_is_prefix, update_path_trail, FilePanelState};
         s.on_listing(p.clone(), vec![ent("stale")], 10);
         assert_eq!(s.listings[&p][0].name, "newest");
     }
+
+/// 目录必须始终排在文件前面，升降序只反转组内顺序、不跨组搬动。
+///
+/// 0.17.0 的回归在这里有个陷阱：排序键写反(文件在前)**同时**降序分支的 `dir_end`
+/// 算成 0 把整个数组翻转，两个错误在降序下互相抵消——只测一个方向会全绿。所以三个
+/// 排序键 × 升降两个方向都得断言。
+#[test]
+fn sort_puts_dirs_first_in_both_directions() {
+    use crate::proto::FileEntry;
+    use super::list::sort_entries;
+    use super::SortKey;
+
+    let mk = |name: &str, is_dir: bool, size: u64, mtime: u64| FileEntry {
+        name: name.into(),
+        is_dir,
+        is_link: false,
+        size,
+        mtime,
+        perm: 0,
+        owner: String::new(),
+        link_target: None,
+        link_dir: false,
+    };
+    // 故意打乱输入顺序，且让 size/mtime 的大小关系与名字顺序不一致
+    let base = vec![
+        mk("b_file", false, 30, 300),
+        mk("a_dir", true, 10, 100),
+        mk("a_file", false, 40, 400),
+        mk("b_dir", true, 20, 200),
+    ];
+    let names = |v: &[FileEntry]| v.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+
+    for key in [SortKey::Name, SortKey::Size, SortKey::Mtime] {
+        for desc in [false, true] {
+            let mut v = base.clone();
+            sort_entries(&mut v, key, desc);
+            assert_eq!(
+                v.iter().take_while(|e| e.is_dir).count(),
+                2,
+                "两个目录必须都在最前面：key={key:?} desc={desc}"
+            );
+        }
+    }
+
+    // 升序：目录按名升序在前，文件按名升序在后
+    let mut v = base.clone();
+    sort_entries(&mut v, SortKey::Name, false);
+    assert_eq!(names(&v), ["a_dir", "b_dir", "a_file", "b_file"]);
+
+    // 降序：仍是目录在前，只是各组内反过来
+    let mut v = base.clone();
+    sort_entries(&mut v, SortKey::Name, true);
+    assert_eq!(names(&v), ["b_dir", "a_dir", "b_file", "a_file"]);
+
+    // 按大小：目录组内 10 < 20，文件组内 30 < 40（升序）
+    let mut v = base.clone();
+    sort_entries(&mut v, SortKey::Size, false);
+    assert_eq!(names(&v), ["a_dir", "b_dir", "b_file", "a_file"]);
+    let mut v = base.clone();
+    sort_entries(&mut v, SortKey::Size, true);
+    assert_eq!(names(&v), ["b_dir", "a_dir", "a_file", "b_file"]);
+
+    // 按时间：与 size 同构（mtime 递增顺序一致）
+    let mut v = base.clone();
+    sort_entries(&mut v, SortKey::Mtime, false);
+    assert_eq!(names(&v), ["a_dir", "b_dir", "b_file", "a_file"]);
+
+    // 全是文件时降序也不能出错（旧代码的 dir_end 恰好在这种情况下"蒙对"）
+    let mut only_files = vec![mk("x", false, 1, 1), mk("y", false, 2, 2)];
+    sort_entries(&mut only_files, SortKey::Name, true);
+    assert_eq!(names(&only_files), ["y", "x"]);
+
+    // 全是目录时同理
+    let mut only_dirs = vec![mk("x", true, 1, 1), mk("y", true, 2, 2)];
+    sort_entries(&mut only_dirs, SortKey::Name, true);
+    assert_eq!(names(&only_dirs), ["y", "x"]);
+}

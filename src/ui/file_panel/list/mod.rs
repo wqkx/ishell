@@ -7,6 +7,7 @@ mod table;
 mod toolbar;
 
 pub(super) use helpers::{valid_move_srcs, DragPaths};
+pub(super) use table::sort_entries;
 
 pub(super) fn file_list(
     ui: &mut egui::Ui,

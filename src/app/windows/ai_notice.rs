@@ -1,6 +1,6 @@
 //! 终端通知浮层（右上角）：AI CLI 响铃 / OSC 9/777 通知。
 //!
-//! 多条通知自右上角向下纵排，浮于全部内容之上（Order::Foreground）。
+//! 多条通知自右上角向下纵排（层级见 `Order::Middle` 处的说明）。
 //! 左键点击：跳转到来源会话并移除该条；右键点击：浮层菜单（删除此条 / 删除全部）。
 
 use egui::RichText;
@@ -8,6 +8,13 @@ use egui::RichText;
 use crate::theme::Palette;
 
 use super::super::App;
+
+/// 可见条目的下标区间：新通知追加在**尾部**，所以超出容量时要丢掉最旧的、留最新的
+/// `max` 条。写成 `0..n.min(max)` 会正好取反——一旦攒满 max 条，后来的每一条都永远
+/// 画不出来，只有「+N」计数在涨（0.17.0 就是这么错的）。
+fn visible_range(n: usize, max: usize) -> std::ops::Range<usize> {
+    n.saturating_sub(max)..n
+}
 
 impl App {
     pub(in crate::app) fn ai_notice_overlay(&mut self, ctx: &egui::Context) {
@@ -45,8 +52,9 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_max_width(CARD_W);
                 let n = self.ai_notices.len();
-                // 最新在上：倒序展示前 MAX_VISIBLE 条
-                for i in (0..n.min(MAX_VISIBLE)).rev() {
+                // 最新在上：取**末尾** MAX_VISIBLE 条后倒序画（新的追加在尾部）；
+                // 被丢掉的是最旧的那些，正好对应下方的「+N」。
+                for i in visible_range(n, MAX_VISIBLE).rev() {
                     let no = &self.ai_notices[i];
                     // 半透明常态 + 悬停迅速转不透明。悬停状态取自**上一帧**（本帧的
                     // response 要等画完才有），配上 0.12s 的过渡，这一帧的滞后看不出来。
@@ -161,5 +169,21 @@ impl App {
                 self.sessions[idx].terminal.request_focus();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_range;
+
+    /// 新通知追加在尾部，超出容量时必须丢最旧的、留最新的。
+    #[test]
+    fn keeps_newest_when_over_capacity() {
+        assert_eq!(visible_range(0, 6), 0..0);
+        assert_eq!(visible_range(3, 6), 0..3);
+        assert_eq!(visible_range(6, 6), 0..6);
+        // 攒满后又来两条：显示的必须是 2..8（最新六条），而不是 0..6（最旧六条）
+        assert_eq!(visible_range(8, 6), 2..8);
+        assert_eq!(visible_range(100, 6), 94..100);
     }
 }

@@ -477,6 +477,30 @@ impl App {
 /// 不引第三方通知库：各平台自带的命令行入口就够，且省掉一整条 D-Bus/AppKit 依赖。
 /// 一律 `spawn` 不 `wait`——通知进程慢或卡住都不该拖住 UI 帧循环；失败（比如没装
 /// `notify-send`）静默忽略，浮层卡片仍在，不会因此丢消息。
+/// `notify-send` 的完整参数表（抽出来是为了能单测——通知本身在测试里没法观察）。
+///
+/// 末尾的 `--` 不可省：摘要/正文是位置参数，而正文来自终端输出，AI CLI 常输出以 `-`
+/// 开头的 markdown 列表项——没有 `--` 时 `notify-send` 会把它当成选项解析，整条系统
+/// 通知就被静默丢掉了。
+///
+/// 参数直接传给进程，不经 shell，正文没有被解释成命令的机会。`desktop-entry` 提示告诉
+/// GNOME 这条通知属于哪个 `.desktop`，点击时才谈得上「激活已有窗口」而不是另开一个；
+/// 它需要和窗口的 WM_CLASS/app_id 对上（见 `main.rs` 的 `APP_ID`）。
+#[cfg(any(target_os = "linux", test))]
+fn notify_send_args<'a>(summary: &'a str, body: &'a str) -> [&'a str; 9] {
+    [
+        "-a",
+        "iShell",
+        "-u",
+        "normal",
+        "-h",
+        "string:desktop-entry:ishell",
+        "--",
+        summary,
+        body,
+    ]
+}
+
 #[allow(unused_variables)]
 fn os_notify(session_title: &str, body: &str) {
     let summary = match crate::i18n::current() {
@@ -485,21 +509,8 @@ fn os_notify(session_title: &str, body: &str) {
     };
     #[cfg(target_os = "linux")]
     {
-        // 参数直接传给进程，不经 shell——正文来自终端输出，绝不能有被解释成命令的机会。
-        // `desktop-entry` 提示告诉 GNOME 这条通知属于哪个 .desktop，点击时才谈得上
-        // 「激活已有窗口」而不是另开一个。它要和窗口的 WM_CLASS/app_id 一起对上才有效——
-        // 见 main.rs 里把 RESOURCE_NAME 钉成 ishell 的那段说明。
         let _ = std::process::Command::new("notify-send")
-            .args([
-                "-a",
-                "iShell",
-                "-u",
-                "normal",
-                "-h",
-                "string:desktop-entry:ishell",
-                &summary,
-                body,
-            ])
+            .args(notify_send_args(&summary, body))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -523,5 +534,29 @@ fn os_notify(session_title: &str, body: &str) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+    }
+}
+
+#[cfg(test)]
+mod os_notify_tests {
+    /// 正文以 `-` 开头（AI CLI 输出 markdown 列表项时很常见）必须被 `--` 挡在选项解析之外，
+    /// 否则 `notify-send` 会把它当选项、整条系统通知静默消失。
+    #[test]
+    fn body_starting_with_dash_is_after_double_dash() {
+        let args = super::notify_send_args("iShell · web", "- 任务已完成");
+        let sep = args
+            .iter()
+            .position(|a| *a == "--")
+            .expect("必须有 -- 分隔符");
+        assert_eq!(args[sep + 1], "iShell · web");
+        assert_eq!(args[sep + 2], "- 任务已完成");
+        assert_eq!(sep + 3, args.len(), "-- 之后只能有摘要和正文两个位置参数");
+    }
+
+    /// `-h desktop-entry` 是「点通知激活已有窗口」的关键，别在重构里掉了。
+    #[test]
+    fn carries_desktop_entry_hint() {
+        let args = super::notify_send_args("s", "b");
+        assert!(args.contains(&"string:desktop-entry:ishell"));
     }
 }

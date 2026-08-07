@@ -120,7 +120,7 @@ pub struct MoveRecord {
 }
 
 /// 文件列表排序键。
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortKey {
     #[default]
     Name,

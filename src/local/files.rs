@@ -658,6 +658,23 @@ async fn copy_move(srcs: Vec<String>, dest_dir: &str, do_move: bool, sink: &UiSi
             continue;
         };
         let target = dest.join(name);
+        // 目标落在源自身或源的子孙里——两种都必须拦在递归之前：
+        //   1. `target == src`（复制后粘回原目录）：`fs::copy` 以 truncate 打开目标，
+        //      会把源文件**清成 0 字节**（远端那条路走 `cp -a`，cp 自己会拒绝）。
+        //   2. `target` 在 `src` 内部（把目录复制进自己的子目录）：`copy_recursive` 会
+        //      走进刚复制出来的副本里，一直递归到 ENAMETOOLONG。
+        // `Path::starts_with` 按路径分量比较，`/a/project` 不会误命中 `/a/proj`。
+        // 放在这里而不是递归内部：`move_path` 的 rename 失败回退也一并覆盖到了。
+        if target.starts_with(&src) {
+            failed = Some(
+                crate::i18n::tr(
+                    "目标与源相同或位于源目录内部",
+                    "Destination is the source itself or inside it",
+                )
+                .into(),
+            );
+            continue;
+        }
         let r = if do_move {
             move_path(&src, &target).await
         } else {
@@ -809,4 +826,139 @@ fn rand_suffix() -> String {
         b = ns.to_le_bytes();
     }
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个只用于收事件的 UiSink（egui::Context 默认构造即可，测试里不会真重绘）。
+    fn test_sink() -> (UiSink, std::sync::mpsc::Receiver<WorkerEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (sys_tx, _sys_rx) = tokio::sync::watch::channel(None);
+        (
+            UiSink::new(tx, egui::Context::default(), std::sync::Arc::new(sys_tx)),
+            rx,
+        )
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(f)
+    }
+
+    /// 临时目录，Drop 时清理。不引 tempfile 依赖。
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("ishell-test-{tag}-{}", rand_suffix()));
+            std::fs::create_dir_all(&p).expect("mkdir tmp");
+            Self(p)
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 数据丢失防护：把文件复制并粘贴回**它自己所在的目录**，内容必须原封不动。
+    ///
+    /// 修复前 `target == src`，走到 `fs::copy(src, src)`——它以 truncate 打开目标，
+    /// 文件会被清成 0 字节。这条断言就是那个数据丢失的守门人，别删。
+    #[test]
+    fn copy_into_own_directory_does_not_truncate() {
+        let tmp = TmpDir::new("samedir");
+        let file = tmp.0.join("data.txt");
+        let content = b"important payload that must survive";
+        std::fs::write(&file, content).expect("write");
+
+        let (sink, rx) = test_sink();
+        block_on(copy_move(
+            vec![file.to_string_lossy().into_owned()],
+            &tmp.0.to_string_lossy(),
+            false,
+            &sink,
+        ));
+
+        assert_eq!(
+            std::fs::read(&file).expect("read back"),
+            content,
+            "同目录粘贴把源文件清空了"
+        );
+        // 且必须明确报错，而不是假装成功
+        let msg = rx.try_iter().find_map(|e| match e {
+            WorkerEvent::OpDone { message, .. } => Some(message),
+            _ => None,
+        });
+        assert!(
+            msg.is_some_and(|m| m.contains("失败") || m.to_lowercase().contains("failed")),
+            "应报复制失败"
+        );
+    }
+
+    /// `dest_dir` 写成 `/x/.` 这种等价拼法时守卫仍要生效（`Path::components` 会吃掉 `.`）。
+    #[test]
+    fn copy_into_own_directory_dot_spelling_still_guarded() {
+        let tmp = TmpDir::new("dotdir");
+        let file = tmp.0.join("data.txt");
+        std::fs::write(&file, b"payload").expect("write");
+
+        let (sink, _rx) = test_sink();
+        block_on(copy_move(
+            vec![file.to_string_lossy().into_owned()],
+            &format!("{}/.", tmp.0.to_string_lossy()),
+            false,
+            &sink,
+        ));
+        assert_eq!(std::fs::read(&file).expect("read back"), b"payload");
+    }
+
+    /// 把目录复制进它自己的子目录：必须直接拒绝，而不是递归到 ENAMETOOLONG。
+    #[test]
+    fn copy_dir_into_own_descendant_is_refused() {
+        let tmp = TmpDir::new("nest");
+        let src = tmp.0.join("proj");
+        let inner = src.join("sub");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        std::fs::write(src.join("f.txt"), b"x").expect("write");
+
+        let (sink, _rx) = test_sink();
+        block_on(copy_move(
+            vec![src.to_string_lossy().into_owned()],
+            &inner.to_string_lossy(),
+            false,
+            &sink,
+        ));
+        assert!(
+            !inner.join("proj").exists(),
+            "不该在自己的子目录里造出副本"
+        );
+    }
+
+    /// 同名前缀不能误伤：`/x/proj` 复制到 `/x/project` 是合法的。
+    #[test]
+    fn sibling_with_shared_name_prefix_is_allowed() {
+        let tmp = TmpDir::new("prefix");
+        let src = tmp.0.join("proj");
+        let dest = tmp.0.join("project");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::create_dir_all(&dest).expect("mkdir dest");
+        std::fs::write(src.join("f.txt"), b"payload").expect("write");
+
+        let (sink, _rx) = test_sink();
+        block_on(copy_move(
+            vec![src.to_string_lossy().into_owned()],
+            &dest.to_string_lossy(),
+            false,
+            &sink,
+        ));
+        assert_eq!(
+            std::fs::read(dest.join("proj").join("f.txt")).expect("copied"),
+            b"payload"
+        );
+    }
 }
