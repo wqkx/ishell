@@ -262,8 +262,8 @@ impl Editor {
     pub fn dirty(&self) -> bool {
         // 内容、编码、行尾任一与打开/上次保存时不同都算「有改动」——
         // 仅切换 GBK/UTF-8 或 LF/CRLF 也必须能保存、关闭时也要警告。
-        // 标记由各变更点维护（v_apply/set_encoding/set_eol 置位、mark_saved 复位、
-        // undo/redo 与初始化时全量重算），此处 O(1) 读取。
+        // 标记由各变更点维护（v_apply 置位、mark_saved 复位、set_encoding/set_eol 与
+        // undo/redo 全量重算），此处 O(1) 读取。
         self.dirty_flag
     }
     /// 全量重算 dirty 标记（undo/redo 可能精确回到保存点，必须重新比较）。
@@ -342,16 +342,20 @@ impl Editor {
     pub fn set_mtime(&mut self, m: u32) {
         self.mtime = m;
     }
+    /// 改行尾/编码后一律走 `recompute_dirty`，不能直接置 `dirty_flag = true`。
+    /// `dirty()` 比的是与**打开时**的差异，改回原值就该重新变干净；直接置位会让
+    /// 「UTF-8 → GBK → 改回 UTF-8」这种来回切换留下一个抹不掉的已修改标记，
+    /// 关标签时还要提示保存一个其实没动过的文件。
     pub fn set_eol(&mut self, e: crate::proto::Eol) {
         if self.eol != e {
             self.eol = e;
-            self.dirty_flag = true;
+            self.recompute_dirty();
         }
     }
     pub fn set_encoding(&mut self, enc: String) {
         if self.encoding != enc {
             self.encoding = enc;
-            self.dirty_flag = true;
+            self.recompute_dirty();
         }
     }
 }

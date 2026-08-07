@@ -162,3 +162,44 @@ fn sort_puts_dirs_first_in_both_directions() {
     sort_entries(&mut only_dirs, SortKey::Name, true);
     assert_eq!(names(&only_dirs), ["y", "x"]);
 }
+
+/// 用户报过的偶发 bug：删掉一个文件夹、外部又重建了同名的，点刷新却不显示（过滤框反倒
+/// 能搜到）。根因是 `view_cache` 只认 `applied_list_gen`，而 `refresh_dir` 这类原地改动
+/// 不推进它——过滤框改的是缓存键的另一个字段，所以一按就重建了，才有那个"搜得到"的怪象。
+#[test]
+fn listings_mutations_invalidate_view_cache() {
+    use crate::proto::FileEntry;
+    let ent = |name: &str| FileEntry {
+        name: name.into(),
+        is_dir: true,
+        is_link: false,
+        size: 0,
+        mtime: 0,
+        perm: 0,
+        owner: String::new(),
+        link_target: None,
+        link_dir: false,
+    };
+    let mut s = FilePanelState::default();
+    let p = "/d".to_string();
+    s.cwd = p.clone();
+
+    s.on_listing(p.clone(), vec![ent("keep")], 1);
+    let after_listing = s.view_epoch;
+
+    // 手动刷新：移除该目录缓存 → 必须让视图缓存失效，否则界面继续画旧列表
+    assert!(s.refresh_dir(&p));
+    assert_ne!(s.view_epoch, after_listing, "refresh_dir 未使视图缓存失效");
+    let after_refresh = s.view_epoch;
+
+    // 外部重建的同名目录随刷新结果回来：同样要失效
+    s.on_listing(p.clone(), vec![ent("keep"), ent("recreated")], 2);
+    assert_ne!(s.view_epoch, after_refresh, "on_listing 未使视图缓存失效");
+    assert_eq!(s.listings[&p].len(), 2);
+    let after_second = s.view_epoch;
+
+    // 新建目录的乐观插入：也必须失效，否则新建的文件夹要等一个来回才看得见
+    s.insert_new(&p, "brand_new", true);
+    assert_ne!(s.view_epoch, after_second, "insert_new 未使视图缓存失效");
+    assert!(s.listings[&p].iter().any(|e| e.name == "brand_new"));
+}

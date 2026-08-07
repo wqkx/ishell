@@ -721,3 +721,70 @@ fn unclassifiable_notices_default_to_needs_attention() {
     // 别人的标题要原样保留（只有 iShell 自己的标记才剥）
     assert_eq!(ns[2].title.as_deref(), Some("MyTool"));
 }
+
+/// SSH 是按包喂进来的，一条转义序列完全可能横跨两次 `feed`。
+///
+/// 切断时若不做跨块拼接会**同时**错两件事：通知本身丢掉（找不到终止符就跳过），而下一块
+/// 开头那半截被当成普通文本扫描，给 OSC 收尾的 BEL 就成了"真响铃"——通知没弹，反倒多出
+/// 一条内容不对的响铃提醒。和 tmux 那个 DCS bug 是同一类。
+#[test]
+fn osc_notification_split_across_feeds_is_recovered() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]9;split noti");
+    assert!(t.take_notices().is_empty(), "半条序列不该产出任何东西");
+    t.feed(b"fication\x07");
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 1, "拼回来后应当且只当一条通知");
+    assert_eq!(ns[0].body, "split notification");
+}
+
+/// 切在 `ESC` 和 `]` 之间（最刁钻的位置）也要能拼回来。
+#[test]
+fn osc_split_between_esc_and_bracket_is_recovered() {
+    let mut t = Terminal::new();
+    t.feed(b"hello\x1b");
+    t.feed(b"]9;after esc\x07");
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 1);
+    assert_eq!(ns[0].body, "after esc");
+}
+
+/// tmux 的 DCS 透传被切断时同样要拼回来，且仍然只弹一条。
+#[test]
+fn dcs_passthrough_split_across_feeds_is_parsed_once() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1bPtmux;\x1b\x1b]9;codex");
+    t.feed(b" done\x07\x1b\\");
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 1, "被切断的 DCS 透传应当且只当一条通知");
+    assert_eq!(ns[0].body, "codex done");
+}
+
+/// 拼接不能把已经数过的 BEL 再数一遍：完整的一块之后紧跟一个真响铃，只能算一条。
+#[test]
+fn carryover_does_not_double_count_bells() {
+    let mut t = Terminal::new();
+    run_ai_cli(&mut t, "claude");
+    t.feed(b"\x1b]9;first\x07");
+    assert_eq!(t.take_notices().len(), 1);
+    t.feed(b"plain \x07");
+    assert_eq!(t.take_notices().len(), 1, "第二块里只有一个真响铃");
+}
+
+/// 未终止的序列不能让暂存无限增长：超过上限就整段丢弃，从干净状态重扫。
+#[test]
+fn unterminated_sequence_tail_is_capped() {
+    let mut t = Terminal::new();
+    run_ai_cli(&mut t, "claude");
+    t.feed(b"\x1b]9;");
+    // 远超 8KB 的垃圾内容且始终不终止
+    for _ in 0..12 {
+        t.feed(&vec![b'x'; 1024]);
+    }
+    let _ = t.take_notices();
+    // 暂存已被丢弃 → 这一块是干净的一条完整通知，不会被前面那堆垃圾污染
+    t.feed(b"\x1b]9;fresh\x07");
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 1);
+    assert_eq!(ns[0].body, "fresh");
+}

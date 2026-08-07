@@ -86,7 +86,10 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
                 }
                 Some(UiCommand::Disconnect) | None => {
                     // 主动断开 / UI 侧通道关闭：杀掉 shell 子进程并收尾。
+                    // `kill` 之后必须 `wait` 回收，否则每关一个本机标签就留一个僵尸进程
+                    // （上面的 EOF 分支本来就是这么做的，这里漏了）。
                     let _ = child.kill();
+                    let _ = child.wait();
                     sink.send(WorkerEvent::Disconnected(
                         crate::i18n::tr("已断开", "Disconnected").into(),
                     ));

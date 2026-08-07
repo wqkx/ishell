@@ -596,6 +596,7 @@ pub(super) fn toolbar(
         // 先跳父级目录刷新（连带清子目录缓存）才能间接清掉这个陈旧状态。
         if state.nav_error.remove(&state.cwd) {
             state.listings.remove(&state.cwd);
+            state.touch_listings();
         }
         // 跳到未缓存的路径（如「粘贴并转到」到一个此前没进过的目录）：本帧 sync_tree 已在改 cwd 前
         // 跑过、不会再列举它，若不在此显式发起 List，会卡在空白/不加载。命中缓存则无需重复请求。

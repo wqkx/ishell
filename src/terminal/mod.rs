@@ -77,6 +77,10 @@ pub struct Terminal {
     held_btn: Option<u8>,
     /// 跨数据块暂存的不完整 UTF-8 尾字节（避免多字节中文被拆分后乱码）
     utf8_pending: Vec<u8>,
+    /// 跨数据块暂存的未终止字符串类转义序列（OSC/DCS…），供通知扫描拼接。
+    /// 与 `utf8_pending` 不同，它**不影响**喂给 vt100 的字节，只服务于通知/响铃识别。
+    /// 详见 `feed()` 里 `NOTICE_TAIL_CAP` 那段说明。
+    notice_tail: Vec<u8>,
     /// 外部（如「在终端 cd 到此处」）请求下一帧聚焦终端
     focus_req: bool,
     /// 会话日志：开启后把远端原始字节追加写入该文件（typescript 式）
@@ -182,6 +186,7 @@ impl Terminal {
             search_hl: None,
             held_btn: None,
             utf8_pending: Vec::new(),
+            notice_tail: Vec::new(),
             focus_req: false,
             log_file: None,
             highlight: true,
@@ -308,6 +313,25 @@ impl Terminal {
     /// 自动注入类操作的安全前提之一（另见 `input_idle_for`）。
     pub fn output_idle_for(&self, d: std::time::Duration) -> bool {
         self.last_output_at.is_none_or(|t| t.elapsed() >= d)
+    }
+
+    /// 本次（重）连以来用户一次键都没敲过。
+    ///
+    /// 自动注入 MCP 配对 token 的**必要**前提。光靠「输出静止 + 用户停笔」分不清
+    /// 「shell 提示符」和「某个程序正阻塞在 stdin 上」——`sudo`/`ssh` 的密码提示符
+    /// 恰好也是不输出、不动的，而 `expect_echo` 还会把注入的回显吞掉，token 就这么
+    /// 无声无息进了对方的 auth log。而要走到那种提示符前，用户必然先敲过命令，
+    /// 所以「一个键都没敲过」能把这类场景整个排除掉。
+    ///
+    /// 代价：用户在连上后的静止窗口出现之前就动了键盘，本次连接不再自动注入，
+    /// MCP 多机路由退回原有的「多实例弹窗选择」——是既有的降级路径，不是坏掉。
+    pub fn never_typed(&self) -> bool {
+        self.last_input_at.is_none()
+    }
+
+    /// （重）连时复位输入时钟：新 shell 是全新的一轮，`never_typed` 该重新计。
+    pub fn reset_input_clock(&mut self) {
+        self.last_input_at = None;
     }
 
     /// 用户是否已停笔至少 `d`：本地输入行为空，且最近无键盘事件。

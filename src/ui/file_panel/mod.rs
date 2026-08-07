@@ -120,6 +120,14 @@ pub(in crate::ui::file_panel) fn open_intent(e: &FileEntry, full: &str) -> OpenI
 }
 
 impl FilePanelState {
+    /// 声明「`listings` 变了」，让 `view_cache` 在下一帧重建（见 `view_epoch` 字段说明）。
+    ///
+    /// **改动 `listings` 的每一处都必须调它**，否则那次改动在界面上根本不显示——缓存命中
+    /// 时渲染走的是旧的 `Rc<Vec<FileEntry>>`，压根不看 `listings`。
+    pub fn touch_listings(&mut self) {
+        self.view_epoch = self.view_epoch.wrapping_add(1);
+    }
+
     /// 收到目录列表后由 App 调用：写入缓存并清除 loading；首次自动设为 cwd。
     ///
     /// `gen` 是发起该请求时的全局单调序号（见 `proto::next_list_gen`）。同一目录可能有多个
@@ -170,6 +178,7 @@ impl FilePanelState {
             }
         }
         self.listings.insert(path.clone(), entries);
+        self.touch_listings();
         if self.cwd.is_empty() {
             self.cwd = path.clone();
         }
@@ -212,6 +221,7 @@ impl FilePanelState {
         if self.listings.get(&path).is_none_or(|v| v.is_empty()) {
             self.nav_error.insert(path.clone());
             self.listings.insert(path, Vec::new());
+            self.touch_listings();
         }
     }
 
@@ -228,6 +238,7 @@ impl FilePanelState {
         // 移除该目录与其所有直接子目录的缓存/无效标记（孙级不动：进入子目录时其渲染会再预取）
         self.listings
             .retain(|k, _| k != path && parent_of(k) != path);
+        self.touch_listings();
         self.nav_error.retain(|k| k != path && parent_of(k) != path);
         self.load_at.remove(path); // 重置超时计时，让手动刷新获得完整重试预算
         self.loading.insert(path.to_string());
@@ -256,6 +267,7 @@ impl FilePanelState {
             link_target: None,
             link_dir: false,
         });
+        self.touch_listings();
         // 刷新渲染时按名选中新条目（与上传后高亮一致）
         self.pending_select = Some((dir.to_string(), std::iter::once(name.to_string()).collect()));
     }
@@ -391,6 +403,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut FilePanelState, has_clip: bool) -> Ve
             if p == state.cwd && !state.listings.contains_key(&p) {
                 state.nav_error.insert(p.clone());
                 state.listings.insert(p, Vec::new());
+                state.touch_listings();
             }
         }
     }

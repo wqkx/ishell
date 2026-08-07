@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use super::{
-    osc::{count_bel, parse_osc7, parse_osc_notify},
+    osc::{count_bel, parse_osc7, parse_osc_notify, unterminated_string_tail},
     vt::{find_sub, incomplete_utf8_tail, serialize_row, strip_ansi_to_text},
     Terminal, DEFAULT_SCROLLBACK,
 };
@@ -213,13 +213,43 @@ impl Terminal {
         if let Some(f) = &mut self.log_file {
             let _ = f.write_all(bytes);
         }
+        // 通知类扫描（OSC 7 / OSC 9/777 / 裸 BEL）统一在 `scan` 上做，而不是直接看 `bytes`。
+        //
+        // `feed` 是按 SSH 通道包调用的，一条转义序列完全可能被拆在两个包里。拆断时：
+        // 通知本身丢掉（`osc_sequences` 找不到终止符就跳过），而**下一块**开头那半截会被
+        // 当成普通文本扫描，其中给 OSC 收尾的那个 BEL 就成了「真响铃」——于是通知没弹、
+        // 反倒多出一条内容不对的响铃提醒。和刚修掉的 tmux DCS 那个 bug 是同一类。
+        //
+        // 做法：把上一块结尾那段**未终止的字符串类转义序列**原样留到本块前面再扫。这不会
+        // 重复计数——`count_bel` 对未终止的 OSC/DCS 是一路吃到缓冲区末尾且不计数的，
+        // 留下来的那截里本来就没有算过的 BEL。喂给 vt100 的仍是原始 `bytes`（它自己跨
+        // `process()` 维护状态机，不需要这份帮助）。
+        //
+        // 8KB 上限：未终止序列会让尾巴每块都变长（后面的全算在这段序列"里面"），到顶就
+        // 整段丢弃、下一块从干净状态重扫，内存有界。不在 `ESC[3J` 重建解析器时清空——
+        // 清屏并不会终止一条正在传输的 OSC，清了反而会丢掉本来能拼完整的通知。
+        const NOTICE_TAIL_CAP: usize = 8 * 1024;
+        let joined: Vec<u8>;
+        let scan: &[u8] = {
+            let tail = std::mem::take(&mut self.notice_tail);
+            if tail.is_empty() {
+                bytes
+            } else {
+                joined = [tail.as_slice(), bytes].concat();
+                &joined
+            }
+        };
+        self.notice_tail = match unterminated_string_tail(scan) {
+            Some(at) if scan.len() - at <= NOTICE_TAIL_CAP => scan[at..].to_vec(),
+            _ => Vec::new(),
+        };
         // OSC 7 上报的工作目录（shell 配置后会发；用于断线重连恢复 cwd）
-        if let Some(p) = parse_osc7(bytes) {
+        if let Some(p) = parse_osc7(scan) {
             self.osc7_cwd = Some(p);
         }
         // OSC 9/777 桌面通知（codex 走这条、`printf '\e]9;done\a'` 类脚本也是）。
         // **不设门槛**：发这个序列本身就是程序在明确要求"提醒用户"，不像裸 BEL 那样含糊。
-        for (title, body) in parse_osc_notify(bytes) {
+        for (title, body) in parse_osc_notify(scan) {
             // 会主动发通知的程序，其后续的裸 BEL 也值得提醒（同一个程序在说同一件事）。
             self.ai_cli_seen = true;
             // iShell 自己装的 hook 会把类别写在标题位（见 NOTICE_TAG_*）；这类标题是内部
@@ -239,7 +269,7 @@ impl Terminal {
         // BEL 响铃：Claude Code 等 AI CLI 等待确认/任务完成时的标准提示信号。
         // 只统计转义序列之外的 BEL（OSC 通知序列自身的 BEL 终止符不算响铃）。
         // 预览在 process 之后取（那时响铃前的提示文本已上屏）。
-        let bel = count_bel(bytes) > 0;
+        let bel = count_bel(scan) > 0;
         // 合并上次暂存的不完整 UTF-8 前缀，并把本次结尾不完整的多字节序列暂存到下次，
         // 避免一个中文字符被拆在两个数据块里导致乱码。
         let mut data = std::mem::take(&mut self.utf8_pending);

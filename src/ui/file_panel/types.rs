@@ -96,13 +96,26 @@ pub struct FilePanelState {
     /// 此前每帧全量 clone 整个目录再 sort_by（比较器内每次 to_lowercase 分配），
     /// 万条目录下是主要 CPU 热点；现在仅在 listing/排序/过滤变化时重建一次。
     pub view_cache: Option<ViewCache>,
+    /// `listings` 的变更计数（`view_cache` 的失效凭据）。**任何**改动 `listings` 的地方
+    /// 都必须先调 `FilePanelState::touch_listings()`。
+    ///
+    /// 为什么不复用 `applied_list_gen`：那个字段承担的是「丢弃乱序返回的陈旧 List 响应」，
+    /// 是有语义的单调序号；为了让缓存失效而人为把它推高，会让真正在飞的 List 结果被误判
+    /// 成陈旧而丢掉。两件事各用各的计数器，互不干扰。
+    ///
+    /// 只在 `on_listing` 里推进 `applied_list_gen` 而漏掉其余变更点，正是「删掉文件夹后
+    /// 外部重建同名、刷新却不显示（过滤框反倒搜得到）」那个偶发 bug 的根因——过滤框改的是
+    /// 缓存键，所以一按就重建了。
+    pub view_epoch: u64,
 }
 
 /// 排序+过滤后的条目视图（见 `view_cache` 字段）。
 pub struct ViewCache {
-    /// 缓存键：目录、listing 版本（applied_list_gen）、排序、过滤串——全等才命中
+    /// 缓存键：目录、listing 版本（applied_list_gen）、`listings` 变更计数、排序、
+    /// 过滤串——全等才命中
     pub cwd: String,
     pub gen: u64,
+    pub epoch: u64,
     pub sort_key: SortKey,
     pub sort_desc: bool,
     pub filter: String,

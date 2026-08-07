@@ -55,6 +55,9 @@ impl Session {
                     // （重）连后是全新的远端 shell：此前注入的 MCP 配对 token（export 进 shell
                     // env）已随旧 shell 丢失——复位标记，等静止窗口出现时重新注入。
                     self.mcp_token_injected = false;
+                    // 同时复位输入时钟：注入的前提之一是「本次连接以来没敲过键」
+                    // （见 Terminal::never_typed），重连后要重新开始计。
+                    self.terminal.reset_input_clock();
                     // 重连后恢复工作目录（若断线前由 OSC 7 记录过）；ai_owned 会话从不做
                     // OSC 7 注入（见 layout_body.rs），restore_cwd 理论上不会为 true，这里
                     // 仍显式排除一下，避免以后有别的路径意外置位时悄悄破了只读约定。

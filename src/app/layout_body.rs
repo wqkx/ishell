@@ -157,8 +157,15 @@ impl App {
                 //
                 // 只在「提示符几乎确定闲置」时注入，信号缺一不可（等下一帧重试）：
                 // 终端不忙（无全屏程序/1s 内无输出）、远端输出静止 2s+、用户停笔 2s+ 且
-                // 本地输入行为空；且无挂起的 AI 命令/哨兵捕获（expect_echo 会覆盖其吞除状态）。
-                // ai_owned 会话（AI 专用）不注入。
+                // 本地输入行为空、**本次连接以来一个键都没敲过**；且无挂起的 AI 命令/哨兵
+                // 捕获（expect_echo 会覆盖其吞除状态）。ai_owned 会话（AI 专用）不注入。
+                //
+                // 最后那条「没敲过键」是安全边界而非优化：前面几条信号分不清「shell 提示符」
+                // 和「程序阻塞在 stdin」，而 sudo/ssh 的密码提示符恰好也是安静不动的。
+                // 详见 Terminal::never_typed。
+                //
+                // 仍存在的残余风险：某个保存的连接其远端命令直接落进一个密码提示符——那种
+                // 情况下用户确实一个键都没敲。这不在本次修复范围内。
                 if crate::store::load_mcp_consent()
                     && s.connected
                     && !s.ai_owned
@@ -168,6 +175,9 @@ impl App {
                     && !s.terminal.appears_busy()
                     && s.terminal.output_idle_for(std::time::Duration::from_secs(2))
                     && s.terminal.input_idle_for(std::time::Duration::from_secs(2))
+                    // 本次连接以来一个键都没敲过——把「其实停在某个程序的密码提示符上」
+                    // 这类场景整个排除掉。理由见 Terminal::never_typed。
+                    && s.terminal.never_typed()
                 {
                     inject_mcp_token(s);
                     s.mcp_token_injected = true;

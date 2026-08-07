@@ -187,6 +187,74 @@ pub(super) fn count_bel(data: &[u8]) -> usize {
     n
 }
 
+/// 若缓冲区结尾停在一条**未终止的字符串类转义序列**里，返回它的起始下标。
+///
+/// 「字符串类」指 OSC(`ESC ]`) 与 DCS/SOS/PM/APC(`ESC P/X/^/_`)：它们的内容可以是任意
+/// 字节（**包括 BEL**），必须靠终止符划界。调用方据此把这一截留到下一个数据块前面再扫，
+/// 避免一条被 SSH 分包切断的通知既丢了通知、又把它的 BEL 终止符误记成响铃。
+///
+/// 结尾只有一个孤零零的 `ESC` 也算——它后面是什么类型的序列还不知道，同样得留着。
+///
+/// CSI(`ESC [`) 不在此列：它的参数/中间字节都落在 0x20–0x3f，终结字节落在 0x40–0x7e，
+/// 无论怎么切断都不可能有 0x07 混在里面，留不留都不影响响铃计数。
+pub(super) fn unterminated_string_tail(data: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        match data.get(i + 1) {
+            None => return Some(start), // 结尾的裸 ESC
+            Some(&kind @ (b']' | b'P' | b'X' | b'^' | b'_')) => {
+                let bel_terminates = kind == b']'; // 只有 OSC 认 BEL 作终止符
+                i += 2;
+                let mut terminated = false;
+                while i < data.len() {
+                    if bel_terminates && data[i] == 0x07 {
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if data[i] == 0x1b {
+                        match data.get(i + 1) {
+                            Some(b'\\') => {
+                                i += 2;
+                                terminated = true;
+                            }
+                            // ST 的后半个字节还没到：整段留到下一块再判
+                            None => {}
+                            Some(_) => {
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return Some(start);
+                }
+            }
+            // CSI 与 ESC+单字节：不可能藏 BEL，跳过即可（见上文）
+            Some(b'[') => {
+                i += 2;
+                while i < data.len() {
+                    let fin = (0x40..=0x7e).contains(&data[i]);
+                    i += 1;
+                    if fin {
+                        break;
+                    }
+                }
+            }
+            _ => i += 2,
+        }
+    }
+    None
+}
+
 /// 简单 percent 解码（%XX -> 字节）。
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();

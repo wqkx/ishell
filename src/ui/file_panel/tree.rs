@@ -81,6 +81,7 @@ pub(super) fn tree(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut 
                 let moved: HashSet<String> = srcs.iter().cloned().collect();
                 list.retain(|e| !moved.contains(&join_path(&cwd, &e.name)));
             }
+            state.touch_listings();
         }
         state.record_move(srcs.clone(), dest_dir.clone());
         actions.push(FileAction::Move { srcs, dest_dir });
@@ -102,6 +103,7 @@ pub(super) fn sync_tree(state: &mut FilePanelState, actions: &mut Vec<FileAction
         // 陈旧负缓存问题，在这里一并修，覆盖面更全。
         if state.nav_error.remove(&anc) {
             state.listings.remove(&anc);
+            state.touch_listings();
         }
         if !state.listings.contains_key(&anc) && !state.loading.contains(&anc) {
             state.loading.insert(anc.clone());

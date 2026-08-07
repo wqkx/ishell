@@ -42,7 +42,23 @@ pub(super) async fn handle(cmd: UiCommand, sink: &UiSink) {
         // 系统监控侧栏的进程详情 / 结束进程：本机直接读 /proc、本机 kill。
         UiCommand::ProcDetail(pid) => super::sys::proc_detail(pid, sink).await,
         UiCommand::KillProc(pid) => super::sys::kill_proc(pid, sink).await,
-        // 传输 / 端口转发 / PDF / MCP 中转等：本机会话尚不支持（或不适用），忽略。
+        // 「下载/上传」对本机会话没有意义（源和目标是同一个文件系统，复制粘贴就够了），
+        // 但 UI 侧的右键菜单并没有按会话类型隐藏这两项。默默吞掉会让传输面板留下一条
+        // 永远停在 0% 的记录，而 `file_actions` 的去重又会对之后每次重试回答「已在下载中」
+        // ——这条记录再也清不掉。所以必须明确回一个失败，让它正常收尾。
+        UiCommand::Download { id, .. } | UiCommand::Upload { id, .. } => {
+            sink.send(WorkerEvent::TransferDone {
+                id,
+                ok: false,
+                message: crate::i18n::tr(
+                    "本机会话无需传输：请直接用复制/粘贴",
+                    "Local session needs no transfer: use copy/paste instead",
+                )
+                .into(),
+                refresh_dir: None,
+            });
+        }
+        // 端口转发 / PDF / MCP 中转等：本机会话尚不支持（或不适用），忽略。
         _ => {}
     }
 }
@@ -348,12 +364,23 @@ async fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
         .map(|m| m.permissions());
 
     let tmp = parent.join(format!(".{fname}.ishell-tmp-{}", rand_suffix()));
+    // 权限必须在**写入内容之前**落好：`fs::write` 建出来的是 0666 & umask（通常 0644），
+    // 先写后 chmod 会让一个 0600 文件的明文有一段时间是全局可读的。目标文件不存在时
+    // 没有可继承的权限，保持默认。
+    if let Err(e) = create_with_perm(&tmp, orig_perm.clone()).await {
+        return Err(e);
+    }
     if let Err(e) = tokio::fs::write(&tmp, data).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e);
     }
+    // 覆盖已有文件时权限必须**确实**设上了才能换入：设不上就 rename 过去，等于把
+    // `~/.ssh/config` 这类文件从 0600 静默降成 0644。设失败宁可整个保存失败。
     if let Some(perm) = orig_perm {
-        let _ = tokio::fs::set_permissions(&tmp, perm).await; // 尽力继承权限，失败不阻断保存
+        if let Err(e) = tokio::fs::set_permissions(&tmp, perm).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
     }
     if let Err(e) = tokio::fs::rename(&tmp, &target).await {
         let _ = tokio::fs::remove_file(&tmp).await;
@@ -628,6 +655,23 @@ async fn delete_many(paths: Vec<String>, sink: &UiSink) {
         },
     };
     op_done(sink, message, Some(parent));
+}
+
+/// 以指定权限创建一个空文件（不存在才创建，已存在则报错——临时名带随机后缀，撞名即异常）。
+///
+/// Unix 下用 `OpenOptions::mode` 在 `open(2)` 时就带上权限位，避免「先按 umask 建、再 chmod」
+/// 中间那段窗口里文件是全局可读的。非 Unix 平台无此概念，普通创建即可。
+async fn create_with_perm(path: &Path, perm: Option<std::fs::Permissions>) -> std::io::Result<()> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(p) = &perm {
+        use std::os::unix::fs::PermissionsExt;
+        opts.mode(p.mode());
+    }
+    #[cfg(not(unix))]
+    let _ = &perm;
+    opts.open(path).await.map(|_| ())
 }
 
 async fn copy_move(srcs: Vec<String>, dest_dir: &str, do_move: bool, sink: &UiSink) {

@@ -407,6 +407,7 @@ pub(super) fn dialogs(
                 if let Some(list) = state.listings.get_mut(&rec.dest_dir) {
                     list.retain(|e| !moved.contains(&join_path(&rec.dest_dir, &e.name)));
                 }
+                state.touch_listings();
             }
             let names: Vec<&str> = rec.original.iter().map(|o| basename(o)).collect();
             let what = if names.len() == 1 {

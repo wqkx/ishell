@@ -121,6 +121,7 @@ pub(super) fn file_table(
     let cache_hit = state.view_cache.as_ref().is_some_and(|c| {
         c.cwd == cwd
             && c.gen == gen
+            && c.epoch == state.view_epoch
             && c.sort_key == state.sort_key
             && c.sort_desc == state.sort_desc
             && c.filter == state.filter
@@ -142,6 +143,7 @@ pub(super) fn file_table(
         state.view_cache = Some(super::super::ViewCache {
             cwd: cwd.clone(),
             gen,
+            epoch: state.view_epoch,
             sort_key: state.sort_key,
             sort_desc: state.sort_desc,
             filter: state.filter.clone(),

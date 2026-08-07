@@ -71,6 +71,7 @@ pub(super) fn apply_table_tail_actions(
                 let moved: std::collections::HashSet<String> = srcs.iter().cloned().collect();
                 list.retain(|e| !moved.contains(&join_path(cwd, &e.name)));
             }
+            state.touch_listings();
         }
         state.record_move(srcs.clone(), dest_dir.clone());
         actions.push(FileAction::Move { srcs, dest_dir });
