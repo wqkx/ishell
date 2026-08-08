@@ -273,8 +273,34 @@ impl eframe::App for App {
         Palette::BG.to_normalized_gamma_f32()
     }
 
-    // eframe 0.34 的现代入口：所有面板通过 `show_inside` 嵌入根 `ui`。
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// eframe 0.34 的现代入口。这里只是兜底外壳，真正的绘制在 [`App::ui_impl`]。
+    ///
+    /// 为什么要 `catch_unwind`：SSH 客户端崩一次的代价是所有会话断开 + 编辑器里未保存的
+    /// 内容全丢，远大于「这一帧少画了点东西」。接住的位置刻意选在 `ui_impl` 外层——panic
+    /// 只从我们自己的闭包里展开出来，eframe/egui 该收尾的 `end_pass` 照常执行，不会把
+    /// egui 卡在半开的帧上。连续崩太多帧则不再兜底，详见 `crash::on_frame_panic`。
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // AssertUnwindSafe：&mut self / &mut Ui 本就不是 UnwindSafe，我们接受「接住后状态
+        // 可能是半截的」——横幅会明确提示用户尽快保存重启。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.ui_impl(ui, frame)));
+        match r {
+            Ok(()) => crate::crash::on_frame_ok(),
+            Err(_) => crate::crash::on_frame_panic(&ctx),
+        }
+    }
+}
+
+impl App {
+    /// 每帧的实际绘制：所有面板通过 `show_inside` 嵌入根 `ui`。
+    fn ui_impl(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 恢复提示必须画在**这里**（catch_unwind 里面、且在任何面板打开之前），不能画在
+        // 外层 catch 之后：那时 egui 的 pass 状态是半截的（panic 从某个面板/弹窗的闭包里
+        // 展开出来，area/panel 没收尾），在上面再开一个 Window 有可能二次 panic——而二次
+        // panic 是 abort，连下面的「连续 N 帧放弃兜底」都轮不到执行。
+        // `on_frame_panic` 已经 request_repaint，提示会在紧接着那一帧干净地画出来。
+        crate::crash::recovery_notice(ui.ctx());
+
         // Logo 生成模式：透明画布上画一个圆角矩形（初始界面背景色）+ iShell（accent 色、同字体）
         if self.logo {
             {

@@ -107,5 +107,9 @@ vt100 = { path = "vendor/vt100" }
 opt-level = "s"   # 优化体积（GUI 仅事件驱动重绘，活跃渲染影响可忽略）
 lto = true        # fat LTO：更激进的跨 crate 内联与死代码消除
 codegen-units = 1
-strip = true
+# strip = "debuginfo"（而不是 true）：只丢 DWARF，保留符号表。
+# 全 strip 时 crash.log 里的栈全是 `<unknown>`，只剩 panic 那一行的位置——如果 panic 落在
+# egui/winit 内部（输入法类问题很可能如此），没有调用链就等于没有线索。留符号表换回可读的
+# 栈，代价是二进制大一点点，值。
+strip = "debuginfo"
 # 保留 panic = unwind：某个传输/worker 任务 panic 不至于整应用崩溃

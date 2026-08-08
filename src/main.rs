@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod crash;
 mod i18n;
 mod limits;
 mod local;
@@ -49,6 +50,9 @@ fn main() -> eframe::Result<()> {
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // 必须在日志之后、eframe 之前：桌面项启动时 stderr 无人可见，出事得有一份可交的日志
+    crash::install_panic_hook();
 
     // 尽早加载界面语言：窗口标题等在 App::new 之前创建，需要语言已就位才能本地化（App::new 再设一次无妨）。
     if let Some(code) = store::load_lang() {

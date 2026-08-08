@@ -12,6 +12,12 @@ pub(super) fn config_dir() -> Option<PathBuf> {
     }
 }
 
+/// 崩溃/内部错误日志。GUI 从 `.desktop` 启动时 stderr 用户根本看不到，出事只剩「它崩了」
+/// 一句话——落一份文件是让下一次事故可查的最低成本手段。
+pub fn crash_log_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("crash.log"))
+}
+
 pub(super) fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("connections.json"))
 }

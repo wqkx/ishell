@@ -11,6 +11,7 @@ use super::edit::{
 };
 use super::geom::{next_char_boundary, v_sel_range};
 use super::wrap::v_recompute;
+use crate::ui::ime_safe::replace_preedit;
 
 pub(super) fn handle_input(
     ui: &mut egui::Ui,
@@ -45,14 +46,15 @@ pub(super) fn handle_input(
                         continue;
                     }
                     // 组字是临时的：直接改 content、不入撤销栈
-                    let (s, e) = ed
+                    let r = ed
                         .vime_preedit
                         .take()
                         .or_else(|| v_sel_range(ed))
                         .unwrap_or((ed.vcaret, ed.vcaret));
-                    let (s, e) = (s.min(ed.content.len()), e.min(ed.content.len()));
-                    ed.content.replace_range(s..e, &t);
-                    let end = s + t.len();
+                    // 必须走 replace_preedit 而不是裸 replace_range：撤销/重新加载会在两条
+                    // Preedit 之间换掉 content，旧区间可能落在多字节字符中间——那是 panic，
+                    // 不是越界，`.min(len)` 挡不住。
+                    let (s, end) = replace_preedit(&mut ed.content, r, &t);
                     ed.vcaret = end;
                     ed.vsel = None;
                     ed.msel.clear();
@@ -64,10 +66,8 @@ pub(super) fn handle_input(
                     if t == "\n" || t == "\r" {
                         continue;
                     }
-                    if let Some((s, e)) = ed.vime_preedit.take() {
-                        let (s, e) = (s.min(ed.content.len()), e.min(ed.content.len()));
-                        ed.content.replace_range(s..e, "");
-                        ed.vcaret = s;
+                    if let Some(r) = ed.vime_preedit.take() {
+                        ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
                         ed.vsel = None;
                         v_recompute(ed);
                     }
@@ -79,10 +79,8 @@ pub(super) fn handle_input(
                     }
                 }
                 egui::ImeEvent::Disabled => {
-                    if let Some((s, e)) = ed.vime_preedit.take() {
-                        let (s, e) = (s.min(ed.content.len()), e.min(ed.content.len()));
-                        ed.content.replace_range(s..e, "");
-                        ed.vcaret = s;
+                    if let Some(r) = ed.vime_preedit.take() {
+                        ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
                         ed.vsel = None;
                         // 组字取消：内容恢复到组字前，可能恰在保存点上——全量重算
                         ed.recompute_dirty();

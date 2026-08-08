@@ -1,4 +1,10 @@
 //! 单行输入 IME 绕过（fcitx/X11 Commit 门）。从 file_panel 拆出，行为不变。
+//!
+//! 组字区间的所有偏移计算一律走 `crate::ui::ime_safe`——`preedit` 是跨帧存在 state 里的，
+//! 而 `buf` 可能被别处换掉（切目录重置路径框、对话框换类型、重命名行复用），陈旧偏移落在
+//! 多字节字符中间会直接 panic。理由详见该模块文档。
+
+use crate::ui::ime_safe::{byte_of_char, char_of_byte, insert_at, replace_preedit};
 
 pub(super) fn ime_apply_events(
     ui: &mut egui::Ui,
@@ -41,31 +47,24 @@ pub(super) fn ime_apply_events(
                 if t == "\n" || t == "\r" {
                     continue;
                 }
-                let (s, e) = preedit.take().unwrap_or((caret, caret));
-                let (s, e) = (s.min(buf.len()), e.min(buf.len()));
-                buf.replace_range(s..e, &t);
-                caret = s + t.len();
-                *preedit = if t.is_empty() { None } else { Some((s, caret)) };
+                let r = preedit.take().unwrap_or((caret, caret));
+                let (s, end) = replace_preedit(buf, r, &t);
+                caret = end;
+                *preedit = if t.is_empty() { None } else { Some((s, end)) };
             }
             egui::ImeEvent::Commit(t) => {
                 if t == "\n" || t == "\r" {
                     continue;
                 }
-                if let Some((s, e)) = preedit.take() {
-                    let (s, e) = (s.min(buf.len()), e.min(buf.len()));
-                    buf.replace_range(s..e, "");
-                    caret = s;
+                if let Some(r) = preedit.take() {
+                    caret = replace_preedit(buf, r, "").0;
                 }
-                let at = caret.min(buf.len());
-                buf.insert_str(at, &t);
-                caret = at + t.len();
+                caret = insert_at(buf, caret, &t);
             }
             egui::ImeEvent::Enabled => {}
             egui::ImeEvent::Disabled => {
-                if let Some((s, e)) = preedit.take() {
-                    let (s, e) = (s.min(buf.len()), e.min(buf.len()));
-                    buf.replace_range(s..e, "");
-                    caret = s;
+                if let Some(r) = preedit.take() {
+                    caret = replace_preedit(buf, r, "").0;
                 }
             }
         }
@@ -99,22 +98,4 @@ pub(super) fn ime_singleline(
     let enter =
         (resp.has_focus() || resp.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
     (resp, enter)
-}
-
-/// 字符位 → 字节偏移（越界回退到串尾）。
-pub(super) fn byte_of_char(s: &str, ch: usize) -> usize {
-    s.char_indices()
-        .map(|(b, _)| b)
-        .chain(std::iter::once(s.len()))
-        .nth(ch)
-        .unwrap_or(s.len())
-}
-
-/// 字节偏移 → 字符位（非字符边界时向下取整，避免切片 panic）。
-pub(super) fn char_of_byte(s: &str, b: usize) -> usize {
-    let mut b = b.min(s.len());
-    while b > 0 && !s.is_char_boundary(b) {
-        b -= 1;
-    }
-    s[..b].chars().count()
 }
