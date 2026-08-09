@@ -41,6 +41,24 @@ pub(super) struct Transfer {
     pub(super) queued: bool,
     /// 模式徽标（如「直传」）：显示在文件大小之后，标注传输方式；空串不显示
     pub(super) tag: String,
+    /// 建立时刻。传输浮窗把同一服务器多个会话的列表合并展示，需要一个**跨会话可比**的
+    /// 排序键——`id` 是每个会话各自的计数器，跨会话没有可比性；靠会话顺序更不行，
+    /// `same_server_idxs` 把当前活动会话排在最前，那会让同一份传输在不同标签下顺序不同。
+    pub(super) started_at: std::time::Instant,
+}
+
+/// 合并列表的排序：全局新→旧；同刻（同一帧批量建立的多文件传输）用 `(uid, id)` 兜成全序。
+///
+/// 必须是**全序且与「当前是哪个标签」无关**：否则同一份传输在两个标签下顺序不同，再叠加
+/// 显示条数上限，两个标签就会保留不同的子集——看起来就是「同一台服务器的下载列表不共享」。
+pub(super) fn xfer_order(
+    (ua, ta): (u64, &Transfer),
+    (ub, tb): (u64, &Transfer),
+) -> std::cmp::Ordering {
+    tb.started_at
+        .cmp(&ta.started_at)
+        .then(ua.cmp(&ub))
+        .then(tb.id.cmp(&ta.id))
 }
 
 impl Transfer {
@@ -71,6 +89,7 @@ impl Transfer {
             note: String::new(),
             queued: false,
             tag: String::new(),
+            started_at: std::time::Instant::now(),
         }
     }
 }
@@ -644,5 +663,60 @@ mod save_fsm_tests {
         t.begin_save(true);
         t.save = SaveState::Conflict;
         assert!(t.is_conflict() && !t.is_saving() && !t.wants_close());
+    }
+}
+
+#[cfg(test)]
+mod xfer_order_tests {
+    use super::*;
+    use crate::proto::TransferDir;
+
+    fn t(id: u64, name: &str, at: std::time::Instant) -> Transfer {
+        let mut x = Transfer::new(id, name.into(), TransferDir::Download, 100, None, None);
+        x.started_at = at;
+        x
+    }
+
+    /// 用户报的现象：同一台服务器的两个标签，传输列表内容对不上、还显示不全。
+    ///
+    /// 根因是收集顺序跟着「当前是哪个标签」变（`same_server_idxs` 把活动会话排最前），
+    /// 再叠加列表的条数上限，两个标签就各自留下不同的一批。这里模拟两个标签各自的收集
+    /// 顺序，排完必须**完全一致**——包括被截断时留下的那一批。
+    #[test]
+    fn merged_order_is_identical_from_either_tab() {
+        let t0 = std::time::Instant::now();
+        let ms = |n| t0 + std::time::Duration::from_millis(n);
+        // 会话 A(uid=1) 与 B(uid=2) 的传输交错发生
+        let (a1, a2) = (t(1, "a-old", ms(10)), t(2, "a-new", ms(40)));
+        let (b1, b2) = (t(1, "b-mid", ms(20)), t(2, "b-newest", ms(50)));
+
+        // 站在标签 A：A 的会话排在前；站在标签 B：B 的会话排在前
+        let mut from_a = vec![(1, &a1), (1, &a2), (2, &b1), (2, &b2)];
+        let mut from_b = vec![(2, &b1), (2, &b2), (1, &a1), (1, &a2)];
+        from_a.sort_by(|&x, &y| xfer_order(x, y));
+        from_b.sort_by(|&x, &y| xfer_order(x, y));
+
+        let names = |v: &Vec<(u64, &Transfer)>| {
+            v.iter().map(|(_, t)| t.name.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&from_a), names(&from_b), "两个标签的顺序必须一致");
+        assert_eq!(
+            names(&from_a),
+            vec!["b-newest", "a-new", "b-mid", "a-old"],
+            "应当是跨会话的全局新→旧"
+        );
+        // 截断也必须截出同一批（这正是「显示不全且两边不一样」的那一步）
+        assert_eq!(names(&from_a)[..2], names(&from_b)[..2]);
+    }
+
+    /// 同一帧批量建立的多文件传输 `started_at` 可能相同，此时必须仍是全序，
+    /// 否则列表每帧都在抖。
+    #[test]
+    fn simultaneous_transfers_still_have_a_total_order() {
+        let at = std::time::Instant::now();
+        let (x, y) = (t(7, "x", at), t(8, "y", at));
+        assert_eq!(xfer_order((1, &x), (1, &y)), std::cmp::Ordering::Greater);
+        assert_eq!(xfer_order((1, &x), (2, &y)), std::cmp::Ordering::Less);
+        assert_eq!(xfer_order((1, &x), (1, &x)), std::cmp::Ordering::Equal);
     }
 }

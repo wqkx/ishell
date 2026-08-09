@@ -126,12 +126,17 @@ impl App {
                 }
                 let filter = self.xfer_filter;
 
-                // 汇总同服务器所有会话的传输（活动会话在前，各自新→旧），元素为 (会话 uid, &Transfer)
-                let items: Vec<(u64, &Transfer)> = server_idxs
+                // 汇总同服务器所有会话的传输，元素为 (会话 uid, &Transfer)。
+                // 收集顺序取决于 same_server_idxs（活动会话在最前），所以**必须**再按一个
+                // 与当前标签无关的全序重排——否则同一份传输在两个标签下顺序不同，叠加下面
+                // 的 MAX_ROWS 上限就会各自保留不同的一批，看起来就是「两个标签的下载列表
+                // 不一样、还显示不全」。
+                let mut items: Vec<(u64, &Transfer)> = server_idxs
                     .iter()
                     .filter_map(|&i| self.sessions.get(i))
-                    .flat_map(|s| s.transfers.iter().rev().map(move |t| (s.uid, t)))
+                    .flat_map(|s| s.transfers.iter().map(move |t| (s.uid, t)))
                     .collect();
+                items.sort_by(|&a, &b| super::super::xfer_order(a, b));
                 let total_len = items.len();
                 if total_len == 0 {
                     ui.add_space(6.0);
@@ -139,6 +144,20 @@ impl App {
                 }
                 let mut open_dir: Option<String> = None;
                 let mut shown = 0usize; // 当前筛选下实际展示的条数（用于「无匹配」提示）
+                // 单帧最多建多少行控件。上面的筛选结果超过它时会被截断，而顶部的状态计数
+                // 是不截断的全量——两个数字对不上会让人以为「列表丢东西了」，故在列表末尾
+                // 明说还有多少条没显示。
+                const MAX_ROWS: usize = 50;
+                let matched = items
+                    .iter()
+                    .filter(|(_, t)| match filter {
+                        XferFilter::All => true,
+                        XferFilter::Active => t.ok.is_none(),
+                        XferFilter::Done => t.ok == Some(true),
+                        XferFilter::Failed => t.ok == Some(false),
+                    })
+                    .count();
+                let hidden = matched.saturating_sub(MAX_ROWS);
                 // 列表过长时滚动：约 8 条高度封顶，其余可滚动查看
                 egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true])
                     // 传输框不显示滚动条（内容仍可滚轮滚动）——条数多时靠滚轮，界面更干净。
@@ -149,7 +168,7 @@ impl App {
                     XferFilter::Active => t.ok.is_none(),
                     XferFilter::Done => t.ok == Some(true),
                     XferFilter::Failed => t.ok == Some(false),
-                }).take(50) {
+                }).take(MAX_ROWS) {
                     shown += 1;
                     // 下载=绿色，上传=珊瑚橙，颜色区分方向
                     let (dir_icon, dir_col) = match t.dir {
@@ -315,6 +334,18 @@ impl App {
                         }
                     });
                     ui.add_space(4.0);
+                }
+                // 被 MAX_ROWS 截掉的部分：明说，别让顶部计数和列表长度对不上还不解释
+                if hidden > 0 {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!("… 另有 {hidden} 条较早的记录未显示"),
+                            crate::i18n::Lang::En => format!("… {hidden} older entries not shown"),
+                        })
+                        .size(11.0)
+                        .color(Palette::TEXT_DIM),
+                    );
                 }
                 // 有任务但当前筛选下一条都没有：给出「无匹配」提示，避免看着像空列表
                 if shown == 0 && total_len > 0 {
