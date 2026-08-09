@@ -123,19 +123,23 @@ pub fn view_context_menu(resp: &egui::Response) {
                         "仅需要我处理时",
                         "Only when it needs me",
                         "AI 在等你确认/输入时才提醒。「任务完成」那类每轮都来的提醒会被过滤掉。\n\
-                         判不出类别的（裸响铃、第三方 OSC 通知）一律按「需要处理」提醒——\
-                         宁可多弹一条，也不漏掉真正等着你的那条。",
+                         裸响铃（BEL）任何档位下都不提醒：它和补全失败、readline 报错是同一个\
+                         字节，分不出类别，用它当判据必然误报。要准确分档请用终端右键的\
+                         「配置 AI 完成通知」装一次 hook。第三方主动发的 OSC 通知照常提醒。",
                         "Alert only when the AI is waiting on you. Per-turn \"task done\" \
                          notices are filtered out.\n\
-                         Anything unclassifiable (bare bell, third-party OSC) counts as \
-                         \"needs you\" — better one extra card than a missed prompt.",
+                         A bare bell (BEL) never alerts, in any mode: it is the same byte as a \
+                         failed completion or a readline error, so it cannot be classified and \
+                         always misfires. For accurate classification install the hook via the \
+                         terminal context menu. Third-party OSC notifications still alert.",
                     ),
                     (
                         AiNotifyMode::All,
-                        "全部（含任务完成）",
-                        "Everything (incl. task done)",
-                        "每一条终端通知都提醒，包括每轮回答结束的「任务完成」。",
-                        "Alert on every terminal notification, including per-turn completions.",
+                        "含任务完成",
+                        "Incl. task done",
+                        "「需要确认」和「任务完成」都提醒。裸响铃仍然不提醒（见上一档说明）。",
+                        "Alert on both \"needs you\" and \"task done\". A bare bell still never \
+                         alerts (see the mode above).",
                     ),
                     (
                         AiNotifyMode::Off,

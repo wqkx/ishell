@@ -133,7 +133,6 @@ impl App {
                 if window_focused && Some(s.uid) == active_uid {
                     continue;
                 }
-                let now = self.ctx.input(|i| i.time);
                 // 两行文本：OSC 带标题就 `标题：正文`，否则取有内容的那个；BEL 的正文是
                 // 光标行预览，可能整行是空的（比如响铃时屏幕刚好被清），给一句兜底。
                 let text = match (n.title, n.body.trim()) {
@@ -155,7 +154,6 @@ impl App {
                     session_uid: s.uid,
                     session_title: s.title.clone(),
                     text,
-                    at: now,
                 });
             }
             for x in s.pending.relay_source.drain(..) {
@@ -181,11 +179,13 @@ impl App {
         // 条件与上面「不弹」的规则**严格对称**（窗口在前台 且 是活动标签）：少了 window_focused
         // 这一半，窗口在后台时刚给活动标签生成的通知会在同一帧被抹掉，那就是丢消息。
         // 系统气泡也一起关掉，否则通知中心里会留下一条早已看过的。
-        if window_focused {
-            if let Some(uid) = active_uid {
-                if self.ai_notices.iter().any(|x| x.session_uid == uid) {
-                    self.ai_notices.retain(|x| x.session_uid != uid);
-                }
+        //
+        // 边沿触发（只在「正看着的标签」变化时做一次）：见 App::last_focused_tab。
+        let focused_tab = if window_focused { active_uid } else { None };
+        if focused_tab != self.last_focused_tab {
+            self.last_focused_tab = focused_tab;
+            if let Some(uid) = focused_tab {
+                self.ai_notices.retain(|x| x.session_uid != uid);
                 os_notify_close(uid);
             }
         }
@@ -589,7 +589,6 @@ fn parse_gdbus_uint32(out: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-#[allow(unused_variables)]
 /// 这条终端通知该不该提醒用户。
 ///
 /// 分成独立函数是为了能直接测——策略藏在几百行的 `frame()` 里，改坏了没有任何东西拦得住，
@@ -612,54 +611,111 @@ fn notice_should_alert(
     }
 }
 
-/// 每个会话在系统通知服务里的通知 id（Linux）。
-///
-/// 有了它才能做到「同一会话的后一条替换前一条」和「切回该标签时把气泡关掉」——
-/// 否则通知中心里会堆满同一个会话的历史消息，还得一条条手动划掉。
+/// 系统通知的操作，串行交给唯一一条通知线程处理。
 #[cfg(target_os = "linux")]
-static NOTIFY_IDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, u32>>> =
-    std::sync::LazyLock::new(Default::default);
+enum NotifyOp {
+    Show { uid: u64, summary: String, body: String },
+    Close { uid: u64 },
+}
 
+/// 通往通知线程的队列。
+///
+/// 为什么必须串行、而不是每条通知起一个线程各自读写一张共享表：
+/// 「本次要替换哪一条」这个决定依赖上一次调用**返回**的通知 id，而 id 要等 gdbus 跑完才
+/// 拿得到。AI CLI 是成串发通知的——两条抢在第一次 gdbus 返回前进来，就都会读到「没有上
+/// 一条」，于是各建一个气泡（本该只有一个），而且先建的那个 id 被后者覆盖、再也关不掉。
+/// 反过来，用户在 id 写回之前切回标签，`Close` 也会扑空、气泡一直挂着。
+///
+/// 排成一条队列后，读 id、发通知、写回 id 天然是原子的，那张表也就不用再共享了
+/// （直接是通知线程的局部变量，连锁都不需要）。
+#[cfg(target_os = "linux")]
+static NOTIFY_TX: std::sync::LazyLock<std::sync::mpsc::Sender<NotifyOp>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<NotifyOp>();
+        std::thread::spawn(move || {
+            // uid → 该会话当前挂在通知服务里的那条通知 id
+            let mut ids: std::collections::HashMap<u64, u32> = Default::default();
+            while let Ok(op) = rx.recv() {
+                match op {
+                    NotifyOp::Show { uid, summary, body } => {
+                        let replaces = ids.get(&uid).copied().unwrap_or(0);
+                        match gdbus_notify(&summary, &body, replaces) {
+                            Some(id) => {
+                                ids.insert(uid, id);
+                            }
+                            // 没有 gdbus / 调用失败：退回 notify-send。发得出去，但没法替换
+                            // 和关闭——宁可少两个新特性，也不能让通知整个消失。
+                            None => {
+                                ids.remove(&uid);
+                                let _ = std::process::Command::new("notify-send")
+                                    .args(notify_send_args(&summary, &body))
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                            }
+                        }
+                    }
+                    NotifyOp::Close { uid } => {
+                        if let Some(id) = ids.remove(&uid) {
+                            gdbus_close(id);
+                        }
+                    }
+                }
+            }
+        });
+        tx
+    });
+
+/// 发一条通知，返回通知服务分配的 id（失败返回 None）。在通知线程上同步执行。
+#[cfg(target_os = "linux")]
+fn gdbus_notify(summary: &str, body: &str, replaces: u32) -> Option<u32> {
+    let out = std::process::Command::new("gdbus")
+        .args(gdbus_notify_args(summary, body, replaces))
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_gdbus_uint32(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn gdbus_close(id: u32) {
+    let _ = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--timeout",
+            "5",
+            "--method",
+            "org.freedesktop.Notifications.CloseNotification",
+            &id.to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+// 既非 linux 也非 macos 的目标上，下面的参数确实都用不到——别把这个 allow 挪到别的函数
+// 头上（曾经在中间插入新函数时被带走过一次）。
+#[allow(unused_variables)]
 fn os_notify(uid: u64, session_title: &str, body: &str) {
     let summary = match crate::i18n::current() {
         crate::i18n::Lang::Zh => format!("iShell · {session_title}"),
         crate::i18n::Lang::En => format!("iShell · {session_title}"),
     };
+    // 只是入队；发送在通知线程上做，UI 线程一步都不等（gdbus 最坏要 5s 才超时）。
     #[cfg(target_os = "linux")]
-    {
-        let replaces = NOTIFY_IDS
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&uid).copied())
-            .unwrap_or(0);
-        let args = gdbus_notify_args(&summary, body, replaces);
-        let (s2, b2) = (summary.clone(), body.to_string());
-        // 必须开线程：要读 stdout 拿通知 id 就得 `output()`，而它会阻塞——通知服务没响应时
-        // 不能把整个界面拖住。
-        std::thread::spawn(move || {
-            let out = std::process::Command::new("gdbus")
-                .args(&args)
-                .stderr(std::process::Stdio::null())
-                .output();
-            if let Ok(o) = out {
-                if o.status.success() {
-                    if let Some(id) = parse_gdbus_uint32(&String::from_utf8_lossy(&o.stdout)) {
-                        if let Ok(mut m) = NOTIFY_IDS.lock() {
-                            m.insert(uid, id);
-                        }
-                        return;
-                    }
-                }
-            }
-            // 没有 gdbus / 调用失败：退回 notify-send。发得出去，但没法替换和关闭——
-            // 宁可少两个新特性，也不能让通知整个消失。
-            let _ = std::process::Command::new("notify-send")
-                .args(notify_send_args(&s2, &b2))
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        });
-    }
+    let _ = NOTIFY_TX.send(NotifyOp::Show {
+        uid,
+        summary: summary.clone(),
+        body: body.to_string(),
+    });
     #[cfg(not(target_os = "linux"))]
     let _ = uid; // macOS 的 osascript 没有替换/关闭通知的等价能力，uid 用不上
     #[cfg(target_os = "macos")]
@@ -690,28 +746,7 @@ fn os_notify(uid: u64, session_title: &str, body: &str) {
 /// 只能发不能关。缺 gdbus（非 GNOME/无 glib 工具）时静默失败：气泡留着而已，不影响功能。
 fn os_notify_close(uid: u64) {
     #[cfg(target_os = "linux")]
-    {
-        let Some(id) = NOTIFY_IDS.lock().ok().and_then(|mut m| m.remove(&uid)) else {
-            return; // 这个会话没发过气泡，或者已经关过了——绝大多数帧走这条，开销只有一次哈希查找
-        };
-        let _ = std::process::Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.freedesktop.Notifications",
-                "--object-path",
-                "/org/freedesktop/Notifications",
-                "--method",
-                "org.freedesktop.Notifications.CloseNotification",
-                "--timeout",
-                "5",
-                &id.to_string(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    let _ = NOTIFY_TX.send(NotifyOp::Close { uid });
     #[cfg(not(target_os = "linux"))]
     let _ = uid;
 }

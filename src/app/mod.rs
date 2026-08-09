@@ -149,6 +149,12 @@ pub struct App {
     /// 终端通知浮层（BEL 响铃 / OSC 9/777：AI CLI 等待确认、任务完成、脚本通知）。
     /// 右上角纵排，点击跳转对应会话，右键可逐条/全部删除。
     ai_notices: Vec<AiNotice>,
+    /// 上一帧「窗口在前台时的活动会话 uid」（窗口不在前台则为 None）。
+    ///
+    /// 用来把「切到某标签 → 清掉它的通知」做成**边沿触发**：这个判断每帧都要做，而清理
+    /// 动作要给通知线程发消息，每帧都发会把队列灌爆。而且也只在切换那一刻有意义——
+    /// 停在同一个标签上时，该标签根本不会有新通知产生（生成时就被同一条规则挡掉了）。
+    last_focused_tab: Option<u64>,
     /// 终端内容区在本帧的矩形（由 layout_body 记录）：通知浮层据此贴着终端摆，
     /// 而不是贴窗口边。None = 本帧没画终端（欢迎页等）。
     term_rect: Option<egui::Rect>,
@@ -166,8 +172,6 @@ pub struct AiNotice {
     /// 没有任何信息量的占位词，真正有用的是 body（光标行文本，通常就是那句待确认的提示）。
     /// 合成一行既省地方，也不会再出现「标题是占位词、正文才是内容」的别扭排版。
     pub text: String,
-    /// 收到时刻（egui time；同会话去抖与排序用）
-    pub at: f64,
 }
 
 impl App {
@@ -257,6 +261,7 @@ impl App {
             mcp_open_approved: std::collections::HashSet::new(),
             cross_copy_jobs: Vec::new(),
             ai_notices: Vec::new(),
+            last_focused_tab: None,
             term_rect: None,
         };
 

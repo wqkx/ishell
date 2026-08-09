@@ -168,11 +168,19 @@ pub fn on_frame_panic(ctx: &egui::Context) {
     ctx.request_repaint();
 }
 
+/// 恢复提示这一帧该不该显示：崩过、且崩的次数比用户点「知道了」那一刻更多。
+///
+/// 单独成函数是为了能被测到——写在 `recovery_notice` 里就只能靠测试重抄一遍判断条件，
+/// 那种测试永远为真，把条件写反了也照样通过。
+fn notice_visible(total: u32, dismissed_at: u32) -> bool {
+    total > 0 && total > dismissed_at
+}
+
 /// 发生过被接住的 panic 时，在界面上说明情况——否则用户只会看到「偶尔闪一下」，
 /// 既不知道该保存退出，也不知道有日志可交。
 pub fn recovery_notice(ctx: &egui::Context) {
     let total = TOTAL.load(Ordering::Relaxed);
-    if total == 0 || total <= DISMISSED_AT.load(Ordering::Relaxed) {
+    if !notice_visible(total, DISMISSED_AT.load(Ordering::Relaxed)) {
         return;
     }
     let path = crate::store::crash_log_path()
@@ -259,9 +267,9 @@ mod tests {
     /// 毫无预兆地把进程带走。
     #[test]
     fn dismissal_is_rearmed_by_a_later_panic() {
-        let dismissed_at = 3u32;
-        let visible = |total: u32| total > 0 && total > dismissed_at;
-        assert!(!visible(3), "点掉那一刻不该再显示");
-        assert!(visible(4), "之后又崩了必须重新弹出来");
+        assert!(!notice_visible(0, 0), "没崩过就不该显示");
+        assert!(notice_visible(1, 0), "崩过且没点掉，必须显示");
+        assert!(!notice_visible(3, 3), "点掉那一刻不该再显示");
+        assert!(notice_visible(4, 3), "之后又崩了必须重新弹出来");
     }
 }

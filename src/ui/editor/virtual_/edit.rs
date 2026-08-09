@@ -100,10 +100,19 @@ pub(super) fn v_complete_accept(ed: &mut Editor, idx: usize) {
 /// 内容替换（content[at..at+removed_len] → inserted）**之前**调用：按行数增量平移
 /// 折叠区间；行结构未变（无换行增删）时折叠原样保留；与编辑行重叠的折叠保守展开。
 pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: &str) {
+    // 这里是编辑器**唯一**改 content 的地方，所以也是最后一道防线：把区间收敛到合法的
+    // 字符边界上，让 `v_apply` 成为一个总函数（同 `ime_safe::replace_preedit` 的思路）。
+    //
+    // 上游各处算出来的 (at, len) 只要有一端落在多字节字符中间就是 panic，而编辑器里存着
+    // 用户还没保存的远端文件——为一个算错的偏移崩掉整个应用不值得。这里刻意**不加**
+    // debug_assert：越界/非边界正是它要兜住的输入，加了断言等于让 dev 构建在我们明确
+    // 决定要容忍的场景上崩掉。真正的不变量守在源头（见 v_undo 里的 floor_boundary）。
+    let (at, end) = crate::ui::ime_safe::clamp_range(&ed.content, (at, at + removed_len));
+    let removed_len = end - at;
     v_remap_folds(ed, at, removed_len, inserted);
     let caret_before = ed.vcaret;
-    let removed = ed.content[at..at + removed_len].to_string();
-    ed.content.replace_range(at..at + removed_len, inserted);
+    let removed = ed.content[at..end].to_string();
+    ed.content.replace_range(at..end, inserted);
     ed.vcaret = at + inserted.len();
     ed.vsel = None;
     // 连续单段输入（非换行）合并到上一条，避免每个字符一条撤销记录
@@ -253,7 +262,11 @@ pub(super) fn v_undo(ed: &mut Editor) {
         let end = op.at + op.inserted.len();
         v_remap_folds(ed, op.at, op.inserted.len(), &op.removed);
         ed.content.replace_range(op.at..end, &op.removed);
-        ed.vcaret = op.caret_before.min(ed.content.len());
+        // floor_boundary 而不是 `.min(len)`：`caret_before` 是**另一个形状**的缓冲区留下的
+        // 偏移，撤销一段含组字文本的编辑后，它完全可能落在某个多字节字符中间。`.min` 只挡
+        // 越界，落在字符中间照样 panic——而且不是崩在这里，是崩在下一次退格/删除/绘制上，
+        // 现场看不出跟撤销有关。vcaret 是「必须是字符边界」这条不变量唯一的漏口，堵在这里。
+        ed.vcaret = crate::ui::ime_safe::floor_boundary(&ed.content, op.caret_before);
         ed.vsel = None;
         ed.vgoal_col = None;
         // 撤销可能精确回到保存点（或离开它）——必须全量重算而非简单置位
@@ -267,7 +280,7 @@ pub(super) fn v_redo(ed: &mut Editor) {
         let end = op.at + op.removed.len();
         v_remap_folds(ed, op.at, op.removed.len(), &op.inserted);
         ed.content.replace_range(op.at..end, &op.inserted);
-        ed.vcaret = op.caret_after.min(ed.content.len());
+        ed.vcaret = crate::ui::ime_safe::floor_boundary(&ed.content, op.caret_after); // 同 v_undo
         ed.vsel = None;
         ed.vgoal_col = None;
         ed.recompute_dirty();
@@ -596,5 +609,58 @@ mod tests {
         assert!(!ed.dirty(), "撤销回到保存点应恢复干净");
         v_redo(&mut ed);
         assert!(ed.dirty(), "重做应再次有改动");
+    }
+
+    /// 撤销把光标放回**另一个形状**的缓冲区留下的偏移，它可能落在多字节字符中间。
+    /// 此后第一次退格就崩在 `v_apply` 的 `content[at..at+len]` 上——注意光标吸附必须做在
+    /// **撤销那一步**：只让 `prev_char_boundary` 内部吸附是不够的，调用方仍拿未吸附的
+    /// `vcaret` 去算删除长度，panic 只是从一处挪到另一处。
+    fn ed_with(content: &str) -> Editor {
+        let mut ed = Editor::new("/tmp/a.txt".into(), content.into());
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        ed
+    }
+
+    /// 光标停在多字节字符中间时退格。
+    ///
+    /// 注意断言的对象是**生产代码自己吸附**：光标直接置成 5（「文」的中间），一步都不替它
+    /// 修正就调 `v_backspace`。修复前 `prev_char_boundary` 内部吸附出 prev=0，调用方却拿
+    /// 未吸附的 vcaret 算长度，`v_apply` 执行 `content[0..5]` 当场 panic——光在 helper 里
+    /// 吸附只是把 panic 从一处挪到另一处。
+    #[test]
+    fn backspace_with_a_mid_character_caret_does_not_panic() {
+        let mut ed = ed_with("中文abc");
+        assert!(!ed.content.is_char_boundary(5));
+        ed.vcaret = 5;
+        v_backspace(&mut ed);
+        assert!(ed.content.is_char_boundary(ed.vcaret));
+        assert_eq!(ed.content, "文abc", "应当只删掉「中」这一个字符");
+    }
+
+    /// 前向删除同理：`v_apply(ed, vcaret, next - vcaret, "")` 的**左端**就是未吸附的 vcaret。
+    #[test]
+    fn delete_forward_with_a_mid_character_caret_does_not_panic() {
+        let mut ed = ed_with("中文abc");
+        ed.vcaret = 5;
+        v_delete_fwd(&mut ed);
+        assert!(ed.content.is_char_boundary(ed.vcaret));
+        assert_eq!(ed.content, "中abc");
+    }
+
+    /// 走完整的一条真实路径：光标落在多字节字符中间时做了一次编辑（组字直接改 content 就是
+    /// 这个形状），撤销会把那个坏偏移原样放回 `vcaret`——`.min(len)` 拦不住它。
+    /// 此后第一次退格就崩，而且崩在删除代码里、看不出跟撤销有关。
+    #[test]
+    fn undo_does_not_restore_a_mid_character_caret() {
+        let mut ed = ed_with("中文abc");
+        ed.vcaret = 5; // 「文」的中间
+        v_insert(&mut ed, "X"); // 这次编辑把 caret_before=5 记进了撤销栈
+        v_undo(&mut ed);
+        assert!(
+            ed.content.is_char_boundary(ed.vcaret),
+            "撤销把光标放回了字符中间：{}",
+            ed.vcaret
+        );
+        v_backspace(&mut ed); // 修复前在这里 panic
     }
 }
