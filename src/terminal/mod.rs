@@ -35,8 +35,31 @@ pub struct TermNotice {
     pub title: Option<String>,
     /// 正文/预览（OSC 通知正文；BEL 时为光标所在行的文本预览——确认菜单常显示在这行）
     pub body: String,
-    /// 是不是「任务完成」那一类。用于「只提醒需要人干涉的」这档过滤（见 store::AiNotifyMode）。
-    pub done_kind: bool,
+    /// 类别。终端层只负责如实上报「发生了什么」，弹不弹由 App 层按策略决定
+    /// （见 `frame.rs` 的通知过滤与 `store::AiNotifyMode`）。
+    pub kind: NoticeKind,
+}
+
+/// 一条终端通知的类别来源。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoticeKind {
+    /// iShell 自己装的 hook 明确标了「需要人干涉」（等待确认/等待输入）。
+    Need,
+    /// iShell hook 明确标了「任务完成」。
+    Done,
+    /// 第三方程序主动发的 OSC 9/777，但没带类别标记（codex、`printf '\e]9;...\a'` 等）。
+    /// 发这个序列本身就是程序在明确要求「提醒用户」，所以照弹，只是分不出档。
+    Untagged,
+    /// 裸 BEL 响铃。
+    ///
+    /// **App 层不会为它弹通知。** 它和 shell 补全失败、readline 报错发的是同一个字节，
+    /// 而 Claude Code 在既不是「等你确认」也不是「任务完成」的时候同样会响它——拿它当
+    /// 判据必然误报，这正是「通知不准确」的根因。要准确分档只能靠发送方标注，也就是
+    /// iShell 装的那个 hook（见 `NOTICE_TAG_*`）。
+    ///
+    /// 仍然如实上报而不是在终端层就丢掉：终端层的职责是解析、不是决定策略。放在 App 层
+    /// 意味着以后要加「也提醒裸响铃」这档设置时，不用再动解析器。
+    Bell,
 }
 
 /// iShell 自己装的 hook 用 OSC 777 的**标题位**打这个标记，好让通知能被分档过滤。

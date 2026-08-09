@@ -695,8 +695,8 @@ fn ishell_tagged_notices_are_classified_and_tag_is_hidden() {
     t.feed(b"\x1b]777;notify;ishell:need;needs your confirmation\x07");
     let ns = t.take_notices();
     assert_eq!(ns.len(), 2);
-    assert!(ns[0].done_kind, "ishell:done 应判为「任务完成」");
-    assert!(!ns[1].done_kind, "ishell:need 应判为「需要人干涉」");
+    assert_eq!(ns[0].kind, NoticeKind::Done, "ishell:done 应判为「任务完成」");
+    assert_eq!(ns[1].kind, NoticeKind::Need, "ishell:need 应判为「需要人干涉」");
     // 标记是内部用的，不能漏进界面文字里
     for n in &ns {
         assert_eq!(n.title, None, "类别标记应被剥掉，不该当成标题显示");
@@ -704,10 +704,10 @@ fn ishell_tagged_notices_are_classified_and_tag_is_hidden() {
     }
 }
 
-/// 判不出类别的一律当「需要人干涉」：裸响铃、第三方 OSC 通知都算。
-/// 宁可多弹一条，也不能漏掉真正等着你的那条。
+/// 无标记的来源要和「有标记」区分开：裸响铃是 Bell（App 层永不弹），第三方主动发的
+/// OSC 通知是 Untagged（照弹，只是分不出档）。两者都不能被误判成 Done 而被分档过滤掉。
 #[test]
-fn unclassifiable_notices_default_to_needs_attention() {
+fn unclassified_sources_keep_their_own_kind() {
     let mut t = Terminal::new();
     run_ai_cli(&mut t, "claude");
     t.feed(b"continue? [y/N]\x07");           // 裸 BEL
@@ -715,9 +715,9 @@ fn unclassifiable_notices_default_to_needs_attention() {
     t.feed(b"\x1b]777;notify;MyTool;hi\x07"); // 别人的 OSC 777,标题不是 iShell 标记
     let ns = t.take_notices();
     assert_eq!(ns.len(), 3);
-    for n in &ns {
-        assert!(!n.done_kind, "无标记的通知不该被判成「任务完成」而被过滤掉");
-    }
+    assert_eq!(ns[0].kind, NoticeKind::Bell, "裸响铃必须能被单独认出来并滤掉");
+    assert_eq!(ns[1].kind, NoticeKind::Untagged);
+    assert_eq!(ns[2].kind, NoticeKind::Untagged);
     // 别人的标题要原样保留（只有 iShell 自己的标记才剥）
     assert_eq!(ns[2].title.as_deref(), Some("MyTool"));
 }

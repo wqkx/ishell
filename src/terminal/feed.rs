@@ -255,16 +255,16 @@ impl Terminal {
             // iShell 自己装的 hook 会把类别写在标题位（见 NOTICE_TAG_*）；这类标题是内部
             // 标记，不该显示给用户，取出类别后就丢掉。别人发的通知没有标记——一律当
             // 「需要人干涉」，宁可多提醒也不漏掉真正等着你的那条。
-            let done_kind = title.as_deref() == Some(super::NOTICE_TAG_DONE);
+            let kind = match title.as_deref() {
+                Some(super::NOTICE_TAG_DONE) => super::NoticeKind::Done,
+                Some(super::NOTICE_TAG_NEED) => super::NoticeKind::Need,
+                _ => super::NoticeKind::Untagged,
+            };
             let title = match title.as_deref() {
                 Some(super::NOTICE_TAG_DONE) | Some(super::NOTICE_TAG_NEED) => None,
                 _ => title,
             };
-            self.notices.push(super::TermNotice {
-                title,
-                body,
-                done_kind,
-            });
+            self.notices.push(super::TermNotice { title, body, kind });
         }
         // BEL 响铃：Claude Code 等 AI CLI 等待确认/任务完成时的标准提示信号。
         // 只统计转义序列之外的 BEL（OSC 通知序列自身的 BEL 终止符不算响铃）。
@@ -340,9 +340,8 @@ impl Terminal {
         self.notices.push(super::TermNotice {
             title: None,
             body: preview,
-            // 裸响铃分不出类别（Claude Code 的确认提示和任务完成发的是同一个字节），
-            // 当「需要人干涉」处理——漏掉一条等你确认的，比多弹一条完成提醒糟糕得多。
-            done_kind: false,
+            // 如实上报为「裸响铃」。App 层不会为它弹通知——理由见 NoticeKind::Bell。
+            kind: super::NoticeKind::Bell,
         });
     }
 

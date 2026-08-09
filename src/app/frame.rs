@@ -116,17 +116,18 @@ impl App {
             // 终端通知（BEL 响铃 / OSC 9/777）：AI CLI 等待确认或完成时提醒用户。
             //
             // 关于「不弹」的两条规则，写清楚免得日后又被当成 bug 来回改：
-            //  1. 按 `AiNotifyMode` 分档：默认只提醒「需要人干涉」的，滤掉每轮都来的
-            //     「任务完成」。判不出类别的一律当「需要处理」（见 TermNotice::done_kind）。
-            //  2. **窗口在前台、且通知来自你正看着的那个标签**才不弹——人就在那儿盯着。
+            //  1. **裸 BEL 一律不弹。** 它和 shell 补全失败、readline 报错是同一个字节，
+            //     Claude Code 也会在既非「等你确认」也非「已完成」时响它——拿它当判据必然
+            //     误报，这就是「通知不准确」的根因。要分得准只能靠发送方标注，也就是
+            //     右键菜单「配置 AI 完成通知」装的那个 hook（见 NoticeKind）。
+            //  2. 按 `AiNotifyMode` 分档：默认只提醒「需要人干涉」的，滤掉每轮都来的
+            //     「任务完成」。第三方 OSC 9/777 没有标记但确实是在主动要求提醒，照弹。
+            //  3. **窗口在前台、且通知来自你正看着的那个标签**才不弹——人就在那儿盯着。
             //     条件必须是这两个的与：只看「窗口在前台」会把后台标签的通知也吞掉，
             //     那才是真的丢消息。（曾经因为这条规则，用户在当前标签里 `printf '\a'`
             //     测不出任何反应，误以为功能坏了——所以判据必须是"标签级"而非"窗口级"。）
             for n in s.terminal.take_notices() {
-                if matches!(notify_mode, crate::store::AiNotifyMode::Off)
-                    || (n.done_kind
-                        && matches!(notify_mode, crate::store::AiNotifyMode::NeedsInput))
-                {
+                if !notice_should_alert(n.kind, notify_mode) {
                     continue;
                 }
                 if window_focused && Some(s.uid) == active_uid {
@@ -146,8 +147,9 @@ impl App {
                 self.ai_notices.retain(|x| x.session_uid != s.uid);
                 // 焦点不在 iShell 上时顺带发一条系统通知（Ubuntu 的通知气泡 / macOS 通知
                 // 中心）：这时候用户多半在别的窗口里，浮层卡片他根本看不见。
+                // 传 uid 是为了让同一会话的后一条**替换**前一条，而不是在通知中心里越堆越多。
                 if !window_focused {
-                    os_notify(&s.title, &text);
+                    os_notify(s.uid, &s.title, &text);
                 }
                 self.ai_notices.push(super::AiNotice {
                     session_uid: s.uid,
@@ -173,6 +175,18 @@ impl App {
             }
             for x in s.pending.direct_relay_done.drain(..) {
                 direct_relay_done.push(x);
+            }
+        }
+        // 用户自己切回（并且正看着）某个标签，那条通知的使命就完成了——不该还要手动点掉它。
+        // 条件与上面「不弹」的规则**严格对称**（窗口在前台 且 是活动标签）：少了 window_focused
+        // 这一半，窗口在后台时刚给活动标签生成的通知会在同一帧被抹掉，那就是丢消息。
+        // 系统气泡也一起关掉，否则通知中心里会留下一条早已看过的。
+        if window_focused {
+            if let Some(uid) = active_uid {
+                if self.ai_notices.iter().any(|x| x.session_uid == uid) {
+                    self.ai_notices.retain(|x| x.session_uid != uid);
+                }
+                os_notify_close(uid);
             }
         }
         // 必须在上面这个 drain_events 循环之后调用：文件读写超时判定要晚于"本帧事件是否
@@ -501,20 +515,153 @@ fn notify_send_args<'a>(summary: &'a str, body: &'a str) -> [&'a str; 9] {
     ]
 }
 
+/// 把字符串包成 GVariant 文本格式的字面量（`gdbus call` 的每个参数都按 GVariant 解析，
+/// 裸字符串是非法的，必须带引号）。
+///
+/// 正文来自终端输出，什么都可能有：反斜杠、双引号、换行。前两者必须转义，换行直接换成
+/// 空格——GVariant 字面量里的裸换行会让整条命令解析失败，而通知本来也是单行展示。
+#[cfg(any(target_os = "linux", test))]
+fn gvariant_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `org.freedesktop.Notifications.Notify` 的 gdbus 调用参数。
+///
+/// 为什么绕开 `notify-send` 走 D-Bus：替换（`replaces_id`）和拿回通知 id 是 Notify 方法
+/// **自带**的能力，而 `notify-send` 要到 libnotify 0.8.0 才有对应的 `-r` / `-p`。
+/// Ubuntu 22.04 上还是 0.7.9，给它传 `-p` 会「Unknown option」直接失败、一条通知都发不出去。
+/// 走 D-Bus 就没有这个版本矩阵，所有发行版一个行为。
+///
+/// `replaces_id` 传 0 表示新建；传上一条的 id 就是原地替换它。
+#[cfg(any(target_os = "linux", test))]
+fn gdbus_notify_args(summary: &str, body: &str, replaces_id: u32) -> Vec<String> {
+    [
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.Notifications",
+        "--object-path",
+        "/org/freedesktop/Notifications",
+        // 没有通知服务时 gdbus 会一直等到它自己 25s 的默认超时，那条后台线程就挂在那儿。
+        // 真实的 Notify 调用是毫秒级返回的，5s 足够宽松。放在 --method 之前，好让位置参数
+        // 紧跟在方法名后面（测试就按这个位置关系断言）。
+        "--timeout",
+        "5",
+        "--method",
+        "org.freedesktop.Notifications.Notify",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .chain([
+        gvariant_str("iShell"),          // app_name
+        replaces_id.to_string(),         // replaces_id：0=新建，否则替换那一条
+        gvariant_str(""),                // app_icon：留空，图标由 desktop-entry 决定
+        gvariant_str(summary),
+        gvariant_str(body),
+        "[]".to_string(),                // actions：无按钮
+        // desktop-entry 告诉 GNOME 这条通知属于哪个 .desktop，点击才谈得上「激活已有窗口」
+        // 而不是另开一个（要和窗口 app_id 对上，见 main.rs 的 APP_ID）。
+        "{'desktop-entry': <'ishell'>}".to_string(),
+        // expire_timeout = -1（由通知服务决定）。**必须写成 `int32 -1` 这种带类型前缀的
+        // 形式**：裸 `-1` 会被 gdbus 的选项解析当成一个未知短选项，直接打印 Usage 退出，
+        // 一条通知都发不出去（实测过）。带前缀后首字符不是 `-`，就不会被误认。
+        "int32 -1".to_string(),
+    ])
+    .collect()
+}
+
+/// 从 `gdbus call` 的输出里取通知 id。输出形如 `(uint32 12,)`。
+#[cfg(any(target_os = "linux", test))]
+fn parse_gdbus_uint32(out: &str) -> Option<u32> {
+    let rest = out.split_once("uint32")?.1;
+    let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 #[allow(unused_variables)]
-fn os_notify(session_title: &str, body: &str) {
+/// 这条终端通知该不该提醒用户。
+///
+/// 分成独立函数是为了能直接测——策略藏在几百行的 `frame()` 里，改坏了没有任何东西拦得住，
+/// 而这几条规则已经被来回改过三次了。
+fn notice_should_alert(
+    kind: crate::terminal::NoticeKind,
+    mode: crate::store::AiNotifyMode,
+) -> bool {
+    use crate::store::AiNotifyMode as M;
+    use crate::terminal::NoticeKind as K;
+    match (kind, mode) {
+        // 总开关关闭
+        (_, M::Off) => false,
+        // 裸响铃永不提醒：分不出类别，用它当判据必然误报（详见 NoticeKind::Bell）
+        (K::Bell, _) => false,
+        // 「任务完成」在「只提醒需要人干涉」这档下滤掉
+        (K::Done, M::NeedsInput) => false,
+        // 剩下的都提醒：明确标了 Need 的、以及第三方主动发的无标记 OSC 通知
+        _ => true,
+    }
+}
+
+/// 每个会话在系统通知服务里的通知 id（Linux）。
+///
+/// 有了它才能做到「同一会话的后一条替换前一条」和「切回该标签时把气泡关掉」——
+/// 否则通知中心里会堆满同一个会话的历史消息，还得一条条手动划掉。
+#[cfg(target_os = "linux")]
+static NOTIFY_IDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, u32>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn os_notify(uid: u64, session_title: &str, body: &str) {
     let summary = match crate::i18n::current() {
         crate::i18n::Lang::Zh => format!("iShell · {session_title}"),
         crate::i18n::Lang::En => format!("iShell · {session_title}"),
     };
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("notify-send")
-            .args(notify_send_args(&summary, body))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let replaces = NOTIFY_IDS
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&uid).copied())
+            .unwrap_or(0);
+        let args = gdbus_notify_args(&summary, body, replaces);
+        let (s2, b2) = (summary.clone(), body.to_string());
+        // 必须开线程：要读 stdout 拿通知 id 就得 `output()`，而它会阻塞——通知服务没响应时
+        // 不能把整个界面拖住。
+        std::thread::spawn(move || {
+            let out = std::process::Command::new("gdbus")
+                .args(&args)
+                .stderr(std::process::Stdio::null())
+                .output();
+            if let Ok(o) = out {
+                if o.status.success() {
+                    if let Some(id) = parse_gdbus_uint32(&String::from_utf8_lossy(&o.stdout)) {
+                        if let Ok(mut m) = NOTIFY_IDS.lock() {
+                            m.insert(uid, id);
+                        }
+                        return;
+                    }
+                }
+            }
+            // 没有 gdbus / 调用失败：退回 notify-send。发得出去，但没法替换和关闭——
+            // 宁可少两个新特性，也不能让通知整个消失。
+            let _ = std::process::Command::new("notify-send")
+                .args(notify_send_args(&s2, &b2))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        });
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = uid; // macOS 的 osascript 没有替换/关闭通知的等价能力，uid 用不上
     #[cfg(target_os = "macos")]
     {
         // osascript 只能收一段脚本文本，所以必须自己转义：反斜杠在前、双引号在后，
@@ -535,6 +682,38 @@ fn os_notify(session_title: &str, body: &str) {
             .stderr(std::process::Stdio::null())
             .spawn();
     }
+}
+
+/// 关掉某会话还挂在通知中心里的那条系统气泡（用户已经切回该标签、看过了）。
+///
+/// 走 `gdbus` 直接调 `org.freedesktop.Notifications.CloseNotification`——`notify-send`
+/// 只能发不能关。缺 gdbus（非 GNOME/无 glib 工具）时静默失败：气泡留着而已，不影响功能。
+fn os_notify_close(uid: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(id) = NOTIFY_IDS.lock().ok().and_then(|mut m| m.remove(&uid)) else {
+            return; // 这个会话没发过气泡，或者已经关过了——绝大多数帧走这条，开销只有一次哈希查找
+        };
+        let _ = std::process::Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.Notifications",
+                "--object-path",
+                "/org/freedesktop/Notifications",
+                "--method",
+                "org.freedesktop.Notifications.CloseNotification",
+                "--timeout",
+                "5",
+                &id.to_string(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = uid;
 }
 
 #[cfg(test)]
@@ -558,5 +737,104 @@ mod os_notify_tests {
     fn carries_desktop_entry_hint() {
         let args = super::notify_send_args("s", "b");
         assert!(args.contains(&"string:desktop-entry:ishell"));
+    }
+
+    /// **别再给 notify-send 加选项。** 系统上装的很可能是 libnotify 0.7.9（Ubuntu 22.04），
+    /// 它不认识 0.8.0 才加的 `-p`/`-r`/`-e`，而 notify-send 遇到未知选项是直接报错退出、
+    /// 一条通知都不发。替换/关闭那套能力走 gdbus，不要往这里塞。
+    #[test]
+    fn notify_send_sticks_to_options_that_exist_in_0_7() {
+        const SINCE_0_8: [&str; 6] = ["-p", "--print-id", "-r", "--replace-id", "-e", "--transient"];
+        let args = super::notify_send_args("s", "b");
+        for opt in SINCE_0_8 {
+            assert!(!args.contains(&opt), "{opt} 在 libnotify 0.7.x 上会让整条通知发不出去");
+        }
+    }
+
+    /// gdbus 的每个参数都按 GVariant 解析，裸字符串非法；正文来自终端输出，
+    /// 引号/反斜杠/换行都必须处理掉，否则整条命令解析失败 = 通知静默消失。
+    #[test]
+    fn gvariant_escapes_quotes_backslashes_and_control_chars() {
+        assert_eq!(super::gvariant_str(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(super::gvariant_str(r"a\b"), r#""a\\b""#);
+        assert_eq!(super::gvariant_str("a\nb\tc"), r#""a b c""#);
+        assert_eq!(super::gvariant_str(""), r#""""#);
+    }
+
+    /// replaces_id：0 = 新建，非 0 = 原地替换同一会话的上一条。位置固定在第 2 个参数，
+    /// 传错位就会把它当成别的字段。
+    #[test]
+    fn notify_call_carries_replaces_id_in_the_right_slot() {
+        let a = super::gdbus_notify_args("sum", "body", 0);
+        let m = a.iter().position(|x| x == "--method").unwrap();
+        // --method <名字> 之后依次是 app_name, replaces_id, app_icon, summary, body, ...
+        assert_eq!(a[m + 2], r#""iShell""#);
+        assert_eq!(a[m + 3], "0");
+        assert_eq!(a[m + 5], r#""sum""#);
+        assert_eq!(a[m + 6], r#""body""#);
+        assert_eq!(super::gdbus_notify_args("s", "b", 77)[m + 3], "77");
+        assert!(a.iter().any(|x| x.contains("desktop-entry")));
+    }
+
+    /// 位置参数一个都不能以 `-` 开头，否则 gdbus 的选项解析会把它当短选项，直接打印
+    /// Usage 退出——通知一条都发不出去。踩过一次：expire_timeout 写成裸 `-1` 就是这样。
+    /// 正文来自终端输出，同样可能以 `-` 开头（markdown 列表项），所以它必须被引号包住。
+    #[test]
+    fn no_positional_argument_can_look_like_an_option() {
+        let a = super::gdbus_notify_args("- 摘要", "- 正文", 0);
+        let m = a.iter().position(|x| x == "--method").unwrap();
+        for (i, arg) in a.iter().enumerate().skip(m + 2) {
+            assert!(!arg.starts_with('-'), "第 {i} 个位置参数 {arg:?} 会被当成选项");
+        }
+    }
+
+    /// 拿不到 id 就既不能替换也不能关闭；输出格式是 `(uint32 12,)`。
+    #[test]
+    fn parses_the_notification_id_out_of_gdbus_output() {
+        assert_eq!(super::parse_gdbus_uint32("(uint32 12,)\n"), Some(12));
+        assert_eq!(super::parse_gdbus_uint32("(uint32 0,)"), Some(0));
+        assert_eq!(super::parse_gdbus_uint32("Error: whatever"), None);
+        assert_eq!(super::parse_gdbus_uint32(""), None);
+    }
+}
+
+#[cfg(test)]
+mod notice_policy_tests {
+    use super::notice_should_alert as alert;
+    use crate::store::AiNotifyMode as M;
+    use crate::terminal::NoticeKind as K;
+
+    /// 「通知不准确」的根因：裸 BEL 和 shell 补全失败、readline 报错是同一个字节，
+    /// Claude Code 也会在既非等待确认、也非任务完成时响它。任何档位下都不该弹。
+    #[test]
+    fn a_bare_bell_never_alerts_in_any_mode() {
+        for m in [M::Off, M::NeedsInput, M::All] {
+            assert!(!alert(K::Bell, m), "裸响铃在 {m:?} 档下仍然弹了");
+        }
+    }
+
+    /// 分档过滤只针对「任务完成」——它每轮都来。等你确认的那条任何档位都不能滤。
+    #[test]
+    fn done_is_filtered_only_in_needs_input_mode() {
+        assert!(!alert(K::Done, M::NeedsInput));
+        assert!(alert(K::Done, M::All));
+        assert!(alert(K::Need, M::NeedsInput));
+        assert!(alert(K::Need, M::All));
+    }
+
+    /// 第三方程序主动发 OSC 9/777 本身就是在明确要求提醒用户，不能因为没有 iShell 的
+    /// 标记就被当成「任务完成」滤掉——那会漏掉 codex 之类工具真正等你处理的提示。
+    #[test]
+    fn untagged_osc_notifications_still_alert() {
+        assert!(alert(K::Untagged, M::NeedsInput));
+        assert!(alert(K::Untagged, M::All));
+    }
+
+    /// 总开关关掉就是全关，不留例外。
+    #[test]
+    fn off_silences_everything() {
+        for k in [K::Need, K::Done, K::Untagged, K::Bell] {
+            assert!(!alert(k, M::Off), "{k:?} 在 Off 档下仍然弹了");
+        }
     }
 }

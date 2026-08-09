@@ -25,7 +25,8 @@ impl App {
         /// 卡片宽度：够放「会话名 + 两行提示」即可，不占掉右上角一大块。
         const CARD_W: f32 = 300.0;
         /// 常态不透明度：通知是被动提示，压在终端上方长期发亮会碍眼；鼠标移上去才转不透明。
-        const IDLE_ALPHA: f32 = 0.72;
+        /// 调得很淡是刻意的——它只需要用余光能察觉「有事」，真要看内容时鼠标移上去即可。
+        const IDLE_ALPHA: f32 = 0.40;
         let mut jump_to: Option<u64> = None;
         let mut remove_one: Option<usize> = None;
         let mut clear_all = false;
