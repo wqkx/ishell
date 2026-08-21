@@ -97,18 +97,19 @@ pub(in crate::ssh) async fn sftp_write_atomic(
         }));
     }
     // 权限回填到临时文件（保存前继承原文件的 mode）。
-    // 【坑】个别服务器（外置盘 / 非 OpenSSH 实现）会在 SETSTAT 时把文件**截断为 0**！
-    // 这正是「保存清空文件」的真凶：tmp 写满→设权限被清空→rename 搬走空文件。
-    // 故设完权限必须**复验 tmp**；一旦发现被截断，就**重写 tmp 内容、放弃权限保留**（数据优先）。
+    //
+    // 【已定性的老坑，别再误判成服务器问题】「保存把文件写空」曾被诊断成「个别服务器在 SETSTAT
+    // 时会截断文件」。真因在客户端这边：当时这里写的是
+    // `FileAttributes { permissions: Some(mode), ..Default::default() }`，而 russh-sftp 的
+    // `Default` **不是**全 None（size/uid/gid/atime/mtime 全是 `Some(0)`），序列化时四个标志位
+    // 全开，于是那条「只想改权限」的 SETSTAT 实际让服务端先 `truncate(path, 0)`——任何守规矩的
+    // 服务器都会照做。现在统一走 `perm_only_attrs`（只点亮 PERMISSIONS），见它的注释。
+    //
+    // 下面的「设完权限复验 tmp、被截断就重写内容放弃权限」保留不动：根因虽已消除，但这一步
+    // 便宜，且真遇到行为古怪的服务端时它仍是最后一道「数据优先」的兜底。
     if let Some(mode) = orig_perm {
         let _ = sftp
-            .set_metadata(
-                &tmp,
-                russh_sftp::protocol::FileAttributes {
-                    permissions: Some(mode),
-                    ..Default::default()
-                },
-            )
+            .set_metadata(&tmp, super::perm_only_attrs(mode))
             .await;
         if !sftp_verify_size(sftp, &tmp, data.len()).await {
             // 该服务器 SETSTAT 会截断文件：重写内容、放弃权限保留（数据优先）。
@@ -306,10 +307,7 @@ pub(in crate::ssh) async fn handle_fs_op(
         }
         UiCommand::Chmod { path, mode } => {
             let parent = remote_parent(&path);
-            let attrs = russh_sftp::protocol::FileAttributes {
-                permissions: Some(mode & 0o777),
-                ..Default::default()
-            };
+            let attrs = super::perm_only_attrs(mode & 0o777);
             sftp.set_metadata(&path, attrs)
                 .await
                 .map(|_| {

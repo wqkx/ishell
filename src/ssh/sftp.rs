@@ -15,6 +15,40 @@ pub(super) use write::{handle_fs_op, sftp_overwrite};
 /// 网络超时、SFTP 会话异常等其它错误——这几种情况都不代表目标真的不存在，一律当成
 /// "不存在"会做出错误的判断（比如把一个探测失败、但其实已经存在的文件误判为可安全覆盖的
 /// 新建目标）。共享给 `xfer`（上传冲突改名）和 `sftp::write`（保存时的备份步骤）用。
+/// 构造一个**只带权限位**的 SETSTAT 属性集。
+///
+/// 千万别写成 `FileAttributes { permissions: Some(mode), ..Default::default() }`——那句话看起来
+/// 是「只设权限」，实际不是。russh-sftp 的 `FileAttributes::default()` **不是**全 `None`：
+///
+/// ```text
+/// size: Some(0), uid: Some(0), gid: Some(0), atime: Some(0), mtime: Some(0),
+/// permissions: Some(0o777 | DIR)
+/// ```
+///
+/// 而它的 `Serialize` 是「哪个字段是 Some 就点亮哪个标志位」。于是 `..Default::default()` 发出去的
+/// 是一条 **SIZE|UIDGID|PERMISSIONS|ACMODTIME 全开** 的 SETSTAT——按 RFC 语义，服务端会
+/// 依次执行 `truncate(path, 0)`、`chmod`、`utimes`、`chown(path, 0, 0)`：
+///
+/// - `truncate` 排在最前且必然成功 → **文件当场被清成 0 字节**；
+/// - `chown` 到 root 对普通用户必然 EPERM → 整条请求回 `PermissionDenied`。
+///
+/// 也就是说：一次「只想改个权限」的调用，实际后果是**文件被清空、然后报一个权限错误**。
+/// 这正是 memory `save-empty-file-sftp-verify` 里记的「保存把文件写空」的真正根因——当时诊断成
+/// 「个别服务器在 SETSTAT 时会截断文件」，其实是我们自己每次都在请求截断，任何守规矩的服务器
+/// 都会照做。别把这个函数换回结构体字面量。
+pub(super) fn perm_only_attrs(mode: u32) -> russh_sftp::protocol::FileAttributes {
+    russh_sftp::protocol::FileAttributes {
+        size: None,
+        uid: None,
+        user: None,
+        gid: None,
+        group: None,
+        permissions: Some(mode),
+        atime: None,
+        mtime: None,
+    }
+}
+
 pub(super) fn is_sftp_not_found(e: &russh_sftp::client::error::Error) -> bool {
     matches!(
         e,

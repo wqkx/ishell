@@ -153,13 +153,14 @@ pub(super) async fn upload(
             // **之外**——这两次探测与重试次数无关，而且下面清理临时文件时算出来的路径
             // 必须和 upload_file_once 内部用的是同一个。目标是目录属于永久性错误，
             // 重试没有任何意义，直接失败。
-            let target = resolve_upload_target(sftp, &rpath).await?;
+            let (target, orig_perm) = resolve_upload_target(sftp, &rpath).await?;
             let mut attempt = 0u32;
             loop {
                 match upload_file_once(
                     sftp,
                     &lpath,
                     &target,
+                    orig_perm,
                     &cancel,
                     done_base,
                     id,
@@ -390,10 +391,15 @@ pub(super) async fn upload_from_mcp(
 /// 探测失败（多半是目标不存在，这是新建文件的正常情形）不视为错误：让后续的写入/换入
 /// 自然报错即可。**绝不**据此认定"文件不存在"去跳过备份——那是 `upload_file_once` 里
 /// 用 rename 结果判定备份的原因。
+/// 一并返回目标**原有的权限位**（不存在则 None）。事务写是「建新文件再 rename 顶上去」，
+/// 而 `rename` 保留的是**新文件**的 mode——不把原权限带过去，每上传覆盖一次就把远端文件的
+/// 权限重置成服务器 umask 的默认值：0755 的部署脚本变 0644 直接不能执行，0600 的配置文件
+/// 变成全局可读。旧的「直接 open 目标再截断」写法不换 inode，所以从来不用操心这件事，
+/// 改成事务写就必须自己接上。这里顺手取，不额外多花往返：为了判断链接/目录本来就 stat 过了。
 pub(super) async fn resolve_upload_target(
     sftp: &russh_sftp::client::SftpSession,
     rpath: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<u32>)> {
     let link_meta = sftp.symlink_metadata(rpath).await;
     let target = match &link_meta {
         Ok(m) if m.is_symlink() => sftp
@@ -402,15 +408,15 @@ pub(super) async fn resolve_upload_target(
             .unwrap_or_else(|_| rpath.to_string()),
         _ => rpath.to_string(),
     };
-    // 目录判定要看**解析之后**的路径：指向目录的链接同样不能被文件顶替。
-    let is_dir = match &link_meta {
-        Ok(m) if m.is_symlink() => sftp
-            .metadata(&target)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false),
-        Ok(m) => m.is_dir(),
-        Err(_) => false,
+    // 目录判定与权限都要看**解析之后**的路径：指向目录的链接同样不能被文件顶替，
+    // 而写穿链接时该继承的是**真实文件**的权限、不是链接自己的。
+    let (is_dir, perm) = match &link_meta {
+        Ok(m) if m.is_symlink() => match sftp.metadata(&target).await {
+            Ok(t) => (t.is_dir(), t.permissions),
+            Err(_) => (false, None),
+        },
+        Ok(m) => (m.is_dir(), m.permissions),
+        Err(_) => (false, None),
     };
     if is_dir {
         anyhow::bail!(
@@ -424,7 +430,7 @@ pub(super) async fn resolve_upload_target(
             }
         );
     }
-    Ok(target)
+    Ok((target, perm))
 }
 
 /// 单个文件上传的**分段临时文件**路径：`<远端目标>.ishell-part`。
@@ -457,6 +463,8 @@ pub(super) async fn upload_file_once(
     sftp: &russh_sftp::client::SftpSession,
     lpath: &std::path::Path,
     target: &str,
+    // 目标原有的权限位（新建文件为 None），见 resolve_upload_target
+    orig_perm: Option<u32>,
     cancel: &Arc<AtomicBool>,
     done_base: u64,
     id: u64,
@@ -512,6 +520,21 @@ pub(super) async fn upload_file_once(
         OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE
     };
     let mut rf = sftp.open_with_flags(&part, flags).await?;
+    // 权限**在写内容之前**落到分段文件上（只在从头写时做一次；续传时上一轮已经设过）。
+    //
+    // 为什么是"之前"而不是换入前：个别服务器的 SETSTAT 会把文件截断成 0——那正是
+    // 「保存把文件写空」那个老 bug 的真凶（见 sftp_write.rs 里的注释）。此刻分段文件刚被
+    // TRUNCATE、本来就是空的，截断不掉任何东西；等写满几个 G 再设，就是拿整个传输去赌。
+    //
+    // 设不上就算了（best-effort，同 sftp_write_atomic）：服务器不支持 SETSTAT 时结果不过是
+    // 退回"用默认权限"，也就是这次修复之前的状态，不会更糟，但不该因此让整个上传失败。
+    if start == 0 {
+        if let Some(mode) = orig_perm {
+            let _ = sftp
+                .set_metadata(&part, super::super::sftp::perm_only_attrs(mode))
+                .await;
+        }
+    }
     rf.seek(std::io::SeekFrom::Start(start)).await?;
     let mut lf = tokio::fs::File::open(lpath).await?;
     if start > 0 {
@@ -579,7 +602,9 @@ pub(super) async fn upload_file_once(
             "{}",
             match crate::i18n::current() {
                 crate::i18n::Lang::Zh => format!(
-                    "无法确认原文件状态（备份步骤失败，非「文件不存在」）：{e}，已中止换入，原文件未改动"
+                    "无法确认原文件状态（备份步骤失败，非「文件不存在」）：{e}，已中止换入，原文件未改动。\
+                     覆盖已有文件需要对**所在目录**有写权限（要在里面建临时文件再改名），\
+                     只对文件本身可写是不够的——权限不足多半就是这个原因"
                 ),
                 crate::i18n::Lang::En => format!(
                     "could not determine original file state (backup failed, not \"not found\"): {e}; swap aborted, original unchanged"
@@ -668,10 +693,27 @@ mod live_sftp_tests {
         let user = std::env::var("ISHELL_TEST_SSH_USER").ok()?;
         let key_path = std::env::var("ISHELL_TEST_SSH_KEY").ok()?;
 
-        let cfg = Arc::new(russh::client::Config::default());
-        let mut handle = russh::client::connect(cfg, (host.as_str(), port), TestHandler)
-            .await
-            .expect("连接测试 sshd");
+        // 每个测试各开一条连接，9 条背靠背地打到同一台 sshd 上，偶尔会撞上 MaxStartups
+        // （默认 10:30:100）被随机丢掉——那是**测试夹具**的问题，不是被测代码的。退避重试几次，
+        // 免得一次无关的丢连接把整批门禁测试报成失败、白白浪费一轮排查。
+        let mut handle = {
+            let mut attempt = 0u32;
+            loop {
+                let cfg = Arc::new(russh::client::Config::default());
+                match russh::client::connect(cfg, (host.as_str(), port), TestHandler).await {
+                    Ok(h) => break h,
+                    Err(e) if attempt < 5 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            200 * (1 << attempt.min(4)),
+                        ))
+                        .await;
+                        eprintln!("连接测试 sshd 失败（第 {attempt} 次重试）：{e}");
+                    }
+                    Err(e) => panic!("连接测试 sshd 失败（已重试 5 次）：{e}"),
+                }
+            }
+        };
         let key = russh::keys::load_secret_key(&key_path, None).expect("读取测试私钥");
         let ok = handle
             .authenticate_publickey(
@@ -729,8 +771,9 @@ mod live_sftp_tests {
         let flag = Arc::new(AtomicBool::new(cancel));
         let last = AtomicU64::new(0);
         let sz = std::fs::metadata(lpath).map(|m| m.len()).unwrap_or(0);
+        let perm = env.sftp.metadata(target).await.ok().and_then(|m| m.permissions);
         upload_file_once(
-            &env.sftp, lpath, target, &flag, 0, 1, &s, &last, false, sz, None,
+            &env.sftp, lpath, target, perm, &flag, 0, 1, &s, &last, false, sz, None,
         )
         .await
     }
@@ -801,6 +844,125 @@ mod live_sftp_tests {
                 e.file_name()
             );
         }
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// **SETSTAT 只能带权限位**——这条测试同时钉住陷阱与修法。
+    ///
+    /// `FileAttributes { permissions: Some(m), ..Default::default() }` 看着像「只设权限」，
+    /// 实际上 russh-sftp 的 `Default` 会把 size/uid/gid/atime/mtime 一并填成 `Some(0)`，
+    /// 序列化时四个标志位全开 → 服务端先 `truncate(path, 0)` 把文件清空、再 `chown` 到 root
+    /// 报 EPERM。一次「改权限」变成「清空文件 + 报权限错误」。
+    ///
+    /// 前半段如实记录这个行为（库哪天把 Default 改成全 None，这里会失败，那时就该来简化
+    /// `perm_only_attrs`）；后半段验证 `perm_only_attrs` 干净地只改权限。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_setstat_must_carry_permissions_only() {
+        let env = env_or_skip!();
+
+        // A) 库的 Default：文件被清空（外加一个权限错误）
+        let trap = env.path("setstat-trap.txt");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &trap, b"0123456789")
+            .await
+            .expect("预置内容");
+        let res = env
+            .sftp
+            .set_metadata(
+                trap.clone(),
+                russh_sftp::protocol::FileAttributes {
+                    permissions: Some(0o644),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let len_after = env
+            .sftp
+            .metadata(&trap)
+            .await
+            .ok()
+            .and_then(|m| m.size)
+            .unwrap_or(u64::MAX);
+        assert!(
+            res.is_err() || len_after == 0,
+            "russh-sftp 的 FileAttributes::default() 似乎不再捎带 size/uid/gid 了——\
+             可以去简化 sftp::perm_only_attrs 并更新它的注释"
+        );
+
+        // B) perm_only_attrs：内容分毫不动，权限确实改到位
+        let good = env.path("setstat-good.txt");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &good, b"0123456789")
+            .await
+            .expect("预置内容");
+        env.sftp
+            .set_metadata(good.clone(), crate::ssh::sftp::perm_only_attrs(0o640))
+            .await
+            .expect("只带权限位的 SETSTAT 不该失败");
+        assert_eq!(
+            env.read(&good).await.as_deref(),
+            Some(&b"0123456789"[..]),
+            "只改权限却把内容弄没了"
+        );
+        assert_eq!(
+            env.sftp
+                .metadata(&good)
+                .await
+                .expect("读回")
+                .permissions
+                .expect("服务器应回报权限")
+                & 0o777,
+            0o640
+        );
+    }
+
+    /// **权限守门人**：覆盖已有文件必须保住它原来的权限位。
+    ///
+    /// 事务写是「建新文件再 rename 顶上去」，`rename` 保留的是新文件的 mode。不专门把原权限
+    /// 带过去，每覆盖一次就把远端文件重置成服务器 umask 的默认值——0755 的部署脚本变 0644
+    /// 直接跑不了，0600 的配置变成全局可读。旧的直写路径不换 inode，白得这个性质；改成事务写
+    /// 之后是自己接上的，接口一动就容易掉。别把这条断言删了。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_overwrite_preserves_the_target_mode() {
+        let env = env_or_skip!();
+        let target = env.path("deploy.sh");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &target, b"#!/bin/sh\necho old\n")
+            .await
+            .expect("预置脚本");
+        env.sftp
+            .set_metadata(target.clone(), crate::ssh::sftp::perm_only_attrs(0o755))
+            .await
+            .expect("置 0755");
+        let before = env
+            .sftp
+            .metadata(&target)
+            .await
+            .expect("读回权限")
+            .permissions
+            .expect("服务器应回报权限");
+        assert_eq!(before & 0o777, 0o755, "测试前置没设上，后面的断言就没意义了");
+
+        let src = local_file("mode", b"#!/bin/sh\necho new\n");
+        upload_one(&env, &src, &target, false).await.expect("上传");
+
+        let after = env
+            .sftp
+            .metadata(&target)
+            .await
+            .expect("读回权限")
+            .permissions
+            .expect("服务器应回报权限");
+        assert_eq!(
+            after & 0o777,
+            0o755,
+            "覆盖上传把目标的权限位弄丢了（0755 → {:o}）——可执行脚本会就此跑不了",
+            after & 0o777
+        );
+        assert_eq!(
+            env.read(&target).await.as_deref(),
+            Some(&b"#!/bin/sh\necho new\n"[..]),
+            "内容也得换过去"
+        );
         let _ = std::fs::remove_file(&src);
     }
 
@@ -881,7 +1043,7 @@ mod live_sftp_tests {
         }
         assert!(made, "两种参数顺序都没能建出符号链接，测试环境有问题");
 
-        let target = resolve_upload_target(&env.sftp, &link)
+        let (target, _perm) = resolve_upload_target(&env.sftp, &link)
             .await
             .expect("解析链接");
         let src = local_file("link", b"new real");
@@ -983,7 +1145,7 @@ mod live_sftp_tests {
         let flag = Arc::new(AtomicBool::new(false));
         let last = AtomicU64::new(0);
         upload_file_once(
-            &env.sftp, &src, &target, &flag, 0, 1, &s, &last, true, sz, mtime,
+            &env.sftp, &src, &target, None, &flag, 0, 1, &s, &last, true, sz, mtime,
         )
         .await
         .expect("续传上传");
