@@ -34,6 +34,36 @@ cargo build --release
 
 产物在该次运行的 **Artifacts** 下载。
 
+## 测试
+
+```bash
+cargo test              # 单元 + 回归测试（CI 每次 push/PR 都跑这条）
+cargo clippy --all-targets
+```
+
+`.github/workflows/ci.yml` 在每次 push/PR 上跑 `cargo test`，并对
+aarch64-linux / aarch64-darwin / x86_64-windows 各做一次 `cargo check --all-targets`。
+**交叉那几个 job 很重要**：`release.yml` 只在推 `v*` 标签时才碰这些平台，于是
+`#[cfg(windows)]` / `#[cfg(not(unix))]` 分支平时根本不会被编译，改坏了要等到发版当天才炸。
+
+### live SFTP 集成测试（需要一台真 sshd）
+
+有一组测试连**真实的 sshd**，验证那些只有在真服务器上才成立的事：SFTP 的 rename 语义、
+SETSTAT 会不会截断文件、事务写换入前后的权限位、断点续传拼出来的字节、撤销临时信任之后
+`authorized_keys` 的权限。它们默认带 `#[ignore]`，`cargo test` 与 CI 都不会跑到。
+
+```bash
+scripts/test-live-sftp.sh <host> <user> <无口令私钥路径> [端口]
+# 例：在测试服务器上连它自己（公钥本来就在 authorized_keys 里，最省事）
+scripts/test-live-sftp.sh 127.0.0.1 "$USER" ~/.ssh/id_ed25519
+```
+
+测试只在服务器的 `/tmp/ishell-upload-it-<随机>/` 里折腾，不碰你真实的 `~/.ssh`。
+失败时工作目录会留着好排查，清理：`rm -rf /tmp/ishell-upload-it-*`。
+
+**改动传输/SFTP 相关代码后请手动跑一次这组**——CI 覆盖不到它们，而它们守的恰恰是
+「失败了会丢用户文件」的那几条路径。
+
 ## 交叉编译 ishell-mcp 代理
 
 MCP 代理 `ishell-mcp`（见 README 的「AI / MCP integration」）要部署到**运行 AI 客户端的
