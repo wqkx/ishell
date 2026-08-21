@@ -149,12 +149,17 @@ pub(super) async fn upload(
                 .await
                 .ok()
                 .and_then(|m| m.modified().ok());
+            // 符号链接解析 + 「目标是不是目录」的判定：每个文件只做一次，放在重试循环
+            // **之外**——这两次探测与重试次数无关，而且下面清理临时文件时算出来的路径
+            // 必须和 upload_file_once 内部用的是同一个。目标是目录属于永久性错误，
+            // 重试没有任何意义，直接失败。
+            let target = resolve_upload_target(sftp, &rpath).await?;
             let mut attempt = 0u32;
             loop {
                 match upload_file_once(
                     sftp,
                     &lpath,
-                    &rpath,
+                    &target,
                     &cancel,
                     done_base,
                     id,
@@ -169,6 +174,11 @@ pub(super) async fn upload(
                     Ok(()) => break,
                     Err(e) => {
                         if cancel.load(Ordering::Relaxed) || attempt >= XFER_RETRIES {
+                            // 彻底放弃这个文件：清掉它的分段临时文件。留着没有意义——
+                            // 续传只在**本次**传输的重试之间生效（见 upload_file_once 的
+                            // allow_resume），下一次上传第一件事就是把它截断重写；留着只是
+                            // 在用户的远端目录里堆垃圾。目标文件全程未被触碰，无需还原。
+                            let _ = sftp.remove_file(&upload_part_path(&target)).await;
                             return Err(e);
                         }
                         attempt += 1;
@@ -366,11 +376,87 @@ pub(super) async fn upload_from_mcp(
     }
 }
 
-/// 上传单个文件：以远端已有大小为起点续传；带进度节流上报。
+/// 解析一个上传目标：跟随符号链接到真实路径，并确认它不是目录。
+///
+/// **符号链接**：替换必须发生在链接指向的真实文件上（链接本身保留）。旧的直写路径是
+/// 写穿链接、改的是目标文件；事务写若不解析，rename 会把链接本身换成一个普通文件，
+/// 语义完全变了。与编辑器保存 `sftp_write_atomic` 的处理一致。链接损坏（canonicalize
+/// 失败）时就地按普通文件处理——换入后该路径变成普通文件，但至少不留残缺文件。
+///
+/// **目录**：直接拒绝，不能用一个文件顶替它。旧的直写路径在 `open` 时会自然失败；事务写
+/// 不显式挡住的话，rename 会先把整个目录挪到 `.bak`、再把文件放进原位——数据虽然还在
+/// 备份里，但用户的目录已经被换成了文件，比报一句错糟糕得多。
+///
+/// 探测失败（多半是目标不存在，这是新建文件的正常情形）不视为错误：让后续的写入/换入
+/// 自然报错即可。**绝不**据此认定"文件不存在"去跳过备份——那是 `upload_file_once` 里
+/// 用 rename 结果判定备份的原因。
+pub(super) async fn resolve_upload_target(
+    sftp: &russh_sftp::client::SftpSession,
+    rpath: &str,
+) -> anyhow::Result<String> {
+    let link_meta = sftp.symlink_metadata(rpath).await;
+    let target = match &link_meta {
+        Ok(m) if m.is_symlink() => sftp
+            .canonicalize(rpath)
+            .await
+            .unwrap_or_else(|_| rpath.to_string()),
+        _ => rpath.to_string(),
+    };
+    // 目录判定要看**解析之后**的路径：指向目录的链接同样不能被文件顶替。
+    let is_dir = match &link_meta {
+        Ok(m) if m.is_symlink() => sftp
+            .metadata(&target)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false),
+        Ok(m) => m.is_dir(),
+        Err(_) => false,
+    };
+    if is_dir {
+        anyhow::bail!(
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Zh =>
+                    format!("远端同名路径是一个目录，不能用文件覆盖：{target}"),
+                crate::i18n::Lang::En => format!(
+                    "Remote path is a directory; refusing to replace it with a file: {target}"
+                ),
+            }
+        );
+    }
+    Ok(target)
+}
+
+/// 单个文件上传的**分段临时文件**路径：`<远端目标>.ishell-part`。
+///
+/// 刻意是**确定性**的（不带随机后缀）：同一次传输的多次重试要能接着上一次的残段续写，
+/// 随机名每次都从零开始，等于把断点续传废掉。与下载侧 `<local>.ishellpart` 同一思路。
+///
+/// 不怕上一轮遗留的同名残段被误当成本次的进度：首次尝试一律 TRUNCATE 从 0 重写
+/// （`allow_resume == false`），只有本次传输的重试才会去读它的长度。
+pub(super) fn upload_part_path(rpath: &str) -> String {
+    format!("{rpath}.ishell-part")
+}
+
+/// 上传单个文件（**事务写**）：字节先全部写进 `<目标>.ishell-part`，校验落盘长度无误后，
+/// 才把原文件挪到 `.bak`、换入临时文件、删备份——**成功换入之前绝不触碰目标文件**。
+///
+/// 这里曾经是直接 `open(目标, CREATE|WRITE|TRUNCATE)` 再流式写：目标在第一个字节写进去
+/// 之前就已经被截断成 0，此后任何一次断线/取消/本地读错/服务器出错，都会把用户的远端
+/// 文件留成一个空的或半截的文件，**原内容不可恢复**。同一个文件里的 `upload_from_mcp`、
+/// 编辑器保存的 `sftp_write_atomic`、以及下载侧的 `download_file` 三条路径早就都改成事务
+/// 写了，唯独用户日常最常走的这条没跟上。别改回去。
+///
+/// 续传语义随之调整：续的是**临时文件**的长度，不再是目标文件的长度——目标文件在整个
+/// 过程中都保持原样，拿它的长度当偏移毫无意义。
+///
+/// `target` 必须是 [`resolve_upload_target`] 的返回值（符号链接已解析、已确认不是目录），
+/// 由调用方在重试循环**之外**求一次：那两次探测每个文件只该付一遍，而且换入用的临时文件
+/// 必须和调用方清理时算出来的是同一个路径。
 pub(super) async fn upload_file_once(
     sftp: &russh_sftp::client::SftpSession,
     lpath: &std::path::Path,
-    rpath: &str,
+    target: &str,
     cancel: &Arc<AtomicBool>,
     done_base: u64,
     id: u64,
@@ -400,15 +486,17 @@ pub(super) async fn upload_file_once(
                 .and_then(|m| m.modified().ok())
                 .is_some_and(|now| now == pinned)
         });
+    let part = upload_part_path(target);
+    // 续传读的是**临时文件**的长度（目标文件全程不动，它的长度与本次进度无关）。
     let start = if allow_resume && local_unchanged {
-        let remote_size = sftp
-            .metadata(rpath)
+        let part_size = sftp
+            .metadata(&part)
             .await
             .ok()
             .and_then(|m| m.size)
             .unwrap_or(0);
-        if remote_size > 0 && remote_size <= local_size {
-            remote_size
+        if part_size > 0 && part_size <= local_size {
+            part_size
         } else {
             0
         }
@@ -416,13 +504,14 @@ pub(super) async fn upload_file_once(
         0
     };
 
-    // 续传(start>0)保留已传字节；从头(start==0)则 TRUNCATE 覆盖，避免残留旧尾部
+    // 1) 写临时文件。续传(start>0)保留已传字节；从头(start==0)则 TRUNCATE，
+    //    避免上一轮/上一次遗留的残段留下旧尾部。
     let flags = if start > 0 {
         OpenFlags::CREATE | OpenFlags::WRITE
     } else {
         OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE
     };
-    let mut rf = sftp.open_with_flags(rpath, flags).await?;
+    let mut rf = sftp.open_with_flags(&part, flags).await?;
     rf.seek(std::io::SeekFrom::Start(start)).await?;
     let mut lf = tokio::fs::File::open(lpath).await?;
     if start > 0 {
@@ -449,5 +538,404 @@ pub(super) async fn upload_file_once(
     }
     rf.flush().await?;
     rf.shutdown().await?;
+    drop(rf); // 换入前确保句柄已关（部分服务端要 CLOSE 才真正落盘）
+
+    // 2) 换入前校验临时文件落盘长度。比对的是**本次实际写出的字节数** `pos`，而不是
+    //    枚举阶段记下的 `pinned_size`：本地文件在传输期间被改大/改小是允许的（旧实现
+    //    也是读到 EOF 为止），这里要保证的是「服务器确实原样收下了我们发出去的每一个
+    //    字节」——个别服务端会静默截断，那正是这道闸要挡的。
+    //
+    //    只在**确实拿到了 size** 时才判定。服务器不回报 size（退化实现返回 None）时跳过
+    //    这道校验直接换入：拿不到长度就无从比对，把「没测到」当成「不相符」会让这类
+    //    服务器上的每一次上传都失败——那是比不校验严重得多的回归。不像编辑器保存那样
+    //    退回「整文件读回比对」：上传动辄几个 GB，为校验再下载一遍完全不成比例。
+    if let Some(part_size) = sftp.metadata(&part).await.ok().and_then(|m| m.size) {
+        if part_size != pos {
+            anyhow::bail!(
+                "{}",
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!(
+                        "临时文件落盘校验失败：应为 {pos} 字节，实际 {part_size} 字节，已中止换入（目标文件未改动）"
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "temp file verify failed: expected {pos} bytes, got {part_size}; swap aborted (target unchanged)"
+                    ),
+                }
+            );
+        }
+    }
+
+    // 3) 原子换入：SFTP 的 rename 在目标已存在时可能失败（非 POSIX rename），故先把已存在
+    //    的原文件挪到 .bak，再换入临时文件，失败则从 .bak 还原——任一步失败原文件都不丢。
+    //
+    //    **是否已备份由 rename 的结果判定，不依赖可能瞬时失败的 stat**：明确的 NoSuchFile
+    //    才是「原文件不存在」；其它错误（权限/网络/被占用）真相不明，此时绝不能当成"新建"
+    //    继续往下换入——万一原文件其实存在，就会在没有备份的情况下被直接覆盖。
+    let bak = format!("{target}.ishell-bak-{}", super::rand_hex(6));
+    let backed_up = match sftp.rename(target, &bak).await {
+        Ok(()) => true,
+        Err(e) if is_sftp_not_found(&e) => false,
+        Err(e) => anyhow::bail!(
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!(
+                    "无法确认原文件状态（备份步骤失败，非「文件不存在」）：{e}，已中止换入，原文件未改动"
+                ),
+                crate::i18n::Lang::En => format!(
+                    "could not determine original file state (backup failed, not \"not found\"): {e}; swap aborted, original unchanged"
+                ),
+            }
+        ),
+    };
+    if let Err(e) = sftp.rename(&part, target).await {
+        let restored = backed_up && sftp.rename(&bak, target).await.is_ok();
+        anyhow::bail!(
+            "{}",
+            match (crate::i18n::current(), backed_up, restored) {
+                (crate::i18n::Lang::Zh, false, _) => format!("换入失败，原文件未改动：{e}"),
+                (crate::i18n::Lang::Zh, true, true) => format!("换入失败，已还原原文件：{e}"),
+                (crate::i18n::Lang::Zh, true, false) =>
+                    format!("换入失败且未能还原，原文件备份在 {bak}：{e}"),
+                (crate::i18n::Lang::En, false, _) =>
+                    format!("swap failed, original unchanged: {e}"),
+                (crate::i18n::Lang::En, true, true) =>
+                    format!("swap failed, original restored: {e}"),
+                (crate::i18n::Lang::En, true, false) =>
+                    format!("swap failed and not restored; original is at {bak}: {e}"),
+            }
+        );
+    }
+    if backed_up {
+        let _ = sftp.remove_file(&bak).await; // 换入成功：清理备份
+    }
     Ok(())
+}
+
+/// 上传事务写的**真·SFTP** 集成测试。
+///
+/// 这条路径的核心承诺是「换入成功之前绝不触碰目标文件」，而它只有在一个真实 SFTP 服务器上
+/// 才成立得了——rename 语义、TRUNCATE 时机、备份/还原都在服务端。纯单元测试碰不到，所以
+/// 这里连一个真的 sshd。默认 `#[ignore]`（CI/开发机没有服务器时 `cargo test` 照样全绿），
+/// 需要时用环境变量指定服务器再显式跑：
+///
+/// ```text
+/// ISHELL_TEST_SSH_HOST=127.0.0.1 ISHELL_TEST_SSH_PORT=22 \
+/// ISHELL_TEST_SSH_USER=me ISHELL_TEST_SSH_KEY=/path/to/id_ed25519 \
+///   cargo test --  --ignored live_sftp
+/// ```
+#[cfg(test)]
+mod live_sftp_tests {
+    use super::*;
+
+    struct TestHandler;
+    impl russh::client::Handler for TestHandler {
+        type Error = russh::Error;
+        // 测试连的是自己指定的那台机器，指纹校验没有意义
+        async fn check_server_key(
+            &mut self,
+            _key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    struct Env {
+        sftp: russh_sftp::client::SftpSession,
+        dir: String,
+        /// 持有连接句柄，drop 了通道就断
+        _handle: russh::client::Handle<TestHandler>,
+    }
+
+    impl Env {
+        fn path(&self, name: &str) -> String {
+            format!("{}/{name}", self.dir)
+        }
+        async fn read(&self, path: &str) -> Option<Vec<u8>> {
+            self.sftp.read(path).await.ok()
+        }
+        async fn exists(&self, path: &str) -> bool {
+            self.sftp.metadata(path).await.is_ok()
+        }
+    }
+
+    /// 连服务器并建一个一次性工作目录；环境变量没配齐就返回 None（测试自行跳过）。
+    async fn connect() -> Option<Env> {
+        let host = std::env::var("ISHELL_TEST_SSH_HOST").ok()?;
+        let port: u16 = std::env::var("ISHELL_TEST_SSH_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        let user = std::env::var("ISHELL_TEST_SSH_USER").ok()?;
+        let key_path = std::env::var("ISHELL_TEST_SSH_KEY").ok()?;
+
+        let cfg = Arc::new(russh::client::Config::default());
+        let mut handle = russh::client::connect(cfg, (host.as_str(), port), TestHandler)
+            .await
+            .expect("连接测试 sshd");
+        let key = russh::keys::load_secret_key(&key_path, None).expect("读取测试私钥");
+        let ok = handle
+            .authenticate_publickey(
+                &user,
+                russh::keys::PrivateKeyWithHashAlg::new(
+                    Arc::new(key),
+                    Some(russh::keys::HashAlg::Sha512),
+                ),
+            )
+            .await
+            .expect("公钥认证")
+            .success();
+        assert!(ok, "测试 sshd 公钥认证失败");
+
+        let channel = handle.channel_open_session().await.expect("开通道");
+        channel.request_subsystem(true, "sftp").await.expect("sftp");
+        let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .expect("sftp 会话");
+        let dir = format!("/tmp/ishell-upload-it-{}", super::super::rand_hex(8));
+        sftp.create_dir(dir.clone()).await.expect("建测试目录");
+        Some(Env {
+            sftp,
+            dir,
+            _handle: handle,
+        })
+    }
+
+    fn sink() -> (crate::ssh::UiSink, std::sync::mpsc::Receiver<WorkerEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (sys_tx, _sys_rx) = tokio::sync::watch::channel(None);
+        (
+            crate::ssh::UiSink::new(tx, egui::Context::default(), Arc::new(sys_tx)),
+            rx,
+        )
+    }
+
+    /// 造一个本地临时文件，返回路径（同一测试内唯一）。
+    fn local_file(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "ishell-upload-it-{tag}-{}",
+            super::super::rand_hex(6)
+        ));
+        std::fs::write(&p, bytes).expect("写本地临时文件");
+        p
+    }
+
+    async fn upload_one(
+        env: &Env,
+        lpath: &std::path::Path,
+        target: &str,
+        cancel: bool,
+    ) -> anyhow::Result<()> {
+        let (s, _rx) = sink();
+        let flag = Arc::new(AtomicBool::new(cancel));
+        let last = AtomicU64::new(0);
+        let sz = std::fs::metadata(lpath).map(|m| m.len()).unwrap_or(0);
+        upload_file_once(
+            &env.sftp, lpath, target, &flag, 0, 1, &s, &last, false, sz, None,
+        )
+        .await
+    }
+
+    macro_rules! env_or_skip {
+        () => {
+            match connect().await {
+                Some(e) => e,
+                None => {
+                    eprintln!("跳过：未设置 ISHELL_TEST_SSH_* 环境变量");
+                    return;
+                }
+            }
+        };
+    }
+
+    /// **这就是那个 bug 的守门人**：上传中途失败时，远端目标文件必须分毫未动。
+    ///
+    /// 旧实现是 `open(目标, CREATE|WRITE|TRUNCATE)` 再流式写——目标在第一个字节写进去之前
+    /// 就已经被截断成 0 字节了，此后任何失败都会把用户的文件留成空的/半截的，原内容不可
+    /// 恢复。这里用「一开始就置位的 cancel」精确复现那一刻：旧代码到这里目标已经没了，
+    /// 新代码连碰都没碰过它。别把这条断言删了。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_failed_upload_leaves_target_untouched() {
+        let env = env_or_skip!();
+        let target = env.path("precious.txt");
+        let original = b"ORIGINAL CONTENT THAT MUST SURVIVE";
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &target, original)
+            .await
+            .expect("预置原文件");
+
+        let src = local_file("cancel", &vec![b'x'; 512 * 1024]);
+        let res = upload_one(&env, &src, &target, true).await;
+        assert!(res.is_err(), "取消状态下上传应当失败");
+
+        assert_eq!(
+            env.read(&target).await.as_deref(),
+            Some(&original[..]),
+            "上传失败后原文件被改动了——事务写被破坏"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// 正常覆盖：内容替换成功，且不留下临时文件/备份文件。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_overwrite_swaps_in_and_leaves_no_litter() {
+        let env = env_or_skip!();
+        let target = env.path("swap.txt");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &target, b"old")
+            .await
+            .expect("预置原文件");
+
+        let src = local_file("swap", b"brand new content");
+        upload_one(&env, &src, &target, false).await.expect("上传");
+
+        assert_eq!(env.read(&target).await.as_deref(), Some(&b"brand new content"[..]));
+        assert!(
+            !env.exists(&upload_part_path(&target)).await,
+            "换入后不该留下 .ishell-part"
+        );
+        let names = env.sftp.read_dir(&env.dir).await.expect("列目录");
+        for e in names {
+            assert!(
+                !e.file_name().contains("ishell-bak"),
+                "换入成功后备份必须删掉：{}",
+                e.file_name()
+            );
+        }
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// 目标不存在（新建）：正常写入，且不留临时文件。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_new_file_is_created() {
+        let env = env_or_skip!();
+        let target = env.path("fresh.txt");
+        let src = local_file("fresh", b"hello");
+        upload_one(&env, &src, &target, false).await.expect("上传");
+        assert_eq!(env.read(&target).await.as_deref(), Some(&b"hello"[..]));
+        assert!(!env.exists(&upload_part_path(&target)).await);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// 目标是**目录**：必须直接拒绝，且那个目录连同里面的内容都不能被动。
+    ///
+    /// 旧的直写路径在 open 时会自然失败；事务写若不显式挡住，rename 会把整个目录挪到
+    /// .bak、再把文件放进原位——数据虽然还在备份里，但用户的目录已经被换成了文件。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_refuses_to_replace_a_directory() {
+        let env = env_or_skip!();
+        let target = env.path("adir");
+        env.sftp.create_dir(target.clone()).await.expect("建目录");
+        let inside = format!("{target}/keepme.txt");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &inside, b"keep")
+            .await
+            .expect("目录里放个文件");
+
+        let err = resolve_upload_target(&env.sftp, &target)
+            .await
+            .expect_err("目标是目录时必须报错");
+        assert!(
+            format!("{err}").contains("目录") || format!("{err}").contains("directory"),
+            "错误信息应说明目标是目录：{err}"
+        );
+        assert!(
+            env.sftp.metadata(&target).await.expect("目录还在").is_dir(),
+            "目录被换掉了"
+        );
+        assert_eq!(env.read(&inside).await.as_deref(), Some(&b"keep"[..]));
+    }
+
+    /// 目标是**符号链接**：写穿到链接指向的真实文件，链接本身仍然是链接。
+    ///
+    /// 旧的直写路径是 open 链接 → 改的是目标文件。事务写若不先解析链接，rename 会把链接
+    /// 本身换成一个普通文件，语义就变了。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_writes_through_a_symlink() {
+        let env = env_or_skip!();
+        let real = env.path("real.txt");
+        let link = env.path("link.txt");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &real, b"old real")
+            .await
+            .expect("预置真实文件");
+        // russh-sftp 的 `symlink(path, target)` 到底哪个是链接、哪个是被指向者，各服务端
+        // 实现历来有分歧（OpenSSH 的 SSH_FXP_SYMLINK 当年就把两个字段发反了）。这里不猜：
+        // 两种顺序各试一次，谁真的在 `link` 处造出了符号链接就用谁。
+        let mut made = env.sftp.symlink(link.clone(), real.clone()).await.is_ok()
+            && env
+                .sftp
+                .symlink_metadata(&link)
+                .await
+                .map(|m| m.is_symlink())
+                .unwrap_or(false);
+        if !made {
+            let _ = env.sftp.remove_file(&link).await;
+            made = env.sftp.symlink(real.clone(), link.clone()).await.is_ok()
+                && env
+                    .sftp
+                    .symlink_metadata(&link)
+                    .await
+                    .map(|m| m.is_symlink())
+                    .unwrap_or(false);
+        }
+        assert!(made, "两种参数顺序都没能建出符号链接，测试环境有问题");
+
+        let target = resolve_upload_target(&env.sftp, &link)
+            .await
+            .expect("解析链接");
+        let src = local_file("link", b"new real");
+        upload_one(&env, &src, &target, false).await.expect("上传");
+
+        assert_eq!(
+            env.read(&real).await.as_deref(),
+            Some(&b"new real"[..]),
+            "应当写穿到链接指向的真实文件"
+        );
+        assert!(
+            env.sftp
+                .symlink_metadata(&link)
+                .await
+                .expect("链接还在")
+                .is_symlink(),
+            "链接本身被换成普通文件了"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// 重试续传：临时文件里已有前缀时，第二次尝试只补剩下的，最终内容完整。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_resume_completes_the_file() {
+        let env = env_or_skip!();
+        let target = env.path("resume.bin");
+        let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let src = local_file("resume", &content);
+        let meta = std::fs::metadata(&src).expect("本地元数据");
+        let sz = meta.len();
+        let mtime = meta.modified().ok();
+
+        // 预置一个「已传了一半」的分段文件
+        let part = upload_part_path(&target);
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &part, &content[..120_000])
+            .await
+            .expect("预置半截分段");
+
+        let (s, _rx) = sink();
+        let flag = Arc::new(AtomicBool::new(false));
+        let last = AtomicU64::new(0);
+        upload_file_once(
+            &env.sftp, &src, &target, &flag, 0, 1, &s, &last, true, sz, mtime,
+        )
+        .await
+        .expect("续传上传");
+
+        assert_eq!(
+            env.read(&target).await.as_deref(),
+            Some(&content[..]),
+            "续传拼出来的内容与源文件不一致"
+        );
+        assert!(!env.exists(&part).await, "换入后分段文件应当已被 rename 走");
+        let _ = std::fs::remove_file(&src);
+    }
 }
