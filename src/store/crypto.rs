@@ -32,6 +32,21 @@ fn keychain_available() -> bool {
 static KEYCHAIN_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const KEYCHAIN_MAX_INFLIGHT: usize = 2;
 
+/// 归还 `KEYCHAIN_INFLIGHT` 名额的守卫。
+///
+/// 计数**必须**走 Drop、不能写在工作线程末尾：`keyring` 是第三方 crate，其调用一旦
+/// panic（或将来某次改动引入了 `?`/提前返回），写在末尾的 `fetch_sub` 就永远执行不到，
+/// 名额只减不增。攒够 `KEYCHAIN_MAX_INFLIGHT` 次之后 `with_timeout` 会对**每一次**调用
+/// 直接返回 `None`，于是 `keychain_get_key`/`keychain_set_key` 永久失效 → 主密钥被判为
+/// 「不可用」→ `decrypt_secret` 全线走 fallback 返回密文原串 → 所有已保存的密码都登录失败。
+/// 线程展开时 Drop 照常执行，这一条就堵死了。
+struct KeychainSlot;
+impl Drop for KeychainSlot {
+    fn drop(&mut self) {
+        KEYCHAIN_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// 在限定时间内执行可能阻塞的钥匙串操作；超时则放弃。
 /// 超时线程可能短暂存活至钥匙串返回，但并发数有上限，避免无限堆积。
 fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -43,8 +58,9 @@ fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Op
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // 名额在本线程结束时归还，无论正常返回还是 panic 展开（见 KeychainSlot）。
+        let _slot = KeychainSlot;
         let _ = tx.send(f());
-        KEYCHAIN_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     });
     // 超时：工作线程结束后自行减计数
     rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
