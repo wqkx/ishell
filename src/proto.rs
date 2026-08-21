@@ -226,6 +226,10 @@ pub enum UiCommand {
         srcs: Vec<String>,
         dest_dir: String,
         do_move: bool,
+        /// 目标目录里已有同名项时怎么办。与文件传输共用同一个设置（`App::conflict_policy`）：
+        /// 用户在传输窗口里选的是「目标已存在时的默认处理」，同机粘贴/拖拽同样是"目标已存在"，
+        /// 没有理由只在传输时守规矩、在这里闷头覆盖。
+        policy: ConflictPolicy,
     },
     /// 跨主机「直传」：在源主机上直接用 rsync/scp 把 srcs 推到目标主机 dest（数据不经本地）。
     /// 仅目标为「无口令密钥」认证时可用；key_path 为本地（本进程可直接读）的 B 私钥路径，

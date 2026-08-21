@@ -903,6 +903,64 @@ mod live_sftp_tests {
         let _ = std::fs::remove_file(&src);
     }
 
+    /// `plan_copy_move` 的真·SFTP 行为：「目标在不在」判错了，「跳过 / 重命名」就全是空话。
+    ///
+    /// 被测函数住在 `util.rs`，但活的 SFTP 夹具在这个模块里，就近放这儿。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_copy_move_plan_respects_policy() {
+        use super::super::util::{plan_copy_move, CopyDest};
+        use crate::proto::ConflictPolicy as P;
+
+        let env = env_or_skip!();
+        let dst = env.path("dst");
+        env.sftp.create_dir(dst.clone()).await.expect("建目标目录");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &format!("{dst}/a.txt"), b"OLD")
+            .await
+            .expect("预置冲突项");
+        let srcs = vec![env.path("a.txt"), env.path("b.txt")];
+        for src in &srcs {
+            crate::ssh::sftp::sftp_overwrite(&env.sftp, src, b"NEW")
+                .await
+                .expect("预置源文件");
+        }
+
+        // 覆盖：一次探测都不做，全部照常移入——默认值的行为一个字都不能变
+        let p = plan_copy_move(&env.sftp, &srcs, &dst, P::Overwrite)
+            .await
+            .expect("覆盖策略不该失败");
+        assert_eq!(
+            p,
+            vec![
+                (srcs[0].clone(), CopyDest::Into),
+                (srcs[1].clone(), CopyDest::Into)
+            ]
+        );
+
+        // 跳过：冲突的那项跳过，不冲突的照做
+        let p = plan_copy_move(&env.sftp, &srcs, &dst, P::Skip)
+            .await
+            .expect("跳过策略");
+        assert_eq!(p[0].1, CopyDest::Skip, "目标已存在的项应当跳过");
+        assert_eq!(p[1].1, CopyDest::Into, "目标不存在的项应当照常");
+
+        // 重命名：冲突的换个不冲突的名字，且那个新名字确实还没被占
+        let p = plan_copy_move(&env.sftp, &srcs, &dst, P::Rename)
+            .await
+            .expect("重命名策略");
+        match &p[0].1 {
+            CopyDest::Renamed(n) => {
+                assert_eq!(n, "a (1).txt");
+                assert!(
+                    !env.exists(&format!("{dst}/{n}")).await,
+                    "换出来的名字必须是没被占的"
+                );
+            }
+            other => panic!("目标已存在的项应当换名，实际是 {other:?}"),
+        }
+        assert_eq!(p[1].1, CopyDest::Into);
+    }
+
     /// 重试续传：临时文件里已有前缀时，第二次尝试只补剩下的，最终内容完整。
     #[tokio::test]
     #[ignore = "需要真实 sshd，见模块文档"]

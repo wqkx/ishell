@@ -73,7 +73,7 @@ pub(super) fn join_quoted(items: &[String]) -> String {
 /// 直传临时私钥目录的清理守卫：无论正常返回、`?` 早退，还是被取消（future 被 drop），
 /// Drop 时都异步清除源主机上的临时私钥目录——避免目标主机私钥残留在源主机（凭据泄露）。
 /// 取消路径下本函数栈已被展开，无法 `.await`，故 detach 一个清理任务到当前运行时。
-pub(super) fn local_nonexistent(path: &str) -> String {
+pub(crate) fn local_nonexistent(path: &str) -> String {
     let p = std::path::Path::new(path);
     if !p.exists() {
         return path.to_string();
@@ -106,7 +106,7 @@ pub(super) fn local_nonexistent(path: &str) -> String {
 /// "不存在"（NoSuchFile）才当作候选可用；权限不足、网络超时、SFTP 会话异常等其它错误
 /// 不能被当成"不存在"直接放行——那样可能把一个探测失败、但其实已经存在的候选名
 /// 错误地当成安全目标，交给上层决定要不要重试/放弃（返回错误，而不是悄悄继续猜下一个）。
-pub(super) async fn remote_nonexistent(
+pub(in crate::ssh) async fn remote_nonexistent(
     sftp: &russh_sftp::client::SftpSession,
     dir: &str,
     name: &str,
@@ -125,6 +125,105 @@ pub(super) async fn remote_nonexistent(
         }
     }
     Ok(name.to_string())
+}
+
+/// 一项复制/移动在冲突策略下的归宿。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ssh) enum CopyDest {
+    /// 照常「移入目标目录」，即命令写成 `cp/mv 源 目标目录/`。
+    ///
+    /// **不能**为了省事改写成显式的 `目标目录/同名`：源是目录、且目标目录里已有同名目录时，
+    /// `cp -a 源 目标/名` 的语义是「把源放进那个已存在的目录里面」（得到 `目标/名/名`），
+    /// 而 `cp -a 源 目标/` 才是「合并进去」。两者差一个层级，是实打实的行为变化。
+    Into,
+    /// 换一个不冲突的新名字。此时目标必然不存在，写显式全路径没有上面那个歧义。
+    Renamed(String),
+    /// 跳过这一项（冲突策略为「跳过」）。
+    Skip,
+}
+
+/// 按冲突策略给一批 复制/移动 定归宿。
+///
+/// 策略是「覆盖」时**直接返回、一次探测都不做**：那既是默认值也是原来的行为，多打 N 个
+/// SFTP 往返只会让最常见的路径变慢，还平白多出「探测瞬时失败该怎么办」的分支。
+///
+/// 「跳过 / 重命名」才需要知道目标在不在。探测失败（既不是成功、也不是明确的
+/// NoSuchFile）一律向上报错，**不退化成覆盖**：用户特意选了别覆盖，拿一次探测失败当
+/// "那就覆盖吧"是把设置反过来执行。
+pub(in crate::ssh) async fn plan_copy_move(
+    sftp: &russh_sftp::client::SftpSession,
+    srcs: &[String],
+    dest_dir: &str,
+    policy: crate::proto::ConflictPolicy,
+) -> anyhow::Result<Vec<(String, CopyDest)>> {
+    use crate::proto::ConflictPolicy as P;
+    if matches!(policy, P::Overwrite) {
+        return Ok(srcs.iter().map(|p| (p.clone(), CopyDest::Into)).collect());
+    }
+    let mut out = Vec::with_capacity(srcs.len());
+    for src in srcs {
+        let name = basename(src);
+        let taken = match sftp.metadata(&join_remote(dest_dir, &name)).await {
+            Ok(_) => true,
+            Err(e) if is_sftp_not_found(&e) => false,
+            Err(e) => anyhow::bail!(
+                "{}",
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh =>
+                        format!("检查目标是否已存在失败（{name}）：{e}；已中止，未改动任何文件"),
+                    crate::i18n::Lang::En => format!(
+                        "failed to check whether the target exists ({name}): {e}; aborted, nothing changed"
+                    ),
+                }
+            ),
+        };
+        if !taken {
+            out.push((src.clone(), CopyDest::Into));
+            continue;
+        }
+        match policy {
+            P::Skip => out.push((src.clone(), CopyDest::Skip)),
+            P::Rename => {
+                // 源是不是目录，决定 split_name 要不要拆后缀（目录名里的点不是扩展名）
+                let is_dir = sftp.metadata(src).await.map(|m| m.is_dir()).unwrap_or(false);
+                let fresh = remote_nonexistent(sftp, dest_dir, &name, is_dir).await?;
+                out.push((src.clone(), CopyDest::Renamed(fresh)));
+            }
+            P::Overwrite => unreachable!("上面已提前返回"),
+        }
+    }
+    Ok(out)
+}
+
+/// 把归宿表拼成一条 shell 脚本；全部跳过时返回 None（调用方据此连命令都不用发）。
+///
+/// 用 `rc=0; … || rc=1; exit $rc` 而不是 `&&`/`;` 直接串：既要「有一项失败也把其余项做完」
+/// （这是原来一条 `cp -a -- 全部源 目标/` 的行为），又要能从退出码看出整体成没成——`;` 串起来
+/// 只剩最后一条的退出码，前面失败了会被报成成功。
+pub(in crate::ssh) fn copy_move_script(
+    plan: &[(String, CopyDest)],
+    dest_dir: &str,
+    do_move: bool,
+) -> Option<String> {
+    let tool = if do_move { "mv -f" } else { "cp -a" };
+    let mut lines = String::from("rc=0");
+    let mut any = false;
+    for (src, dest) in plan {
+        let target = match dest {
+            CopyDest::Skip => continue,
+            // 目标强制以 "/" 结尾，令 mv/cp 必须把源「移入目录」：目标不是已存在目录时报错，
+            // 而不是把单个文件重命名成目标名——杜绝「拖到目录树后文件被改名、两个目录都找不到」。
+            CopyDest::Into => format!("{}/", sh_quote(dest_dir)),
+            CopyDest::Renamed(n) => sh_quote(&join_remote(dest_dir, n)),
+        };
+        any = true;
+        // `--` 终止选项解析，避免以 - 开头的文件名被当作开关
+        lines.push_str(&format!("\n{tool} -- {} {target} || rc=1", sh_quote(src)));
+    }
+    any.then(|| {
+        lines.push_str("\nexit $rc");
+        lines
+    })
 }
 
 /// 拆分文件名为 (主名, 扩展)；目录或无扩展时扩展为 None（首字符的点不算扩展）。
@@ -227,6 +326,102 @@ pub(super) fn place_extracted_dir(extracted: &std::path::Path, target: &std::pat
             let _ = std::fs::rename(&backup, target);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_move_script_tests {
+    use super::{copy_move_script, CopyDest};
+
+    fn plan(items: &[(&str, CopyDest)]) -> Vec<(String, CopyDest)> {
+        items.iter().map(|(s, d)| (s.to_string(), d.clone())).collect()
+    }
+
+    /// **层级守门人**：不冲突/覆盖的那一项必须写成 `目标目录/`，**不能**写成显式的
+    /// `目标目录/同名`。
+    ///
+    /// 源是目录、且目标目录里已有同名目录时：`cp -a 源 目标/` 是「合并进去」，
+    /// 而 `cp -a 源 目标/名` 是「放进那个已存在的目录里面」，会多出一层 `目标/名/名`。
+    /// 为了「顺手把目标写全」而改掉这里，就是一次静默的行为变化。
+    #[test]
+    fn non_conflicting_items_keep_the_trailing_slash_form() {
+        let cmd = copy_move_script(
+            &plan(&[("/a/proj", CopyDest::Into)]),
+            "/b",
+            false,
+        )
+        .expect("有活要干");
+        assert!(cmd.contains("cp -a -- '/a/proj' '/b'/"), "应当是「移入目录」形式：\n{cmd}");
+        assert!(!cmd.contains("'/b/proj'"), "不得写成显式的目标全路径：\n{cmd}");
+    }
+
+    /// 重命名的那一项目标必然不存在，写显式全路径没有歧义。
+    #[test]
+    fn renamed_items_use_the_explicit_full_path() {
+        let cmd = copy_move_script(
+            &plan(&[("/a/r.pdf", CopyDest::Renamed("r (1).pdf".into()))]),
+            "/b",
+            false,
+        )
+        .expect("有活要干");
+        assert!(cmd.contains("'/b/r (1).pdf'"), "重命名应落到显式全路径：\n{cmd}");
+    }
+
+    /// 一项失败不能让其余项不做（原来一条 `cp -a -- 全部源 目标/` 就是这个行为），
+    /// 但整体退出码要能反映"有东西失败了"——`;` 直接串只剩最后一条的退出码。
+    #[test]
+    fn one_failure_does_not_stop_the_rest_but_still_shows_up_in_the_exit_code() {
+        let cmd = copy_move_script(
+            &plan(&[("/a/x", CopyDest::Into), ("/a/y", CopyDest::Into)]),
+            "/b",
+            false,
+        )
+        .expect("有活要干");
+        assert!(cmd.starts_with("rc=0"), "缺少 rc 初始化：\n{cmd}");
+        assert_eq!(cmd.matches("|| rc=1").count(), 2, "每一项都要记失败：\n{cmd}");
+        assert!(cmd.ends_with("exit $rc"), "缺少整体退出码：\n{cmd}");
+        assert!(!cmd.contains("&&"), "不得用 && 串联（一项失败就不做后面的了）：\n{cmd}");
+    }
+
+    /// 跳过的项一条命令都不该出现；全部跳过时连脚本都不用发。
+    #[test]
+    fn skipped_items_emit_nothing() {
+        let cmd = copy_move_script(
+            &plan(&[("/a/x", CopyDest::Skip), ("/a/y", CopyDest::Into)]),
+            "/b",
+            false,
+        )
+        .expect("还有一项要干");
+        assert!(!cmd.contains("/a/x"), "跳过项不该进命令：\n{cmd}");
+        assert!(cmd.contains("/a/y"));
+        assert!(
+            copy_move_script(&plan(&[("/a/x", CopyDest::Skip)]), "/b", false).is_none(),
+            "全部跳过时不该产出任何命令"
+        );
+    }
+
+    /// 移动走 `mv -f`，复制走 `cp -a`；两者都带 `--` 终止选项解析。
+    #[test]
+    fn move_and_copy_use_their_own_tool_and_terminate_options() {
+        let mv = copy_move_script(&plan(&[("/a/-weird", CopyDest::Into)]), "/b", true)
+            .expect("有活要干");
+        assert!(mv.contains("mv -f -- '/a/-weird'"), "{mv}");
+        let cp = copy_move_script(&plan(&[("/a/-weird", CopyDest::Into)]), "/b", false)
+            .expect("有活要干");
+        assert!(cp.contains("cp -a -- '/a/-weird'"), "{cp}");
+    }
+
+    /// 带引号/空格的路径要靠 sh_quote escape，不能破坏命令结构。
+    #[test]
+    fn paths_are_shell_quoted() {
+        let cmd = copy_move_script(
+            &plan(&[("/a/it's here.txt", CopyDest::Into)]),
+            "/b/my dir",
+            false,
+        )
+        .expect("有活要干");
+        assert!(cmd.contains(r#"'/a/it'\''s here.txt'"#), "{cmd}");
+        assert!(cmd.contains("'/b/my dir'/"), "{cmd}");
     }
 }
 

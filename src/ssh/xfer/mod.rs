@@ -3,7 +3,7 @@
 mod direct;
 mod download;
 mod upload;
-mod util;
+pub(in crate::ssh) mod util;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

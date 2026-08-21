@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::proto::{Eol, FileEntry, UiCommand, WorkerEvent};
+use crate::proto::{ConflictPolicy, Eol, FileEntry, UiCommand, WorkerEvent};
 use crate::ssh::UiSink;
 use crate::textcodec::decode_text;
 
@@ -38,7 +38,8 @@ pub(super) async fn handle(cmd: UiCommand, sink: &UiSink) {
             srcs,
             dest_dir,
             do_move,
-        } => copy_move(srcs, &dest_dir, do_move, sink).await,
+            policy,
+        } => copy_move(srcs, &dest_dir, do_move, policy, sink).await,
         // 系统监控侧栏的进程详情 / 结束进程：本机直接读 /proc、本机 kill。
         UiCommand::ProcDetail(pid) => super::sys::proc_detail(pid, sink).await,
         UiCommand::KillProc(pid) => super::sys::kill_proc(pid, sink).await,
@@ -676,7 +677,13 @@ async fn create_with_perm(path: &Path, perm: Option<std::fs::Permissions>) -> st
     opts.open(path).await.map(|_| ())
 }
 
-async fn copy_move(srcs: Vec<String>, dest_dir: &str, do_move: bool, sink: &UiSink) {
+async fn copy_move(
+    srcs: Vec<String>,
+    dest_dir: &str,
+    do_move: bool,
+    policy: ConflictPolicy,
+    sink: &UiSink,
+) {
     if srcs.is_empty() {
         return;
     }
@@ -697,6 +704,7 @@ async fn copy_move(srcs: Vec<String>, dest_dir: &str, do_move: bool, sink: &UiSi
     }
     let src_parent = srcs.first().map(|p| parent_of(p));
     let mut failed: Option<String> = None;
+    let mut skipped = 0usize;
     for s in &srcs {
         let src = PathBuf::from(s);
         let Some(name) = src.file_name() else {
@@ -721,6 +729,24 @@ async fn copy_move(srcs: Vec<String>, dest_dir: &str, do_move: bool, sink: &UiSi
             );
             continue;
         }
+        // 目标已存在时按策略处理。放在上面那道「目标落在源自身或源内部」的守卫**之后**：
+        // 那条守卫防的是数据丢失（`fs::copy(src, src)` 会把源清成 0 字节），级别高于冲突策略，
+        // 不该因为选了「重命名」就绕过去。用 symlink_metadata 而不是 exists()：断链也算占位，
+        // 直接往上写会写穿到一个不存在的目标。
+        let target = if tokio::fs::symlink_metadata(&target).await.is_ok() {
+            match policy {
+                ConflictPolicy::Skip => {
+                    skipped += 1;
+                    continue;
+                }
+                ConflictPolicy::Rename => {
+                    std::path::PathBuf::from(crate::ssh::local_nonexistent(&target.to_string_lossy()))
+                }
+                ConflictPolicy::Overwrite => target,
+            }
+        } else {
+            target
+        };
         let r = if do_move {
             move_path(&src, &target).await
         } else {
@@ -741,10 +767,17 @@ async fn copy_move(srcs: Vec<String>, dest_dir: &str, do_move: bool, sink: &UiSi
     } else {
         ("复制", "Copied")
     };
+    let done = n - skipped;
     let message = match &failed {
-        None => match crate::i18n::current() {
-            crate::i18n::Lang::Zh => format!("已{verb_zh} {n} 项"),
-            crate::i18n::Lang::En => format!("{verb_en} {n} item(s)"),
+        None if skipped == n => match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("已跳过 {skipped} 项（目标已存在）"),
+            crate::i18n::Lang::En => format!("Skipped {skipped} item(s) (already exist)"),
+        },
+        None => match (crate::i18n::current(), skipped) {
+            (crate::i18n::Lang::Zh, 0) => format!("已{verb_zh} {done} 项"),
+            (crate::i18n::Lang::Zh, k) => format!("已{verb_zh} {done} 项，跳过 {k} 项（已存在）"),
+            (crate::i18n::Lang::En, 0) => format!("{verb_en} {done} item(s)"),
+            (crate::i18n::Lang::En, k) => format!("{verb_en} {done} item(s), skipped {k} (already exist)"),
         },
         Some(e) => match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!("{verb_zh}失败：{}", e.trim()),
@@ -927,6 +960,7 @@ mod tests {
             vec![file.to_string_lossy().into_owned()],
             &tmp.0.to_string_lossy(),
             false,
+            ConflictPolicy::Overwrite,
             &sink,
         ));
 
@@ -958,6 +992,7 @@ mod tests {
             vec![file.to_string_lossy().into_owned()],
             &format!("{}/.", tmp.0.to_string_lossy()),
             false,
+            ConflictPolicy::Overwrite,
             &sink,
         ));
         assert_eq!(std::fs::read(&file).expect("read back"), b"payload");
@@ -977,12 +1012,104 @@ mod tests {
             vec![src.to_string_lossy().into_owned()],
             &inner.to_string_lossy(),
             false,
+            ConflictPolicy::Overwrite,
             &sink,
         ));
         assert!(
             !inner.join("proj").exists(),
             "不该在自己的子目录里造出副本"
         );
+    }
+
+    /// 冲突策略「跳过」：目标目录里已有同名项时不动它，源也留在原处。
+    ///
+    /// 修之前同机粘贴压根不看冲突策略，一律 `fs::copy` 直接覆盖——用户在传输窗口里明明
+    /// 选了「跳过」，粘贴照样把目标文件冲掉。
+    #[test]
+    fn skip_policy_leaves_the_existing_target_alone() {
+        let tmp = TmpDir::new("skip");
+        let srcdir = tmp.0.join("src");
+        let dstdir = tmp.0.join("dst");
+        std::fs::create_dir_all(&srcdir).expect("mkdir src");
+        std::fs::create_dir_all(&dstdir).expect("mkdir dst");
+        std::fs::write(srcdir.join("a.txt"), b"NEW").expect("write src");
+        std::fs::write(dstdir.join("a.txt"), b"OLD").expect("write dst");
+
+        let (sink, rx) = test_sink();
+        block_on(copy_move(
+            vec![srcdir.join("a.txt").to_string_lossy().into_owned()],
+            &dstdir.to_string_lossy(),
+            false,
+            ConflictPolicy::Skip,
+            &sink,
+        ));
+
+        assert_eq!(
+            std::fs::read(dstdir.join("a.txt")).expect("read dst"),
+            b"OLD",
+            "「跳过」策略下目标被覆盖了"
+        );
+        let msg = rx.try_iter().find_map(|e| match e {
+            WorkerEvent::OpDone { message, .. } => Some(message),
+            _ => None,
+        });
+        assert!(
+            msg.is_some_and(|m| m.contains("跳过") || m.to_lowercase().contains("skip")),
+            "应当如实告诉用户跳过了"
+        );
+    }
+
+    /// 冲突策略「重命名」：换一个不冲突的名字落地，原有的同名文件分毫不动。
+    #[test]
+    fn rename_policy_lands_beside_the_existing_target() {
+        let tmp = TmpDir::new("rename");
+        let srcdir = tmp.0.join("src");
+        let dstdir = tmp.0.join("dst");
+        std::fs::create_dir_all(&srcdir).expect("mkdir src");
+        std::fs::create_dir_all(&dstdir).expect("mkdir dst");
+        std::fs::write(srcdir.join("a.txt"), b"NEW").expect("write src");
+        std::fs::write(dstdir.join("a.txt"), b"OLD").expect("write dst");
+
+        let (sink, _rx) = test_sink();
+        block_on(copy_move(
+            vec![srcdir.join("a.txt").to_string_lossy().into_owned()],
+            &dstdir.to_string_lossy(),
+            false,
+            ConflictPolicy::Rename,
+            &sink,
+        ));
+
+        assert_eq!(
+            std::fs::read(dstdir.join("a.txt")).expect("read dst"),
+            b"OLD",
+            "「重命名」策略下原有文件不该被动"
+        );
+        assert_eq!(
+            std::fs::read(dstdir.join("a (1).txt")).expect("重命名后的新文件应当存在"),
+            b"NEW"
+        );
+    }
+
+    /// 「覆盖」仍然是覆盖——默认值的行为一个字都不能变。
+    #[test]
+    fn overwrite_policy_still_overwrites() {
+        let tmp = TmpDir::new("ow");
+        let srcdir = tmp.0.join("src");
+        let dstdir = tmp.0.join("dst");
+        std::fs::create_dir_all(&srcdir).expect("mkdir src");
+        std::fs::create_dir_all(&dstdir).expect("mkdir dst");
+        std::fs::write(srcdir.join("a.txt"), b"NEW").expect("write src");
+        std::fs::write(dstdir.join("a.txt"), b"OLD").expect("write dst");
+
+        let (sink, _rx) = test_sink();
+        block_on(copy_move(
+            vec![srcdir.join("a.txt").to_string_lossy().into_owned()],
+            &dstdir.to_string_lossy(),
+            false,
+            ConflictPolicy::Overwrite,
+            &sink,
+        ));
+        assert_eq!(std::fs::read(dstdir.join("a.txt")).expect("read dst"), b"NEW");
     }
 
     /// 同名前缀不能误伤：`/x/proj` 复制到 `/x/project` 是合法的。
@@ -1000,6 +1127,7 @@ mod tests {
             vec![src.to_string_lossy().into_owned()],
             &dest.to_string_lossy(),
             false,
+            ConflictPolicy::Overwrite,
             &sink,
         ));
         assert_eq!(

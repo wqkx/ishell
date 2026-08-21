@@ -91,6 +91,7 @@ impl App {
         let is_cut = plan.is_cut; // 提前取出：plan 在直传分支会被移动
         if !plan.cross {
             let srcs: Vec<String> = plan.items.iter().map(|(p, _)| p.clone()).collect();
+            let policy = self.conflict_policy; // 先取出：下面要可变借用 self.sessions
             if let Some(di) = self.session_idx_by_uid(plan.dest_uid) {
                 let n = srcs.len();
                 let s = &mut self.sessions[di];
@@ -98,6 +99,7 @@ impl App {
                     srcs,
                     dest_dir: plan.dest_dir.clone(),
                     do_move: plan.is_cut,
+                    policy,
                 });
                 s.status = match (plan.is_cut, crate::i18n::current()) {
                     (true, crate::i18n::Lang::Zh) => format!("移动 {n} 项 …"),

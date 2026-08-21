@@ -242,6 +242,7 @@ impl App {
                     srcs,
                     dest_dir,
                     do_move: true,
+                    policy,
                 });
                 s.status = match crate::i18n::current() {
                     crate::i18n::Lang::Zh => format!("移动 {n} 项 …"),

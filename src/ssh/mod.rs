@@ -8,6 +8,11 @@ mod sftp;
 pub mod sysinfo;
 mod xfer;
 
+/// 「找一个本地不冲突的新名字」：下载的 Rename 冲突策略要用，本机会话的粘贴/拖拽
+/// （`crate::local::files`）也要用。函数本身住在传输子模块里（它是跟着下载落地一起长出来的），
+/// 这里向 crate 内转出一个名字，省得为共用它把整条 `xfer` 私有链都掀开。
+pub(crate) use xfer::util::local_nonexistent;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -702,33 +707,66 @@ pub async fn run(
                         }
                     }
                     // 远端批量复制/移动：经 shell 执行 cp -a / mv，独立任务不阻塞交互
-                    Some(UiCommand::CopyMove { srcs, dest_dir, do_move }) => {
+                    Some(UiCommand::CopyMove { srcs, dest_dir, do_move, policy }) => {
                         let h = handle.clone();
                         let s = sink.clone();
+                        let sftp_opt = sftp.clone();
                         tokio::spawn(async move {
-                            let mut joined = String::new();
-                            for p in &srcs {
-                                joined.push_str(&sh_quote(p));
-                                joined.push(' ');
-                            }
-                            // 目标强制以 "/" 结尾，令 mv/cp 必须把源「移入目录」：
-                            // 若目标不是已存在目录则报错而非把单个文件重命名成目标名，
-                            // 杜绝「拖到目录树后文件被改名、两个目录都找不到」的数据丢失。
-                            let dest = format!("{}/", sh_quote(&dest_dir));
-                            // `--` 终止选项解析，避免以 - 开头的文件名被当作开关
-                            let cmd = if do_move {
-                                format!("mv -f -- {joined}{dest}")
-                            } else {
-                                format!("cp -a -- {joined}{dest}")
-                            };
-                            let n = srcs.len();
+                            let n_all = srcs.len();
                             // 失败时需刷新「源目录」，让前端乐观移除的项重新显示（文件其实还在源处）
                             let src_parent = srcs.first().map(|p| remote_parent(p));
+                            // 「跳过 / 重命名」要先探测目标在不在，得有 SFTP。此时 SFTP 不可用
+                            // 就**明确报错**，绝不退回覆盖——用户选的就是别覆盖。
+                            let plan = if matches!(policy, crate::proto::ConflictPolicy::Overwrite) {
+                                Ok(srcs.iter().map(|p| (p.clone(), xfer::util::CopyDest::Into)).collect::<Vec<_>>())
+                            } else {
+                                match &sftp_opt {
+                                    Some(sftp) => xfer::util::plan_copy_move(sftp, &srcs, &dest_dir, policy).await,
+                                    None => Err(anyhow::anyhow!(
+                                        "{}",
+                                        crate::i18n::tr(
+                                            "SFTP 不可用，无法检查目标是否已存在；为避免违背「跳过/重命名」设置，本次操作已中止",
+                                            "SFTP unavailable, cannot check for existing targets; aborted rather than overwrite against your Skip/Rename setting"
+                                        )
+                                    )),
+                                }
+                            };
+                            let plan = match plan {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    s.send(WorkerEvent::OpDone {
+                                        message: match crate::i18n::current() {
+                                            crate::i18n::Lang::Zh => format!("操作失败：{e}"),
+                                            crate::i18n::Lang::En => format!("Failed: {e}"),
+                                        },
+                                        refresh_dir: src_parent,
+                                    });
+                                    return;
+                                }
+                            };
+                            let n_skip = plan.iter().filter(|(_, d)| *d == xfer::util::CopyDest::Skip).count();
+                            let n = n_all - n_skip;
+                            let skipped_note = |zh: bool| match (n_skip, zh) {
+                                (0, _) => String::new(),
+                                (k, true) => format!("，跳过 {k} 项（已存在）"),
+                                (k, false) => format!(", skipped {k} (already exist)"),
+                            };
+                            let Some(cmd) = xfer::util::copy_move_script(&plan, &dest_dir, do_move) else {
+                                // 全部跳过：一条命令都不用发
+                                s.send(WorkerEvent::OpDone {
+                                    message: match crate::i18n::current() {
+                                        crate::i18n::Lang::Zh => format!("已跳过 {n_skip} 项（目标已存在）"),
+                                        crate::i18n::Lang::En => format!("Skipped {n_skip} item(s) (already exist)"),
+                                    },
+                                    refresh_dir: Some(dest_dir.clone()),
+                                });
+                                return;
+                            };
                             match exec_status(&h, &cmd).await {
                                 Ok((0, _)) => s.send(WorkerEvent::OpDone {
                                     message: match crate::i18n::current() {
-                                        crate::i18n::Lang::Zh => format!("{}完成（{n} 项）", if do_move { "移动" } else { "复制" }),
-                                        crate::i18n::Lang::En => format!("{} done ({n})", if do_move { "Move" } else { "Copy" }),
+                                        crate::i18n::Lang::Zh => format!("{}完成（{n} 项）{}", if do_move { "移动" } else { "复制" }, skipped_note(true)),
+                                        crate::i18n::Lang::En => format!("{} done ({n}){}", if do_move { "Move" } else { "Copy" }, skipped_note(false)),
                                     },
                                     refresh_dir: Some(dest_dir.clone()),
                                 }),
