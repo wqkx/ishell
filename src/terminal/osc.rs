@@ -72,7 +72,7 @@ pub(super) fn parse_osc_notify(data: &[u8]) -> Vec<(Option<String>, String)> {
         if let Some(rest) = payload.strip_prefix(b"9;") {
             if let Ok(s) = std::str::from_utf8(rest) {
                 let s = s.trim();
-                if !s.is_empty() {
+                if !s.is_empty() && !is_conemu_progress(s) {
                     out.push((None, s.to_string()));
                 }
             }
@@ -96,6 +96,25 @@ pub(super) fn parse_osc_notify(data: &[u8]) -> Vec<(Option<String>, String)> {
         }
     }
     out
+}
+
+/// `OSC 9` 的这段负载（已去掉 `9;` 前缀）是不是 ConEmu 的**进度条**上报，而不是通知。
+///
+/// `OSC 9;4;<state>;<percent>` 是 ConEmu / Windows Terminal 的进度协议，如今 cargo、
+/// ripgrep、winget 等一大批工具都在发（结束时还会补一条 `9;4;0;0` 清零）。把它当通知放行
+/// 有两层后果，第二层才是真正难受的：
+///   1. 弹出一条正文是 `4;1;50` 的莫名其妙的桌面通知；
+///   2. `feed()` 紧接着会把 `ai_cli_seen` 置真——**此后这个标签的所有裸 BEL 都开始提醒**，
+///      而裸 BEL 和 shell 补全失败、readline 报错发的是同一个字节。也就是说在一个普通
+///      shell 标签里跑一次 `cargo build`，就把这个标签变成了「每次补全失败都弹提醒」，
+///      正是 `push_bel_notice` 注释里说「这个功能此前难用的根因」要防的那件事。
+///
+/// 判据刻意只认 `4`（进度），不泛化成「首段是数字就跳过」：iTerm2 式的 `OSC 9;<正文>`
+/// 通知正文是自由文本，真有人发一条以数字加分号开头的通知（`9;404;not found`）也不该被
+/// 吞掉。将来若发现 `9;9;<cwd>`（ConEmu 设置工作目录，Windows 上 clink 会发）之类也误报，
+/// 再按同样方式逐个加，不要改成通配。
+fn is_conemu_progress(payload: &str) -> bool {
+    matches!(payload.split(';').next(), Some("4")) && payload.contains(';')
 }
 
 /// 枚举数据块里的完整 OSC 序列：(序列起始, 负载起始(ESC]x; 的 `x` 处), 负载结束(BEL/ST 前))。

@@ -623,6 +623,43 @@ fn osc_notify_needs_no_ai_gate_and_opens_it() {
     assert_eq!(ns[0].body, "continue? [y/N]");
 }
 
+/// `OSC 9;4;<state>;<pct>` 是 ConEmu / Windows Terminal 的**进度条**协议（cargo、ripgrep、
+/// winget 都在发，结束时还补一条 `9;4;0;0` 清零），不是通知。
+///
+/// 放行它有两层后果，第二层才是真正难受的：弹一条正文是 `4;1;50` 的怪通知只是烦；更要命
+/// 的是它会顺带把本标签的 `ai_cli_seen` 打开，此后这个标签的**每一次裸 BEL**（shell 补全
+/// 失败、readline 报错发的是同一个字节）都会弹提醒——在一个普通 shell 里跑一次
+/// `cargo build` 就踩到了。这正是那道 AI 门本来要防的事。
+#[test]
+fn conemu_progress_is_not_a_notification_and_does_not_arm_bell_alerts() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]9;4;1;50\x07");
+    t.feed(b"\x1b]9;4;0;0\x07"); // 结束时的清零上报
+    assert!(t.take_notices().is_empty(), "进度上报不该产生任何通知");
+    assert!(!t.ai_cli_seen, "进度上报不该把本标签标记成「跑过 AI CLI」");
+    // 门必须还关着：没跑过 AI CLI 的标签，裸 BEL 不提醒
+    t.feed(b"1. Yes  2. No\x07");
+    assert!(
+        t.take_notices().is_empty(),
+        "进度上报之后，裸 BEL 仍应被 AI 门拦住"
+    );
+}
+
+/// 但真正的 OSC 9 通知一条都不能被误伤——包括正文恰好以数字开头的。判据只认 `4;`
+/// 这一个子命令，不是「首段是数字就跳过」。
+#[test]
+fn real_osc9_notifications_are_not_mistaken_for_progress() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]9;build finished\x07");
+    t.feed(b"\x1b]9;404 not found\x07"); // 数字开头，但不是 `4;` 子命令
+    t.feed(b"\x1b]9;42\x07"); // 纯数字、没有分号
+    let ns = t.take_notices();
+    assert_eq!(ns.len(), 3, "普通 OSC 9 通知不得被进度判据误伤");
+    assert_eq!(ns[0].body, "build finished");
+    assert_eq!(ns[1].body, "404 not found");
+    assert_eq!(ns[2].body, "42");
+}
+
 /// codex 在 tmux 下发的是 DCS 透传变体：`ESC P tmux ; ESC ESC ] 9 ; <msg> BEL ESC \`。
 ///
 /// 两件事都要对：内容要解析出来（双写的 ESC 让 OSC 扫描器在第二个 ESC 上对上 `ESC ]`），
