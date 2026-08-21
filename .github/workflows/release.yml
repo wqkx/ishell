@@ -88,10 +88,21 @@ jobs:
 
       # 发布门禁：单测必须通过才允许出包（数据路径回归的最后防线）。
       # Clippy：允许少量存量项（egui deprecated Popup API、too_many_arguments 等），其余按 -D 失败。
+      #
+      # **只在 linux-x64 这条腿上跑**。测试是平台无关的纯逻辑（终端解析、路径拼接、冲突策略、
+      # 字符边界……），五条腿各跑一遍等于把同一份结果算五次；而 GitHub 的计费是 Linux 1×、
+      # Windows 2×、**macOS 10×**，两条 mac 腿就占了这项开销的八成以上。跑一遍就够，省下的
+      # 额度留给真正只有在各自平台上才做得了的事——编译与链接。
+      #
+      # 其余平台的保障靠「编译得过」：那几条腿照样 build，cfg 分支坏了照样会挂。
+      # 发版**之前**的完整验证（含交叉 check）请在自己的机器/构建服务器上跑
+      # `scripts/precheck.sh`，那里不花额度。见 BUILD.md「测试」一节。
       - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --target ${{ matrix.target }}
 
       - name: Clippy
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: >
           cargo clippy --target ${{ matrix.target }} --all-targets --
           -W clippy::all

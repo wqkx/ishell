@@ -36,15 +36,23 @@ cargo build --release
 
 ## 测试
 
+**CI 额度有限，检查放在本地跑。** 仓库里只有 `release.yml` 一个工作流，**仅在推 `v*` 标签时
+触发**；为省额度，它的测试与 clippy 只在 linux-x64 那条腿上跑（GitHub 计费 Linux 1×、
+Windows 2×、**macOS 10×**，五条腿各跑一遍等于把同一份平台无关的结果算五次）。其余平台靠
+「编译得过」把关。
+
+所以**发版前请在自己的机器/构建服务器上跑一次**：
+
 ```bash
-cargo test              # 单元 + 回归测试（CI 每次 push/PR 都跑这条）
-cargo clippy --all-targets
+scripts/precheck.sh           # 测试 + clippy + 交叉编译检查
+scripts/precheck.sh --quick   # 只测试 + clippy（跳过交叉，快很多）
 ```
 
-`.github/workflows/ci.yml` 在每次 push/PR 上跑 `cargo test`，并对
-aarch64-linux / aarch64-darwin / x86_64-windows 各做一次 `cargo check --all-targets`。
-**交叉那几个 job 很重要**：`release.yml` 只在推 `v*` 标签时才碰这些平台，于是
-`#[cfg(windows)]` / `#[cfg(not(unix))]` 分支平时根本不会被编译，改坏了要等到发版当天才炸。
+它用的 clippy flag 与 `release.yml` 的门禁**完全一致**，避免本地绿、CI 红。
+交叉那一步很重要：`#[cfg(windows)]` / `#[cfg(not(unix))]` 分支平时根本不会被编译，
+改坏了要等到发版当天 CI 才炸，那时通常正赶时间。
+
+日常改完代码跑 `cargo test` 即可（秒级）。
 
 ### live SFTP 集成测试（需要一台真 sshd）
 
