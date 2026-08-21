@@ -55,17 +55,54 @@ static KNOWN_HOSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 同目录临时文件 + rename 的原子写：避免半截内容被读到，或进程崩溃时整个 known_hosts
 /// 变成空文件（`std::fs::write` 是"先截断再写"，中途失败/崩溃会丢光原有内容）。
+///
+/// 权限：`rename` **保留的是临时文件的 mode**，所以临时文件一律以 0600 创建（不留
+/// 「先按 umask 建、再收紧」的暴露窗口），再把原文件的权限继承过来。少了这一步，
+/// 用户特意收紧到 0600 的 `~/.ssh/known_hosts` 会在一次「接受变更的主机密钥」之后被
+/// 静默放宽成 umask 默认（通常 0644）——文件本身不是密钥材料，但它记录了这台机器连过
+/// 哪些主机。原文件不存在时（首次写入）保持 0600。
 fn atomic_write_text(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension(format!("ishell-tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp); // 清理崩溃残留，确保 create_new 能成功
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(contents.as_bytes())?;
         f.sync_all()?;
     }
+    inherit_perms(path, &tmp);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+/// 新建一个仅属主可读写的文件（权限在 `open(2)` 时即生效，非事后 chmod）。
+#[cfg(unix)]
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+#[cfg(not(unix))]
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// 把 `orig` 的权限位复制到 `tmp`（`orig` 不存在则保持 `tmp` 现有的 0600）。尽力而为：
+/// 设不上就按 0600 换入，那是更严而不是更松的一侧，不值得让整次写入失败。
+#[cfg(unix)]
+fn inherit_perms(orig: &std::path::Path, tmp: &std::path::Path) {
+    if let Ok(meta) = std::fs::metadata(orig) {
+        let _ = std::fs::set_permissions(tmp, meta.permissions());
+    }
+}
+#[cfg(not(unix))]
+fn inherit_perms(_orig: &std::path::Path, _tmp: &std::path::Path) {}
 
 /// 首次信任新主机（TOFU）：直接追加，复用 russh 自带的 append 逻辑，但要跟
 /// `replace_known_host` 共用同一把锁——否则一条连接正在读取整份文件准备重写（过滤旧行）
@@ -613,6 +650,47 @@ pub(super) async fn open_sftp(
     Ok(sftp)
 }
 
+/// 一次 exec 捕获允许在内存里累积的 stdout 上限。
+///
+/// 这几个函数原先是无界 `extend_from_slice`：远端命令输出多少就在本进程里攒多少。调用点
+/// 现在都是自己拼的命令，但其中两条的输出**由远端文件决定大小**——`pdftotext <书> -` 会把
+/// 整本 PDF 的文本全倒出来，`pdftoppm -r 300` 渲染一张 A0 图纸是上亿像素的 PNG。都不需要
+/// 恶意构造，一个大文件就够把 GUI 进程撑爆。
+///
+/// 64 MiB 的取法：单页 PNG 常见是几 MB（A4/300dpi 约 1240×1754），整本书的纯文本通常几 MB，
+/// 都留了一个数量级的余量；真超过了，报错也远好过 OOM。
+const EXEC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
+
+/// stderr 只是给人看的诊断文本，攒够这些就不再追加（但**继续读到通道关闭**，否则拿不到
+/// 退出码）。不像 stdout 那样超限即失败：一条命令刷了一堆警告到 stderr 但其实成功了，
+/// 为此把整个操作判失败是本末倒置。
+const EXEC_STDERR_LIMIT: usize = 256 * 1024;
+
+fn exec_overflow(cmd: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}",
+        match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!(
+                "远端命令输出超过 {} MiB 上限，已中止读取：{cmd}",
+                EXEC_CAPTURE_LIMIT / 1024 / 1024
+            ),
+            crate::i18n::Lang::En => format!(
+                "remote command output exceeded the {} MiB limit, aborted: {cmd}",
+                EXEC_CAPTURE_LIMIT / 1024 / 1024
+            ),
+        }
+    )
+}
+
+/// 往诊断缓冲里追加，攒到上限就不再增长（内容截断，不报错）。
+fn push_capped(buf: &mut Vec<u8>, data: &[u8], limit: usize) {
+    if buf.len() >= limit {
+        return;
+    }
+    let room = limit - buf.len();
+    buf.extend_from_slice(&data[..room.min(data.len())]);
+}
+
 /// 打开一次性 exec 通道执行命令并收集 stdout。
 pub(super) async fn exec_capture(
     handle: &Handle<ClientHandler>,
@@ -624,7 +702,12 @@ pub(super) async fn exec_capture(
     let mut buf = Vec::new();
     while let Some(msg) = channel.wait().await {
         match msg {
-            ChannelMsg::Data { data } => buf.extend_from_slice(&data),
+            ChannelMsg::Data { data } => {
+                if buf.len() + data.len() > EXEC_CAPTURE_LIMIT {
+                    return Err(exec_overflow(cmd));
+                }
+                buf.extend_from_slice(&data);
+            }
             ChannelMsg::ExitStatus { .. } => {}
             ChannelMsg::Eof | ChannelMsg::Close => break,
             _ => {}
@@ -647,8 +730,15 @@ pub(super) async fn exec_capture_bytes(
     // 读到通道关闭为止（ExitStatus 可能在 Eof 前后到达，不能提前 break）
     while let Some(msg) = channel.wait().await {
         match msg {
-            ChannelMsg::Data { data } => out.extend_from_slice(&data),
-            ChannelMsg::ExtendedData { data, ext: 1 } => err.extend_from_slice(&data),
+            ChannelMsg::Data { data } => {
+                if out.len() + data.len() > EXEC_CAPTURE_LIMIT {
+                    return Err(exec_overflow(cmd));
+                }
+                out.extend_from_slice(&data);
+            }
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                push_capped(&mut err, &data, EXEC_STDERR_LIMIT)
+            }
             ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
             _ => {}
         }
@@ -669,7 +759,9 @@ pub(super) async fn exec_status(
     // 否则可能漏掉退出码；这里一直读到通道关闭（wait 返回 None）。
     while let Some(msg) = channel.wait().await {
         match msg {
-            ChannelMsg::ExtendedData { data, ext: 1 } => err.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                push_capped(&mut err, &data, EXEC_STDERR_LIMIT)
+            }
             ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
             _ => {}
         }
