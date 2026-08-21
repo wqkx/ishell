@@ -922,7 +922,7 @@ mod tests {
     use super::*;
 
     /// 造一个只用于收事件的 UiSink（egui::Context 默认构造即可，测试里不会真重绘）。
-    fn test_sink() -> (UiSink, std::sync::mpsc::Receiver<WorkerEvent>) {
+    pub(super) fn test_sink() -> (UiSink, std::sync::mpsc::Receiver<WorkerEvent>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let (sys_tx, _sys_rx) = tokio::sync::watch::channel(None);
         (
@@ -931,7 +931,7 @@ mod tests {
         )
     }
 
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    pub(super) fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -940,9 +940,9 @@ mod tests {
     }
 
     /// 临时目录，Drop 时清理。不引 tempfile 依赖。
-    struct TmpDir(PathBuf);
+    pub(super) struct TmpDir(pub(super) PathBuf);
     impl TmpDir {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             let p = std::env::temp_dir().join(format!("ishell-test-{tag}-{}", rand_suffix()));
             std::fs::create_dir_all(&p).expect("mkdir tmp");
             Self(p)
@@ -1218,3 +1218,8 @@ mod tests {
         );
     }
 }
+
+/// 数据安全回归套件（见该文件）。
+#[cfg(test)]
+#[path = "data_safety_tests.rs"]
+mod data_safety_tests;
