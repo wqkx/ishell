@@ -231,3 +231,126 @@ mod tests {
     }
 
 }
+
+/// 高亮/lint 的**绝不 panic**回归测试。
+///
+/// 这一族函数拿的是用户打开的任意文件内容（远端来的、编码可能是任何东西），且跑在 UI 绘制
+/// 路径上——一次 panic 就是整个应用闪退，连带丢掉编辑器里没保存的改动。`highlight_segment`
+/// 里那段「防御性字符边界吸附」的注释就是为这个写的（粘贴含中文的文本时，本帧绘制用的还是
+/// 改动前算出的 lint_ranges，旧偏移落进了汉字中间 → 崩）。
+///
+/// 这里不引 proptest/fuzz：手写的确定性遍历在 CI 里稳定可复现，也和仓库既有测试的写法一致。
+#[cfg(test)]
+mod never_panic_tests {
+    use super::*;
+
+    /// 各种能把分词器带进奇怪状态的输入。
+    const NASTY: &[&str] = &[
+        "",
+        "\u{0}\u{1}\u{7f}",
+        "中文注释 // 后面还有中文",
+        "\"未闭合的字符串",
+        "'\\",                                  // 未闭合 + 结尾反斜杠
+        "r#\"raw 未闭合",
+        "/* 未闭合块注释",
+        "'''python 三引号未闭合",
+        "\"\"\"另一种三引号",
+        "a\"b'c`d/*e*/f//g",
+        "😀😀😀\"😀",                          // 4 字节字符 + 未闭合引号
+        "é\\\"é",                                // 2 字节 + 转义引号
+        "((((((((((((((((((((",                 // 大量未配平括号
+        "))))))))))))))))))))",
+        "{[(<>)]}{[(<>)]}",
+        "\\\\\\\\\"",                            // 连续反斜杠后跟引号（奇偶转义判定）
+        "0x1e-5 1e-5 1_000 .5 5.",              // 数字字面量各种形状
+        "let x = \"中\"; // 漢字",
+        "\r\n\r\n\t\t   ",
+        "#include <中文.h>",
+    ];
+
+    const EXTS: &[&str] = &["rs", "py", "js", "c", "go", "json", "md", "txt", "sh", "unknown", ""];
+
+    /// `line_states` 对任意内容 × 任意扩展名都不能 panic，且返回的状态数与行数一致
+    /// （渲染按行索引取状态，长度对不上就会索引越界）。
+    #[test]
+    fn line_states_never_panics_and_matches_line_count() {
+        for text in NASTY {
+            for ext in EXTS {
+                let states = line_states(text, ext);
+                let lines = text.split('\n').count();
+                assert_eq!(
+                    states.len(),
+                    lines,
+                    "line_states({text:?}, {ext:?}) 返回 {} 个状态，但有 {lines} 行",
+                    states.len()
+                );
+            }
+        }
+    }
+
+    /// `highlight_segment` 用**任意窗口和任意错误区间**（含落在多字节字符中间、越界、颠倒）
+    /// 调用都不能 panic。调用方本应传同步的边界，但那依赖「内容改动后缓存已重算」这个时序
+    /// 前提——这里就是兜住它失效的那一刻。
+    #[test]
+    fn highlight_segment_never_panics_on_stale_or_misaligned_ranges() {
+        for text in NASTY {
+            // 只取第一行：highlight_segment 的契约是「整行 + 窗口」
+            let line = text.split('\n').next().unwrap_or("");
+            let n = line.len();
+            let states = line_states(text, "rs");
+            let state = states.first().copied().unwrap_or(LineState::Normal);
+            for ext in EXTS {
+                for a in 0..=n + 2 {
+                    for b in 0..=n + 2 {
+                        // 错误区间也故意用同样一对可能非法的下标
+                        let _ = highlight_segment(line, a..b, ext, 12.0, std::slice::from_ref(&(a..b)), state);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `lint_syntax` 对任意内容不能 panic，且返回的错误区间必须落在**合法字符边界**上——
+    /// 它们随后会被拿去切片画下划线，非边界就是一次崩溃。
+    #[test]
+    fn lint_syntax_never_panics_and_returns_char_boundaries() {
+        for text in NASTY {
+            for ext in EXTS {
+                let (lines, ranges, msg) = lint_syntax(text, ext);
+                for l in &lines {
+                    assert!(
+                        *l < text.split('\n').count().max(1),
+                        "lint 报的行号 {l} 超出了 {text:?} 的行数"
+                    );
+                }
+                for r in &ranges {
+                    assert!(r.start <= r.end, "lint 区间颠倒：{r:?}（{text:?}）");
+                    assert!(r.end <= text.len(), "lint 区间越界：{r:?}（{text:?}）");
+                    assert!(
+                        text.is_char_boundary(r.start) && text.is_char_boundary(r.end),
+                        "lint 区间 {r:?} 落在字符中间（{text:?}）——拿去切片会崩"
+                    );
+                }
+                let _ = msg;
+            }
+        }
+    }
+
+    /// 把每一段语料**逐字节前缀**都跑一遍：模拟"用户正在往里打字"的中间态。
+    /// 未闭合的字符串/注释/括号在打字过程中是常态，分词器必须每一步都活着。
+    #[test]
+    fn every_prefix_of_every_sample_is_safe() {
+        for text in NASTY {
+            for end in 0..=text.len() {
+                if !text.is_char_boundary(end) {
+                    continue; // 只取合法前缀，非法切片是调用方的错、不是被测函数的
+                }
+                let prefix = &text[..end];
+                let _ = line_states(prefix, "rs");
+                let _ = lint_syntax(prefix, "rs");
+                let line = prefix.split('\n').next().unwrap_or("");
+                let _ = highlight_segment(line, 0..line.len(), "rs", 12.0, &[], LineState::Normal);
+            }
+        }
+    }
+}

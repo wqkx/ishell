@@ -162,3 +162,93 @@ mod tests {
         assert_eq!(buf, "中拼");
     }
 }
+
+#[cfg(test)]
+mod boundary_sweep_tests {
+    use super::*;
+
+    /// 一段混合宽度的字符串：ASCII(1) + 中文(3) + 带变音符(2) + emoji(4)。
+    /// 覆盖 UTF-8 全部四种长度，且相邻字符长度不同——最容易踩边界的形状。
+    const MIXED: &str = "a中é😀b漢z";
+
+    /// **全下标扫描**：对每一个字节位置（含 0 与 len，含所有字符内部的非法位置）调用
+    /// `floor_boundary`，结果必须是合法边界、必须 ≤ 输入、且必须是 ≤ 输入的最大合法边界。
+    ///
+    /// 这个函数是「vcaret 必须落在字符边界」这条不变量的唯一收口点（见 geom.rs 的注释：
+    /// 组字期间 vcaret 会被一段陈旧的 IME 区间推到多字节字符中间，此后第一次退格就崩）。
+    /// 既有测试只点了几个位置，这里把整条串扫穿。
+    #[test]
+    fn floor_boundary_sweeps_every_byte_index() {
+        let n = MIXED.len();
+        for b in 0..=n + 5 {
+            let got = floor_boundary(MIXED, b);
+            assert!(
+                MIXED.is_char_boundary(got),
+                "floor_boundary({b}) = {got} 不是字符边界"
+            );
+            assert!(got <= n, "floor_boundary({b}) = {got} 越界（len={n}）");
+            assert!(got <= b || b > n, "floor_boundary({b}) = {got} 比入参还大");
+            // 必须是「≤ b 的最大合法边界」，不能保守地退太多
+            let want = (0..=b.min(n)).rev().find(|&i| MIXED.is_char_boundary(i)).unwrap();
+            assert_eq!(got, want, "floor_boundary({b}) 应当退到 {want}");
+        }
+    }
+
+    /// `clamp_range` 对**任意**一对下标（含颠倒、越界、落在字符中间）都必须产出一个
+    /// 可以直接拿去 `String::replace_range` 的合法区间：两端都是边界、start ≤ end ≤ len。
+    /// 这是 `v_apply` 的最后一道防线（编辑器里存着用户还没保存的远端文件，为一个算错的
+    /// 偏移崩掉整个应用不值得）。
+    #[test]
+    fn clamp_range_always_yields_a_usable_range() {
+        let n = MIXED.len();
+        for a in 0..=n + 3 {
+            for b in 0..=n + 3 {
+                let (s, e) = clamp_range(MIXED, (a, b));
+                assert!(MIXED.is_char_boundary(s), "({a},{b}) → start {s} 不是边界");
+                assert!(MIXED.is_char_boundary(e), "({a},{b}) → end {e} 不是边界");
+                assert!(s <= e, "({a},{b}) → ({s},{e}) 顺序颠倒");
+                assert!(e <= n, "({a},{b}) → end {e} 越界");
+                // 真拿去用一次，确认不会 panic
+                let mut buf = MIXED.to_string();
+                buf.replace_range(s..e, "X");
+            }
+        }
+    }
+
+    /// `char_of_byte` / `byte_of_char` 在所有合法边界上必须互为逆；对落在字符中间的
+    /// 字节位置也不能 panic。
+    #[test]
+    fn char_and_byte_indices_round_trip_on_every_boundary() {
+        let n = MIXED.len();
+        for b in 0..=n {
+            let ch = char_of_byte(MIXED, b); // 非边界也不能崩
+            if MIXED.is_char_boundary(b) {
+                assert_eq!(byte_of_char(MIXED, ch), b, "字节 {b} → 字符 {ch} → 字节 往返不一致");
+            }
+        }
+        // 字符下标越界也要有个合理答案（钳到末尾），不能 panic
+        let total = MIXED.chars().count();
+        assert_eq!(byte_of_char(MIXED, total), n);
+        assert_eq!(byte_of_char(MIXED, total + 10), n);
+    }
+
+    /// `replace_preedit` / `insert_at` 用任意（可能非法的）位置调用都不能 panic，
+    /// 且改完之后缓冲区仍是合法 UTF-8、返回的位置仍是合法边界。
+    /// 组字过程中这两个函数是被 IME 事件以任意顺序驱动的，位置随时可能过时。
+    #[test]
+    fn preedit_helpers_never_corrupt_the_buffer() {
+        let n = MIXED.len();
+        for a in 0..=n + 2 {
+            for b in 0..=n + 2 {
+                let mut buf = MIXED.to_string();
+                let (s, e) = replace_preedit(&mut buf, (a, b), "组字");
+                assert!(buf.is_char_boundary(s) && buf.is_char_boundary(e));
+                assert!(s <= e && e <= buf.len());
+            }
+            let mut buf = MIXED.to_string();
+            let at = insert_at(&mut buf, a, "x");
+            assert!(buf.is_char_boundary(at), "insert_at({a}) 返回了非边界 {at}");
+            assert!(at <= buf.len());
+        }
+    }
+}
