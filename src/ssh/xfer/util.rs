@@ -73,9 +73,19 @@ pub(super) fn join_quoted(items: &[String]) -> String {
 /// 直传临时私钥目录的清理守卫：无论正常返回、`?` 早退，还是被取消（future 被 drop），
 /// Drop 时都异步清除源主机上的临时私钥目录——避免目标主机私钥残留在源主机（凭据泄露）。
 /// 取消路径下本函数栈已被展开，无法 `.await`，故 detach 一个清理任务到当前运行时。
+/// 这个本地路径「被占了没有」。
+///
+/// 用 `symlink_metadata` 而**不是** `Path::exists()`：后者跟随符号链接，一条**断链**会被判成
+/// 「不存在」，于是 `local_nonexistent` 把这个坏链接原样当作可用名字返回——调用方随后
+/// `fs::copy` 过去会**写穿到链接指向的位置**（很可能在完全另一个目录里），既没重命名、也没
+/// 落在目标目录里；走 `rename` 则直接把那条链接毁掉。断链同样是「这个名字被占了」。
+fn local_path_taken(p: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
 pub(crate) fn local_nonexistent(path: &str) -> String {
     let p = std::path::Path::new(path);
-    if !p.exists() {
+    if !local_path_taken(p) {
         return path.to_string();
     }
     let is_dir = p.is_dir();
@@ -94,7 +104,7 @@ pub(crate) fn local_nonexistent(path: &str) -> String {
             Some(d) => d.join(&cand_name),
             None => std::path::PathBuf::from(&cand_name),
         };
-        if !cand.exists() {
+        if !local_path_taken(&cand) {
             return cand.to_string_lossy().into_owned();
         }
     }
@@ -112,12 +122,31 @@ pub(in crate::ssh) async fn remote_nonexistent(
     name: &str,
     is_dir: bool,
 ) -> anyhow::Result<String> {
+    remote_nonexistent_excluding(sftp, dir, name, is_dir, &std::collections::HashSet::new()).await
+}
+
+/// 同 [`remote_nonexistent`]，但额外把 `reserved` 里的名字也当成「已被占用」。
+///
+/// 批量复制/移动时必须这样：整个计划是在**一条命令都还没执行**的时候一次算完的，服务器上
+/// 还看不到本批次即将创建的那些名字。少了这一层，「目标已有 a.txt，用户把 a.txt 和
+/// a (1).txt 一起移过去」就会算出 a.txt→`a (1).txt`、而 a (1).txt→原名直入，脚本跑起来后
+/// 一条覆盖另一条——在一个存在意义就是「绝不覆盖」的策略下。
+pub(in crate::ssh) async fn remote_nonexistent_excluding(
+    sftp: &russh_sftp::client::SftpSession,
+    dir: &str,
+    name: &str,
+    is_dir: bool,
+    reserved: &std::collections::HashSet<String>,
+) -> anyhow::Result<String> {
     let (stem, ext) = split_name(name, is_dir);
     for n in 1..10000u32 {
         let cand = match &ext {
             Some(e) => format!("{stem} ({n}).{e}"),
             None => format!("{stem} ({n})"),
         };
+        if reserved.contains(&cand) {
+            continue; // 本批次前面某一项已经预定了这个名字
+        }
         match sftp.metadata(&join_remote(dir, &cand)).await {
             Ok(_) => continue, // 候选已存在，试下一个
             Err(e) if is_sftp_not_found(&e) => return Ok(cand),
@@ -161,9 +190,13 @@ pub(in crate::ssh) async fn plan_copy_move(
         return Ok(srcs.iter().map(|p| (p.clone(), CopyDest::Into)).collect());
     }
     let mut out = Vec::with_capacity(srcs.len());
+    // 本批次即将在目标目录里创建的名字。计划是在一条命令都还没执行时一次算完的，服务器上
+    // 还看不到它们；不自己记着，同一批里的两项就会算到同一个目标上、互相覆盖。
+    let mut reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
     for src in srcs {
         let name = basename(src);
-        let taken = match sftp.metadata(&join_remote(dest_dir, &name)).await {
+        let taken = reserved.contains(&name)
+            || match sftp.metadata(&join_remote(dest_dir, &name)).await {
             Ok(_) => true,
             Err(e) if is_sftp_not_found(&e) => false,
             Err(e) => anyhow::bail!(
@@ -178,15 +211,32 @@ pub(in crate::ssh) async fn plan_copy_move(
             ),
         };
         if !taken {
+            reserved.insert(name);
             out.push((src.clone(), CopyDest::Into));
             continue;
         }
         match policy {
             P::Skip => out.push((src.clone(), CopyDest::Skip)),
             P::Rename => {
-                // 源是不是目录，决定 split_name 要不要拆后缀（目录名里的点不是扩展名）
-                let is_dir = sftp.metadata(src).await.map(|m| m.is_dir()).unwrap_or(false);
-                let fresh = remote_nonexistent(sftp, dest_dir, &name, is_dir).await?;
+                // 源是不是目录，决定 split_name 要不要拆后缀（目录名里的点不是扩展名）。
+                // 探测失败就报错、不猜：上面判「目标在不在」时刚刚坚持过同一条原则，
+                // 这里 `unwrap_or(false)` 会把一个目录当成文件，`my.dir` 被拆成
+                // `my (1).dir`，名字都对不上。
+                let is_dir = sftp.metadata(src).await.map(|m| m.is_dir()).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}",
+                        match crate::i18n::current() {
+                            crate::i18n::Lang::Zh =>
+                                format!("读取源的类型失败（{name}）：{e}；已中止，未改动任何文件"),
+                            crate::i18n::Lang::En => format!(
+                                "failed to stat the source ({name}): {e}; aborted, nothing changed"
+                            ),
+                        }
+                    )
+                })?;
+                let fresh =
+                    remote_nonexistent_excluding(sftp, dest_dir, &name, is_dir, &reserved).await?;
+                reserved.insert(fresh.clone());
                 out.push((src.clone(), CopyDest::Renamed(fresh)));
             }
             P::Overwrite => unreachable!("上面已提前返回"),
