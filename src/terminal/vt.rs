@@ -296,7 +296,7 @@ mod csi_tail_tests {
     #[test]
     fn overlong_incomplete_csi_is_not_held() {
         let mut v = b"\x1b[".to_vec();
-        v.extend(std::iter::repeat(b'1').take(CAP + 5));
+        v.extend(std::iter::repeat_n(b'1', CAP + 5));
         assert_eq!(incomplete_csi_tail(&v, CAP), None);
     }
 }

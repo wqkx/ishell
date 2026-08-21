@@ -61,9 +61,12 @@ pub(super) fn parse_osc7(data: &[u8]) -> Option<String> {
 }
 
 /// 解析 OSC 通知序列，返回 (标题, 正文) 列表：
+///
 /// - OSC 9  ：`ESC ] 9 ; <message> BEL|ST`（iTerm2/ConEmu 式，仅正文）
 /// - OSC 777：`ESC ] 777 ; notify ; <title> ; <body> BEL|ST`（urxvt 式，标题+正文）
+///
 /// Claude Code 等 AI CLI 的通知 hook、以及 `printf '\e]9;done\a'` 类脚本都走这两类。
+///
 /// `carried`：`data` 开头有多少字节是**上一次调用已经扫过**的（`feed()` 为了拼接被截断的
 /// 序列而留下的尾巴，见 `Terminal::notice_tail`）。终止符落在这段前缀里的 OSC 序列，上一轮
 /// 就已经完整、已经报过一次通知了，这一轮必须跳过。

@@ -868,14 +868,17 @@ fn visible_notices(t: &mut Terminal) -> Vec<(Option<String>, String)> {
         .collect()
 }
 
-fn feed_whole(data: &[u8]) -> (String, Vec<(Option<String>, String)>, Vec<u8>) {
+/// 一次 feed 的可观测结果：(屏幕文本, 会弹给用户的通知, 要回给远端的应答字节)
+type FeedOutcome = (String, Vec<(Option<String>, String)>, Vec<u8>);
+
+fn feed_whole(data: &[u8]) -> FeedOutcome {
     let mut t = Terminal::new();
     let replies = t.feed(data);
     let notices = visible_notices(&mut t);
     (t.screen_text(), notices, replies)
 }
 
-fn feed_split_at(data: &[u8], at: usize) -> (String, Vec<(Option<String>, String)>, Vec<u8>) {
+fn feed_split_at(data: &[u8], at: usize) -> FeedOutcome {
     let mut t = Terminal::new();
     let mut replies = t.feed(&data[..at]);
     replies.extend(t.feed(&data[at..]));

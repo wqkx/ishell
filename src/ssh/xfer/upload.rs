@@ -459,6 +459,7 @@ pub(super) fn upload_part_path(rpath: &str) -> String {
 /// `target` 必须是 [`resolve_upload_target`] 的返回值（符号链接已解析、已确认不是目录），
 /// 由调用方在重试循环**之外**求一次：那两次探测每个文件只该付一遍，而且换入用的临时文件
 /// 必须和调用方清理时算出来的是同一个路径。
+#[allow(clippy::too_many_arguments)] // 与同文件的 upload()/download() 一致，未拆结构体
 pub(super) async fn upload_file_once(
     sftp: &russh_sftp::client::SftpSession,
     lpath: &std::path::Path,
@@ -667,13 +668,30 @@ mod live_sftp_tests {
     struct Env {
         sftp: russh_sftp::client::SftpSession,
         dir: String,
-        /// 持有连接句柄，drop 了通道就断
-        _handle: russh::client::Handle<TestHandler>,
+        /// 持有连接句柄，drop 了通道就断；也用来跑 shell 命令（见 `exec`）
+        handle: russh::client::Handle<TestHandler>,
     }
 
     impl Env {
         fn path(&self, name: &str) -> String {
             format!("{}/{name}", self.dir)
+        }
+        /// 在测试服务器上跑一条 shell 命令，返回 (退出码, stdout)。
+        /// 用来验证那些「最终效果在服务器上」的东西——比如一条命令跑完之后文件的权限位。
+        async fn exec(&self, cmd: &str) -> (i32, String) {
+            use russh::ChannelMsg;
+            let mut ch = self.handle.channel_open_session().await.expect("开通道");
+            ch.exec(true, cmd).await.expect("exec");
+            let mut out = Vec::new();
+            let mut code = -1;
+            while let Some(msg) = ch.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
+                    _ => {}
+                }
+            }
+            (code, String::from_utf8_lossy(&out).into_owned())
         }
         async fn read(&self, path: &str) -> Option<Vec<u8>> {
             self.sftp.read(path).await.ok()
@@ -738,7 +756,7 @@ mod live_sftp_tests {
         Some(Env {
             sftp,
             dir,
-            _handle: handle,
+            handle,
         })
     }
 
@@ -1063,6 +1081,62 @@ mod live_sftp_tests {
             "链接本身被换成普通文件了"
         );
         let _ = std::fs::remove_file(&src);
+    }
+
+    /// **authorized_keys 权限的真·行为门禁**（对应提交 41ce50c）。
+    ///
+    /// 既有的 `untrust_cmd_tests` 只断言命令**文本**里 `chmod 600` 排在 `mv` 前面——那挡得住
+    /// 「有人把 chmod 删了」，挡不住「命令看着对、跑完服务器上却是 0644」。这条直接在真 sshd
+    /// 上跑一遍那条命令，然后 stat 结果。
+    ///
+    /// 背景：`> tmp` 由 shell 按 umask 建文件，`mv` 同目录内就是 `rename(2)`、**保留 tmp 的
+    /// mode**。少了换入前那步 chmod，每撤销一次临时信任就把用户的 authorized_keys 放宽一次：
+    /// umask 022 → 0644（本该私有的文件变全局可读），umask 002 → 0664（group 可写）→
+    /// sshd 的 StrictModes 拒绝该账号的**全部**公钥认证，等于把人锁在门外。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_untrust_keeps_authorized_keys_at_600() {
+        use super::super::direct::untrust_cmd;
+
+        let env = env_or_skip!();
+        let ak = env.path("authorized_keys");
+        let marker = "ishell-relay-testmarker";
+        // 两行：一行是我们要撤销的临时公钥（带 marker），一行是用户自己的、必须留下
+        let content = format!("ssh-ed25519 AAAAuser userkey\nssh-ed25519 AAAAtmp {marker}\n");
+        crate::ssh::sftp::sftp_overwrite(&env.sftp, &ak, content.as_bytes())
+            .await
+            .expect("预置 authorized_keys");
+        env.sftp
+            .set_metadata(ak.clone(), crate::ssh::sftp::perm_only_attrs(0o600))
+            .await
+            .expect("置 0600");
+
+        let cmd = untrust_cmd(
+            marker,
+            &ak,
+            &format!("{ak}.ishell_tmp.test"),
+            &env.path(".ishell-relay.lock"),
+        );
+        let (_code, _) = env.exec(&cmd).await;
+
+        // 1) 内容：marker 那行没了，用户自己那行还在
+        let after = String::from_utf8_lossy(&env.read(&ak).await.expect("读回")).into_owned();
+        assert!(!after.contains(marker), "临时公钥那行没删掉：{after:?}");
+        assert!(after.contains("userkey"), "把用户自己的公钥也删了：{after:?}");
+
+        // 2) 权限：必须还是 0600
+        let (_, mode) = env.exec(&format!("stat -c %a {ak}")).await;
+        assert_eq!(
+            mode.trim(),
+            "600",
+            "撤销临时信任把 authorized_keys 的权限放宽成了 {}——umask 002 的机器上这会让 \
+             sshd 的 StrictModes 拒绝该账号的全部公钥认证",
+            mode.trim()
+        );
+
+        // 3) 不留临时文件
+        let (code, _) = env.exec(&format!("test -e {ak}.ishell_tmp.test")).await;
+        assert_ne!(code, 0, "临时文件没清理干净");
     }
 
     /// `plan_copy_move` 的真·SFTP 行为：「目标在不在」判错了，「跳过 / 重命名」就全是空话。

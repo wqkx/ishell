@@ -324,7 +324,7 @@ pub(crate) async fn untrust_temp_key(handle: &Handle<ClientHandler>, marker: &st
 /// 拼出 `untrust_temp_key` 那条 shell 命令。单独抽出来是为了能直接测——它有两条容易
 /// 回退的性质（grep 退出码 1 也要换入、换入前必须先 600），藏在一次 SSH 往返后面没有
 /// 任何东西拦得住改坏。
-fn untrust_cmd(marker: &str, auth_keys: &str, tmp_path: &str, lock: &str) -> String {
+pub(super) fn untrust_cmd(marker: &str, auth_keys: &str, tmp_path: &str, lock: &str) -> String {
     // 与 trust_temp_key 用同一把 flock 串行化，避免并发直连拷贝对同一台目标主机的
     // authorized_keys 做读改写时互相覆盖/丢标记（见 trust_temp_key 注释）。
     //
