@@ -289,3 +289,175 @@ pub(super) fn encode_mouse(
         }
     }
 }
+
+#[cfg(test)]
+mod encode_tests {
+    use super::encode_key;
+    use egui::{Key, Modifiers};
+
+    fn enc(key: Key, mods: Modifiers, app_cursor: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_key(key, mods, app_cursor, &mut out);
+        out
+    }
+    fn s(key: Key, mods: Modifiers, app_cursor: bool) -> String {
+        String::from_utf8_lossy(&enc(key, mods, app_cursor)).into_owned()
+    }
+    fn ctrl() -> Modifiers {
+        Modifiers { ctrl: true, ..Default::default() }
+    }
+    fn shift() -> Modifiers {
+        Modifiers { shift: true, ..Default::default() }
+    }
+    fn alt() -> Modifiers {
+        Modifiers { alt: true, ..Default::default() }
+    }
+
+    /// DECCKM（应用光标键模式）：htop/vim/less 这类 ncurses 程序初始化时会开它，之后期望
+    /// 方向键是 SS3（`ESC O A`）而不是 `ESC [ A`。发错形式的后果不是"没反应"，而是对端把
+    /// 转义序列拆成散字符——`[`/`]` 恰好是 htop 的降/升 nice，表现成「按上下键改了 NI」。
+    /// 这条注释在源码里，但没有任何测试守着它。
+    #[test]
+    fn arrows_follow_the_application_cursor_mode() {
+        let none = Modifiers::default();
+        assert_eq!(s(Key::ArrowUp, none, false), "\x1b[A");
+        assert_eq!(s(Key::ArrowUp, none, true), "\x1bOA", "DECCKM 下必须发 SS3");
+        assert_eq!(s(Key::ArrowDown, none, true), "\x1bOB");
+        assert_eq!(s(Key::ArrowRight, none, true), "\x1bOC");
+        assert_eq!(s(Key::ArrowLeft, none, true), "\x1bOD");
+        assert_eq!(s(Key::Home, none, true), "\x1bOH");
+        assert_eq!(s(Key::End, none, true), "\x1bOF");
+    }
+
+    /// 带修饰的方向键**即使在 DECCKM 下也走 CSI 长形式**——SS3 没有携带参数的位置。
+    /// 少了这条，Ctrl+←/→（按词跳转）、Shift+←/→（选择）会被降级成普通方向键。
+    #[test]
+    fn modified_arrows_always_use_the_csi_long_form() {
+        for app_cursor in [false, true] {
+            assert_eq!(s(Key::ArrowLeft, ctrl(), app_cursor), "\x1b[1;5D");
+            assert_eq!(s(Key::ArrowRight, shift(), app_cursor), "\x1b[1;2C");
+            assert_eq!(s(Key::ArrowUp, alt(), app_cursor), "\x1b[1;3A");
+        }
+    }
+
+    /// xterm 的修饰位编码：shift=1 alt=2 ctrl=4，参数是位和 +1。组合键（Ctrl+Shift 等）
+    /// 一旦算错，对端收到的是另一个键，且不会报错、只会"行为不对"。
+    #[test]
+    fn modifier_parameter_follows_the_xterm_bitmask() {
+        let cs = Modifiers { ctrl: true, shift: true, ..Default::default() };
+        let ca = Modifiers { ctrl: true, alt: true, ..Default::default() };
+        let all = Modifiers { ctrl: true, alt: true, shift: true, ..Default::default() };
+        assert_eq!(s(Key::ArrowUp, cs, false), "\x1b[1;6A"); // 1|4 +1 = 6
+        assert_eq!(s(Key::ArrowUp, ca, false), "\x1b[1;7A"); // 2|4 +1 = 7
+        assert_eq!(s(Key::ArrowUp, all, false), "\x1b[1;8A"); // 1|2|4 +1 = 8
+    }
+
+    /// tilde 系（Insert/Delete/PageUp/PageDown）：`CSI n ~`，带修饰 `CSI n;m ~`。
+    #[test]
+    fn tilde_keys_encode_their_number() {
+        let none = Modifiers::default();
+        assert_eq!(s(Key::Insert, none, false), "\x1b[2~");
+        assert_eq!(s(Key::Delete, none, false), "\x1b[3~");
+        assert_eq!(s(Key::PageUp, none, false), "\x1b[5~");
+        assert_eq!(s(Key::PageDown, none, false), "\x1b[6~");
+        assert_eq!(s(Key::Delete, ctrl(), false), "\x1b[3;5~");
+    }
+
+    /// Ctrl+字母 → 0x01..0x1a；同时按 Alt 再加 ESC 前缀（Meta 惯例）。
+    /// Ctrl+C 是 0x03——这条要是坏了，用户就中断不了任何东西。
+    #[test]
+    fn ctrl_letters_map_to_control_characters() {
+        assert_eq!(enc(Key::C, ctrl(), false), vec![0x03]);
+        assert_eq!(enc(Key::A, ctrl(), false), vec![0x01]);
+        assert_eq!(enc(Key::Z, ctrl(), false), vec![0x1a]);
+        assert_eq!(enc(Key::D, ctrl(), false), vec![0x04]);
+        // Alt+Ctrl+B：ESC 前缀 + 0x02
+        let ca = Modifiers { ctrl: true, alt: true, ..Default::default() };
+        assert_eq!(enc(Key::B, ca, false), vec![0x1b, 0x02]);
+    }
+
+    /// Ctrl+Shift+C/V/F 留给复制/粘贴/查找，**不能**当终端输入发出去。
+    /// 发出去的后果是：想复制却给远端发了 Ctrl+C，把正在跑的命令打断。
+    #[test]
+    fn ctrl_shift_cvf_are_reserved_for_the_ui() {
+        let cs = Modifiers { ctrl: true, shift: true, ..Default::default() };
+        for k in [Key::C, Key::V, Key::F] {
+            assert!(
+                enc(k, cs, false).is_empty(),
+                "Ctrl+Shift+{k:?} 不该发到终端——它是复制/粘贴/查找的快捷键"
+            );
+        }
+        // 但普通 Ctrl+C 必须照发
+        assert_eq!(enc(Key::C, ctrl(), false), vec![0x03]);
+    }
+
+    /// Shift+Enter / Alt+Enter → `ESC CR`：让 TUI 能把它和普通回车区分开（"换行但不提交"）。
+    /// 裸 xterm 编码里两者都是 CR、无法区分，Claude Code 的 /terminal-setup 就是去给别的
+    /// 终端写这条映射——iShell 自己内建，用户不用配。
+    #[test]
+    fn shift_enter_is_distinguishable_from_plain_enter() {
+        let none = Modifiers::default();
+        assert_eq!(enc(Key::Enter, none, false), b"\r".to_vec());
+        assert_eq!(enc(Key::Enter, shift(), false), b"\x1b\r".to_vec());
+        assert_eq!(enc(Key::Enter, alt(), false), b"\x1b\r".to_vec());
+    }
+
+    /// 功能键曾经完全没编码（按下什么都不发）。F1-F4 无修饰走 SS3，F5+ 走 `CSI n ~`。
+    #[test]
+    fn function_keys_are_encoded() {
+        let none = Modifiers::default();
+        assert_eq!(s(Key::F1, none, false), "\x1bOP");
+        assert_eq!(s(Key::F4, none, false), "\x1bOS");
+        assert_eq!(s(Key::F5, none, false), "\x1b[15~");
+        assert_eq!(s(Key::F12, none, false), "\x1b[24~");
+        for k in [Key::F1, Key::F5, Key::F12] {
+            assert!(!enc(k, none, false).is_empty(), "{k:?} 不该什么都不发");
+        }
+    }
+
+    /// **不变量**：编码结果要么为空（被 UI 保留的快捷键），要么是一个完整的转义序列或
+    /// 控制字符——绝不能发出**半截**序列（只有 `ESC` 或以 `ESC [` 结尾）。半截序列会让
+    /// 对端的状态机一直等下去，把随后的正常输入一起吃掉。
+    #[test]
+    fn no_key_ever_emits_a_truncated_escape_sequence() {
+        let all_keys = [
+            Key::ArrowUp, Key::ArrowDown, Key::ArrowLeft, Key::ArrowRight,
+            Key::Home, Key::End, Key::Insert, Key::Delete, Key::PageUp, Key::PageDown,
+            Key::Enter, Key::Tab, Key::Escape, Key::Backspace, Key::Space,
+            Key::A, Key::C, Key::Z, Key::Num0, Key::Num9,
+            Key::F1, Key::F4, Key::F5, Key::F12,
+        ];
+        let mod_sets = [
+            Modifiers::default(),
+            ctrl(),
+            shift(),
+            alt(),
+            Modifiers { ctrl: true, shift: true, ..Default::default() },
+            Modifiers { ctrl: true, alt: true, ..Default::default() },
+            Modifiers { ctrl: true, alt: true, shift: true, ..Default::default() },
+        ];
+        for k in all_keys {
+            for m in mod_sets {
+                for app_cursor in [false, true] {
+                    let bytes = enc(k, m, app_cursor);
+                    if bytes.is_empty() {
+                        continue; // 被 UI 保留，合法
+                    }
+                    // Esc 键本身就该发一个裸 ESC，这是它的正确编码，不是"半截序列"。
+                    // （这条豁免是写完这个测试后被它自己逼出来的：第一版没有它，Esc 被误报。）
+                    if !matches!(k, Key::Escape) {
+                        assert_ne!(bytes, vec![0x1b_u8], "{k:?}+{m:?} 只发了一个裸 ESC");
+                    }
+                    assert!(
+                        !bytes.ends_with(b"\x1b["),
+                        "{k:?}+{m:?} 发出了半截 CSI：{bytes:?}"
+                    );
+                    assert!(
+                        !bytes.ends_with(b"\x1bO"),
+                        "{k:?}+{m:?} 发出了半截 SS3：{bytes:?}"
+                    );
+                }
+            }
+        }
+    }
+}
