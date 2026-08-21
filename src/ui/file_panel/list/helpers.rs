@@ -337,12 +337,10 @@ pub(super) fn toggle_favorite(state: &mut FilePanelState, path: String) {
     if path.is_empty() {
         return;
     }
-    if let Some(i) = state.favorites.iter().position(|f| f == &path) {
-        state.favorites.remove(i);
-    } else {
-        state.favorites.push(path);
-    }
-    crate::store::save_favorites(&state.server_key, &state.favorites);
+    // 读盘→改→写回，而不是「改本标签的 Vec 再整个覆盖磁盘」：同一台服务器可以同时开多个
+    // 标签页，各自拿着打开那一刻的旧快照，整体覆盖会把别的标签页刚加的收藏抹掉
+    // （用户看到的现象是「明明收藏了五六个，点开只剩两行」）。见 store::toggle_favorite。
+    state.favorites = crate::store::toggle_favorite(&state.server_key, &path);
 }
 
 /// 同 `tool_btn_color`，但返回 `Response`（用于需要命中检测/拖拽目标的按钮，如「上级目录」）。

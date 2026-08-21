@@ -123,8 +123,16 @@ pub(super) fn toolbar(
                         .on_hover_text(crate::i18n::tr("收藏夹", "Favorites"))
                     })
                     .inner;
+                // 点开收藏夹时从磁盘重读一次：别的标签页（同一台服务器可以开好几个）可能已经
+                // 增删过收藏，而本标签手里还是它打开那一刻的快照。不重读的话，用户会看到
+                // 「明明收藏了五六个，点开只剩两行」——那正是本次要修的现象。
+                // 一次点击读一个小 JSON，开销可以忽略。
+                if star.clicked() {
+                    state.favorites = crate::store::load_favorites(&state.server_key);
+                }
                 let mut fav_nav: Option<String> = None;
-                let mut fav_remove: Option<usize> = None;
+                // 按**路径**删，不按下标：下标是相对本标签那份可能过时的快照算的。
+                let mut fav_remove: Option<String> = None;
                 // 收藏数量决定弹窗高度，最多五行；再多就滚动。
                 let fav_rows = state.favorites.len().clamp(1, MAX_FAV_ROWS);
                 let fav_row_h = ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
@@ -153,7 +161,7 @@ pub(super) fn toolbar(
                             egui::ScrollArea::vertical()
                                 .max_height(fav_max_h)
                                 .show(ui, |ui| {
-                                    for (i, p) in state.favorites.iter().enumerate() {
+                                    for p in state.favorites.iter() {
                                         ui.horizontal(|ui| {
                                             ui.set_min_width(266.0);
                                             ui.with_layout(
@@ -174,7 +182,7 @@ pub(super) fn toolbar(
                                                         ))
                                                         .clicked()
                                                     {
-                                                        fav_remove = Some(i);
+                                                        fav_remove = Some(p.clone());
                                                     }
                                                     ui.with_layout(
                                                         egui::Layout::left_to_right(
@@ -210,11 +218,8 @@ pub(super) fn toolbar(
                                 });
                         }
                     });
-                if let Some(i) = fav_remove {
-                    if i < state.favorites.len() {
-                        state.favorites.remove(i);
-                        crate::store::save_favorites(&state.server_key, &state.favorites);
-                    }
+                if let Some(p) = fav_remove {
+                    state.favorites = crate::store::remove_favorite(&state.server_key, &p);
                 }
                 if let Some(p) = fav_nav {
                     state.cwd = p;
@@ -611,5 +616,85 @@ pub(super) fn toolbar(
             state.loading.insert(state.cwd.clone());
             actions.push(FileAction::List(state.cwd.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod fav_popup_tests {
+    use super::*;
+    use egui_phosphor::regular as icon;
+
+    /// 收藏夹弹窗的高度是按「估算的每行高度 × 行数」给的（`fav_row_h`）。这个估算一旦小于
+    /// **真实**行高，弹窗就会少显示几行——而且是无声的，看起来就像「收藏丢了」。
+    ///
+    /// 这里在无窗口的 egui 里按弹窗里逐字一致的标记摆一行出来，量它的真实高度，
+    /// 确认估算没有偏小。（排查用户报的「只显示 2 行」时写的：结论是这里没问题，
+    /// 真因是收藏列表本身被别的标签页的陈旧快照覆盖了，见 store::favorites 的测试。）
+    #[test]
+    fn row_height_estimate_is_not_smaller_than_reality() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut estimate = 0.0f32;
+        let mut actual = 0.0f32;
+        // 跑两帧：第一帧让 set_fonts / set_style 生效
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    estimate =
+                        ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
+                    let r = ui
+                        .horizontal(|ui| {
+                            ui.set_min_width(266.0);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let _ = ui.add(
+                                        egui::Button::new(
+                                            RichText::new(icon::TRASH)
+                                                .size(12.0)
+                                                .color(Palette::TEXT_DIM),
+                                        )
+                                        .frame(false),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            let _ = ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(format!(
+                                                        "{} {}",
+                                                        icon::FOLDER,
+                                                        "/home/u/some/dir"
+                                                    ))
+                                                    .size(12.0)
+                                                    .color(Palette::TEXT),
+                                                )
+                                                .selectable(false)
+                                                .sense(Sense::click()),
+                                            );
+                                        },
+                                    );
+                                },
+                            );
+                        })
+                        .response;
+                    actual = r.rect.height();
+                });
+            });
+        }
+        assert!(
+            estimate >= actual,
+            "每行高度估算 {estimate} 小于真实行高 {actual}：弹窗会少显示几行收藏，\
+             且看起来像是收藏丢了。改了行内控件/样式就要跟着调 fav_row_h。"
+        );
+        assert!(actual > 0.0, "没量到行高，测试本身失效了");
     }
 }
