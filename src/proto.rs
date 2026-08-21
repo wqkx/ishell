@@ -67,10 +67,12 @@ pub struct JumpHost {
     pub auth: AuthMethod,
 }
 
-/// 传输目标已存在时的冲突处理策略（全局设置，默认覆盖）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 目标已存在时的冲突处理策略（全局设置，默认覆盖）。
+/// 传输（下载/上传）与同机复制粘贴/拖拽移动共用这一个设置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ConflictPolicy {
     /// 覆盖（默认）：继续传输，替换/续写目标
+    #[default]
     Overwrite,
     /// 跳过：目标已存在则不传输
     Skip,

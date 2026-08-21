@@ -758,7 +758,7 @@ async fn copy_move(
     }
     // 失败时刷新「源目录」，让前端乐观移除的项重新显示（文件其实还在源处）；成功刷新目标目录。
     let refresh = if failed.is_some() {
-        src_parent
+        src_parent.clone()
     } else {
         Some(dest_dir.to_string())
     };
@@ -784,6 +784,16 @@ async fn copy_move(
             crate::i18n::Lang::En => format!("{verb_en} failed: {}", e.trim()),
         },
     };
+    // 移动 + 有跳过项：被跳过的那几项还留在源目录，而前端在拖拽那一刻就已经把它们乐观
+    // 移除了。不补刷一次源目录，用户看到的就是「从源目录消失了、目标目录里也没有」。
+    // OpDone 一次只带得动一个目录，所以多发一条；message 相同，状态栏不会闪。
+    if do_move && skipped > 0 && failed.is_none() {
+        if let Some(sp) = src_parent.clone() {
+            if refresh.as_deref() != Some(sp.as_str()) {
+                op_done(sink, message.clone(), Some(sp));
+            }
+        }
+    }
     op_done(sink, message, refresh);
 }
 
@@ -1087,6 +1097,78 @@ mod tests {
         assert_eq!(
             std::fs::read(dstdir.join("a (1).txt")).expect("重命名后的新文件应当存在"),
             b"NEW"
+        );
+    }
+
+    /// **「东西没了」守门人**：移动时若有项被跳过，必须补刷**源目录**。
+    ///
+    /// 拖拽移动的那一刻，前端就乐观地把被移动项从源目录列表里删掉了
+    /// （见 `ui/file_panel/list/table_tail.rs`）。跳过的项其实还留在源目录，可 worker 只刷
+    /// 目标目录的话，用户看到的就是「从源目录消失了、目标目录里也没有」——和数据丢失
+    /// 长得一模一样。别把这条断言删了。
+    #[test]
+    fn skipped_move_also_refreshes_the_source_dir() {
+        let tmp = TmpDir::new("skiprefresh");
+        let srcdir = tmp.0.join("src");
+        let dstdir = tmp.0.join("dst");
+        std::fs::create_dir_all(&srcdir).expect("mkdir src");
+        std::fs::create_dir_all(&dstdir).expect("mkdir dst");
+        std::fs::write(srcdir.join("a.txt"), b"NEW").expect("write src");
+        std::fs::write(dstdir.join("a.txt"), b"OLD").expect("write dst");
+
+        let (sink, rx) = test_sink();
+        block_on(copy_move(
+            vec![srcdir.join("a.txt").to_string_lossy().into_owned()],
+            &dstdir.to_string_lossy(),
+            true, // 移动
+            ConflictPolicy::Skip,
+            &sink,
+        ));
+
+        // 源文件确实还在（跳过了）
+        assert!(srcdir.join("a.txt").exists(), "跳过的项不该离开源目录");
+        let refreshed: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                WorkerEvent::OpDone { refresh_dir, .. } => refresh_dir,
+                _ => None,
+            })
+            .collect();
+        assert!(
+            refreshed.iter().any(|d| d == &srcdir.to_string_lossy()),
+            "移动有跳过项时必须刷新源目录，实际只刷了 {refreshed:?}"
+        );
+    }
+
+    /// 反面：没有跳过项时不该多发那条刷新——默认路径的事件流一个字都不该变。
+    #[test]
+    fn clean_move_refreshes_only_the_destination() {
+        let tmp = TmpDir::new("cleanmove");
+        let srcdir = tmp.0.join("src");
+        let dstdir = tmp.0.join("dst");
+        std::fs::create_dir_all(&srcdir).expect("mkdir src");
+        std::fs::create_dir_all(&dstdir).expect("mkdir dst");
+        std::fs::write(srcdir.join("a.txt"), b"NEW").expect("write src");
+
+        let (sink, rx) = test_sink();
+        block_on(copy_move(
+            vec![srcdir.join("a.txt").to_string_lossy().into_owned()],
+            &dstdir.to_string_lossy(),
+            true,
+            ConflictPolicy::Skip, // 无冲突，所以跳过策略也照常移动
+            &sink,
+        ));
+        let refreshed: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                WorkerEvent::OpDone { refresh_dir, .. } => refresh_dir,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refreshed,
+            vec![dstdir.to_string_lossy().into_owned()],
+            "无跳过项时只该刷目标目录"
         );
     }
 

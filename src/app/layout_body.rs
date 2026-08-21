@@ -32,7 +32,11 @@ impl App {
                         }),
                 )
                 .show_inside(root, |ui| {
-                    file_actions = file_panel::show(ui, &mut self.sessions[idx].files, has_clip);
+                    // 冲突策略同步给面板：拖拽移动要据它决定还能不能记撤销（见 FilePanelState 字段说明）
+                    let policy = self.conflict_policy;
+                    let files = &mut self.sessions[idx].files;
+                    files.conflict_policy = policy;
+                    file_actions = file_panel::show(ui, files, has_clip);
                 });
             for a in file_actions {
                 self.handle_file_action(idx, a);

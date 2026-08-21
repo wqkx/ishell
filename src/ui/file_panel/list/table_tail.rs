@@ -73,7 +73,16 @@ pub(super) fn apply_table_tail_actions(
             }
             state.touch_listings();
         }
-        state.record_move(srcs.clone(), dest_dir.clone());
+        // 撤销栈只在「覆盖」策略下敢记。MoveRecord 的假设是「目标目录里那个同名项就是我们
+        // 刚移过去的」，而在跳过/重命名下那个同名项恰恰**是目标目录原有的文件**：跳过时我们
+        // 根本没移过去，重命名时我们落成了 `名 (1)`。照记的话，一次 Ctrl+Z 会把用户目标目录里
+        // 那个原有文件挪走——这是实打实的数据事故，宁可这两种策略下不提供撤销。
+        //
+        // 乐观移除照做不误：重命名下项目确实离开了源目录；只有跳过时留在原处，worker 那边
+        // 检测到有跳过就会补刷一次源目录，把它们放回列表（见 ssh/mod.rs 的 CopyMove 分支）。
+        if matches!(state.conflict_policy, crate::proto::ConflictPolicy::Overwrite) {
+            state.record_move(srcs.clone(), dest_dir.clone());
+        }
         actions.push(FileAction::Move { srcs, dest_dir });
         state.selected.clear();
         state.anchor = None;

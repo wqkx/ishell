@@ -82,6 +82,12 @@ pub struct FilePanelState {
     pub favorites: Vec<String>,
     /// 该服务器的持久化键（host），收藏读写用。
     pub server_key: String,
+    /// 当前的冲突策略（每帧由 App 同步过来，见 `layout_body.rs`）。
+    ///
+    /// 面板只用它判断「这次拖拽移动的结果还预测得出来吗」：只有「覆盖」下每一项都必然
+    /// 落到 `目标目录/同名`，撤销栈才敢按这个假设记；跳过/重命名下那个同名项可能压根
+    /// 不是我们移过去的（见 `record_move` 的调用处）。
+    pub conflict_policy: crate::proto::ConflictPolicy,
     /// 「返回上一个目录」历史栈（浏览器式后退）。
     pub nav_history: Vec<String>,
     /// 上一帧末的 cwd，用于检测目录切换并把旧目录压入历史。

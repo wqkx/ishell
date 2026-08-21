@@ -752,24 +752,42 @@ pub async fn run(
                                 (k, false) => format!(", skipped {k} (already exist)"),
                             };
                             let Some(cmd) = xfer::util::copy_move_script(&plan, &dest_dir, do_move) else {
-                                // 全部跳过：一条命令都不用发
+                                // 全部跳过：一条命令都不用发。移动时刷的是**源**目录——目标那边
+                                // 什么都没多，而源目录里那些项在拖拽那一刻就被前端乐观移除了，
+                                // 不放回去用户看到的就是「东西没了」。
                                 s.send(WorkerEvent::OpDone {
                                     message: match crate::i18n::current() {
                                         crate::i18n::Lang::Zh => format!("已跳过 {n_skip} 项（目标已存在）"),
                                         crate::i18n::Lang::En => format!("Skipped {n_skip} item(s) (already exist)"),
                                     },
-                                    refresh_dir: Some(dest_dir.clone()),
+                                    refresh_dir: if do_move { src_parent.clone() } else { Some(dest_dir.clone()) },
                                 });
                                 return;
                             };
                             match exec_status(&h, &cmd).await {
-                                Ok((0, _)) => s.send(WorkerEvent::OpDone {
-                                    message: match crate::i18n::current() {
+                                Ok((0, _)) => {
+                                    let message = match crate::i18n::current() {
                                         crate::i18n::Lang::Zh => format!("{}完成（{n} 项）{}", if do_move { "移动" } else { "复制" }, skipped_note(true)),
                                         crate::i18n::Lang::En => format!("{} done ({n}){}", if do_move { "Move" } else { "Copy" }, skipped_note(false)),
-                                    },
-                                    refresh_dir: Some(dest_dir.clone()),
-                                }),
+                                    };
+                                    // 移动 + 有跳过项：被跳过的那几项还留在源目录，而前端在拖拽那一刻
+                                    // 就已经把它们乐观移除了（见 ui/file_panel/list/table_tail.rs 的注释）。
+                                    // 不补刷一次源目录，用户看到的就是「从源目录消失了、目标目录里也没有」
+                                    // ——和数据丢失长得一模一样。OpDone 一次只带得动一个目录，所以多发一条；
+                                    // message 相同，状态栏不会闪。
+                                    if do_move && n_skip > 0 {
+                                        if let Some(sp) = src_parent.clone() {
+                                            s.send(WorkerEvent::OpDone {
+                                                message: message.clone(),
+                                                refresh_dir: Some(sp),
+                                            });
+                                        }
+                                    }
+                                    s.send(WorkerEvent::OpDone {
+                                        message,
+                                        refresh_dir: Some(dest_dir.clone()),
+                                    });
+                                }
                                 Ok((code, err)) => s.send(WorkerEvent::OpDone {
                                     message: match crate::i18n::current() {
                                         crate::i18n::Lang::Zh => format!("操作失败（码 {code}）：{}", err.trim()),
