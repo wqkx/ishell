@@ -825,3 +825,156 @@ fn unterminated_sequence_tail_is_capped() {
     assert_eq!(ns.len(), 1);
     assert_eq!(ns[0].body, "fresh");
 }
+
+// ─────────────────────────── 分包鲁棒性（属性式，无新依赖） ───────────────────────────
+//
+// `feed()` 是按 SSH 通道包调用的，一条转义序列完全可能被切在任意两个字节之间。它内部为此
+// 维护了**四套**跨调用状态：`utf8_pending`（半个多字节字符）、`query_tail`（半个 DSR 查询）、
+// `notice_tail`（未终止的 OSC/DCS）、`echo_*`（注入命令的回显吞除）。这类 bug 历史上出过好几次
+// （通知丢失、BEL 误计、tmux DCS 透传弹两遍），而且都不是崩溃，是**静默算错**。
+//
+// 这里用「同一段字节，整块喂 vs 在每一个可能的位置切两半喂」做对拍。不引 proptest/fuzz：
+// 手写的确定性遍历在 CI 里稳定可复现，也和这个文件既有的写法一致。
+
+/// 一段刻意混装的语料：CJK（多字节）、CSI、SGR、OSC 7、OSC 9 通知、DCS(tmux 透传)、
+/// 裸 BEL、DSR 查询、以及被截断的尾巴。
+const SPLIT_CORPUS: &[&[u8]] = &[
+    b"hello \xe4\xb8\xad\xe6\x96\x87 world\r\n",
+    b"\x1b[31mred\x1b[0m normal\r\n",
+    b"\x1b]7;file://h/tmp/\xe4\xb8\xad\x07",
+    b"\x1b]9;task done\x07",
+    b"\x1b]777;notify;Title;Body\x07",
+    b"\x1bPtmux;\x1b\x1b]9;codex done\x07\x1b\\",
+    b"prompt$ \x07",
+    b"\x1b[6n",
+    b"\x1b[2J\x1b[3Jcleared\r\n",
+    b"\x1b]9;4;1;50\x07progress\r\n",
+];
+
+/// 只取**能真正弹给用户**的通知。
+///
+/// 刻意滤掉 `NoticeKind::Bell`：它在 App 层被 `notice_should_alert` 的 `(K::Bell, _) => false`
+/// 无条件挡掉，从来不会呈现给用户；而且它的正文是「`process` 完整包之后的光标行预览」——
+/// 按设计就依赖包的形状（`feed` 里那句注释「预览在 process 之后取」说的就是这个），
+/// 同一段字节切在不同位置，光标行本来就可能落在不同内容上。拿它去要求分包不变性，
+/// 是在给一份既不可见、又按定义与分包有关的数据立规矩。
+///
+/// 剩下的三类（Need / Done / Untagged）才是会变成桌面通知的，它们必须与分包无关。
+fn visible_notices(t: &mut Terminal) -> Vec<(Option<String>, String)> {
+    t.take_notices()
+        .into_iter()
+        .filter(|n| n.kind != NoticeKind::Bell)
+        .map(|n| (n.title, n.body))
+        .collect()
+}
+
+fn feed_whole(data: &[u8]) -> (String, Vec<(Option<String>, String)>, Vec<u8>) {
+    let mut t = Terminal::new();
+    let replies = t.feed(data);
+    let notices = visible_notices(&mut t);
+    (t.screen_text(), notices, replies)
+}
+
+fn feed_split_at(data: &[u8], at: usize) -> (String, Vec<(Option<String>, String)>, Vec<u8>) {
+    let mut t = Terminal::new();
+    let mut replies = t.feed(&data[..at]);
+    replies.extend(t.feed(&data[at..]));
+    let notices = visible_notices(&mut t);
+    (t.screen_text(), notices, replies)
+}
+
+/// **核心不变量**：在任意一个字节位置把输入切成两包，屏幕内容、通知、以及要回给远端的
+/// 应答字节，都必须和整块喂进去完全一致。
+///
+/// 切在哪里是网络决定的，用户不该因为「这一包恰好断在 `ESC ]` 中间」就少收到一条通知、
+/// 或者多响一次铃。
+#[test]
+fn feeding_the_same_bytes_split_anywhere_gives_the_same_result() {
+    for (ci, chunk) in SPLIT_CORPUS.iter().enumerate() {
+        let want = feed_whole(chunk);
+        for at in 1..chunk.len() {
+            let got = feed_split_at(chunk, at);
+            assert_eq!(
+                got.0, want.0,
+                "语料 #{ci} 在第 {at} 字节切开后，屏幕内容不一致"
+            );
+            assert_eq!(
+                got.1, want.1,
+                "语料 #{ci} 在第 {at} 字节切开后，通知不一致"
+            );
+            assert_eq!(
+                got.2, want.2,
+                "语料 #{ci} 在第 {at} 字节切开后，回给远端的应答不一致"
+            );
+        }
+    }
+}
+
+/// 整段语料串起来再做同样的对拍——跨语料的边界（一条序列结束、下一条开始）也要覆盖到。
+#[test]
+fn split_invariance_holds_across_the_whole_corpus() {
+    let all: Vec<u8> = SPLIT_CORPUS.concat();
+    let want = feed_whole(&all);
+    // 全长逐字节切太慢，按步长扫（步长与语料长度互质，保证扫过各种相对位置）
+    let step = 7;
+    let mut at = 1;
+    while at < all.len() {
+        let got = feed_split_at(&all, at);
+        assert_eq!(got.0, want.0, "整段语料在第 {at} 字节切开后屏幕不一致");
+        assert_eq!(got.1, want.1, "整段语料在第 {at} 字节切开后通知不一致");
+        at += step;
+    }
+}
+
+/// **绝不 panic**：任意字节序列（含非法 UTF-8、孤立 ESC、超长参数、嵌套转义）喂进去，
+/// 无论怎么切包都不能把应用带崩。终端喂的是远端来的不可信字节，崩了就是被一段输出打死。
+#[test]
+fn feed_never_panics_on_arbitrary_bytes() {
+    let nasty: &[&[u8]] = &[
+        b"\xff\xfe\xfd",                       // 非法 UTF-8
+        b"\xe4\xb8",                           // 半个 CJK 字符
+        b"\x1b",                               // 孤立 ESC
+        b"\x1b[",                              // 半截 CSI
+        b"\x1b]",                              // 半截 OSC
+        b"\x1bP",                              // 半截 DCS
+        b"\x1b[999999999999999999999m",        // 超大参数
+        b"\x1b]9;",                            // OSC 9 无正文无终止
+        b"\x1b]\x1b]\x1b]\x07",                // 嵌套/重复 OSC 引导
+        b"\x00\x01\x02\x07\x08\x0b\x0c\x0e\x0f", // 控制字符大杂烩
+        b"\x1b]7;file://\x07",                 // OSC 7 空路径
+        b"\x1b]7;file://h\x07",                // OSC 7 无 '/' 路径
+        b"\x1b]777;notify;\x07",               // 空标题空正文
+    ];
+    for (i, data) in nasty.iter().enumerate() {
+        for at in 0..=data.len() {
+            let mut t = Terminal::new();
+            let _ = t.feed(&data[..at]);
+            let _ = t.feed(&data[at..]);
+            let _ = t.take_notices();
+            let _ = t.screen_text();
+            let _ = t.history_text(50);
+            // 再补一刀：把同样的字节倒着喂一遍，制造更奇怪的状态机路径
+            let mut t2 = Terminal::new();
+            for b in data.iter().rev() {
+                let _ = t2.feed(&[*b]);
+            }
+            let _ = t2.screen_text();
+            assert!(i < nasty.len()); // 走到这里就算过（没 panic）
+        }
+    }
+}
+
+/// 逐字节喂（最极端的分包）也不能崩，且屏幕上的可见文本要和整块喂一致。
+/// 这里只比屏幕：逐字节下每个字节都是一次「未终止序列」，`notice_tail` 会反复搬运整段，
+/// 通知的时机与整块喂天然不同，不是这条测试要管的事。
+#[test]
+fn byte_by_byte_feeding_still_renders_the_same_text() {
+    for (ci, chunk) in SPLIT_CORPUS.iter().enumerate() {
+        let want = feed_whole(chunk).0;
+        let mut t = Terminal::new();
+        for b in chunk.iter() {
+            let _ = t.feed(&[*b]);
+        }
+        assert_eq!(t.screen_text(), want, "语料 #{ci} 逐字节喂出来的屏幕不一致");
+    }
+}

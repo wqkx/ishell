@@ -64,9 +64,23 @@ pub(super) fn parse_osc7(data: &[u8]) -> Option<String> {
 /// - OSC 9  ：`ESC ] 9 ; <message> BEL|ST`（iTerm2/ConEmu 式，仅正文）
 /// - OSC 777：`ESC ] 777 ; notify ; <title> ; <body> BEL|ST`（urxvt 式，标题+正文）
 /// Claude Code 等 AI CLI 的通知 hook、以及 `printf '\e]9;done\a'` 类脚本都走这两类。
-pub(super) fn parse_osc_notify(data: &[u8]) -> Vec<(Option<String>, String)> {
+/// `carried`：`data` 开头有多少字节是**上一次调用已经扫过**的（`feed()` 为了拼接被截断的
+/// 序列而留下的尾巴，见 `Terminal::notice_tail`）。终止符落在这段前缀里的 OSC 序列，上一轮
+/// 就已经完整、已经报过一次通知了，这一轮必须跳过。
+///
+/// 不跳会重复弹通知，而且是**只在特定切包位置**才出现的那种偶发：典型是 codex/Claude Code
+/// 在 tmux 下发的 DCS 透传 `ESC P tmux ; ESC ESC ] 9 ; <msg> BEL ESC \`——SSH 若恰好把包切在
+/// BEL 之后、结尾的 `ESC \` 之前（只差两个字节，很容易发生），那条内层 OSC 在第一包里就已经
+/// 终止并报过通知；而外层 DCS 还没终止，于是整段被留作 `notice_tail` 原样带到第二包重扫一遍，
+/// 同一条通知就弹了两次。`count_bel` 没这个问题（它对未终止的 OSC/DCS 一路吃到末尾且不计数），
+/// 所以 `feed()` 里那段「不会重复计数」的说明只对响铃成立，对通知不成立。
+pub(super) fn parse_osc_notify(data: &[u8], carried: usize) -> Vec<(Option<String>, String)> {
     let mut out = Vec::new();
     for (seq_start, body_start, end) in osc_sequences(data) {
+        // 终止符在已扫过的前缀里 = 上一轮已经报过这一条
+        if end < carried {
+            continue;
+        }
         let payload = &data[body_start..end];
         let _ = seq_start;
         if let Some(rest) = payload.strip_prefix(b"9;") {

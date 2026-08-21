@@ -165,6 +165,15 @@ pub struct Terminal {
     hl_cache: std::collections::HashMap<u64, Vec<Option<egui::Color32>>>,
     /// 终端查询序列可能跨 SSH 数据块；暂存尚不能确定是否为完整查询的短尾。
     query_tail: Vec<u8>,
+    /// 结尾停在一条**未完成 CSI**（`ESC [` 还没等到终结字节）时暂存的那几个字节，下一块拼回前面。
+    ///
+    /// 与 `utf8_pending` 同类：这是**真的从字节流里扣下来**的，不是副本。vt100 自己能处理被切断的
+    /// CSI，本来不需要帮忙；要帮忙的是 `feed()` 里对 `ESC[2J` / `ESC[3J` 的**子串匹配**——它是在
+    /// 单次 feed 的字节上做的，一条 4 字节的序列被 SSH 切在中间，两包各看到半截、谁都匹配不上，
+    /// 于是「重建解析器真正清空回滚缓冲」那条特殊路径整个不执行：用户 clear 完还能往上滚出旧内容。
+    /// 只暂存 `CSI_TAIL_CAP` 以内的短序列——`ESC[2J`/`ESC[3J` 都只有 4 字节，长参数的 CSI 与这里
+    /// 的识别无关，不必为它们攒缓冲。
+    csi_pending: Vec<u8>,
     /// resize 去抖：拖拽窗口时每帧尺寸都在变，若每帧都真正 resize（普通屏会序列化整缓冲+重建
     /// 解析器重放，且向远端连发 SIGWINCH）会导致 codex 等自绘 TUI 反复重绘「历史从头刷到尾」。
     /// 这里只记录目标尺寸+首次出现时刻，稳定 ~130ms 后才真正 resize（本地重排 + 上报远端一次）。
@@ -231,6 +240,7 @@ impl Terminal {
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
             query_tail: Vec::new(),
+            csi_pending: Vec::new(),
             prev_alt: false,
             sb_dragging: false,
             ai_capture: None,

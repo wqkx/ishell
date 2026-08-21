@@ -230,14 +230,16 @@ impl Terminal {
         // 清屏并不会终止一条正在传输的 OSC，清了反而会丢掉本来能拼完整的通知。
         const NOTICE_TAIL_CAP: usize = 8 * 1024;
         let joined: Vec<u8>;
-        let scan: &[u8] = {
-            let tail = std::mem::take(&mut self.notice_tail);
-            if tail.is_empty() {
-                bytes
-            } else {
-                joined = [tail.as_slice(), bytes].concat();
-                &joined
-            }
+        let tail = std::mem::take(&mut self.notice_tail);
+        // 留下来的这截**上一轮已经扫过**了。对响铃无所谓（未终止序列不计数），但对通知有所谓：
+        // 一条已经终止的 OSC 可能整个躺在这截里（典型是包在未终止 DCS 里的 tmux 透传通知），
+        // 不告诉 parse_osc_notify 跳过它，同一条通知会弹两次。见 parse_osc_notify 的说明。
+        let carried = tail.len();
+        let scan: &[u8] = if tail.is_empty() {
+            bytes
+        } else {
+            joined = [tail.as_slice(), bytes].concat();
+            &joined
         };
         self.notice_tail = match unterminated_string_tail(scan) {
             Some(at) if scan.len() - at <= NOTICE_TAIL_CAP => scan[at..].to_vec(),
@@ -249,7 +251,7 @@ impl Terminal {
         }
         // OSC 9/777 桌面通知（codex 走这条、`printf '\e]9;done\a'` 类脚本也是）。
         // **不设门槛**：发这个序列本身就是程序在明确要求"提醒用户"，不像裸 BEL 那样含糊。
-        for (title, body) in parse_osc_notify(scan) {
+        for (title, body) in parse_osc_notify(scan, carried) {
             // 会主动发通知的程序，其后续的裸 BEL 也值得提醒（同一个程序在说同一件事）。
             self.ai_cli_seen = true;
             // iShell 自己装的 hook 会把类别写在标题位（见 NOTICE_TAG_*）；这类标题是内部
@@ -273,11 +275,31 @@ impl Terminal {
         // 合并上次暂存的不完整 UTF-8 前缀，并把本次结尾不完整的多字节序列暂存到下次，
         // 避免一个中文字符被拆在两个数据块里导致乱码。
         let mut data = std::mem::take(&mut self.utf8_pending);
+        // csi_pending 排在最前：它是上一块结尾被扣下来的半截 CSI，必须原样接回去
+        if !self.csi_pending.is_empty() {
+            let mut merged = std::mem::take(&mut self.csi_pending);
+            merged.extend_from_slice(&data);
+            data = merged;
+        }
         data.extend_from_slice(bytes);
         let hold = incomplete_utf8_tail(&data);
         let split = data.len() - hold;
         self.utf8_pending = data[split..].to_vec();
         data.truncate(split);
+        // 结尾若停在半截 CSI 里，把它扣下来留到下一块。
+        //
+        // 下面对 `ESC[2J` / `ESC[3J` 的识别是在**单次 feed 的字节**上做子串匹配的：一条 4 字节的
+        // `ESC[3J` 被 SSH 切在中间（比如包边界落在 `ESC[2` 和 `J` 之间），两包各看到半截、
+        // 谁都匹配不上，于是「重建解析器、真正清空回滚缓冲」那条路径整个不执行——用户 clear
+        // 完还能往上滚出旧内容，光标也停在原处而不是回到左上角。这个 bug 是被
+        // `feeding_the_same_bytes_split_anywhere_gives_the_same_result` 那条分包对拍测试逮住的。
+        //
+        // vt100 自己能处理被切断的 CSI，扣下来只是把它推迟一块喂进去，渲染结果不变。
+        const CSI_TAIL_CAP: usize = 16;
+        if let Some(at) = super::vt::incomplete_csi_tail(&data, CSI_TAIL_CAP) {
+            self.csi_pending = data[at..].to_vec();
+            data.truncate(at);
+        }
         let bytes = &data[..];
         if bytes.is_empty() {
             return Vec::new();

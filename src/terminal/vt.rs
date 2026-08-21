@@ -222,3 +222,81 @@ mod utf8_tail_tests {
         assert_eq!(incomplete_utf8_tail(&[0x41, 0xE4, 0xBD, 0xA0]), 0); // A + 完整"你"
     }
 }
+
+/// 缓冲区结尾若停在一条**未完成的 CSI**（`ESC [` 之后还没等到 0x40..0x7e 的终结字节）里，
+/// 返回它的起始下标；否则 None。只认长度在 `cap` 以内的——调用方只关心 `ESC[2J`/`ESC[3J`
+/// 这类 4 字节短序列，长参数 CSI 攒着没意义，交给 vt100 自己的状态机即可。
+///
+/// 结尾的裸 `ESC` 也算（还不知道它是哪类序列的开头）。OSC(`ESC ]`)/DCS(`ESC P` 等)**不归它管**：
+/// 那些由 `unterminated_string_tail` + `notice_tail` 单独处理，且那条路径只留副本、不扣字节。
+pub(super) fn incomplete_csi_tail(data: &[u8], cap: usize) -> Option<usize> {
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        match data.get(i + 1) {
+            // 结尾的裸 ESC：下一个字节还没到，无从判断类型
+            None => return (data.len() - start <= cap).then_some(start),
+            Some(b'[') => {
+                i += 2;
+                let mut terminated = false;
+                while i < data.len() {
+                    let b = data[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        terminated = true;
+                        break;
+                    }
+                }
+                if !terminated {
+                    return (data.len() - start <= cap).then_some(start);
+                }
+            }
+            // 其余（OSC/DCS/ESC+单字节）不归这里管
+            _ => i += 2,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod csi_tail_tests {
+    use super::incomplete_csi_tail;
+
+    const CAP: usize = 16;
+
+    #[test]
+    fn detects_a_csi_cut_in_the_middle() {
+        // `ESC [ 2` —— 还差终结字节 J
+        assert_eq!(incomplete_csi_tail(b"abc\x1b[2", CAP), Some(3));
+        assert_eq!(incomplete_csi_tail(b"\x1b[", CAP), Some(0));
+        assert_eq!(incomplete_csi_tail(b"\x1b", CAP), Some(0));
+    }
+
+    #[test]
+    fn complete_sequences_are_not_held() {
+        assert_eq!(incomplete_csi_tail(b"\x1b[2J", CAP), None);
+        assert_eq!(incomplete_csi_tail(b"\x1b[31mred", CAP), None);
+        assert_eq!(incomplete_csi_tail(b"plain text", CAP), None);
+        assert_eq!(incomplete_csi_tail(b"", CAP), None);
+    }
+
+    /// OSC / DCS 不归它管——那两类由 notice_tail 处理，且**不扣字节**。
+    /// 要是这里也把它们扣下来，两套机制会互相打架。
+    #[test]
+    fn osc_and_dcs_are_left_alone() {
+        assert_eq!(incomplete_csi_tail(b"\x1b]9;hi", CAP), None);
+        assert_eq!(incomplete_csi_tail(b"\x1bPtmux;", CAP), None);
+    }
+
+    /// 超过上限的长 CSI 不攒：识别 `ESC[2J`/`ESC[3J` 用不上，攒着只会无界增长。
+    #[test]
+    fn overlong_incomplete_csi_is_not_held() {
+        let mut v = b"\x1b[".to_vec();
+        v.extend(std::iter::repeat(b'1').take(CAP + 5));
+        assert_eq!(incomplete_csi_tail(&v, CAP), None);
+    }
+}
