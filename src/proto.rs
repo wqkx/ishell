@@ -591,3 +591,42 @@ pub struct FileEntry {
     /// 该符号链接最终指向一个目录（用于「跟随进入」判定与图标着色）。
     pub link_dir: bool,
 }
+
+#[cfg(test)]
+mod conflict_policy_tests {
+    use super::ConflictPolicy;
+
+    /// 这个枚举是**持久化**的（`store::save_conflict_policy` 写字符串、启动时读回），
+    /// 而且自这一轮起它不只管传输，还管同机粘贴/拖拽移动——写进去读不回来，用户的选择就
+    /// 静默变回「覆盖」，而「覆盖」恰恰是破坏性最大的那个。三行测试，守的是这个。
+    #[test]
+    fn as_str_and_from_str_round_trip() {
+        for p in [
+            ConflictPolicy::Overwrite,
+            ConflictPolicy::Skip,
+            ConflictPolicy::Rename,
+        ] {
+            assert_eq!(
+                ConflictPolicy::from_str(p.as_str()),
+                p,
+                "{p:?} 存成 {:?} 之后读不回来",
+                p.as_str()
+            );
+        }
+    }
+
+    /// 认不出来的值（配置文件被手改坏、或将来新增了本版本不认识的策略）必须落到
+    /// **默认值**上，而不是 panic 或落到某个随机分支。
+    #[test]
+    fn unknown_values_fall_back_to_the_default() {
+        for s in ["", "OVERWRITE", "skip ", "什么", "0"] {
+            assert_eq!(ConflictPolicy::from_str(s), ConflictPolicy::Overwrite, "输入 {s:?}");
+        }
+    }
+
+    /// `Default` 必须和 `from_str` 的兜底一致——两处各写各的，迟早会分叉。
+    #[test]
+    fn default_matches_the_from_str_fallback() {
+        assert_eq!(ConflictPolicy::default(), ConflictPolicy::from_str("说不出的东西"));
+    }
+}

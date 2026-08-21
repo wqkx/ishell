@@ -339,3 +339,45 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod keychain_slot_tests {
+    use super::{with_timeout, KEYCHAIN_MAX_INFLIGHT};
+
+    /// **回归门禁**：钥匙串调用 panic 之后，并发名额必须归还。
+    ///
+    /// `with_timeout` 原先把 `KEYCHAIN_INFLIGHT.fetch_sub` 写在工作线程末尾。keyring 是第三方
+    /// crate，其调用一旦 panic，线程展开、那句 fetch_sub 永远执行不到，名额只减不增。攒够
+    /// `KEYCHAIN_MAX_INFLIGHT` 次之后，`with_timeout` 会对**每一次**调用直接返回 None，于是
+    /// keychain_get_key/set_key 永久失效 → 主密钥被判为「不可用」→ decrypt_secret 全线走
+    /// fallback 返回密文原串 → 所有已保存的密码都登录失败，且没有任何提示指向真正的原因。
+    ///
+    /// 这里不去断言那个计数器的绝对值（它是全局的，别的测试也可能碰），而是直接验**用户
+    /// 能感知的那件事**：连续 panic 若干次之后，下一次正常调用还能不能拿到结果。
+    #[test]
+    fn a_panicking_call_still_returns_its_slot() {
+        // panic 的默认 hook 会往 stderr 打一堆栈，这里是**故意**制造 panic，静音掉免得
+        // 测试输出看起来像是出了事。
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        for _ in 0..(KEYCHAIN_MAX_INFLIGHT + 2) {
+            let _ = with_timeout(|| -> u8 { panic!("模拟 keyring 内部 panic") });
+        }
+
+        std::panic::set_hook(prev_hook);
+
+        assert_eq!(
+            with_timeout(|| 42_u8),
+            Some(42),
+            "连续 panic 之后名额没还回来——钥匙串会被永久判定为不可用，\
+             已保存的密码将全部解不开"
+        );
+    }
+
+    /// 正常路径：超时封装本身不改变返回值。
+    #[test]
+    fn normal_calls_pass_the_value_through() {
+        assert_eq!(with_timeout(|| "ok".to_string()), Some("ok".to_string()));
+    }
+}
