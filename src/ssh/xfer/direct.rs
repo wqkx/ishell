@@ -316,26 +316,48 @@ pub(crate) async fn untrust_temp_key(handle: &Handle<ClientHandler>, marker: &st
     // 临时文件名带随机后缀：即使 flock 缺失退化为无锁，并发 untrust 也不会互相踩同一个
     // 临时文件（叠加下面的 flock 是双保险）。
     let tmp_path = format!("{auth_keys}.ishell_tmp.{}", super::rand_hex(6));
+    let cmd = untrust_cmd(marker, &auth_keys, &tmp_path, &lock);
+    let _ = exec_status(handle, &cmd).await;
+    Ok(())
+}
+
+/// 拼出 `untrust_temp_key` 那条 shell 命令。单独抽出来是为了能直接测——它有两条容易
+/// 回退的性质（grep 退出码 1 也要换入、换入前必须先 600），藏在一次 SSH 往返后面没有
+/// 任何东西拦得住改坏。
+fn untrust_cmd(marker: &str, auth_keys: &str, tmp_path: &str, lock: &str) -> String {
     // 与 trust_temp_key 用同一把 flock 串行化，避免并发直连拷贝对同一台目标主机的
     // authorized_keys 做读改写时互相覆盖/丢标记（见 trust_temp_key 注释）。
-    // 注意：不能写成 `grep ... && mv ... || true`——`grep -v` 在“每一行都匹配 marker”
+    //
+    // 注意一：不能写成 `grep ... && mv ... || true`——`grep -v` 在“每一行都匹配 marker”
     // （比如这个临时公钥恰好是 authorized_keys 里唯一一行，常见于纯密码认证账户第一次
     // 建立信任的场景）时不会有任何输出，退出码是 1（非 0），`&&` 直接短路、`mv` 被跳过，
     // 公钥这一行就永远删不掉——即便走的是正常撤销路径也会遗留。grep 退出码 0/1 都表示
     // 命令本身成功执行（1 只是“没有匹配到应保留的行”，输出为空文件也是合法结果），
     // 只有 2+ 才是真正的执行错误（比如文件不可读），此时不应该用这个空/错误的临时文件
     // 覆盖原文件。
-    let cmd = format!(
+    //
+    // 注意二（**换入前必须 `chmod 600 {tmp}`**）：`> {tmp}` 由 shell 创建，权限是
+    // `0666 & ~umask`；`mv` 在同目录内就是 `rename(2)`，**保留的是 tmp 的 mode**。少了这行，
+    // 每撤销一次临时信任就把用户的 `~/.ssh/authorized_keys` 从 0600 放宽一次：umask 022 下
+    // 变 0644（本该只有自己能读的文件变成全局可读），umask 002 下变 0664——**group 可写**，
+    // 于是 sshd 的 `StrictModes yes`（默认）会拒绝该账号的**全部**公钥认证，日志里是
+    // `Authentication refused: bad ownership or modes for file .../authorized_keys`，
+    // 等于把人锁在门外。对称地，trust_temp_key 追加之前也是先 `chmod 600` 的。
+    //
+    // 权限设在 **tmp 上、rename 之前**而不是 `mv` 之后再 chmod：rename 是原子的，这样
+    // authorized_keys 一秒都不会以过宽的权限存在（同 `store::crypto::write_key_file` 的思路）。
+    // `chmod` 失败就不换入、直接清理 tmp——宁可留着那行临时公钥等下一次撤销/24h 兜底，
+    // 也不能把一个权限不对的文件 rename 成 authorized_keys。
+    format!(
         "( flock 9 2>/dev/null || true; \
          grep -vF {marker} {ak} > {tmp} 2>/dev/null; code=$?; \
-         if [ \"$code\" -le 1 ]; then mv {tmp} {ak}; else rm -f {tmp}; fi ) 9>{lock}",
+         if [ \"$code\" -le 1 ]; then chmod 600 {tmp} && mv {tmp} {ak} || rm -f {tmp}; \
+         else rm -f {tmp}; fi ) 9>{lock}",
         marker = sh_quote(marker),
-        ak = sh_quote(&auth_keys),
-        tmp = sh_quote(&tmp_path),
-        lock = sh_quote(&lock),
-    );
-    let _ = exec_status(handle, &cmd).await;
-    Ok(())
+        ak = sh_quote(auth_keys),
+        tmp = sh_quote(tmp_path),
+        lock = sh_quote(lock),
+    )
 }
 
 /// 跨会话拷贝-直连优先模式（源会话侧）：把一次性私钥投放到本主机、直接 scp/rsync 到目标
@@ -510,5 +532,81 @@ pub(crate) async fn direct_relay_copy(
             ok: false,
             message: format!("直连执行失败：{e}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod untrust_cmd_tests {
+    use super::untrust_cmd;
+
+    fn cmd() -> String {
+        untrust_cmd(
+            "ishell-relay-abc123",
+            "/home/u/.ssh/authorized_keys",
+            "/home/u/.ssh/authorized_keys.ishell_tmp.deadbeef",
+            "/home/u/.ssh/.ishell-relay.lock",
+        )
+    }
+
+    /// **数据丢失/锁门守门人**：换入前必须把临时文件收紧到 600，且必须发生在 `mv` **之前**。
+    ///
+    /// `> tmp` 由 shell 按 umask 建文件，`mv` 同目录内就是 `rename(2)`、保留 tmp 的 mode。
+    /// 少了这一步，每撤销一次临时信任就把 authorized_keys 放宽一次：umask 022 → 0644
+    /// （本该私有的文件变全局可读），umask 002 → 0664（group 可写）→ sshd StrictModes
+    /// 拒绝该账号的全部公钥认证。别把这条断言删了。
+    #[test]
+    fn chmod_600_happens_before_the_rename() {
+        let c = cmd();
+        let chmod = c.find("chmod 600").expect("换入前必须 chmod 600 临时文件");
+        let mv = c.find("mv ").expect("应当用 mv 原子换入");
+        assert!(
+            chmod < mv,
+            "chmod 必须在 mv 之前（rename 是原子的，这样 authorized_keys 一秒都不会以过宽权限存在）：\n{c}"
+        );
+        // chmod 的对象必须是临时文件，不是 authorized_keys 本身
+        assert!(
+            c.contains("chmod 600 '/home/u/.ssh/authorized_keys.ishell_tmp.deadbeef'"),
+            "chmod 的对象应当是临时文件：\n{c}"
+        );
+    }
+
+    /// grep 退出码 1（“没有任何一行需要保留”，即临时公钥是文件里唯一一行）也必须换入，
+    /// 否则那行公钥永远删不掉。只有 2+ 才是真错误。
+    #[test]
+    fn grep_exit_one_still_swaps_in() {
+        let c = cmd();
+        assert!(
+            c.contains(r#"[ "$code" -le 1 ]"#),
+            "grep 退出码 0/1 都应视为执行成功并换入：\n{c}"
+        );
+        assert!(
+            !c.contains("&& mv") || c.contains("chmod 600"),
+            "不得退回 `grep && mv` 的短路写法：\n{c}"
+        );
+    }
+
+    /// 任何一步失败都要清掉临时文件，不能在用户的 ~/.ssh 里留垃圾。
+    #[test]
+    fn tmp_is_cleaned_up_on_every_failure_path() {
+        let c = cmd();
+        // 换入链失败（chmod 或 mv 任一失败）→ rm；grep 真错误（2+）→ rm
+        assert_eq!(
+            c.matches("rm -f").count(),
+            2,
+            "换入失败与 grep 出错两条路径都必须清理临时文件：\n{c}"
+        );
+    }
+
+    /// marker / 路径一律经 sh_quote，含空格或引号也不会破坏命令结构。
+    #[test]
+    fn all_interpolated_values_are_quoted() {
+        let c = untrust_cmd(
+            "it's a marker",
+            "/home/a b/.ssh/authorized_keys",
+            "/home/a b/.ssh/tmp",
+            "/home/a b/.ssh/lock",
+        );
+        assert!(c.contains(r#"'it'\''s a marker'"#), "marker 未正确转义：\n{c}");
+        assert!(c.contains("'/home/a b/.ssh/authorized_keys'"), "路径未加引号：\n{c}");
     }
 }
