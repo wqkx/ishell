@@ -95,3 +95,66 @@ pub(super) async fn create_remote_dir_all(
         let _ = sftp.create_dir(cur.clone()).await;
     }
 }
+
+#[cfg(test)]
+mod path_tests {
+    use super::{join_remote, remote_parent};
+
+    /// `join_remote` 是全 App 拼远端路径的唯一入口（列目录、上传、下载、冲突探测、
+    /// 事务写的 .part/.bak 全走它）。它没测过——这里补上，重点是**不能拼出双斜杠**：
+    /// `//a` 和 `/a` 在多数服务器上等价、但不是所有；而 `remote_parent` 又要按 `/` 反解，
+    /// 拼出来的形状不规范会一路歪下去。
+    #[test]
+    fn join_remote_never_doubles_the_separator() {
+        assert_eq!(join_remote("/home/u", "a.txt"), "/home/u/a.txt");
+        // 根目录：dir 本身就以 / 结尾，不能再加一个
+        assert_eq!(join_remote("/", "a.txt"), "/a.txt");
+        // 尾随斜杠（面包屑/路径栏很容易带出来）
+        assert_eq!(join_remote("/home/u/", "a.txt"), "/home/u/a.txt");
+        // 相对路径（会话刚连上、家目录还没解析出来时 cwd 可能是 "."）
+        assert_eq!(join_remote(".", "a.txt"), "./a.txt");
+    }
+
+    /// 名字里的空格/引号/中文原样保留——转义是 `sh_quote` 的职责，不是这里的。
+    /// 这条钉住"别顺手在这里做转义"，两边都做会转义两次。
+    #[test]
+    fn join_remote_does_not_escape_anything() {
+        assert_eq!(join_remote("/d", "a b.txt"), "/d/a b.txt");
+        assert_eq!(join_remote("/d", "it's.txt"), "/d/it's.txt");
+        assert_eq!(join_remote("/d", "报告 (1).pdf"), "/d/报告 (1).pdf");
+    }
+
+    /// `remote_parent` 的返回值会被当作「要刷新的目录」发回 UI，也会被当作
+    /// mkdir/cp 的目标目录用。根目录附近最容易出错：`/a` 的父级是 `/`（不是空串，
+    /// 空串会让后续 join_remote 拼出 `/a` 这种把根丢掉的路径）。
+    #[test]
+    fn remote_parent_bottoms_out_at_root() {
+        assert_eq!(remote_parent("/home/u/a.txt"), "/home/u");
+        assert_eq!(remote_parent("/a"), "/");
+        assert_eq!(remote_parent("/"), "/");
+        // 无斜杠（相对名）：也退到根，绝不返回空串
+        assert_eq!(remote_parent("a.txt"), "/");
+        assert_eq!(remote_parent(""), "/");
+    }
+
+    /// 目录路径常带尾随斜杠（树节点、面包屑），父级要按「去掉尾斜杠后」算，
+    /// 否则 `/home/u/sub/` 的父级会被算成它自己。
+    #[test]
+    fn remote_parent_ignores_trailing_slashes() {
+        assert_eq!(remote_parent("/home/u/sub/"), "/home/u");
+        assert_eq!(remote_parent("/home/u/sub///"), "/home/u");
+        assert_eq!(remote_parent("/a/"), "/");
+    }
+
+    /// join 之后再取 parent，必须回到原来的目录——这两个函数在传输路径上是成对使用的
+    /// （拼出目标路径 → 失败时取父目录刷新），对不上就会刷新错目录。
+    #[test]
+    fn join_then_parent_round_trips() {
+        for dir in ["/", "/home", "/home/u", "/home/u/深 目录"] {
+            let joined = join_remote(dir, "x.txt");
+            let back = remote_parent(&joined);
+            let expect = if dir == "/" { "/" } else { dir };
+            assert_eq!(back, expect, "join_remote({dir:?}, x.txt) = {joined:?} 的父级算错了");
+        }
+    }
+}
