@@ -11,6 +11,27 @@ use crate::theme::Palette;
 /// 五行是「一眼扫得完」和「不糊住半个文件区」之间的折中。
 const MAX_FAV_ROWS: usize = 5;
 
+/// 收藏夹弹窗里那个可滚动的路径列表。
+///
+/// `min_scrolled_height` 不是可有可无的装饰，它是「收藏夹偶尔只剩两行高」的解药：
+/// `ScrollArea` 的高度取的是 `min(可用高度, max_height)`（egui 0.34
+/// `scroll_area.rs`：`available_rect_before_wrap().size().at_most(max_size)`），
+/// 而弹窗所在 `Area` 给出的可用高度来自它**上一帧量到的尺寸**（`area.rs`:
+/// `let max_rect = self.state.rect()`）。两者一咬合就是个**只能变小的棘轮**：
+/// 头一回只有一两条收藏时弹窗被量成很矮，之后收藏变多，可用高度仍是那个矮值，
+/// 列表再也长不回来，最终卡在 `min_scrolled_size` 的默认下限 64px——按真实行高 28px
+/// 算正好「两行左右」，与用户描述的现象完全吻合。而 `Area` 状态是按 id 持久化的，
+/// 所以一旦卡住就一直卡着，重开弹窗也不恢复。
+///
+/// 把下限顶到 `max_h`，高度恒等于 `max_h`，棘轮不成立；顺带也让 `Popup` 的自动翻转
+/// 重新生效——此前列表会自己缩到「放得下」，弹窗因此从不觉得下方空间不够，
+/// 于是永远不会翻到按钮上方去。
+fn fav_scroll_area(max_h: f32) -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .max_height(max_h)
+        .min_scrolled_height(max_h)
+}
+
 pub(super) fn toolbar(
     ui: &mut egui::Ui,
     state: &mut FilePanelState,
@@ -158,8 +179,7 @@ pub(super) fn toolbar(
                                 false,
                             );
                         } else {
-                            egui::ScrollArea::vertical()
-                                .max_height(fav_max_h)
+                            fav_scroll_area(fav_max_h)
                                 .show(ui, |ui| {
                                     for p in state.favorites.iter() {
                                         ui.horizontal(|ui| {
@@ -190,6 +210,10 @@ pub(super) fn toolbar(
                                                         ),
                                                         |ui| {
                                                             let disp = trailing_path(p, 40);
+                                                            // `show_tooltip_when_elided(false)`：
+                                                            // 否则 egui 自带的「省略即提示完整文字」
+                                                            // 会和下面这条 tooltip 叠成两个（同
+                                                            // table_rows.rs 里文件名那处的老毛病）。
                                                             if ui
                                                                 .add(
                                                                     egui::Label::new(
@@ -202,6 +226,7 @@ pub(super) fn toolbar(
                                                                         .color(Palette::TEXT),
                                                                     )
                                                                     .selectable(false)
+                                                                    .show_tooltip_when_elided(false)
                                                                     .sense(Sense::click()),
                                                                 )
                                                                 .on_hover_text(p.as_str())
@@ -630,6 +655,53 @@ mod fav_popup_tests {
     /// 这里在无窗口的 egui 里按弹窗里逐字一致的标记摆一行出来，量它的真实高度，
     /// 确认估算没有偏小。（排查用户报的「只显示 2 行」时写的：结论是这里没问题，
     /// 真因是收藏列表本身被别的标签页的陈旧快照覆盖了，见 store::favorites 的测试。）
+    /// 收藏夹弹窗「偶尔只剩两行左右的高度」的回归门禁。
+    ///
+    /// 复现的是 `fav_scroll_area` 注释里那个棘轮：`ScrollArea` 的高度是
+    /// `min(可用高度, max_height)`，而 `Area` 给的可用高度来自它上一帧量到的尺寸。
+    /// 先用「1 行」渲染一帧把 `Area` 尺寸压小，再用「5 行」渲染——没有
+    /// `min_scrolled_height` 时第二帧长不回来，会停在 egui 的默认下限 64px
+    /// （按 28px 行高算就是两行多一点，正是用户看到的样子）。
+    #[test]
+    fn favorites_popup_height_does_not_ratchet_down() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let area_id = egui::Id::new("fav_scroll_ratchet_probe");
+        let row_h = 28.0f32;
+        let mut measured = 0.0f32;
+        // 三帧：字体/样式生效 → 用 1 行压小 Area → 换成 5 行看能不能长回来
+        for rows in [1usize, 1, 5] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::Area::new(area_id)
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .show(ctx, |ui| {
+                        let max_h = row_h * rows as f32;
+                        let out = fav_scroll_area(max_h).show(ui, |ui| {
+                            for i in 0..rows {
+                                ui.label(format!("/some/favorite/path/{i}"));
+                            }
+                        });
+                        measured = out.inner_rect.height();
+                    });
+            });
+        }
+        let want = row_h * 5.0;
+        assert!(
+            measured >= want - 1.0,
+            "收藏夹列表被上一帧的矮尺寸卡住了：只长到 {measured}px，要 {want}px。\
+             去掉 min_scrolled_height 就会退回 egui 的 64px 下限（约两行），\
+             用户会看到「收藏夹只展开两行左右」。"
+        );
+    }
+
     #[test]
     fn row_height_estimate_is_not_smaller_than_reality() {
         let ctx = egui::Context::default();

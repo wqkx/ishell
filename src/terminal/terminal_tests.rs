@@ -981,3 +981,147 @@ fn byte_by_byte_feeding_still_renders_the_same_text() {
         assert_eq!(t.screen_text(), want, "语料 #{ci} 逐字节喂出来的屏幕不一致");
     }
 }
+
+/// 粘贴必须按远端的 bracketed paste 状态套括号。
+///
+/// 不套的后果是**静默且严重**的：多行内容会被 shell / TUI 当成一行行**敲进去**——每个换行
+/// 都是一次回车。粘一段脚本进去等于逐行执行了它；粘一段多行提示词给 Claude Code 之类的
+/// TUI，会被拆成好几次提交。开了 `CSI ?2004h` 的程序（bash 5、zsh、ipython、几乎所有
+/// Ink/TUI 应用）正是靠这对括号把「粘贴」和「键入」区分开的。
+#[test]
+fn paste_is_bracketed_only_when_the_far_side_asked_for_it() {
+    let mut t = Terminal::new();
+    // 远端没开：原样发出，不加任何东西
+    assert_eq!(t.wrap_paste(b"a\nb"), b"a\nb".to_vec());
+
+    // 远端开启 bracketed paste
+    let _ = t.feed(b"\x1b[?2004h");
+    assert_eq!(
+        t.wrap_paste(b"a\nb"),
+        b"\x1b[200~a\nb\x1b[201~".to_vec(),
+        "开了 bracketed paste 却没套括号：多行粘贴会被逐行当成回车敲进去"
+    );
+
+    // 关掉之后又回到原样
+    let _ = t.feed(b"\x1b[?2004l");
+    assert_eq!(t.wrap_paste(b"a\nb"), b"a\nb".to_vec());
+}
+
+/// 粘贴内容里自带的结束标记必须剔除。
+///
+/// 留着的话，被粘贴的文本可以**自己把括号关掉**，让它后半段重新变成「键入」——这是
+/// bracketed paste 众所周知的注入面：一段看起来无害的文本里藏一个 `ESC[201~`，
+/// 后面跟的命令就会被当成用户亲手敲的。
+#[test]
+fn a_paste_cannot_close_its_own_bracket() {
+    let mut t = Terminal::new();
+    let _ = t.feed(b"\x1b[?2004h");
+    let out = t.wrap_paste(b"safe\x1b[201~rm -rf /\n");
+    assert_eq!(
+        out,
+        b"\x1b[200~saferm -rf /\n\x1b[201~".to_vec(),
+        "粘贴内容里的结束标记没有被剔除，它能自己关掉括号"
+    );
+    // 整个输出里结束标记只能出现一次，且必须在最末尾
+    let end = b"\x1b[201~";
+    let hits = out.windows(end.len()).filter(|w| *w == end).count();
+    assert_eq!(hits, 1, "结束标记出现了 {hits} 次");
+    assert!(out.ends_with(end));
+}
+
+/// 在无窗口 egui 里把一批输入事件喂给终端，返回它决定发往远端的字节。
+fn feed_events(t: &mut Terminal, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            out = t.collect_input(ui);
+        });
+    });
+    out
+}
+
+fn key_v(pressed: bool) -> egui::Event {
+    egui::Event::Key {
+        key: egui::Key::V,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+/// 「Ctrl+V 在 Claude Code 里贴图毫无反应」的回归门禁。
+///
+/// 机制见 `input.rs`：egui-winit 在**按下**时就把 Ctrl+V 认成粘贴命令、只读剪贴板里的
+/// **文本**，读不到就 `return`——连 `Event::Key` 都不再往下发，终端彻底收不到这一下按键。
+/// 我们靠「有 V 的松开、却没有 V 的按下」把它认出来。这里锁住三条：
+///
+/// 1. 正常的文本粘贴**不能**再补一个 0x16（否则每次粘贴都会多出一个控制字符）；
+/// 2. 被吞掉的那一下**必须**补上（剪贴板里没有图时就是 0x16 本身）；
+/// 3. 裸 V（没按 Ctrl）**绝不能**被误判成粘贴。
+///
+/// 特别注意第 3 条和判据的选择：**不能**改用松开时的 `modifiers.ctrl` 来判——先松 Ctrl 还是
+/// 先松 V 取决于用户手指，先松 Ctrl 时那个判据直接失效，表现就是「时灵时不灵」。
+#[test]
+fn a_ctrl_v_swallowed_by_egui_is_recovered_on_release() {
+    let ctx = egui::Context::default();
+
+    // 1) 剪贴板有文本：egui 在按下时给出 Paste（没有 Key 按下），随后一个 V 松开。
+    let mut t = Terminal::new();
+    let out = feed_events(
+        &mut t,
+        &ctx,
+        vec![egui::Event::Paste("hello".into()), key_v(false)],
+    );
+    assert_eq!(out, b"hello".to_vec(), "文本粘贴之后不该再补任何字节");
+
+    // 2) 剪贴板里没有文本（图片 / 空）：egui 什么都不发，只剩一个 V 松开。
+    //    无头环境里拿不到剪贴板图片，因此走「空剪贴板」那条：补发 0x16。
+    let mut t = Terminal::new();
+    let out = feed_events(&mut t, &ctx, vec![key_v(false)]);
+    assert_eq!(
+        out,
+        vec![0x16],
+        "被 egui 吞掉的 Ctrl+V 没有补回来——远端程序（Claude Code 等）收不到这一下按键"
+    );
+
+    // 3) 裸 V：按下和松开都到得了，是普通输入，绝不能补 0x16。
+    let mut t = Terminal::new();
+    let out = feed_events(
+        &mut t,
+        &ctx,
+        vec![key_v(true), egui::Event::Text("v".into()), key_v(false)],
+    );
+    assert_eq!(out, b"v".to_vec(), "普通的 V 被误判成了被吞掉的 Ctrl+V");
+}
+
+/// 松开顺序不能影响判定：先松 Ctrl 再松 V 时，松开事件里的 `modifiers.ctrl` 已经是 false，
+/// 按修饰键判的实现会在这里漏掉。
+#[test]
+fn recovery_does_not_depend_on_which_key_is_released_first() {
+    let ctx = egui::Context::default();
+    let mut t = Terminal::new();
+    // 用户先松开 Ctrl（修饰键归零），再松开 V
+    let out = feed_events(
+        &mut t,
+        &ctx,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::default(), // ctrl 已经松掉了
+            },
+        ],
+    );
+    assert_eq!(out, vec![0x16], "先松 Ctrl 再松 V 时漏掉了这一下按键");
+}

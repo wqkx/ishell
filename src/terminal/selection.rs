@@ -183,4 +183,56 @@ impl Terminal {
         }
         self.clipboard.as_mut()?.get_text().ok()
     }
+
+    /// 剪贴板里若是图片，编码成 PNG 存进 `paste_image`，等 App 取走。
+    ///
+    /// 编码放在这里（而不是交给 App 拿原始 RGBA）是因为 arboard 的 `ImageData` 借的是
+    /// 剪贴板的生命周期，跨帧传出去很别扭；PNG 字节自包含，还顺手压掉了一大截体积
+    /// （一张 4K 截图的裸 RGBA 有 30MB+）。
+    pub(super) fn grab_clipboard_image(&mut self) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        let Some(img) = self.clipboard.as_mut().and_then(|c| c.get_image().ok()) else {
+            return;
+        };
+        let (w, h) = (img.width as u32, img.height as u32);
+        let Some(buf) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else {
+            log::warn!("剪贴板图片尺寸与字节数不匹配（{w}x{h}），忽略");
+            return;
+        };
+        let mut png = std::io::Cursor::new(Vec::new());
+        match buf.write_to(&mut png, image::ImageFormat::Png) {
+            Ok(()) => self.paste_image = Some(png.into_inner()),
+            Err(e) => log::warn!("剪贴板图片编码 PNG 失败：{e}"),
+        }
+    }
+
+    /// 给粘贴内容套上 bracketed paste 括号（远端开了 `CSI ?2004h` 时）。
+    ///
+    /// 不套的话，多行粘贴会被 shell / TUI 当成一行行**敲进去**：每个换行都是一次回车，
+    /// 粘一段脚本进去就等于逐行执行了它，粘一段多行提示词给 Claude Code 则会被拆成好几次
+    /// 提交。开了 bracketed paste 的程序（bash 5、zsh、ipython、几乎所有 Ink/TUI 应用）
+    /// 靠这对括号把「粘贴」和「键入」区分开。
+    ///
+    /// 内容里出现的结束标记必须剔除，否则粘贴内容可以自己「关掉」括号、让后半段重新
+    /// 变成键入——这是 bracketed paste 众所周知的注入面。
+    pub(super) fn wrap_paste(&self, text: &[u8]) -> Vec<u8> {
+        if !self.parser.screen().bracketed_paste() {
+            return text.to_vec();
+        }
+        const END: &[u8] = b"\x1b[201~";
+        let mut body = text.to_vec();
+        while let Some(i) = body
+            .windows(END.len())
+            .position(|w| w == END)
+        {
+            body.drain(i..i + END.len());
+        }
+        let mut out = Vec::with_capacity(body.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(&body);
+        out.extend_from_slice(END);
+        out
+    }
 }

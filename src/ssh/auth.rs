@@ -549,7 +549,9 @@ pub(super) async fn connect(
         sink: sink.clone(),
         decision_rx: decision_rx.clone(),
         agent_forward: cfg.forward_agent,
-        mcp_forward: crate::store::load_mcp_consent(),
+        // cfg!(unix)：与 ssh/mod.rs 里那个反向转发任务保持同一条件——Windows 上没有
+        // 监听方，转发出去的 socket 后面空无一人。
+        mcp_forward: cfg!(unix) && crate::store::load_mcp_consent(),
     };
 
     let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {

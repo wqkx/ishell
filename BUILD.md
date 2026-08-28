@@ -97,6 +97,32 @@ MCP 代理 `ishell-mcp`（见 README 的「AI / MCP integration」）要部署�
 > 代理与 GUI 的线协议是配套编译的（`MCP_PROTOCOL_VERSION`），必须同版本。版本不符时代理会
 > 在连接时明确报错、提示重新部署，不会静默出错——升级 iShell 时记得一并重新部署代理。
 
+### 把代理内嵌进 GUI（发版时务必这么编）
+
+iShell 可以把编好的 `ishell-mcp` 直接**嵌进自己的二进制**，用户在服务器的终端里右键
+「安装 AI 控制代理到这台服务器」就能一键部署，不必再手工下载 + scp + 跑安装脚本；版本
+一致也由构造保证。
+
+因为 `ishell` 和 `ishell-mcp` 是**同一个 crate 的两个 `[[bin]]`**，构建脚本无法在编译
+自己的过程中拿到兄弟二进制的产物，所以顺序必须由外部保证——**先编代理，再编 GUI**：
+
+```bash
+# 1) 各架构的代理（arm64 走上面的 zigbuild）
+cargo build --release --bin ishell-mcp
+cargo zigbuild --release --bin ishell-mcp --target aarch64-unknown-linux-gnu
+
+# 2) 编 GUI，把产物路径经环境变量交给 build.rs
+ISHELL_EMBED_MCP_X86_64=$PWD/target/release/ishell-mcp \
+ISHELL_EMBED_MCP_AARCH64=$PWD/target/aarch64-unknown-linux-gnu/release/ishell-mcp \
+cargo build --release --bin ishell
+```
+
+- 变量**不设就不嵌**（不报错），日常 `cargo check` / `cargo test` 因此不必先编代理，
+  只是那台构建出来的 iShell 里不显示「安装 AI 控制代理」这个菜单项。
+- 指到不存在的文件会**直接构建失败**并说清原因，不会静默漏嵌。
+- 每份代理约 2.2MB，两个架构给 GUI 增重约 4.5MB。
+- `cargo test mcp_embed` 会校验嵌进去的确实是对应架构的 64 位 ELF（防止变量指错文件）。
+
 ## 首次运行的系统拦截
 
 - **macOS**（未签名）：`xattr -dr com.apple.quarantine ./ishell`，或“系统设置→隐私与安全性→仍要打开”。

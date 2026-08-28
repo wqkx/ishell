@@ -171,12 +171,12 @@ pub fn view_context_menu(resp: &egui::Response) {
                     )
                     .on_hover_text(crate::i18n::tr(
                         "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
-                         · 写入操作需当面确认\n\
+                         · 只监听本机 Unix socket（0600），不开任何网络端口\n\
                          · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
                          · 多机共用一台 AI 服务器时：配对标识会在会话空闲时自动注入，请求只回本电脑",
                         "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
                          read/write files.\n\
-                         · Writes need on-screen confirmation\n\
+                         · Local Unix socket only (mode 0600) — no network port is opened\n\
                          · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
                          · Sharing one AI server: the pairing token is auto-injected once the session \
                          goes idle, so requests only reach THIS computer",
@@ -185,6 +185,32 @@ pub fn view_context_menu(resp: &egui::Response) {
                 {
                     crate::store::save_mcp_consent(mcp_on);
                     ui.close();
+                }
+
+                // 逐次确认开关：默认不确认（见 store::load_mcp_auto_approve 的说明）。
+                // 只在总开关打开时才有意义，故收在里面显示。
+                if mcp_on {
+                    let mut auto = crate::store::load_mcp_auto_approve();
+                    if ui
+                        .checkbox(
+                            &mut auto,
+                            crate::i18n::tr(
+                                "　AI 操作无需逐次确认",
+                                "  Don't ask before each AI action",
+                            ),
+                        )
+                        .on_hover_text(crate::i18n::tr(
+                            "关掉它，AI 每次「用你自己打开的会话」或「新开一个会话」都会先弹框\n\
+                             等你当面点允许。默认开着（不弹框）——真正的授权边界是上面那个总开关。",
+                            "Turn this off to get an on-screen confirmation every time the AI wants \n\
+                             to use a session you opened yourself, or to open a new one. On by \n\
+                             default (no prompts) — the switch above is the real permission boundary.",
+                        ))
+                        .clicked()
+                    {
+                        crate::store::save_mcp_auto_approve(auto);
+                        ui.close();
+                    }
                 }
 
                 // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的

@@ -223,8 +223,17 @@ pub(super) fn render_table_rows(
                                 ui.spacing_mut().item_spacing.x = 5.0;
                                 ui.label(RichText::new(file_icon(e)).color(icon_col));
                                 // 名称：单行显示，超出由列 clip(true) 裁剪；悬停给出完整名称——应对超长 / 特殊字符 / emoji
-                                let name_resp =
-                                    ui.label(RichText::new(&e.name).color(Palette::TEXT));
+                                //
+                                // `show_tooltip_when_elided(false)` 是必须的：egui 的 `Label` 默认
+                                // 在文字被省略（galley.elided）时**自己**再挂一个「完整文字」tooltip
+                                // （见 egui 0.34 label.rs 的 `show_tooltip_when_elided`，默认 true）。
+                                // 下面还会挂一个我们自己的 tooltip（带软链目标/断链说明），两个 tooltip
+                                // 会被 egui 上下叠着一起显示——用户看到的正是「完整文件名重复显示两遍」。
+                                // 关掉自带的那个，只留信息更全的这一个。
+                                let name_resp = ui.add(
+                                    egui::Label::new(RichText::new(&e.name).color(Palette::TEXT))
+                                        .show_tooltip_when_elided(false),
+                                );
                                 // 软链：紧跟暗色「→ 目标」，让指向一目了然；断链显示红色「断链」
                                 if e.is_link {
                                     match &e.link_target {

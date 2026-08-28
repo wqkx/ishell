@@ -84,6 +84,16 @@ pub struct Terminal {
     sel_cursor: Option<(usize, u16)>,
     /// 系统剪贴板（懒初始化，用于右键粘贴）
     clipboard: Option<arboard::Clipboard>,
+    /// 剪贴板里是**图片**时的粘贴请求：PNG 字节。终端自己没法把图片喂给远端程序，
+    /// 交给 App 落地成文件（远端会话则上传上去），再把路径打进终端——AI CLI 认路径。
+    paste_image: Option<Vec<u8>>,
+    /// 本轮 Ctrl+V 有没有产生过 `Event::Paste`（等价于「剪贴板里有文本」）。见 `input.rs`
+    /// 里那段关于 egui-winit 在按下时就吞掉 Ctrl+V 的说明。
+    saw_text_paste: bool,
+    /// 上一次 V **按下**的事件有没有到达过我们。裸 V 会到；被 egui-winit 当成粘贴命令吞掉的
+    /// Ctrl+V / Ctrl+Shift+V 不会到。这正是「这一下 V 是不是粘贴」的判据，且不依赖修饰键
+    /// 状态——松开 Ctrl 和松开 V 的先后是任意的，按修饰键判会时灵时不灵。
+    saw_v_press: bool,
     /// 终端配色索引（见 TERM_THEMES）；全局共享，切一个即全部同步
     theme: u8,
     /// 当前输入行的影子缓冲（用于前缀历史搜索）
@@ -151,6 +161,8 @@ pub struct Terminal {
     notices: Vec<TermNotice>,
     /// 右键菜单「配置 AI 完成通知」请求：App 取走后往本终端打一条安装命令（见 layout_body）。
     notify_setup_request: bool,
+    /// 右键菜单「把 AI 控制代理装到这台服务器」请求：App 取走后下发 `DeployMcpAgent`。
+    deploy_agent_request: bool,
     /// 本标签里是否**跑过** AI CLI（claude/codex 等）。裸 BEL 只有在这个标志为真时才当通知，
     /// 否则普通 shell 的补全失败/readline 报错会让每个标签都在弹提醒。见 `is_ai_cli_command`。
     ///
@@ -216,6 +228,9 @@ impl Terminal {
             hist: None,
             find: None,
             search_hl: None,
+            paste_image: None,
+            saw_text_paste: false,
+            saw_v_press: false,
             held_btn: None,
             utf8_pending: Vec::new(),
             notice_tail: Vec::new(),
@@ -236,6 +251,7 @@ impl Terminal {
             last_input_at: None,
             notices: Vec::new(),
             notify_setup_request: false,
+            deploy_agent_request: false,
             ai_cli_seen: false,
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
@@ -256,6 +272,17 @@ impl Terminal {
     /// 取走「在文件列表中显示当前目录」请求（右键菜单触发）。
     pub fn take_reveal_cwd(&mut self) -> Option<String> {
         self.reveal_cwd.take()
+    }
+    /// 取走「粘贴了一张图片」请求（PNG 字节）。由 App 落地/上传后把路径打进终端。
+    pub fn take_paste_image(&mut self) -> Option<Vec<u8>> {
+        self.paste_image.take()
+    }
+    /// 把「我们替用户键入的一段文本」补进输入行影子缓冲。
+    /// 影子缓冲只服务于本地前缀历史搜索，替用户键入的内容也得记上，否则接着按 ↑ 会
+    /// 拿一个和屏幕上不一致的前缀去搜历史。
+    pub fn push_input_line(&mut self, text: &str) {
+        self.input_line.push_str(text);
+        self.hist = None;
     }
     /// 取走「无 cwd 时请求注入」标志。
     pub fn take_inject_request(&mut self) -> bool {
@@ -338,6 +365,9 @@ impl Terminal {
     }
 
     /// 取走「配置 AI 完成通知」请求（右键菜单触发）。
+    pub fn take_deploy_agent_request(&mut self) -> bool {
+        std::mem::take(&mut self.deploy_agent_request)
+    }
     pub fn take_notify_setup_request(&mut self) -> bool {
         std::mem::take(&mut self.notify_setup_request)
     }
@@ -894,6 +924,30 @@ impl Terminal {
                 self.notify_setup_request = true;
                 ui.close();
             }
+            // 只有本次构建真的内嵌了代理二进制时才显示（见 mcp_embed / build.rs）。
+            if crate::mcp_embed::has_embedded()
+                && ui
+                    .button(crate::i18n::tr(
+                        "安装 AI 控制代理到这台服务器…",
+                        "Install the AI control agent on this server…",
+                    ))
+                    .on_hover_text(crate::i18n::tr(
+                        "把 ishell-mcp 传到这台服务器的 ~/.ishell-mcp/bin/ 并置可执行位——AI 跑在\n\
+                         服务器上时，代理必须和它同机。\n\
+                         代理二进制是和本 iShell 一起编出来的，版本天然一致，不会再遇到\n\
+                         「版本不一致，请重新部署」。\n\
+                         传完会把注册命令打进本终端（不自动执行）。",
+                        "Uploads ishell-mcp to ~/.ishell-mcp/bin/ on this server and makes it\n\
+                         executable — when the AI runs on the server, the agent must run there too.\n\
+                         The binary ships inside this iShell build, so the versions always match and\n\
+                         you will not hit the version-mismatch/redeploy error.\n\
+                         The register command is then typed into this terminal (not executed).",
+                    ))
+                    .clicked()
+            {
+                self.deploy_agent_request = true;
+                ui.close();
+            }
             ui.separator();
             // 终端配色：多套主题（深/浅/近白/柔和深/经典浅），选中即全局同步并存盘
             ui.menu_button(crate::i18n::tr("终端配色", "Terminal theme"), |ui| {
@@ -971,8 +1025,10 @@ impl Terminal {
             }
         }
         if do_paste {
-            if let Some(t) = self.read_clipboard() {
-                out.extend_from_slice(t.as_bytes());
+            match self.read_clipboard() {
+                Some(t) => out.extend_from_slice(&self.wrap_paste(t.as_bytes())),
+                // 剪贴板里没有文本：可能是一张图（截图工具刚截的），走「落地成文件再贴路径」。
+                None => self.grab_clipboard_image(),
             }
         }
         // 右键菜单「查找」：无则打开并聚焦输入框，已开则把焦点定位到输入框

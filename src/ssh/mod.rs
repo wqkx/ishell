@@ -4,6 +4,7 @@
 mod auth;
 mod commands;
 mod forward;
+mod mcp_deploy;
 mod sftp;
 pub mod sysinfo;
 mod xfer;
@@ -165,7 +166,11 @@ pub async fn run(
     // 成功后会转入 keepalive 心跳循环、永不自行结束，所以收尾不能死等它完成——改用一个
     // oneshot 通知「注册尝试已结束」，收尾等这个有界的短窗口，到点后 abort 掉心跳。
     let (reg_done_tx, reg_done_rx) = tokio::sync::oneshot::channel::<()>();
-    let mcp_forward_task: Option<tokio::task::JoinHandle<()>> = if crate::store::load_mcp_consent() {
+    // `cfg!(unix)`：Windows 上 `spawn_mcp_listener` 是个空实现（整套 IPC 建在 Unix domain
+    // socket 上），没有任何东西在监听。0.19 起这个开关默认是开的，不加这个条件的话每次连接
+    // 都会往远端注册一个后面空无一人的反向转发 socket，纯粹是垃圾。
+    let mcp_forward_task: Option<tokio::task::JoinHandle<()>> =
+        if cfg!(unix) && crate::store::load_mcp_consent() {
         let fwd_handle = handle.clone();
         let path_slot = mcp_forward_path.clone();
         Some(tokio::spawn(async move {
@@ -249,6 +254,10 @@ pub async fn run(
         }
         let mut sampler = SysSampler::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        // 默认的 Burst 会在一次探测超过 2s（网络抖动 / 目标机负载高）之后把欠下的 tick 一次性
+        // 补齐，于是连着几次背靠背地探测；而进程 CPU% 是按两次采样的墙钟间隔做差分的，
+        // 间隔被压到接近 0 会把百分比放大成离谱的数字。改成 Delay：慢了就顺延，不补课。
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             match exec_capture(&probe_handle, PROBE_CMD).await {
@@ -656,6 +665,14 @@ pub async fn run(
                                 sink.send(WorkerEvent::Error(crate::i18n::tr("SFTP 不可用", "SFTP unavailable").into()));
                             }
                         }
+                    }
+                    Some(UiCommand::DeployMcpAgent) => {
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        tokio::spawn(async move {
+                            let (ok, message) = mcp_deploy::deploy_mcp_agent(&h, &s).await;
+                            s.send(WorkerEvent::McpAgentDeployed { ok, message });
+                        });
                     }
                     Some(UiCommand::ProcDetail(pid)) => {
                         let h = handle.clone();

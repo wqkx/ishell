@@ -36,4 +36,8 @@ cp target/release/ishell ~/.local/bin/ishell
 ishell --version
 ```
 
+> 想让装出来的 iShell 带「安装 AI 控制代理到这台服务器」这个功能，得**先编代理再编 GUI**
+> 并把产物路径经 `ISHELL_EMBED_MCP_*` 交给 build.rs——见 BUILD.md「把代理内嵌进 GUI」。
+> 不这么编不会报错，只是那个菜单项不出现。
+
 > 注意：Cursor 沙箱可能设置 `CARGO_TARGET_DIR` 指向临时目录，本地安装前请 `env -u CARGO_TARGET_DIR` 或显式指定项目 `target/`。

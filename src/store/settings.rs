@@ -214,7 +214,62 @@ fn mcp_consent_path() -> Option<PathBuf> {
     Some(config_dir()?.join("mcp_consent"))
 }
 
-/// 是否已开启「允许 AI 通过本地 MCP server 控制终端」（默认关闭，需用户在设置里显式开启）。
+/// 「允许 AI 通过 MCP 控制终端」的出厂默认值。
+const MCP_CONSENT_DEFAULT: bool = true;
+
+fn mcp_auto_approve_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("mcp_auto_approve"))
+}
+
+/// 「AI 的操作无需逐次当面确认」的出厂默认值。
+const MCP_AUTO_APPROVE_DEFAULT: bool = true;
+
+static MCP_AUTO_APPROVE_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// AI 的两类需授权操作（`open_session` 首次用某条已保存连接、写入**用户自己打开的**会话）
+/// 是否直接放行、不弹确认框。
+///
+/// **默认放行**（0.19 起）。原先每次都当面确认，实际使用中弹框远多于有效阻拦：AI 干活时
+/// 会连着发好几个请求，用户要一路点「允许」，点到最后也不再看内容了——那道闸门于是既挡不住
+/// 什么，又把体验拖垮。总开关（[`load_mcp_consent`]）才是真正的授权边界：不开它，socket
+/// 根本不监听。这个开关留给「就是要每次看一眼」的人，在设置里可以关掉自动放行。
+///
+/// 注意它**不影响**多开 iShell 时的「点窗口选实例」——那不是权限闸门而是选择器，代理在只有
+/// 一个实例（或只有一个 token 匹配者）时本来就直接绑定、不弹窗，只有真的多开才需要用户指认。
+pub fn load_mcp_auto_approve() -> bool {
+    use std::sync::atomic::Ordering;
+    match MCP_AUTO_APPROVE_CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = mcp_auto_approve_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim() == "1")
+                .unwrap_or(MCP_AUTO_APPROVE_DEFAULT);
+            MCP_AUTO_APPROVE_CACHE.store(on as i8, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// 保存「AI 操作无需逐次确认」开关。
+pub fn save_mcp_auto_approve(on: bool) {
+    MCP_AUTO_APPROVE_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
+    if let Some(p) = mcp_auto_approve_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        write_setting(p, if on { "1" } else { "0" });
+    }
+}
+
+/// 是否已开启「允许 AI 通过本地 MCP server 控制终端」。
+///
+/// **默认开启**（0.19 起）。此前默认关闭、要用户自己去设置里勾一次再重启，几乎每个想用这个
+/// 功能的人都要先踩一次「装完发现 AI 连不上」。通道本身仍是本机 Unix socket（0600）+ SSH
+/// 反向转发，没有开放任何网络端口；不想要的人在设置里取消勾选即可，取消后写的是显式的 `"0"`，
+/// 下面的判定认这个值，不会被「默认开」盖过去。
+///
 /// AI/MCP 控制开关的进程内缓存：`-1` 未知（还没读过盘），`0`/`1` 已知值。
 /// 引入缓存的原因：帧循环要每帧读一次 consent 来决定是否维持 MCP 响应性重绘节奏
 ///（见 `frame.rs`），而原实现每次 `load_mcp_consent()` 都同步读文件——每帧一次磁盘 I/O
@@ -228,10 +283,12 @@ pub fn load_mcp_consent() -> bool {
         0 => false,
         1 => true,
         _ => {
+            // 没有这个文件 = 用户从没表过态 → 用默认值（开）。有文件就严格按里面的值来，
+            // 显式关掉的人不会因为默认值变了而被重新打开。
             let on = mcp_consent_path()
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|s| s.trim() == "1")
-                .unwrap_or(false);
+                .unwrap_or(MCP_CONSENT_DEFAULT);
             MCP_CONSENT_CACHE.store(on as i8, Ordering::Relaxed);
             on
         }

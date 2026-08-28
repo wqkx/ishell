@@ -199,8 +199,13 @@ pub(crate) fn doc_view(ui: &mut egui::Ui, tab: &mut EditorTab) {
                             *zoom = 0.0;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(&fname).color(dim).size(11.0))
-                                .on_hover_text(&path);
+                            // show_tooltip_when_elided(false)：文件名被省略时 egui 会自带一个
+                            // 「完整文字」tooltip，和下面这条完整路径叠成两个提示框。
+                            ui.add(
+                                egui::Label::new(RichText::new(&fname).color(dim).size(11.0))
+                                    .show_tooltip_when_elided(false),
+                            )
+                            .on_hover_text(&path);
                         });
                     });
                 });
@@ -422,8 +427,14 @@ pub(crate) fn doc_view(ui: &mut egui::Ui, tab: &mut EditorTab) {
                                 .size(11.0),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(&fname).color(Palette::TEXT_DIM).size(11.0))
-                                .on_hover_text(&path);
+                            // 同上：关掉 egui 自带的省略提示，只留完整路径这一条。
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&fname).color(Palette::TEXT_DIM).size(11.0),
+                                )
+                                .show_tooltip_when_elided(false),
+                            )
+                            .on_hover_text(&path);
                         });
                     });
                 });

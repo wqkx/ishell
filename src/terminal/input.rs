@@ -86,11 +86,49 @@ impl Terminal {
                     self.ime_preedit.clear();
                 }
                 egui::Event::Paste(t) => {
+                    // 记下「这一下 Ctrl+V 是有文本的」，供下面 V 松开时判断——见那段说明。
+                    self.saw_text_paste = true;
                     if !alt {
                         self.input_line.push_str(&t);
                         self.hist = None;
                     }
-                    out.extend_from_slice(t.as_bytes());
+                    // bracketed paste：远端开了就套括号，否则多行内容会被逐行当成回车敲进去。
+                    let wrapped = self.wrap_paste(t.as_bytes());
+                    out.extend_from_slice(&wrapped);
+                }
+                // Ctrl+V 且剪贴板里**没有文本**（典型：刚截的一张图）。
+                //
+                // 这里为什么要靠「松开」而不是「按下」：egui-winit 在**按下**时就把 Ctrl+V
+                // 认成粘贴命令，读一次剪贴板文本，然后 `return`——读不到文本（图片/空剪贴板）
+                // 时它连 `Event::Key` 都不再往下发，终端于是彻底收不到这一下按键，
+                // Claude Code 的「Ctrl+V 贴图」按下去毫无反应。而那段拦截写在 `if pressed`
+                // 里面，**松开**的 Key 事件照常送达，所以这一下只能在松开时补。
+                //
+                // 补什么：剪贴板里真有图 → 交给 App 落地成文件（远端会话则上传），再把路径
+                // 打进终端，AI CLI 认路径；连图都没有（空剪贴板）→ 发 0x16，也就是 Ctrl+V
+                // 的原字节，跟普通终端一致（readline 的 quoted-insert）。
+                egui::Event::Key {
+                    key: Key::V,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => {
+                    // 判据是「有 V 的松开、却没有 V 的按下」：按下被吞掉说明 egui 把它当成了
+                    // 粘贴命令（Ctrl+V 或 Ctrl+Shift+V，`is_paste_command` 只看 command 不看
+                    // shift）。**不能**改看松开时的 `modifiers.ctrl`——先松 Ctrl 还是先松 V
+                    // 完全取决于用户手指，先松 Ctrl 的话这里读到的 ctrl 已经是 false 了。
+                    let was_swallowed_paste = !self.saw_v_press;
+                    if was_swallowed_paste && !self.saw_text_paste {
+                        self.grab_clipboard_image();
+                        // 连图都没有（空剪贴板）：裸 Ctrl+V 按普通终端的样子发 0x16；
+                        // Ctrl+Shift+V 是 iShell 自己的「粘贴」键，没内容时该什么都不做，
+                        // 而不是往远端发一个控制字符。
+                        if self.paste_image.is_none() && !modifiers.shift {
+                            out.push(0x16);
+                        }
+                    }
+                    self.saw_text_paste = false;
+                    self.saw_v_press = false;
                 }
                 egui::Event::Copy => {
                     let copy_selection = cfg!(target_os = "macos") || shift;
@@ -119,6 +157,10 @@ impl Terminal {
                     modifiers,
                     ..
                 } => {
+                    // V 的按下到达了我们 = egui 没有把它当成粘贴命令吞掉（见下面的松开分支）。
+                    if key == Key::V {
+                        self.saw_v_press = true;
+                    }
                     let plain =
                         !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.shift;
                     // Shift+选择键：主屏且远端未接管键盘时做本地键盘选区（Shift+↑↓ 跨行选择

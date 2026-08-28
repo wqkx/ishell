@@ -134,6 +134,14 @@ impl App {
                 if !input.is_empty() && !s.ai_owned {
                     let _ = s.cmd_tx.send(UiCommand::TerminalInput(input));
                 }
+                // 粘贴了一张图片（Ctrl+V / 右键粘贴，剪贴板里是图不是文本）：落地成文件、
+                // 远端会话则上传，传完把路径打进终端（见 Session::paste_image）。
+                // ai_owned 会话不接受用户键入，跳过。
+                if let Some(png) = s.terminal.take_paste_image() {
+                    if !s.ai_owned {
+                        s.paste_image(png);
+                    }
+                }
                 // 右键菜单「在文件列表中显示当前目录」：把文件区导航到终端当前目录
                 if let Some(cwd) = s.terminal.take_reveal_cwd() {
                     s.files.cwd = cwd;
@@ -154,6 +162,23 @@ impl App {
                 // 右键菜单「配置 AI 完成通知」：把安装命令打进终端（不自动执行）。
                 if s.terminal.take_notify_setup_request() {
                     inject_notify_setup(s);
+                }
+                // 右键菜单「安装 AI 控制代理到这台服务器」：走 SFTP 传内嵌的 ishell-mcp。
+                if s.terminal.take_deploy_agent_request() {
+                    if s.cfg.is_local() {
+                        s.status = crate::i18n::tr(
+                            "「本机」会话不需要部署代理：代理本来就跑在这台电脑上。",
+                            "The local session needs no agent deployment — the agent already runs on this computer.",
+                        )
+                        .into();
+                    } else {
+                        let _ = s.cmd_tx.send(UiCommand::DeployMcpAgent);
+                        s.status = crate::i18n::tr(
+                            "正在安装 AI 控制代理 …",
+                            "Installing the AI control agent …",
+                        )
+                        .into();
+                    }
                 }
                 // MCP 配对 token 自动注入：多台电脑共用同一台 AI 服务器时，让本会话里启动的
                 // AI（及其 ishell-mcp 子进程）自动携带配对标识——MCP 请求经既有的 token 匹配

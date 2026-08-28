@@ -662,6 +662,15 @@ pub(super) fn spawn_mcp_listener(
         return rx;
     };
     runtime.spawn(async move {
+        // 配置目录可能压根还不存在：0.19 起这个开关默认是开的，全新安装的用户可能一次设置
+        // 都没存过就直接起来了，此时 ~/.config/ishell/ 还没被任何 save_* 建出来，
+        // `UnixListener::bind` 会以 ENOENT 失败——现象是「默认开着，但 AI 就是连不上」，
+        // 而且只有看日志才知道。先把目录建出来。
+        if let Some(dir) = sock_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                log::warn!("创建配置目录 {} 失败：{e}", dir.display());
+            }
+        }
         // sock_path 现在是带 pid 的、本进程独占的路径（见 mcp_socket_path 的注释）——不会再
         // 有别的实例跟本进程抢同一个路径，remove_file 这里只是兜底极小概率的“同 pid 复用、
         // 上次异常退出没清理”这种情况，不是主要的安全网了。
@@ -1696,6 +1705,13 @@ impl App {
         }) else {
             return Some(call);
         };
+        // 「AI 操作无需逐次确认」开着（默认）时直接放行，并把这个 uid 记进批准集合——
+        // 后续即使用户中途把开关关掉，已经在用的这个会话也不会突然开始弹框。
+        // 放在「只挂一个框」那道守卫**之前**：放行根本不需要弹框，不该被别人的框挡回去。
+        if crate::store::load_mcp_auto_approve() {
+            self.mcp_use_approved.insert(uid);
+            return Some(call);
+        }
         let id = call.req.id;
         // 同一时刻只挂一个确认框：两个叠在一起用户根本分不清在批准哪个。
         if self.pending_use_consent.is_some() || self.pending_open_consent.is_some() {
@@ -1961,7 +1977,9 @@ impl App {
                     send_err(resp_tx, format!("未找到名为 “{name}” 的已保存连接"));
                     return;
                 };
-                if self.mcp_open_approved.contains(&name) {
+                // 已批准过、或「AI 操作无需逐次确认」开着（默认）→ 直接开。
+                if self.mcp_open_approved.contains(&name) || crate::store::load_mcp_auto_approve() {
+                    self.mcp_open_approved.insert(name);
                     self.do_open_session(&c, id, resp_tx);
                     return;
                 }

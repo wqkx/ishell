@@ -11,6 +11,7 @@ mod crash;
 mod i18n;
 mod limits;
 mod local;
+mod mcp_embed;
 mod mcp_protocol;
 mod proto;
 mod ssh;

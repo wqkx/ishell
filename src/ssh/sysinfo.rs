@@ -8,6 +8,16 @@ use std::collections::HashMap;
 use crate::proto::{DiskInfo, GpuInfo, ProcInfo, SysInfo};
 
 /// 采集命令：一次 SSH exec 取回所有原始数据，用 `===MARK===` 分段，便于解析。
+///
+/// `===PROC===` 段刻意发**两份**候选：按累计 CPU tick 排的前 120 个，加上按 RSS 排的前 120 个
+/// （客户端按 pid 去重）。只按累计 tick 截断会漏掉两类真正该看见的进程，用户报的
+/// 「CentOS 上 gmx 明明吃满 CPU 和内存，进程列表里却不显示，过一阵又显示」就是它：
+///   1. **刚起来的 CPU 大户**：排序键是**累计**时间，一个刚跑几分钟的 gmx 累计量远小于
+///      机器上一堆长命进程，直接被 `head` 切掉；等它慢慢攒够累计量才挤进来——「有时又显示」。
+///   2. **吃内存但不吃 CPU 的进程**：侧栏支持按「内存%」排序，可数据源却是按 CPU 截断的，
+///      内存大户根本没进过这份列表。
+/// 按 RSS 的那一路让这两类进程第一次采样就在列表里，进而被 `prev_proc` 记住，
+/// 下一次采样就能算出正确的瞬时 CPU%，也不会再进进出出地闪。
 pub const PROBE_CMD: &str = r#"
 echo '===HOST==='; hostname 2>/dev/null
 echo '===IP==='; hostname -I 2>/dev/null
@@ -19,7 +29,7 @@ echo '===MEM==='; grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/memin
 echo '===NET==='; cat /proc/net/dev 2>/dev/null
 echo '===DISK==='; df -kP 2>/dev/null
 echo '===SYSCONF==='; echo "$(getconf CLK_TCK 2>/dev/null) $(getconf PAGESIZE 2>/dev/null)"
-echo '===PROC==='; awk '{ pid=$1; s=$0; o=index(s,"("); c=0; for(i=length(s);i>0;i--){ if(substr(s,i,1)==")"){c=i;break} } comm=substr(s,o+1,c-o-1); rest=substr(s,c+2); n=split(rest,f," "); print pid, (f[12]+f[13]), f[22], comm }' /proc/[0-9]*/stat 2>/dev/null | sort -k2 -rn | head -n 200
+echo '===PROC==='; _ps=$(awk '{ pid=$1; s=$0; o=index(s,"("); c=0; for(i=length(s);i>0;i--){ if(substr(s,i,1)==")"){c=i;break} } comm=substr(s,o+1,c-o-1); rest=substr(s,c+2); n=split(rest,f," "); print pid, (f[12]+f[13]), f[22], comm }' /proc/[0-9]*/stat 2>/dev/null); { printf '%s\n' "$_ps" | sort -k2 -rn | head -n 120; printf '%s\n' "$_ps" | sort -k3 -rn | head -n 120; }
 echo '===GPU==='
 nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null
 for d in /sys/class/drm/card[0-9]*/device; do [ -r "$d/gpu_busy_percent" ] || continue; v=$(cat "$d/vendor" 2>/dev/null); case "$v" in 0x1002) vn="AMD GPU";; 0x8086) vn="Intel GPU";; *) vn="GPU";; esac; busy=$(cat "$d/gpu_busy_percent" 2>/dev/null || echo 0); used=$(cat "$d/mem_info_vram_used" 2>/dev/null || echo 0); total=$(cat "$d/mem_info_vram_total" 2>/dev/null || echo 0); idx=$(basename "$(dirname "$d")" | tr -dc 0-9); echo "$idx, $vn, ${busy:-0}, $((${used:-0}/1048576)), $((${total:-0}/1048576))"; done 2>/dev/null
@@ -28,6 +38,33 @@ echo '===END==='
 
 /// CPU 单次采样的累计 tick：(busy, total)。
 type CpuTicks = (u64, u64);
+
+/// 每个排序方向各保留多少个进程送进 UI（CPU 前 N ∪ 内存前 N，最多 2N 条）。
+/// 侧栏只显示前 5，留这么多是为了让排序切换、以及后续可能的「全部进程」视图有料可用；
+/// 这份数据只在进程内传递（watch 通道），不过网络，多留几十条没有成本。
+const PROC_KEEP: usize = 40;
+
+/// 只保留「CPU 前 `n`」与「内存前 `n`」的并集，结果按 CPU 降序。
+///
+/// 为什么不能只按 CPU 截断：侧栏的表头「内存%」是可点击的排序键，数据源却按 CPU 截断，
+/// 于是一个吃 100G 内存但几乎不用 CPU 的进程永远排不进来——按内存排序也看不见它。
+fn keep_top_by_cpu_and_mem(procs: &mut Vec<ProcInfo>, n: usize) {
+    if procs.len() <= n {
+        procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+        return;
+    }
+    // 先按内存挑出前 n 的 pid，再按 CPU 排序并保留「CPU 前 n」或「内存前 n」的行。
+    procs.sort_by(|a, b| b.mem.partial_cmp(&a.mem).unwrap_or(std::cmp::Ordering::Equal));
+    let mem_top: std::collections::HashSet<u32> = procs.iter().take(n).map(|p| p.pid).collect();
+    procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+    // `retain` 按原顺序访问，此时顺序即 CPU 排名，`rank` 就是这一行的 CPU 名次。
+    let mut rank = 0usize;
+    procs.retain(|p| {
+        let keep = rank < n || mem_top.contains(&p.pid);
+        rank += 1;
+        keep
+    });
+}
 
 /// 跨周期保留的采样状态，用于计算差分速率。
 #[derive(Default)]
@@ -112,7 +149,11 @@ impl SysSampler {
     }
 
     /// 解析进程段（每行 `pid (utime+stime)ticks rss_pages comm…`），按 tick 差分算**瞬时** CPU%
-    /// （与 htop 一致，多核可超 100%）；内存% 由 rss 页数 × 页大小 / 总内存换算。返回按 CPU 降序的前若干个。
+    /// （与 htop 一致，多核可超 100%）；内存% 由 rss 页数 × 页大小 / 总内存换算。
+    ///
+    /// 远端发来的是「按累计 tick 排的前 N」+「按 RSS 排的前 N」两份拼接，会有重复 pid，
+    /// 这里按 pid 去重（见 `PROBE_CMD` 的注释）。截断同样取**两个方向各取前 N 的并集**，
+    /// 而不是只留 CPU 前 N：侧栏可以按内存% 排序，只按 CPU 截断的话内存大户压根到不了 UI。
     fn parse_proc_delta(
         &mut self,
         raw: &str,
@@ -131,10 +172,17 @@ impl SysSampler {
             let Ok(pid) = pid_s.parse::<u32>() else {
                 continue;
             };
+            // 两份候选拼接必然有重复 pid：先到先得，重复行直接跳过。
+            if cur.contains_key(&pid) {
+                continue;
+            }
             let ticks: u64 = tick_s.parse().unwrap_or(0);
             let rss_pages: u64 = rss_s.parse().unwrap_or(0);
             let name = it.collect::<Vec<_>>().join(" ");
             // 瞬时 CPU%：Δtick / CLK_TCK = CPU 秒；/ dt 秒 × 100 = 百分比（32 核满载 → 3200%）
+            // 首次见到的进程没有上一次的 tick，本帧只能记 0；下一帧就有真值了——它已经因为
+            // RSS 那一路进了列表，不会像以前那样「本帧 0% → 被按 CPU 截断切掉 → 下帧又当新进程」
+            // 地反复进出。
             let cpu = if dt > 0.0 {
                 self.prev_proc.get(&pid).map_or(0.0, |&prev| {
                     (ticks.saturating_sub(prev) as f64 / clk_tck.max(1.0) / dt * 100.0) as f32
@@ -156,12 +204,7 @@ impl SysSampler {
             });
         }
         self.prev_proc = cur; // 仅保留本次见到的进程，自动淘汰已退出的 pid
-        out.sort_by(|a, b| {
-            b.cpu
-                .partial_cmp(&a.cpu)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        out.truncate(40);
+        keep_top_by_cpu_and_mem(&mut out, PROC_KEEP);
         out
     }
 
@@ -437,6 +480,60 @@ mod tests {
         assert_eq!(g[0].mem_used_mb, 18000);
         assert_eq!(g[1].index, 1);
         assert_eq!(g[1].mem_total_mb, 24564);
+    }
+
+    /// 用户报「gmx 明明吃满 CPU 和内存，进程列表里却看不到」的回归门禁：
+    /// 一个内存大户即使 CPU 排名靠后，也必须留在送给 UI 的列表里——侧栏能按内存% 排序。
+    #[test]
+    fn memory_hog_survives_truncation_even_with_low_cpu() {
+        let mut procs: Vec<ProcInfo> = (0..50)
+            .map(|i| ProcInfo {
+                pid: i as u32 + 1,
+                name: format!("busy{i}"),
+                cpu: 100.0 - i as f32, // CPU 从高到低
+                mem: 0.1,
+            })
+            .collect();
+        // 内存大户：CPU 排名垫底（0），内存第一
+        procs.push(ProcInfo {
+            pid: 9999,
+            name: "gmx".into(),
+            cpu: 0.0,
+            mem: 88.0,
+        });
+        keep_top_by_cpu_and_mem(&mut procs, 10);
+        assert!(
+            procs.iter().any(|p| p.pid == 9999),
+            "内存第一但 CPU 垫底的进程被截断掉了——按内存% 排序的侧栏就永远看不到它"
+        );
+        // CPU 前 10 也必须一个不少
+        for pid in 1..=10u32 {
+            assert!(procs.iter().any(|p| p.pid == pid), "CPU 前 10 里少了 pid {pid}");
+        }
+    }
+
+    /// 少于上限时不做任何取舍，只保证按 CPU 降序。
+    #[test]
+    fn small_list_is_only_sorted_by_cpu() {
+        let mut procs = vec![
+            ProcInfo { pid: 1, name: "a".into(), cpu: 1.0, mem: 9.0 },
+            ProcInfo { pid: 2, name: "b".into(), cpu: 5.0, mem: 1.0 },
+        ];
+        keep_top_by_cpu_and_mem(&mut procs, 10);
+        assert_eq!(procs.len(), 2);
+        assert_eq!(procs[0].pid, 2);
+    }
+
+    /// 远端把「CPU 前 N」和「RSS 前 N」两份拼起来发，重复 pid 必须只出现一次，
+    /// 否则同一个进程会在侧栏里列两行。
+    #[test]
+    fn duplicate_pids_from_two_candidate_lists_are_merged() {
+        let mut s = SysSampler::new();
+        // 第一次采样建立基线（dt=0，CPU 全 0）
+        let raw = "100 500 1000 gmx\n200 300 2000 other\n100 500 1000 gmx\n";
+        let out = s.parse_proc_delta(raw, 1.0, 1024 * 1024, 100.0, 4);
+        assert_eq!(out.len(), 2, "重复 pid 没有被去重：{out:?}");
+        assert!(out.iter().any(|p| p.pid == 100 && p.name == "gmx"));
     }
 
     #[test]

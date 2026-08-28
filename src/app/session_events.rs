@@ -290,6 +290,29 @@ impl Session {
                         self.pending.save_failed.push((id, path, message));
                     }
                 }
+                WorkerEvent::McpAgentDeployed { ok, message } => {
+                    if ok {
+                        // message 是远端可执行文件的绝对路径。把注册命令**打进终端但不回车**
+                        // ——注册要在这台服务器上执行一次，用户看得见命令内容再决定按不按，
+                        // 和「配置 AI 完成通知」那条菜单是同一个套路。
+                        let path = message;
+                        let cmd = format!("claude mcp add ishell -s user -- {path}");
+                        let _ = self
+                            .cmd_tx
+                            .send(crate::proto::UiCommand::TerminalInput(cmd.clone().into_bytes()));
+                        self.terminal.push_input_line(&cmd);
+                        self.status = match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!(
+                                "已部署 {path}（版本与本 iShell 一致）。终端里已备好注册命令，回车执行即可。"
+                            ),
+                            crate::i18n::Lang::En => format!(
+                                "Deployed {path} (same version as this iShell). The register command is                                  typed into the terminal — press Enter to run it."
+                            ),
+                        };
+                    } else {
+                        self.status = message;
+                    }
+                }
                 WorkerEvent::FileSaveConflict { id, path } => {
                     if self.file_write_op_would_resolve(id) {
                         self.try_resolve_file_write(id, Err("文件已被外部修改，写入被拒绝".into()));
@@ -406,6 +429,28 @@ impl Session {
                     // 跨会话拷贝（copy_between_sessions）状态机匹配自己关心的 op_id 用；
                     // 无关 id 由 App 层驱动函数直接忽略。
                     self.pending.copy_done.push((id, ok, message.clone()));
+                    // 「粘贴图片」上传完：把远端路径打进终端。失败就说清楚，别让用户以为
+                    // 粘上了却什么都没发生。
+                    if let Some(remote) = self.pending_paste_image.remove(&id) {
+                        if ok {
+                            // 收紧权限：/tmp 是所有人可读的，而截图常常带敏感内容。
+                            // 上传本身按 umask 落地（多半 644），这里补一刀。
+                            let _ = self.cmd_tx.send(crate::proto::UiCommand::Chmod {
+                                path: remote.clone(),
+                                mode: 0o600,
+                            });
+                            self.type_pasted_path(&remote);
+                        } else {
+                            self.status = match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => {
+                                    format!("粘贴的图片上传失败：{message}")
+                                }
+                                crate::i18n::Lang::En => {
+                                    format!("Failed to upload the pasted image: {message}")
+                                }
+                            };
+                        }
+                    }
                     let connected = self.connected;
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
                         t.note = String::new();

@@ -279,6 +279,9 @@ pub enum UiCommand {
     RemoveForward(u64),
     /// 主动断开
     Disconnect,
+    /// 把内嵌的 `ishell-mcp` 代理二进制部署到这台服务器（见 `crate::mcp_embed`）。
+    /// 结果经 `WorkerEvent::McpAgentDeployed` 回报。
+    DeployMcpAgent,
 }
 
 /// `DownloadToMcp` 探测到非目录文件后，一次性交给 `mcp_bridge::handle_conn` 的「文件大小 +
@@ -398,6 +401,9 @@ pub enum WorkerEvent {
     FileSaveConflict { id: u64, path: String },
     /// 保存失败（网络/权限/磁盘等）：标签保持未保存状态并提示
     FileSaveFailed { id: u64, path: String, message: String },
+    /// `DeployMcpAgent` 的结果。成功时 `message` 是远端可执行文件的绝对路径
+    /// （UI 据此把注册命令打进终端）；失败时是给用户看的原因。
+    McpAgentDeployed { ok: bool, message: String },
     /// 打开时发现文件实际大小超限（列表里的旧大小已过时）：请 UI 弹「打开大文件」确认，可强制打开
     FileTooLarge { id: u64, path: String, size: u64 },
     /// 跟随读取返回：data 为新增原始字节（可能为空）；offset 为下次读取起点；

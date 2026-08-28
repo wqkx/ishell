@@ -9,7 +9,7 @@ mod write;
 
 pub(super) use list::list_dir;
 pub(super) use read::{read_file_chunked, read_image_file, tail_file};
-pub(super) use write::{handle_fs_op, sftp_overwrite};
+pub(super) use write::{handle_fs_op, sftp_overwrite, sftp_write_atomic};
 
 /// 判断一次 SFTP 操作失败是不是明确的"文件不存在"（NoSuchFile 状态码），而不是权限不足、
 /// 网络超时、SFTP 会话异常等其它错误——这几种情况都不代表目标真的不存在，一律当成

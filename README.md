@@ -20,7 +20,7 @@ Let Claude Code, Codex CLI, or any MCP-compatible agent drive a real, persistent
 
 Everything you need for daily SSH work in **one window** — and it stays out of your way.
 
-- 🤖 **Let AI drive the terminal (MCP)** — Claude Code / Codex operate a real persistent session (cwd/env/history intact); commands appear live in the tab. Off by default. When several computers share one AI server, enable pairing. See "AI / MCP integration".
+- 🤖 **Let AI drive the terminal (MCP)** — Claude Code / Codex operate a real persistent session (cwd/env/history intact); commands appear live in the tab. On by default (Settings turns it off); the matching proxy binary ships inside iShell and installs onto a server in one click. When several computers share one AI server, enable pairing. See "AI / MCP integration".
 - ⚡ **Fast & lightweight** — pure Rust + GPU immediate-mode UI. A single binary (~8–12 MB), instant startup, **~0% idle CPU**, **~80 MB RAM**. No Electron / JVM / Python, no daemon, no runtime deps.
 - 🎯 **Refined user experience** — a clean, warm light theme; smooth drag-to-reorder tabs; no toolbar clutter; English / 中文 switchable on the fly; sensible defaults so it just works.
 - 📁 **Effortless file operations** — multi-select rubber-band, batch delete/download, server-side copy/move, **resumable** transfers that **auto-resume after reconnect**, and folder **compress-download** (tar.gz) for thousands of small files.
@@ -40,7 +40,7 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 
 ## 🚀 Features
 
-**AI / MCP integration** (off by default — see "AI / MCP integration" below)
+**AI / MCP integration** (on by default — see "AI / MCP integration" below)
 - Let Claude Code / Codex CLI drive a **real terminal session** (cwd/env/history intact), with live commands and output
 - Full tool set: run commands, read screen/history, interactive input, interrupt, open/close sessions, read/write/transfer remote files
 - SSH reverse-forward lets the AI on a remote server reach back to this iShell; **enable pairing when several computers share one AI server** (see below)
@@ -175,21 +175,23 @@ Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal se
 
 ### Enable & setup
 
-1. Settings → “Allow AI to control terminal via MCP” (**restart required**). Listens only on a local Unix socket (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port.
-2. On the machine that runs the AI, install and register the proxy:
-   ```bash
-   scripts/install-mcp.sh target/release/ishell-mcp   # → ~/.ishell-mcp/bin/ishell-mcp
-   claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
-   # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
-   ```
-   Other clients just point `command` at the same path. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
+1. **On by default** since 0.19 (it was opt-in before). Settings → “Allow AI to control terminal via MCP” turns it off. Listens only on a local Unix socket (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port. Changing the switch needs a restart.
+2. Install the proxy on the machine that runs the AI:
+   - **AI runs on a server you SSH into** — right-click in that server's terminal → **“Install the AI control agent on this server”**. iShell ships a matching `ishell-mcp` inside itself and pushes it over the existing SFTP channel to `~/.ishell-mcp/bin/ishell-mcp`, then types the register command into the terminal for you. Versions match by construction, so “version mismatch, redeploy” cannot happen. *Release builds embed the agent only on Linux, and only for the build's own architecture* (a Linux x86_64 iShell can deploy to x86_64 Linux servers); the menu item is hidden when this build embeds nothing. A build that embeds several architectures is possible — see BUILD.md.
+   - **AI runs on this computer, or the server is another arch** — install by hand:
+     ```bash
+     scripts/install-mcp.sh target/release/ishell-mcp   # → ~/.ishell-mcp/bin/ishell-mcp
+     claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
+     # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
+     ```
+     Other clients just point `command` at the same path. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
 
 ### Tools
 
 | Tool | Purpose |
 |------|---------|
 | `list_sessions` / `list_saved_connections` | Open sessions / saved connections |
-| `open_session` / `close_session` | Open/close an AI-only read-only session (first use needs on-screen consent) |
+| `open_session` / `close_session` | Open/close an AI-only read-only session |
 | `run_command` / `poll_run` / `start_command` | Run & wait / keep waiting / start long jobs (up to 24h) |
 | `send_input` / `interrupt` | Interactive input; Ctrl+C (also frees a stuck pending command) |
 | `read_screen` / `read_history` | Visible screen / full scrollback |
@@ -201,7 +203,7 @@ Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal se
 
 With the switch on, each SSH connect reverse-forwards the local MCP socket to `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). Remote `ishell-mcp` auto-discovers it — usually no path to configure.
 
-**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Writes into your own sessions still need on-screen confirmation; socket reach alone can initiate bind / read requests.
+**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Since 0.19 the AI is not asked to confirm each action either (Settings → “Don't ask before each AI action” restores the prompts), so the master switch above *is* the permission boundary.
 
 ### ⚠️ Several computers sharing one AI server (read this)
 
@@ -224,15 +226,15 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 ### Other notes
 
-- Writes into **your** sessions need one on-screen confirmation; `ai_owned` sessions and reads usually don't.
-- AI commands appear live in the target tab — check which session you're approving.
+- Since 0.19 the AI acts without per-action prompts. Turn **Settings → “Don't ask before each AI action”** off to get a confirmation whenever the AI wants to use a session *you* opened, or to open a new one.
+- AI commands appear live in the target tab — you always see what it did.
 - GUI and `ishell-mcp` must be the same version; re-run `install-mcp.sh` after upgrades.
 
 ## 🔒 Security
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
-- **MCP**: off by default; local socket only (`0600`); writes into your sessions need confirmation; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
+- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port; per-action confirmations are off by default and can be turned back on in Settings; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
 
 ## 📄 License
 

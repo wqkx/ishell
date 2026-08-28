@@ -110,8 +110,30 @@ jobs:
           -A clippy::type_complexity
           -A deprecated
 
+      # 先单独编 AI/MCP 代理，再把它的路径交给 GUI 那次构建内嵌进去（见 build.rs / BUILD.md）：
+      # `ishell` 和 `ishell-mcp` 是同一个 crate 的两个 bin，构建脚本拿不到兄弟二进制的产物，
+      # 顺序只能由外部保证。不设这两个环境变量也能编过，只是编出来的 iShell 里没有
+      # 「安装 AI 控制代理到这台服务器」那个菜单项——所以这一步漏了不会报错，会静默少功能。
+      #
+      # 只有 Linux 腿内嵌，且只嵌**自己这条腿的架构**：这个功能是「把代理推到我 SSH 上去的
+      # 那台服务器」，服务器基本都是 Linux；而 macOS/Windows runner 上没法产 Linux 二进制，
+      # 要跨腿共享产物就得拆 job + 传 artifact，眼下不值得。想要一份两种 Linux 架构都嵌全的
+      # 包，在自己的构建服务器上按 BUILD.md 那节编。
+      - name: Build MCP agent (for embedding)
+        if: runner.os == 'Linux'
+        run: cargo build --release --target ${{ matrix.target }} --bin ishell-mcp
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -e
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              export ISHELL_EMBED_MCP_X86_64="$PWD/target/${{ matrix.target }}/release/ishell-mcp" ;;
+            aarch64-unknown-linux-gnu)
+              export ISHELL_EMBED_MCP_AARCH64="$PWD/target/${{ matrix.target }}/release/ishell-mcp" ;;
+          esac
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         shell: bash

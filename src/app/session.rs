@@ -71,6 +71,9 @@ pub(super) struct Session {
     pub(super) monitor_ok: Option<bool>,
     /// AI/MCP 控制通道正在等待完成的一次命令运行（同一会话同一时刻只允许一条）
     pub(super) pending_ai_run: Option<super::PendingAiRun>,
+    /// 「粘贴图片」正在上传的传输 id → 传完要打进终端的**远端路径**。
+    /// 见 [`Session::paste_image`]。
+    pub(super) pending_paste_image: std::collections::HashMap<u64, String>,
     /// 是否由 AI 通过 `open_session` 新开（只读：用户键盘输入不会发给这个会话，只能看不能敲）
     pub(super) ai_owned: bool,
     /// AI/MCP 控制通道正在等待完成的文件读写（write_file/read_file/copy_to_remote/
@@ -93,6 +96,82 @@ pub(super) enum XferSpec {
 }
 
 impl Session {
+    /// 用户往终端里粘了一张图（Ctrl+V / 右键粘贴，剪贴板里是图片而不是文本）。
+    ///
+    /// 终端协议里没有「贴一张图」这回事，字节流塞不进去。能落地的做法只有一条：把图片
+    /// **变成一个文件**，再把**路径**打进终端——Claude Code / Codex 这类 AI CLI 认路径，
+    /// 会自己去读那个文件。
+    ///
+    /// 为什么必须走「上传」而不能只给本机路径：用户的 AI CLI 常常跑在**远端**服务器上
+    /// （经 iShell 的 SSH 会话），远端进程既读不到本机的 `/tmp`，也读不到本机剪贴板——
+    /// 这正是「Ctrl+V 贴图在 iShell 里没反应」的深层原因，光把按键透传过去也解决不了。
+    /// 落到远端 `/tmp` 而不是家目录或当前目录：`/tmp` 一定存在、一定可写，不用先 mkdir，
+    /// 也不会往用户正在干活的目录里丢文件。
+    pub(super) fn paste_image(&mut self, png: Vec<u8>) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let name = format!("ishell-paste-{stamp}.png");
+        let local = std::env::temp_dir().join(&name);
+        // 截图很可能带敏感内容，别让同机的其他账号顺手看到（默认 umask 通常是 644）。
+        if let Err(e) = std::fs::write(&local, &png).and_then(|()| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        }) {
+            self.status = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("粘贴的图片写入本地临时文件失败：{e}"),
+                crate::i18n::Lang::En => format!("Could not save the pasted image locally: {e}"),
+            };
+            return;
+        }
+        let local = local.to_string_lossy().into_owned();
+        // 本机会话：进程就在这台机器上，直接给本地路径，不用上传。
+        if self.cfg.is_local() {
+            self.type_pasted_path(&local);
+            return;
+        }
+        let remote = format!("/tmp/{name}");
+        let id = self.next_xfer;
+        self.next_xfer += 1;
+        self.transfers.push(Transfer::new(
+            id,
+            name.clone(),
+            crate::proto::TransferDir::Upload,
+            png.len() as u64,
+            Some(local.clone()),
+            // 不给 spec：断线重连时不该自动重传一张早已过期的剪贴板临时图。
+            None,
+        ));
+        let _ = self.cmd_tx.send(crate::proto::UiCommand::Upload {
+            id,
+            local,
+            remote_dir: "/tmp".into(),
+            remote_name: Some(name),
+            policy: crate::proto::ConflictPolicy::Overwrite,
+        });
+        self.pending_paste_image.insert(id, remote);
+        self.status = crate::i18n::tr("正在上传粘贴的图片 …", "Uploading pasted image …").into();
+    }
+
+    /// 把图片路径打进终端（末尾补一个空格，方便接着往下写提示词）。不回车。
+    pub(super) fn type_pasted_path(&mut self, path: &str) {
+        let _ = self
+            .cmd_tx
+            .send(crate::proto::UiCommand::TerminalInput(
+                format!("{path} ").into_bytes(),
+            ));
+        self.terminal.push_input_line(path);
+        self.status = match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("已粘贴图片：{path}"),
+            crate::i18n::Lang::En => format!("Pasted image: {path}"),
+        };
+    }
+
     pub(super) fn refresh_dir(&mut self, dir: Option<String>) {
         if let Some(dir) = dir {
             self.files.loading.insert(dir.clone());
@@ -210,6 +289,7 @@ impl App {
             mcp_token_injected: false,
             monitor_ok: None,
             pending_ai_run: None,
+            pending_paste_image: std::collections::HashMap::new(),
             ai_owned: false,
             pending_file_ops: Vec::new(),
             file_op_tombstones: std::collections::VecDeque::new(),
