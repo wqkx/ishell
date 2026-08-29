@@ -9,6 +9,19 @@ use super::{
     Terminal,
 };
 
+/// 把 `r` 平移进 `bounds` 里（尺寸不变）。见下面 IME 上报处的说明。
+pub(super) fn clamp_rect_into(r: Rect, bounds: Rect) -> Rect {
+    let x = r
+        .min
+        .x
+        .clamp(bounds.min.x, (bounds.max.x - r.width()).max(bounds.min.x));
+    let y = r
+        .min
+        .y
+        .clamp(bounds.min.y, (bounds.max.y - r.height()).max(bounds.min.y));
+    Rect::from_min_size(egui::pos2(x, y), r.size())
+}
+
 pub(super) struct PaintParams<'a> {
     pub(super) rect: Rect,
     pub(super) resp: &'a Response,
@@ -230,10 +243,16 @@ impl Terminal {
 
         // 启用 IME（中文 / fcitx 等输入法）：聚焦时上报输入区，并把候选框定位到光标处。
         // 否则平台不会在终端上激活输入法，导致无法输入中文。
+        //
+        // 上报的矩形**钳进终端可见区**。往回翻历史时光标会滚到视口之外，报一个视口外的
+        // 位置有两个后果：候选窗飘到屏幕别处；更要紧的是这个位置在滚动时每帧都在变，而
+        // 每一次变化在 X11 上都是一次 `XSetICValues`——同步的 XIM 往返，Xlib 发出去就阻塞
+        // 等 fcitx 回复且**没有超时**。钳住之后光标一出视口这个值就恒定，滚动期间不再产生
+        // 任何 XIM 往返，也就少了一批「正卡在往返里而 fcitx 恰好没了」的机会窗口。
         if focused {
             let (cr, cc) = screen.cursor_position();
             let ipos = origin + Vec2::new(cc as f32 * char_w, cr as f32 * char_h);
-            let irect = Rect::from_min_size(ipos, cell);
+            let irect = clamp_rect_into(Rect::from_min_size(ipos, cell), rect);
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput {
                     rect: irect,

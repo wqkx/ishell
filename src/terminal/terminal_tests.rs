@@ -1125,3 +1125,63 @@ fn recovery_does_not_depend_on_which_key_is_released_first() {
     );
     assert_eq!(out, vec![0x16], "先松 Ctrl 再松 V 时漏掉了这一下按键");
 }
+
+/// 输入法在组字**半路没了**（fcitx 崩溃/重启、远程桌面会话切换）时，`Ime(Disabled)` 永远
+/// 不会来，`ime_preedit` 就会一直挂在光标处——屏幕上留着一截没提交的拼音，用户重启输入法
+/// 也擦不掉，看起来像终端花了。
+///
+/// 自愈判据：本帧收到了普通文本输入，却一条 `Ime` 事件都没有。XIM 组字期间按键会被输入法
+/// 过滤掉，能收到裸 `Text` 就说明组字已经不在了。
+#[test]
+fn a_dead_ime_does_not_leave_a_ghost_preedit() {
+    let ctx = egui::Context::default();
+    let mut t = Terminal::new();
+
+    // 组字开始：屏幕上出现拼音
+    let _ = feed_events(
+        &mut t,
+        &ctx,
+        vec![egui::Event::Ime(egui::ImeEvent::Preedit("zhong".into()))],
+    );
+    assert_eq!(t.ime_preedit, "zhong", "预编辑没有被记下来，测试前提不成立");
+
+    // 输入法这时候没了：没有 Disabled，用户接着敲了个普通字母
+    let out = feed_events(&mut t, &ctx, vec![egui::Event::Text("a".into())]);
+    assert_eq!(out, b"a".to_vec(), "普通输入本身必须照常发出去");
+    assert!(
+        t.ime_preedit.is_empty(),
+        "输入法没了之后那截没提交的拼音还留在屏幕上，用户重启输入法也擦不掉"
+    );
+}
+
+/// 自愈不能误伤正常组字：Preedit 之后紧跟 Commit 是最常见的路径，中间那一帧有 Ime 事件，
+/// 判据（「有裸 Text 且完全没有 Ime 事件」）不成立，组字必须原样走完。
+#[test]
+fn self_healing_does_not_cancel_a_normal_composition() {
+    let ctx = egui::Context::default();
+    let mut t = Terminal::new();
+    let _ = feed_events(
+        &mut t,
+        &ctx,
+        vec![egui::Event::Ime(egui::ImeEvent::Preedit("zh".into()))],
+    );
+    // 同一帧里既有 Preedit 又有 Text（某些输入法会这样）——有 Ime 事件就不许清
+    let _ = feed_events(
+        &mut t,
+        &ctx,
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("zhong".into())),
+            egui::Event::Text("x".into()),
+        ],
+    );
+    assert_eq!(t.ime_preedit, "zhong", "有 Ime 事件的那一帧不该触发自愈");
+
+    // 正常提交
+    let out = feed_events(
+        &mut t,
+        &ctx,
+        vec![egui::Event::Ime(egui::ImeEvent::Commit("中".into()))],
+    );
+    assert_eq!(out, "中".as_bytes().to_vec());
+    assert!(t.ime_preedit.is_empty(), "提交之后预编辑应当清空");
+}

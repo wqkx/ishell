@@ -275,16 +275,13 @@ pub(super) fn paint_text_row(
                 }
             }
         }
-        // 在主光标处上报 IME 输入区：激活输入法 + 定位候选框（否则虚拟编辑器无法输入中文）
+        // 主光标的屏幕坐标：补全弹窗定位 + IME 候选框定位都用它。
+        //
+        // 注意这里**只**记坐标，不再顺手上报 `o.ime`——上报改到了 paint/mod.rs 的行循环之后。
+        // 原因见那里的注释：在这里报等于「光标可见才报」，光标滚出视口的那一帧 `o.ime` 变成
+        // None，X11 上就是一次 XDestroyIC，滚回来又是 XCreateIC，都是同步的 XIM 往返。
         if ctx.ed.vcaret >= ls && ctx.ed.vcaret <= le && in_win(col_of(ctx.ed.vcaret)) {
             let cx = x_of(ctx.ed.vcaret - ls);
-            let irect = egui::Rect::from_min_size(egui::pos2(cx, y), egui::vec2(1.0, ctx.row_h));
-            ctx.ui.ctx().output_mut(|o| {
-                o.ime = Some(egui::output::IMEOutput {
-                    rect: irect,
-                    cursor_rect: irect,
-                })
-            });
             caret_px_frame = Some(egui::pos2(cx, y + ctx.row_h));
         }
     }

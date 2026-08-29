@@ -12,6 +12,21 @@ use super::wrap::{v_line_of_vrow, v_total_vrows, v_vpos_of_byte, v_wrap_sync};
 use crate::theme::Palette;
 use crate::ui::highlight::{self, Indent};
 
+/// 把 `r` 平移进 `bounds` 里（尺寸不变）。用于 IME 候选框定位：光标滚出视口时报一个视口外
+/// 的位置，输入法的候选窗会飘到屏幕别处；钳住之后这个值在继续滚动时还是常量，顺带避免了
+/// 「每帧一次 XSetICValues」。`r` 比 `bounds` 还大时以 `bounds` 左上角为准。
+fn clamp_rect_into(r: egui::Rect, bounds: egui::Rect) -> egui::Rect {
+    let x = r
+        .min
+        .x
+        .clamp(bounds.min.x, (bounds.max.x - r.width()).max(bounds.min.x));
+    let y = r
+        .min
+        .y
+        .clamp(bounds.min.y, (bounds.max.y - r.height()).max(bounds.min.y));
+    egui::Rect::from_min_size(egui::pos2(x, y), r.size())
+}
+
 pub(super) struct RowPaintContext<'a> {
     ui: &'a mut egui::Ui,
     ed: &'a mut Editor,
@@ -435,6 +450,42 @@ pub(super) fn paint_visible_rows(
                         .request_repaint_after(std::time::Duration::from_millis(33));
                 }
                 ed.caret_px = caret_px_frame;
+                // ——— 上报 IME 输入区（激活输入法 + 定位候选框）———
+                //
+                // **只要编辑器聚焦就报**，光标滚出视口时把矩形钳进可见区，而不是像以前那样
+                // 「光标可见才报」。差别不是美观问题，是会把整个程序冻住的：
+                //
+                // `o.ime` 为 None 的那一帧，egui-winit 会调 `set_ime_allowed(false)`；X11 上
+                // winit 的实现是 **XDestroyIC**，再次为 Some 时是 **XCreateIC**。这两个都是
+                // 同步的 XIM 往返——Xlib 发出请求后阻塞等输入法（fcitx）回复，**没有超时**。
+                // 光标停在视口边缘上下滚动时，旧实现会每帧销毁+重建一次输入上下文；只要
+                // fcitx 在某一次往返中途没了（重启、崩溃、远程桌面会话切换），事件循环线程
+                // 就永远卡在那一次调用里，整个界面冻住——正是用户报的「用 fcitx 打字/删除时
+                // 程序卡死」。聚焦期间恒定上报，XIC 只建一次，往返次数降到「光标真的移动了」
+                // 那几次。
+                //
+                // 钳进 `clip`：光标滚出视口时不能把候选框定位到视口外（会飞到屏幕别处），
+                // 而且钳住之后这个值在继续滚动时是**不变**的，连带把「滚动时每帧一次
+                // XSetICValues」也消掉了。
+                if focused {
+                    let caret_rect = caret_px_frame
+                        .map(|p| {
+                            egui::Rect::from_min_size(
+                                egui::pos2(p.x, p.y - row_h),
+                                egui::vec2(1.0, row_h),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            egui::Rect::from_min_size(clip.min, egui::vec2(1.0, row_h))
+                        });
+                    let irect = clamp_rect_into(caret_rect, clip);
+                    ui.ctx().output_mut(|o| {
+                        o.ime = Some(egui::output::IMEOutput {
+                            rect: irect,
+                            cursor_rect: irect,
+                        })
+                    });
+                }
                 overlays::paint_completion_popup(ui, ed, text_id, clip, gutter_w, char_w, row_h);
                 // 行号分割线（固定在左侧行号列右缘）
                 gutter::paint_gutter_separator(&painter, clip, gutter_w);
@@ -596,4 +647,108 @@ pub(super) fn paint_visible_rows(
                 }
             });
         });
+}
+
+#[cfg(test)]
+mod ime_report_tests {
+    use super::*;
+
+    /// 编辑器聚焦时 `o.ime` 必须**恒定上报**，与光标是否滚出视口无关。
+    ///
+    /// 这不是美观问题，是会把整个程序冻住的那类：`o.ime` 为 `None` 的那一帧，egui-winit 会
+    /// 调 `set_ime_allowed(false)`，而 winit 在 X11 上的实现是 **XDestroyIC**；下一帧又变回
+    /// `Some` 就是 **XCreateIC**。两者都是同步的 XIM 往返——Xlib 把请求发给输入法（fcitx）
+    /// 之后阻塞等回复，**没有超时**。旧实现是「光标可见才报」，于是光标停在视口边缘上下
+    /// 滚动时，每一帧都销毁并重建一次输入上下文；只要 fcitx 在其中某一次往返中途没了
+    /// （崩溃、重启、远程桌面会话切换），事件循环线程就永远停在那一次调用里，整个界面冻住。
+    /// 这正是用户报的「远程桌面下用 fcitx 打字/删除时 iShell 卡死」。
+    ///
+    /// 反向对照：把 `paint_visible_rows` 里那段上报改回「光标可见才报」，第三帧就会是 false。
+    #[test]
+    fn ime_is_reported_whenever_focused_even_with_the_caret_scrolled_away() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let content: String = (0..400).map(|i| format!("line {i}\n")).collect();
+        let mut ed = Editor::new("/tmp/ime_probe.txt".into(), content);
+        // 行索引是懒建的（`Editor::new` 只存内容），不先算一次会在取行时下标越界。
+        super::super::wrap::v_recompute(&mut ed);
+
+        let mut reported = Vec::new();
+        // 光标始终在第 0 行；视口滚到很远再滚回来。第一帧顺带让字体/样式生效。
+        for top in [0usize, 0, 300, 0] {
+            ed.vtop = top;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut actions = ChromeActions::default();
+                    paint_visible_rows(
+                        ui,
+                        &mut ed,
+                        egui::Id::new("ime_probe"),
+                        16.0,
+                        8.0,
+                        egui::FontId::monospace(14.0),
+                        Palette::BG,
+                        true, // focused
+                        false,
+                        "txt".into(),
+                        14.0,
+                        &mut actions,
+                    );
+                });
+            });
+            reported.push(out.platform_output.ime.is_some());
+        }
+        assert_eq!(
+            reported,
+            vec![true; 4],
+            "聚焦期间有某一帧没有上报 o.ime（第 3 帧是光标滚出视口）：\
+             那一帧 egui-winit 会 set_ime_allowed(false) → X11 上 XDestroyIC，\
+             滚回来又 XCreateIC，都是没有超时的同步 XIM 往返，fcitx 一抽风就整个界面冻住"
+        );
+    }
+
+    /// 上报的矩形必须落在可见区内：光标滚出视口时报一个视口外的位置，输入法候选窗会飘到
+    /// 屏幕别处；而且那个值在继续滚动时每帧都变，每次变化都是一次 `XSetICValues`（同样是
+    /// 同步 XIM 往返）。钳住之后它在光标出视口后是常量，滚动期间不再产生任何 XIM 往返。
+    #[test]
+    fn clamped_rect_stays_inside_and_stops_moving_once_out_of_view() {
+        let bounds = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 50.0));
+        // 远在上方 / 远在下方 / 远在右侧，都必须落回 bounds 内
+        for r in [
+            egui::Rect::from_min_size(egui::pos2(-500.0, -900.0), egui::vec2(1.0, 16.0)),
+            egui::Rect::from_min_size(egui::pos2(5000.0, 9000.0), egui::vec2(1.0, 16.0)),
+            egui::Rect::from_min_size(egui::pos2(400.0, 30.0), egui::vec2(1.0, 16.0)),
+        ] {
+            let c = clamp_rect_into(r, bounds);
+            assert!(bounds.contains_rect(c), "{c:?} 没落在 {bounds:?} 里");
+            assert_eq!(c.size(), r.size(), "钳位不该改变尺寸");
+        }
+        // 关键性质：光标越滚越远时，钳位结果不再变化——滚动期间零 XIM 往返。
+        let far1 = clamp_rect_into(
+            egui::Rect::from_min_size(egui::pos2(0.0, -1000.0), egui::vec2(1.0, 16.0)),
+            bounds,
+        );
+        let far2 = clamp_rect_into(
+            egui::Rect::from_min_size(egui::pos2(0.0, -9999.0), egui::vec2(1.0, 16.0)),
+            bounds,
+        );
+        assert_eq!(far1, far2, "越滚越远时钳位结果还在变，等于每帧一次 XSetICValues");
+    }
+
+    /// 矩形比可见区还大时也不能产生 NaN / 反向区间（窗口被拖到极小的退化情形）。
+    #[test]
+    fn degenerate_bounds_do_not_produce_garbage() {
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0));
+        let big = egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(200.0, 200.0));
+        let c = clamp_rect_into(big, tiny);
+        assert!(c.min.x.is_finite() && c.min.y.is_finite());
+        assert_eq!(c.min, tiny.min, "放不下时以可见区左上角为准");
+    }
 }

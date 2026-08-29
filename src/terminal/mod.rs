@@ -499,6 +499,13 @@ impl Terminal {
         if focused != self.prev_focused {
             log::debug!("terminal focus = {focused}");
             self.prev_focused = focused;
+            // 组字状态自愈（失焦）：把还挂在屏幕上的组字预编辑清掉。输入法半路没了
+            // （fcitx 崩溃/重启、远程桌面会话切换）时 `Disabled` 永远不会来，这截拼音
+            // 就会一直画在光标处，看起来像终端花了。用户「重启输入法」这条自救路径
+            // 必须能把界面恢复干净。
+            if !focused {
+                self.ime_preedit.clear();
+            }
         }
 
         // 关键：终端聚焦时锁定 Tab / 方向键 / Esc，使其传给 shell（修复 Tab 补全），

@@ -25,6 +25,9 @@ impl Terminal {
             self.input_line.clear();
             self.hist = None;
         }
+        // 组字状态自愈的两个信号（判定放在循环后，见那里的说明）
+        let ime_seen = events.iter().any(|e| matches!(e, egui::Event::Ime(_)));
+        let plain_text_seen = events.iter().any(|e| matches!(e, egui::Event::Text(_)));
         for ev in events {
             // 记录用户输入时刻：自动注入（如 MCP 配对 export）必须等用户停笔的安全信号
             match &ev {
@@ -226,6 +229,13 @@ impl Terminal {
                 }
                 _ => {}
             }
+        }
+        // 组字状态自愈：本帧收到了普通文本输入，却一条 Ime 事件都没有。XIM 组字期间按键
+        // 会被输入法过滤掉，能收到裸 `Text` 就说明组字已经不在了——输入法多半是半路没了
+        // （fcitx 崩溃/重启、远程桌面会话切换），`Disabled` 永远不会来。不清的话，那截没
+        // 提交的拼音会一直画在光标处，看起来像终端花了，而且用户重启输入法也擦不掉。
+        if !ime_seen && plain_text_seen && !self.ime_preedit.is_empty() {
+            self.ime_preedit.clear();
         }
         out
     }

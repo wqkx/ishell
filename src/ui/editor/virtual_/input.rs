@@ -13,6 +13,27 @@ use super::geom::{next_char_boundary, v_sel_range};
 use super::wrap::v_recompute;
 use crate::ui::ime_safe::replace_preedit;
 
+/// 撤销一段**没提交**的组字，把内容恢复到组字前。
+///
+/// 三个调用点：输入法明确说组字取消（`ImeEvent::Disabled`）、编辑器失焦、以及「收到裸文本
+/// 输入却没有任何 Ime 事件」。后两个是**自愈**用的：输入法进程半路没了（fcitx 崩溃/重启、
+/// 远程桌面会话切换）时 `Disabled` 永远不会来，组字区间就一直挂着——屏幕上留着一截没提交
+/// 的拼音，而下一次组字还会拿这个陈旧区间去 `replace_preedit`，替到别的地方去。
+/// （区间本身落在多字节字符中间也不会 panic，那由 `ui::ime_safe` 兜住；这里管的是
+/// 「内容被改到不该改的位置」。）
+///
+/// 没有组字在进行时是无操作，可以随便调。
+pub(super) fn v_cancel_preedit(ed: &mut Editor) {
+    let Some(r) = ed.vime_preedit.take() else {
+        return;
+    };
+    ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
+    ed.vsel = None;
+    // 内容恢复到组字前，可能恰好回到保存点上——全量重算 dirty
+    ed.recompute_dirty();
+    v_recompute(ed);
+}
+
 pub(super) fn handle_input(
     ui: &mut egui::Ui,
     ed: &mut Editor,
@@ -38,6 +59,8 @@ pub(super) fn handle_input(
                 })
                 .collect()
         });
+        // 本帧到底有没有输入法事件——下面的「组字状态自愈」要用。
+        let ime_seen = !ime_events.is_empty();
         for ev in ime_events {
             match ev {
                 egui::ImeEvent::Enabled => {}
@@ -78,22 +101,27 @@ pub(super) fn handle_input(
                         v_multi_replace(ed, &t);
                     }
                 }
-                egui::ImeEvent::Disabled => {
-                    if let Some(r) = ed.vime_preedit.take() {
-                        ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
-                        ed.vsel = None;
-                        // 组字取消：内容恢复到组字前，可能恰在保存点上——全量重算
-                        ed.recompute_dirty();
-                        v_recompute(ed);
-                    }
-                }
+                egui::ImeEvent::Disabled => v_cancel_preedit(ed),
             }
         }
         // 已自绘处理，移除 Ime 事件，避免主循环重复处理
         ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
+        // 组字状态自愈（信号二）：本帧收到了普通文本输入，却一条 Ime 事件都没有。
+        // XIM 组字期间按键会被输入法过滤掉，能收到裸 `Text` 就说明组字已经不在了——
+        // 输入法多半是半路没了（fcitx 崩溃/重启、远程桌面会话切换），`Disabled` 永远不会来。
+        if !ime_seen && ed.vime_preedit.is_some() {
+            let typed_plain = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
+            if typed_plain {
+                v_cancel_preedit(ed);
+            }
+        }
     }
     if !focused {
         ed.complete = None; // 失焦关闭补全弹窗
+        // 组字状态自愈（信号一）：失焦时把没提交的组字撤掉。不撤的话，用户去重启了输入法
+        // 再点回来，屏幕上还留着上次那截没提交的拼音，而且 `vime_preedit` 里那个陈旧区间
+        // 会被下一次组字拿去替换——替到别的地方，看起来就是「输入法一抽风编辑器就乱」。
+        v_cancel_preedit(ed);
     }
     let mut typed = false; // 本帧是否有字符输入（补全触发 + 光标闪烁重置）
     if focused {
@@ -362,4 +390,55 @@ pub(super) fn handle_input(
         ed.caret_blink_at = ui.input(|i| i.time);
     }
     (save, moved, typed)
+}
+
+#[cfg(test)]
+mod preedit_healing_tests {
+    use super::*;
+
+    /// `v_cancel_preedit` 是「输入法半路没了」的自愈原语：把没提交的组字从内容里撤掉，
+    /// 回到组字前的样子。三个调用点——`Ime(Disabled)`、编辑器失焦、收到裸文本却没有任何
+    /// Ime 事件——后两个正是为了 fcitx 崩溃/重启时 `Disabled` 永远不来的那种情况。
+    #[test]
+    fn cancelling_an_unfinished_composition_restores_the_buffer() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "前缀后缀".into());
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        super::super::wrap::v_recompute(&mut ed);
+        // 模拟组字已上屏："前缀" 之后插了一截拼音
+        let at = "前缀".len();
+        let (s, e) = crate::ui::ime_safe::replace_preedit(&mut ed.content, (at, at), "zhong");
+        ed.vime_preedit = Some((s, e));
+        ed.vcaret = e;
+        assert_eq!(ed.content, "前缀zhong后缀");
+
+        v_cancel_preedit(&mut ed);
+        assert_eq!(ed.content, "前缀后缀", "没提交的组字没有被撤掉");
+        assert!(ed.vime_preedit.is_none(), "组字区间必须一并清掉");
+        assert_eq!(ed.vcaret, at, "光标应回到组字起点");
+    }
+
+    /// 没有组字在进行时必须是无操作——三个调用点里有两个是无条件调的（失焦每帧都会走到）。
+    #[test]
+    fn cancelling_without_a_composition_is_a_no_op() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "hello".into());
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        super::super::wrap::v_recompute(&mut ed);
+        ed.vcaret = 5;
+        v_cancel_preedit(&mut ed);
+        assert_eq!(ed.content, "hello");
+        assert_eq!(ed.vcaret, 5, "无组字时不该动光标");
+    }
+
+    /// 组字区间**陈旧**（缓冲区在两条 Ime 事件之间被撤销/重载换掉，区间落在多字节字符
+    /// 中间）时，自愈也不能 panic——它走的是 `ime_safe::replace_preedit`，那里负责吸附。
+    #[test]
+    fn cancelling_a_stale_range_does_not_panic() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "中文".into());
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        super::super::wrap::v_recompute(&mut ed);
+        ed.vime_preedit = Some((5, 999)); // 5 落在「文」中间，999 越界
+        v_cancel_preedit(&mut ed);
+        assert!(ed.vime_preedit.is_none());
+        assert!(ed.content.is_char_boundary(ed.vcaret));
+    }
 }

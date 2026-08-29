@@ -14,6 +14,13 @@ pub(super) fn ime_apply_events(
 ) {
     let focused = ui.ctx().memory(|m| m.focused() == Some(id));
     if !focused {
+        // 组字状态自愈（失焦）：把没提交的组字撤掉。输入法半路没了（fcitx 崩溃/重启、
+        // 远程桌面会话切换）时 `Disabled` 永远不会来，`preedit` 就一直挂着——框里留着一截
+        // 没提交的拼音，而下一次组字还会拿这个陈旧区间去替换，替到别的地方去。
+        // 用户「重启输入法再点回来」这条自救路径必须是干净的，否则重启了也还是乱的。
+        if let Some(r) = preedit.take() {
+            replace_preedit(buf, r, "");
+        }
         return;
     }
     let ime: Vec<egui::ImeEvent> = ui.input_mut(|i| {
@@ -32,6 +39,15 @@ pub(super) fn ime_apply_events(
         evs
     });
     if ime.is_empty() {
+        // 组字状态自愈（收到裸文本却没有 Ime 事件）：XIM 组字期间按键会被输入法过滤，
+        // 能收到裸 `Text` 就说明组字已经不在了——同上，撤掉没提交的那截。
+        if preedit.is_some()
+            && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))))
+        {
+            if let Some(r) = preedit.take() {
+                replace_preedit(buf, r, "");
+            }
+        }
         return;
     }
     let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
