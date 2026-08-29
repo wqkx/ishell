@@ -21,7 +21,7 @@
 //!
 //! 依赖 `Cargo.toml` 里的 `panic = "unwind"`（那里已有注释说明不要改成 abort）。
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// 连续多少帧都 panic 就不再兜底。
 ///
@@ -44,6 +44,14 @@ const _: () = assert!(GIVE_UP_TOTAL >= GIVE_UP_AFTER && GIVE_UP_TOTAL <= 1000);
 
 static CONSECUTIVE: AtomicU32 = AtomicU32::new(0);
 static TOTAL: AtomicU32 = AtomicU32::new(0);
+/// 本帧已经有地方 panic 过了。
+///
+/// 一帧现在有**两个**被 `catch_unwind` 罩住的入口：`App::logic`（每帧的后台推进，窗口不可见
+/// 时也跑）和 `App::ui`（绘制）。少了这个标记，`logic` 里的 panic 会被紧接着成功返回的 `ui`
+/// 调用 [`on_frame_ok`] 清零，[`GIVE_UP_AFTER`] 那条「连续崩就别兜了」永远够不到——退化成
+/// 本文件开头明确点名的最难受的一种：每帧崩一次、每帧又"恢复"，应用带着一个半截状态无限
+/// 空转（`on_frame_panic` 还会 `request_repaint`，于是是满速空转）。
+static PANICKED_THIS_FRAME: AtomicBool = AtomicBool::new(false);
 /// 用户点「知道了」时的累计次数。存计数而不是 bool：bool 是单向开关，点掉一次之后
 /// 后续 99 次恢复都悄无声息，然后在累计上限那一刻毫无预兆地把整个进程带走。存计数就能在
 /// 又崩了之后重新弹出来——每一次都是「状态可能已经不一致」的新警告，用户有机会先存盘。
@@ -149,13 +157,17 @@ fn append_crash_log(loc: &str, thread: &str, msg: &str) {
     );
 }
 
-/// 本帧绘制正常结束：清零连续计数。
+/// 本帧绘制正常结束：清零连续计数——**但本帧另一半（`App::logic`）没崩过才算数**。
 pub fn on_frame_ok() {
+    if PANICKED_THIS_FRAME.swap(false, Ordering::Relaxed) {
+        return; // 这一帧是「logic 崩了、ui 没崩」，不能当成干净的一帧
+    }
     CONSECUTIVE.store(0, Ordering::Relaxed);
 }
 
 /// 本帧绘制 panic 且已被接住。连续崩太多次则不再兜底，让它照常崩。
 pub fn on_frame_panic(ctx: &egui::Context) {
+    PANICKED_THIS_FRAME.store(true, Ordering::Relaxed);
     let n = CONSECUTIVE.fetch_add(1, Ordering::Relaxed) + 1;
     let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
     if n >= GIVE_UP_AFTER {
@@ -260,6 +272,27 @@ mod tests {
             "已存在的宽权限文件必须被收紧"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一帧的两半：`App::logic` 崩了、`App::ui` 没崩，**不能**算作干净的一帧。
+    /// 算干净的话连续计数每帧被清零，`GIVE_UP_AFTER` 永远够不到，只剩满速空转。
+    #[test]
+    fn a_panic_in_the_logic_half_is_not_erased_by_a_clean_ui_half() {
+        CONSECUTIVE.store(0, Ordering::Relaxed);
+        PANICKED_THIS_FRAME.store(false, Ordering::Relaxed);
+        // 模拟：logic 崩 → ui 正常
+        PANICKED_THIS_FRAME.store(true, Ordering::Relaxed);
+        CONSECUTIVE.store(1, Ordering::Relaxed);
+        on_frame_ok();
+        assert_eq!(
+            CONSECUTIVE.load(Ordering::Relaxed),
+            1,
+            "logic 崩过的那一帧被 ui 的成功清零了——连续崩判定就此失效"
+        );
+        // 下一帧两半都干净 → 才允许清零
+        on_frame_ok();
+        assert_eq!(CONSECUTIVE.load(Ordering::Relaxed), 0);
+        CONSECUTIVE.store(0, Ordering::Relaxed);
     }
 
     /// 「知道了」记的是当时的累计次数，不是一个单向开关：再崩就得再弹。

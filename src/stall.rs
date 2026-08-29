@@ -26,6 +26,11 @@
 //! 用户停手 [`ACTIVE_WINDOW`] 之后探测自动停止，空闲期一次多余的唤醒都没有——而在探测
 //! 期间 egui 本来就在为光标闪烁重绘，等于零额外成本。
 
+/// 窗口可见时卡死的那套说辞：用户实测抓到的栈就是这个形状。
+const XIM_LIKELY: &str = "卡在输入法的同步 XIM 请求上（Xlib 对 XIM 没有超时）。典型栈：\n\
+     \x20         poll → _XReadEvents → XIfEvent → _XimRead → XSetICValues\n\
+     \x20         → winit::…::ImeContext::set_spot → eframe::run_native";
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,7 +46,12 @@ static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// 只报一次：卡死之后每 2 秒往日志里灌一条毫无意义。
-static REPORTED: AtomicBool = AtomicBool::new(false);
+///
+/// 按**原因**分开记，不是一个总闸：窗口最小化时的卡死不采取任何处置（见 [`on_stall`]），
+/// 用一个总闸的话，它会把后面一次真正的、窗口可见的 XIM 卡死一并吞掉——那次既不写日志也
+/// 不关跟随，正好回到「它又卡死了，一行记录都没有」这个本模块要根除的状态。
+static REPORTED_HIDDEN: AtomicBool = AtomicBool::new(false);
+static REPORTED_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 最后一帧时窗口是不是最小化/被遮挡。卡死时用来判断该不该把账算到输入法头上——
 /// 最小化状态下卡住更可能是窗口/绘制路径（eframe 仍会给最小化的窗口画帧并交换缓冲，
 /// 而合成器可能已经不再给它调度垂直同步了），跟 XIM 无关。
@@ -97,8 +107,14 @@ pub fn spawn(ctx: egui::Context) {
                 continue; // 用户停手了，不探——空闲期一次多余唤醒都不做
             }
             if should_report(now, LAST_FRAME_MS.load(Ordering::Relaxed), last_input) {
-                if !REPORTED.swap(true, Ordering::Relaxed) {
-                    on_stall();
+                let hidden = WAS_HIDDEN.load(Ordering::Relaxed);
+                let latch = if hidden {
+                    &REPORTED_HIDDEN
+                } else {
+                    &REPORTED_VISIBLE
+                };
+                if !latch.swap(true, Ordering::Relaxed) {
+                    on_stall(hidden);
                 }
                 continue; // 已经卡住了，别再请求重绘
             }
@@ -109,8 +125,7 @@ pub fn spawn(ctx: egui::Context) {
 }
 
 /// 判定卡死之后做的两件事：落日志、（在能确定元凶时）把最可能的元凶关掉。
-fn on_stall() {
-    let hidden = WAS_HIDDEN.load(Ordering::Relaxed);
+fn on_stall(hidden: bool) {
     let follow = crate::store::load_ime_follow_caret();
     log::error!(
         "UI 线程已 {}s 没有出帧（用户刚刚还在输入）。窗口最小化/被遮挡={hidden}，\
@@ -152,24 +167,34 @@ fn write_stall_log(hidden: bool, follow_was_on: bool, acted: bool) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let action = if acted {
-        "已自动关闭「输入法候选框跟随光标」，重启后不再发送 XSetICValues。"
-    } else if hidden {
-        "窗口当时是最小化/被遮挡的：这种情况下更可能卡在窗口与绘制路径上（合成器不再给\n\
-         \x20         图标化的窗口调度垂直同步，而 eframe 仍会给它画帧并交换缓冲），与输入法无关，\n\
-         \x20         因此**没有**去动输入法设置。请务必抓一份栈。"
+    // 「最可能」和「已处理」必须讲同一个故事：早先的版本无论如何都印那段 XIM 栈，而窗口
+    // 最小化时紧接着又说「跟输入法无关」，同一份日志自相矛盾，反而误导排查。
+    let (likely, action) = if hidden {
+        (
+            "窗口当时是最小化/被遮挡的，更可能卡在窗口与绘制路径上：合成器不再给一个图标化的\n\
+             \x20         窗口调度垂直同步，而 eframe 仍会给它画帧并交换缓冲（原生平台上 is_visible\n\
+             \x20         恒为真），缓冲交换就会一直等一个不来的帧回调。",
+            "**没有**去动输入法设置（这种形态与 XIM 无关）。请务必抓一份栈。",
+        )
+    } else if acted {
+        (
+            XIM_LIKELY,
+            "已自动关闭「输入法候选框跟随光标」，重启后不再发送 XSetICValues。",
+        )
     } else {
-        "「输入法候选框跟随光标」本来就是关的——这次卡死另有原因，请抓一份栈。"
+        (
+            XIM_LIKELY,
+            "「输入法候选框跟随光标」本来就是关的——这次卡死另有原因，请抓一份栈。",
+        )
     };
     let _ = writeln!(
         f,
         "\n=== ishell {} UI 线程卡死 ===\n\
          unix_time: {secs}\n\
          现象:     用户刚刚还在输入，但界面已经 {}s 没有出帧（看门狗每 2s 主动请求重绘，\
-         活着的事件循环不可能这么久不响应）。窗口最小化/被遮挡={hidden}。\n\
-         最可能:   卡在输入法的同步 XIM 请求上（Xlib 对 XIM 没有超时）。典型栈：\n\
-         \x20         poll → _XReadEvents → XIfEvent → _XimRead → XSetICValues\n\
-         \x20         → winit::…::ImeContext::set_spot → eframe::run_native\n\
+         活着的事件循环不可能这么久不响应）。\n\
+         当时状态: 窗口最小化/被遮挡={hidden}，输入法候选框跟随光标={follow_was_on}\n\
+         最可能:   {likely}\n\
          已处理:   {action}\n\
          想确认:   下次卡住时跑 gdb -p $(pidof ishell) -batch -ex \"thread apply all bt\"",
         crate::version::VERSION,

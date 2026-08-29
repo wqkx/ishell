@@ -37,14 +37,54 @@ impl App {
     pub(super) fn pump_background(&mut self, ctx: &egui::Context) {
         self.drain_mcp_calls();
         let mut backlog = false;
+        // 跨会话拷贝状态机要吃的那几条 pending 也在这里收走：它同样是纯后台推进，不碰 Ui，
+        // 而且一旦停摆，`copy_between_sessions` 会卡在某个中间阶段既不前进也不超时。
+        let mut relay_source: Vec<(u64, Result<u64, String>)> = Vec::new();
+        let mut copy_done: Vec<(u64, u64, bool, String)> = Vec::new();
+        let mut temp_key_trusted: Vec<(u64, bool, String)> = Vec::new();
+        let mut temp_key_untrusted: Vec<u64> = Vec::new();
+        let mut direct_relay_started: Vec<u64> = Vec::new();
+        let mut direct_relay_done: Vec<(u64, bool, String)> = Vec::new();
         for s in &mut self.sessions {
             backlog |= s.drain_events();
+            for x in s.pending.relay_source.drain(..) {
+                relay_source.push(x);
+            }
+            for (id, ok, message) in s.pending.copy_done.drain(..) {
+                copy_done.push((s.uid, id, ok, message));
+            }
+            for x in s.pending.temp_key_trusted.drain(..) {
+                temp_key_trusted.push(x);
+            }
+            for x in s.pending.temp_key_untrusted.drain(..) {
+                temp_key_untrusted.push(x);
+            }
+            for x in s.pending.direct_relay_started.drain(..) {
+                direct_relay_started.push(x);
+            }
+            for x in s.pending.direct_relay_done.drain(..) {
+                direct_relay_done.push(x);
+            }
         }
+        // 必须在上面那轮 drain_events **之后**：文件读写的超时判定要晚于「本帧事件是否已经
+        // 带来真正结果」，否则会跟刚好本帧到达的完成事件打时序竞争（见该方法注释）。
+        self.check_file_op_timeouts();
+        self.advance_cross_copy_jobs(
+            temp_key_trusted,
+            temp_key_untrusted,
+            direct_relay_started,
+            direct_relay_done,
+            relay_source,
+            copy_done,
+        );
         // 事件没排空（每帧有预算，防止一次性把渲染拖垮）：马上再来一帧接着消化。
         // 这是**同线程**的 request_repaint，可靠（不可靠的是跨线程那条，见下面的说明）。
         if backlog {
             ctx.request_repaint();
         }
+        // 必须在上面所有超时判定之后：那些判定全是每帧轮询的，而 egui 按需重绘——空闲窗口
+        // 不转帧，它们就永远不被求值。这一下按最近的 deadline 排定时重绘，保证到点必有一帧。
+        self.arm_timeout_repaint();
 
         // AI/MCP 控制的响应性兜底节奏。
         //
@@ -63,10 +103,11 @@ impl App {
     }
 
     pub(super) fn process_frame_events(&mut self, ui: &mut egui::Ui) {
-        // 0) AI/MCP 请求与后台事件的排空已由 `pump_background` 做过——它挂在
-        //    `App::logic` 上，eframe 保证在 `App::ui` 之前调用，且窗口最小化时也调用。
-        //    这里只负责把 `s.pending.*` 里攒下的东西画出来/落到 UI 状态上。
-        // 1) 连接成功后初始化文件树
+        // AI/MCP 请求、后台事件、以及所有纯后台轮询（文件操作超时、跨会话拷贝、按 deadline
+        // 排重绘）都已由 `pump_background` 做过——它挂在 `App::logic` 上，eframe 保证在
+        // `App::ui` 之前调用，且窗口不可见时也调用。这里只负责把 `s.pending.*` 里攒下的
+        // 东西落到 UI 状态上（开标签、贴图、弹 toast…），那些是真的需要 `Ui` 的部分。
+        // 连接成功后初始化文件树
         // 身份用会话 uid（稳定唯一），title 仅作显示——避免同名会话（默认 title=用户名）串台。
         let mut new_placeholders: Vec<FramePlaceholder> = Vec::new();
         let mut filled: Vec<FrameFilled> = Vec::new();
@@ -84,20 +125,15 @@ impl App {
         let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
         let mut pdf_searches: Vec<FramePdfSearch> = Vec::new();
         let mut new_docs: Vec<(u64, u64, Vec<u8>)> = Vec::new(); // uid, 占位 id, docx 字节
-        let mut relay_source: Vec<(u64, Result<u64, String>)> = Vec::new(); // op_id, Ok(size)/Err(msg)
-        let mut copy_done: Vec<(u64, u64, bool, String)> = Vec::new(); // uid, op_id, ok, message
-        let mut temp_key_trusted: Vec<(u64, bool, String)> = Vec::new();
-        let mut temp_key_untrusted: Vec<u64> = Vec::new();
-        let mut direct_relay_started: Vec<u64> = Vec::new();
-        let mut direct_relay_done: Vec<(u64, bool, String)> = Vec::new();
-        let mut evt_backlog = false;
         // 终端通知的判据：都要在借用 sessions 之前算好。
         let active_uid = self.active.and_then(|i| self.sessions.get(i).map(|s| s.uid));
         let window_focused = self.ctx.input(|i| i.focused);
         let notify_mode = crate::store::load_ai_notify_mode();
         for s in &mut self.sessions {
-            // 事件积压未排空（每帧预算保护渲染）时安排下一帧继续消化
-            evt_backlog |= s.drain_events();
+            // 这里**不再** drain_events：`pump_background` 已经排空过（它挂在 `App::logic`
+            // 上，eframe 保证先于 `App::ui` 调用）。再排一次会把 `Session::drain_events`
+            // 里那份「每帧最多 2MB / 512 条」的预算翻倍——那份预算正是用来防止一个话痨
+            // 远端把渲染饿死的，不能白白放大到两倍。
             if s.connected && !s.initialized {
                 s.initialized = true;
                 // 本机会话也初始化文件树：init_files 发 ListDir("."), 本机 worker 解析到家目录
@@ -199,24 +235,6 @@ impl App {
                     text,
                 });
             }
-            for x in s.pending.relay_source.drain(..) {
-                relay_source.push(x);
-            }
-            for (id, ok, message) in s.pending.copy_done.drain(..) {
-                copy_done.push((s.uid, id, ok, message));
-            }
-            for x in s.pending.temp_key_trusted.drain(..) {
-                temp_key_trusted.push(x);
-            }
-            for x in s.pending.temp_key_untrusted.drain(..) {
-                temp_key_untrusted.push(x);
-            }
-            for x in s.pending.direct_relay_started.drain(..) {
-                direct_relay_started.push(x);
-            }
-            for x in s.pending.direct_relay_done.drain(..) {
-                direct_relay_done.push(x);
-            }
         }
         // 用户自己切回（并且正看着）某个标签，那条通知的使命就完成了——不该还要手动点掉它。
         // 条件与上面「不弹」的规则**严格对称**（窗口在前台 且 是活动标签）：少了 window_focused
@@ -232,23 +250,8 @@ impl App {
                 os_notify_close(uid);
             }
         }
-        // 必须在上面这个 drain_events 循环之后调用：文件读写超时判定要晚于"本帧事件是否
-        // 已经带来真正结果"的判断，否则会跟刚好本帧到达的完成事件打时序竞争（见该方法注释）。
-        self.check_file_op_timeouts();
-        self.advance_cross_copy_jobs(
-            temp_key_trusted,
-            temp_key_untrusted,
-            direct_relay_started,
-            direct_relay_done,
-            relay_source,
-            copy_done,
-        );
-        if evt_backlog {
-            self.ctx.request_repaint();
-        }
-        // 必须在上面所有超时判定之后：那些判定全是每帧轮询的，而 egui 按需重绘——空闲窗口
-        // 不转帧，它们就永远不被求值。这一下按最近的 deadline 排定时重绘，保证到点必有一帧。
-        self.arm_timeout_repaint();
+        // 超时判定、跨会话拷贝推进、按 deadline 排重绘都在 `pump_background` 里——它们是
+        // 纯后台轮询，放在只有窗口可见时才跑的这里，窗口一藏起来就全停摆了。
         // 设置持久化失败（磁盘满/只读/权限）也冒泡成顶部 toast，避免「以为已保存、其实没落盘」。
         warns.extend(crate::store::take_setting_write_errors());
         // 警告（如编码丢字）弹顶部 toast
