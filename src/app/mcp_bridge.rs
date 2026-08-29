@@ -574,8 +574,15 @@ pub(super) struct PendingBindConsent {
 /// 注意签名里**没有**任何设置项，这是刻意的：用户明确要求过「AI 只能操作自己开的会话，
 /// 操作用户的会话必须授权」。0.19 一度让 `mcp_auto_approve` 从这里短路过去，那是错的。
 /// 谁要再加一个能绕过它的开关，先来改这个函数、并解释为什么。
-fn write_needs_consent(ai_owned: bool, already_approved: bool) -> bool {
-    !ai_owned && !already_approved
+fn write_needs_consent(ai_owned: Option<bool>, already_approved: bool) -> bool {
+    match ai_owned {
+        // 会话根本不存在：**不在这道门拦**。拦下来只能含混地说一句「需要授权」，而放它过去
+        // 各分支会回「会话不存在（uid=…）+ 当前可用会话列表」——那条报错有用得多。
+        // 这也是下面 `expect("…确认过这个会话存在")` 成立的前提：这里返回 false 的 uid
+        // 不会被选中，被选中的必然存在。
+        None => false,
+        Some(owned) => !owned && !already_approved,
+    }
 }
 
 /// 给用户看的一句话：AI 具体想拿这个会话干什么。
@@ -1718,9 +1725,13 @@ impl App {
         // 目标会话不存在时不在这里拦：让它照常走下去，由各分支回「会话不存在 + 当前可用
         // 会话列表」那条更有用的报错，而不是在这里含混地说一句"需要授权"。
         let Some(uid) = call.req.kind.write_target_uids().into_iter().find(|uid| {
+            // `None` = 这个 uid 没有对应的会话。**必须原样传给判定**，不能在这里塌成
+            // `is_some_and(..)` 那种「不存在就当成不是 ai_owned」——那会让不存在的会话被判成
+            // 「需要授权」并选中，随后撞上下面那句 expect 直接 panic（AI 手里攥着一个 iShell
+            // 重启前的旧 uid 就够了，重启后 uid 从 1 重新分配）。
             let ai_owned = self
                 .session_idx_by_uid(*uid)
-                .is_some_and(|idx| self.sessions[idx].ai_owned);
+                .map(|idx| self.sessions[idx].ai_owned);
             write_needs_consent(ai_owned, self.mcp_use_approved.contains(uid))
         }) else {
             return Some(call);
@@ -1734,7 +1745,9 @@ impl App {
             });
             return None;
         }
-        let idx = self.session_idx_by_uid(uid).expect("上面刚确认过这个会话存在");
+        let idx = self
+            .session_idx_by_uid(uid)
+            .expect("write_needs_consent(None, _) 恒为 false，被选中的 uid 必然存在");
         let title = self.sessions[idx].title.clone();
         let action = action_summary(&call.req.kind);
         self.pending_use_consent = Some(PendingUseConsent {
@@ -2495,7 +2508,7 @@ mod write_consent_tests {
     #[test]
     fn writing_a_user_owned_session_always_needs_consent() {
         assert!(
-            write_needs_consent(false, false),
+            write_needs_consent(Some(false), false),
             "用户自己开的会话、且本次运行没授权过——必须当面确认，任何设置都不该绕过"
         );
     }
@@ -2504,15 +2517,29 @@ mod write_consent_tests {
     /// 不存在两路输入交织的问题。
     #[test]
     fn ai_owned_sessions_need_no_consent() {
-        assert!(!write_needs_consent(true, false));
-        assert!(!write_needs_consent(true, true));
+        assert!(!write_needs_consent(Some(true), false));
+        assert!(!write_needs_consent(Some(true), true));
+    }
+
+    /// **会话不存在时不在这道门拦。** 这条既是体验（放过去才能回「会话不存在 + 当前可用会话
+    /// 列表」那条有用的报错，而不是含混的「需要授权」），也是安全边界：判定返回 true 的 uid
+    /// 会被选中，而选中之后的代码用 `expect` 断言它存在——一旦这里对 `None` 返回 true，
+    /// 任何一条点名不存在 uid 的写请求都会把 UI 线程打 panic。AI 手里攥着一个 iShell 重启前
+    /// 的旧 uid 就够了（重启后 uid 从 1 重新分配）。
+    #[test]
+    fn a_uid_with_no_session_is_not_gated_here() {
+        assert!(
+            !write_needs_consent(None, false),
+            "不存在的会话被判成「需要授权」——它会被选中，然后撞上 expect 直接 panic"
+        );
+        assert!(!write_needs_consent(None, true));
     }
 
     /// 用户为某个会话授权过一次之后，本次运行内不再打扰他。
     /// uid 由 `next_uid` 单调分配、只增不复用，所以不存在「授权被后开的会话捡到」。
     #[test]
     fn an_approved_session_is_not_asked_again() {
-        assert!(!write_needs_consent(false, true));
+        assert!(!write_needs_consent(Some(false), true));
     }
 }
 

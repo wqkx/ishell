@@ -201,7 +201,7 @@ pub fn view_context_menu(resp: &egui::Response) {
                         .on_hover_text(crate::i18n::tr(
                             "只管「AI 用某条已保存连接新开一个自己的会话」这一档：默认不弹框，\n\
                              关掉它则每次都要你当面点允许。\n\
-                             它**管不到**「AI 写你自己打开的那些会话」——那一档永远要当面授权，\n\
+                             它管不到「AI 写你自己打开的那些会话」——那一档永远要当面授权，\n\
                              没有任何开关能绕过：AI 只能随便动自己开的会话。",
                             "Covers only \"the AI opens a new session of its own from a saved \n\
                              connection\": no prompt by default, turn it off to confirm each time.\n\
