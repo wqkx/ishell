@@ -227,7 +227,7 @@ Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal se
 
 With the switch on, each SSH connect reverse-forwards the local MCP socket to `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). Remote `ishell-mcp` auto-discovers it — usually no path to configure.
 
-**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Since 0.19 the AI is not asked to confirm each action either (Settings → “Don't ask before each AI action” restores the prompts), so the master switch above *is* the permission boundary.
+**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Reaching the socket lets a caller open its own sessions and read; writing into a session *you* opened still requires your on-screen consent every time.
 
 ### ⚠️ Several computers sharing one AI server (read this)
 
@@ -250,7 +250,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 ### Other notes
 
-- Since 0.19 the AI acts without per-action prompts. Turn **Settings → “Don't ask before each AI action”** off to get a confirmation whenever the AI wants to use a session *you* opened, or to open a new one.
+- **The AI may act freely only in sessions it opened itself.** Writing into a session *you* opened always needs on-screen consent — no setting can bypass that. **Settings → “Don't ask before the AI opens a session”** (on by default) covers only the other case: the AI opening a new session of its own from a saved connection.
 - AI commands appear live in the target tab — you always see what it did.
 - GUI and `ishell-mcp` must be the same version; re-run `install-mcp.sh` after upgrades.
 
@@ -258,7 +258,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
-- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port; per-action confirmations are off by default and can be turned back on in Settings; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
+- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port; the AI may act freely only in sessions it opened itself — writing into your own sessions always needs on-screen consent, which no setting can bypass; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
 
 ## 📄 License
 

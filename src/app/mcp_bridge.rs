@@ -566,6 +566,18 @@ pub(super) struct PendingBindConsent {
     deadline: Instant,
 }
 
+/// 这次写入要不要当面授权。
+///
+/// 只有两种情况不用问：目标是 **AI 自己开的**会话（`ai_owned`，用户根本不能往里打字，
+/// 两路输入交织的问题不存在），或者用户**本次运行里已经为这个会话授权过**。
+///
+/// 注意签名里**没有**任何设置项，这是刻意的：用户明确要求过「AI 只能操作自己开的会话，
+/// 操作用户的会话必须授权」。0.19 一度让 `mcp_auto_approve` 从这里短路过去，那是错的。
+/// 谁要再加一个能绕过它的开关，先来改这个函数、并解释为什么。
+fn write_needs_consent(ai_owned: bool, already_approved: bool) -> bool {
+    !ai_owned && !already_approved
+}
+
 /// 给用户看的一句话：AI 具体想拿这个会话干什么。
 ///
 /// 授权弹窗必须靠它做到知情同意——只说一句「AI 想操作这个会话」，用户没有任何依据判断该不该
@@ -1694,24 +1706,25 @@ impl App {
 
     /// 写入类操作的会话门禁：目标若是**用户自己打开的**会话且本次运行还没授权过，扣下请求
     /// 弹窗等用户当面确认。放行则原样返回 `call`；扣下（或直接回错）返回 `None`。
+    ///
+    /// # 这道闸门没有任何开关可以绕过
+    ///
+    /// AI 能随便用的只有**它自己 `open_session` 开出来的**会话。用户自己开的那些标签里有他
+    /// 正在做的事——半截命令、sudo 提示符、连着生产库的 psql——往里面打字是两路输入交织，
+    /// 轻则互相打断，重则改到他没想改的东西上。所以「操作用户的会话」必须每次当面授权，
+    /// **不受任何设置影响**：`mcp_auto_approve` 只管「AI 新开会话」那一档，绝不能拿到这里
+    /// 来短路（0.19 曾经这么干过，是错的，已改回）。判定见 [`write_needs_consent`]。
     fn gate_user_session_write(&mut self, call: McpCall) -> Option<McpCall> {
         // 目标会话不存在时不在这里拦：让它照常走下去，由各分支回「会话不存在 + 当前可用
         // 会话列表」那条更有用的报错，而不是在这里含混地说一句"需要授权"。
         let Some(uid) = call.req.kind.write_target_uids().into_iter().find(|uid| {
-            !self.mcp_use_approved.contains(uid)
-                && self
-                    .session_idx_by_uid(*uid)
-                    .is_some_and(|idx| !self.sessions[idx].ai_owned)
+            let ai_owned = self
+                .session_idx_by_uid(*uid)
+                .is_some_and(|idx| self.sessions[idx].ai_owned);
+            write_needs_consent(ai_owned, self.mcp_use_approved.contains(uid))
         }) else {
             return Some(call);
         };
-        // 「AI 操作无需逐次确认」开着（默认）时直接放行，并把这个 uid 记进批准集合——
-        // 后续即使用户中途把开关关掉，已经在用的这个会话也不会突然开始弹框。
-        // 放在「只挂一个框」那道守卫**之前**：放行根本不需要弹框，不该被别人的框挡回去。
-        if crate::store::load_mcp_auto_approve() {
-            self.mcp_use_approved.insert(uid);
-            return Some(call);
-        }
         let id = call.req.id;
         // 同一时刻只挂一个确认框：两个叠在一起用户根本分不清在批准哪个。
         if self.pending_use_consent.is_some() || self.pending_open_consent.is_some() {
@@ -2464,6 +2477,42 @@ impl App {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod write_consent_tests {
+    use super::write_needs_consent;
+
+    /// **AI 只能随便动自己开的会话。** 用户自己开的那些标签里有他正在做的事——半截命令、
+    /// sudo 提示符、连着生产库的 psql——往里面打字是两路输入交织，轻则互相打断，重则改到
+    /// 他没想改的东西上。所以写它必须当面授权。
+    ///
+    /// 0.19 一度让「AI 操作无需逐次确认」这个设置从这里短路过去，用户当场否掉了：
+    /// 「AI 就算可以任意操作会话，也不能在不授权的情况下操作用户的会话」。这条门禁盯的就是
+    /// 那次错误——注意 `write_needs_consent` 的签名里没有任何设置项，想再加一个能绕过它的
+    /// 开关，就得先改这个函数，那时这条测试会把你拦下来。
+    #[test]
+    fn writing_a_user_owned_session_always_needs_consent() {
+        assert!(
+            write_needs_consent(false, false),
+            "用户自己开的会话、且本次运行没授权过——必须当面确认，任何设置都不该绕过"
+        );
+    }
+
+    /// AI 自己开的会话随便用：`ai_owned` 会话是只读给用户看的，他的键盘输入根本进不去，
+    /// 不存在两路输入交织的问题。
+    #[test]
+    fn ai_owned_sessions_need_no_consent() {
+        assert!(!write_needs_consent(true, false));
+        assert!(!write_needs_consent(true, true));
+    }
+
+    /// 用户为某个会话授权过一次之后，本次运行内不再打扰他。
+    /// uid 由 `next_uid` 单调分配、只增不复用，所以不存在「授权被后开的会话捡到」。
+    #[test]
+    fn an_approved_session_is_not_asked_again() {
+        assert!(!write_needs_consent(false, true));
     }
 }
 

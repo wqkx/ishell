@@ -194,16 +194,20 @@ pub fn view_context_menu(resp: &egui::Response) {
                         .checkbox(
                             &mut auto,
                             crate::i18n::tr(
-                                "　AI 操作无需逐次确认",
-                                "  Don't ask before each AI action",
+                                "　AI 新开会话无需逐次确认",
+                                "  Don't ask before the AI opens a session",
                             ),
                         )
                         .on_hover_text(crate::i18n::tr(
-                            "关掉它，AI 每次「用你自己打开的会话」或「新开一个会话」都会先弹框\n\
-                             等你当面点允许。默认开着（不弹框）——真正的授权边界是上面那个总开关。",
-                            "Turn this off to get an on-screen confirmation every time the AI wants \n\
-                             to use a session you opened yourself, or to open a new one. On by \n\
-                             default (no prompts) — the switch above is the real permission boundary.",
+                            "只管「AI 用某条已保存连接新开一个自己的会话」这一档：默认不弹框，\n\
+                             关掉它则每次都要你当面点允许。\n\
+                             它**管不到**「AI 写你自己打开的那些会话」——那一档永远要当面授权，\n\
+                             没有任何开关能绕过：AI 只能随便动自己开的会话。",
+                            "Covers only \"the AI opens a new session of its own from a saved \n\
+                             connection\": no prompt by default, turn it off to confirm each time.\n\
+                             It does NOT cover the AI writing into sessions YOU opened — that always \n\
+                             needs on-screen consent and no setting can bypass it. The AI may act \n\
+                             freely only in sessions it opened itself.",
                         ))
                         .clicked()
                     {
