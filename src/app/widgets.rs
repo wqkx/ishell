@@ -173,13 +173,12 @@ pub fn view_context_menu(resp: &egui::Response) {
                         "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
                          · 只监听本机 Unix socket（0600），不开任何网络端口\n\
                          · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
-                         · 多机共用一台 AI 服务器时：配对标识会在会话空闲时自动注入，请求只回本电脑",
+                         · 多机共用一台 AI 服务器时：见下面的「自动注入配对标识」",
                         "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
                          read/write files.\n\
                          · Local Unix socket only (mode 0600) — no network port is opened\n\
                          · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
-                         · Sharing one AI server: the pairing token is auto-injected once the session \
-                         goes idle, so requests only reach THIS computer",
+                         · Sharing one AI server: see \"auto-inject the pairing token\" below",
                     ))
                     .clicked()
                 {
@@ -209,6 +208,38 @@ pub fn view_context_menu(resp: &egui::Response) {
                         .clicked()
                     {
                         crate::store::save_mcp_auto_approve(auto);
+                        ui.close();
+                    }
+
+                    // 自动注入配对标识：**默认关**。它会替用户在自己的 shell 里敲一条命令
+                    // 并回车，只有「多台电脑共用一台 AI 服务器」才需要。
+                    let mut auto_pair = crate::store::load_mcp_auto_pair();
+                    if ui
+                        .checkbox(
+                            &mut auto_pair,
+                            crate::i18n::tr(
+                                "　自动注入配对标识（多机共用 AI 服务器）",
+                                "  Auto-inject the pairing token (shared AI server)",
+                            ),
+                        )
+                        .on_hover_text(crate::i18n::tr(
+                            "多台电脑共用同一台 AI 服务器时才需要：各家 iShell 反向转发的 socket\n\
+                             堆在同一个远端目录里，代理靠这个环境变量才知道该回哪台电脑。\n\
+                             开启后，每个新会话空闲时 iShell 会替你敲一条\n\
+                             ` export ISHELL_MCP_TOKEN=…` 并回车（回显会被吞掉）。\n\
+                             默认关：它毕竟是程序替你在自己的 shell 里执行命令。\n\
+                             不想开也有手动路径——用下面的「复制配对配置」。",
+                            "Only needed when several computers share one AI server: their \n\
+                             reverse-forwarded sockets pile up in the same remote directory, and \n\
+                             the proxy needs this environment variable to know which computer to \n\
+                             answer. When on, iShell types ` export ISHELL_MCP_TOKEN=…` into each \n\
+                             new session once it goes idle, and presses Enter (the echo is \n\
+                             swallowed). Off by default — it is still the program running a command \n\
+                             in your own shell. The manual route is \"Copy pairing config\" below.",
+                        ))
+                        .clicked()
+                    {
+                        crate::store::save_mcp_auto_pair(auto_pair);
                         ui.close();
                     }
                 }

@@ -210,6 +210,57 @@ pub fn save_ai_notify_mode(m: AiNotifyMode) {
     }
 }
 
+fn mcp_auto_pair_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("mcp_auto_pair"))
+}
+
+/// 「自动向新会话注入配对标识」的出厂默认值。
+const MCP_AUTO_PAIR_DEFAULT: bool = false;
+
+static MCP_AUTO_PAIR_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// 是否在会话空闲时自动把配对标识注入终端（` export ISHELL_MCP_TOKEN=…` 并回车执行）。
+///
+/// # 为什么默认关
+///
+/// 它只对一种拓扑有用：**多台电脑共用同一台 AI 服务器**——各家 iShell 反向转发的 socket
+/// 堆在同一个远端目录里，代理靠这个环境变量才知道该回哪台电脑。这是少数派场景。
+///
+/// 而它的代价是 iShell **替用户在他自己的 shell 里执行一条命令**。这件事此前一直挂在
+/// [`load_mcp_consent`] 下面，尚可接受：那时 AI 控制默认关闭，能走到这里的人都是自己去
+/// 设置里勾过、明确知道自己在用 MCP 的。0.19 起 AI 控制默认开启之后，同一个门就意味着
+/// **每一个新连上的会话都会被自动打进一条命令并回车**——用户的现场反馈正是「iShell 往我
+/// 当前会话里输东西」。默认开一个会替用户敲键盘的行为，无论回显吞得多干净都不合适。
+///
+/// 需要的人在设置里勾上即可；不勾也有手动路径：设置里的「复制配对配置」，把
+/// `ISHELL_MCP_TOKEN=…` 写进那份 AI 的 MCP server 环境变量。
+pub fn load_mcp_auto_pair() -> bool {
+    use std::sync::atomic::Ordering;
+    match MCP_AUTO_PAIR_CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = mcp_auto_pair_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim() == "1")
+                .unwrap_or(MCP_AUTO_PAIR_DEFAULT);
+            MCP_AUTO_PAIR_CACHE.store(on as i8, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// 保存「自动注入配对标识」开关。
+pub fn save_mcp_auto_pair(on: bool) {
+    MCP_AUTO_PAIR_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
+    if let Some(p) = mcp_auto_pair_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        write_setting(p, if on { "1" } else { "0" });
+    }
+}
+
 fn ime_follow_caret_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ime_follow_caret"))
 }

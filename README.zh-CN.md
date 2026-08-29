@@ -157,6 +157,18 @@ poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
 winit 只在坐标**真的变了**时才发这条请求，所以恒定上报同一个坐标 = 一条都不会发出去。中文照常能打，只是候选框停在输入区左上角。iShell 也会自己发现界面卡住：往 `~/.config/ishell/crash.log` 追加一条说明，并顺手把这个选项关掉，让下一次启动不再踩同一个坑。
 
 
+**最小化窗口之后整个界面像被挂起、AI 也操作不了？**
+先用 `ISHELL_NO_VSYNC=1 ./ishell-linux-x86_64` 启动试一次。如果最小化之后一切正常，那就是下面这条。
+
+读框架源码得到的线索：eframe 会给**最小化的窗口照样画帧并交换缓冲**——它内部判断可见性用的 `viewport.info.visible()` 在原生平台上**没有任何一处赋值**（`Occluded` 事件写的是 `info.occluded`），恒为真，于是绘制和 `gl_surface.swap_buffers()` 都不会被跳过。而默认 `vsync: true` 让 glutin 用 `SwapInterval::Wait(1)`，那次交换要等一个垂直同步；一个已经被图标化、合成器不再呈现的窗口很可能永远等不到，画界面的线程就停在那儿。这条链路里只有这一个会阻塞的调用。
+
+零成本的判别方法（不用装 gdb）：**打几个字 → 最小化 → 等 15 秒 → 还原 → 看 `~/.config/ishell/crash.log`**。
+- 有记录（写着「窗口最小化/被遮挡=true」）→ 只是 UI 线程被阻塞，进程本身活着，就是上面这条。
+- 没有记录、而 AI 确实操作不了 → 连看门狗线程都被冻住了，那是 iShell 之外的东西在挂起整个进程。
+
+关掉垂直同步的代价是连续滚动时可能撕裂，所以不设为默认。
+
+
 ## 🔧 从源码构建
 
 需要 [Rust](https://rustup.rs/)（stable）。在目标平台上：
@@ -224,7 +236,7 @@ cargo run --release
 
 正确做法（任选其一，推荐 1）：
 
-1. **在本机 iShell 终端右键 →「启用 AI 配对」**（或等会话空闲时的自动注入）。向该 shell `export ISHELL_MCP_TOKEN=…`；此后在此终端启动的 AI / `ishell-mcp` 只绑定你这台电脑。
+1. **设置 →「自动注入配对标识（多机共用 AI 服务器）」**（**默认关**）。开启后每个新会话空闲时会被打进 ` export ISHELL_MCP_TOKEN=…`；此后在该终端启动的 AI / `ishell-mcp` 只绑定你这台电脑。默认关是因为它毕竟是程序替你在自己的 shell 里执行命令——只在这种共用服务器的拓扑下才打开。
 2. AI 不在 iShell 终端里跑时：设置里「复制配对配置」，把 `ISHELL_MCP_TOKEN=…` 写进该 AI 的 MCP server 环境变量。
 3. 未配对仍可点确认窗选机器，但**共享账号下务必配对**。
 

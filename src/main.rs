@@ -98,8 +98,26 @@ fn main() -> eframe::Result<()> {
             .with_app_id(APP_ID)
             .with_icon(load_icon())
     };
+    // 垂直同步。默认开（不开会撕裂），但留一个关掉它的口子——**这是「最小化之后整个界面
+    // 像被挂起」的排查/应急开关**。
+    //
+    // 起因：eframe 会给**最小化的窗口照样画帧并交换缓冲**。它内部那个 `is_visible` 取自
+    // `viewport.info.visible()`，而原生平台上没有任何一处给这个字段赋值（`Occluded` 事件写
+    // 的是 `info.occluded`），于是恒为真——绘制与 `gl_surface.swap_buffers()` 都不会被跳过。
+    // 而 `vsync: true` 让 glutin 用 `SwapInterval::Wait(1)`，那次交换要等一个垂直同步；一个
+    // 已经被图标化、合成器不再呈现的窗口很可能永远等不到，事件循环线程就停在那儿——从外面
+    // 看就是「进程挂起了」，AI 经 MCP 也操作不了（排空请求要在事件循环里跑）。
+    //
+    // 这条链路里**只有这一个会阻塞的调用**，所以先给它一个开关：`ISHELL_NO_VSYNC=1` 启动，
+    // 交换缓冲改成 `DontWait`，立即返回、不可能卡住。若这样最小化之后一切正常，就坐实了。
+    // 代价是连续滚动时可能撕裂，所以不设为默认。
+    let no_vsync = std::env::var_os("ISHELL_NO_VSYNC").is_some();
+    if no_vsync {
+        log::info!("已关闭垂直同步（ISHELL_NO_VSYNC）：交换缓冲不再等垂直同步");
+    }
     let native_options = eframe::NativeOptions {
         viewport,
+        vsync: !no_vsync,
         ..Default::default()
     };
 
