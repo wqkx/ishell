@@ -1,4 +1,4 @@
-//! UI 线程「卡死」检测：抓到界面冻住，落一份日志，并自动关掉最可能的元凶。
+//! UI 线程「卡死」检测：抓到界面冻住，落一份可以直接交出去的诊断。**只报告，不改任何设置。**
 //!
 //! # 为什么需要它，以及为什么它不是一个普通的 watchdog
 //!
@@ -13,9 +13,9 @@
 //! ```
 //!
 //! 这不是 panic，[`crate::crash`] 的 `catch_unwind` 接不住；从别的线程也无法安全地把它拽
-//! 回来。能做的只有两件事：**留下证据**（否则用户能提供的只有「它又卡死了」），以及
-//! **让下一次启动不再踩同一个坑**——自动把「输入法候选框跟随光标」关掉，那条 `XSetICValues`
-//! 就一次都不会再发出去（winit 只在坐标真的变了时才发，见 `store::load_ime_follow_caret`）。
+//! 回来。能做的只有一件事：**留下证据**——否则用户能提供的全部信息就是「它又卡死了」。
+//! 日志里连带给出这次最可能的原因和该试什么（比如取消勾选「输入法候选框跟随光标」，
+//! 关掉之后那条 `XSetICValues` 一次都不会再发出去），但**由用户去做**，见下面那段。
 //!
 //! # 为什么不会误报
 //!
@@ -58,15 +58,24 @@ static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// 只报一次：卡死之后每 2 秒往日志里灌一条毫无意义。
 ///
-/// 按**原因**分开记，不是一个总闸：窗口最小化时的卡死不采取任何处置（见 [`on_stall`]），
-/// 用一个总闸的话，它会把后面一次真正的、窗口可见的 XIM 卡死一并吞掉——那次既不写日志也
-/// 不关跟随，正好回到「它又卡死了，一行记录都没有」这个本模块要根除的状态。
+/// 按**原因**分开记，不是一个总闸：三种成因的诊断内容完全不同，用一个总闸的话，先发生的
+/// 那一种会把后面另一种一并吞掉——用户拿到的日志里就少了正是他这次需要的那条，回到
+/// 「它又卡死了，一行记录都没有」这个本模块要根除的状态。
 static REPORTED_HIDDEN: AtomicBool = AtomicBool::new(false);
 static REPORTED_VISIBLE: AtomicBool = AtomicBool::new(false);
+static REPORTED_BLOCKING: AtomicBool = AtomicBool::new(false);
 /// 最后一帧时窗口是不是最小化/被遮挡。卡死时用来判断该不该把账算到输入法头上——
 /// 最小化状态下卡住更可能是窗口/绘制路径（eframe 仍会给最小化的窗口画帧并交换缓冲，
 /// 而合成器可能已经不再给它调度垂直同步了），跟 XIM 无关。
 static WAS_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// 阻塞守卫最长容忍多久。超过它仍不出帧就照报——`rfd` 自己挂死（Linux 上
+/// `xdg-desktop-portal` 没跑/无响应是它已知的失败形态）时守卫永远不会析构，
+/// 没有这个上限，界面真的永久冻住而日志里一个字都没有，正是本模块要根除的那种。
+/// 取值远大于任何人翻目录所需，宁可晚报也不误报。
+const BLOCKING_MAX: Duration = Duration::from_secs(300);
+
+/// 最近一次「从没有阻塞调用变成有」的时刻（毫秒）。
+static BLOCKING_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// 当前有多少个「已知会把事件循环整个堵住」的调用在进行中（原生文件对话框）。
 /// 大于 0 时探测一律不作数——见 [`blocking`]。
 static BLOCKING: AtomicU64 = AtomicU64::new(0);
@@ -88,7 +97,9 @@ fn now_ms() -> u64 {
 /// 「上次出帧时刻」推到现在——否则对话框一关，看门狗看到的仍是十几秒前的旧时间戳，
 /// 下一轮探测（还没来得及出帧）照样误报。
 pub fn blocking() -> BlockingGuard {
-    BLOCKING.fetch_add(1, Ordering::Relaxed);
+    if BLOCKING.fetch_add(1, Ordering::Relaxed) == 0 {
+        BLOCKING_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+    }
     BlockingGuard
 }
 
@@ -132,6 +143,22 @@ fn should_report(now: u64, last_frame: u64, last_input: u64, blocking: bool) -> 
     now.saturating_sub(last_frame) > STALL_AFTER.as_millis() as u64
 }
 
+/// 阻塞调用（文件对话框）已经堵了太久，该按「它自己挂死了」报一次。纯函数，便于测试。
+fn should_report_blocking(now: u64, blocking_since: u64) -> bool {
+    now.saturating_sub(blocking_since) > BLOCKING_MAX.as_millis() as u64
+}
+
+/// 这次卡死的成因——决定诊断内容，也各自只报一次。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StallKind {
+    /// 窗口最小化/被遮挡：更像卡在绘制与缓冲交换上。
+    Hidden,
+    /// 窗口可见：最像卡在输入法的同步 XIM 请求上。
+    Visible,
+    /// 原生文件对话框自己挂死了（portal 无响应），守卫永远不析构。
+    BlockingDialog,
+}
+
 /// 启动看门狗线程（只启动一次）。`ctx` 用于主动请求重绘来探测事件循环是否还活着。
 pub fn spawn(ctx: egui::Context) {
     if STARTED.swap(true, Ordering::Relaxed) {
@@ -151,22 +178,33 @@ pub fn spawn(ctx: egui::Context) {
                 continue; // 用户停手了，不探——空闲期一次多余唤醒都不做
             }
             let blocking = BLOCKING.load(Ordering::Relaxed) > 0;
-            if should_report(
-                now,
-                LAST_FRAME_MS.load(Ordering::Relaxed),
-                last_input,
-                blocking,
-            ) {
-                let hidden = WAS_HIDDEN.load(Ordering::Relaxed);
-                let latch = if hidden {
-                    &REPORTED_HIDDEN
+            // 文件对话框堵着是预期内的，但堵过头就说明它自己挂死了（portal 无响应），
+            // 那同样是「界面永久冻住」，必须留下记录。
+            let kind = if blocking {
+                should_report_blocking(now, BLOCKING_SINCE_MS.load(Ordering::Relaxed))
+                    .then_some(StallKind::BlockingDialog)
+            } else if should_report(now, LAST_FRAME_MS.load(Ordering::Relaxed), last_input, false) {
+                Some(if WAS_HIDDEN.load(Ordering::Relaxed) {
+                    StallKind::Hidden
                 } else {
-                    &REPORTED_VISIBLE
+                    StallKind::Visible
+                })
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                let latch = match kind {
+                    StallKind::Hidden => &REPORTED_HIDDEN,
+                    StallKind::Visible => &REPORTED_VISIBLE,
+                    StallKind::BlockingDialog => &REPORTED_BLOCKING,
                 };
                 if !latch.swap(true, Ordering::Relaxed) {
-                    on_stall(hidden);
+                    on_stall(kind);
                 }
                 continue; // 已经卡住了，别再请求重绘
+            }
+            if blocking {
+                continue; // 对话框正常开着：不探、也不报
             }
             // 唤醒事件循环：活着的话下一帧马上会把 last_frame 推新。
             ctx.request_repaint();
@@ -180,20 +218,18 @@ pub fn spawn(ctx: egui::Context) {
 /// 只是「一段时间没出帧」，静默改用户设置的代价配不上这个确定性（真出过一次误报就知道了）；
 /// ② 那条归因本身也没被证实——最小化时更像卡在绘制/缓冲交换上（见 `main.rs` 的
 /// `ISHELL_NO_VSYNC`），关输入法跟随既没用又冤枉。日志里把两条候选都写清楚，由用户定夺。
-fn on_stall(hidden: bool) {
+fn on_stall(kind: StallKind) {
     let follow = crate::store::load_ime_follow_caret();
     log::error!(
-        "UI 线程已 {}s 没有出帧（用户刚刚还在输入）。窗口最小化/被遮挡={hidden}，\
-         ime_follow_caret={follow}",
-        STALL_AFTER.as_secs()
+        "UI 线程没有出帧（用户刚刚还在输入）。成因判定={kind:?}，ime_follow_caret={follow}"
     );
-    write_stall_log(hidden, follow);
+    write_stall_log(kind, follow);
 }
 
 /// 往 `crash.log` 里追加一条卡死记录——和 panic 走同一份文件，用户交一份就够。
 ///
 /// 主线程此刻正卡在 Xlib 里，这里是**另一个线程**在写，只能碰文件系统，不能碰任何 UI 状态。
-fn write_stall_log(hidden: bool, follow_was_on: bool) {
+fn write_stall_log(kind: StallKind, follow_was_on: bool) {
     use std::io::Write;
     let Some(path) = crate::store::crash_log_path() else {
         return;
@@ -217,38 +253,44 @@ fn write_stall_log(hidden: bool, follow_was_on: bool) {
         .unwrap_or(0);
     // 「最可能」和「已处理」必须讲同一个故事：早先的版本无论如何都印那段 XIM 栈，而窗口
     // 最小化时紧接着又说「跟输入法无关」，同一份日志自相矛盾，反而误导排查。
-    // 「最可能」与「可以试」必须讲同一个故事，而且都只是**建议**——本模块不替用户改任何设置。
-    let (likely, action) = if hidden {
-        (
+    // 「最可能」与「可以试」必须讲同一个故事，而且**都只是建议**——本模块不替用户改任何设置，
+    // 所以这一栏的名字也不能叫「已处理」（叫了用户会以为程序已经动过手，于是既不改设置也不
+    // 抓栈，下次照样卡且仍无证据）。
+    let (likely, action) = match kind {
+        StallKind::BlockingDialog => (
+            "原生文件对话框自己挂死了：它是同步调用（Linux 上 rfd 走 xdg-portal + pollster），\n\
+             \x20         而调用点就在事件循环线程上。`xdg-desktop-portal` 没在跑或无响应时它永不返回。",
+            "检查 xdg-desktop-portal 服务（systemctl --user status xdg-desktop-portal）。\n\
+             \x20         与输入法、与窗口最小化都无关。",
+        ),
+        StallKind::Hidden => (
             "窗口当时是最小化/被遮挡的，更可能卡在窗口与绘制路径上：合成器不再给一个图标化的\n\
              \x20         窗口调度垂直同步，而 eframe 仍会给它画帧并交换缓冲（原生平台上 is_visible\n\
              \x20         恒为真），缓冲交换就会一直等一个不来的帧回调。",
             "用 ISHELL_NO_VSYNC=1 启动再试一次（交换缓冲改成不等垂直同步）。与输入法无关。",
-        )
-    } else if follow_was_on {
-        (
+        ),
+        StallKind::Visible if follow_was_on => (
             XIM_LIKELY,
             "在设置里取消勾选「输入法候选框跟随光标」再试一次——关掉之后 iShell 恒定上报同一个\n\
              \x20         坐标，那条 XSetICValues 一次都不会发出去。",
-        )
-    } else {
-        (
+        ),
+        StallKind::Visible => (
             XIM_LIKELY,
             "「输入法候选框跟随光标」本来就是关的——这次卡死另有原因，请抓一份栈。",
-        )
+        ),
     };
     let _ = writeln!(
         f,
         "\n=== ishell {} UI 线程卡死 ===\n\
          unix_time: {secs}\n\
-         现象:     用户刚刚还在输入，但界面已经 {}s 没有出帧（看门狗每 2s 主动请求重绘，\
+         现象:     用户刚刚还在输入，但界面已经很久没有出帧（看门狗每 2s 主动请求重绘，\
          活着的事件循环不可能这么久不响应）。\n\
-         当时状态: 窗口最小化/被遮挡={hidden}，输入法候选框跟随光标={follow_was_on}\n\
+         当时状态: 成因判定={kind:?}，输入法候选框跟随光标={follow_was_on}\n\
          最可能:   {likely}\n\
-         已处理:   {action}\n\
+         可以试:   {action}\n\
+         \x20         （iShell 只记录，不会替你改任何设置）\n\
          想确认:   下次卡住时跑 gdb -p $(pidof ishell) -batch -ex \"thread apply all bt\"",
-        crate::version::VERSION,
-        STALL_AFTER.as_secs()
+        crate::version::VERSION
     );
 }
 
@@ -297,6 +339,34 @@ mod tests {
         assert!(
             !should_report(20_000, 20_000 - STALL - 1_000, 19_000, true),
             "文件对话框开着的时候不出帧是预期内的，不能报成卡死"
+        );
+    }
+
+    /// **文件对话框自己挂死时必须照报。** `xdg-desktop-portal` 没在跑或无响应是 `rfd` 已知的
+    /// 失败形态：`pick_files()` 永不返回 → 守卫永不析构 → `BLOCKING > 0` 永远成立。
+    /// 少了这条上限，界面真的永久冻住而 `crash.log` 里一个字都没有——正是本模块要根除的
+    /// 「它又卡死了，一行记录都没有」。
+    #[test]
+    fn a_dialog_that_never_returns_is_eventually_reported() {
+        let max = BLOCKING_MAX.as_millis() as u64;
+        assert!(
+            !should_report_blocking(max, 0),
+            "还没超过上限就报，等于把「用户在慢慢翻目录」也报成卡死"
+        );
+        assert!(
+            should_report_blocking(max + 1, 0),
+            "对话框堵过了上限仍不出帧，必须留下记录"
+        );
+        // 时钟倒挂不能算
+        assert!(!should_report_blocking(0, 1_000));
+    }
+
+    /// 上限要远大于任何人翻目录所需，宁可晚报也不误报。
+    #[test]
+    fn the_blocking_ceiling_is_generous() {
+        assert!(
+            BLOCKING_MAX >= Duration::from_secs(120),
+            "上限太短，正常挑个文件都会被报成卡死"
         );
     }
 

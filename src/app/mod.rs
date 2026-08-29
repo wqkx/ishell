@@ -279,12 +279,6 @@ impl eframe::App for App {
         Palette::BG.to_normalized_gamma_f32()
     }
 
-    /// eframe 0.34 的现代入口。这里只是兜底外壳，真正的绘制在 [`App::ui_impl`]。
-    ///
-    /// 为什么要 `catch_unwind`：SSH 客户端崩一次的代价是所有会话断开 + 编辑器里未保存的
-    /// 内容全丢，远大于「这一帧少画了点东西」。接住的位置刻意选在 `ui_impl` 外层——panic
-    /// 只从我们自己的闭包里展开出来，eframe/egui 该收尾的 `end_pass` 照常执行，不会把
-    /// egui 卡在半开的帧上。连续崩太多帧则不再兜底，详见 `crash::on_frame_panic`。
     /// 每帧的**非绘制**工作。eframe 无条件调用它，而 [`Self::ui`] 被 `if is_visible` 包着
     /// （`epi_integration.rs`）——凡是不需要 `Ui`、且不能因为窗口看不见就停摆的事情，
     /// 都该放在这里。见 [`App::pump_background`]。
@@ -318,6 +312,12 @@ impl eframe::App for App {
         }
     }
 
+    /// eframe 0.34 的现代入口。这里只是兜底外壳，真正的绘制在 [`App::ui_impl`]。
+    ///
+    /// 为什么要 `catch_unwind`：SSH 客户端崩一次的代价是所有会话断开 + 编辑器里未保存的
+    /// 内容全丢，远大于「这一帧少画了点东西」。接住的位置刻意选在 `ui_impl` 外层——panic
+    /// 只从我们自己的闭包里展开出来，eframe/egui 该收尾的 `end_pass` 照常执行，不会把
+    /// egui 卡在半开的帧上。连续崩太多帧则不再兜底，详见 `crash::on_frame_panic`。
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // AssertUnwindSafe：&mut self / &mut Ui 本就不是 UnwindSafe，我们接受「接住后状态
