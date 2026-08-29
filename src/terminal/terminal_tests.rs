@@ -1185,3 +1185,23 @@ fn self_healing_does_not_cancel_a_normal_composition() {
     assert_eq!(out, "中".as_bytes().to_vec());
     assert!(t.ime_preedit.is_empty(), "提交之后预编辑应当清空");
 }
+
+/// 终端侧同一条不变量：关掉「候选框跟随光标」之后，上报给输入法的坐标必须与光标位置
+/// **完全无关**。winit 只在坐标真的变了时才发 `XSetICValues`（同步 XIM 请求，Xlib 无超时地
+/// 等输入法回复），恒定上报 = 一条都不发 = 画界面的线程不可能卡在 `_XimRead` 里。
+/// 用户抓到的栈正是停在 `set_spot → XSetICValues → _XimRead → poll(timeout=-1)`。
+#[test]
+fn terminal_ime_spot_is_constant_when_following_is_off() {
+    use super::ui_paint::ime_rect;
+    let area = egui::Rect::from_min_size(egui::pos2(4.0, 8.0), egui::vec2(600.0, 400.0));
+    let cell = egui::vec2(8.0, 16.0);
+    let a = ime_rect(false, egui::pos2(100.0, 100.0), area, cell);
+    let b = ime_rect(false, egui::pos2(500.0, 300.0), area, cell);
+    assert_eq!(a, b, "关掉跟随后坐标仍随光标变——那条会冻住界面的 XSetICValues 还是会发");
+    assert!(area.contains_rect(a));
+
+    // 开着的时候必须真的跟随
+    let c = ime_rect(true, egui::pos2(100.0, 100.0), area, cell);
+    let d = ime_rect(true, egui::pos2(500.0, 300.0), area, cell);
+    assert_ne!(c, d, "开着跟随却不动，候选框永远停在一个地方");
+}

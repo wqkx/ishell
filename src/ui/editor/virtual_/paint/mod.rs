@@ -27,6 +27,25 @@ fn clamp_rect_into(r: egui::Rect, bounds: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(x, y), r.size())
 }
 
+/// 算出这一帧要上报给输入法的矩形。
+///
+/// `follow == false` 时返回一个**与光标位置无关**的恒定矩形——这一条是关键：winit 只在坐标
+/// 真的变了时才发 `XSetICValues`（`ime/context.rs::set_spot` 自带去重），恒定上报等于一条
+/// 都不发，那条「Xlib 无超时地等 fcitx 回复、把画界面的线程冻住」的路径就不存在了。
+/// 见 `store::load_ime_follow_caret`。
+fn ime_rect(
+    follow: bool,
+    caret_px: Option<egui::Pos2>,
+    clip: egui::Rect,
+    row_h: f32,
+) -> egui::Rect {
+    let caret_rect = caret_px
+        .filter(|_| follow)
+        .map(|p| egui::Rect::from_min_size(egui::pos2(p.x, p.y - row_h), egui::vec2(1.0, row_h)))
+        .unwrap_or_else(|| egui::Rect::from_min_size(clip.min, egui::vec2(1.0, row_h)));
+    clamp_rect_into(caret_rect, clip)
+}
+
 pub(super) struct RowPaintContext<'a> {
     ui: &'a mut egui::Ui,
     ed: &'a mut Editor,
@@ -468,17 +487,15 @@ pub(super) fn paint_visible_rows(
                 // 而且钳住之后这个值在继续滚动时是**不变**的，连带把「滚动时每帧一次
                 // XSetICValues」也消掉了。
                 if focused {
-                    let caret_rect = caret_px_frame
-                        .map(|p| {
-                            egui::Rect::from_min_size(
-                                egui::pos2(p.x, p.y - row_h),
-                                egui::vec2(1.0, row_h),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            egui::Rect::from_min_size(clip.min, egui::vec2(1.0, row_h))
-                        });
-                    let irect = clamp_rect_into(caret_rect, clip);
+                    // 「候选框跟随光标」关掉时上报一个**恒定**坐标：winit 只在坐标真的变了
+                    // 时才发 `XSetICValues`，恒定上报 = 一条都不发 = 那条「Xlib 无超时地等
+                    // fcitx 回复」的卡死路径直接消失（见 `store::load_ime_follow_caret`）。
+                    let irect = ime_rect(
+                        crate::store::load_ime_follow_caret(),
+                        caret_px_frame,
+                        clip,
+                        row_h,
+                    );
                     ui.ctx().output_mut(|o| {
                         o.ime = Some(egui::output::IMEOutput {
                             rect: irect,
@@ -740,6 +757,37 @@ mod ime_report_tests {
             bounds,
         );
         assert_eq!(far1, far2, "越滚越远时钳位结果还在变，等于每帧一次 XSetICValues");
+    }
+
+    /// 关掉「候选框跟随光标」之后，上报的坐标必须与光标位置**完全无关**。
+    ///
+    /// 这条不是偏好设置，是那条卡死路径的开关：winit 只在坐标真的变了时才发
+    /// `XSetICValues`（同步 XIM 请求，Xlib 无超时地等输入法回复）。只要这里返回的值恒定，
+    /// 那条请求一次都不会发出去，画界面的线程就不可能卡在 `_XimRead` 里。
+    /// 用户抓到的栈正是停在 `set_spot → XSetICValues → _XimRead → poll(timeout=-1)`。
+    #[test]
+    fn with_following_off_the_reported_spot_never_moves() {
+        let clip = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 300.0));
+        let a = ime_rect(false, Some(egui::pos2(50.0, 80.0)), clip, 16.0);
+        let b = ime_rect(false, Some(egui::pos2(300.0, 250.0)), clip, 16.0);
+        let c = ime_rect(false, None, clip, 16.0);
+        assert_eq!(a, b, "关掉跟随后坐标仍随光标变——XSetICValues 还是会发，卡死路径没封住");
+        assert_eq!(b, c, "有没有光标都该是同一个恒定值");
+        assert!(clip.contains_rect(a));
+    }
+
+    /// 开着的时候必须真的跟随，否则这个开关就成了摆设。
+    #[test]
+    fn with_following_on_the_spot_tracks_the_caret() {
+        let clip = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 300.0));
+        let a = ime_rect(true, Some(egui::pos2(50.0, 80.0)), clip, 16.0);
+        let b = ime_rect(true, Some(egui::pos2(300.0, 250.0)), clip, 16.0);
+        assert_ne!(a, b, "开着跟随却不动，候选框永远停在一个地方");
+        // 光标不可见时退回一个恒定值（不能报到视口外去）
+        assert_eq!(
+            ime_rect(true, None, clip, 16.0),
+            ime_rect(false, None, clip, 16.0)
+        );
     }
 
     /// 矩形比可见区还大时也不能产生 NaN / 反向区间（窗口被拖到极小的退化情形）。

@@ -289,6 +289,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         // AssertUnwindSafe：&mut self / &mut Ui 本就不是 UnwindSafe，我们接受「接住后状态
         // 可能是半截的」——横幅会明确提示用户尽快保存重启。
+        // 卡死看门狗：记下「出帧了」以及这一帧有没有用户输入。放在 catch_unwind **之前**，
+        // 因为 panic 被接住的那一帧同样是出过帧的——那是 crash 模块管的事，不该被误判成卡死。
+        // 首帧顺带把探测线程拉起来（拿 ctx 用于主动请求重绘）。见 `crate::stall`。
+        crate::stall::spawn(ctx.clone());
+        crate::stall::note_frame(ctx.input(|i| !i.events.is_empty()));
+
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.ui_impl(ui, frame)));
         match r {
             Ok(()) => crate::crash::on_frame_ok(),

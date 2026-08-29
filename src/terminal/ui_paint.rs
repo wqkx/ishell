@@ -22,6 +22,16 @@ pub(super) fn clamp_rect_into(r: Rect, bounds: Rect) -> Rect {
     Rect::from_min_size(egui::pos2(x, y), r.size())
 }
 
+/// 算出这一帧要上报给输入法的矩形。
+///
+/// `follow == false` 时返回一个**与光标位置无关**的恒定矩形。winit 只在坐标真的变了时才发
+/// `XSetICValues`（同步 XIM 请求，Xlib 无超时地等输入法回复），恒定上报等于一条都不发，
+/// 那条会把画界面的线程冻住的路径就不存在了。见 `store::load_ime_follow_caret`。
+pub(super) fn ime_rect(follow: bool, caret: egui::Pos2, area: Rect, cell: Vec2) -> Rect {
+    let pos = if follow { caret } else { area.min };
+    clamp_rect_into(Rect::from_min_size(pos, cell), area)
+}
+
 pub(super) struct PaintParams<'a> {
     pub(super) rect: Rect,
     pub(super) resp: &'a Response,
@@ -251,8 +261,15 @@ impl Terminal {
         // 任何 XIM 往返，也就少了一批「正卡在往返里而 fcitx 恰好没了」的机会窗口。
         if focused {
             let (cr, cc) = screen.cursor_position();
+            // 「候选框跟随光标」关掉时上报一个**恒定**坐标（输入区左上角）。
+            // winit 只在坐标真的变了时才发 `XSetICValues`（`ime/context.rs::set_spot` 自带
+            // 去重），恒定上报 = 一条都不发 = 那条「Xlib 无超时地等 fcitx 回复」的卡死路径
+            // 直接消失。中文照常能打，只是候选框不跟着光标跑。
+            // 见 `store::load_ime_follow_caret`。
+            // 光标的真实屏幕位置。自绘的预编辑（组字中的拼音）永远画在这里——那是我们自己
+            // 画的，跟下面上报给输入法的坐标是两回事，不受「跟随光标」开关影响。
             let ipos = origin + Vec2::new(cc as f32 * char_w, cr as f32 * char_h);
-            let irect = clamp_rect_into(Rect::from_min_size(ipos, cell), rect);
+            let irect = ime_rect(crate::store::load_ime_follow_caret(), ipos, rect, cell);
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput {
                     rect: irect,

@@ -281,6 +281,37 @@ pub fn view_context_menu(resp: &egui::Response) {
                     crate::store::save_force_x11(fx);
                     ui.close();
                 }
+
+                // 输入法候选框跟随光标：关掉它能封死一条会把整个界面冻住的路径，
+                // 详见 store::load_ime_follow_caret 的说明。即时生效，不用重启。
+                let mut follow = crate::store::load_ime_follow_caret();
+                if ui
+                    .checkbox(
+                        &mut follow,
+                        crate::i18n::tr(
+                            "输入法候选框跟随光标",
+                            "IME candidate window follows the caret",
+                        ),
+                    )
+                    .on_hover_text(crate::i18n::tr(
+                        "关掉它可以治「用 fcitx 打字/删除时整个界面冻住」——远程桌面下多见。\n\
+                         原因：把光标位置告诉输入法在 X11 上是一次同步的 XIM 请求，Xlib 发出去\n\
+                         之后无限期等回复（没有超时），输入法一旦在这中间没了，画界面的线程就\n\
+                         永远停在那里。关掉后 iShell 恒定上报同一个坐标，这条请求一次都不会发。\n\
+                         代价只是候选框停在输入区左上角，中文照常能打。即时生效。",
+                        "Turn this off to cure \"the whole UI freezes while typing with fcitx\" — \n\
+                         common over remote desktops. Telling the IME where the caret is means a \n\
+                         synchronous XIM request on X11, and Xlib waits for the reply forever (no \n\
+                         timeout); if the IME dies in between, the UI thread is stuck for good. \n\
+                         With this off iShell always reports the same spot, so that request is \n\
+                         never sent. The candidate window just stops following the caret. \n\
+                         Takes effect immediately.",
+                    ))
+                    .clicked()
+                {
+                    crate::store::save_ime_follow_caret(follow);
+                    ui.close();
+                }
             },
         );
 

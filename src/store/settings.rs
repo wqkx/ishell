@@ -210,6 +210,65 @@ pub fn save_ai_notify_mode(m: AiNotifyMode) {
     }
 }
 
+fn ime_follow_caret_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("ime_follow_caret"))
+}
+
+/// 「输入法候选框跟随光标」的出厂默认值。
+const IME_FOLLOW_CARET_DEFAULT: bool = true;
+
+static IME_FOLLOW_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// 是否把光标位置上报给输入法（让候选框跟着光标走）。
+///
+/// # 关掉它能治什么
+///
+/// X11 上这个上报最终会走到 `XSetICValues`——**同步的 XIM 请求**：Xlib 把它发给输入法进程
+/// 之后就 `poll(timeout=-1)` 等回复，而 **Xlib 对 XIM 没有超时**。这个调用发生在 winit 的
+/// 事件循环线程上，也就是画界面的那个线程。fcitx 只要在某一次请求中途没了（崩溃、重启、
+/// 远程桌面会话切换/重连），这个线程就永远停在那儿，整个界面冻住。用户实测抓到的栈正是：
+///
+/// ```text
+/// poll → _XReadEvents → XIfEvent → _XimRead → XSetICValues
+///      → winit::…::ImeContext::set_spot → eframe::run_native
+/// ```
+///
+/// winit 只在**坐标真的变了**时才发这条请求（`ime/context.rs::set_spot` 自带去重）。
+/// 所以把这个开关关掉、让 iShell 恒定上报同一个坐标，`XSetICValues` 就一次都不会再发出去,
+/// 这条卡死路径直接消失。代价只是候选框不跟着光标跑（停在输入区左上角），中文照常能打。
+///
+/// 默认开：本机 X11/Wayland 上 fcitx 健康时跟随光标体验更好，卡死只在远程桌面这类
+/// 输入法容易半路没掉的环境里出现。真卡住过一次的话，`crate::stall` 会自动把它关掉。
+pub fn load_ime_follow_caret() -> bool {
+    use std::sync::atomic::Ordering;
+    match IME_FOLLOW_CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = ime_follow_caret_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim() == "1")
+                .unwrap_or(IME_FOLLOW_CARET_DEFAULT);
+            IME_FOLLOW_CACHE.store(on as i8, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// 保存「输入法候选框跟随光标」开关。
+///
+/// **会被卡死看门狗从后台线程调用**（见 `crate::stall`），所以只碰自己的缓存和自己那个
+/// 文件，不依赖任何 UI 状态。
+pub fn save_ime_follow_caret(on: bool) {
+    IME_FOLLOW_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
+    if let Some(p) = ime_follow_caret_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        write_setting(p, if on { "1" } else { "0" });
+    }
+}
+
 fn mcp_consent_path() -> Option<PathBuf> {
     Some(config_dir()?.join("mcp_consent"))
 }

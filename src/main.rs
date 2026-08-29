@@ -15,6 +15,7 @@ mod mcp_embed;
 mod mcp_protocol;
 mod proto;
 mod ssh;
+mod stall;
 mod store;
 mod terminal;
 mod textcodec;

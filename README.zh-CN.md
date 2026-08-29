@@ -144,6 +144,19 @@ chmod +x ishell-*            # 赋可执行权限
 
 > 权衡：强制 X11 会损失部分原生 Wayland 体验（如分数缩放更顺滑），换来输入法可用——与 Chrome 的 `--ozone-platform=x11` 同理。默认仍走 Wayland，仅在你开启后切换。
 
+**用 fcitx 打字/删除时整个界面冻住（远程桌面下多见）？**
+把**设置 → 启动选项 →「输入法候选框跟随光标」**取消勾选。即时生效，不用重启。
+
+原因：把光标位置告诉输入法，在 X11 上是一次**同步的 XIM 请求**（`XSetICValues`），Xlib 发出去之后**无限期等回复、没有超时**——而这个调用就发生在画界面的那个线程上。输入法只要在这中间没了（崩溃、重启、远程桌面会话切换/重连），这个线程就永远停在那儿。实测抓到的栈：
+
+```text
+poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
+                 → winit::…::ImeContext::set_spot → eframe::run_native
+```
+
+winit 只在坐标**真的变了**时才发这条请求，所以恒定上报同一个坐标 = 一条都不会发出去。中文照常能打，只是候选框停在输入区左上角。iShell 也会自己发现界面卡住：往 `~/.config/ishell/crash.log` 追加一条说明，并顺手把这个选项关掉，让下一次启动不再踩同一个坑。
+
+
 ## 🔧 从源码构建
 
 需要 [Rust](https://rustup.rs/)（stable）。在目标平台上：

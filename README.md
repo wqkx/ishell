@@ -144,6 +144,18 @@ Some Wayland desktops (KDE Plasma / GNOME) have flaky `text-input-v3` support fo
 
 > Trade-off: forcing X11 loses some native-Wayland niceties (e.g. smoother fractional scaling) in exchange for a working IME — the same trade-off as Chrome's `--ozone-platform=x11`. The default is still Wayland; it only switches when you enable this.
 
+**The whole UI freezes while typing with fcitx (often over a remote desktop)?**
+Uncheck **“IME candidate window follows the caret”** (Settings → Startup). Takes effect immediately, no restart.
+
+Why: telling the IME where the caret is means a **synchronous XIM request** on X11 (`XSetICValues`), and Xlib waits for the reply **with no timeout** — on the very thread that draws the UI. If the IME dies mid-request (crash, restart, remote-desktop session switch/reconnect) that thread is stuck for good. A captured stack looks like:
+
+```text
+poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
+                 → winit::…::ImeContext::set_spot → eframe::run_native
+```
+
+winit only sends that request when the coordinate actually *changes*, so reporting a constant one means it is never sent at all. You keep full CJK input; the candidate window just stops following the caret. iShell also detects a frozen UI thread on its own — it appends an explanation to `~/.config/ishell/crash.log` and turns this option off for you, so the next launch is safe.
+
 ## 🔧 Build from source
 
 Requires [Rust](https://rustup.rs/) (stable). On the target platform:
