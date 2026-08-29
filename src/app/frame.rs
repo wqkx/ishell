@@ -20,10 +20,53 @@ type FramePdfSearch = (u64, String, Vec<(u32, String)>, Option<String>);
 
 impl App {
     /// 处理本帧会话事件与编辑器/传输副作用（在布局绘制之前调用）。
-    pub(super) fn process_frame_events(&mut self, ui: &mut egui::Ui) {
-        // 0) AI/MCP 控制通道：排空本地 socket 收到的请求 + 检查各会话待完成的命令运行
+    /// 每帧的**非绘制**工作，由 [`eframe::App::logic`] 调用——**窗口最小化/不可见时也照常
+    /// 调用**，这正是它存在的理由。
+    ///
+    /// eframe 只在窗口可见时调用 `App::ui`（`epi_integration.rs`：
+    /// `if is_visible { app.update(); app.ui(); }`）。iShell 原本把每帧工作全放在 `ui` 里，
+    /// 于是最小化窗口之后 MCP 请求就再也没人排空——现象是「最小化 iShell 之后 AI 完全操作
+    /// 不了它」。这里放的三件事都不需要 `Ui`，且都不能因为窗口看不见就停摆：
+    ///
+    /// 1. 排空 MCP 请求 + 检查各会话待完成的 AI 命令运行；
+    /// 2. 排空各会话的后台事件——`run_command` 靠终端输出里的哨兵判断命令结束，不喂数据
+    ///    就永远等不到（事件只是搬进 `s.pending.*`，等窗口回来由 `process_frame_events`
+    ///    消费，不会丢）；
+    /// 3. 续下一帧——最小化时 eframe 会把重绘节流到 ≥100ms，但**前提是应用还在请求重绘**，
+    ///    不续就直接睡死了。
+    pub(super) fn pump_background(&mut self, ctx: &egui::Context) {
         self.drain_mcp_calls();
-        // 1) 排空所有会话的后台事件，并在连接成功后初始化文件树
+        let mut backlog = false;
+        for s in &mut self.sessions {
+            backlog |= s.drain_events();
+        }
+        // 事件没排空（每帧有预算，防止一次性把渲染拖垮）：马上再来一帧接着消化。
+        // 这是**同线程**的 request_repaint，可靠（不可靠的是跨线程那条，见下面的说明）。
+        if backlog {
+            ctx.request_repaint();
+        }
+
+        // AI/MCP 控制的响应性兜底节奏。
+        //
+        // 背景：MCP 请求到达 socket 后由后台 tokio 线程 `ctx.request_repaint()` 唤醒 UI
+        // 线程来排空。但实测发现——窗口彻底空闲、eframe 停在 `ControlFlow::Wait` 时，
+        // **跨线程的 `request_repaint()` 唤醒会丢**：请求只能干等到别的事件偶然唤起一帧，
+        // 实测单条 `list_sessions` 卡了 157 秒。而 MCP 代理是「每次工具调用新开一条连接」，
+        // 所以这不是首次连接的一次性问题，每个调用都可能中招。
+        //
+        // 修法：改用可靠的 `request_repaint_after`——它设的 `WaitUntil` 是 OS 层定时唤醒。
+        // 只要 AI 控制已启用且有已连接会话（此时反向转发 socket 正暴露、随时可能来请求），
+        // 就每帧续一个短定时重绘。门控为假时完全不介入，零额外开销。
+        if crate::store::load_mcp_consent() && self.sessions.iter().any(|s| s.connected) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+    }
+
+    pub(super) fn process_frame_events(&mut self, ui: &mut egui::Ui) {
+        // 0) AI/MCP 请求与后台事件的排空已由 `pump_background` 做过——它挂在
+        //    `App::logic` 上，eframe 保证在 `App::ui` 之前调用，且窗口最小化时也调用。
+        //    这里只负责把 `s.pending.*` 里攒下的东西画出来/落到 UI 状态上。
+        // 1) 连接成功后初始化文件树
         // 身份用会话 uid（稳定唯一），title 仅作显示——避免同名会话（默认 title=用户名）串台。
         let mut new_placeholders: Vec<FramePlaceholder> = Vec::new();
         let mut filled: Vec<FrameFilled> = Vec::new();
@@ -462,24 +505,8 @@ impl App {
             }
         }
 
-        // AI/MCP 控制的响应性兜底节奏。
-        //
-        // 背景：MCP 请求（list_sessions/run_command/…）到达 socket 后由后台 tokio 线程
-        // `ctx.request_repaint()` 唤醒 UI 线程来 `drain_mcp_calls()`。但实测发现——窗口彻底
-        // 空闲、eframe 停在 `ControlFlow::Wait` 时，**跨线程的 `request_repaint()` 唤醒会丢**：
-        // 请求只能干等到别的事件（SSH keepalive/定时器）偶然唤起一帧才被处理，实测单条
-        // `list_sessions` 因此卡了 157 秒。而 MCP 代理是「每次工具调用新开一条连接」，所以
-        // 这不是首次连接的一次性问题，而是每个调用都可能中招。
-        //
-        // 修法：不依赖那个会丢的跨线程唤醒，改用可靠的 `request_repaint_after`——它设的
-        // `WaitUntil` 是 OS 层定时唤醒，连窗口被最小化/遮挡（compositor 停发重绘）时也照样
-        // 触发。只要 AI 控制已启用且有已连接会话（此时反向转发 socket 正暴露、随时可能来
-        // 请求），就每帧续一个短定时重绘，形成稳定的低频节奏，保证请求 ≤150ms 被排空。
-        // 门控条件为假（普通用户没开 AI 控制，或没有活跃会话）时完全不介入，零额外开销。
-        if crate::store::load_mcp_consent() && self.sessions.iter().any(|s| s.connected) {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(150));
-        }
+        // 续帧节奏见 `pump_background`——那边挂在 `App::logic` 上，最小化时也照常跑；
+        // 放在这里的话窗口一最小化就停了（`App::ui` 不再被调用），MCP 会直接失联。
     }
 }
 

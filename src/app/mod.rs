@@ -285,16 +285,37 @@ impl eframe::App for App {
     /// 内容全丢，远大于「这一帧少画了点东西」。接住的位置刻意选在 `ui_impl` 外层——panic
     /// 只从我们自己的闭包里展开出来，eframe/egui 该收尾的 `end_pass` 照常执行，不会把
     /// egui 卡在半开的帧上。连续崩太多帧则不再兜底，详见 `crash::on_frame_panic`。
+    /// 每帧的**非绘制**工作。窗口最小化/不可见时 eframe **不会**调用 [`Self::ui`]，只有这里
+    /// 照常调用（eframe `epi_integration.rs`：`app.logic(..)` 无条件执行，`app.update()`/
+    /// `app.ui()` 被 `if is_visible` 包着）。
+    ///
+    /// AI/MCP 的请求排空原本整个在 `ui` 里，于是「最小化 iShell 之后 AI 就操作不了它了」
+    /// ——不是慢，是彻底没人处理。凡是不需要 `Ui`、且不能因为窗口看不见就停摆的事情，
+    /// 都必须放在这里。见 [`App::pump_background`]。
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 卡死看门狗：记「事件循环还活着」。必须记在 logic 而不是 ui——最小化时 ui 不再被
+        // 调用，记在那边会把「窗口最小化」误判成「UI 线程卡死」。
+        crate::stall::spawn(ctx.clone());
+        crate::stall::note_frame(
+            ctx.input(|i| !i.events.is_empty()),
+            // 最小化/被遮挡：卡死时据此判断该不该把账算到输入法头上（见 stall::on_stall）
+            ctx.input(|i| {
+                let vp = i.viewport();
+                vp.minimized == Some(true) || vp.occluded == Some(true)
+            }),
+        );
+        // 同 `ui` 的理由兜住 panic：这里跑的是 MCP 请求处理，一次意外不该带走整个进程。
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pump_background(ctx)))
+            .is_err()
+        {
+            crate::crash::on_frame_panic(ctx);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // AssertUnwindSafe：&mut self / &mut Ui 本就不是 UnwindSafe，我们接受「接住后状态
         // 可能是半截的」——横幅会明确提示用户尽快保存重启。
-        // 卡死看门狗：记下「出帧了」以及这一帧有没有用户输入。放在 catch_unwind **之前**，
-        // 因为 panic 被接住的那一帧同样是出过帧的——那是 crash 模块管的事，不该被误判成卡死。
-        // 首帧顺带把探测线程拉起来（拿 ctx 用于主动请求重绘）。见 `crate::stall`。
-        crate::stall::spawn(ctx.clone());
-        crate::stall::note_frame(ctx.input(|i| !i.events.is_empty()));
-
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.ui_impl(ui, frame)));
         match r {
             Ok(()) => crate::crash::on_frame_ok(),

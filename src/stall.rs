@@ -42,6 +42,10 @@ static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// 只报一次：卡死之后每 2 秒往日志里灌一条毫无意义。
 static REPORTED: AtomicBool = AtomicBool::new(false);
+/// 最后一帧时窗口是不是最小化/被遮挡。卡死时用来判断该不该把账算到输入法头上——
+/// 最小化状态下卡住更可能是窗口/绘制路径（eframe 仍会给最小化的窗口画帧并交换缓冲，
+/// 而合成器可能已经不再给它调度垂直同步了），跟 XIM 无关。
+static WAS_HIDDEN: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 fn now_ms() -> u64 {
@@ -52,9 +56,10 @@ fn now_ms() -> u64 {
 ///
 /// `had_input` 决定探测窗口是否续期——只有真的在敲键盘/动鼠标才值得探，
 /// 光标闪烁那种自发重绘不算。
-pub fn note_frame(had_input: bool) {
+pub fn note_frame(had_input: bool, hidden: bool) {
     let t = now_ms();
     LAST_FRAME_MS.store(t, Ordering::Relaxed);
+    WAS_HIDDEN.store(hidden, Ordering::Relaxed);
     if had_input {
         LAST_INPUT_MS.store(t, Ordering::Relaxed);
     }
@@ -103,27 +108,29 @@ pub fn spawn(ctx: egui::Context) {
         .ok();
 }
 
-/// 判定卡死之后做的两件事：落日志、把最可能的元凶关掉。
+/// 判定卡死之后做的两件事：落日志、（在能确定元凶时）把最可能的元凶关掉。
 fn on_stall() {
+    let hidden = WAS_HIDDEN.load(Ordering::Relaxed);
     let follow = crate::store::load_ime_follow_caret();
     log::error!(
-        "UI 线程已 {}s 没有出帧（用户刚刚还在输入）——极可能卡在输入法的同步 XIM 请求上。\
+        "UI 线程已 {}s 没有出帧（用户刚刚还在输入）。窗口最小化/被遮挡={hidden}，\
          ime_follow_caret={follow}",
         STALL_AFTER.as_secs()
     );
-    // 唯一能让下一次启动不再踩同一个坑的动作：关掉光标位置上报。winit 只在坐标真的变了
-    // 时才发 XSetICValues，恒定上报 = 一条都不发 = 这条卡死路径消失。中文照常能打，
-    // 只是候选框不跟着光标跑。用户可以在设置里再打开。
-    if follow {
+    // **只在窗口可见时**才把账算到输入法头上。最小化时 eframe 照样会给窗口画帧并交换缓冲
+    // （`is_visible` 在原生平台上恒为真），而合成器很可能已经不再给一个图标化的窗口调度
+    // 垂直同步了——那种卡住在绘制路径上，跟 XIM 无关，关掉候选框跟随既没用又冤枉。
+    let acted = !hidden && follow;
+    if acted {
         crate::store::save_ime_follow_caret(false);
     }
-    write_stall_log(follow);
+    write_stall_log(hidden, follow, acted);
 }
 
 /// 往 `crash.log` 里追加一条卡死记录——和 panic 走同一份文件，用户交一份就够。
 ///
 /// 主线程此刻正卡在 Xlib 里，这里是**另一个线程**在写，只能碰文件系统，不能碰任何 UI 状态。
-fn write_stall_log(follow_was_on: bool) {
+fn write_stall_log(hidden: bool, follow_was_on: bool, acted: bool) {
     use std::io::Write;
     let Some(path) = crate::store::crash_log_path() else {
         return;
@@ -145,8 +152,12 @@ fn write_stall_log(follow_was_on: bool) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let action = if follow_was_on {
+    let action = if acted {
         "已自动关闭「输入法候选框跟随光标」，重启后不再发送 XSetICValues。"
+    } else if hidden {
+        "窗口当时是最小化/被遮挡的：这种情况下更可能卡在窗口与绘制路径上（合成器不再给\n\
+         \x20         图标化的窗口调度垂直同步，而 eframe 仍会给它画帧并交换缓冲），与输入法无关，\n\
+         \x20         因此**没有**去动输入法设置。请务必抓一份栈。"
     } else {
         "「输入法候选框跟随光标」本来就是关的——这次卡死另有原因，请抓一份栈。"
     };
@@ -155,7 +166,7 @@ fn write_stall_log(follow_was_on: bool) {
         "\n=== ishell {} UI 线程卡死 ===\n\
          unix_time: {secs}\n\
          现象:     用户刚刚还在输入，但界面已经 {}s 没有出帧（看门狗每 2s 主动请求重绘，\
-         活着的事件循环不可能这么久不响应）。\n\
+         活着的事件循环不可能这么久不响应）。窗口最小化/被遮挡={hidden}。\n\
          最可能:   卡在输入法的同步 XIM 请求上（Xlib 对 XIM 没有超时）。典型栈：\n\
          \x20         poll → _XReadEvents → XIfEvent → _XimRead → XSetICValues\n\
          \x20         → winit::…::ImeContext::set_spot → eframe::run_native\n\
@@ -171,6 +182,7 @@ mod tests {
     use super::*;
 
     const WIN: u64 = ACTIVE_WINDOW.as_millis() as u64;
+    #[allow(dead_code)]
     const STALL: u64 = STALL_AFTER.as_millis() as u64;
 
     /// 探测窗口内、久久不出帧 → 判定卡死。这是这个模块存在的理由。
