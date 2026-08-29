@@ -154,7 +154,7 @@ poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
                  → winit::…::ImeContext::set_spot → eframe::run_native
 ```
 
-winit only sends that request when the coordinate actually *changes*, so reporting a constant one means it is never sent at all. You keep full CJK input; the candidate window just stops following the caret. iShell also detects a frozen UI thread on its own — it appends an explanation to `~/.config/ishell/crash.log` and turns this option off for you, so the next launch is safe.
+winit only sends that request when the coordinate actually *changes*, so reporting a constant one means it is never sent at all. You keep full CJK input; the candidate window just stops following the caret. iShell also detects a frozen UI thread on its own and appends an explanation to `~/.config/ishell/crash.log` — it only reports, it never changes settings behind your back.
 
 **Whole UI looks suspended after minimizing the window — and the AI can't drive it either?**
 Try starting with `ISHELL_NO_VSYNC=1 ./ishell-linux-x86_64`. If minimizing behaves after that, it's the following.

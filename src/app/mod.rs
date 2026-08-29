@@ -285,13 +285,19 @@ impl eframe::App for App {
     /// 内容全丢，远大于「这一帧少画了点东西」。接住的位置刻意选在 `ui_impl` 外层——panic
     /// 只从我们自己的闭包里展开出来，eframe/egui 该收尾的 `end_pass` 照常执行，不会把
     /// egui 卡在半开的帧上。连续崩太多帧则不再兜底，详见 `crash::on_frame_panic`。
-    /// 每帧的**非绘制**工作。窗口最小化/不可见时 eframe **不会**调用 [`Self::ui`]，只有这里
-    /// 照常调用（eframe `epi_integration.rs`：`app.logic(..)` 无条件执行，`app.update()`/
-    /// `app.ui()` 被 `if is_visible` 包着）。
+    /// 每帧的**非绘制**工作。eframe 无条件调用它，而 [`Self::ui`] 被 `if is_visible` 包着
+    /// （`epi_integration.rs`）——凡是不需要 `Ui`、且不能因为窗口看不见就停摆的事情，
+    /// 都该放在这里。见 [`App::pump_background`]。
     ///
-    /// AI/MCP 的请求排空原本整个在 `ui` 里，于是「最小化 iShell 之后 AI 就操作不了它了」
-    /// ——不是慢，是彻底没人处理。凡是不需要 `Ui`、且不能因为窗口看不见就停摆的事情，
-    /// 都必须放在这里。见 [`App::pump_background`]。
+    /// **别把它当成「最小化之后 AI 操作不了 iShell」的修复**：那条 `is_visible` 取自
+    /// `viewport.info.visible()`，而原生平台上 eframe/egui-winit **没有任何一处给这个字段
+    /// 赋值**（`Occluded` 事件写的是 `info.occluded`），恒为 `None → unwrap_or(true)`，
+    /// 所以 Linux 上最小化时 `ui` 照样被调用（已用无头实测双向确认）。那个 bug 的真因另有
+    /// 其人，目前最像的是 `swap_buffers` 等一个图标化窗口永远等不到的垂直同步——见 `main.rs`
+    /// 里 `ISHELL_NO_VSYNC` 那段。真是它的话，`logic` 和 `ui` 在同一个线程上，挪过来也救不了。
+    ///
+    /// 这里成立的理由要弱一些、但仍然成立：Windows 上 `is_visible` 确实会变假，而且这些活
+    /// 本来就不该挂在「窗口可见」这个条件上。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 卡死看门狗：记「事件循环还活着」。必须记在 logic 而不是 ui——最小化时 ui 不再被
         // 调用，记在那边会把「窗口最小化」误判成「UI 线程卡死」。

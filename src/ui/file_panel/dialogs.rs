@@ -92,6 +92,9 @@ pub(super) fn dialogs(
                     button_row(ui, 118.0, 2, |ui| {
                         if dlg_btn(ui, crate::i18n::tr("选择文件…", "Choose files…"), 118.0, 0)
                         {
+                            // 原生文件对话框是**同步**的（Linux 上 rfd 走 xdg-portal + pollster），而这里就在事件循环线程上：
+                            // 用户翻目录的那十几秒界面一帧都不出。圈起来，免得卡死看门狗把它误判成卡死。
+                            let _stall_guard = crate::stall::blocking();
                             if let Some(paths) = rfd::FileDialog::new().pick_files() {
                                 for p in paths {
                                     actions.push(FileAction::Upload {
@@ -108,6 +111,9 @@ pub(super) fn dialogs(
                             118.0,
                             0,
                         ) {
+                            // 原生文件对话框是**同步**的（Linux 上 rfd 走 xdg-portal + pollster），而这里就在事件循环线程上：
+                            // 用户翻目录的那十几秒界面一帧都不出。圈起来，免得卡死看门狗把它误判成卡死。
+                            let _stall_guard = crate::stall::blocking();
                             if let Some(p) = rfd::FileDialog::new().pick_folder() {
                                 actions.push(FileAction::Upload {
                                     local: p.to_string_lossy().into_owned(),

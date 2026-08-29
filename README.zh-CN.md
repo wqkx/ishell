@@ -154,7 +154,7 @@ poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
                  → winit::…::ImeContext::set_spot → eframe::run_native
 ```
 
-winit 只在坐标**真的变了**时才发这条请求，所以恒定上报同一个坐标 = 一条都不会发出去。中文照常能打，只是候选框停在输入区左上角。iShell 也会自己发现界面卡住：往 `~/.config/ishell/crash.log` 追加一条说明，并顺手把这个选项关掉，让下一次启动不再踩同一个坑。
+winit 只在坐标**真的变了**时才发这条请求，所以恒定上报同一个坐标 = 一条都不会发出去。中文照常能打，只是候选框停在输入区左上角。iShell 也会自己发现界面卡住：往 `~/.config/ishell/crash.log` 追加一条说明——只报告，不会背着你改设置。
 
 
 **最小化窗口之后整个界面像被挂起、AI 也操作不了？**

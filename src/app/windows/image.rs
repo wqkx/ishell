@@ -196,6 +196,9 @@ impl App {
                     if !t.data.is_empty() {
                         let fname = t.path.rsplit('/').next().unwrap_or("image").to_string();
                         let data = t.data.clone();
+                        // 原生文件对话框是**同步**的（Linux 上 rfd 走 xdg-portal + pollster），而这里就在事件循环线程上：
+                        // 用户翻目录的那十几秒界面一帧都不出。圈起来，免得卡死看门狗把它误判成卡死。
+                        let _stall_guard = crate::stall::blocking();
                         if let Some(path) = rfd::FileDialog::new().set_file_name(&fname).save_file() {
                             save_msg = Some(match std::fs::write(&path, &data) {
                                 Ok(_) => match crate::i18n::current() { crate::i18n::Lang::Zh => format!("已保存到 {}", path.display()), crate::i18n::Lang::En => format!("Saved to {}", path.display()) },

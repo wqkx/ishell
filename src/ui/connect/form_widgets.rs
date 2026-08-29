@@ -58,6 +58,9 @@ pub(super) fn key_file_row(
             .on_hover_text(crate::i18n::tr("浏览选择私钥文件", "Browse for key file"))
             .clicked()
         {
+            // 原生文件对话框是**同步**的（Linux 上 rfd 走 xdg-portal + pollster），而这里就在事件循环线程上：
+            // 用户翻目录的那十几秒界面一帧都不出。圈起来，免得卡死看门狗把它误判成卡死。
+            let _stall_guard = crate::stall::blocking();
             if let Some(path) = rfd::FileDialog::new().set_title(dialog_title).pick_file() {
                 *value = path.to_string_lossy().into_owned();
             }

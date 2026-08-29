@@ -523,6 +523,9 @@ impl App {
         }
         // 选择默认下载目录（原生文件夹选择器）
         if pick_dir {
+            // 原生文件对话框是**同步**的（Linux 上 rfd 走 xdg-portal + pollster），而这里就在事件循环线程上：
+            // 用户翻目录的那十几秒界面一帧都不出。圈起来，免得卡死看门狗把它误判成卡死。
+            let _stall_guard = crate::stall::blocking();
             if let Some(dir) = rfd::FileDialog::new()
                 .set_title(crate::i18n::tr(
                     "选择默认下载文件夹",
