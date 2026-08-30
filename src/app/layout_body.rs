@@ -201,17 +201,44 @@ impl App {
                 //
                 // 仍存在的残余风险：某个保存的连接其远端命令直接落进一个密码提示符——那种
                 // 情况下用户确实一个键都没敲。这不在本次修复范围内。
+                // 重连后恢复工作目录：等 shell 真的闲下来再 `cd` 回去。
+                // 判据与下面的配对标识注入共用 `Session::shell_idle_for_injection`——两处干的
+                // 是同一件事（程序替用户敲键盘），判据分成两份迟早会漂移。
+                if s.restore_cwd && !s.last_cwd.is_empty() && !s.ai_owned {
+                    let expired = s
+                        .restore_cwd_until
+                        .is_none_or(|t| std::time::Instant::now() >= t);
+                    match super::session::cwd_restore_decision(
+                        s.terminal.never_typed(),
+                        s.shell_idle_for_injection(),
+                        expired,
+                    ) {
+                        super::session::CwdRestore::Inject => {
+                            let cmd = format!(
+                                "cd '{}'",
+                                s.last_cwd.replace('\'', "'\\''")
+                            );
+                            let _ = s.cmd_tx.send(UiCommand::TerminalInput(
+                                format!("{cmd}\r").into_bytes(),
+                            ));
+                            // 吞掉回显——此前这条注入连这一步都没有，`cd '…'` 会原样留在屏幕上。
+                            s.terminal.expect_echo(&cmd);
+                            s.restore_cwd = false;
+                            s.restore_cwd_until = None;
+                        }
+                        super::session::CwdRestore::GiveUp => {
+                            s.restore_cwd = false;
+                            s.restore_cwd_until = None;
+                        }
+                        super::session::CwdRestore::Wait => {}
+                    }
+                }
                 if pair_inject_allowed(
                     crate::store::load_mcp_auto_pair(),
                     crate::store::load_mcp_consent(),
                     s.ai_owned,
                     s.mcp_token_injected,
-                ) && s.connected
-                    && s.pending_ai_run.is_none()
-                    && !s.terminal.ai_capture_pending()
-                    && !s.terminal.appears_busy()
-                    && s.terminal.output_idle_for(std::time::Duration::from_secs(2))
-                    && s.terminal.input_idle_for(std::time::Duration::from_secs(2))
+                ) && s.shell_idle_for_injection()
                     // 本次连接以来一个键都没敲过——把「其实停在某个程序的密码提示符上」
                     // 这类场景整个排除掉。理由见 Terminal::never_typed。
                     && s.terminal.never_typed()

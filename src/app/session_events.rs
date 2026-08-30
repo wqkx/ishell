@@ -58,16 +58,25 @@ impl Session {
                     // 同时复位输入时钟：注入的前提之一是「本次连接以来没敲过键」
                     // （见 Terminal::never_typed），重连后要重新开始计。
                     self.terminal.reset_input_clock();
-                    // 重连后恢复工作目录（若断线前由 OSC 7 记录过）；ai_owned 会话从不做
-                    // OSC 7 注入（见 layout_body.rs），restore_cwd 理论上不会为 true，这里
+                    // 重连后恢复工作目录（若断线前由 OSC 7 记录过）。
+                    //
+                    // **不在这里直接注入。** `Connected` 是「SSH 连上了」，不是「shell 已经在
+                    // 提示符上等着了」——此刻远端多半正在吐 MOTD/banner，甚至可能停在某个登录
+                    // 脚本起的程序或密码提示符上。往那儿打一行 `cd …\r`，轻则被 MOTD 冲掉、
+                    // 回显原样留在屏幕上（这里此前连 expect_echo 都没有），重则把这一行喂给
+                    // 那个正在等输入的程序。这和 MCP 配对标识注入是同一类问题，那边已经有一
+                    // 整套闲置判据，这里改成复用它：先记下意图，等 shell 真的闲下来再注入
+                    // （见 layout_body.rs 里的分支与 `cwd_restore_decision`）。
+                    //
+                    // ai_owned 会话从不做 OSC 7 注入，`restore_cwd` 理论上不会为 true，这里
                     // 仍显式排除一下，避免以后有别的路径意外置位时悄悄破了只读约定。
                     if self.restore_cwd && !self.last_cwd.is_empty() && !self.ai_owned {
-                        let quoted = format!("'{}'", self.last_cwd.replace('\'', "'\\''"));
-                        let _ = self.cmd_tx.send(UiCommand::TerminalInput(
-                            format!("cd {quoted}\r").into_bytes(),
-                        ));
+                        self.restore_cwd_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
+                    } else {
+                        self.restore_cwd = false;
+                        self.restore_cwd_until = None;
                     }
-                    self.restore_cwd = false;
                     // OSC 7 注入改为「点菜单时按需注入」（那时 shell 闲置在提示符，回显可被可靠吞掉），
                     // 不在连接时自动注入，避免与 MOTD/首个提示符的输出竞争、以及每次连接都注入。
                     // 断线前被中断的传输：重连后用新通道重发，底层据本地/远端已有字节自动续传

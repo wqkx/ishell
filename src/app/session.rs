@@ -57,6 +57,9 @@ pub(super) struct Session {
     pub(super) last_cwd: String,
     /// 重连后待恢复 cwd
     pub(super) restore_cwd: bool,
+    /// 「等 shell 闲下来再 cd 回去」的截止时刻。到点还没等到闲置窗口就放弃——不能让这个
+    /// 意图无限期挂着，几分钟后突然往用户的 shell 里敲一行 `cd`。见 `cwd_restore_decision`。
+    pub(super) restore_cwd_until: Option<std::time::Instant>,
     /// 待弹出「注入 OSC 7」确认框（右键功能在无 cwd 时触发）
     pub(super) osc7_confirm: bool,
     /// 已注入、等下个提示符上报 cwd 后把文件区跳过去
@@ -117,7 +120,54 @@ fn quote_shell_arg(path: &str, windows_style: bool) -> String {
     }
 }
 
+/// 恢复工作目录这一步该怎么走。
+///
+/// 抽成纯函数是因为这里唯一容易写错的是**放弃的条件**：意图挂着不放，就会在几分钟后突然
+/// 往用户的 shell 里敲一行 `cd`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CwdRestore {
+    /// 还没等到安全窗口，下一帧再看。
+    Wait,
+    /// 现在可以注入。
+    Inject,
+    /// 放弃：用户已经自己动手了，或者等太久了。
+    GiveUp,
+}
+
+/// - `never_typed`：本次连接以来用户一个键都没敲过。敲过就说明他已经在用这个 shell 了，
+///   此时替他 `cd` 只会打断他——直接放弃，别再等。
+/// - `idle`：终端不忙、远端输出与用户输入都静止了一段时间（与 MCP 配对标识注入同一套判据）。
+/// - `expired`：等过了截止时刻。
+pub(super) fn cwd_restore_decision(never_typed: bool, idle: bool, expired: bool) -> CwdRestore {
+    if !never_typed {
+        return CwdRestore::GiveUp;
+    }
+    if idle {
+        return CwdRestore::Inject;
+    }
+    if expired {
+        return CwdRestore::GiveUp;
+    }
+    CwdRestore::Wait
+}
+
 impl Session {
+    /// 现在往这个 shell 里替用户敲一行东西安全吗——「提示符几乎确定闲着」的那套判据。
+    ///
+    /// 与 MCP 配对标识的自动注入共用同一个函数**是有意的**：两处干的是同一件事（程序替用户
+    /// 敲键盘），判据分成两份迟早会漂移，而漂移的后果是往某个正在等输入的程序（sudo/ssh 的
+    /// 密码提示符）里打字。
+    pub(super) fn shell_idle_for_injection(&self) -> bool {
+        const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+        self.connected
+            && !self.ai_owned
+            && self.pending_ai_run.is_none()
+            && !self.terminal.ai_capture_pending()
+            && !self.terminal.appears_busy()
+            && self.terminal.output_idle_for(QUIET)
+            && self.terminal.input_idle_for(QUIET)
+    }
+
     /// 用户往终端里粘了一张图（Ctrl+V / 右键粘贴，剪贴板里是图片而不是文本）。
     ///
     /// 终端协议里没有「贴一张图」这回事，字节流塞不进去。能落地的做法只有一条：把图片
@@ -313,6 +363,7 @@ impl App {
             reconnect_tries: 0,
             last_cwd: String::new(),
             restore_cwd: false,
+            restore_cwd_until: None,
             osc7_confirm: false,
             osc7_pending_reveal: false,
             cd_force_until: None,
@@ -489,5 +540,34 @@ mod paste_path_tests {
         assert_eq!(quote_shell_arg("/tmp/$(id).png", false), "'/tmp/$(id).png'");
         assert_eq!(quote_shell_arg("/tmp/a`id`.png", false), "'/tmp/a`id`.png'");
         assert_eq!(quote_shell_arg("", false), "''");
+    }
+}
+
+#[cfg(test)]
+mod cwd_restore_tests {
+    use super::{cwd_restore_decision, CwdRestore};
+
+    /// shell 闲下来了才注入。`Connected` 那一刻远端多半正在吐 MOTD/banner，甚至可能停在
+    /// 某个登录脚本起的程序上——此前是在那一刻直接打一行 `cd …\r` 过去。
+    #[test]
+    fn injects_only_once_the_shell_is_actually_idle() {
+        assert_eq!(cwd_restore_decision(true, false, false), CwdRestore::Wait);
+        assert_eq!(cwd_restore_decision(true, true, false), CwdRestore::Inject);
+    }
+
+    /// **用户一动手就放弃。** 他已经在用这个 shell 了（可能正对着某个提示符输密码），
+    /// 此时替他 `cd` 只会打断他，而且那一行可能被别的程序吃掉。
+    #[test]
+    fn gives_up_as_soon_as_the_user_starts_typing() {
+        assert_eq!(cwd_restore_decision(false, true, false), CwdRestore::GiveUp);
+        assert_eq!(cwd_restore_decision(false, false, false), CwdRestore::GiveUp);
+    }
+
+    /// 等太久也放弃：意图不能无限期挂着，否则几分钟后突然往用户的 shell 里敲一行 `cd`。
+    #[test]
+    fn gives_up_after_the_deadline() {
+        assert_eq!(cwd_restore_decision(true, false, true), CwdRestore::GiveUp);
+        // 但截止时刻到了、同时又恰好闲下来的那一帧，注入优先——意图本来就该在这时兑现
+        assert_eq!(cwd_restore_decision(true, true, true), CwdRestore::Inject);
     }
 }
