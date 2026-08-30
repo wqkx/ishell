@@ -82,10 +82,10 @@ impl App {
         if backlog {
             ctx.request_repaint();
         }
-        // 「重连后恢复 cwd」的完整状态机（注入/等待/放弃）。**必须放在这条与标签页无关的
-        // 每帧路径上**：它一度挂在 `right_body` 里，而那个只对当前活动标签调用，于是
-        // 「在别的标签上重连」这条最常见的路径反而一次都不会被求值。见函数自身的注释。
-        self.advance_cwd_restore();
+        // 两处「程序替用户敲键盘」的自动注入。**必须放在这条与标签页无关的每帧路径上**：
+        // 它们一度挂在 `right_body` 里，而那个只对当前活动标签调用，于是「在别的标签上
+        // 重连」这条最常见的路径反而一次都不会被求值。见函数自身的注释。
+        self.advance_auto_injections();
         // 必须在上面所有超时判定之后：那些判定全是每帧轮询的，而 egui 按需重绘——空闲窗口
         // 不转帧，它们就永远不被求值。这一下按最近的 deadline 排定时重绘，保证到点必有一帧。
         self.arm_timeout_repaint();
@@ -119,7 +119,13 @@ impl App {
         }
     }
 
-    /// 推进「重连后恢复工作目录」的意图：闲下来就 `cd` 回去，用户上手了或超时就放弃。
+    /// 推进两处**自动注入**——「重连后恢复工作目录」与「MCP 配对标识」。两处干的是同一件
+    /// 事（程序替用户敲键盘），判据早已共用 `Session::shell_idle_for_injection`，现在求值
+    /// 时机也统一：同一条每帧路径、同一次会话遍历、cwd 在前。
+    ///
+    /// **顺序是有意的**：`cd` 一旦注入就 `expect_echo` 武装了回显吞除，而 `expect_echo`
+    /// 是整体覆写；同一轮里紧跟着的配对标识注入会读到刚更新的 `injection_idle_for`，
+    /// 因而必然被挡下，`cd` 的回显不会被冲掉。
     ///
     /// **这里是与标签页无关的每帧路径，这一点是本函数存在的全部理由。** 它一度写在
     /// `right_body` 里，而 `right_body` 只对**当前活动标签**调用（`mod.rs` 的
@@ -130,7 +136,7 @@ impl App {
     /// 判据仍与 MCP 配对标识注入共用 `Session::shell_idle_for_injection`——两处干的是同一件
     /// 事（程序替用户敲键盘），判据分成两份迟早会漂移。差别只在求值时机：那一处天然只关心
     /// 用户正在看的会话，这一处不能。
-    fn advance_cwd_restore(&mut self) {
+    fn advance_auto_injections(&mut self) {
         let now = std::time::Instant::now();
         for s in &mut self.sessions {
             // `s.connected` 是前提：重连期间 `do_reconnect` 已置下 `restore_cwd`，而截止
@@ -173,6 +179,41 @@ impl App {
                     s.restore_cwd_until = None;
                 }
                 super::session::CwdRestore::Wait => {}
+            }
+        }
+        // MCP 配对 token 自动注入：多台电脑共用同一台 AI 服务器时，让本会话里启动的 AI
+        // （及其 ishell-mcp 子进程）自动携带配对标识——MCP 请求经既有的 token 匹配精确
+        // 路由回本电脑，不再弹窗打扰其他人（未注入时维持原有「多实例弹窗选择」）。
+        //
+        // **默认关，需在设置里显式勾选**（见 `store::load_mcp_auto_pair`）。这一步是 iShell
+        // 替用户在他自己的 shell 里敲一条命令并回车；以前挂在「AI 控制已开启」下面还说得
+        // 过去（那时 AI 控制默认关，能走到这儿的人都是自己勾过的），0.19 起 AI 控制默认开启
+        // 之后，同一个门就变成「每个新会话都被自动打进一条命令」——用户的现场反馈正是
+        // 「iShell 往我当前会话里输东西」。见 `pair_inject_tests` 的回归门禁。
+        //
+        // 闲置判据整体交给 `shell_idle_for_injection`（与 cwd 恢复同一道闸门），其中
+        // 「本次连接以来一个键都没敲过」是**安全边界而非优化**：其余信号分不清「shell 闲在
+        // 提示符上」和「某个程序正阻塞在 stdin」，而 sudo/ssh 的密码提示符恰好也是安静不动的。
+        // 残余风险：某个保存的连接其远端命令直接落进一个密码提示符——那种情况下用户确实
+        // 一个键都没敲。不在本次修复范围内。
+        //
+        // 与上面同一条路径、同一批会话，但**不合进同一个循环**：上面那个循环的 `continue`
+        // 是为 cwd 意图写的（没有意图就跳过该会话），而配对标识跟有没有 cwd 意图无关。
+        // 分成两趟，语义各自独立；`shell_idle_for_injection` 在第二趟读到的是第一趟注入后
+        // 已更新的状态，同帧覆写因此不可能发生。
+        //
+        // 不需要为它另续重绘：`pair_inject_allowed` 以「AI 控制已开启」为前置条件，而那正是
+        // `pump_background` 末尾那条 150ms 心跳的门——能走到这里时心跳一定在转。
+        for s in &mut self.sessions {
+            if pair_inject_allowed(
+                crate::store::load_mcp_auto_pair(),
+                crate::store::load_mcp_consent(),
+                s.ai_owned,
+                s.mcp_token_injected,
+            ) && s.shell_idle_for_injection()
+            {
+                inject_mcp_token(s);
+                s.mcp_token_injected = true;
             }
         }
     }
@@ -976,5 +1017,72 @@ mod notice_policy_tests {
         for k in [K::Need, K::Done, K::Untagged, K::Bell] {
             assert!(!alert(k, M::Off), "{k:?} 在 Off 档下仍然弹了");
         }
+    }
+}
+
+/// 该不该往这个会话自动注入配对标识——只管**策略**那几个开关，终端是否闲置由调用处判断。
+///
+/// 单独抽出来是为了能测：这里最要命的错误是「打开 AI 控制就等于允许 iShell 替我敲键盘」，
+/// 那是一条只有真机上开个新会话才看得见的回归，写成纯函数才守得住。
+fn pair_inject_allowed(
+    auto_pair_on: bool,
+    mcp_on: bool,
+    ai_owned: bool,
+    already_injected: bool,
+) -> bool {
+    // `mcp_on` 仍是前置条件：AI 控制都没开，注入配对标识毫无意义。
+    auto_pair_on && mcp_on && !ai_owned && !already_injected
+}
+
+/// 往会话终端注入 `export ISHELL_MCP_TOKEN=<本机配对 token>`（回显吞除）。
+/// 此后该 shell 里启动的 AI / ishell-mcp 子进程自动继承这个环境变量，MCP 绑定走
+/// ishell-mcp 既有的 token 匹配路径（`bind_instance`），请求精确路由回这台电脑。
+/// 前导空格：配合 bash/zsh 常见的 HISTCONTROL=ignorespace，不进 shell 历史。
+/// token 是 16 位 hex（无 shell 特殊字符），无需引号。
+fn inject_mcp_token(s: &mut super::Session) {
+    let cmd = format!(
+        " export ISHELL_MCP_TOKEN={}",
+        crate::store::mcp_pairing_token()
+    );
+    let _ = s
+        .cmd_tx
+        .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
+    s.terminal.expect_echo(&cmd);
+}
+
+#[cfg(test)]
+mod pair_inject_tests {
+    use super::pair_inject_allowed;
+
+    /// **回归门禁**：仅仅打开「允许 AI 通过 MCP 控制终端」，不等于允许 iShell 替用户在他
+    /// 自己的 shell 里敲一条命令并回车。
+    ///
+    /// 0.19 把 AI 控制的默认值翻成开启之后，自动注入的门还挂在那个开关上，于是每一个新连上
+    /// 的会话都会被自动打进 ` export ISHELL_MCP_TOKEN=…` 并执行——用户报的「iShell 往我当前
+    /// 会话里输东西」就是它。注入必须由**它自己那个默认关闭的开关**把门。
+    #[test]
+    fn enabling_ai_control_alone_never_authorises_typing_into_the_users_shell() {
+        assert!(
+            !pair_inject_allowed(false, true, false, false),
+            "只开了 AI 控制就往用户 shell 里敲命令——这正是 0.19 的那条回归"
+        );
+    }
+
+    /// 显式勾选之后才注入，且只注入一次、只注入用户自己的会话。
+    #[test]
+    fn opted_in_injects_once_into_user_sessions_only() {
+        assert!(pair_inject_allowed(true, true, false, false), "勾选后应当注入");
+        assert!(
+            !pair_inject_allowed(true, true, true, false),
+            "AI 专用会话不该注入：那里的 AI 是我们自己开的，本来就知道该回哪台电脑"
+        );
+        assert!(
+            !pair_inject_allowed(true, true, false, true),
+            "已经注入过就不该再来一次"
+        );
+        assert!(
+            !pair_inject_allowed(true, false, false, false),
+            "AI 控制没开时注入配对标识毫无意义"
+        );
     }
 }
