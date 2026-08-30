@@ -201,49 +201,9 @@ impl App {
                 //
                 // 仍存在的残余风险：某个保存的连接其远端命令直接落进一个密码提示符——那种
                 // 情况下用户确实一个键都没敲。这不在本次修复范围内。
-                // 重连后恢复工作目录：等 shell 真的闲下来再 `cd` 回去。
-                // 判据与下面的配对标识注入共用 `Session::shell_idle_for_injection`——两处干的
-                // 是同一件事（程序替用户敲键盘），判据分成两份迟早会漂移。
-                //
-                // **`s.connected` 是这一段的前提。** 断线横幅那个分支只画一条提示就往下走，
-                // 不挡渲染——也就是说重连期间本段照样每帧被求值，而那时 `do_reconnect` 已
-                // 置下 `restore_cwd`、截止时刻却要到 `Connected` 才武装（`restore_cwd_until`
-                // 还是 `None`）。少了这个门，判据全落在「未连接」那一侧：`idle` 恒假、
-                // `never_typed` 恒真（终端刚重建），意图只会被白白丢掉。
-                if s.connected && s.restore_cwd && !s.last_cwd.is_empty() && !s.ai_owned {
-                    let expired = super::session::cwd_restore_expired(
-                        s.restore_cwd_until,
-                        std::time::Instant::now(),
-                    );
-                    match super::session::cwd_restore_decision(
-                        // 这里再读一次 `never_typed` **不是**跟闸门重复：闸门问的是
-                        // 「现在敲键盘安不安全」（不安全就等下一帧），这里问的是「这个
-                        // 意图还该不该留着」——用户已经上手了就直接放弃，而不是干等到
-                        // 15s 超时。同一个字段，两个不同的问题、两种不同的结果。
-                        s.terminal.never_typed(),
-                        s.shell_idle_for_injection(),
-                        expired,
-                    ) {
-                        super::session::CwdRestore::Inject => {
-                            let cmd = format!(
-                                "cd '{}'",
-                                s.last_cwd.replace('\'', "'\\''")
-                            );
-                            let _ = s.cmd_tx.send(UiCommand::TerminalInput(
-                                format!("{cmd}\r").into_bytes(),
-                            ));
-                            // 吞掉回显——此前这条注入连这一步都没有，`cd '…'` 会原样留在屏幕上。
-                            s.terminal.expect_echo(&cmd);
-                            s.restore_cwd = false;
-                            s.restore_cwd_until = None;
-                        }
-                        super::session::CwdRestore::GiveUp => {
-                            s.restore_cwd = false;
-                            s.restore_cwd_until = None;
-                        }
-                        super::session::CwdRestore::Wait => {}
-                    }
-                }
+                // 重连后恢复工作目录那一段**不在这里**：它挂在 `App::advance_cwd_restore`
+                // 上（`pump_background`，与标签页无关的每帧路径）。理由见那边的注释——
+                // 本函数只在当前活动标签上被调用，而自动重连跟哪个标签在前台没有关系。
                 if pair_inject_allowed(
                     crate::store::load_mcp_auto_pair(),
                     crate::store::load_mcp_consent(),

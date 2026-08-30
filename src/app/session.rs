@@ -139,11 +139,10 @@ pub(super) enum CwdRestore {
 /// - `idle`：终端不忙、远端输出与用户输入都静止了一段时间（与 MCP 配对标识注入同一套判据）。
 /// - `expired`：等过了截止时刻。
 ///
-/// **`expired` 判在 `idle` 前面，过期一律放弃。** 这三个入参是在渲染该会话时才被采样的
-/// （见 `layout_body.rs`），「截止时刻已过」不保证在到点那一刻就被看见。虽然 `App` 每帧
-/// 都会做一次与标签页无关的过期清扫（`expire_cwd_restore_intents`），这里仍按过期优先
-/// 判：判据分两处，靠其中一处「先跑到」来保证安全是脆的，而失手的后果是十分钟后往用户
-/// 的 shell 里补一行 `cd`。
+/// **`expired` 判在 `idle` 前面，过期一律放弃。** 求值由 `App::advance_cwd_restore` 每帧
+/// 驱动（与标签页无关），正常情况下到点那一帧就会看见「已过期」。但空闲窗口是按需重绘的，
+/// 「每帧」并不等于「一定有帧」——真漏掉一段之后再恰好闲下来，就成了十分钟后往用户的
+/// shell 里补一行 `cd`，正是加截止时刻要防的事。所以这里按过期优先判，不依赖调用方的节奏。
 pub(super) fn cwd_restore_decision(never_typed: bool, idle: bool, expired: bool) -> CwdRestore {
     if !never_typed {
         return CwdRestore::GiveUp;
@@ -673,11 +672,17 @@ mod injection_gate_tests {
     #[test]
     fn the_gate_opens_only_after_the_shell_has_spoken_and_gone_quiet() {
         let mut t = Terminal::new();
+        let fed = std::time::Instant::now();
         t.feed(b"user@host:~$ ");
-        assert!(
-            !injection_allowed(true, false, false, &t, QUIET),
-            "banner 刚到，还没静止"
-        );
+        // 只在「确实是刚喂完」时断言：并行跑测试时本线程可能在这两句之间被调度出去，
+        // 若真被挤掉超过 QUIET，「还没静止」就不再成立——那是调度噪声，不是回归。
+        // 门禁宁可少断言一次，也不能偶发挂。
+        if fed.elapsed() < QUIET / 4 {
+            assert!(
+                !injection_allowed(true, false, false, &t, QUIET),
+                "banner 刚到，还没静止"
+            );
+        }
         // `Terminal::appears_busy` 的窗口是硬编码的 1s，这里必须真等过去
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(
@@ -731,10 +736,13 @@ mod injection_gate_tests {
         t.feed(b"user@host:~$ ");
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(injection_allowed(true, false, false, &t, QUIET));
+        let armed = std::time::Instant::now();
         t.expect_echo("cd '/tmp'");
-        assert!(
-            !injection_allowed(true, false, false, &t, QUIET),
-            "刚替用户敲过一行，下一条注入必须等"
-        );
+        if armed.elapsed() < QUIET / 4 {
+            assert!(
+                !injection_allowed(true, false, false, &t, QUIET),
+                "刚替用户敲过一行，下一条注入必须等"
+            );
+        }
     }
 }

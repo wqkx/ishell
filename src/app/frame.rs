@@ -82,11 +82,10 @@ impl App {
         if backlog {
             ctx.request_repaint();
         }
-        // 「重连后恢复 cwd」的意图过期清扫。**必须放在这条与标签页无关的每帧路径上。**
-        // 注入判据只在 `right_body` 渲染该会话时才求值（见 layout_body.rs），重连若发生
-        // 在后台标签页，意图就一直挂着没人过问——用户十分钟后切回来的第一帧恰好闲着，
-        // 就会挨一行 `cd`，正是加截止时刻要防的那个场景。
-        self.expire_cwd_restore_intents();
+        // 「重连后恢复 cwd」的完整状态机（注入/等待/放弃）。**必须放在这条与标签页无关的
+        // 每帧路径上**：它一度挂在 `right_body` 里，而那个只对当前活动标签调用，于是
+        // 「在别的标签上重连」这条最常见的路径反而一次都不会被求值。见函数自身的注释。
+        self.advance_cwd_restore();
         // 必须在上面所有超时判定之后：那些判定全是每帧轮询的，而 egui 按需重绘——空闲窗口
         // 不转帧，它们就永远不被求值。这一下按最近的 deadline 排定时重绘，保证到点必有一帧。
         self.arm_timeout_repaint();
@@ -120,17 +119,60 @@ impl App {
         }
     }
 
-    /// 清掉已过期的「重连后恢复 cwd」意图。见 `pump_background` 里的调用点注释与
-    /// `session::cwd_restore_decision`。
+    /// 推进「重连后恢复工作目录」的意图：闲下来就 `cd` 回去，用户上手了或超时就放弃。
     ///
-    /// 注意 `restore_cwd_until` 为 `None` 表示**截止时刻还没武装**（重连中，尚未收到
-    /// `Connected`），不是已过期——判定统一走 `cwd_restore_expired`。
-    fn expire_cwd_restore_intents(&mut self) {
+    /// **这里是与标签页无关的每帧路径，这一点是本函数存在的全部理由。** 它一度写在
+    /// `right_body` 里，而 `right_body` 只对**当前活动标签**调用（`mod.rs` 的
+    /// `match self.active`，活动页是「新建连接」时更是一个会话都不渲染）——自动重连
+    /// （`check_reconnects`）却跟哪个标签在前台毫无关系。后果是：链路在用户看着别的标签时
+    /// 掉线，15s 的截止时刻内判据一次都没被求值，意图到点被清掉，cwd 恢复**必然丢失**。
+    ///
+    /// 判据仍与 MCP 配对标识注入共用 `Session::shell_idle_for_injection`——两处干的是同一件
+    /// 事（程序替用户敲键盘），判据分成两份迟早会漂移。差别只在求值时机：那一处天然只关心
+    /// 用户正在看的会话，这一处不能。
+    fn advance_cwd_restore(&mut self) {
         let now = std::time::Instant::now();
         for s in &mut self.sessions {
-            if s.restore_cwd && super::session::cwd_restore_expired(s.restore_cwd_until, now) {
-                s.restore_cwd = false;
-                s.restore_cwd_until = None;
+            // `s.connected` 是前提：重连期间 `do_reconnect` 已置下 `restore_cwd`，而截止
+            // 时刻要到 `Connected` 才武装（`restore_cwd_until` 还是 `None`）。少了这个门，
+            // 判据全落在「未连接」那一侧——`idle` 恒假、`never_typed` 恒真（终端刚重建），
+            // 意图只会被白白丢掉。
+            let live = s.connected && s.restore_cwd && !s.last_cwd.is_empty() && !s.ai_owned;
+            if !live {
+                // 未连接时也要让已过期的意图消失：否则 200ms 续帧会一直转着。
+                if s.restore_cwd && super::session::cwd_restore_expired(s.restore_cwd_until, now) {
+                    s.restore_cwd = false;
+                    s.restore_cwd_until = None;
+                }
+                continue;
+            }
+            let expired = super::session::cwd_restore_expired(s.restore_cwd_until, now);
+            match super::session::cwd_restore_decision(
+                // 这里再读一次 `never_typed` **不是**跟闸门重复：闸门问的是「现在敲键盘
+                // 安不安全」（不安全就等下一帧），这里问的是「这个意图还该不该留着」——
+                // 用户已经上手了就直接放弃，而不是干等到 15s 超时。同一个字段，两个不同
+                // 的问题、两种不同的结果。
+                s.terminal.never_typed(),
+                s.shell_idle_for_injection(),
+                expired,
+            ) {
+                super::session::CwdRestore::Inject => {
+                    let cmd = format!("cd '{}'", s.last_cwd.replace('\'', "'\\''"));
+                    let _ = s
+                        .cmd_tx
+                        .send(crate::proto::UiCommand::TerminalInput(
+                            format!("{cmd}\r").into_bytes(),
+                        ));
+                    // 吞掉回显，否则 `cd '…'` 会原样留在屏幕上
+                    s.terminal.expect_echo(&cmd);
+                    s.restore_cwd = false;
+                    s.restore_cwd_until = None;
+                }
+                super::session::CwdRestore::GiveUp => {
+                    s.restore_cwd = false;
+                    s.restore_cwd_until = None;
+                }
+                super::session::CwdRestore::Wait => {}
             }
         }
     }

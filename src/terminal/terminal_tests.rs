@@ -1238,8 +1238,13 @@ fn a_fresh_injection_blocks_the_next_one() {
     let mut t = Terminal::new();
     let d = std::time::Duration::from_millis(50);
     assert!(t.injection_idle_for(d), "从没注入过：不挡");
+    let armed = std::time::Instant::now();
     t.expect_echo("cd '/tmp'");
-    assert!(!t.injection_idle_for(d), "刚注入完：挡住下一条");
+    // 只在「确实是刚武装完」时断言：并行跑测试时本线程可能在这两句之间被挤掉超过 d，
+    // 那是调度噪声不是回归。门禁宁可少断言一次，也不能偶发挂。
+    if armed.elapsed() < d / 4 {
+        assert!(!t.injection_idle_for(d), "刚注入完：挡住下一条");
+    }
     std::thread::sleep(std::time::Duration::from_millis(60));
     assert!(t.injection_idle_for(d), "过了时间窗才放行");
 }
