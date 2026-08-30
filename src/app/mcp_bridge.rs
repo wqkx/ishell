@@ -1224,6 +1224,10 @@ impl App {
                 .map(|p| p.deadline)
                 .into_iter()
                 .chain(s.pending_file_ops.iter().map(|op| op.deadline))
+                // 「重连后恢复 cwd」的截止时刻：到点要有一帧把过期的意图清掉
+                // （`expire_cwd_restore_intents`），否则它会一直挂到某个不相干的事件
+                // 偶然唤起一帧为止。
+                .chain(s.restore_cwd_until)
         });
         let jobs = self
             .cross_copy_jobs

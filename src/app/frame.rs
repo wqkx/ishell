@@ -82,6 +82,11 @@ impl App {
         if backlog {
             ctx.request_repaint();
         }
+        // 「重连后恢复 cwd」的意图过期清扫。**必须放在这条与标签页无关的每帧路径上。**
+        // 注入判据只在 `right_body` 渲染该会话时才求值（见 layout_body.rs），重连若发生
+        // 在后台标签页，意图就一直挂着没人过问——用户十分钟后切回来的第一帧恰好闲着，
+        // 就会挨一行 `cd`，正是加截止时刻要防的那个场景。
+        self.expire_cwd_restore_intents();
         // 必须在上面所有超时判定之后：那些判定全是每帧轮询的，而 egui 按需重绘——空闲窗口
         // 不转帧，它们就永远不被求值。这一下按最近的 deadline 排定时重绘，保证到点必有一帧。
         self.arm_timeout_repaint();
@@ -99,6 +104,34 @@ impl App {
         // 就每帧续一个短定时重绘。门控为假时完全不介入，零额外开销。
         if crate::store::load_mcp_consent() && self.sessions.iter().any(|s| s.connected) {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        // 「重连后恢复 cwd」意图挂着期间，同样得保证出帧。
+        //
+        // 它的注入判据（远端输出静止 2s、用户停笔 2s）全是每帧轮询的，而空闲窗口不转帧：
+        // 重连完成、MOTD 吐完之后远端就彻底安静了，「静止满 2s」那一刻没有任何事件会唤起
+        // 一帧，判据于是永远不被求值。上面那条 150ms 心跳看着能兜住，但它的门是**AI 控制
+        // 开着**——把一个功能的可用性挂在另一个不相干开关上，关掉 AI 控制的人就悄悄丢掉
+        // 这个功能。这里自己续一条。
+        //
+        // 不会空转：意图最长挂 15s，到点由 `expire_cwd_restore_intents` 清掉（那条路径与
+        // 标签页无关，后台标签页也照清）。
+        if self.sessions.iter().any(|s| s.connected && s.restore_cwd) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// 清掉已过期的「重连后恢复 cwd」意图。见 `pump_background` 里的调用点注释与
+    /// `session::cwd_restore_decision`。
+    ///
+    /// 注意 `restore_cwd_until` 为 `None` 表示**截止时刻还没武装**（重连中，尚未收到
+    /// `Connected`），不是已过期——判定统一走 `cwd_restore_expired`。
+    fn expire_cwd_restore_intents(&mut self) {
+        let now = std::time::Instant::now();
+        for s in &mut self.sessions {
+            if s.restore_cwd && super::session::cwd_restore_expired(s.restore_cwd_until, now) {
+                s.restore_cwd = false;
+                s.restore_cwd_until = None;
+            }
         }
     }
 

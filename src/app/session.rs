@@ -138,17 +138,36 @@ pub(super) enum CwdRestore {
 ///   此时替他 `cd` 只会打断他——直接放弃，别再等。
 /// - `idle`：终端不忙、远端输出与用户输入都静止了一段时间（与 MCP 配对标识注入同一套判据）。
 /// - `expired`：等过了截止时刻。
+///
+/// **`expired` 判在 `idle` 前面，过期一律放弃。** 这三个入参是在渲染该会话时才被采样的
+/// （见 `layout_body.rs`），「截止时刻已过」不保证在到点那一刻就被看见。虽然 `App` 每帧
+/// 都会做一次与标签页无关的过期清扫（`expire_cwd_restore_intents`），这里仍按过期优先
+/// 判：判据分两处，靠其中一处「先跑到」来保证安全是脆的，而失手的后果是十分钟后往用户
+/// 的 shell 里补一行 `cd`。
 pub(super) fn cwd_restore_decision(never_typed: bool, idle: bool, expired: bool) -> CwdRestore {
     if !never_typed {
+        return CwdRestore::GiveUp;
+    }
+    if expired {
         return CwdRestore::GiveUp;
     }
     if idle {
         return CwdRestore::Inject;
     }
-    if expired {
-        return CwdRestore::GiveUp;
-    }
     CwdRestore::Wait
+}
+
+/// 「恢复 cwd 的意图是否已过期」。
+///
+/// 抽出来是因为这里有个**反直觉的边界**：`until` 为 `None` 表示截止时刻**还没武装**，
+/// 不是「已经过期」。`do_reconnect` 先置 `restore_cwd = true` 而把 `restore_cwd_until`
+/// 留在 `None`，要到 `WorkerEvent::Connected` 才武装它——用 `is_none_or` 写这一句，
+/// 重连窗口里的每一帧都会算出「已过期」，意图当场就被丢掉，功能一次都不会触发。
+pub(super) fn cwd_restore_expired(
+    until: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    until.is_some_and(|t| now >= t)
 }
 
 impl Session {
@@ -410,6 +429,10 @@ impl App {
         s.kbd_prompt = None;
         s.reconnect_at = None;
         s.restore_cwd = true; // 重连成功后尝试 cd 回 last_cwd（保留不清空）
+        // 截止时刻属于**上一轮**连接，必须一并清掉：连接抖动（刚连上又断）时它可能已经
+        // 过期，留着会让这一轮新置下的意图被 `expire_cwd_restore_intents` 当场清掉。
+        // 新的 15s 由下一次 `WorkerEvent::Connected` 武装。
+        s.restore_cwd_until = None;
         s.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
         // M1：刷新该会话已打开编辑器标签的 cmd_tx——旧句柄随 worker 失效，否则重连后保存静默丢失。
         {
@@ -545,7 +568,7 @@ mod paste_path_tests {
 
 #[cfg(test)]
 mod cwd_restore_tests {
-    use super::{cwd_restore_decision, CwdRestore};
+    use super::{cwd_restore_decision, cwd_restore_expired, CwdRestore};
 
     /// shell 闲下来了才注入。`Connected` 那一刻远端多半正在吐 MOTD/banner，甚至可能停在
     /// 某个登录脚本起的程序上——此前是在那一刻直接打一行 `cd …\r` 过去。
@@ -567,7 +590,25 @@ mod cwd_restore_tests {
     #[test]
     fn gives_up_after_the_deadline() {
         assert_eq!(cwd_restore_decision(true, false, true), CwdRestore::GiveUp);
-        // 但截止时刻到了、同时又恰好闲下来的那一帧，注入优先——意图本来就该在这时兑现
-        assert_eq!(cwd_restore_decision(true, true, true), CwdRestore::Inject);
+        // **过期优先于闲置。** 这一帧恰好闲下来也不注入：判据只在渲染该会话时被采样，
+        // 那个「闲着」很可能就是用户十分钟后切回这个标签页的第一帧——此时补一行 `cd`
+        // 正是加截止时刻要防的事。反向对照：把 `idle` 判回 `expired` 前面，这条当场挂。
+        assert_eq!(cwd_restore_decision(true, true, true), CwdRestore::GiveUp);
+    }
+
+    /// **截止时刻没武装 ≠ 已过期。** `do_reconnect` 置下意图时 `restore_cwd_until` 还是
+    /// `None`（要到 `Connected` 才武装），若把它读成「已过期」，重连窗口里的第一帧就把
+    /// 意图丢掉——功能一次都不触发。反向对照：改回 `is_none_or`，这条当场挂。
+    #[test]
+    fn an_unarmed_deadline_is_not_expired() {
+        let now = std::time::Instant::now();
+        assert!(!cwd_restore_expired(None, now));
+        assert!(!cwd_restore_expired(
+            Some(now + std::time::Duration::from_secs(15)),
+            now
+        ));
+        assert!(cwd_restore_expired(now.checked_sub(std::time::Duration::from_secs(1)), now));
+        // 恰好到点也算过期（`>=`）
+        assert!(cwd_restore_expired(Some(now), now));
     }
 }
