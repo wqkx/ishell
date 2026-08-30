@@ -185,6 +185,9 @@ impl Session {
             && !self.terminal.appears_busy()
             && self.terminal.output_idle_for(QUIET)
             && self.terminal.input_idle_for(QUIET)
+            // 距我们自己上一次替用户敲键盘也要满 QUIET：`expect_echo` 是整体覆写，两条
+            // 注入挨太近，后一条会把前一条的回显吞除冲掉。见 `injection_idle_for`。
+            && self.terminal.injection_idle_for(QUIET)
     }
 
     /// 用户往终端里粘了一张图（Ctrl+V / 右键粘贴，剪贴板里是图片而不是文本）。

@@ -1205,3 +1205,41 @@ fn terminal_ime_spot_is_constant_when_following_is_off() {
     let d = ime_rect(true, egui::pos2(500.0, 300.0), area, cell);
     assert_ne!(c, d, "开着跟随却不动，候选框永远停在一个地方");
 }
+
+/// **本次连接以来一个字节都没收到 ≠ shell 闲在提示符上。**
+///
+/// 这两条判据是「程序替用户敲键盘」的安全前提。`do_reconnect` 会 `Terminal::new()`，
+/// 而 `WorkerEvent::Connected`（「SSH 连上了」，不是「shell 在提示符上等着」）在同一帧
+/// 被排空——那一刻 MOTD 还差一个网络往返。若把「还没收到过输出」读成「已经静止」，
+/// 注入就必然落在最不该落的那一帧。
+///
+/// 反向对照：把 `output_idle_for` 改回 `is_none_or`，第一条断言当场挂。
+#[test]
+fn a_connection_with_no_output_yet_is_not_idle() {
+    let mut t = Terminal::new();
+    let d = std::time::Duration::from_millis(1);
+    assert!(!t.output_idle_for(d), "还没见过这个 shell，不能算静止");
+    assert!(!t.appears_busy(), "也不该算成忙——它只是还没说话");
+    t.feed(b"user@host:~$ ");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(t.output_idle_for(d), "收到输出并静止之后才算闲");
+}
+
+/// **刚替用户敲过一行，就不能马上再敲第二行。** `expect_echo` 是整体覆写：第二次武装会把
+/// 第一条命令没吞完的回显状态冲掉，那条命令就原样留在屏幕上。
+///
+/// 只挡「同一帧」不够——回显要走一个远端往返才回来，而注入走 `cmd_tx`，既不更新
+/// `last_output_at` 也不更新 `last_input_at`，下一帧（重绘心跳 150/200ms）那几道「静止」
+/// 判据仍然全部放行。所以这里用的是时间窗，不是帧。
+///
+/// 反向对照：把 `injection_idle_for` 改成恒真，第二条断言当场挂。
+#[test]
+fn a_fresh_injection_blocks_the_next_one() {
+    let mut t = Terminal::new();
+    let d = std::time::Duration::from_millis(50);
+    assert!(t.injection_idle_for(d), "从没注入过：不挡");
+    t.expect_echo("cd '/tmp'");
+    assert!(!t.injection_idle_for(d), "刚注入完：挡住下一条");
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert!(t.injection_idle_for(d), "过了时间窗才放行");
+}

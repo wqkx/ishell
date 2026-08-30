@@ -135,6 +135,8 @@ pub struct Terminal {
     /// 会先当作「可能是目标回显」而不立即输出；一旦后续字节证明只是巧合（失配），要把这些
     /// 暂存字节还给真实输出，不能凭空丢掉。
     echo_pending: Vec<u8>,
+    /// 上一次 `expect_echo` 武装的时刻：见 `injection_idle_for`
+    echo_armed_at: Option<std::time::Instant>,
     /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
     ime_preedit: String,
     /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
@@ -244,6 +246,7 @@ impl Terminal {
             echo_pos: 0,
             echo_tail: false,
             echo_pending: Vec::new(),
+            echo_armed_at: None,
             ime_preedit: String::new(),
             prev_focused: false,
             local_scroll_accum: 0.0,
@@ -290,11 +293,27 @@ impl Terminal {
     }
     /// 登记一段「我们替用户键入」的命令文本，其 shell 回显将从输出中被吞掉（不显示在终端）。
     /// 须在发送命令后、回显到达前调用（即点击注入的同一帧）。
+    ///
+    /// **整体覆写**：后一次武装会把前一次未吞完的状态冲掉，那条命令的回显就漏到屏幕上。
+    /// 所有注入点都会经过这里，所以顺手在这里记下武装时刻，`injection_idle_for` 据此把
+    /// 「刚替用户敲过一行」挡在下一次自动注入之前——挡的责任放在这里，调用方不会漏。
     pub fn expect_echo(&mut self, s: &str) {
         self.echo_expect = s.as_bytes().to_vec();
         self.echo_pos = 0;
         self.echo_tail = false;
         self.echo_pending.clear();
+        self.echo_armed_at = Some(std::time::Instant::now());
+    }
+
+    /// 距上一次「替用户键入」是否已过 `d`。自动注入类操作的安全前提之一。
+    ///
+    /// 不能用 `echo_expect` 是否为空来判：那个字段命中之后**故意不清空**（见
+    /// `strip_echo`，清了真正的目标回显就不会被吞了），所以它一旦武装就永远非空。也不能
+    /// 只挡同一帧：回显要走一个远端往返才回来，而注入走 `cmd_tx`，既不碰 `last_output_at`
+    /// 也不碰 `last_input_at`——下一帧（重绘心跳 150/200ms）那几道「静止」判据仍然全部
+    /// 放行，第二条注入照样把第一条的吞除状态覆写掉。这里用时间窗兜住那段往返。
+    pub fn injection_idle_for(&self, d: std::time::Duration) -> bool {
+        self.echo_armed_at.is_none_or(|t| t.elapsed() >= d)
     }
 
     /// 武装一次「等待哨兵」捕获：`prefix` 是唯一前缀（含 nonce），命中后紧跟的退出码数字
@@ -372,10 +391,20 @@ impl Terminal {
         std::mem::take(&mut self.notify_setup_request)
     }
 
-    /// 远端输出是否已静止至少 `d`（None=连接后尚未有输出，视为静止）。
-    /// 自动注入类操作的安全前提之一（另见 `input_idle_for`）。
+    /// 远端输出是否已静止至少 `d`。自动注入类操作的安全前提之一（另见 `input_idle_for`）。
+    ///
+    /// **`None`（本次连接以来一个字节都还没收到）算不静止，不算静止。** 这一条曾经反过来
+    /// 写成「视为静止」，后果是自动注入必然发生在**最不该注入的那一帧**：`do_reconnect`
+    /// 会 `Terminal::new()`，`last_output_at` 归 `None`；`WorkerEvent::Connected` 在同一帧
+    /// 被排空，而 `Connected` 只是「SSH 连上了」——远端的 MOTD/banner 还差一个网络往返才
+    /// 到。于是「输出静止 2s」在那一帧恒真（连同 `never_typed`、`input_idle_for` 一起），
+    /// 判据全部放行，`cd '…'\r` 正好打进那个即将开始吐 banner、或者停在登录脚本某个程序
+    /// 上的 shell 里。
+    ///
+    /// 语义上也该是这样：这道判据问的是「shell 现在闲在提示符上吗」，而一个字节都没见过
+    /// 的连接，我们根本还没见过它的提示符。
     pub fn output_idle_for(&self, d: std::time::Duration) -> bool {
-        self.last_output_at.is_none_or(|t| t.elapsed() >= d)
+        self.last_output_at.is_some_and(|t| t.elapsed() >= d)
     }
 
     /// 本次（重）连以来用户一次键都没敲过。

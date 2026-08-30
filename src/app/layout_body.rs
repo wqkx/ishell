@@ -210,7 +210,6 @@ impl App {
                 // 置下 `restore_cwd`、截止时刻却要到 `Connected` 才武装（`restore_cwd_until`
                 // 还是 `None`）。少了这个门，判据全落在「未连接」那一侧：`idle` 恒假、
                 // `never_typed` 恒真（终端刚重建），意图只会被白白丢掉。
-                let mut injected_cwd_this_frame = false;
                 if s.connected && s.restore_cwd && !s.last_cwd.is_empty() && !s.ai_owned {
                     let expired = super::session::cwd_restore_expired(
                         s.restore_cwd_until,
@@ -233,7 +232,6 @@ impl App {
                             s.terminal.expect_echo(&cmd);
                             s.restore_cwd = false;
                             s.restore_cwd_until = None;
-                            injected_cwd_this_frame = true;
                         }
                         super::session::CwdRestore::GiveUp => {
                             s.restore_cwd = false;
@@ -251,13 +249,6 @@ impl App {
                     // 本次连接以来一个键都没敲过——把「其实停在某个程序的密码提示符上」
                     // 这类场景整个排除掉。理由见 Terminal::never_typed。
                     && s.terminal.never_typed()
-                    // 上面那条 `cd` 刚在**本帧**发出去：两处用的是同一组判据，而这组判据
-                    // 在一帧之内不会变（都是时间戳型的，刚发出的字节还没回环），所以不挡
-                    // 的话两条注入必然同帧发生。而 `expect_echo` 是整体覆写（见
-                    // `Terminal::expect_echo`）：后一次武装会把 `cd` 的吞除状态冲掉，
-                    // `cd '/path'` 原样留在屏幕上，还紧跟着第二行命令。下一帧起 `cd` 的
-                    // 回显已让 `output_idle_for` 变假，同帧挡一下就够。
-                    && !injected_cwd_this_frame
                 {
                     inject_mcp_token(s);
                     s.mcp_token_injected = true;
