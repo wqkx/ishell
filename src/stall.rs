@@ -71,8 +71,10 @@ static WAS_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// 阻塞守卫最长容忍多久。超过它仍不出帧就照报——`rfd` 自己挂死（Linux 上
 /// `xdg-desktop-portal` 没跑/无响应是它已知的失败形态）时守卫永远不会析构，
 /// 没有这个上限，界面真的永久冻住而日志里一个字都没有，正是本模块要根除的那种。
-/// 取值远大于任何人翻目录所需，宁可晚报也不误报。
-const BLOCKING_MAX: Duration = Duration::from_secs(300);
+/// 取值远大于任何人翻目录所需，宁可晚报也不误报；而且这个判定**天然分不清**「portal 挂死」
+/// 和「用户开着选择框走神了」——所以日志措辞只陈述事实（界面已经 N 分钟没出帧），把两种
+/// 读法都摆出来，并且闩锁按每一轮阻塞复位（见 `BlockingGuard::drop`）。
+const BLOCKING_MAX: Duration = Duration::from_secs(600);
 
 /// 最近一次「从没有阻塞调用变成有」的时刻（毫秒）。
 static BLOCKING_SINCE_MS: AtomicU64 = AtomicU64::new(0);
@@ -97,9 +99,10 @@ fn now_ms() -> u64 {
 /// 「上次出帧时刻」推到现在——否则对话框一关，看门狗看到的仍是十几秒前的旧时间戳，
 /// 下一轮探测（还没来得及出帧）照样误报。
 pub fn blocking() -> BlockingGuard {
-    if BLOCKING.fetch_add(1, Ordering::Relaxed) == 0 {
-        BLOCKING_SINCE_MS.store(now_ms(), Ordering::Relaxed);
-    }
+    // 先写起始时刻**再**加计数：反过来的话，看门狗可能读到「已经有阻塞了」却配上一个上一轮
+    // 留下的陈旧起始时刻，当场判成「堵了很久」。
+    BLOCKING_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+    BLOCKING.fetch_add(1, Ordering::Relaxed);
     BlockingGuard
 }
 
@@ -109,7 +112,12 @@ pub struct BlockingGuard;
 impl Drop for BlockingGuard {
     fn drop(&mut self) {
         LAST_FRAME_MS.store(now_ms(), Ordering::Relaxed);
-        BLOCKING.fetch_sub(1, Ordering::Relaxed);
+        if BLOCKING.fetch_sub(1, Ordering::Relaxed) == 1 {
+            // 本轮阻塞结束：复位「已报告」。闩锁按**每一轮阻塞**而不是整个进程记——
+            // 用户开着选择框走神二十分钟会让我们报一次（那条记录说的是事实：界面确实那么久
+            // 没出帧），但不该因此把后面一次真正的 portal 挂死永久静音掉。
+            REPORTED_BLOCKING.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -130,11 +138,7 @@ pub fn note_frame(had_input: bool, hidden: bool) {
 /// 是因为「什么时候算卡死」正是这个模块唯一容易写错的地方。
 ///
 /// - `now` / `last_frame` / `last_input` 均为距进程启动的毫秒数。
-fn should_report(now: u64, last_frame: u64, last_input: u64, blocking: bool) -> bool {
-    // 我们自己知道有东西在堵事件循环（原生文件对话框）：不出帧是预期内的，不报。
-    if blocking {
-        return false;
-    }
+fn should_report(now: u64, last_frame: u64, last_input: u64) -> bool {
     // 探测窗口外（用户早就停手了）：不出帧是正常的空闲，不报。
     if now.saturating_sub(last_input) > ACTIVE_WINDOW.as_millis() as u64 {
         return false;
@@ -143,9 +147,38 @@ fn should_report(now: u64, last_frame: u64, last_input: u64, blocking: bool) -> 
     now.saturating_sub(last_frame) > STALL_AFTER.as_millis() as u64
 }
 
-/// 阻塞调用（文件对话框）已经堵了太久，该按「它自己挂死了」报一次。纯函数，便于测试。
+/// 阻塞调用（文件对话框）已经堵了太久，该报一次。纯函数，便于测试。
 fn should_report_blocking(now: u64, blocking_since: u64) -> bool {
     now.saturating_sub(blocking_since) > BLOCKING_MAX.as_millis() as u64
+}
+
+/// 看门狗每一轮的**完整判定**。抽成纯函数是因为这里唯一容易写错的不是某个阈值，而是
+/// **判定的先后顺序**——上一版就栽在这上面：「用户最近敲过键」那道门排在阻塞判定前面，
+/// 而对话框一开事件循环就停了、`LAST_INPUT_MS` 跟着冻在点开的那一刻，于是 30s 之后
+/// 那道门永远 `continue`，整个 [`StallKind::BlockingDialog`] 分支成了执行不到的死代码。
+/// 单测那时是绿的，因为它只测了 `should_report_blocking` 这个谓词本身。
+///
+/// 所以：**阻塞判定必须排在最前面，且不受 `ACTIVE_WINDOW` 约束。**
+fn decide(
+    now: u64,
+    last_frame: u64,
+    last_input: u64,
+    hidden: bool,
+    blocking: bool,
+    blocking_since: u64,
+) -> Option<StallKind> {
+    if blocking {
+        // 对话框开着：不出帧是预期内的，只有堵过上限才报，且报的是另一码事。
+        return should_report_blocking(now, blocking_since).then_some(StallKind::BlockingDialog);
+    }
+    if !should_report(now, last_frame, last_input) {
+        return None;
+    }
+    Some(if hidden {
+        StallKind::Hidden
+    } else {
+        StallKind::Visible
+    })
 }
 
 /// 这次卡死的成因——决定诊断内容，也各自只报一次。
@@ -174,24 +207,15 @@ pub fn spawn(ctx: egui::Context) {
             std::thread::sleep(PROBE_EVERY);
             let now = now_ms();
             let last_input = LAST_INPUT_MS.load(Ordering::Relaxed);
-            if now.saturating_sub(last_input) > ACTIVE_WINDOW.as_millis() as u64 {
-                continue; // 用户停手了，不探——空闲期一次多余唤醒都不做
-            }
             let blocking = BLOCKING.load(Ordering::Relaxed) > 0;
-            // 文件对话框堵着是预期内的，但堵过头就说明它自己挂死了（portal 无响应），
-            // 那同样是「界面永久冻住」，必须留下记录。
-            let kind = if blocking {
-                should_report_blocking(now, BLOCKING_SINCE_MS.load(Ordering::Relaxed))
-                    .then_some(StallKind::BlockingDialog)
-            } else if should_report(now, LAST_FRAME_MS.load(Ordering::Relaxed), last_input, false) {
-                Some(if WAS_HIDDEN.load(Ordering::Relaxed) {
-                    StallKind::Hidden
-                } else {
-                    StallKind::Visible
-                })
-            } else {
-                None
-            };
+            let kind = decide(
+                now,
+                LAST_FRAME_MS.load(Ordering::Relaxed),
+                last_input,
+                WAS_HIDDEN.load(Ordering::Relaxed),
+                blocking,
+                BLOCKING_SINCE_MS.load(Ordering::Relaxed),
+            );
             if let Some(kind) = kind {
                 let latch = match kind {
                     StallKind::Hidden => &REPORTED_HIDDEN,
@@ -204,7 +228,10 @@ pub fn spawn(ctx: egui::Context) {
                 continue; // 已经卡住了，别再请求重绘
             }
             if blocking {
-                continue; // 对话框正常开着：不探、也不报
+                continue; // 对话框正常开着：不探（探了也出不来帧），也不报
+            }
+            if now.saturating_sub(last_input) > ACTIVE_WINDOW.as_millis() as u64 {
+                continue; // 用户停手了，不探——空闲期一次多余唤醒都不做
             }
             // 唤醒事件循环：活着的话下一帧马上会把 last_frame 推新。
             ctx.request_repaint();
@@ -258,9 +285,12 @@ fn write_stall_log(kind: StallKind, follow_was_on: bool) {
     // 抓栈，下次照样卡且仍无证据）。
     let (likely, action) = match kind {
         StallKind::BlockingDialog => (
-            "原生文件对话框自己挂死了：它是同步调用（Linux 上 rfd 走 xdg-portal + pollster），\n\
-             \x20         而调用点就在事件循环线程上。`xdg-desktop-portal` 没在跑或无响应时它永不返回。",
-            "检查 xdg-desktop-portal 服务（systemctl --user status xdg-desktop-portal）。\n\
+            "一个原生文件对话框已经开了很久还没返回。它是**同步**调用（Linux 上 rfd 走\n\
+             \x20         xdg-portal + pollster），调用点就在事件循环线程上，所以这期间界面本来就不出帧。\n\
+             \x20         两种读法：① 你只是开着选择框去忙别的了——那这条记录无害，忽略即可；\n\
+             \x20         ② xdg-desktop-portal 没在跑或没响应，pick_files() 永远不会返回。\n\
+             \x20         程序分不清这两者，所以只陈述事实、不下断言。",
+            "若你并没有在挑文件，查一下 systemctl --user status xdg-desktop-portal。\n\
              \x20         与输入法、与窗口最小化都无关。",
         ),
         StallKind::Hidden => (
@@ -306,7 +336,7 @@ mod tests {
     #[test]
     fn a_frozen_frame_loop_right_after_typing_is_reported() {
         // 刚敲过键（1s 前），但已经 STALL+1s 没出帧
-        assert!(should_report(20_000, 20_000 - STALL - 1_000, 19_000, false));
+        assert!(should_report(20_000, 20_000 - STALL - 1_000, 19_000));
     }
 
     /// **空闲不能误报**：用户早就停手了，不出帧是 egui 的正常行为（几分钟不出帧很常见）。
@@ -315,17 +345,17 @@ mod tests {
     #[test]
     fn a_long_idle_session_is_never_reported() {
         // 上次输入是 10 分钟前，之后一帧都没出过——完全正常
-        assert!(!should_report(600_000, 100, 100, false));
+        assert!(!should_report(600_000, 100, 100));
         // 刚好落在窗口边界之外
-        assert!(!should_report(WIN + 2, 0, 0, false));
+        assert!(!should_report(WIN + 2, 0, 0));
     }
 
     /// 窗口内但出帧正常（看门狗每 2s 请求一次重绘，活着就会出帧）→ 不报。
     #[test]
     fn a_live_loop_inside_the_probe_window_is_not_reported() {
-        assert!(!should_report(20_000, 19_000, 19_000, false));
+        assert!(!should_report(20_000, 19_000, 19_000));
         // 恰好等于阈值也不报（严格大于才算）
-        assert!(!should_report(20_000, 20_000 - STALL, 19_500, false));
+        assert!(!should_report(20_000, 20_000 - STALL, 19_500));
     }
 
     /// **原生文件对话框不是卡死。** `rfd` 在 Linux 上是同步调用，而所有调用点都在绘制代码里
@@ -335,11 +365,35 @@ mod tests {
     #[test]
     fn a_blocking_native_dialog_is_never_reported_as_a_stall() {
         // 其余条件全部满足（刚敲过键、久久不出帧），只差 blocking 这一条
-        assert!(should_report(20_000, 20_000 - STALL - 1_000, 19_000, false));
-        assert!(
-            !should_report(20_000, 20_000 - STALL - 1_000, 19_000, true),
-            "文件对话框开着的时候不出帧是预期内的，不能报成卡死"
+        assert_eq!(
+            decide(20_000, 20_000 - STALL - 1_000, 19_000, false, false, 0),
+            Some(StallKind::Visible)
         );
+        assert_eq!(
+            decide(20_000, 20_000 - STALL - 1_000, 19_000, false, true, 19_000),
+            None,
+            "文件对话框刚开着的时候不出帧是预期内的，不能报成卡死"
+        );
+    }
+
+    /// **顺序回归门禁。** 上一版把「用户最近敲过键」那道门排在了阻塞判定前面，而对话框一开
+    /// 事件循环就停了、`LAST_INPUT_MS` 跟着冻在点开的那一刻——于是 30s 之后那道门永远
+    /// `continue`，整个 `BlockingDialog` 分支成了执行不到的死代码，而单测全绿（它只测了
+    /// `should_report_blocking` 这个谓词本身，没测判定顺序）。
+    ///
+    /// 这条测试摆的就是那个真实形状：`last_input` 与 `last_frame` 都冻在阻塞开始的那一刻，
+    /// 现在已经过去十几分钟。必须报。
+    #[test]
+    fn a_hung_dialog_is_reported_even_though_input_and_frames_froze_when_it_opened() {
+        let since = 5_000; // 点开对话框的时刻——此后事件循环停了，两个时间戳都冻在这里
+        let now = since + BLOCKING_MAX.as_millis() as u64 + 60_000;
+        assert_eq!(
+            decide(now, since, since, false, true, since),
+            Some(StallKind::BlockingDialog),
+            "对话框挂死这条路走不到——`ACTIVE_WINDOW` 那道门把它拦死了，整个分支是死代码"
+        );
+        // 同样的时间戳、但没有阻塞：属于「用户早就停手」的正常空闲，不该报
+        assert_eq!(decide(now, since, since, false, false, 0), None);
     }
 
     /// **文件对话框自己挂死时必须照报。** `xdg-desktop-portal` 没在跑或无响应是 `rfd` 已知的
@@ -373,6 +427,6 @@ mod tests {
     /// 时间戳倒挂（时钟/调度抖动）不能算成卡死。
     #[test]
     fn out_of_order_timestamps_do_not_report() {
-        assert!(!should_report(1_000, 5_000, 5_000, false));
+        assert!(!should_report(1_000, 5_000, 5_000));
     }
 }
