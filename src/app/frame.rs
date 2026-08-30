@@ -42,7 +42,7 @@ impl App {
         let mut relay_source: Vec<(u64, Result<u64, String>)> = Vec::new();
         let mut copy_done: Vec<(u64, u64, bool, String)> = Vec::new();
         let mut temp_key_trusted: Vec<(u64, bool, String)> = Vec::new();
-        let mut temp_key_untrusted: Vec<u64> = Vec::new();
+        let mut temp_key_untrusted: Vec<(u64, bool, String)> = Vec::new();
         let mut direct_relay_started: Vec<u64> = Vec::new();
         let mut direct_relay_done: Vec<(u64, bool, String)> = Vec::new();
         for s in &mut self.sessions {

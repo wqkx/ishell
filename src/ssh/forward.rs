@@ -69,10 +69,41 @@ pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, 
 
     // 并发连接上限：防异常客户端把本机拖入无界任务/文件句柄增长
     let permits = Arc::new(tokio::sync::Semaphore::new(128));
+    // accept 失败**一律先当成瞬时的**：退一步再试，连续失败够多次才放弃。
+    //
+    // 以前是 `Err(_) => break`，一视同仁地直接退出循环，而且**不发任何状态**——UI 上永远停在
+    // 「监听中」，实际上一条连接都不会再被接受。最难受的是 EMFILE/ENFILE（进程或系统的 fd
+    // 用满了）：那通常只是别处一次短暂的句柄泄漏，退一步就能恢复，却把用户的转发永久干掉了。
+    //
+    // 不按 `ErrorKind` 挑「哪些算瞬时」是刻意的：那需要平台相关的 errno 常量，而挑漏一个的
+    // 后果就是上面那种静默死亡。一律重试、有上限、放弃时如实上报，三条合起来既不会因为一次
+    // 抖动丢掉转发，也不会在真故障时空转或骗人。
+    const MAX_TRANSIENT: u32 = 32;
+    let mut transient = 0u32;
     loop {
         let (sock, peer) = match listener.accept().await {
-            Ok(x) => x,
-            Err(_) => break,
+            Ok(x) => {
+                transient = 0;
+                x
+            }
+            Err(e) => {
+                transient += 1;
+                if transient > MAX_TRANSIENT {
+                    let msg = match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("监听已停止：accept 连续失败（{e}）"),
+                        crate::i18n::Lang::En => format!("Listener stopped: accept kept failing ({e})"),
+                    };
+                    sink.send(WorkerEvent::ForwardStatus {
+                        id: spec.id,
+                        ok: false,
+                        message: msg,
+                    });
+                    break;
+                }
+                log::debug!("转发 {label} accept 失败（第 {transient} 次，将重试）：{e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue; // 超限：直接丢弃新连接（客户端得到 RST/EOF）

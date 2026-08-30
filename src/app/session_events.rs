@@ -406,8 +406,8 @@ impl Session {
                 WorkerEvent::TempKeyTrusted { op_id, ok, message } => {
                     self.pending.temp_key_trusted.push((op_id, ok, message));
                 }
-                WorkerEvent::TempKeyUntrusted { op_id } => {
-                    self.pending.temp_key_untrusted.push(op_id);
+                WorkerEvent::TempKeyUntrusted { op_id, ok, message } => {
+                    self.pending.temp_key_untrusted.push((op_id, ok, message));
                 }
                 WorkerEvent::DirectRelayStarted { op_id } => {
                     self.pending.direct_relay_started.push(op_id);

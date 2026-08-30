@@ -1286,7 +1286,7 @@ impl App {
     pub(super) fn advance_cross_copy_jobs(
         &mut self,
         temp_key_trusted: Vec<(u64, bool, String)>,
-        temp_key_untrusted: Vec<u64>,
+        temp_key_untrusted: Vec<(u64, bool, String)>,
         direct_relay_started: Vec<u64>,
         direct_relay_done: Vec<(u64, bool, String)>,
         relay_source: Vec<(u64, Result<u64, String>)>,
@@ -1327,10 +1327,28 @@ impl App {
             }
             self.finish_direct_attempt(idx, if ok { Ok(()) } else { Err(message) });
         }
-        for op_id in temp_key_untrusted {
+        for (op_id, ok, message) in temp_key_untrusted {
             let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
                 continue;
             };
+            // 撤销失败**不改变**这次拷贝的成败（`direct_result` 早就定了），但绝不能咽下去：
+            // 目标机的 `~/.ssh/authorized_keys` 里可能留着一把带 `restrict` 的临时公钥，
+            // 而用户完全不知道该去清。把原因连同标记一起摆到目标会话的状态栏上。
+            if !ok {
+                let dest_uid = self.cross_copy_jobs[idx].dest_uid;
+                let marker = self.cross_copy_jobs[idx].marker.clone();
+                log::warn!("临时公钥撤销失败（op {op_id}，标记 {marker}）：{message}");
+                if let Some(d) = self.session_idx_by_uid(dest_uid) {
+                    self.sessions[d].status = match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!(
+                            "⚠ 临时公钥未能撤销（{message}）。请在这台机器上手工删除                              ~/.ssh/authorized_keys 里含 {marker} 的那一行。"
+                        ),
+                        crate::i18n::Lang::En => format!(
+                            "⚠ Could not revoke the temporary key ({message}). Please remove the                              line containing {marker} from ~/.ssh/authorized_keys on this host."
+                        ),
+                    };
+                }
+            }
             if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
                 self.finish_after_untrust(idx, true);
             }

@@ -482,7 +482,13 @@ pub enum WorkerEvent {
     /// `TrustTempKey` 的执行结果。
     TempKeyTrusted { op_id: u64, ok: bool, message: String },
     /// `UntrustTempKey` 已执行完（结果不影响主流程成败判定，仅供日志）。
-    TempKeyUntrusted { op_id: u64 },
+    /// 临时公钥撤销的结果。`ok=false` 时 `message` 是原因——**必须让用户看见**：
+    /// 撤销失败意味着一把带 `restrict` 的临时公钥留在了目标机的 `~/.ssh/authorized_keys` 里。
+    TempKeyUntrusted {
+        op_id: u64,
+        ok: bool,
+        message: String,
+    },
     /// `DirectRelayCopy` 已经真正开始跑 scp/rsync 传输数据（SSH 连接和认证都已成功）——
     /// App 层收到后应解除直连尝试的短超时窗口，改用整个操作的总超时，避免大文件直连
     /// 一半被误杀。

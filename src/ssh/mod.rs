@@ -459,8 +459,15 @@ pub async fn run(
                         let h = handle.clone();
                         let s = sink.clone();
                         tokio::spawn(async move {
-                            let _ = untrust_temp_key(&h, &marker).await;
-                            s.send(WorkerEvent::TempKeyUntrusted { op_id });
+                            let (ok, message) = match untrust_temp_key(&h, &marker).await {
+                                Ok(()) => (true, String::new()),
+                                Err(e) => (false, e.to_string()),
+                            };
+                            s.send(WorkerEvent::TempKeyUntrusted {
+                                op_id,
+                                ok,
+                                message,
+                            });
                         });
                     }
                     Some(UiCommand::DirectRelayCopy {

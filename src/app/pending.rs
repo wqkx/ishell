@@ -47,8 +47,9 @@ pub(super) struct SessionPending {
     pub copy_done: Vec<(u64, bool, String)>,
     /// 跨会话拷贝-直连优先模式：`TrustTempKey` 的结果（op_id, ok, message）。
     pub temp_key_trusted: Vec<(u64, bool, String)>,
-    /// 跨会话拷贝-直连优先模式：`UntrustTempKey` 已执行完（op_id）。
-    pub temp_key_untrusted: Vec<u64>,
+    /// 跨会话拷贝-直连优先模式：`UntrustTempKey` 的结果（op_id, ok, message）。
+    /// `ok=false` 意味着临时公钥可能残留在目标机上，必须让用户看见。
+    pub temp_key_untrusted: Vec<(u64, bool, String)>,
     /// 跨会话拷贝-直连优先模式：直连传输已经真正开始跑（op_id）。
     pub direct_relay_started: Vec<u64>,
     /// 跨会话拷贝-直连优先模式：直连传输的最终结果（op_id, ok, message）。

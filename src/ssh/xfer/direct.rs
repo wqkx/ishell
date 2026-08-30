@@ -317,8 +317,24 @@ pub(crate) async fn untrust_temp_key(handle: &Handle<ClientHandler>, marker: &st
     // 临时文件（叠加下面的 flock 是双保险）。
     let tmp_path = format!("{auth_keys}.ishell_tmp.{}", super::rand_hex(6));
     let cmd = untrust_cmd(marker, &auth_keys, &tmp_path, &lock);
-    let _ = exec_status(handle, &cmd).await;
-    Ok(())
+    // 结果**必须**看：这一步失败意味着那把带 `restrict` 的临时公钥留在了目标机的
+    // authorized_keys 里。以前这里是 `let _ = ...`，无论远端怎么答都当成撤销成功，UI 也照报
+    // 「已撤销」——残留是静默的，用户没有任何机会知道该去手工清。
+    //
+    // 失败重试一次：`exec_status` 要新开一条 exec 通道，撞上 sshd 的 MaxSessions（并发拷贝
+    // 时很常见）是典型的瞬时失败，退一步再来通常就成了。两次都不成才往上报。
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        match exec_status(handle, &cmd).await {
+            Ok((0, _)) => return Ok(()),
+            Ok((code, err)) => last_err = format!("退出码 {code}：{}", err.trim()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    anyhow::bail!("{last_err}")
 }
 
 /// 拼出 `untrust_temp_key` 那条 shell 命令。单独抽出来是为了能直接测——它有两条容易

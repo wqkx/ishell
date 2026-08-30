@@ -95,6 +95,28 @@ pub(super) enum XferSpec {
     Upload { local: String, remote_dir: String },
 }
 
+/// 把一个路径变成可以直接打进 shell 的一个词。**不需要引号时原样返回**——绝大多数远端路径
+/// 都是干净的，无谓加引号只会让用户看着别扭。
+///
+/// `windows_style`：目标 shell 是 cmd/PowerShell（只有「本机」会话且 iShell 跑在 Windows 上
+/// 才成立）。那两个 shell 不认 POSIX 的单引号转义，用双引号；而 Windows 路径里不可能出现
+/// `"`（文件名非法字符），所以双引号里不需要再转义什么。
+fn quote_shell_arg(path: &str, windows_style: bool) -> String {
+    let needs = path.is_empty()
+        || path
+            .chars()
+            .any(|c| !(c.is_alphanumeric() || "/._-:\\~+=,@".contains(c)));
+    if !needs {
+        return path.to_string();
+    }
+    if windows_style {
+        format!("\"{}\"", path.replace('"', ""))
+    } else {
+        // POSIX：单引号里除了单引号本身什么都不用转义
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
 impl Session {
     /// 用户往终端里粘了一张图（Ctrl+V / 右键粘贴，剪贴板里是图片而不是文本）。
     ///
@@ -160,12 +182,20 @@ impl Session {
 
     /// 把图片路径打进终端（末尾补一个空格，方便接着往下写提示词）。不回车。
     pub(super) fn type_pasted_path(&mut self, path: &str) {
+        // 需要时加引号。远端那条路径是我们自己拼的 `/tmp/ishell-paste-<毫秒>.png`，不含特殊
+        // 字符；**本机**那条来自 `std::env::temp_dir()`，Windows 上常见
+        // `C:\Users\Some Name\AppData\Local\Temp\…`——带空格，原样打进 shell 会被拆成两个词，
+        // AI 拿到的是半截路径。Linux 上 `$TMPDIR` 同样可以是任何东西。
+        //
+        // 引号风格按**会话类型**而不是本机平台选：远端会话一律是 POSIX shell（哪怕 iShell
+        // 跑在 Windows 上），只有「本机」会话在 Windows 上才是 cmd/PowerShell。
+        let quoted = quote_shell_arg(path, self.cfg.is_local() && cfg!(windows));
         let _ = self
             .cmd_tx
             .send(crate::proto::UiCommand::TerminalInput(
-                format!("{path} ").into_bytes(),
+                format!("{quoted} ").into_bytes(),
             ));
-        self.terminal.push_input_line(path);
+        self.terminal.push_input_line(&quoted);
         self.status = match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!("已粘贴图片：{path}"),
             crate::i18n::Lang::En => format!("Pasted image: {path}"),
@@ -419,5 +449,45 @@ impl App {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod paste_path_tests {
+    use super::quote_shell_arg;
+
+    /// 干净路径不加引号——远端那条 `/tmp/ishell-paste-<毫秒>.png` 是最常见的形状。
+    #[test]
+    fn a_clean_path_is_left_alone() {
+        assert_eq!(
+            quote_shell_arg("/tmp/ishell-paste-1788000000000.png", false),
+            "/tmp/ishell-paste-1788000000000.png"
+        );
+        assert_eq!(quote_shell_arg("C:\\Temp\\a.png", true), "C:\\Temp\\a.png");
+    }
+
+    /// **带空格必须引起来。** Windows 的临时目录几乎一定含空格
+    /// （`C:\Users\Some Name\AppData\Local\Temp`），不引的话打进 shell 就被拆成两个词，
+    /// AI 拿到的是半截路径、读不到那张图。
+    #[test]
+    fn a_path_with_spaces_is_quoted() {
+        assert_eq!(
+            quote_shell_arg("/tmp/my pics/a.png", false),
+            "'/tmp/my pics/a.png'"
+        );
+        assert_eq!(
+            quote_shell_arg("C:\\Users\\Some Name\\AppData\\Local\\Temp\\a.png", true),
+            "\"C:\\Users\\Some Name\\AppData\\Local\\Temp\\a.png\""
+        );
+    }
+
+    /// 单引号、`$`、反引号这些在 POSIX shell 里有含义的字符也必须被关住——路径里出现它们
+    /// 时不引就等于让文件名参与命令解析。
+    #[test]
+    fn shell_metacharacters_cannot_escape_the_quotes() {
+        assert_eq!(quote_shell_arg("/tmp/a'b.png", false), "'/tmp/a'\\''b.png'");
+        assert_eq!(quote_shell_arg("/tmp/$(id).png", false), "'/tmp/$(id).png'");
+        assert_eq!(quote_shell_arg("/tmp/a`id`.png", false), "'/tmp/a`id`.png'");
+        assert_eq!(quote_shell_arg("", false), "''");
     }
 }
