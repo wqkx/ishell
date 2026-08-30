@@ -216,6 +216,10 @@ impl App {
                         std::time::Instant::now(),
                     );
                     match super::session::cwd_restore_decision(
+                        // 这里再读一次 `never_typed` **不是**跟闸门重复：闸门问的是
+                        // 「现在敲键盘安不安全」（不安全就等下一帧），这里问的是「这个
+                        // 意图还该不该留着」——用户已经上手了就直接放弃，而不是干等到
+                        // 15s 超时。同一个字段，两个不同的问题、两种不同的结果。
                         s.terminal.never_typed(),
                         s.shell_idle_for_injection(),
                         expired,
@@ -246,9 +250,6 @@ impl App {
                     s.ai_owned,
                     s.mcp_token_injected,
                 ) && s.shell_idle_for_injection()
-                    // 本次连接以来一个键都没敲过——把「其实停在某个程序的密码提示符上」
-                    // 这类场景整个排除掉。理由见 Terminal::never_typed。
-                    && s.terminal.never_typed()
                 {
                     inject_mcp_token(s);
                     s.mcp_token_injected = true;

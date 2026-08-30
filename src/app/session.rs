@@ -170,24 +170,52 @@ pub(super) fn cwd_restore_expired(
     until.is_some_and(|t| now >= t)
 }
 
+/// 「现在往这个 shell 里替用户敲一行东西安全吗」——「提示符几乎确定闲着」的那套判据。
+///
+/// **抽成自由函数是为了它能被测。** `Session` 在测试里造不出来（要 worker 线程、若干通道、
+/// 一份连接配置），而这道闸门最容易写错的恰恰是它在**初始状态**下的取值——见
+/// `injection_gate_tests`。
+///
+/// `ai_busy`：本会话有挂起的 AI 命令，或终端正武装着哨兵捕获。此时注入会用 `expect_echo`
+/// 覆盖掉哨兵的吞除状态，打断正在进行的 `run_command`。
+fn injection_allowed(
+    connected: bool,
+    ai_owned: bool,
+    ai_busy: bool,
+    t: &Terminal,
+    quiet: std::time::Duration,
+) -> bool {
+    connected
+        && !ai_owned
+        && !ai_busy
+        && !t.appears_busy()
+        && t.output_idle_for(quiet)
+        && t.input_idle_for(quiet)
+        // 距我们自己上一次替用户敲键盘也要满 quiet：`expect_echo` 是整体覆写，两条注入
+        // 挨太近，后一条会把前一条的回显吞除冲掉。见 `Terminal::injection_idle_for`。
+        && t.injection_idle_for(quiet)
+        // **本次连接以来用户一个键都没敲过。** 这是安全边界而非优化：上面几条信号分不清
+        // 「shell 闲在提示符上」和「某个程序正阻塞在 stdin」，而 sudo/ssh 的密码提示符
+        // 恰好也是安静不动的。详见 `Terminal::never_typed`。
+        //
+        // 它此前不在这道闸门里，而是抄在每个调用点上——**而本函数的注释同时在警告「判据
+        // 分成两份迟早会漂移」**。也就是说它当时已经是两份了，只是还没漂。收进来。
+        && t.never_typed()
+}
+
 impl Session {
-    /// 现在往这个 shell 里替用户敲一行东西安全吗——「提示符几乎确定闲着」的那套判据。
-    ///
-    /// 与 MCP 配对标识的自动注入共用同一个函数**是有意的**：两处干的是同一件事（程序替用户
-    /// 敲键盘），判据分成两份迟早会漂移，而漂移的后果是往某个正在等输入的程序（sudo/ssh 的
-    /// 密码提示符）里打字。
+    /// 见 [`injection_allowed`]。与 MCP 配对标识的自动注入共用同一道闸门**是有意的**：
+    /// 两处干的是同一件事（程序替用户敲键盘），判据分成两份迟早会漂移，而漂移的后果是
+    /// 往某个正在等输入的程序（sudo/ssh 的密码提示符）里打字。
     pub(super) fn shell_idle_for_injection(&self) -> bool {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
-        self.connected
-            && !self.ai_owned
-            && self.pending_ai_run.is_none()
-            && !self.terminal.ai_capture_pending()
-            && !self.terminal.appears_busy()
-            && self.terminal.output_idle_for(QUIET)
-            && self.terminal.input_idle_for(QUIET)
-            // 距我们自己上一次替用户敲键盘也要满 QUIET：`expect_echo` 是整体覆写，两条
-            // 注入挨太近，后一条会把前一条的回显吞除冲掉。见 `injection_idle_for`。
-            && self.terminal.injection_idle_for(QUIET)
+        injection_allowed(
+            self.connected,
+            self.ai_owned,
+            self.pending_ai_run.is_some() || self.terminal.ai_capture_pending(),
+            &self.terminal,
+            QUIET,
+        )
     }
 
     /// 用户往终端里粘了一张图（Ctrl+V / 右键粘贴，剪贴板里是图片而不是文本）。
@@ -613,5 +641,100 @@ mod cwd_restore_tests {
         assert!(cwd_restore_expired(now.checked_sub(std::time::Duration::from_secs(1)), now));
         // 恰好到点也算过期（`>=`）
         assert!(cwd_restore_expired(Some(now), now));
+    }
+}
+
+#[cfg(test)]
+mod injection_gate_tests {
+    use super::injection_allowed;
+    use crate::terminal::Terminal;
+
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// **刚 Connected 的那一帧，闸门必须是关的。**
+    ///
+    /// 这条测试补的是一整类缺陷，而不是某一个 bug：`c957902` → `323d9cc` → `a535c67`
+    /// 三个提交里，被抽出来的判据每次都有单测、每次都绿，而缺陷每次都在「这套判据在
+    /// **初始状态**下取什么值」——`do_reconnect` 会 `Terminal::new()`（所有时刻戳归零），
+    /// `WorkerEvent::Connected` 又在同一帧被排空，于是「输出静止 2s」「用户停笔 2s」
+    /// 在远端还没开口说过一个字的那一刻全部恒真，闸门在信息最少的时候全开。
+    ///
+    /// 反向对照：把 `Terminal::output_idle_for` 改回 `is_none_or`，这条当场挂。
+    #[test]
+    fn a_just_connected_session_is_never_safe_to_inject_into() {
+        let t = Terminal::new();
+        assert!(
+            !injection_allowed(true, false, false, &t, QUIET),
+            "一个字节都没收到过——我们还没见过这个 shell 的提示符，不能替用户敲键盘"
+        );
+    }
+
+    /// 正向对照：防止上面那条被「闸门恒假」这种退化实现骗过。顺带钉住三个会话级前提。
+    #[test]
+    fn the_gate_opens_only_after_the_shell_has_spoken_and_gone_quiet() {
+        let mut t = Terminal::new();
+        t.feed(b"user@host:~$ ");
+        assert!(
+            !injection_allowed(true, false, false, &t, QUIET),
+            "banner 刚到，还没静止"
+        );
+        // `Terminal::appears_busy` 的窗口是硬编码的 1s，这里必须真等过去
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            injection_allowed(true, false, false, &t, QUIET),
+            "收到输出、又静止够久了：这才是可以注入的那一帧"
+        );
+        assert!(
+            !injection_allowed(false, false, false, &t, QUIET),
+            "断线期间永远不注入"
+        );
+        assert!(
+            !injection_allowed(true, true, false, &t, QUIET),
+            "ai_owned 是 AI 专用的只读会话，不注入"
+        );
+        assert!(
+            !injection_allowed(true, false, true, &t, QUIET),
+            "有挂起的 AI 命令/哨兵捕获时不注入——expect_echo 会覆盖它的吞除状态"
+        );
+    }
+
+    /// **用户一动手，闸门就永远关死。** 这是这套判据里唯一的安全边界：上面几条信号分不清
+    /// 「shell 闲在提示符上」和「某个程序正阻塞在 stdin」，而 sudo/ssh 的密码提示符恰好也是
+    /// 安静不动的——真往那儿注入，密码提示符会把整行吃掉，`expect_echo` 还会把回显吞了。
+    ///
+    /// 这一条此前抄在每个调用点上、不在闸门里，本次收进 `injection_allowed`。
+    /// 反向对照：把 `&& t.never_typed()` 从闸门里去掉，这条当场挂。
+    #[test]
+    fn a_user_who_has_touched_the_keyboard_closes_the_gate_for_good() {
+        let mut t = Terminal::new();
+        t.feed(b"user@host:~$ ");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(injection_allowed(true, false, false, &t, QUIET));
+        t.note_user_input_for_test();
+        assert!(
+            !injection_allowed(true, false, false, &t, QUIET),
+            "用户已经在用这个 shell 了——他可能正对着某个提示符输密码"
+        );
+        // 停笔再久也不放行：这道边界按「本次连接以来敲过没有」算，不是按「最近敲过没有」
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            !injection_allowed(true, false, false, &t, QUIET),
+            "停笔久了也不行——never_typed 是整段连接的性质，不是一个静止窗口"
+        );
+    }
+
+    /// 我们自己刚敲过一行，闸门也要关着：`expect_echo` 是整体覆写，两条注入挨太近，
+    /// 后一条会把前一条的回显吞除冲掉，那行命令就原样留在屏幕上。
+    #[test]
+    fn our_own_last_injection_also_closes_the_gate() {
+        let mut t = Terminal::new();
+        t.feed(b"user@host:~$ ");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(injection_allowed(true, false, false, &t, QUIET));
+        t.expect_echo("cd '/tmp'");
+        assert!(
+            !injection_allowed(true, false, false, &t, QUIET),
+            "刚替用户敲过一行，下一条注入必须等"
+        );
     }
 }

@@ -426,6 +426,13 @@ impl Terminal {
         self.last_input_at = None;
     }
 
+    /// 测试用：模拟用户敲了一下键盘。生产路径是 `collect_input`，而那条要 `egui::Ui`
+    /// ——没有这个入口，「用户一动手就不许注入」这道**最要紧的**安全边界就测不到。
+    #[cfg(test)]
+    pub fn note_user_input_for_test(&mut self) {
+        self.last_input_at = Some(std::time::Instant::now());
+    }
+
     /// 用户是否已停笔至少 `d`：本地输入行为空，且最近无键盘事件。
     /// 不满足时往终端注入字符会插进用户正在输入的命令。
     pub fn input_idle_for(&self, d: std::time::Duration) -> bool {
