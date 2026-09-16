@@ -125,6 +125,9 @@ impl Session {
                 WorkerEvent::Disconnected(reason) => {
                     self.connected = false;
                     self.status = reason;
+                    // 断线时丢弃未完成的同步帧：半帧属于已死的会话，留着会被重连后
+                    // 的看门狗刷进新会话屏幕。
+                    self.terminal.reset_sync();
                     // 断线意味着这个会话上任何挂起的 AI 命令都注定等不到哨兵了（worker 重启
                     // 后旧连接的输出流已经没了）——给还在等的 poll_run 一个明确的"未完成"
                     // 响应，而不是让它一直空等到自己的超时，也避免这个会话被"忙碌"卡住。

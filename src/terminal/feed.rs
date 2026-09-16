@@ -19,7 +19,9 @@ const SYNC_OFF: &[u8] = b"\x1b[?2026l";
 /// 看门狗：一帧超过 100ms 还没等到 `2026l`（程序崩溃/结束标记丢失），下一包到达时把
 /// 半帧强刷给解析器——宁可画半帧也不能让画面永久冻结。正常帧只有几毫秒。
 const SYNC_WATCHDOG: std::time::Duration = std::time::Duration::from_millis(100);
-/// 帧缓冲上限：超出强制刷掉，内存有界（正常帧几 KB，1 MiB 是极宽裕的兜底）。
+/// 帧缓冲软上限：超出强制刷掉，内存有界（正常帧几 KB，1 MiB 是极宽裕的兜底）。
+/// 「软」在检查点——只在「本块没找到 2026l」时量一次，故峰值可达上限 + 一个 feed
+/// 块（drain 预算 2 MiB，实测 SSH 块约 32 KB），仍有界。
 pub(super) const SYNC_BUF_CAP: usize = 1024 * 1024;
 
 impl Terminal {
@@ -371,7 +373,7 @@ impl Terminal {
                     } else if !head.is_empty() {
                         replies.extend(self.process_bytes(head));
                     }
-                    rest = &tail[SYNC_ON.len()..];
+                    rest = &tail[marker.len()..];
                     if self.sync_active {
                         replies.extend(self.flush_sync());
                     } else {
@@ -405,6 +407,14 @@ impl Terminal {
         } else {
             self.process_bytes(&frame)
         }
+    }
+
+    /// 丢弃未完成的同步帧（断线重连时调用）。半帧属于已死的会话：重连后看门狗会把
+    /// 滞留的旧字节刷进新会话屏幕（新连接的第一包必然远超 100ms），与其画一帧死内容，
+    /// 不如清掉——回滚历史保留不动，只清 `sync_buf`/`sync_active` 这两个瞬时状态。
+    pub fn reset_sync(&mut self) {
+        self.sync_buf.clear();
+        self.sync_active = false;
     }
 
     /// BEL 响铃 → 生成一条待上报通知，预览取光标所在行文本（确认菜单/提示语常在这行）。

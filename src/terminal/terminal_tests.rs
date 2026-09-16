@@ -1359,14 +1359,14 @@ fn unterminated_sync_frame_flushes_on_watchdog() {
 }
 
 /// 帧缓冲上限：超过 `SYNC_BUF_CAP` 强制刷掉，内存有界；刷掉后同步状态复位、
-/// 仍能正常进下一帧。
+/// 仍能正常进下一帧。走「多包累积、始终没有 2026l」的 None 分支——那才是真正的
+/// 上限检查路径（Some 分支是随 2026l 正常 flush，不查上限）。
 #[test]
 fn oversized_sync_frame_flushes_and_recovers() {
     let mut t = Terminal::new();
     let mut data = b"\x1b[?2026h".to_vec();
     data.extend(std::iter::repeat_n(b'a', super::feed::SYNC_BUF_CAP + 64));
-    data.extend_from_slice(b"\x1b[?2026l");
-    let replies = t.feed(&data);
+    let replies = t.feed(&data); // 无 2026l：None 分支内命中上限
     assert!(replies.is_empty());
     assert!(t.screen_text().contains('a'));
     assert!(!t.sync_active, "超限 flush 后同步状态应复位");
@@ -1377,8 +1377,11 @@ fn oversized_sync_frame_flushes_and_recovers() {
 }
 
 /// resize 落在帧中间：攒着的半帧不清掉，之后照常灌进**新**解析器，顺序不变、不崩。
+/// 两个分支都要覆盖：直接 set_size 的扩容分支（rows 变大），以及序列化重建解析器
+/// 的缩窄分支（cols 变小）——后者才是「半帧灌进新解析器」的真正场景。
 #[test]
 fn resize_mid_sync_frame_does_not_panic() {
+    // 扩容分支：rows 24 -> 40 直接 set_size
     let mut t = Terminal::new();
     t.feed(b"\x1b[?2026h\x1b[1;1Hpartial");
     assert!(t.resize(100, 40));
@@ -1386,6 +1389,34 @@ fn resize_mid_sync_frame_does_not_panic() {
     t.feed(b" rest\r\n\x1b[?2026l");
     assert!(t.screen_text().contains("partial rest"));
     assert!(!t.sync_active);
+
+    // 缩窄重建分支：cols 80 -> 60 走 serialize_buffer + 重建解析器
+    let mut t = Terminal::new();
+    t.feed(b"before\r\n\x1b[?2026h\x1b[1;1Hpartial");
+    assert!(t.resize(60, 20));
+    assert!(t.sync_active, "重建解析器也不应打断帧内状态");
+    t.feed(b" rest\r\n\x1b[?2026l");
+    assert!(t.screen_text().contains("partial rest"));
+    assert!(!t.sync_active);
+}
+
+/// 断线丢弃未完成的同步帧：半帧属于已死的会话，重连后绝不允许被看门狗刷上新屏幕。
+#[test]
+fn disconnect_drops_unfinished_sync_frame() {
+    let mut t = Terminal::new();
+    t.feed(b"alive\r\n");
+    t.feed(b"\x1b[?2026h\x1b[1;1Hstale dead frame"); // 无 2026l
+    assert!(t.sync_active);
+    t.reset_sync(); // 断线重连时 App 调用
+    assert!(!t.sync_active);
+    // 重连后的新输出：旧半帧一个字都不许出现
+    t.feed(b"new session\r\n");
+    let s = t.screen_text();
+    assert!(s.contains("new session"), "新会话输出应在屏上：{s:?}");
+    assert!(!s.contains("stale dead frame"), "旧会话半帧上了屏：{s:?}");
+    // 同步机制照常工作
+    t.feed(b"\x1b[?2026h\x1b[1;1Hfresh frame\r\n\x1b[?2026l");
+    assert!(t.screen_text().contains("fresh frame"));
 }
 
 /// 落单的 `2026l`（不在帧内）：原样喂给 vt100 忽略，后续输出不受影响。
