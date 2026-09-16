@@ -11,6 +11,17 @@ use super::{
 /// AI 捕获缓冲上限：超过后从前端裁掉最早的部分（兜底极端长输出，不做无界增长）。
 const AI_CAPTURE_CAP: usize = 4 * 1024 * 1024;
 
+/// 同步输出（DEC 私有模式 2026）的帧开始/结束标记。`h`/`l` 等长（8 字节），
+/// 切包重组后按子串识别即可——同 `ESC[2J`/`ESC[3J` 的识别一个风险级别：
+/// 真序列里 `h`/`l` 就是 CSI 终结字节，不存在「更长的参数序列」被误吞的问题。
+const SYNC_ON: &[u8] = b"\x1b[?2026h";
+const SYNC_OFF: &[u8] = b"\x1b[?2026l";
+/// 看门狗：一帧超过 100ms 还没等到 `2026l`（程序崩溃/结束标记丢失），下一包到达时把
+/// 半帧强刷给解析器——宁可画半帧也不能让画面永久冻结。正常帧只有几毫秒。
+const SYNC_WATCHDOG: std::time::Duration = std::time::Duration::from_millis(100);
+/// 帧缓冲上限：超出强制刷掉，内存有界（正常帧几 KB，1 MiB 是极宽裕的兜底）。
+pub(super) const SYNC_BUF_CAP: usize = 1024 * 1024;
+
 impl Terminal {
     /// 处理终端输出，并为需要终端主动应答的查询生成回写字节。
     ///
@@ -305,6 +316,17 @@ impl Terminal {
             return Vec::new();
         }
 
+        let replies = self.process_with_sync(bytes);
+        self.ensure_cursor_after_alt();
+        if bel {
+            self.push_bel_notice();
+        }
+        replies
+    }
+
+    /// 把一段「普通字节」喂给 vt100（帧外的输出、以及攒齐后的一次性整帧），返回查询应答。
+    /// 内含 `clear` 的特例：见 `feed()` 对 ESC[2J/3J 的那段说明。
+    fn process_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         // `clear` 会发 ESC[2J（清屏）+ ESC[3J（清回滚缓冲）。vt100 不处理 [3J，
         // 导致旧内容仍留在 scrollback（可上滚看到）。这里在 [3J 处重建解析器，
         // 真正清空回滚缓冲；[3J 之后的字节（新提示符等）喂入全新解析器。
@@ -319,16 +341,70 @@ impl Terminal {
                 self.scrollback = 0;
                 replies.extend(self.process_with_replies(after));
                 self.parser.process(&restore);
-                self.ensure_cursor_after_alt();
                 return replies;
             }
         }
-        let replies = self.process_with_replies(bytes);
-        self.ensure_cursor_after_alt();
-        if bel {
-            self.push_bel_notice();
+        self.process_with_replies(bytes)
+    }
+
+    /// 同步输出（模式 2026）分发：按帧标记把字节流切成「普通段」和「帧」。
+    /// 普通段立即喂；帧内容攒进 `sync_buf`，直到 `2026l` 才由 `flush_sync` 一次性整帧
+    /// 喂给解析器——对 vt100 来说一帧就是一次顺序 process，中间态不存在于任何
+    /// 「两次 paint 之间」，`ui_paint` 因此无需任何改动。
+    fn process_with_sync(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut replies = Vec::new();
+        // 看门狗：上一帧一直没等到 `2026l`，先把超时的半帧刷掉再继续。
+        if self.sync_active && self.sync_since.elapsed() >= SYNC_WATCHDOG {
+            log::debug!("同步帧看门狗触发：{}ms 未等到 2026l，强刷半帧", self.sync_since.elapsed().as_millis());
+            replies.extend(self.flush_sync());
+        }
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            // 帧内只找结束标记；帧外只找开始标记。落单的另一种标记会随普通段
+            // 喂给 vt100，被它的 unhandled 路径忽略——与原行为一致。
+            let marker = if self.sync_active { SYNC_OFF } else { SYNC_ON };
+            match find_sub(rest, marker) {
+                Some(pos) => {
+                    let (head, tail) = rest.split_at(pos);
+                    if self.sync_active {
+                        self.sync_buf.extend_from_slice(head);
+                    } else if !head.is_empty() {
+                        replies.extend(self.process_bytes(head));
+                    }
+                    rest = &tail[SYNC_ON.len()..];
+                    if self.sync_active {
+                        replies.extend(self.flush_sync());
+                    } else {
+                        self.sync_active = true;
+                        self.sync_since = std::time::Instant::now();
+                    }
+                }
+                None => {
+                    if self.sync_active {
+                        self.sync_buf.extend_from_slice(rest);
+                        if self.sync_buf.len() >= SYNC_BUF_CAP {
+                            log::debug!("同步帧缓冲超上限（{} 字节），强制刷掉", self.sync_buf.len());
+                            replies.extend(self.flush_sync());
+                        }
+                    } else {
+                        replies.extend(self.process_bytes(rest));
+                    }
+                    break;
+                }
+            }
         }
         replies
+    }
+
+    /// 把攒下的一整帧（或被看门狗/上限逼出的半帧）整体喂给 vt100 并复位同步状态。
+    fn flush_sync(&mut self) -> Vec<u8> {
+        self.sync_active = false;
+        let frame = std::mem::take(&mut self.sync_buf);
+        if frame.is_empty() {
+            Vec::new()
+        } else {
+            self.process_bytes(&frame)
+        }
     }
 
     /// BEL 响铃 → 生成一条待上报通知，预览取光标所在行文本（确认菜单/提示语常在这行）。

@@ -188,6 +188,18 @@ pub struct Terminal {
     /// 只暂存 `CSI_TAIL_CAP` 以内的短序列——`ESC[2J`/`ESC[3J` 都只有 4 字节，长参数的 CSI 与这里
     /// 的识别无关，不必为它们攒缓冲。
     csi_pending: Vec<u8>,
+    /// 「同步输出」帧缓冲（DEC 私有模式 2026）：`ESC[?2026h`…`ESC[?2026l` 之间的一整帧
+    /// 先攒在这里、不喂解析器，到 `2026l` 才一次性 `process`——帧内的中间态（整屏擦除、
+    /// 逐行清空重建）永远不会上屏。kimi/codex 这类「内联视口」TUI 每帧都靠它把整框重绘
+    /// 包成原子操作；不识别 2026 的终端会把中间态逐数据包画出来，表现为内容持续「跳跃」。
+    /// 标记本身不喂给 vt100（它的 unhandled 回调是空操作，喂了也无意义），只在这里消费。
+    sync_buf: Vec<u8>,
+    /// 当前是否处于 2026 帧内（见到 `2026h` 置真，`2026l`/看门狗/上限 flush 时清假）。
+    /// resize 重建解析器时不清它：攒着的半帧之后照常灌进新解析器，顺序不变。
+    sync_active: bool,
+    /// 帧开始时刻，看门狗判据：程序崩溃在帧中间（`2026l` 永远不来）时，下一包到达会把
+    /// 超过 `SYNC_WATCHDOG` 的半帧强刷上去——宁可画半帧也不能让画面永久冻结。
+    sync_since: std::time::Instant,
     /// resize 去抖：拖拽窗口时每帧尺寸都在变，若每帧都真正 resize（普通屏会序列化整缓冲+重建
     /// 解析器重放，且向远端连发 SIGWINCH）会导致 codex 等自绘 TUI 反复重绘「历史从头刷到尾」。
     /// 这里只记录目标尺寸+首次出现时刻，稳定 ~130ms 后才真正 resize（本地重排 + 上报远端一次）。
@@ -260,6 +272,9 @@ impl Terminal {
             hl_cache: std::collections::HashMap::new(),
             query_tail: Vec::new(),
             csi_pending: Vec::new(),
+            sync_buf: Vec::new(),
+            sync_active: false,
+            sync_since: std::time::Instant::now(),
             prev_alt: false,
             sb_dragging: false,
             ai_capture: None,

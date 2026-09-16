@@ -849,6 +849,14 @@ const SPLIT_CORPUS: &[&[u8]] = &[
     b"\x1b[6n",
     b"\x1b[2J\x1b[3Jcleared\r\n",
     b"\x1b]9;4;1;50\x07progress\r\n",
+    // 同步输出帧（DEC 私有模式 2026）：整帧攒齐才上屏，任意分包结果须一致
+    b"\x1b[?2026h\x1b[1;1H\x1b[J\x1b[1;1Hframe one\r\n\x1b[?2026l",
+    // 帧内又来个 2026h（畸形但容错）：一个 2026l 即结束，多余的 h 喂给 vt100 忽略
+    b"\x1b[?2026h\x1b[2;1Hframe two\r\n\x1b[?2026h\x1b[3;1Hstill frame two\r\n\x1b[?2026l",
+    // 落单的 2026l：不在帧内，随普通段喂给 vt100 忽略即可
+    b"\x1b[?2026lstray sync-off\r\n",
+    // 真实 codex 同步帧（PTY 抓包，空闲转圈时的一整帧重绘）：整屏擦除 + 逐行清空 + 逐行重建
+    b"\x1b[?2026h\x1b[1;1H\x1b[J\x1b[1;42H\x1b[0m\x1b[m\x1b[K\x1b[2;42H\x1b[0m\x1b[m\x1b[K\x1b[3;42H\x1b[0m\x1b[m\x1b[K\x1b[4;42H\x1b[0m\x1b[m\x1b[K\x1b[5;42H\x1b[0m\x1b[m\x1b[K\x1b[6;42H\x1b[0m\x1b[m\x1b[K\x1b[7;2H\x1b[0m\x1b[m\x1b[K\x1b[8;2H\x1b[0m\x1b[m\x1b[K\x1b[9;27H\x1b[0m\x1b[m\x1b[K\x1b[10;2H\x1b[0m\x1b[m\x1b[K\x1b[11;18H\x1b[0m\x1b[m\x1b[K\x1b[1;1H\x1b[2m\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae\x1b[2;1H\xe2\x94\x82 >_ \x1b[22m\x1b[1mOpenAI Codex\x1b[22m\x1b[2m\x1b[2m (v0.154.0)            \xe2\x94\x82\x1b[3;1H\xe2\x94\x82                                       \xe2\x94\x82\x1b[4;1H\xe2\x94\x82 model:     \x1b[3mloading\x1b[23m   \x1b[22m\x1b[;m/model\x1b[2m\x1b[;m to change \xe2\x94\x82\x1b[5;1H\xe2\x94\x82 directory: \x1b[22mloading\x1b[2m                    \xe2\x94\x82\x1b[6;1H\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf\x1b[7;1H\x1b[22m \x1b[8;1H \x1b[9;1H\x1b[1m\xe2\x80\xba\x1b[22m \x1b[2mAsk Codex to do anything\x1b[10;1H\x1b[22m \x1b[11;1H  \x1b[2m? for shortcuts\x1b[m\x1b[m\x1b[0m\x1b[1;1H\x1b[0 q\x1b[1;1H\x1b[2m\xe2\x95\xad\x1b[m\x1b[m\x1b[0m\x1b[9;3H\x1b[?25h\x1b[?2026l",
 ];
 
 /// 只取**能真正弹给用户**的通知。
@@ -947,6 +955,9 @@ fn feed_never_panics_on_arbitrary_bytes() {
         b"\x1b]7;file://\x07",                 // OSC 7 空路径
         b"\x1b]7;file://h\x07",                // OSC 7 无 '/' 路径
         b"\x1b]777;notify;\x07",               // 空标题空正文
+        b"\x1b[?2026h",                        // 未终止的同步帧（看门狗兜底）
+        b"\x1b[?2026l",                        // 落单的同步结束标记
+        b"\x1b[?2026h\x1b[?2026h\x1b[?2026l", // 连续嵌套的同步标记
     ];
     for (i, data) in nasty.iter().enumerate() {
         for at in 0..=data.len() {
@@ -1247,4 +1258,157 @@ fn a_fresh_injection_blocks_the_next_one() {
     }
     std::thread::sleep(std::time::Duration::from_millis(60));
     assert!(t.injection_idle_for(d), "过了时间窗才放行");
+}
+
+
+/// 同步输出（DEC 私有模式 2026）专项测试。
+///
+/// 背景：kimi/codex 这类「内联视口」TUI 每帧都是「整屏擦除 + 逐行重建」，帧体包在
+/// `ESC[?2026h`…`ESC[?2026l` 里、依赖终端在帧结束前不上屏。帧体本身又是几十个小
+/// write，一帧几乎必然跨多个数据包。`feed()` 在 2026h 起把字节攒进 `sync_buf`、到
+/// 2026l 才一次性喂给 vt100，中间态因此对任何 paint 都不可见。
+
+/// 原子性：帧未结束（没有 `2026l`）时，帧内的清屏/绘制一律不上屏；结束后整帧一次生效。
+#[test]
+fn sync_frame_is_buffered_until_sync_off() {
+    let mut t = Terminal::new();
+    t.feed(b"old content\r\n");
+    let before = t.screen_text();
+    // 帧的前半：清屏 + 写了一行——但没有 2026l，屏幕上必须还是旧内容
+    let replies = t.feed(b"\x1b[?2026h\x1b[1;1H\x1b[J\x1b[1;1Hnew frame");
+    assert!(replies.is_empty());
+    assert_eq!(t.screen_text(), before, "帧未结束时中间态上了屏");
+    assert!(t.sync_active, "应处于帧内");
+    // 帧的后半 + 结束标记：此刻整帧一次性上屏
+    t.feed(b" continues\r\n\x1b[?2026l");
+    let after = t.screen_text();
+    assert!(after.contains("new frame continues"), "结束后整帧应已上屏：{after:?}");
+    assert!(!after.contains("old content"), "帧内清屏应随整帧生效");
+    assert!(!t.sync_active, "结束后应退出帧内状态");
+}
+
+/// 对拍：codex 形态的帧（整屏擦除 + 逐行清空重建）在**任意**字节位置切成两包，
+/// 第一包喂完后屏幕上都不许出现帧内容（中间态两边都不可见），两包喂完后与整块一致。
+#[test]
+fn codex_style_frame_is_atomic_under_any_split() {
+    let frame: &[u8] = b"\x1b[?2026h\x1b[1;1H\x1b[J\x1b[1;1H\x1b[K\x1b[2;1H\x1b[K\x1b[1;1HBOX\r\n\x1b[2;1Hcontent\x1b[?2026l";
+    let mut base = Terminal::new();
+    base.feed(b"prompt$ ");
+    base.feed(frame);
+    let want = base.screen_text();
+    for at in 1..frame.len() {
+        let mut t = Terminal::new();
+        t.feed(b"prompt$ ");
+        t.feed(&frame[..at]);
+        assert!(
+            !t.screen_text().contains("BOX"),
+            "切点 {at}：帧未完整送达，中间态却上了屏"
+        );
+        t.feed(&frame[at..]);
+        assert_eq!(t.screen_text(), want, "切点 {at}：最终屏幕与整块不一致");
+    }
+}
+
+/// 帧内的光标查询（`ESC[6n`）在整帧完成时才产生应答，且光标位置与整块喂入一致；
+/// 任意切包下应答字节都必须相同（查询可能被切在 `ESC[6` / `n` 之间，靠暂存拼回）。
+#[test]
+fn sync_frame_answers_cursor_query_at_frame_end() {
+    let frame: &[u8] = b"\x1b[?2026h\x1b[5;10H\x1b[6n\x1b[?2026l";
+    let mut whole = Terminal::new();
+    let want_replies = whole.feed(frame);
+    assert_eq!(want_replies, b"\x1b[5;10R".to_vec(), "应答应是查询点的光标位置");
+    for at in 1..frame.len() {
+        let mut t = Terminal::new();
+        let mut r = t.feed(&frame[..at]);
+        r.extend(t.feed(&frame[at..]));
+        assert_eq!(r, want_replies, "切点 {at}：回给远端的应答不一致");
+    }
+}
+
+/// 帧内嵌 `clear`（`ESC[2J ESC[3J`）照常走「重建解析器、真正清空回滚缓冲」的特例，
+/// 只是时机推迟到帧结束——清的是旧历史，帧自己写的内容要留下。
+#[test]
+fn sync_frame_containing_clear_still_clears_scrollback() {
+    let mut t = Terminal::new();
+    for i in 0..30 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    assert!(t.history_text(100).contains("line 0"), "清屏前应能回看到最早的历史行");
+    t.feed(b"\x1b[?2026h\x1b[2J\x1b[3J\x1b[1;1Hcleared in frame\r\n\x1b[?2026l");
+    let history = t.history_text(100);
+    assert!(!history.contains("line 0"), "帧内 clear 后旧历史应被清空：{history:?}");
+    assert!(history.contains("cleared in frame"), "帧自己写的内容应留下");
+}
+
+/// 看门狗：程序崩溃在帧中间（`2026l` 永远不来）时，下一包到达会把超时半帧强刷上去，
+/// 画面不能永久冻结。这里直接把帧开始时刻拨回过去来确定性触发。
+#[test]
+fn unterminated_sync_frame_flushes_on_watchdog() {
+    let mut t = Terminal::new();
+    t.feed(b"before\r\n");
+    t.feed(b"\x1b[?2026h\x1b[1;1Hhalf frame"); // 无 2026l
+    assert!(t.screen_text().contains("before"), "未结束帧不上屏");
+    assert!(t.sync_active);
+    // 模拟看门狗超时
+    t.sync_since = std::time::Instant::now() - std::time::Duration::from_millis(500);
+    t.feed(b"x");
+    let s = t.screen_text();
+    assert!(s.contains("half frame"), "看门狗应把半帧刷上去：{s:?}");
+    assert!(s.contains('x'), "看门狗刷完后本次字节照常处理");
+    assert!(!t.sync_active, "看门狗刷完后应复位帧内状态");
+}
+
+/// 帧缓冲上限：超过 `SYNC_BUF_CAP` 强制刷掉，内存有界；刷掉后同步状态复位、
+/// 仍能正常进下一帧。
+#[test]
+fn oversized_sync_frame_flushes_and_recovers() {
+    let mut t = Terminal::new();
+    let mut data = b"\x1b[?2026h".to_vec();
+    data.extend(std::iter::repeat_n(b'a', super::feed::SYNC_BUF_CAP + 64));
+    data.extend_from_slice(b"\x1b[?2026l");
+    let replies = t.feed(&data);
+    assert!(replies.is_empty());
+    assert!(t.screen_text().contains('a'));
+    assert!(!t.sync_active, "超限 flush 后同步状态应复位");
+    // 之后还能正常进帧
+    t.feed(b"\x1b[?2026h\x1b[1;1Htail\r\n\x1b[?2026l");
+    assert!(t.screen_text().contains("tail"));
+    assert!(!t.sync_active);
+}
+
+/// resize 落在帧中间：攒着的半帧不清掉，之后照常灌进**新**解析器，顺序不变、不崩。
+#[test]
+fn resize_mid_sync_frame_does_not_panic() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?2026h\x1b[1;1Hpartial");
+    assert!(t.resize(100, 40));
+    assert!(t.sync_active, "resize 不应打断帧内状态");
+    t.feed(b" rest\r\n\x1b[?2026l");
+    assert!(t.screen_text().contains("partial rest"));
+    assert!(!t.sync_active);
+}
+
+/// 落单的 `2026l`（不在帧内）：原样喂给 vt100 忽略，后续输出不受影响。
+#[test]
+fn stray_sync_off_outside_frame_is_inert() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?2026lplain\r\n");
+    assert!(t.screen_text().contains("plain"));
+    assert!(!t.sync_active);
+}
+
+/// 连续交错：普通段 → 帧A → 普通段 → 帧B，全部一次喂入，各段效果按序生效。
+#[test]
+fn interleaved_plain_segments_and_frames_apply_in_order() {
+    let mut t = Terminal::new();
+    t.feed(b"one\r\n\x1b[?2026htwo-frame\r\n\x1b[?2026lthree\r\n\x1b[?2026hfour-frame\r\n\x1b[?2026l");
+    let history = t.history_text(50);
+    let pos_one = history.find("one").unwrap();
+    let pos_two = history.find("two-frame").unwrap();
+    let pos_three = history.find("three").unwrap();
+    let pos_four = history.find("four-frame").unwrap();
+    assert!(
+        pos_one < pos_two && pos_two < pos_three && pos_three < pos_four,
+        "交错段落的生效顺序乱了：{history:?}"
+    );
 }
