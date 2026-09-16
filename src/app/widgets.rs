@@ -232,19 +232,78 @@ pub fn view_context_menu(resp: &egui::Response) {
                              开启后，每个新会话空闲时 iShell 会替你敲一条\n\
                              ` export ISHELL_MCP_TOKEN=…` 并回车（回显会被吞掉）。\n\
                              默认关：它毕竟是程序替你在自己的 shell 里执行命令。\n\
-                             不想开也有手动路径——用下面的「复制配对配置」。",
+                             不想开也有手动路径——用下面的「复制配对配置」。\n\
+                             ⚠ 安全提示：token 会留在 shell 环境变量里，同账号的其他用户可读\n\
+                             ——互不信任的共享账号上，这等于让他们跳过弹窗直接绑定你的电脑。",
                             "Only needed when several computers share one AI server: their \n\
                              reverse-forwarded sockets pile up in the same remote directory, and \n\
                              the proxy needs this environment variable to know which computer to \n\
                              answer. When on, iShell types ` export ISHELL_MCP_TOKEN=…` into each \n\
                              new session once it goes idle, and presses Enter (the echo is \n\
                              swallowed). Off by default — it is still the program running a command \n\
-                             in your own shell. The manual route is \"Copy pairing config\" below.",
+                             in your own shell. The manual route is \"Copy pairing config\" below.\n\
+                             ⚠ Security note: the token stays in the shell environment, readable \n\
+                             by any other user of the same account — on a shared account with \n\
+                             mutually untrusted users, that lets them bind to your iShell without \n\
+                             the consent prompt.",
                         ))
                         .clicked()
                     {
                         crate::store::save_mcp_auto_pair(auto_pair);
                         ui.close();
+                    }
+
+                    // 只响应配对请求：多用户服务器上的防打扰开关（默认关，见
+                    // store::load_mcp_paired_only 的完整代价说明）。
+                    let mut paired_only = crate::store::load_mcp_paired_only();
+                    if ui
+                        .checkbox(
+                            &mut paired_only,
+                            crate::i18n::tr(
+                                "　只响应配对请求（多用户服务器防打扰）",
+                                "  Answer only paired requests (shared-server anti-nag)",
+                            ),
+                        )
+                        .on_hover_text(crate::i18n::tr(
+                            "多人共用同一台服务器账号时：未配 pairing token 的 AI 会向**每台**\
+                             iShell 广播绑定请求、每个窗口都弹「同意/拒绝」框（先点先赢，\
+                             误点允许会把别人的 AI 绑到你的电脑上）。\n\
+                             开启后，本 iShell 对匿名发现不应答——别人的 AI 完全看不到你，\
+                             弹窗无从出现。\n\
+                             代价：你自己未配 token 的 AI 也找不到这台 iShell（报「连不上」）。\
+                             需要配合上面的「自动注入配对标识」使用，或手动把配对配置填进 \
+                             AI 的 MCP server 环境变量。",
+                            "When several people share one server account, an AI without a \
+                             pairing token broadcasts its bind request to EVERY iShell — every \
+                             window gets an approve/reject popup (first click wins; approving \
+                             someone else's AI by mistake binds it to YOUR computer).\n\
+                             When on, this iShell stays silent to anonymous discovery: their AIs \
+                             never see you and no popup can appear.\n\
+                             Cost: your own AIs also can't find this iShell without a token \
+                             (\"can't connect\"). Use together with \"auto-inject the pairing \
+                             token\" above, or paste the pairing config into the AI's MCP server \
+                             environment.",
+                        ))
+                        .clicked()
+                    {
+                        crate::store::save_mcp_paired_only(paired_only);
+                        ui.close();
+                    }
+
+                    // 开关联动提示：「只响应配对请求」挡的是一切匿名 AI——包括用户自己的。
+                    // 自动注入没开时，用户的 AI 根本拿不到配对 token，会连不上，必须就地
+                    // 说明，别让用户两周后对着一句「连不上 iShell」排查不到原因。
+                    if paired_only && !auto_pair {
+                        ui.label(
+                            RichText::new(crate::i18n::tr(
+                                "　⚠ 你自己的 AI 也将连不上这台 iShell——建议同时开启上面的\
+                                 「自动注入配对标识」",
+                                "  ⚠ Your own AIs also won't reach this iShell — consider \
+                                 enabling \"auto-inject the pairing token\" above",
+                            ))
+                            .size(11.0)
+                            .color(crate::theme::Palette::WARN),
+                        );
                     }
                 }
 

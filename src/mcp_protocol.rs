@@ -528,6 +528,14 @@ pub struct McpRequest {
     /// 只有 `Identify` / `IdentifyPair` 允许填 `None`（那时还不知道对面是谁）。其余请求带
     /// `None` 一律拒绝：「没点名」不等于「随便谁都行」，那正是要根除的静默走错实例。
     pub instance: Option<String>,
+    /// 发起方的可读来源描述（如 `e5-1 (ishell-mcp pid 42)` / `Codex CLI`）——**仅供弹窗
+    /// 展示**，帮助被询问的用户判断「这是谁的 AI」。纯显示信息，不构成身份凭证：真正决定
+    /// 绑定的是用户在弹窗里的点击，或配对 token 握手。
+    ///
+    /// 可选且向后兼容：旧代理不发此字段（默认 `None`）；旧 GUI 按 serde 默认行为忽略未知
+    /// 字段。只有代理广播 `Bind` 时才需要带，其余请求一律 `None`。
+    #[serde(default)]
+    pub origin: Option<String>,
     pub kind: McpReqKind,
 }
 
@@ -640,8 +648,27 @@ mod addressing_tests {
         McpRequest {
             id: 1,
             instance: instance.map(str::to_string),
+            origin: None,
             kind,
         }
+    }
+
+    /// 来源字段的向后兼容：旧负载（无 `origin`）必须能解析为 `None`；新负载带 origin 原样往返。
+    /// 这条保证「新代理 + 旧 GUI」「旧代理 + 新 GUI」混搭都不炸——部署两端从不是同步升级的。
+    #[test]
+    fn request_origin_field_is_optional_and_roundtrips() {
+        let legacy = r#"{"id":1,"instance":"me","kind":"Bind"}"#;
+        let parsed: McpRequest = serde_json::from_str(legacy).expect("旧负载必须能解析");
+        assert_eq!(parsed.origin, None, "旧负载的来源字段应为 None");
+        let mut with_origin = req(Some("me"), McpReqKind::Bind);
+        with_origin.origin = Some("e5-1 (ishell-mcp pid 42)".into());
+        let json = serde_json::to_string(&with_origin).unwrap();
+        let back: McpRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.origin.as_deref(),
+            Some("e5-1 (ishell-mcp pid 42)"),
+            "来源字段应原样往返"
+        );
     }
 
     /// 点名点中自己才执行——这是「一个代理只操作一个 iShell」的硬保证。
@@ -873,6 +900,7 @@ mod tests {
         let request = McpRequest {
             id: 7,
             instance: Some("1234-a1b2c3d4".into()),
+            origin: None,
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 11,
                 remote_path: "/srv/project/cuda_eri.py".into(),

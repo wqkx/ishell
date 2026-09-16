@@ -670,14 +670,20 @@ impl App {
         });
     }
 
-    /// 一个 AI 客户端想接管这个 iShell 窗口——只在本机同时开着多个 iShell 时才会弹。
+    /// 一个 AI 客户端想接管这个 iShell 窗口。
     ///
-    /// 代理进程把这个请求同时发给了**每一个** iShell 实例，所以此刻每个窗口上都有一个一样
-    /// 的框。用户在想用的那个窗口上点「允许」即可；其余窗口的框会在代理挂断连接后自动消失
-    /// （见 `sweep_pending_consents`），不需要挨个去点「拒绝」。
+    /// 两种场景都会触发，弹窗文案必须同时覆盖：
+    /// - 单机多开：代理发现多个实例，让用户点窗口选（原版设计）；
+    /// - **共享服务器**：某个用户的 AI 广播绑定，所有实例都收到——大多数窗口根本不是
+    ///   它的目标。旧文案只写了第一种，用户在共享服务器上会被「你同时开着多个 iShell」
+    ///   误导去做无用功。
     ///
-    /// 之所以让用户「点窗口」而不是「读出实例名去填配置」：他本来就是看着窗口决定的，实例
-    /// 标识是纯内部的东西，不该爬到 UI 上来。
+    /// 代理（≥带来源的版本）会附一行发起人描述（unix 用户/进程名），用户据此判断这是
+    /// 不是自己的 AI。「不再接收此类请求」一键开启「只响应配对请求」——对匿名隐身，
+    /// 这类弹窗从此消失（代价见设置里的说明）。
+    ///
+    /// 落选的那些窗口不需要用户逐个点「拒绝」：代理拿到第一个「允许」后就挂断其余连接，
+    /// `resp_tx.is_closed()` 随即为真，弹窗自动消失（见 `sweep_pending_consents`）。
     pub(super) fn handle_ai_bind_consent(&mut self, ctx: &egui::Context) {
         if self.pending_bind_consent.is_none() {
             return;
@@ -688,6 +694,10 @@ impl App {
         if self.pending_open_consent.is_some() || self.pending_use_consent.is_some() {
             return;
         }
+        let origin = self
+            .pending_bind_consent
+            .as_ref()
+            .and_then(|p| p.origin.clone());
         egui::Modal::new(egui::Id::new("ai_bind_consent_modal")).show(ctx, |ui| {
             ui.set_width(400.0);
             ui.vertical_centered(|ui| {
@@ -700,13 +710,28 @@ impl App {
                     .strong(),
                 );
                 ui.add_space(6.0);
+                if let Some(origin) = &origin {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}：{origin}",
+                            crate::i18n::tr("来源", "From")
+                        ))
+                        .size(12.0)
+                        .color(Palette::TEXT_DIM),
+                    );
+                    ui.add_space(4.0);
+                }
                 ui.label(crate::i18n::tr(
-                    "你同时开着多个 iShell，AI 无法自己判断该用哪一个。\n\n\
-                     如果你就是想让它操作这个窗口，点「允许」；想用别的窗口，就去那个窗口上点\
-                     「允许」——这里不用管，框会自己消失。",
-                    "You have several iShell windows open, and AI cannot tell which one you mean.\n\n\
-                     Click Allow if this is the window you want it to use. If you meant another \
-                     window, click Allow there instead — this prompt will dismiss itself.",
+                    "服务器上的一个 AI 正在挑选要连接的 iShell 窗口——可能是你的 AI（比如你\
+                     开了多个窗口），也可能属于同一台服务器上的其他用户。\n\n\
+                     想让它用这个窗口，点「允许」；想用别的窗口，去那个窗口点「允许」——这里不用\
+                     管，框会自己消失。不是你的 AI，点「拒绝」，或「不再接收此类请求」彻底关掉。",
+                    "An AI on this server is looking for an iShell window to connect to — it may \
+                     be yours (e.g. you have several windows open), or it may belong to another \
+                     user of the same server.\n\n\
+                     Click Allow to let it use THIS window. If you want it to use another window, \
+                     click Allow there instead — this prompt will dismiss itself. If it is not \
+                     your AI, click Deny, or \"Stop these prompts\" to opt out for good.",
                 ));
                 ui.add_space(4.0);
                 ui.label(
@@ -730,6 +755,33 @@ impl App {
                 if dialog_button(ui, crate::i18n::tr("拒绝", "Deny"), Some(Palette::DANGER), bw) {
                     self.resolve_bind_consent(false);
                 }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .link(crate::i18n::tr(
+                            "不再接收此类请求（开启「只响应配对请求」）",
+                            "Stop these prompts (answer only paired requests)",
+                        ))
+                        .on_hover_text(crate::i18n::tr(
+                            "开启「只响应配对请求」：未携带配对 token 的 AI 将完全看不到这台 \
+                             iShell，这类弹窗从此消失。\n\
+                             代价：你自己未配 token 的 AI 也会连不上它（设置里可同时开启\
+                             「自动注入配对标识」解决）。随时可在 MCP 设置里关掉。",
+                            "Turn on \"answer only paired requests\": AIs without a pairing \
+                             token will no longer see this iShell at all, and these prompts \
+                             stop appearing.\n\
+                             Cost: your own AIs also can't reach it without a token (enable \
+                             \"auto-inject the pairing token\" in settings to fix that). You \
+                             can turn this off anytime in the MCP settings.",
+                        ))
+                        .clicked()
+                    {
+                        crate::store::save_mcp_paired_only(true);
+                        self.resolve_bind_consent(false);
+                    }
+                });
             });
         });
     }

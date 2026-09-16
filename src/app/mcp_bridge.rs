@@ -563,6 +563,8 @@ pub(super) struct PendingUseConsent {
 pub(super) struct PendingBindConsent {
     resp_tx: oneshot::Sender<McpResponse>,
     req_id: u64,
+    /// 发起方的可读来源描述（代理 `Bind` 时携带，见 `McpRequest::origin`），弹窗展示用。
+    pub(super) origin: Option<String>,
     deadline: Instant,
 }
 
@@ -842,6 +844,15 @@ async fn handle_conn(
     // Identify / IdentifyPair：连接层就地回答，不进 App 帧循环。
     // v3 起 Instance.token 恒为空——真实配对由 IdentifyPair 让调用方出示 token 证明，
     // 绝不在响应里回传（反向转发后同账号他人也能连上 socket 发 Identify）。
+    // 「只响应配对请求」（store::load_mcp_paired_only）开启时，匿名发现一律不应答：
+    // 代理眼里这条 socket 与死文件无异，无 token 的广播 `Bind` 发不起来，别人的 AI
+    // 不会对你弹窗。配对握手（PairHello/PairProve）不受影响——它只对知道 token 的
+    // 调用方有意义，而那正是「这台 iShell 归谁」的判据。代价与配套用法见 store 注释。
+    let anonymous_probe =
+        matches!(&req.kind, McpReqKind::Identify | McpReqKind::IdentifyPair { .. });
+    if anonymous_probe && crate::store::load_mcp_paired_only() {
+        return; // 静默丢弃：probe 分类为 Dead，实例从候选集里消失
+    }
     match &req.kind {
         McpReqKind::Identify => {
             reply(
@@ -1841,6 +1852,9 @@ impl App {
                 self.pending_bind_consent = Some(PendingBindConsent {
                     resp_tx,
                     req_id: id,
+                    // 代理（≥某个版本起）会带上发起方的来源描述，弹窗原样展示给用户看。
+                    // 旧代理不带：None，弹窗就不显示这一行。
+                    origin: req.origin.clone(),
                     // 与另外两个确认框同样给 5 分钟：用户可能不在电脑前。
                     deadline: Instant::now() + Duration::from_secs(300),
                 });
@@ -2690,6 +2704,7 @@ mod pair_handshake_tests {
         let mut line = serde_json::to_string(&McpRequest {
             id,
             instance: None,
+            origin: None,
             kind,
         })
         .unwrap();
@@ -2830,6 +2845,52 @@ mod pair_handshake_tests {
             .expect_err("握手第二步只接受 PairProve");
         assert!(err.contains("PairProve"), "{err}");
     }
+
+    /// 发一行请求，断言**零应答**（对端静默关闭连接）：`paired_only` 模式下匿名探测的期望行为。
+    async fn assert_silenced(kind: McpReqKind) {
+        let (r, mut w) = serve_one().await.into_split();
+        let mut r = BufReader::new(r);
+        let mut line = serde_json::to_string(&McpRequest {
+            id: 1,
+            instance: None,
+            origin: None,
+            kind,
+        })
+        .unwrap();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.expect("写请求");
+        let mut resp = String::new();
+        let n = r.read_line(&mut resp).await.expect("读响应");
+        assert_eq!(n, 0, "只响应配对请求时该探测必须零应答（连接被静默关闭）");
+    }
+
+    /// 「只响应配对请求」：匿名 `Identify`/`IdentifyPair` 探测零应答（代理眼里这条 socket
+    /// 与死文件无异，无 token 的广播 `Bind` 发不起来，别人的 AI 不会对你弹窗），而配对
+    /// 握手照常完成——对匿名隐身、对配对可见，否则会把主人自己的 AI 也锁在门外。
+    ///
+    /// 两个场景必须放在**同一条**测试里：开关是进程级全局状态，两条测试并行跑会互相
+    /// 踩（restore 的时机不可控）。
+    #[tokio::test]
+    async fn paired_only_silences_anonymous_probes_but_keeps_the_handshake() {
+        let prev = crate::store::load_mcp_paired_only();
+        crate::store::save_mcp_paired_only(true);
+        // 匿名探测：零应答，连接被静默关闭
+        assert_silenced(McpReqKind::Identify).await;
+        assert_silenced(McpReqKind::IdentifyPair {
+            token: "whatever".into(),
+        })
+        .await;
+        // 配对握手：知道 token 的调用方照常拿到实例标识
+        let token = crate::store::mcp_pairing_token();
+        let result = handshake_with(&token).await;
+        crate::store::save_mcp_paired_only(prev);
+        match result {
+            Ok(McpReqResult::Instance { id, .. }) => {
+                assert_eq!(id, crate::store::mcp_instance_id())
+            }
+            other => panic!("只响应配对请求不应挡住配对握手，实际：{other:?}"),
+        }
+    }
 }
 
 #[cfg(all(unix, test))]
@@ -2868,6 +2929,7 @@ mod upload_stream_tests {
             id: 1,
             // 非握手类请求必须点名实例，否则会被 `is_addressed_to` 挡在门外
             instance: Some(crate::store::mcp_instance_id().to_string()),
+            origin: None,
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 1,
                 remote_path: "/tmp/whatever".into(),

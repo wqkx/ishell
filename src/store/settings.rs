@@ -261,6 +261,62 @@ pub fn save_mcp_auto_pair(on: bool) {
     }
 }
 
+fn mcp_paired_only_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("mcp_paired_only"))
+}
+
+/// 「只响应配对请求」的出厂默认值。
+const MCP_PAIRED_ONLY_DEFAULT: bool = false;
+
+static MCP_PAIRED_ONLY_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// 是否只响应携带配对 token 的发现/绑定，对**匿名** `Identify` 探测不应答。
+///
+/// # 解决什么
+///
+/// 多台电脑（多人）共用同一台服务器账号时，各家 iShell 反向转发的 socket 堆在同一远端
+/// 目录里。未配 `ISHELL_MCP_TOKEN` 的 AI 代理发起绑定时会向**每个**实例广播 `Bind`，
+/// 每个窗口都弹「同意/拒绝」框、先点先赢——别人的 AI 会对你弹窗，误点「允许」还会把
+/// 那个 AI 绑到你的电脑上（见 `app::mcp_bridge::PendingBindConsent`）。
+///
+/// 开启本开关后，本实例对匿名探测不应答：代理眼里这条 socket 是死的，广播发不起来，
+/// 弹窗无从出现。携带配对 token 的握手（PairHello/PairProve）不受影响——**它只为
+/// 知道 token 的调用方存在**，而那正是「这台 iShell 归谁」的判据。
+///
+/// # 代价（开启前必须知道）
+///
+/// 你自己那些**没配 token** 的 AI 也将完全找不到这台 iShell（报「连不上」）。这是同一个
+/// 开关的两面：对匿名隐身意味着对匿名不可用。配套用法是同时开「自动注入配对标识」，
+/// 或手动把配对配置填进 AI 的 MCP server 环境变量。
+///
+/// 默认关：单机/单人多窗口依赖匿名发现做「多开弹窗选择」，不能破那个体验。
+pub fn load_mcp_paired_only() -> bool {
+    use std::sync::atomic::Ordering;
+    match MCP_PAIRED_ONLY_CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = mcp_paired_only_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim() == "1")
+                .unwrap_or(MCP_PAIRED_ONLY_DEFAULT);
+            MCP_PAIRED_ONLY_CACHE.store(on as i8, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// 保存「只响应配对请求」开关。
+pub fn save_mcp_paired_only(on: bool) {
+    MCP_PAIRED_ONLY_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
+    if let Some(p) = mcp_paired_only_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        write_setting(p, if on { "1" } else { "0" });
+    }
+}
+
 fn ime_follow_caret_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ime_follow_caret"))
 }

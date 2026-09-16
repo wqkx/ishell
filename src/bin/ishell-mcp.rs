@@ -162,6 +162,7 @@ async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, 
         let mut line = serde_json::to_string(&McpRequest {
             id,
             instance: None,
+            origin: None, // 握手阶段还没有「来源」可言，也不该有
             kind,
         })
         .ok()?;
@@ -248,7 +249,7 @@ async fn identify(path: &std::path::Path) -> Option<(String, u32)> {
         }
         _ => return None,
     };
-    match exchange(stream, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
+    match exchange(stream, None, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
         Ok(McpReqResult::Instance { id, proto_version, .. }) => Some((id, proto_version)),
         _ => None,
     }
@@ -397,7 +398,11 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
              MCP 设置里核对配对 token，确认与这里配置的一致。"
                 .into()
         } else {
-            "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）".into()
+            "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）。\n\
+             若服务器上的 iShell 开了「只响应配对请求」，未配对的 AI 会找不到它——请在 \
+             iShell 的 MCP 设置里开启「自动注入配对标识」，或把「复制配对配置」的内容填进 \
+             这份 AI 的 MCP server 环境变量。"
+                .into()
         }),
         1 => {
             // 唯一实例（配了 token 时是唯一匹配者）：直接绑定，不弹窗——token 本身就是操作者
@@ -432,7 +437,14 @@ async fn choose_instance(
                 .await
                 .map_err(|_| "连接 iShell socket 超时".to_string())?
                 .map_err(|e| e.to_string())?;
-            exchange(stream, Some(id.clone()), McpReqKind::Bind, BIND_TIMEOUT).await?;
+            exchange(
+                stream,
+                Some(id.clone()),
+                Some(caller_origin()),
+                McpReqKind::Bind,
+                BIND_TIMEOUT,
+            )
+            .await?;
             Ok::<_, String>((id, ver, path))
         });
     }
@@ -503,17 +515,25 @@ async fn connect_bound() -> Result<(UnixStream, String), String> {
 ///
 /// `instance` 点名这条请求发给谁，由对端自己校验（见 `McpRequest::is_addressed_to`）。
 /// 只有 `Identify` 填 `None`——那时还不知道对面是谁。
+/// `origin` 是发起方的可读来源描述（谁/什么进程），仅 `Bind` 携带、供对端弹窗展示；
+/// 纯显示信息，不构成身份凭证。其余请求传 `None`。
 #[cfg(unix)]
 async fn exchange(
     stream: UnixStream,
     instance: Option<String>,
+    origin: Option<String>,
     kind: McpReqKind,
     response_timeout: std::time::Duration,
 ) -> Result<McpReqResult, String> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (r, mut w) = stream.into_split();
-    let mut line = serde_json::to_string(&McpRequest { id, instance, kind })
-        .map_err(|e| e.to_string())?;
+    let mut line = serde_json::to_string(&McpRequest {
+        id,
+        instance,
+        origin,
+        kind,
+    })
+    .map_err(|e| e.to_string())?;
     line.push('\n');
     tokio::time::timeout(CONNECT_WRITE_TIMEOUT, w.write_all(line.as_bytes()))
         .await
@@ -551,7 +571,7 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 
 #[cfg(unix)]
 async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
     let (stream, instance) = connect_bound().await?;
-    exchange(stream, Some(instance), kind, RESPONSE_TIMEOUT).await
+    exchange(stream, Some(instance), None, kind, RESPONSE_TIMEOUT).await
 }
 
 /// 校验一个调用方本机路径：必须绝对、不含 `.`/`..` 路径段。跟 GUI 侧
@@ -596,6 +616,7 @@ async fn copy_to_remote_from_caller(
     let request = McpRequest {
         id,
         instance: Some(instance),
+        origin: None,
         kind: McpReqKind::CopyToRemoteFromCaller {
             session_uid,
             remote_path,
@@ -665,6 +686,7 @@ async fn copy_from_remote_to_caller(
     let request = McpRequest {
         id,
         instance: Some(instance),
+        origin: None,
         kind: McpReqKind::CopyFromRemoteToCaller { session_uid, remote_path, timeout_ms },
     };
     let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;
@@ -1287,8 +1309,34 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 绑定弹窗里给被询问用户看的来源描述：哪个 unix 用户、哪个进程在发起。纯展示信息，
+/// 不构成身份凭证——真正决定绑定的是用户在弹窗里的点击，或配对 token 握手。
+///
+/// AI 可用环境变量 `ISHELL_MCP_ORIGIN` 自报更好认的名字（如 `Codex CLI (e5-1)`）；
+/// 没设就用 `USER (ishell-mcp pid N)`——共享服务器上，被弹窗打扰的用户凭 user/pid
+/// 一眼判断是不是自己的 AI（`ps` 可查）。空白与控制字符会被压平/截断（上限 80 字符），
+/// 它毕竟是要上弹窗的一行字。
+fn caller_origin() -> String {
+    if let Some(custom) = std::env::var_os("ISHELL_MCP_ORIGIN") {
+        let flattened: String = custom
+            .to_string_lossy()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let trimmed: String = flattened.chars().take(80).collect();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown-user".into());
+    format!("{user} (ishell-mcp pid {})", std::process::id())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
+    use super::caller_origin;
     use super::check_proto_version;
     use super::mcp_protocol::MCP_PROTOCOL_VERSION;
 
@@ -1302,5 +1350,33 @@ mod tests {
         assert!(check_proto_version(MCP_PROTOCOL_VERSION + 1).is_err());
         // 旧版 iShell 不带版本字段 → serde 默认收到 0 → 必须判为不一致。
         assert!(check_proto_version(0).is_err());
+    }
+
+    /// 来源描述：优先用 AI 自报的名字（空白/控制字符压平、截断），没有才退回 user+pid。
+    /// 两个场景放进同一条测试：它们共用同一个环境变量，并行跑会互相踩。
+    #[test]
+    fn caller_origin_prefers_env_override_then_falls_back() {
+        let old = std::env::var_os("ISHELL_MCP_ORIGIN");
+        std::env::remove_var("ISHELL_MCP_ORIGIN");
+        let fallback = caller_origin();
+        assert!(
+            fallback.contains("(ishell-mcp pid"),
+            "退回形态应含进程标识：{fallback}"
+        );
+
+        std::env::set_var("ISHELL_MCP_ORIGIN", "  Codex\nCLI\t(e5-1)  ");
+        assert_eq!(caller_origin(), "Codex CLI (e5-1)");
+
+        std::env::set_var("ISHELL_MCP_ORIGIN", "   \n\t  ");
+        assert!(
+            caller_origin().contains("(ishell-mcp pid"),
+            "空白覆盖值应视为未设置：{}",
+            caller_origin()
+        );
+
+        match old {
+            Some(v) => std::env::set_var("ISHELL_MCP_ORIGIN", v),
+            None => std::env::remove_var("ISHELL_MCP_ORIGIN"),
+        }
     }
 }
