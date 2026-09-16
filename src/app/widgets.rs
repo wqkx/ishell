@@ -215,8 +215,9 @@ pub fn view_context_menu(resp: &egui::Response) {
                         ui.close();
                     }
 
-                    // 自动注入配对标识：**默认关**。它会替用户在自己的 shell 里敲一条命令
-                    // 并回车，只有「多台电脑共用一台 AI 服务器」才需要。
+                    // 自动注入配对标识：**默认开**（见 store::load_mcp_auto_pair）。它是
+                    // 「iShell 替用户在自己的 shell 里敲一条命令并回车」，换来的是多用户
+                    // 服务器上 AI 绑定只回自己电脑、不再对所有人弹窗。
                     let mut auto_pair = crate::store::load_mcp_auto_pair();
                     if ui
                         .checkbox(
@@ -227,25 +228,33 @@ pub fn view_context_menu(resp: &egui::Response) {
                             ),
                         )
                         .on_hover_text(crate::i18n::tr(
-                            "多台电脑共用同一台 AI 服务器时才需要：各家 iShell 反向转发的 socket\n\
+                            "多台电脑共用同一台 AI 服务器时：各家 iShell 反向转发的 socket\n\
                              堆在同一个远端目录里，代理靠这个环境变量才知道该回哪台电脑。\n\
                              开启后，每个新会话空闲时 iShell 会替你敲一条\n\
                              ` export ISHELL_MCP_TOKEN=…` 并回车（回显会被吞掉）。\n\
-                             默认关：它毕竟是程序替你在自己的 shell 里执行命令。\n\
-                             不想开也有手动路径——用下面的「复制配对配置」。\n\
+                             默认开：0.19 之后 AI 控制默认开启，不注入就意味着别人的 AI 会对\n\
+                             每台 iShell 广播绑定弹窗——注入让绑定只回你自己的电脑。\n\
+                             AI 不在 iShell 终端里跑时注入帮不到它：把下面的「复制配对配置」\n\
+                             填进那份 AI 的 MCP server 环境变量。\n\
                              ⚠ 安全提示：token 会留在 shell 环境变量里，同账号的其他用户可读\n\
-                             ——互不信任的共享账号上，这等于让他们跳过弹窗直接绑定你的电脑。",
+                             ——互不信任的共享账号上，这等于让他们跳过弹窗直接绑定你的电脑，\n\
+                             介意请关掉本开关改走手动配置。",
                             "Only needed when several computers share one AI server: their \n\
                              reverse-forwarded sockets pile up in the same remote directory, and \n\
                              the proxy needs this environment variable to know which computer to \n\
                              answer. When on, iShell types ` export ISHELL_MCP_TOKEN=…` into each \n\
                              new session once it goes idle, and presses Enter (the echo is \n\
-                             swallowed). Off by default — it is still the program running a command \n\
-                             in your own shell. The manual route is \"Copy pairing config\" below.\n\
+                             swallowed). On by default: since 0.19 AI control is on by default, \n\
+                             without injection other users' AIs broadcast bind popups to every \n\
+                             iShell — injection makes binds come back only to YOUR computer.\n\
+                             If the AI is not started inside an iShell terminal this can't reach \n\
+                             it: paste \"Copy pairing config\" below into that AI's MCP server \n\
+                             environment instead.\n\
                              ⚠ Security note: the token stays in the shell environment, readable \n\
                              by any other user of the same account — on a shared account with \n\
                              mutually untrusted users, that lets them bind to your iShell without \n\
-                             the consent prompt.",
+                             the consent prompt. Turn this off and configure manually if that \n\
+                             matters to you.",
                         ))
                         .clicked()
                     {

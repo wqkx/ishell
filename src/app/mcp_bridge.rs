@@ -531,6 +531,9 @@ pub(super) struct PendingOpenConsent {
     pub(super) conn: SavedConnection,
     resp_tx: Option<oneshot::Sender<McpResponse>>,
     req_id: u64,
+    /// 发起方代理的进程标识与可读来源（请求快照，真正开窗口时记到会话归属上）。
+    pub(super) actor: Option<String>,
+    pub(super) origin: Option<String>,
     deadline: Instant,
 }
 
@@ -547,6 +550,10 @@ pub(super) struct PendingUseConsent {
     pub(super) uid: u64,
     /// 会话标签名，给弹窗显示用（发起时刻的快照）。
     pub(super) title: String,
+    /// 若目标本身是 AI 开的窗口：开启者的来源标签（弹窗据此说明「这是另一个 AI 的窗口」）。
+    pub(super) owner_label: Option<String>,
+    /// 发起方代理的可读来源（请求里的 origin 快照），弹窗「来源」行展示。
+    pub(super) origin: Option<String>,
     /// 给用户看的一句话：AI 具体想干什么。
     pub(super) action: String,
     deadline: Instant,
@@ -568,22 +575,49 @@ pub(super) struct PendingBindConsent {
     deadline: Instant,
 }
 
+/// 写入门禁的目标分类。
+#[derive(Debug, Clone, PartialEq)]
+enum WriteTarget {
+    /// 会话不存在：**不在这道门拦**（沿用既有设计——拦下来只能含混地说一句「需要授权」，
+    /// 放它过去各分支会回「会话不存在 + 当前可用会话列表」，那条报错有用得多）。
+    Missing,
+    /// 用户本人开的会话。
+    User,
+    /// 旧代理（不带 actor）开的 AI 窗口：旧版「AI 窗口共享池」，维持兼容——旧代理
+    /// （actor=None）随便写，新代理写它需授权。
+    AiSharedLegacy,
+    /// 新代理开的 AI 窗口，携带开启者的进程标识。
+    AiOwned(String),
+}
+
+fn write_target(ai_owned: bool, ai_owner: Option<String>) -> WriteTarget {
+    if !ai_owned {
+        WriteTarget::User
+    } else if let Some(o) = ai_owner {
+        WriteTarget::AiOwned(o)
+    } else {
+        WriteTarget::AiSharedLegacy
+    }
+}
+
 /// 这次写入要不要当面授权。
 ///
-/// 只有两种情况不用问：目标是 **AI 自己开的**会话（`ai_owned`，用户根本不能往里打字，
-/// 两路输入交织的问题不存在），或者用户**本次运行里已经为这个会话授权过**。
+/// 不用问的只有两种：目标是**发起请求的 AI 自己开的**会话（归属按代理进程标识 `actor`
+/// 比对），或者用户**本次运行里已经为这个会话授权过**。
 ///
-/// 注意签名里**没有**任何设置项，这是刻意的：用户明确要求过「AI 只能操作自己开的会话，
-/// 操作用户的会话必须授权」。0.19 一度让 `mcp_auto_approve` 从这里短路过去，那是错的。
-/// 谁要再加一个能绕过它的开关，先来改这个函数、并解释为什么。
-fn write_needs_consent(ai_owned: Option<bool>, already_approved: bool) -> bool {
-    match ai_owned {
-        // 会话根本不存在：**不在这道门拦**。拦下来只能含混地说一句「需要授权」，而放它过去
-        // 各分支会回「会话不存在（uid=…）+ 当前可用会话列表」——那条报错有用得多。
-        // 这也是下面 `expect("…确认过这个会话存在")` 成立的前提：这里返回 false 的 uid
-        // 不会被选中，被选中的必然存在。
-        None => false,
-        Some(owned) => !owned && !already_approved,
+/// 注意参数里**没有**任何设置项，这是刻意的：用户明确要求过「AI 只能自由操作自己开的
+/// 会话，动用户（或其他 AI）的会话必须授权」。0.19 一度让 `mcp_auto_approve` 从这里短路
+/// 过去，那是错的。谁要再加一个能绕过它的开关，先来改这个函数、并解释为什么。
+///
+/// `actor` 只是进程标识、不是保密凭据：它防的是**误用**（两个 AI 的窗口互相串门），同账号
+/// 下的主动伪造由配对 token 那一层负责。
+fn write_needs_consent(target: WriteTarget, actor: Option<&str>, already_approved: bool) -> bool {
+    match target {
+        WriteTarget::Missing => false,
+        WriteTarget::User => !already_approved,
+        // 旧版共享池：旧代理（不带 actor）维持原行为；新代理写它要授权。
+        WriteTarget::AiSharedLegacy => actor.is_some() && !already_approved,
+        WriteTarget::AiOwned(owner) => actor != Some(owner.as_str()) && !already_approved,
     }
 }
 
@@ -1661,11 +1695,32 @@ impl App {
     }
 
     /// 真正建立会话：`open_session` 直接批准，或用户在确认弹窗里点了「允许」之后调用。
-    fn do_open_session(&mut self, c: &SavedConnection, id: u64, resp_tx: oneshot::Sender<McpResponse>) {
+    fn do_open_session(
+        &mut self,
+        c: &SavedConnection,
+        id: u64,
+        resp_tx: oneshot::Sender<McpResponse>,
+        owner: Option<String>,
+        owner_label: Option<String>,
+    ) {
         let cfg = connect_config_from_saved(c);
+        // AI 开的会话要**静默**落在新标签：spawn_session 会把新标签置为活动并请求滚动过去，
+        // 焦点被从用户正在交互的会话里拽走是最糟糕的打扰——先把当前活动标签记下来，开完恢复。
+        let prev_active = self.active;
         self.spawn_session(cfg);
+        self.active = prev_active;
         let s = self.sessions.last_mut().expect("spawn_session 刚 push 了一个会话");
         s.ai_owned = true; // AI 新开的会话：只读，用户键盘输入不转发（见 layout_body.rs）
+        s.ai_owner = owner; // 归属：只归开它的那个 AI 进程使用（见 write_needs_consent）
+        s.ai_owner_label = owner_label.clone(); // 标签 hover 上展示「谁开的」
+        if let Some(label) = &owner_label {
+            s.tip = format!(
+                "{} · {} {}",
+                s.tip,
+                crate::i18n::tr("AI 开启，来源", "AI-opened by"),
+                label
+            );
+        }
         let info = McpSessionInfo {
             uid: s.uid,
             title: s.title.clone(),
@@ -1673,6 +1728,8 @@ impl App {
             connected: s.connected,
             cwd: s.terminal.cwd().map(|c| c.to_string()),
             ai_owned: s.ai_owned,
+            ai_owner: s.ai_owner_label.clone(),
+            mine: true, // 开它的就是发起者自己
         };
         let _ = resp_tx.send(McpResponse {
             id,
@@ -1708,6 +1765,8 @@ impl App {
             conn,
             resp_tx,
             req_id,
+            actor,
+            origin,
             ..
         } = pending;
         let Some(resp_tx) = resp_tx else {
@@ -1715,7 +1774,7 @@ impl App {
         };
         if allow {
             self.mcp_open_approved.insert(conn.name.clone());
-            self.do_open_session(&conn, req_id, resp_tx);
+            self.do_open_session(&conn, req_id, resp_tx, actor, origin);
         } else {
             let _ = resp_tx.send(McpResponse {
                 id: req_id,
@@ -1744,28 +1803,35 @@ impl App {
         )
     }
 
-    /// 写入类操作的会话门禁：目标若是**用户自己打开的**会话且本次运行还没授权过，扣下请求
-    /// 弹窗等用户当面确认。放行则原样返回 `call`；扣下（或直接回错）返回 `None`。
+    /// 写入类操作的会话门禁：目标若是**用户（或另一个 AI）的**会话且本次运行还没授权过，
+    /// 扣下请求弹窗等用户当面确认。放行则原样返回 `call`；扣下（或直接回错）返回 `None`。
     ///
     /// # 这道闸门没有任何开关可以绕过
     ///
-    /// AI 能随便用的只有**它自己 `open_session` 开出来的**会话。用户自己开的那些标签里有他
-    /// 正在做的事——半截命令、sudo 提示符、连着生产库的 psql——往里面打字是两路输入交织，
-    /// 轻则互相打断，重则改到他没想改的东西上。所以「操作用户的会话」必须每次当面授权，
+    /// AI 能随便用的只有**它自己 `open_session` 开出来的**会话（按代理进程标识 `actor`
+    /// 归属，见 `write_needs_consent`）。用户自己开的那些标签里有他正在做的事——半截命令、
+    /// sudo 提示符、连着生产库的 psql——往里面打字是两路输入交织，轻则互相打断，重则改到他
+    /// 没想改的东西上；另一个 AI 开的窗口同理。所以「动不属于自己的会话」必须每次当面授权，
     /// **不受任何设置影响**：`mcp_auto_approve` 只管「AI 新开会话」那一档，绝不能拿到这里
     /// 来短路（0.19 曾经这么干过，是错的，已改回）。判定见 [`write_needs_consent`]。
     fn gate_user_session_write(&mut self, call: McpCall) -> Option<McpCall> {
         // 目标会话不存在时不在这里拦：让它照常走下去，由各分支回「会话不存在 + 当前可用
         // 会话列表」那条更有用的报错，而不是在这里含混地说一句"需要授权"。
+        let caller_actor = call.req.actor.clone();
         let Some(uid) = call.req.kind.write_target_uids().into_iter().find(|uid| {
-            // `None` = 这个 uid 没有对应的会话。**必须原样传给判定**，不能在这里塌成
-            // `is_some_and(..)` 那种「不存在就当成不是 ai_owned」——那会让不存在的会话被判成
-            // 「需要授权」并选中，随后撞上下面那句 expect 直接 panic（AI 手里攥着一个 iShell
-            // 重启前的旧 uid 就够了，重启后 uid 从 1 重新分配）。
-            let ai_owned = self
-                .session_idx_by_uid(*uid)
-                .map(|idx| self.sessions[idx].ai_owned);
-            write_needs_consent(ai_owned, self.mcp_use_approved.contains(uid))
+            // `Missing` = 这个 uid 没有对应的会话。**必须原样传给判定**，不能在这里塌成
+            // 「不存在就当成用户会话」——那会让不存在的会话被判成「需要授权」并选中，随后
+            // 撞上下面那句 expect 直接 panic（AI 手里攥着一个 iShell 重启前的旧 uid 就够了，
+            // 重启后 uid 从 1 重新分配）。
+            let target = self.session_idx_by_uid(*uid).map(|idx| {
+                let s = &self.sessions[idx];
+                write_target(s.ai_owned, s.ai_owner.clone())
+            });
+            write_needs_consent(
+                target.unwrap_or(WriteTarget::Missing),
+                caller_actor.as_deref(),
+                self.mcp_use_approved.contains(uid),
+            )
         }) else {
             return Some(call);
         };
@@ -1780,13 +1846,17 @@ impl App {
         }
         let idx = self
             .session_idx_by_uid(uid)
-            .expect("write_needs_consent(None, _) 恒为 false，被选中的 uid 必然存在");
+            .expect("WriteTarget::Missing 恒为 false，被选中的 uid 必然存在");
         let title = self.sessions[idx].title.clone();
+        let owner_label = self.sessions[idx].ai_owner_label.clone();
         let action = action_summary(&call.req.kind);
+        let origin = call.req.origin.clone();
         self.pending_use_consent = Some(PendingUseConsent {
             call,
             uid,
             title,
+            owner_label,
+            origin,
             action,
             // 与 open_session 的确认框同样给 5 分钟：用户可能不在电脑前。
             deadline: Instant::now() + Duration::from_secs(300),
@@ -1801,14 +1871,20 @@ impl App {
         };
         if !allow {
             let id = pending.call.req.id;
-            let _ = pending.call.resp_tx.send(McpResponse {
-                id,
-                result: Err(format!(
+            let msg = match &pending.owner_label {
+                // 目标是另一个 AI 开的窗口：报错要指明归属，引导调用方去用自己的会话。
+                Some(label) => format!(
+                    "用户拒绝对会话 uid={} 的这次操作——那是另一个 AI（{label}）开的窗口，\
+                     不是发起请求的 AI 的。请改用 open_session 开一个自己的专用会话",
+                    pending.uid
+                ),
+                None => format!(
                     "用户拒绝了对会话 uid={} 的这次操作。这是用户自己打开的会话，AI 不应直接\
                      使用——请改用 open_session 开一个自己的专用会话",
                     pending.uid
-                )),
-            });
+                ),
+            };
+            let _ = pending.call.resp_tx.send(McpResponse { id, result: Err(msg) });
             return;
         }
         // 记住这个会话 uid，后续写入不再打扰用户。uid 由 next_uid 单调分配、只增不复用
@@ -1823,6 +1899,9 @@ impl App {
             return;
         };
         let McpCall { req, resp_tx, upload_source, download_sink } = call;
+        // 发起方代理的进程标识：归属判定（CloseSession）与 list_sessions 的 mine 标记都要
+        // 用，先在这里快照——match req.kind 之后 req 就被部分移动了。
+        let caller_actor = req.actor.clone();
         let id = req.id;
         let send_err = |resp_tx: oneshot::Sender<McpResponse>, msg: String| {
             let _ = resp_tx.send(McpResponse {
@@ -1870,6 +1949,11 @@ impl App {
                         connected: s.connected,
                         cwd: s.terminal.cwd().map(|c| c.to_string()),
                         ai_owned: s.ai_owned,
+                        // 归属展示：谁开的（可读标签）。旧代理开的窗口没有标签。
+                        ai_owner: s.ai_owner_label.clone(),
+                        // 是不是「发起本次查询的这个 AI」自己开的——按进程标识比对；
+                        // 旧代理（不带 actor）开的共享池窗口对任何调用方都报 false。
+                        mine: s.ai_owner.is_some() && s.ai_owner == caller_actor,
                     })
                     .collect();
                 let _ = resp_tx.send(McpResponse {
@@ -2042,7 +2126,7 @@ impl App {
                 // 已批准过、或「AI 操作无需逐次确认」开着（默认）→ 直接开。
                 if self.mcp_open_approved.contains(&name) || crate::store::load_mcp_auto_approve() {
                     self.mcp_open_approved.insert(name);
-                    self.do_open_session(&c, id, resp_tx);
+                    self.do_open_session(&c, id, resp_tx, req.actor, req.origin);
                     return;
                 }
                 // 两种确认框（新开会话 / 写入用户会话）任一挂着就不再叠第二个：两个 modal
@@ -2057,6 +2141,8 @@ impl App {
                     conn: c,
                     resp_tx: Some(resp_tx),
                     req_id: id,
+                    actor: req.actor,
+                    origin: req.origin,
                     // 60s 对"用户可能不在电脑前"这种常见情况太紧——超时会被下面的
                     // 拒绝分支吃掉,还得让 AI 重新发起一次 open_session 才能再弹一次
                     // 确认框。放宽到 5 分钟,给用户更充裕的反应时间。
@@ -2068,9 +2154,28 @@ impl App {
                     send_err(resp_tx, self.session_not_found_msg(session_uid));
                     return;
                 };
-                // 只允许关自己（AI）开的会话，不能关用户自己的会话——关闭权限不超过打开权限。
-                if !self.sessions[idx].ai_owned {
-                    send_err(resp_tx, "这不是 AI 自己开的会话，不能通过这个工具关闭".into());
+                // 只允许关「自己（这个 AI 进程）」开的会话：不能关用户的，也不能关另一个
+                // AI 开的——关闭权限不超过归属权（归属见 write_needs_consent）。
+                let s = &self.sessions[idx];
+                let can_close = s.ai_owned
+                    && match (&s.ai_owner, caller_actor.as_deref()) {
+                        // 旧版共享池窗口：维持旧行为——只有不带 actor 的旧代理能关。
+                        (None, None) => true,
+                        (None, Some(_)) => false,
+                        (Some(owner), actor) => actor == Some(owner.as_str()),
+                    };
+                if !can_close {
+                    let msg = if !s.ai_owned {
+                        "这不是 AI 自己开的会话，不能通过这个工具关闭".to_string()
+                    } else {
+                        match &s.ai_owner_label {
+                            Some(label) => format!(
+                                "这是另一个 AI（{label}）开的会话，只能由它自己关闭"
+                            ),
+                            None => "这不是你这个 AI 开的会话，不能关闭".to_string(),
+                        }
+                    };
+                    send_err(resp_tx, msg);
                     return;
                 }
                 self.close_session(idx);
@@ -2531,7 +2636,7 @@ impl App {
 
 #[cfg(test)]
 mod write_consent_tests {
-    use super::write_needs_consent;
+    use super::{write_needs_consent, write_target, WriteTarget};
 
     /// **AI 只能随便动自己开的会话。** 用户自己开的那些标签里有他正在做的事——半截命令、
     /// sudo 提示符、连着生产库的 psql——往里面打字是两路输入交织，轻则互相打断，重则改到
@@ -2544,38 +2649,63 @@ mod write_consent_tests {
     #[test]
     fn writing_a_user_owned_session_always_needs_consent() {
         assert!(
-            write_needs_consent(Some(false), false),
+            write_needs_consent(WriteTarget::User, None, false),
             "用户自己开的会话、且本次运行没授权过——必须当面确认，任何设置都不该绕过"
+        );
+        assert!(
+            write_needs_consent(WriteTarget::User, Some("actor-x"), false),
+            "无论谁发起，写用户的会话都要授权"
         );
     }
 
-    /// AI 自己开的会话随便用：`ai_owned` 会话是只读给用户看的，他的键盘输入根本进不去，
-    /// 不存在两路输入交织的问题。
+    /// AI 自己开的会话随便用：`mine=true` 的窗口是只读给用户看的，他的键盘输入根本进不去，
+    /// 不存在两路输入交织的问题。归属按代理进程标识 `actor` 比对——不是「任何 AI 开的窗口
+    /// 都能随便写」。
     #[test]
-    fn ai_owned_sessions_need_no_consent() {
-        assert!(!write_needs_consent(Some(true), false));
-        assert!(!write_needs_consent(Some(true), true));
+    fn ai_owned_sessions_need_no_consent_only_for_their_owner() {
+        let mine = write_target(true, Some("actor-me".into()));
+        assert!(!write_needs_consent(mine.clone(), Some("actor-me"), false));
+        assert!(!write_needs_consent(mine.clone(), Some("actor-me"), true));
+        // 另一个 AI 写我开的窗口：必须授权（且授权后不再问）。
+        assert!(write_needs_consent(mine.clone(), Some("actor-other"), false));
+        assert!(!write_needs_consent(mine, Some("actor-other"), true));
+    }
+
+    /// 旧代理（不带 actor）开的窗口 = 旧版「AI 窗口共享池」：旧代理（actor=None）维持原行为
+    /// 随便写；新代理写它要授权。这是行为兼容的边界——旧组合不回归，新组合收紧。
+    #[test]
+    fn legacy_shared_ai_windows_keep_legacy_behavior() {
+        let legacy = write_target(true, None);
+        assert!(!write_needs_consent(legacy.clone(), None, false));
+        assert!(write_needs_consent(legacy, Some("actor-new"), false));
+    }
+
+    /// 不带 actor 的新请求写「明确归属某个 actor 的窗口」：按「不是主人」处理，要授权。
+    #[test]
+    fn actorless_request_is_not_treated_as_owner() {
+        let owned = write_target(true, Some("actor-me".into()));
+        assert!(write_needs_consent(owned, None, false));
     }
 
     /// **会话不存在时不在这道门拦。** 这条既是体验（放过去才能回「会话不存在 + 当前可用会话
     /// 列表」那条有用的报错，而不是含混的「需要授权」），也是安全边界：判定返回 true 的 uid
-    /// 会被选中，而选中之后的代码用 `expect` 断言它存在——一旦这里对 `None` 返回 true，
+    /// 会被选中，而选中之后的代码用 `expect` 断言它存在——一旦这里对 `Missing` 返回 true，
     /// 任何一条点名不存在 uid 的写请求都会把 UI 线程打 panic。AI 手里攥着一个 iShell 重启前
     /// 的旧 uid 就够了（重启后 uid 从 1 重新分配）。
     #[test]
     fn a_uid_with_no_session_is_not_gated_here() {
         assert!(
-            !write_needs_consent(None, false),
+            !write_needs_consent(WriteTarget::Missing, Some("actor-x"), false),
             "不存在的会话被判成「需要授权」——它会被选中，然后撞上 expect 直接 panic"
         );
-        assert!(!write_needs_consent(None, true));
+        assert!(!write_needs_consent(WriteTarget::Missing, None, true));
     }
 
     /// 用户为某个会话授权过一次之后，本次运行内不再打扰他。
     /// uid 由 `next_uid` 单调分配、只增不复用，所以不存在「授权被后开的会话捡到」。
     #[test]
     fn an_approved_session_is_not_asked_again() {
-        assert!(!write_needs_consent(Some(false), true));
+        assert!(!write_needs_consent(WriteTarget::User, None, true));
     }
 }
 
@@ -2705,6 +2835,7 @@ mod pair_handshake_tests {
             id,
             instance: None,
             origin: None,
+            actor: None,
             kind,
         })
         .unwrap();
@@ -2854,6 +2985,7 @@ mod pair_handshake_tests {
             id: 1,
             instance: None,
             origin: None,
+            actor: None,
             kind,
         })
         .unwrap();
@@ -2930,6 +3062,7 @@ mod upload_stream_tests {
             // 非握手类请求必须点名实例，否则会被 `is_addressed_to` 挡在门外
             instance: Some(crate::store::mcp_instance_id().to_string()),
             origin: None,
+            actor: None,
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 1,
                 remote_path: "/tmp/whatever".into(),

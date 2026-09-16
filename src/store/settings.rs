@@ -215,25 +215,27 @@ fn mcp_auto_pair_path() -> Option<PathBuf> {
 }
 
 /// 「自动向新会话注入配对标识」的出厂默认值。
-const MCP_AUTO_PAIR_DEFAULT: bool = false;
+const MCP_AUTO_PAIR_DEFAULT: bool = true;
 
 static MCP_AUTO_PAIR_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
 /// 是否在会话空闲时自动把配对标识注入终端（` export ISHELL_MCP_TOKEN=…` 并回车执行）。
 ///
-/// # 为什么默认关
+/// # 为什么默认开
 ///
-/// 它只对一种拓扑有用：**多台电脑共用同一台 AI 服务器**——各家 iShell 反向转发的 socket
-/// 堆在同一个远端目录里，代理靠这个环境变量才知道该回哪台电脑。这是少数派场景。
+/// 0.19 把「允许 AI 通过 MCP 控制终端」默认打开之后，多用户服务器上「别人的 AI 对每台
+/// iShell 广播绑定弹窗」成了默认体验（见 `app::mcp_bridge::PendingBindConsent`）。配对
+/// token 是根治——AI 带 token，绑定只回自己那台，弹窗消失——而 token 生效的前提是 AI
+/// 的进程环境里有它。默认注入让「iShell 终端里启动的 AI」自动携带配对身份，多数用户无需
+/// 任何配置就拿到正确的多机行为。
 ///
-/// 而它的代价是 iShell **替用户在他自己的 shell 里执行一条命令**。这件事此前一直挂在
-/// [`load_mcp_consent`] 下面，尚可接受：那时 AI 控制默认关闭，能走到这里的人都是自己去
-/// 设置里勾过、明确知道自己在用 MCP 的。0.19 起 AI 控制默认开启之后，同一个门就意味着
-/// **每一个新连上的会话都会被自动打进一条命令并回车**——用户的现场反馈正是「iShell 往我
-/// 当前会话里输东西」。默认开一个会替用户敲键盘的行为，无论回显吞得多干净都不合适。
+/// # 代价（用户应当知道，UI 里也有提示）
 ///
-/// 需要的人在设置里勾上即可；不勾也有手动路径：设置里的「复制配对配置」，把
-/// `ISHELL_MCP_TOKEN=…` 写进那份 AI 的 MCP server 环境变量。
+/// 这是 iShell **替用户在他自己的 shell 里执行一条命令**（回显被吞掉，命令带前导空格配合
+/// HISTCONTROL=ignorespace 不进历史）。更要注意安全面：token 会留在 shell 环境变量里，
+/// **同账号的其他用户可读**——互不信任的共享账号上，这等于让对方跳过弹窗直接绑定你的
+/// 电脑。介意的人应在设置里关掉，改用手动路径（「复制配对配置」填进 AI 的 MCP server
+/// 环境变量）。AI 不在 iShell 终端里跑时注入帮不到它，同样需要手动配置。
 pub fn load_mcp_auto_pair() -> bool {
     use std::sync::atomic::Ordering;
     match MCP_AUTO_PAIR_CACHE.load(Ordering::Relaxed) {

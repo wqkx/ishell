@@ -7,6 +7,14 @@ use crate::terminal::Terminal;
 use crate::ui::file_panel::FilePanelState;
 use crate::ui::sidebar::NetHistory;
 
+/// 开启者来源标签的短形态（标签页上「谁开的」角标）：取第一个空白分隔段、最多 8 字符
+/// （如 `e5-1 (ishell-mcp pid 42)` → `e5-1`）。没有标签（旧代理开的窗口）返回 None。
+pub(super) fn ai_owner_short(label: Option<&str>) -> Option<String> {
+    let first = label?.split_whitespace().next()?;
+    let short: String = first.chars().take(8).collect();
+    (!short.is_empty()).then_some(short)
+}
+
 /// 单个 SSH 会话的前台状态。
 pub(super) struct Session {
     /// 稳定唯一 id（用于标签滑动动画在重排后仍追踪同一标签）
@@ -79,6 +87,13 @@ pub(super) struct Session {
     pub(super) pending_paste_image: std::collections::HashMap<u64, String>,
     /// 是否由 AI 通过 `open_session` 新开（只读：用户键盘输入不会发给这个会话，只能看不能敲）
     pub(super) ai_owned: bool,
+    /// 开启它的 AI 的**进程标识**（请求里的 `actor`，代理进程启动时生成的随机串）：落实
+    /// 「窗口归开它的那个 AI 专用」——写入类请求的 actor 与这里不符，就按「动别人/用户的
+    /// 会话」走弹窗授权。旧代理开的窗口为 `None`（旧版共享池行为，任何 AI 都能写）。
+    pub(super) ai_owner: Option<String>,
+    /// 开启它的 AI 的可读来源标签（请求里的 `origin` 快照，如 `e5-1 (ishell-mcp pid 42)`），
+    /// 标签页 hover 提示用。`ai_owned=false` 时为 `None`。
+    pub(super) ai_owner_label: Option<String>,
     /// AI/MCP 控制通道正在等待完成的文件读写（write_file/read_file/copy_to_remote/
     /// copy_from_remote/copy_between_sessions）。允许同一会话同时挂多个——SFTP 天然支持
     /// 并发，worker 侧也已有 `MAX_CONCURRENT_XFER` 并发+排队，所以这里放成一个列表让 AI
@@ -421,6 +436,8 @@ impl App {
             pending_ai_run: None,
             pending_paste_image: std::collections::HashMap::new(),
             ai_owned: false,
+            ai_owner: None,
+            ai_owner_label: None,
             pending_file_ops: Vec::new(),
             file_op_tombstones: std::collections::VecDeque::new(),
         });

@@ -174,9 +174,17 @@ impl App {
                                     for (i, s) in self.sessions.iter().enumerate() {
                                         let selected = active == Some(i);
                                         // AI（open_session）新开的会话在标签上加机器人图标前缀，
-                                        // 一眼和用户自己开的会话区分开。
+                                        // 一眼和用户自己开的会话区分开；带得开启者标签时再加一个
+                                        // 短标签（谁开的）——共享屏幕上多个 AI 的窗口可辨。
                                         let display_title = if s.ai_owned {
-                                            format!("{} {}", icon::ROBOT, s.title)
+                                            match super::session::ai_owner_short(
+                                                s.ai_owner_label.as_deref(),
+                                            ) {
+                                                Some(short) => {
+                                                    format!("{} {} {}", icon::ROBOT, short, s.title)
+                                                }
+                                                None => format!("{} {}", icon::ROBOT, s.title),
+                                            }
                                         } else {
                                             s.title.clone()
                                         };

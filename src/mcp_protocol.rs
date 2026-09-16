@@ -124,6 +124,14 @@ pub fn pair_nonce() -> Option<String> {
     Some(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// 生成 `n` 字节的随机十六进制串（如代理进程标识 `actor`）。熵源失败返回 `None`——
+/// 调用方自行决定是报错还是退回弱一些的形态（`actor` 只是进程区分，不是保密凭据）。
+pub fn random_hex(n: usize) -> Option<String> {
+    let mut buf = vec![0u8; n];
+    getrandom::getrandom(&mut buf).ok()?;
+    Some(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// 计算某一方的配对证明：`HMAC-SHA256(token, "<role>:<nonce_c>:<nonce_s>")`，十六进制。
 ///
 /// 两个 nonce 都进 MAC：只带服务器的 nonce，客户端就无法确认对面是"这一次"在答话；只带
@@ -177,6 +185,16 @@ pub struct McpSessionInfo {
     /// 哨兵标记行搅乱。所以写入类操作（见 `McpReqKind::write_target_uids`）默认走不通，
     /// 需要用户当面授权一次。调用方应当优先 `open_session` 开自己的专用会话。
     pub ai_owned: bool,
+    /// 开启它的 AI 的可读来源标签（代理请求里的 `origin` 快照，如 `e5-1 (ishell-mcp pid
+    /// 42)`）。旧代理开的会话没有（`None`），`ai_owned=false` 时为 `None`。
+    #[serde(default)]
+    pub ai_owner: Option<String>,
+    /// 这个 AI 窗口是不是**发起本次 list_sessions 的这个 AI** 自己开的（按代理进程的
+    /// `actor` 身份比对）。`true` = 你的专用窗口，随便用；`false` 而 `ai_owned=true` =
+    /// **另一个 AI** 开的窗口，写入会弹窗让用户授权。旧代理（不带 actor）开的窗口对任何
+    /// 调用方都报 `false`——它们属于旧版的共享池。
+    #[serde(default)]
+    pub mine: bool,
 }
 
 /// 一条已保存连接的摘要（`list_saved_connections` 的返回项）。不含密码/密钥等敏感字段——
@@ -536,6 +554,13 @@ pub struct McpRequest {
     /// 字段。只有代理广播 `Bind` 时才需要带，其余请求一律 `None`。
     #[serde(default)]
     pub origin: Option<String>,
+    /// 发起方代理**进程**的身份标识：代理启动时生成的随机串，同进程内所有请求一致、不同
+    /// AI 进程互不相同。**不是保密凭据**（不防同账号下主动伪造，那由配对 token 负责），
+    /// 用途是让 iShell 把「窗口归开它的那个 AI 专用」落到实处：`open_session` 记录它，
+    /// 此后写入类请求带上的 actor 与记录不符就走用户授权。旧代理不带（`None`），其开的
+    /// 窗口维持旧版「AI 窗口共享池」行为。可选且向后兼容。
+    #[serde(default)]
+    pub actor: Option<String>,
     pub kind: McpReqKind,
 }
 
@@ -649,6 +674,7 @@ mod addressing_tests {
             id: 1,
             instance: instance.map(str::to_string),
             origin: None,
+            actor: None,
             kind,
         }
     }
@@ -660,14 +686,21 @@ mod addressing_tests {
         let legacy = r#"{"id":1,"instance":"me","kind":"Bind"}"#;
         let parsed: McpRequest = serde_json::from_str(legacy).expect("旧负载必须能解析");
         assert_eq!(parsed.origin, None, "旧负载的来源字段应为 None");
+        assert_eq!(parsed.actor, None, "旧负载的进程标识字段应为 None");
         let mut with_origin = req(Some("me"), McpReqKind::Bind);
         with_origin.origin = Some("e5-1 (ishell-mcp pid 42)".into());
+        with_origin.actor = Some("a1b2c3d4e5f60718".into());
         let json = serde_json::to_string(&with_origin).unwrap();
         let back: McpRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(
             back.origin.as_deref(),
             Some("e5-1 (ishell-mcp pid 42)"),
             "来源字段应原样往返"
+        );
+        assert_eq!(
+            back.actor.as_deref(),
+            Some("a1b2c3d4e5f60718"),
+            "进程标识字段应原样往返"
         );
     }
 
@@ -901,6 +934,7 @@ mod tests {
             id: 7,
             instance: Some("1234-a1b2c3d4".into()),
             origin: None,
+            actor: None,
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 11,
                 remote_path: "/srv/project/cuda_eri.py".into(),

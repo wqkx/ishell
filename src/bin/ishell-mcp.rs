@@ -163,6 +163,7 @@ async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, 
             id,
             instance: None,
             origin: None, // 握手阶段还没有「来源」可言，也不该有
+            actor: None,
             kind,
         })
         .ok()?;
@@ -249,7 +250,7 @@ async fn identify(path: &std::path::Path) -> Option<(String, u32)> {
         }
         _ => return None,
     };
-    match exchange(stream, None, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
+    match exchange(stream, None, None, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
         Ok(McpReqResult::Instance { id, proto_version, .. }) => Some((id, proto_version)),
         _ => None,
     }
@@ -393,15 +394,21 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
             // 报成 token 不匹配会把用户引向死胡同（怎么核对 token 都是对的）。
             check_proto_version(ver).unwrap_err()
         } else if want_token.is_some() {
-            "配了 ISHELL_MCP_TOKEN，但没有一台 iShell 通过配对握手（它未运行、未在设置里\
-             开启「允许 AI 通过 MCP 控制终端」，或 token 填错了）。请在你自己那台 iShell 的\
-             MCP 设置里核对配对 token，确认与这里配置的一致。"
+            "未检测到与配对 token 匹配的 iShell 客户端：ishell-mcp 无法工作，请停止重试，\
+             并把下面的话转达给用户。\n\
+             可能原因：iShell 未运行、未在设置里开启「允许 AI 通过 MCP 控制终端」，或 \
+             ISHELL_MCP_TOKEN 与 iShell 侧不一致。请在你自己那台 iShell 的 MCP 设置里核对\
+             配对 token（可用「复制配对配置」），确认与这里配置的一致。"
                 .into()
         } else {
-            "连不上 iShell（未运行，或未在设置里开启「允许 AI 通过 MCP 控制终端」）。\n\
-             若服务器上的 iShell 开了「只响应配对请求」，未配对的 AI 会找不到它——请在 \
-             iShell 的 MCP 设置里开启「自动注入配对标识」，或把「复制配对配置」的内容填进 \
-             这份 AI 的 MCP server 环境变量。"
+            "未检测到可用的 iShell 客户端：ishell-mcp 无法工作，请停止重试，并把下面的话转达\
+             给用户。\n\
+             可能原因：iShell 未运行或未开启「允许 AI 通过 MCP 控制终端」；或者这台服务器上的\
+             iShell 开了「只响应配对请求」，而这份 AI 没有携带配对 token——此时**不要**反复\
+             重试：那样只会持续打扰服务器上的其他用户。\n\
+             解决办法：在 iShell 的 MCP 设置里开启「自动注入配对标识」（iShell 终端里的 AI \
+             自动携带配对身份），或把「复制配对配置」的内容填进这份 AI 的 MCP server 环境\
+             变量。"
                 .into()
         }),
         1 => {
@@ -441,6 +448,7 @@ async fn choose_instance(
                 stream,
                 Some(id.clone()),
                 Some(caller_origin()),
+                Some(current_actor()),
                 McpReqKind::Bind,
                 BIND_TIMEOUT,
             )
@@ -515,13 +523,15 @@ async fn connect_bound() -> Result<(UnixStream, String), String> {
 ///
 /// `instance` 点名这条请求发给谁，由对端自己校验（见 `McpRequest::is_addressed_to`）。
 /// 只有 `Identify` 填 `None`——那时还不知道对面是谁。
-/// `origin` 是发起方的可读来源描述（谁/什么进程），仅 `Bind` 携带、供对端弹窗展示；
-/// 纯显示信息，不构成身份凭证。其余请求传 `None`。
+/// `origin`（可读来源）与 `actor`（本进程标识）随每条业务请求携带：`origin` 给对端弹窗
+/// 展示用，`actor` 让 iShell 落实「AI 窗口归开它的 AI 专用」。纯元数据，不构成身份凭证。
+/// 匿名探测（Identify）两者都传 `None`。
 #[cfg(unix)]
 async fn exchange(
     stream: UnixStream,
     instance: Option<String>,
     origin: Option<String>,
+    actor: Option<String>,
     kind: McpReqKind,
     response_timeout: std::time::Duration,
 ) -> Result<McpReqResult, String> {
@@ -531,6 +541,7 @@ async fn exchange(
         id,
         instance,
         origin,
+        actor,
         kind,
     })
     .map_err(|e| e.to_string())?;
@@ -571,7 +582,15 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 
 #[cfg(unix)]
 async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
     let (stream, instance) = connect_bound().await?;
-    exchange(stream, Some(instance), None, kind, RESPONSE_TIMEOUT).await
+    exchange(
+        stream,
+        Some(instance),
+        Some(caller_origin()),
+        Some(current_actor()),
+        kind,
+        RESPONSE_TIMEOUT,
+    )
+    .await
 }
 
 /// 校验一个调用方本机路径：必须绝对、不含 `.`/`..` 路径段。跟 GUI 侧
@@ -616,7 +635,8 @@ async fn copy_to_remote_from_caller(
     let request = McpRequest {
         id,
         instance: Some(instance),
-        origin: None,
+        origin: Some(caller_origin()),
+        actor: Some(current_actor()),
         kind: McpReqKind::CopyToRemoteFromCaller {
             session_uid,
             remote_path,
@@ -686,7 +706,8 @@ async fn copy_from_remote_to_caller(
     let request = McpRequest {
         id,
         instance: Some(instance),
-        origin: None,
+        origin: Some(caller_origin()),
+        actor: Some(current_actor()),
         kind: McpReqKind::CopyFromRemoteToCaller { session_uid, remote_path, timeout_ms },
     };
     let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;
@@ -803,7 +824,7 @@ fn default_timeout_ms() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RunCommandArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     /// 要在该终端里执行的 shell 命令（会像用户手动输入一样实时显示在终端里）
     pub command: String,
@@ -816,12 +837,14 @@ pub struct RunCommandArgs {
 /// 只是把等待窗口固定为协议允许的最小值，避免 MCP 客户端的空闲超时占住等待者。
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StartCommandArgs {
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     pub command: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PollRunArgs {
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     /// 可省略：同一会话同一时刻只会有一条挂起的运行，省略就直接续等它，不需要精确转述
     /// run_command 返回的那个长数字 id。传了会做一致性校验（防止误续等一条不相关的旧运行）。
@@ -833,7 +856,7 @@ pub struct PollRunArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SessionArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
 }
 
@@ -849,7 +872,7 @@ fn default_max_lines() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReadHistoryArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     /// 只要最后这么多行（默认 200，够用再加大）；传 0 表示不限制（回滚很长时可能很大）
     #[serde(default = "default_max_lines")]
@@ -858,7 +881,7 @@ pub struct ReadHistoryArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SendInputArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     /// 要发送的原始文本/按键，不会自动加回车——要按 Enter 就在末尾加 "\r"
     pub text: String,
@@ -870,7 +893,7 @@ fn default_file_timeout_ms() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct WriteFileArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     /// 远端绝对路径，已存在会被直接覆盖
     pub path: String,
@@ -882,7 +905,7 @@ pub struct WriteFileArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReadFileArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     pub path: String,
     /// 默认 false：遵守 20MB 软上限、二进制内容直接报错。true：放宽到 128MB 且把二进制也
@@ -899,7 +922,7 @@ fn default_copy_timeout_ms() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CopyToRemoteArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     /// 运行 ishell-mcp 的调用方机器上的单个文件绝对路径
     pub local_path: String,
@@ -911,7 +934,7 @@ pub struct CopyToRemoteArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CopyFromRemoteArgs {
-    /// list_sessions 返回的会话 uid
+    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
     /// 远端绝对路径（仅单个文件；目录请逐文件拉取或用 tar/rsync）
     pub remote_path: String,
@@ -942,16 +965,20 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "列出 iShell 当前打开的所有终端会话（uid、标题、主机、连接状态、远端工作目录、\
-                        是否为 AI 自己开的会话）。\
-                        注意 ai_owned 字段：true = 你自己用 open_session 开的专用会话，只读给用户看、\
-                        用户的键盘输入不会进去，你可以随便用；false = **用户本人正在用的会话**，他随时\
-                        可能在里面敲字。默认不要往 ai_owned=false 的会话里写（run_command / send_input / \
-                        interrupt / write_file / copy_to_remote 等）——两路输入会在同一个 shell 里交织，\
-                        轻则互相打断、重则把 run_command 判断命令结束用的哨兵标记搅乱，还可能误操作用户\
-                        正在做的事。需要执行东西就用 open_session 开一个自己的会话。确实必须用用户那个\
-                        会话时（比如要复用他已经 cd 到的目录、已经激活的 venv、已经 sudo 的状态），调用\
-                        会照常发出，但 iShell 会弹窗让用户当面授权一次，用户同意后该会话不再询问。"
+        description = "列出 iShell 当前打开的所有终端会话。每个会话返回：uid（整数，后续所有\
+                        工具的 session_uid 都直接复制它）、标题、主机、连接状态、远端工作目录、\
+                        以及三个归属字段——ai_owned（是不是 AI 开的专用窗口）、ai_owner（开它的\
+                        AI 的来源标签，如 `e5-1 (ishell-mcp pid 42)`，用户开的会话为 null）、mine\
+                        （**是不是你这个进程自己开的**：true = 你的专用窗口，随便用；false 而\
+                        ai_owned=true = 另一个 AI 开的窗口，写入会弹窗让用户授权）。\n\
+                        归属速查：mine=true 直接用；ai_owned=false 是**用户本人正在用的会话**，\
+                        他随时可能在里面敲字，默认不要往里写（run_command / send_input / \
+                        interrupt / write_file / copy_to_remote 等）——两路输入会在同一个 shell \
+                        里交织，轻则互相打断、重则把 run_command 判断命令结束用的哨兵标记搅乱，\
+                        还可能误操作用户正在做的事。需要执行东西就用 open_session 开一个自己的\
+                        会话。确实必须用用户那个会话时（比如要复用他已经 cd 到的目录、已经激活\
+                        的 venv、已经 sudo 的状态），调用会照常发出，但 iShell 会弹窗让用户当面\
+                        授权一次，用户同意后该会话不再询问。"
     )]
     async fn list_sessions(&self) -> Result<CallToolResult, McpError> {
         text_result(call(McpReqKind::ListSessions).await)
@@ -1269,26 +1296,36 @@ impl IshellMcp {
 }
 
 #[tool_handler(
-    instructions = "远端命令/文件优先用本工具集操作 iShell 会话，不要另开 `ssh host cmd`（会丢\
-                    cwd/环境/历史，用户也看不见）。仅当 iShell 未运行或用户明确要求独立 ssh 时例外。\n\
-                    流程：list_sessions（看 ai_owned）→ **默认 open_session 开专用会话**\
-                    （先 list_saved_connections 核对名字；首次连接需用户确认；ai_owned=true，\
-                    用户不能打字）→ run_command 执行 → 超时用 poll_run 续等（不重发）→ 交互提示\
-                    （sudo/vim/REPL）用 send_input → 看屏用 read_screen，看完整历史用 \
-                    read_history → 中断用 interrupt → 用完 close_session（只能关自己开的）。\n\
-                    不要默认往 ai_owned=false（用户自己的会话）里写：两路输入会交织并破坏完成\
-                    检测。必须复用其 cwd/venv/sudo 状态时照常调用——会弹窗让用户授权一次，同意后\
-                    该会话本进程内不再问；拒绝或超时则改 open_session。只读\
-                    （read_screen/read_history/read_file/list_*）不需授权。\n\
-                    文件：小文本用 write_file/read_file；大文件/二进制用 copy_to_remote/\
-                    copy_from_remote（字节不进 JSON；local_path 在**运行 ishell-mcp 的机器**上）；\
-                    两台已打开远端之间用 copy_between_sessions。均为单文件，目录请逐文件或 \
-                    tar/rsync。\n\
-                    长任务：timeout_ms 最长 24h，直接等完；勿 sleep 轮询。后台任务用 \
-                    `tail --pid=… -f /dev/null` 等退出。`&` 优先级低于 `&&`，勿把前置步骤一并\
-                    丢进后台。工具调用结果丢失时先 poll_run（可省略 run_id）确认状态，勿盲目重试\
-                    有副作用的命令。run_command 是往交互 shell 打字：前台全屏/REPL/未闭合语法时\
-                    完成检测可能挂起，先 read_screen。"
+    instructions = "这是 iShell——一个由用户盯着运行的真实终端管理器——的 MCP 桥。你操作的是**真\
+                    实的交互式终端**（能看到你在打字，前台程序、提示符、sudo 都会受影响），不是\
+                    无状态的执行沙箱。用户能看见你做的每件事；写用户的会话前 iShell 会替你弹窗\
+                    征求同意。\n\
+                    会话归属（list_sessions 的 mine / ai_owned / ai_owner 三个字段）：\n\
+                    · mine=true：你这个进程自己 open_session 开的专用窗口，随便用，用户不能往里\
+                    打字。\n\
+                    · ai_owned=true 且 mine=false：另一个 AI 开的窗口，别往里写——会像写用户会话\
+                    一样弹窗。\n\
+                    · ai_owned=false：用户本人的会话。只读（read_screen/read_history/read_file/\
+                    list_*）随意；写入默认弹窗授权，确需复用其 cwd/venv/sudo 时才这样做，\
+                    拒绝或超时就用 open_session 开自己的。\n\
+                    标准流程：list_saved_connections 核对名字 → open_session 开专用会话（首次\
+                    需用户确认；刚返回时可能在连接中，connected=true 再用）→ run_command 执行\
+                    → 超时用 poll_run 续等（省略 run_id，不重发命令）→ 交互场景（sudo/vim/REPL）\
+                    用 send_input，看屏用 read_screen → **用完 close_session**（只能关自己开的；\
+                    开一堆不关会占着连接和标签）。\n\
+                    上下文管理：你的上下文是宝贵的，终端输出不是。\n\
+                    · session_uid 一律从 list_sessions **原样复制**，不要凭记忆写数字。\n\
+                    · read_screen 只看一屏；read_history 从 max_lines 小的值开始（默认 200），\n\
+                    别一次性吞整个回滚。\n\
+                    · 大文件/二进制一律走 copy_to_remote/copy_from_remote（字节不进你的上下文）；\n\
+                    read_file 用于真正需要读内容的文本；grep/sed/head 等就地过滤优先于拉全量。\n\
+                    · run_command 的输出会原样进你的上下文：能定向到文件的别打印，能 tail -1 的\
+                    别 cat。\n\
+                    可靠性：run_command 是往交互 shell 打字+回车——前台全屏程序/REPL/未闭合语法时\
+                    完成检测可能挂起，发命令前先 read_screen；中断用 interrupt；工具调用结果丢失时\
+                    先 poll_run 确认状态，勿盲目重试有副作用的命令。timeout_ms 最长 24h，长任务直接\
+                    等完，勿 sleep 轮询；`&` 优先级低于 `&&`，勿把前置步骤一并丢进后台。远端命令/\
+                    文件优先走本工具集，不要另开 `ssh host cmd`（会丢 cwd/环境/历史，用户也看不见）。"
 )]
 impl ServerHandler for IshellMcp {}
 
@@ -1307,6 +1344,21 @@ async fn main() -> anyhow::Result<()> {
     let service = IshellMcp::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// 本代理**进程**的身份标识：启动时生成的随机串（16 位十六进制），同进程内所有请求一致、
+/// 不同 AI 进程互不相同。iShell 用它落实「窗口归开它的那个 AI 专用」：`open_session` 记录
+/// 它，之后写入类请求带上的 actor 与记录不符，iShell 就按「动别人/用户的会话」弹窗授权。
+/// 纯进程身份、**不是保密凭据**——防同账号冒名是配对 token 那一层的事。
+fn current_actor() -> String {
+    static ACTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ACTOR
+        .get_or_init(|| {
+            mcp_protocol::random_hex(8)
+                // 熵源失败（实际不会发生）：退回 pid——只是进程区分，允许弱。
+                .unwrap_or_else(|| format!("fallback-pid{}", std::process::id()))
+        })
+        .clone()
 }
 
 /// 绑定弹窗里给被询问用户看的来源描述：哪个 unix 用户、哪个进程在发起。纯展示信息，
@@ -1338,6 +1390,7 @@ fn caller_origin() -> String {
 mod tests {
     use super::caller_origin;
     use super::check_proto_version;
+    use super::current_actor;
     use super::mcp_protocol::MCP_PROTOCOL_VERSION;
 
     #[test]
@@ -1378,5 +1431,14 @@ mod tests {
             Some(v) => std::env::set_var("ISHELL_MCP_ORIGIN", v),
             None => std::env::remove_var("ISHELL_MCP_ORIGIN"),
         }
+    }
+
+    /// 进程标识：16 位十六进制，同进程内多次取必须一致（OnceLock 缓存）。
+    #[test]
+    fn current_actor_is_stable_random_hex_within_a_process() {
+        let a = current_actor();
+        assert_eq!(a, current_actor(), "同进程内 actor 必须稳定");
+        assert_eq!(a.len(), 16, "16 位十六进制，实际：{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "应为十六进制：{a}");
     }
 }
