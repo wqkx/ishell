@@ -674,18 +674,42 @@ async fn copy_to_remote_from_caller(
         Ok::<(), std::io::Error>(())
     };
     tokio::pin!(body);
+    // biased + 读分支优先：GUI 拒绝请求是「先写响应、再关连接」——响应字节和对端关闭导致的
+    // EPIPE 会同时就绪，而 tokio::select! 默认**随机**挑分支：若先轮上 body，报错路径返回
+    // 「Broken pipe」，真实错误又被盖住。biased 让读确定性地优先；body 先出错时再用短超时
+    // 追读一次响应行——追到了返回 GUI 的真实错误，追不到才报 body 的错误。
     let early = tokio::select! {
-        r = &mut body => {
-            r.map_err(|error| format!("发送调用方文件流失败: {error}"))?;
-            None
-        }
+        biased;
         r = reader.read_line(&mut response) => Some(r),
+        r = &mut body => match r {
+            Ok(()) => None,
+            Err(error) => {
+                // 典型场景：GUI 已回错并关连接，我们的写撞上 EPIPE。它关连接前写下的
+                // 响应行可能还躺在 socket 缓冲里——短超时追读，追到就把真实错误带回去。
+                let mut late = String::new();
+                if let Ok(Ok(n)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    reader.read_line(&mut late),
+                )
+                .await
+                {
+                    if n > 0 && !late.trim().is_empty() {
+                        return serde_json::from_str::<McpResponse>(late.trim())
+                            .map_err(|e| e.to_string())?
+                            .result;
+                    }
+                }
+                return Err(format!("发送调用方文件流失败: {error}"));
+            }
+        },
     };
     let read = match early {
         Some(r) => r.map_err(|error| error.to_string())?,
         None => {
-            // 文件体已推完：按既有路径等判定行。read_line 在 select 里被丢弃时可能已把
-            // 一行的一部分追加进 response——同一行接着读，内容仍然连续。
+            // 文件体已推完：按既有路径等判定行。注意 tokio 的 read_line **不能安全取消**：
+            // 它开始时会 mem::take 走整个 String（已读到的部分字节在内），被取消时随
+            // future 一起丢掉、不会还原——所以这里依赖的事实是「GUI 的响应是一小行、一次
+            // write 写完」，select 里被丢弃的 read_line 不会产生需要接着读的半行。
             tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut response))
                 .await
                 .map_err(|_| "等待 iShell 上传响应超时（可能是 GUI、SFTP 或连接异常）".to_string())?
