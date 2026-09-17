@@ -7,14 +7,6 @@ use crate::terminal::Terminal;
 use crate::ui::file_panel::FilePanelState;
 use crate::ui::sidebar::NetHistory;
 
-/// 开启者来源标签的短形态（标签页上「谁开的」角标）：取第一个空白分隔段、最多 8 字符
-/// （如 `e5-1 (ishell-mcp pid 42)` → `e5-1`）。没有标签（旧代理开的窗口）返回 None。
-pub(super) fn ai_owner_short(label: Option<&str>) -> Option<String> {
-    let first = label?.split_whitespace().next()?;
-    let short: String = first.chars().take(8).collect();
-    (!short.is_empty()).then_some(short)
-}
-
 /// 单个 SSH 会话的前台状态。
 pub(super) struct Session {
     /// 稳定唯一 id（用于标签滑动动画在重排后仍追踪同一标签）

@@ -173,21 +173,10 @@ impl App {
                                     let mut acc = 0.0f32; // 目标布局累计左边界
                                     for (i, s) in self.sessions.iter().enumerate() {
                                         let selected = active == Some(i);
-                                        // AI（open_session）新开的会话在标签上加机器人图标前缀，
-                                        // 一眼和用户自己开的会话区分开；带得开启者标签时再加一个
-                                        // 短标签（谁开的）——共享屏幕上多个 AI 的窗口可辨。
-                                        let display_title = if s.ai_owned {
-                                            match super::session::ai_owner_short(
-                                                s.ai_owner_label.as_deref(),
-                                            ) {
-                                                Some(short) => {
-                                                    format!("{} {} {}", icon::ROBOT, short, s.title)
-                                                }
-                                                None => format!("{} {}", icon::ROBOT, s.title),
-                                            }
-                                        } else {
-                                            s.title.clone()
-                                        };
+                                        // 标签只显示会话标题：机器人图标、开启者名这类
+                                        // MCP 内部标识用户看着只是噪声（归属信息仍在
+                                        // list_sessions/写入弹窗里发挥作用，不上屏）。
+                                        let display_title = s.title.clone();
                                         // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
                                         let title_w = ctx.fonts_mut(|f| {
                                             f.layout_no_wrap(

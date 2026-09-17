@@ -68,14 +68,6 @@ impl App {
                 // 不用 `ctx.available_rect()`：那个在 egui 0.34 已弃用，官方建议换成
                 // `content_rect()`——但后者是整个窗口内容区、不扣面板，语义对不上。
                 self.term_rect = Some(ui.max_rect());
-                // 当前所有 AI（open_session）打开的会话 uid，AI 提示条里要报全，方便 AI
-                // 自己核对哪些会话还在。
-                let ai_uids: Vec<u64> = self
-                    .sessions
-                    .iter()
-                    .filter(|s| s.ai_owned)
-                    .map(|s| s.uid)
-                    .collect();
                 let s = &mut self.sessions[idx];
                 // 断线提示条 + 手动重连（初次"连接中"不显示）
                 if !s.connected {
@@ -95,32 +87,21 @@ impl App {
                         });
                     ui.add_space(4.0);
                 }
-                // ai_owned 会话是 AI 自己新开的只读会话：报出这个终端自己的 uid + 当前全部
-                // AI 终端的 uid（方便 AI 核对），用高对比度的实心底色 + 加粗白字，确保不管
-                // 当前终端主题深浅都清楚可辨。非 AI 会话不显示任何 MCP 相关提示。
+                // ai_owned 会话是 AI 自己新开的只读会话：一句话说明它在被 AI 驱动、用户
+                // 键入不会转发（键盘被锁住的原因）。uid/开启者列表这类内部标识不上屏——
+                // 它们是 MCP 调用方的定位细节，用户看着只是噪声。非 AI 会话不显示任何
+                // MCP 相关提示。
                 if s.ai_owned {
-                    let uid = s.uid;
-                    let ai_list = ai_uids
-                        .iter()
-                        .map(|u| u.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
                     egui::Frame::new()
                         .fill(Palette::ACCENT)
                         .corner_radius(6)
                         .inner_margin(egui::Margin::symmetric(8, 5))
                         .show(ui, |ui| {
                             ui.label(
-                                RichText::new(match crate::i18n::current() {
-                                    crate::i18n::Lang::Zh => format!(
-                                        "{}  AI 正在驱动此终端（只读，uid={uid}）· 当前全部 AI 终端 uid：{ai_list}",
-                                        egui_phosphor::regular::ROBOT,
-                                    ),
-                                    crate::i18n::Lang::En => format!(
-                                        "{}  AI is driving this terminal (read-only, uid={uid}) · All AI terminals: uid {ai_list}",
-                                        egui_phosphor::regular::ROBOT,
-                                    ),
-                                })
+                                RichText::new(crate::i18n::tr(
+                                    "AI 正在驱动此终端（只读）",
+                                    "AI is driving this terminal (read-only)",
+                                ))
                                 .color(egui::Color32::WHITE)
                                 .strong()
                                 .size(12.0),
@@ -186,10 +167,8 @@ impl App {
                 // 提示分支），这里是它的手动补救。
                 if s.terminal.take_pair_inject_request() {
                     s.status = match s.inject_pair_token_now() {
-                        Ok(()) => {
-                            crate::i18n::tr("已注入配对标识", "Pairing token injected").into()
-                        }
-                        Err(msg) => msg.into(),
+                        Ok(()) => crate::i18n::tr("已注入配对标识", "Pairing token injected").into(),
+                        Err(msg) => msg,
                     };
                 }
                 // 两处「程序替用户敲键盘」的自动注入——重连后恢复工作目录、MCP 配对标识
