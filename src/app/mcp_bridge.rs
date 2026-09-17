@@ -301,6 +301,20 @@ const DIRECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 撤销临时信任的等待上限：只是清理步骤，不需要等太久，超过就直接放弃等待、继续收尾。
 const UNTRUST_WAIT: Duration = Duration::from_secs(10);
 
+/// 临时公钥撤销能否真正送达目标 worker。入参是目标会话的 `connected`（`None` = 会话已不存在）。
+///
+/// **断线时不能拿 `cmd_tx.send` 的结果当「会被执行」**：重连（`reconnect_session`）换的是全新
+/// 的通道，发到旧通道的命令永不处理；而旧 worker 退出主循环后还要做收尾（等 MCP 转发注册、
+/// 远端 `rm -f`，网络真断时可能卡很久），期间 `cmd_rx` 仍活着，`send` 照样返回 Ok——撤销
+/// 被静默吞掉，公钥残留却没有任何告警。所以断线一律判「送不达」，由调用方直接告警。
+fn untrust_route(dest_connected: Option<bool>) -> Result<(), &'static str> {
+    match dest_connected {
+        None => Err("目标会话已不存在，无法自动撤销"),
+        Some(false) => Err("目标会话已断线，撤销无法送达"),
+        Some(true) => Ok(()),
+    }
+}
+
 /// 把 `SavedConnection` 的 `auth_kind` 字符串 + 相应字段还原成 `AuthMethod`（跟
 /// `ui/connect/form.rs::build()` 里对同一套字段的映射保持一致）。
 fn auth_method(kind: &str, password: &str, key_path: &str, passphrase: &str) -> AuthMethod {
@@ -1478,23 +1492,35 @@ impl App {
         // 刻意放在事件循环**之后**：本帧到达的成功事件（直连完成/中转 TransferDone）会先把
         // 作业收掉，不会因为同一帧里恰好有断线而把一次成功的拷贝报成失败。
         for idx in (0..self.cross_copy_jobs.len()).rev() {
+            // UntrustingAfterDirect 的成败早已确定（direct_result），只是等撤销回执，断线不构成
+            // 判败理由（它有自己的 phase_deadline 收尾）。但**目标**断线时回执永远不会来了：
+            // 撤销是断线前发的，旧 worker 未必处理到——等 phase_deadline 收尾时一声不吭，
+            // 公钥就可能静默残留。这里当场告警，并把 trust_established 清掉（已告警、也已
+            // 无通道可补发），避免快败/总超时分支之后再对同一把 key 重复告警。
+            if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
+                let (dest_uid, marker, trusted) = {
+                    let job = &self.cross_copy_jobs[idx];
+                    (job.dest_uid, job.marker.clone(), job.trust_established)
+                };
+                let dest_connected =
+                    self.session_idx_by_uid(dest_uid).map(|i| self.sessions[i].connected);
+                if trusted && untrust_route(dest_connected).is_err() {
+                    self.warn_temp_key_residue(dest_uid, marker, "撤销回执未到，目标会话已断线");
+                    self.cross_copy_jobs[idx].trust_established = false;
+                }
+                continue;
+            }
             let dead = {
                 let job = &self.cross_copy_jobs[idx];
-                // UntrustingAfterDirect 的成败早已确定（direct_result），只是等撤销回执——
-                // 它有自己的 phase_deadline 收尾，断线不构成判败理由。
-                if matches!(job.phase, CrossCopyPhase::UntrustingAfterDirect) {
-                    None
-                } else {
-                    [("源", job.src_uid), ("目标", job.dest_uid)]
-                        .into_iter()
-                        .find_map(|(role, uid)| match self.session_idx_by_uid(uid) {
-                            None => Some(format!("{role}会话已不存在（uid={uid}），跨会话拷贝中止")),
-                            Some(i) if !self.sessions[i].connected => {
-                                Some(format!("{role}会话已断线（uid={uid}），跨会话拷贝中止——重连后请重试"))
-                            }
-                            Some(_) => None,
-                        })
-                }
+                [("源", job.src_uid), ("目标", job.dest_uid)]
+                    .into_iter()
+                    .find_map(|(role, uid)| match self.session_idx_by_uid(uid) {
+                        None => Some(format!("{role}会话已不存在（uid={uid}），跨会话拷贝中止")),
+                        Some(i) if !self.sessions[i].connected => {
+                            Some(format!("{role}会话已断线（uid={uid}），跨会话拷贝中止——重连后请重试"))
+                        }
+                        Some(_) => None,
+                    })
             };
             if let Some(msg) = dead {
                 let (cancel, dest_uid, op_id, marker, maybe_trusted) = {
@@ -1514,9 +1540,10 @@ impl App {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // TrustingB 在途窗口（信任已发给 worker、回执未到）里判败必须先补发撤销——
-                // worker 可能在我们断线前已经把公钥写进了 authorized_keys；cmd_tx 是每会话
-                // 持久通道，断线期间发送会缓冲，重连后按 FIFO 在 TrustTempKey 之后处理。
-                // 注意 DirectCopying 进行中其实还没到 finish_direct_attempt（那里才发撤销），
+                // worker 可能在我们断线前已经把公钥写进了 authorized_keys。断的若是目标会话，
+                // 撤销送不达（重连换新通道，旧 worker 不再处理命令），`best_effort_untrust`
+                // 会直接告警而不是假装发出去了。注意 DirectCopying 进行中其实还没到
+                // finish_direct_attempt（那里才发撤销），
                 // 这里补发只会更早清理、不影响已建立的 scp 连接（认证只在建连时发生）；
                 // UntrustingAfterDirect/Relay 阶段确认已发过——回执 ok 时上面已把
                 // trust_established 清回 false，不会再走到这里。
@@ -1714,26 +1741,22 @@ impl App {
         }
     }
 
-    /// 尽力而为补发一次临时公钥撤销；发送失败或目标会话已不在时走 `warn_temp_key_residue`
-    /// 告警（残留必须可见），调用方不再各自处理失败。注意 `cmd_tx` 是每会话一条的持久
-    /// 通道：断线期间发送会缓冲，重连后的新 worker 仍按 FIFO 在早先的 TrustTempKey
-    /// 之后处理这条撤销——所以「会话断着」也值得发，不是白做。
+    /// 尽力而为补发一次临时公钥撤销；送不达（见 [`untrust_route`]）或发送失败时走
+    /// `warn_temp_key_residue` 告警（残留必须可见），调用方不再各自处理失败。
     fn best_effort_untrust(&mut self, dest_uid: u64, op_id: u64, marker: String) {
-        match self.session_idx_by_uid(dest_uid) {
-            Some(dest_idx) => {
-                let sent = self.sessions[dest_idx]
-                    .cmd_tx
-                    .send(UiCommand::UntrustTempKey { op_id, marker: marker.clone() })
-                    .is_ok();
-                if !sent {
-                    self.warn_temp_key_residue(
-                        dest_uid,
-                        marker,
-                        "撤销消息发送失败（目标会话后台连接已断开）",
-                    );
-                }
-            }
-            None => self.warn_temp_key_residue(dest_uid, marker, "目标会话已不存在，无法自动撤销"),
+        let dest_idx = self.session_idx_by_uid(dest_uid);
+        let route = untrust_route(dest_idx.map(|i| self.sessions[i].connected));
+        let (Some(dest_idx), Ok(())) = (dest_idx, route) else {
+            let reason = route.err().unwrap_or("目标会话已不存在，无法自动撤销");
+            self.warn_temp_key_residue(dest_uid, marker, reason);
+            return;
+        };
+        let sent = self.sessions[dest_idx]
+            .cmd_tx
+            .send(UiCommand::UntrustTempKey { op_id, marker: marker.clone() })
+            .is_ok();
+        if !sent {
+            self.warn_temp_key_residue(dest_uid, marker, "撤销消息发送失败（目标会话后台连接已断开）");
         }
     }
 
@@ -1752,7 +1775,12 @@ impl App {
             ),
         };
         match self.session_idx_by_uid(dest_uid) {
-            Some(i) => self.sessions[i].status = text,
+            Some(i) if self.sessions[i].connected => self.sessions[i].status = text,
+            // 断线会话的状态栏随后会被「重连中 …」覆盖，只写它等于转瞬即逝——同时弹 toast。
+            Some(i) => {
+                self.sessions[i].status = text.clone();
+                self.toast = Some((text, self.ctx.input(|i| i.time)));
+            }
             None => self.toast = Some((text, self.ctx.input(|i| i.time))),
         }
     }
@@ -2801,6 +2829,21 @@ impl App {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod untrust_route_tests {
+    use super::untrust_route;
+
+    /// 目标会话断线时撤销必须判「送不达」，让调用方直接告警。
+    /// 反向对照：把 `Some(false)` 改判 `Ok(())`（即旧实现「断线照发、只看 send 结果」），
+    /// 第一条断言当场挂——那正是公钥静默残留的路径。
+    #[test]
+    fn disconnected_destination_is_never_treated_as_deliverable() {
+        assert!(untrust_route(Some(false)).is_err(), "断线会话的 send 可能 Ok 却永不执行");
+        assert!(untrust_route(None).is_err(), "会话已不存在");
+        assert!(untrust_route(Some(true)).is_ok(), "连着的会话照常发撤销");
     }
 }
 
