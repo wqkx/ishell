@@ -116,22 +116,27 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 
 ## 📦 Install
 
-Download the binary for your platform from [**Releases**](https://github.com/wqkx/ishell/releases):
+Download the archive for your platform from [**Releases**](https://github.com/wqkx/ishell/releases) (releases ship archives only, no bare binaries):
 
 | Platform | File |
 |---|---|
-| Linux x86_64 | `ishell-linux-x86_64` |
-| macOS Apple Silicon | `ishell-macos-aarch64` |
-| macOS Intel | `ishell-macos-x86_64` |
-| Windows x86_64 | `ishell-windows-x86_64.exe` |
+| Linux x86_64 | `ishell-linux-x86_64.tar.gz` |
+| Linux ARM64 | `ishell-linux-aarch64.tar.gz` |
+| macOS Apple Silicon | `ishell-macos-aarch64.app.zip` |
+| macOS Intel | `ishell-macos-x86_64.app.zip` |
+| Windows x86_64 | `ishell-windows-x86_64.zip` |
 
 ```bash
-# Linux / macOS
-chmod +x ishell-*            # make it executable
-./ishell-linux-x86_64
+# Linux: extracts to iShell/ (with icon, .desktop and an install script)
+tar xzf ishell-linux-x86_64.tar.gz && cd iShell && ./ishell
+
+# macOS: extracts iShell.app — drag to Applications or launch from Finder
+unzip ishell-macos-aarch64.app.zip
+
+# Windows: extract ishell.exe and run it
 ```
 
-- **macOS** (unsigned, first run): `xattr -dr com.apple.quarantine ./ishell-macos-aarch64`, or "System Settings → Privacy & Security → Open Anyway".
+- **macOS** (unsigned, first run): `xattr -dr com.apple.quarantine iShell.app`, or "System Settings → Privacy & Security → Open Anyway".
 - **Windows** SmartScreen: click "More info → Run anyway".
 
 ## ❓ Troubleshooting
@@ -140,7 +145,7 @@ chmod +x ishell-*            # make it executable
 Some Wayland desktops (KDE Plasma / GNOME) have flaky `text-input-v3` support for winit-based apps, so fcitx-style IMEs never activate or compose (same issue as Chrome/Electron). Fix: **switch to X11 (XWayland)**, where XIM input works. Two ways (either one):
 
 - **In-app**: right-click the terminal → check "**Force X11 (fix IME · restart)**" → **restart iShell**. The setting is persisted — set it once.
-- **Env var**: `ISHELL_X11=1 ./ishell-linux-x86_64` (or temporarily `WAYLAND_DISPLAY= ./ishell-linux-x86_64`).
+- **Env var**: `ISHELL_X11=1 ./iShell/ishell` (or temporarily `WAYLAND_DISPLAY= ./iShell/ishell`).
 
 > Trade-off: forcing X11 loses some native-Wayland niceties (e.g. smoother fractional scaling) in exchange for a working IME — the same trade-off as Chrome's `--ozone-platform=x11`. The default is still Wayland; it only switches when you enable this.
 
@@ -157,7 +162,7 @@ poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
 winit only sends that request when the coordinate actually *changes*, so reporting a constant one means it is never sent at all. You keep full CJK input; the candidate window just stops following the caret. iShell also detects a frozen UI thread on its own and appends an explanation to `~/.config/ishell/crash.log` — it only reports, it never changes settings behind your back.
 
 **Whole UI looks suspended after minimizing the window — and the AI can't drive it either?**
-Try starting with `ISHELL_NO_VSYNC=1 ./ishell-linux-x86_64`. If minimizing behaves after that, it's the following.
+Try starting with `ISHELL_NO_VSYNC=1 ./iShell/ishell`. If minimizing behaves after that, it's the following.
 
 What the framework source says: eframe **keeps drawing and swapping buffers for a minimized window**. Its visibility check reads `viewport.info.visible()`, and **nothing on native ever assigns that field** (the `Occluded` event writes `info.occluded` instead), so it is always true — neither the paint nor `gl_surface.swap_buffers()` is skipped. With the default `vsync: true`, glutin uses `SwapInterval::Wait(1)`, so that swap waits for a vblank — which an iconified window the compositor no longer presents may never get, parking the thread that draws the UI. It is the only blocking call on that path.
 
@@ -195,16 +200,16 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 
 ## 🤖 AI / MCP integration
 
-Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal session — cwd / env / history intact — instead of a throwaway `ssh host cmd`. It can take over a tab you already have open, or open a read-only AI-only session from a saved connection (a human can't type into it). Tabs show a 🤖 badge.
+Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal session — cwd / env / history intact — instead of a throwaway `ssh host cmd`. It can take over a tab you already have open, or open a read-only AI-only session from a saved connection (a human can't type into it).
 
 ### Enable & setup
 
 1. **On by default** since 0.19 (it was opt-in before). Settings → “Allow AI to control terminal via MCP” turns it off. Listens only on a local Unix socket (`~/.config/ishell/mcp-<pid>.sock`, mode `0600`) — no network port. Changing the switch needs a restart.
 2. Install the proxy on the machine that runs the AI:
    - **AI runs on a server you SSH into** — right-click in that server's terminal → **“Install the AI control agent on this server”**. iShell ships a matching `ishell-mcp` inside itself and pushes it over the existing SFTP channel to `~/.ishell-mcp/bin/ishell-mcp`, then types the register command into the terminal for you. Versions match by construction, so “version mismatch, redeploy” cannot happen. *Release builds embed the agent only on Linux, and only for the build's own architecture* (a Linux x86_64 iShell can deploy to x86_64 Linux servers); the menu item is hidden when this build embeds nothing. A build that embeds several architectures is possible — see BUILD.md.
-   - **AI runs on this computer, or the server is another arch** — install by hand:
+   - **AI runs on this computer, or the server is another arch** — install by hand: download `ishell-mcp-<platform>.tar.gz` from Releases (`.zip` on macOS), extract `ishell-mcp`, then:
      ```bash
-     scripts/install-mcp.sh target/release/ishell-mcp   # → ~/.ishell-mcp/bin/ishell-mcp
+     scripts/install-mcp.sh ./ishell-mcp                  # → ~/.ishell-mcp/bin/ishell-mcp
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
      # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
      ```

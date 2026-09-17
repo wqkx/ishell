@@ -26,11 +26,11 @@ jobs:
           # domain socket 做 IPC，Windows 上整套通道被 cfg 门掉成一个总是报错的桩实现
           # （见 src/bin/ishell-mcp.rs），打包出去也不能用，Windows 行不设该字段、后续步骤
           # 用它是否非空来判断要不要处理。
-          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  ext: "",     asset: ishell-linux-x86_64,  mcp_asset: ishell-mcp-linux-x86_64 }
-          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, ext: "",     asset: ishell-linux-aarch64, mcp_asset: ishell-mcp-linux-aarch64 }
-          - { os: macos-14,         target: aarch64-apple-darwin,     ext: "",     asset: ishell-macos-aarch64, mcp_asset: ishell-mcp-macos-aarch64 }
-          - { os: macos-14,         target: x86_64-apple-darwin,      ext: "",     asset: ishell-macos-x86_64,  mcp_asset: ishell-mcp-macos-x86_64 }
-          - { os: windows-latest,   target: x86_64-pc-windows-msvc,   ext: ".exe", asset: ishell-windows-x86_64.exe, mcp_asset: "" }
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  asset: ishell-linux-x86_64,  mcp_asset: ishell-mcp-linux-x86_64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, asset: ishell-linux-aarch64, mcp_asset: ishell-mcp-linux-aarch64 }
+          - { os: macos-14,         target: aarch64-apple-darwin,     asset: ishell-macos-aarch64, mcp_asset: ishell-mcp-macos-aarch64 }
+          - { os: macos-14,         target: x86_64-apple-darwin,      asset: ishell-macos-x86_64,  mcp_asset: ishell-mcp-macos-x86_64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,   asset: ishell-windows-x86_64,  mcp_asset: "" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -135,19 +135,10 @@ jobs:
           esac
           cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary
-        shell: bash
-        run: cp "target/${{ matrix.target }}/release/ishell${{ matrix.ext }}" "${{ matrix.asset }}"
-
-      # ishell-mcp 是 src/bin/ 下自动发现的第二个 bin，上面的 Build 步骤（无 --bin 过滤）本就
-      # 已经把它一起编译出来了，这里只是重命名 + 单独上传，不需要再跑一次 cargo build。
-      - name: Rename MCP binary
-        if: matrix.mcp_asset != ''
-        shell: bash
-        run: cp "target/${{ matrix.target }}/release/ishell-mcp${{ matrix.ext }}" "${{ matrix.mcp_asset }}"
+      # Release 只发布压缩包，不再上传裸二进制（用户明确要求：包列表只放压缩包）。
+      # 压缩包在各自平台的 Bundle 步骤里产出，这里统一由 release job 的 dist/* 收走。
 
       # Linux：打包 二进制 + 图标 + .desktop + 安装脚本，使其在应用菜单显示 logo。
-      # 裸二进制仍单独保留供 CLI 使用。
       - name: Bundle Linux tarball
         if: runner.os == 'Linux'
         shell: bash
@@ -171,8 +162,26 @@ jobs:
           name: ${{ matrix.asset }}.tar.gz
           path: ${{ matrix.asset }}.tar.gz
 
+      # Linux 的 MCP 代理同样只发压缩包：包内单文件 ishell-mcp（已置可执行位）。
+      - name: Bundle Linux MCP tarball
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p mcp-pkg
+          cp "target/${{ matrix.target }}/release/ishell-mcp" "mcp-pkg/ishell-mcp"
+          chmod +x "mcp-pkg/ishell-mcp"
+          tar czf "${{ matrix.mcp_asset }}.tar.gz" -C mcp-pkg ishell-mcp
+
+      - name: Upload Linux MCP tarball
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.mcp_asset }}.tar.gz
+          path: ${{ matrix.mcp_asset }}.tar.gz
+
       # macOS：把裸二进制打包成带图标的 .app，使其在「访达 / 启动台」显示 logo 并可正常启动。
-      # .app 是目录，用 ditto 压成单文件上传（保留结构与权限）。同时保留裸二进制供 CLI 使用。
+      # .app 是目录，用 ditto 压成单文件上传（保留结构与权限）。
       - name: Bundle macOS .app
         if: runner.os == 'macOS'
         shell: bash
@@ -196,18 +205,39 @@ jobs:
           sed "s/__VERSION__/$VER/g" assets/macos/Info.plist > "$APP/Contents/Info.plist"
           ditto -c -k --keepParent "$APP" "${{ matrix.asset }}.app.zip"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+      # macOS 的 MCP 代理只发压缩包：zip 内单文件 ishell-mcp（已置可执行位）。
+      - name: Bundle macOS MCP zip
+        if: runner.os == 'macOS' && matrix.mcp_asset != ''
+        shell: bash
+        run: |
+          set -e
+          mkdir -p mcp-pkg
+          cp "target/${{ matrix.target }}/release/ishell-mcp" "mcp-pkg/ishell-mcp"
+          chmod +x "mcp-pkg/ishell-mcp"
+          (cd mcp-pkg && zip -q "../${{ matrix.mcp_asset }}.zip" ishell-mcp)
 
-      - name: Upload MCP artifact
-        if: matrix.mcp_asset != ''
+      - name: Upload macOS MCP zip
+        if: runner.os == 'macOS' && matrix.mcp_asset != ''
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.mcp_asset }}
-          path: ${{ matrix.mcp_asset }}
+          name: ${{ matrix.mcp_asset }}.zip
+          path: ${{ matrix.mcp_asset }}.zip
+
+      # Windows：GUI 可执行文件压成 zip 发布（Release 不再放裸 .exe）。
+      - name: Bundle Windows zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/ishell.exe"
+          $zip = "${{ matrix.asset }}.zip"
+          Compress-Archive -Path $exe -DestinationPath $zip
+
+      - name: Upload Windows zip
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}.zip
+          path: ${{ matrix.asset }}.zip
 
       - name: Upload macOS .app
         if: runner.os == 'macOS'

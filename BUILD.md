@@ -27,10 +27,12 @@ cargo build --release
 ## 用 GitHub Actions 自动产出（无需本机有对应系统）
 
 仓库自带工作流 `.github/workflows/release.yml`，推 `v*` 标签或在 Actions 页手动 Run，
-一次产出全部平台：
-- Linux：`ishell-linux-x86_64`（裸二进制 + 带图标/desktop 的 tar.gz）
-- macOS：`ishell-macos-aarch64` / `ishell-macos-x86_64`（另附 .app 包）
-- Windows：`ishell-windows-x86_64.exe`
+一次产出全部平台（Release 只发压缩包，不附裸二进制）：
+- Linux：`ishell-linux-x86_64.tar.gz` / `ishell-linux-aarch64.tar.gz`（含图标/desktop 的 iShell/ 目录），
+  MCP 代理为 `ishell-mcp-linux-x86_64.tar.gz` / `ishell-mcp-linux-aarch64.tar.gz`
+- macOS：`ishell-macos-aarch64.app.zip` / `ishell-macos-x86_64.app.zip`，
+  MCP 代理为 `ishell-mcp-macos-aarch64.zip` / `ishell-mcp-macos-x86_64.zip`
+- Windows：`ishell-windows-x86_64.zip`（内为 ishell.exe；MCP 代理无 Windows 版——它依赖 Unix socket）
 
 产物在该次运行的 **Artifacts** 下载。
 

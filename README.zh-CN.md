@@ -116,22 +116,27 @@
 
 ## 📦 安装
 
-从 [**Releases**](https://github.com/wqkx/ishell/releases) 下载对应平台的可执行文件：
+从 [**Releases**](https://github.com/wqkx/ishell/releases) 下载对应平台的压缩包（Release 只发布压缩包，不再附裸二进制）：
 
 | 平台 | 文件 |
 |---|---|
-| Linux x86_64 | `ishell-linux-x86_64` |
-| macOS Apple Silicon | `ishell-macos-aarch64` |
-| macOS Intel | `ishell-macos-x86_64` |
-| Windows x86_64 | `ishell-windows-x86_64.exe` |
+| Linux x86_64 | `ishell-linux-x86_64.tar.gz` |
+| Linux ARM64 | `ishell-linux-aarch64.tar.gz` |
+| macOS Apple Silicon | `ishell-macos-aarch64.app.zip` |
+| macOS Intel | `ishell-macos-x86_64.app.zip` |
+| Windows x86_64 | `ishell-windows-x86_64.zip` |
 
 ```bash
-# Linux / macOS
-chmod +x ishell-*            # 赋可执行权限
-./ishell-linux-x86_64
+# Linux：解压即是 iShell/ 目录（含图标、.desktop 与安装脚本）
+tar xzf ishell-linux-x86_64.tar.gz && cd iShell && ./ishell
+
+# macOS：解压出 iShell.app，拖进「应用程序」或直接从访达启动
+unzip ishell-macos-aarch64.app.zip
+
+# Windows：解压出 ishell.exe 直接运行
 ```
 
-- **macOS** 未签名首次运行：`xattr -dr com.apple.quarantine ./ishell-macos-aarch64`，或“系统设置 → 隐私与安全性 → 仍要打开”。
+- **macOS** 未签名首次运行：`xattr -dr com.apple.quarantine iShell.app`，或“系统设置 → 隐私与安全性 → 仍要打开”。
 - **Windows** SmartScreen：点“更多信息 → 仍要运行”。
 
 ## ❓ 常见问题
@@ -140,7 +145,7 @@ chmod +x ishell-*            # 赋可执行权限
 部分 Wayland 桌面（如 KDE Plasma / GNOME）对 winit 类应用的 `text-input-v3` 协议支持有坑，导致 fcitx 等输入法无法激活、组字（和 Chrome/Electron 同病）。解决：**改走 X11（XWayland）**，其 XIM 输入法正常。两种开启方式（任选其一）：
 
 - **应用内**：终端区右键 → 勾选「**强制 X11（修复输入法·重启生效）**」→ **重启 iShell**。该设置持久化，设一次即可。
-- **环境变量**：`ISHELL_X11=1 ./ishell-linux-x86_64`（或临时 `WAYLAND_DISPLAY= ./ishell-linux-x86_64`）。
+- **环境变量**：`ISHELL_X11=1 ./iShell/ishell`（或临时 `WAYLAND_DISPLAY= ./iShell/ishell`）。
 
 > 权衡：强制 X11 会损失部分原生 Wayland 体验（如分数缩放更顺滑），换来输入法可用——与 Chrome 的 `--ozone-platform=x11` 同理。默认仍走 Wayland，仅在你开启后切换。
 
@@ -158,7 +163,7 @@ winit 只在坐标**真的变了**时才发这条请求，所以恒定上报同�
 
 
 **最小化窗口之后整个界面像被挂起、AI 也操作不了？**
-先用 `ISHELL_NO_VSYNC=1 ./ishell-linux-x86_64` 启动试一次。如果最小化之后一切正常，那就是下面这条。
+先用 `ISHELL_NO_VSYNC=1 ./iShell/ishell` 启动试一次。如果最小化之后一切正常，那就是下面这条。
 
 读框架源码得到的线索：eframe 会给**最小化的窗口照样画帧并交换缓冲**——它内部判断可见性用的 `viewport.info.visible()` 在原生平台上**没有任何一处赋值**（`Occluded` 事件写的是 `info.occluded`），恒为真，于是绘制和 `gl_surface.swap_buffers()` 都不会被跳过。而默认 `vsync: true` 让 glutin 用 `SwapInterval::Wait(1)`，那次交换要等一个垂直同步；一个已经被图标化、合成器不再呈现的窗口很可能永远等不到，画界面的线程就停在那儿。这条链路里只有这一个会阻塞的调用。
 
@@ -196,16 +201,16 @@ cargo run --release
 
 ## 🤖 AI / MCP 集成
 
-让 AI（Claude Code、Codex CLI 等）驱动**真实、持久**的终端会话——保留 cwd / 环境 / 历史，而不是每次另开一条丢光上下文的 `ssh host cmd`。可接管你已打开的标签，也可按已保存连接新开只读 AI 会话（人不能往里打字）；标签栏有 🤖 标识。
+让 AI（Claude Code、Codex CLI 等）驱动**真实、持久**的终端会话——保留 cwd / 环境 / 历史，而不是每次另开一条丢光上下文的 `ssh host cmd`。可接管你已打开的标签，也可按已保存连接新开只读 AI 会话（人不能往里打字）。
 
 ### 开启与接入
 
 1. **0.19 起默认开启**（此前默认关闭）。设置菜单里的「允许 AI 通过 MCP 控制终端」用来关掉它。仅本机 Unix socket（`~/.config/ishell/mcp-<pid>.sock`，`0600`），不监听网络端口；改这个开关需重启。
 2. 在**跑 AI 的那台机器**上安装代理：
    - **AI 跑在你 SSH 上去的服务器上** —— 在那台服务器的终端里右键 →「**安装 AI 控制代理到这台服务器**」。iShell 自带配套的 `ishell-mcp`，经现有 SFTP 通道推到 `~/.ishell-mcp/bin/ishell-mcp` 并置可执行位，再把注册命令打进终端。版本一致由构造保证，不会再出现「版本不一致，请重新部署」。*发版包只有 Linux 版内嵌代理，且只嵌自己这条腿的架构*（Linux x86_64 的 iShell 可部署到 x86_64 Linux 服务器）；本次构建没嵌任何架构时这个菜单项不显示。想要一份多架构都嵌全的包见 BUILD.md。
-   - **AI 跑在本机，或服务器是别的架构** —— 手工装：
+   - **AI 跑在本机，或服务器是别的架构** —— 手工装：从 Releases 下载 `ishell-mcp-<平台>.tar.gz`（macOS 为 `.zip`），解压出 `ishell-mcp` 后：
      ```bash
-     scripts/install-mcp.sh target/release/ishell-mcp   # → ~/.ishell-mcp/bin/ishell-mcp
+     scripts/install-mcp.sh ./ishell-mcp                  # → ~/.ishell-mcp/bin/ishell-mcp
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
      # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
      ```

@@ -18,6 +18,10 @@
   AI 提示条从「🤖 AI 正在驱动此终端（只读，uid=N）· 当前全部 AI 终端 uid：…」精简为
   「AI 正在驱动此终端（只读）」——uid/开启者列表是 MCP 调用方的内部定位细节，用户看着
   只是噪声（归属信息仍在 list_sessions 与写入弹窗里发挥作用，只是不上屏）。
+- **Release 只发压缩包**：GitHub Release 不再附裸二进制——ishell 的 Linux tar.gz /
+  macOS .app.zip / Windows zip 照旧，MCP 代理从裸二进制改为 `ishell-mcp-<平台>.tar.gz`
+  （macOS 为 .zip），Windows 新增 `ishell-windows-x86_64.zip`（原先只有裸 .exe）。README
+  安装段与 BUILD.md 的产物清单同步更新。
 
 ## [0.21.0] - 2026-09-17
 
