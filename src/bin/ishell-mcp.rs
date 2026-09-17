@@ -1091,7 +1091,9 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "用一个已保存的连接（按名称）新开一个终端会话/标签，等价于用户在 iShell 侧栏里\
+        description = "**已有合适会话时优先复用（见 list_sessions），别为同一台机器重复开新会话**\
+                        ——新会话是全新登录，没有现成的 cwd/venv/登录态。确实需要新登录时：用一\
+                        个已保存的连接（按名称）新开一个终端会话/标签，等价于用户在 iShell 侧栏里\
                         双击这条已保存连接。name 是已保存连接的名字，不是主机地址，也不是 \
                         list_sessions 里的会话标题——不确定具体拼写时先调 list_saved_connections \
                         核对。返回新会话的 uid；此时通常还没连上（connected=false，正在连接/\
@@ -1298,34 +1300,69 @@ impl IshellMcp {
 #[tool_handler(
     instructions = "这是 iShell——一个由用户盯着运行的真实终端管理器——的 MCP 桥。你操作的是**真\
                     实的交互式终端**（能看到你在打字，前台程序、提示符、sudo 都会受影响），不是\
-                    无状态的执行沙箱。用户能看见你做的每件事；写用户的会话前 iShell 会替你弹窗\
-                    征求同意。\n\
-                    会话归属（list_sessions 的 mine / ai_owned / ai_owner 三个字段）：\n\
+                    无状态的执行沙箱。用户能看见你做的每件事；写不属于你的会话前 iShell 会替你\
+                    弹窗征求同意。\n\
+                    概念与优先级：已保存连接（list_saved_connections）只是凭据模板，用来 \
+                    open_session 发起全新登录；会话（list_sessions）是已经打开的终端标签。用户\
+                    说「在 e5 上跑一下」时，e5 通常已是其中一个会话——**优先复用已有会话**，别为了\
+                    干净就开新的：新会话是全新登录，没有他现成的 cwd/venv/登录态，还多占一条\
+                    连接和一个标签。\n\
+                    会话归属（list_sessions 的 mine / ai_owned / ai_owner）：\n\
                     · mine=true：你这个进程自己 open_session 开的专用窗口，随便用，用户不能往里\
                     打字。\n\
                     · ai_owned=true 且 mine=false：另一个 AI 开的窗口，别往里写——会像写用户会话\
                     一样弹窗。\n\
                     · ai_owned=false：用户本人的会话。只读（read_screen/read_history/read_file/\
-                    list_*）随意；写入默认弹窗授权，确需复用其 cwd/venv/sudo 时才这样做，\
-                    拒绝或超时就用 open_session 开自己的。\n\
-                    标准流程：list_saved_connections 核对名字 → open_session 开专用会话（首次\
-                    需用户确认；刚返回时可能在连接中，connected=true 再用）→ run_command 执行\
-                    → 超时用 poll_run 续等（省略 run_id，不重发命令）→ 交互场景（sudo/vim/REPL）\
-                    用 send_input，看屏用 read_screen → **用完 close_session**（只能关自己开的；\
-                    开一堆不关会占着连接和标签）。\n\
+                    list_*）随意；写入会弹窗授权（本次运行内只需同意一次）。用户点名要用它时就\
+                    这样做：照常调用、等用户点允许；被拒或超时再 open_session 开自己的。\n\
+                    定位目标会话：list_sessions 按 host/title/cwd 匹配用户说的机器，多个候选用 \
+                    read_screen 看内容敲定。报「会话不存在」时别猜新 uid——错误里自带当前可用会\
+                    话列表（uid:标题），按它重新匹配；确实没有才去 list_saved_connections 核对名\
+                    字 → open_session（首次需用户确认）。uid 在同一次 iShell 运行内稳定、断线重连\
+                    不变；iShell 重启后重新分配，历史上下文里的旧 uid 可能已指向别的会话——所以\
+                    一律从最新的 list_sessions 原样复制。\n\
+                    会话状态与报错：connected=false = 还在连接/认证中或已断线（重连中），此刻发命\
+                    令会报「会话尚未连接」，等它变 true。一个会话同时只能有一条 AI 命令在跑，再发\
+                    会报「已有一条正在执行」——用 poll_run 续等或 interrupt 释放。运行中途断线：进\
+                    行中的 run_command/poll_run 会收到「运行已失效、无法再 poll_run」加已知部分输\
+                    出，按它判断执行到哪一步，不要整条重发。每条错误文案都写明了类别和下一步（重试\
+                    /换会话/找用户），按文案行事。\n\
+                    标准流程：定位会话（见上）→ run_command 执行 → 超时用 poll_run 续等（省略 \
+                    run_id，不重发）→ 交互场景（sudo/vim/REPL）用 send_input，看屏用 read_screen → \
+                    自己开的会话用完 close_session（只能关自己开的；开一堆不关会占着连接和标签）。\n\
+                    失败恢复：只读调用（list_sessions/read_screen/read_history/list_*）结果丢失或\
+                    超时就直接重调，幂等安全。写调用结果丢失：先 poll_run 确认有没有在跑；报\
+                    「run_id 不存在或已结束」而你不确定命令执行没有，用 read_screen/read_history \
+                    核实再决定，勿盲目重试有副作用的命令。看到「命令可能已执行、结果未知」先核实\
+                    屏幕。报「已经有一个 poll_run 在等待」说明旧等待者还挂着：别并发 poll，旧等待\
+                    者不要了就 interrupt 释放。\n\
+                    定位目录与环境：先 list_sessions 的 cwd 字段（用户没同意 OSC7 注入时为空）→ \
+                    再看 read_screen 里提示符显示的路径 → 还定不了就在你自己的会话 run_command 跑 \
+                    `pwd; ls; git rev-parse --show-toplevel 2>/dev/null` 这类只读探测；用户会话只用\
+                    只读手段看，别猜。\n\
                     上下文管理：你的上下文是宝贵的，终端输出不是。\n\
-                    · session_uid 一律从 list_sessions **原样复制**，不要凭记忆写数字。\n\
-                    · read_screen 只看一屏；read_history 从 max_lines 小的值开始（默认 200），\n\
+                    · read_screen 只看一屏；read_history 从 max_lines 小的值开始（默认 200），\
                     别一次性吞整个回滚。\n\
-                    · 大文件/二进制一律走 copy_to_remote/copy_from_remote（字节不进你的上下文）；\n\
+                    · 大文件/二进制一律走 copy_to_remote/copy_from_remote（字节不进你的上下文）；\
                     read_file 用于真正需要读内容的文本；grep/sed/head 等就地过滤优先于拉全量。\n\
                     · run_command 的输出会原样进你的上下文：能定向到文件的别打印，能 tail -1 的\
                     别 cat。\n\
                     可靠性：run_command 是往交互 shell 打字+回车——前台全屏程序/REPL/未闭合语法时\
-                    完成检测可能挂起，发命令前先 read_screen；中断用 interrupt；工具调用结果丢失时\
-                    先 poll_run 确认状态，勿盲目重试有副作用的命令。timeout_ms 最长 24h，长任务直接\
-                    等完，勿 sleep 轮询；`&` 优先级低于 `&&`，勿把前置步骤一并丢进后台。远端命令/\
-                    文件优先走本工具集，不要另开 `ssh host cmd`（会丢 cwd/环境/历史，用户也看不见）。"
+                    完成检测可能挂起，发命令前先 read_screen；中断用 interrupt；timeout_ms 最长 24h，\
+                    长任务直接等完，勿 sleep 轮询；`&` 优先级低于 `&&`，勿把前置步骤一并丢进后台。远\
+                    端命令/文件优先走本工具集，不要另开 `ssh host cmd`（会丢 cwd/环境/历史，用户也看\
+                    不见）。\n\
+                    典型任务：\n\
+                    · 在用户已打开的 e5 会话跑测试：list_sessions（host/title 找 e5，cwd 确认是目\
+                    标仓库）→ run_command ./run_tests.sh（用户会话会弹窗，等允许）→ 超时 poll_run \
+                    续等 → read_screen 看结果。\n\
+                    · 机器还没有打开会话：list_saved_connections 核对名字 → open_session → 等 \
+                    connected=true → run_command `pwd; ls` 探测环境 → 干活 → close_session。\n\
+                    · 长构建/长测试：run_command timeout_ms 给足直接等；MCP 客户端自己超时断了就 \
+                    poll_run（省略 run_id）续等同一条运行，绝不重发命令。\n\
+                    · 终端卡着交互程序（vim/top/sudo 密码提示）：先 read_screen 看前台是什么 → \
+                    send_input 逐键应对（vim 里 :q! 加回车）→ sudo 密码提示符让用户自己输，或征得\
+                    同意后 send_input。"
 )]
 impl ServerHandler for IshellMcp {}
 
