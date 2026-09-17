@@ -1,8 +1,9 @@
 //! AI/MCP 控制通道的本地线协议：iShell 主进程与独立的 `ishell-mcp` stdio 代理进程之间，
 //! 经 Unix domain socket 传输的请求/响应类型。一次 socket 连接 = 一问一答（换行分隔的 JSON），
-//! 不做多路复用——**唯一的例外**是 v4 的配对握手（`PairHello`→`PairProve`，一条连接两问两答），
-//! 因为双向证明必须绑定同一对随机数，拆成两条连接就绑不住了。本文件被 `main.rs` 和
-//! `src/bin/mcp_stdio.rs` 各自 `include!` 一份，避免为共享这几个类型而拆出独立的 lib crate。
+//! 不做多路复用——**唯一的例外**是 v4 引入并沿用至今的配对握手（`PairHello`→`PairProve`，
+//! 一条连接两问两答），因为双向证明必须绑定同一对随机数，拆成两条连接就绑不住了。本文件被
+//! `main.rs` 和 `src/bin/ishell-mcp.rs` 各自 `include!` 一份，避免为共享这几个类型而拆出
+//! 独立的 lib crate。
 
 use serde::{Deserialize, Serialize};
 

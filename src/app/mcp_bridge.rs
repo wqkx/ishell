@@ -1,6 +1,7 @@
 //! AI/MCP 控制通道：本地 Unix domain socket 桥接，供独立的 `ishell-mcp` stdio 代理进程
-//! （见 `src/bin/mcp_stdio.rs`）连接，把 list/run/poll/read/interrupt 请求转发到本进程
-//! 持有的活跃 SSH 会话。默认关闭（`store::load_mcp_consent()`），一次 socket 连接 = 一问一答。
+//! （见 `src/bin/ishell-mcp.rs`）连接，把 list/run/poll/read/interrupt 请求转发到本进程
+//! 持有的活跃 SSH 会话。由 `store::load_mcp_consent()` 开关把门（0.19 起默认开），
+//! 一次 socket 连接 = 一问一答。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

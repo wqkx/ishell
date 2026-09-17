@@ -122,7 +122,8 @@ impl Probe {
 /// 连一条 socket 问出对端 iShell 的实例标识（可选地完成配对握手）。
 ///
 /// `prove_token`：
-/// - `None` → 发普通 `Identify`，发现全部实例（供多机弹窗选择）。
+/// - `None` → 发普通 `Identify` 问出实例标识（只用于 connect_bound 按 id 找回已绑定的
+///   实例；v5 起无 token 不再用于发现绑定，bind_instance 直接拒绝）。
 /// - `Some` → 走 v4 **双向挑战-应答**握手（`PairHello` → 验对端的 `Server` 证明 →
 ///   `PairProve`）。token 本身绝不过线；对端证明不过就地放弃，**不发**自己的证明——
 ///   否则一个不知道 token 的假 socket 也能把本代理钓过去（见 `mcp_protocol` 的说明）。
