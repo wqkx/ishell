@@ -236,13 +236,15 @@ impl App {
         // 是同一个（仅当前会话、不写 rc），但 AI 自己的会话无需征求同意——和用户会话不同，
         // 这里没人「正在用」这个 shell，注入的代价只是提示符上多一条看不见的 OSC 序列。
         // 注入后远端每次显示提示符都会上报 cwd，`list_sessions` 的 cwd 字段由此有值——
-        // 否则 AI 只能跑 pwd 猜目录。与上面各趟分开：判据同样交给 `shell_idle_for_injection`
-        // （含 injection_idle_for，上一趟注入的回显吞除不会被这趟冲掉）。
+        // 否则 AI 只能跑 pwd 猜目录。与上面各趟分开：判据走 AI 专用闸门
+        // `ai_shell_idle_for_injection`（同样含 injection_idle_for，上一趟注入的回显吞除
+        // 不会被这趟冲掉；不能用 `shell_idle_for_injection`——它的 !ai_owned/never_typed
+        // 是为用户 shell 设计的，对 AI 会话恒假）。
         for s in &mut self.sessions {
             if !s.ai_owned || !s.connected || s.osc7_injected {
                 continue;
             }
-            if s.shell_idle_for_injection() {
+            if s.ai_shell_idle_for_injection() {
                 let cmd = super::view_state::OSC7_SNIPPET;
                 let _ = s
                     .cmd_tx

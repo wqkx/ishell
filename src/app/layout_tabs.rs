@@ -171,8 +171,11 @@ impl App {
                                     let ctx = ui.ctx().clone();
                                     let body_font = egui::TextStyle::Body.resolve(ui.style());
                                     let mut acc = 0.0f32; // 目标布局累计左边界
-                                    // 同名会话消歧：标题撞车的会话追加区分后缀（主机，本机会话
-                                    // 退化为 uid），不撞车的标签保持原标题、零额外噪声。
+                                    // 同名会话消歧：标题撞车的会话追加区分后缀，不撞车的
+                                    // 标签保持原标题、零额外噪声。后缀先取主机（本机/无
+                                    // 主机信息用 #uid）；同名又同主机的（最常见：同名连接
+                                    // 开两个）主机后缀照样撞车，第二遍把 uid 并进后缀——
+                                    // uid 在同一次运行内唯一，兜底无歧义。
                                     let mut title_counts: std::collections::HashMap<
                                         &str,
                                         usize,
@@ -180,21 +183,43 @@ impl App {
                                     for s in &self.sessions {
                                         *title_counts.entry(s.title.as_str()).or_default() += 1;
                                     }
+                                    let mut display_titles: Vec<String> = self
+                                        .sessions
+                                        .iter()
+                                        .map(|s| {
+                                            if title_counts[s.title.as_str()] > 1 {
+                                                let disambig =
+                                                    if s.cfg.is_local() || s.cfg.host.is_empty() {
+                                                        format!("#{}", s.uid)
+                                                    } else {
+                                                        s.cfg.host.clone()
+                                                    };
+                                                format!("{} · {}", s.title, disambig)
+                                            } else {
+                                                s.title.clone()
+                                            }
+                                        })
+                                        .collect();
+                                    let mut full_counts: std::collections::HashMap<
+                                        String,
+                                        usize,
+                                    > = std::collections::HashMap::new();
+                                    for d in &display_titles {
+                                        *full_counts.entry(d.clone()).or_default() += 1;
+                                    }
+                                    for (s, d) in
+                                        self.sessions.iter().zip(display_titles.iter_mut())
+                                    {
+                                        if full_counts[d.as_str()] > 1 {
+                                            *d = format!("{} · #{}", s.title, s.uid);
+                                        }
+                                    }
                                     for (i, s) in self.sessions.iter().enumerate() {
                                         let selected = active == Some(i);
                                         // 标签只显示会话标题：机器人图标、开启者名这类
                                         // MCP 内部标识用户看着只是噪声（归属信息仍在
                                         // list_sessions/写入弹窗里发挥作用，不上屏）。
-                                        let display_title = if title_counts[s.title.as_str()] > 1 {
-                                            let disambig = if s.cfg.host.is_empty() {
-                                                format!("#{}", s.uid)
-                                            } else {
-                                                s.cfg.host.clone()
-                                            };
-                                            format!("{} · {}", s.title, disambig)
-                                        } else {
-                                            s.title.clone()
-                                        };
+                                        let display_title = display_titles[i].clone();
                                         // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
                                         let title_w = ctx.fonts_mut(|f| {
                                             f.layout_no_wrap(

@@ -223,6 +223,34 @@ fn injection_allowed(
         && t.never_typed()
 }
 
+/// AI 专用会话的注入闸门——`frame.rs` 的 OSC 7 cwd 上报片段自动注入用。抽成自由函数
+/// 的理由与 `injection_allowed` 相同：`Session` 在测试里造不出来。
+///
+/// 与 `injection_allowed` 的两处刻意差别：
+///
+/// - **不排斥 `ai_owned`**：这道闸门存在的目的就是往 AI 会话里注入；
+/// - **不要求 `never_typed`**：AI 会话的键盘输入虽不转发（`layout_body` 丢弃字节），
+///   但 `collect_input` 依旧会记 `last_input_at`——用户随手按一个键，never_typed 就在
+///   本次连接内永久为假，注入永远轮不到。而「有人正对着密码提示符打字」这条安全边界对
+///   AI 会话不成立：字节根本不送达远端，被吃掉的不是任何人的输入。
+///
+/// 保留的判据：`connected`（断线不注）、`ai_busy`（有挂起的 AI 命令/哨兵捕获时不注——
+/// `expect_echo` 会整体覆写吞除状态、打断正在进行的 run_command）、`terminal_idle`
+/// （没见过提示符 / 还在动 / 我们自己刚注过，都不注）。
+///
+/// 残余风险（可接受，写在这里防漂移）：AI 用 send_input 起过 sudo/ssh 这类阻塞在 stdin
+/// 的程序时，静止判据分不清「shell 闲在提示符上」和「密码提示符」——注入行会被当密码
+/// 吃掉、注入标记却已置位。注入每连接只做一次（`osc7_injected`），且通常发生在会话刚
+/// 连上、AI 还没来得及做交互操作的空档；真撞上重新连接即可重注。
+fn ai_injection_allowed(
+    connected: bool,
+    ai_busy: bool,
+    t: &Terminal,
+    quiet: std::time::Duration,
+) -> bool {
+    connected && !ai_busy && terminal_idle(t, quiet)
+}
+
 impl Session {
     /// 见 [`injection_allowed`]。与 MCP 配对标识的自动注入共用同一道闸门**是有意的**：
     /// 两处干的是同一件事（程序替用户敲键盘），判据分成两份迟早会漂移，而漂移的后果是
@@ -232,6 +260,20 @@ impl Session {
         injection_allowed(
             self.connected,
             self.ai_owned,
+            self.pending_ai_run.is_some() || self.terminal.ai_capture_pending(),
+            &self.terminal,
+            QUIET,
+        )
+    }
+
+    /// 见 [`ai_injection_allowed`]。供 `frame.rs` 的 AI 会话 OSC 7 自动注入使用——
+    /// **不要改用 `shell_idle_for_injection`**：那道闸门的 `!ai_owned` 与 `never_typed`
+    /// 是为用户 shell 设计的，对 AI 会话恒假，注入会永远不发生（回归测试钉在
+    /// `injection_gate_tests::ai_gate_opens_for_idle_ai_sessions`）。
+    pub(super) fn ai_shell_idle_for_injection(&self) -> bool {
+        const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+        ai_injection_allowed(
+            self.connected,
             self.pending_ai_run.is_some() || self.terminal.ai_capture_pending(),
             &self.terminal,
             QUIET,
@@ -738,7 +780,7 @@ mod cwd_restore_tests {
 
 #[cfg(test)]
 mod injection_gate_tests {
-    use super::injection_allowed;
+    use super::{ai_injection_allowed, injection_allowed};
     use crate::terminal::Terminal;
 
     const QUIET: std::time::Duration = std::time::Duration::from_secs(1);
@@ -837,5 +879,48 @@ mod injection_gate_tests {
                 "刚替用户敲过一行，下一条注入必须等"
             );
         }
+    }
+
+    /// AI 专用闸门的正向对照：OSC 7 注入等的就是「连上 + 闲够」这一帧。
+    /// 反向对照：`frame.rs` 的 OSC 7 注入曾错用 `injection_allowed`，AI 会话被
+    /// `!ai_owned` 恒拒、整条注入路径成为死代码——本测试钉住 AI 闸门自己的取值。
+    #[test]
+    fn ai_gate_opens_for_idle_ai_sessions() {
+        let mut t = Terminal::new();
+        t.feed(b"user@host:~$ ");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            ai_injection_allowed(true, false, &t, QUIET),
+            "收到输出、又静止够久了：OSC 7 注入该发生的一帧"
+        );
+        assert!(
+            !ai_injection_allowed(false, false, &t, QUIET),
+            "断线期间不注入"
+        );
+        assert!(
+            !ai_injection_allowed(true, true, &t, QUIET),
+            "有挂起的 AI 命令/哨兵捕获时不注入——expect_echo 会覆盖它的吞除状态"
+        );
+    }
+
+    /// AI 会话的只读键盘依旧会被 `collect_input` 记进 `last_input_at`（字节只是不转发，
+    /// 见 `layout_body`），所以 AI 闸门刻意不看 never_typed：用户随手按一个键，不该把
+    /// 本次连接的 OSC 7 注入永久封死——停笔够久后闸门照常开放。
+    /// 反向对照：把 never_typed 加回 AI 闸门，这条当场挂。
+    #[test]
+    fn ai_gate_ignores_stray_user_keypresses() {
+        let mut t = Terminal::new();
+        t.feed(b"user@host:~$ ");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        t.note_user_input_for_test();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            ai_injection_allowed(true, false, &t, QUIET),
+            "按键不送达远端、停笔也够久了：对 AI 会话不构成「有人正对着提示符打字」"
+        );
+        assert!(
+            !injection_allowed(true, false, false, &t, QUIET),
+            "同一帧上用户闸门依旧关死——never_typed 是整段连接的性质，两道闸门必须不同"
+        );
     }
 }

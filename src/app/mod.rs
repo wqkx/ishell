@@ -312,6 +312,12 @@ impl eframe::App for App {
         }
     }
 
+    /// 进程退出收尾：跨会话拷贝留下的临时 SSH 信任只能在这里尽力补救（worker 随进程
+    /// 一起死，再晚就来不及发了）。详见 `mcp_bridge::revoke_temp_keys_on_exit`。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.revoke_temp_keys_on_exit();
+    }
+
     /// eframe 0.34 的现代入口。这里只是兜底外壳，真正的绘制在 [`App::ui_impl`]。
     ///
     /// 为什么要 `catch_unwind`：SSH 客户端崩一次的代价是所有会话断开 + 编辑器里未保存的

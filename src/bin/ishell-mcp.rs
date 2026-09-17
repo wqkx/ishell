@@ -662,20 +662,36 @@ async fn copy_to_remote_from_caller(
     let mut source = tokio::fs::File::open(&path)
         .await
         .map_err(|error| format!("无法打开调用方文件 {local_path}: {error}"))?;
-    tokio::io::copy(&mut source, &mut write_half)
-        .await
-        .map_err(|error| format!("发送调用方文件流失败: {error}"))?;
-    write_half
-        .shutdown()
-        .await
-        .map_err(|error| format!("结束调用方文件流失败: {error}"))?;
-
+    // 边推文件体、边读响应。GUI 可能在我们还在写时就拒绝（会话不存在/路径非法/并发满/
+    // 用户拒绝授权）——先写完整个文件才读响应的话，超过内核缓冲的大文件拿到的是 EPIPE，
+    // 真实错误被掩盖，同一错误大小文件表现不同。并发读后，拒绝一到手立刻丢弃写入 future、
+    // 关闭连接（对端读端随之 EOF），把 GUI 给出的真实错误原样带给调用方。
     let mut response = String::new();
     let mut reader = BufReader::new(read_half);
-    let read = tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut response))
-        .await
-        .map_err(|_| "等待 iShell 上传响应超时（可能是 GUI、SFTP 或连接异常）".to_string())?
-        .map_err(|error| error.to_string())?;
+    let body = async {
+        tokio::io::copy(&mut source, &mut write_half).await?;
+        write_half.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::pin!(body);
+    let early = tokio::select! {
+        r = &mut body => {
+            r.map_err(|error| format!("发送调用方文件流失败: {error}"))?;
+            None
+        }
+        r = reader.read_line(&mut response) => Some(r),
+    };
+    let read = match early {
+        Some(r) => r.map_err(|error| error.to_string())?,
+        None => {
+            // 文件体已推完：按既有路径等判定行。read_line 在 select 里被丢弃时可能已把
+            // 一行的一部分追加进 response——同一行接着读，内容仍然连续。
+            tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut response))
+                .await
+                .map_err(|_| "等待 iShell 上传响应超时（可能是 GUI、SFTP 或连接异常）".to_string())?
+                .map_err(|error| error.to_string())?
+        }
+    };
     if read == 0 {
         return Err("iShell 未返回上传结果就关闭了连接".into());
     }
@@ -1048,6 +1064,11 @@ impl IshellMcp {
                         程序/续行的输入吃掉，完成检测可能永远等不到，且可能改动那个程序里的\
                         数据。不确定当前前台状态时，先用 read_screen 看一眼再决定要不要发命令，\
                         或者改用 send_input 应对交互式场景。\
+                        还有一类命令形态会连**完成哨兵**一起吞掉、让运行永远等不到结束：命令以 `#`\
+                        注释结尾、引号未闭合、以反斜杠续行结尾，或多行命令的中间行进入交互程\
+                        序——表现为反复超时、输出却在增长。这时调用 interrupt 释放，用 \
+                        read_screen/read_history 核实，并把命令改写为完整单行重试——不要反复 \
+                        poll_run 干等（每次都会烧满一个完整超时）。\
                         两个解读输出时容易踩的坑：① output 末尾常带一段 shell 提示符残留（比如 \
                         `(venv) user@host:~$`，有时只剩一个 `$`）——这是刻意不做的清理（早期试过按\
                         「最后一行大概率是提示符」启发式剥掉，但 PS1 为空/不可见时会把真实输出误删，\
@@ -1076,12 +1097,15 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "启动一条可能很长的命令，并在至多 100ms 后返回，不会因 MCP 客户端的长时间\
-                        空闲限制而占住等待连接。返回 finished=false 时保存 run_id，之后用 poll_run\
+        description = "启动一条可能很长的命令；命令开始运行后至多 100ms 返回（会话还在连接/\
+                        认证中时会先等它连上，最多约 20 秒），不会因 MCP 客户端的长时间空闲\
+                        限制而占住等待连接。返回 finished=false 时保存 run_id，之后用 poll_run\
                         以较短 timeout_ms 查询；命令已很快结束时会直接返回 finished=true。\
                         **预计运行时间可能超过 MCP 客户端空闲超时（几十秒到几分钟）的命令优先用\
-                        本工具**：run_command 的等待会被客户端空闲超时切断，本工具不会。会话还在\
-                        连接/认证中时同样会自动等它连上（最多约 20 秒）。"
+                        本工具**：run_command 的等待会被客户端空闲超时切断，本工具不会。\
+                        完成哨兵与 run_command 是同一套：若命令形态把哨兵吞掉（以 # 注释结尾、\
+                        引号未闭合、反斜杠续行结尾），运行同样永远等不到结束——按 run_command \
+                        描述里的处理办法 interrupt 释放、改写成完整单行重试。"
     )]
     async fn start_command(
         &self,
@@ -1376,7 +1400,7 @@ impl IshellMcp {
                     定位目标会话：list_sessions 按 host/title/cwd 匹配用户说的机器，多个候选用 \
                     read_screen 看内容敲定。报「会话不存在」时别猜新 uid——错误里自带当前可用会\
                     话列表（uid:标题），按它重新匹配；确实没有才去 list_saved_connections 核对名\
-                    字 → open_session（首次需用户确认）。uid 在同一次 iShell 运行内稳定、断线重连\
+                    字 → open_session。uid 在同一次 iShell 运行内稳定、断线重连\
                     不变；iShell 重启后重新分配，历史上下文里的旧 uid 可能已指向别的会话——所以\
                     一律从最新的 list_sessions 原样复制。\n\
                     会话状态与报错：connected=false = 还在连接/认证中或已断线（重连中）；run_command \

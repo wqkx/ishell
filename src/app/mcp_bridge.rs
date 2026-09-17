@@ -1194,6 +1194,12 @@ impl App {
                 if let Some(tx) = pending.resp_tx.take() {
                     let _ = tx.send(resp);
                 }
+                // 本次等待的耐心已兑现：把 deadline 拨回未来。否则「停在过去的 deadline」
+                // 会让 `arm_timeout_repaint` 每帧算出 request_repaint_after(0)——GUI 全速
+                // 空转（且每帧对捕获缓冲做一次 ANSI 剥离），直到哨兵到达/interrupt/poll_run
+                // 重新武装 deadline 为止。重绘心跳与数据事件照常驱动帧，完成检测不会丢；
+                // poll_run 会按自己的 timeout_ms 重新武装 deadline。
+                pending.deadline = Instant::now() + std::time::Duration::from_secs(3600);
                 // 未完成：保留 pending_ai_run，等下一次 poll_run 续等（不重发命令）
             }
         }
@@ -1313,7 +1319,12 @@ impl App {
                 if let Some(tx) = op.resp_tx.take() {
                     let _ = tx.send(McpResponse {
                         id: op.req_id,
-                        result: Err("文件操作超时（worker 未在超时前返回结果）".into()),
+                        result: Err(
+                            "文件操作超时（worker 未在超时前返回结果）。注意：写入/复制类操作\
+                             无法取消、可能已经在远端生效——重试覆盖同一文件前，先用 read_file \
+                             或到远端核实"
+                                .into(),
+                        ),
                     });
                 }
                 // worker 侧的 SFTP 操作没法取消，超时不代表它已经停止——记一个"墓碑"，
@@ -1345,8 +1356,31 @@ impl App {
         relay_source: Vec<(u64, Result<u64, String>)>,
         copy_done: Vec<(u64, u64, bool, String)>,
     ) {
+        // 参与会话被关闭或断线的作业立即判败：底层 scp/管道已随连接死掉，等它自愈没有意义
+        // （断线重连是全新 worker，作业持有的旧 cmd_tx/传输不可能复活）——不检查的话作业
+        // 会一直挂到总超时（最长 24h）才以一句笼统的「超时」收场。
+        for idx in (0..self.cross_copy_jobs.len()).rev() {
+            let dead = {
+                let job = &self.cross_copy_jobs[idx];
+                [("源", job.src_uid), ("目标", job.dest_uid)]
+                    .into_iter()
+                    .find_map(|(role, uid)| match self.session_idx_by_uid(uid) {
+                        None => Some(format!("{role}会话已不存在（uid={uid}），跨会话拷贝中止")),
+                        Some(i) if !self.sessions[i].connected => {
+                            Some(format!("{role}会话已断线（uid={uid}），跨会话拷贝中止——重连后请重试"))
+                        }
+                        Some(_) => None,
+                    })
+            };
+            if let Some(msg) = dead {
+                self.fail_cross_copy_job(idx, msg);
+            }
+        }
         for (op_id, ok, message) in temp_key_trusted {
             let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
+                // 作业刚因总超时/失败被移除、回执才到：总超时分支已按「TrustingB 在途窗口」
+                // 补发过撤销，这里属良性迟到——但留一行日志，排查残留时才知道发生过什么。
+                log::debug!("TempKeyTrusted 迟到：op {op_id} 的作业已不存在");
                 continue;
             };
             if !matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::TrustingB) {
@@ -1386,21 +1420,11 @@ impl App {
             };
             // 撤销失败**不改变**这次拷贝的成败（`direct_result` 早就定了），但绝不能咽下去：
             // 目标机的 `~/.ssh/authorized_keys` 里可能留着一把带 `restrict` 的临时公钥，
-            // 而用户完全不知道该去清。把原因连同标记一起摆到目标会话的状态栏上。
+            // 而用户完全不知道该去清——交给 `warn_temp_key_residue` 落日志 + 摆到状态栏/toast。
             if !ok {
                 let dest_uid = self.cross_copy_jobs[idx].dest_uid;
                 let marker = self.cross_copy_jobs[idx].marker.clone();
-                log::warn!("临时公钥撤销失败（op {op_id}，标记 {marker}）：{message}");
-                if let Some(d) = self.session_idx_by_uid(dest_uid) {
-                    self.sessions[d].status = match crate::i18n::current() {
-                        crate::i18n::Lang::Zh => format!(
-                            "⚠ 临时公钥未能撤销（{message}）。请在这台机器上手工删除                              ~/.ssh/authorized_keys 里含 {marker} 的那一行。"
-                        ),
-                        crate::i18n::Lang::En => format!(
-                            "⚠ Could not revoke the temporary key ({message}). Please remove the                              line containing {marker} from ~/.ssh/authorized_keys on this host."
-                        ),
-                    };
-                }
+                self.warn_temp_key_residue(dest_uid, marker, &format!("撤销失败（{message}）"));
             }
             if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
                 self.finish_after_untrust(idx, true);
@@ -1478,14 +1502,38 @@ impl App {
                 if matches!(job.phase, CrossCopyPhase::UntrustingAfterDirect) {
                     self.finish_after_untrust(idx, false);
                 } else {
-                    if job.trust_established {
+                    // 直连传输已在进行：先把取消标志置上——job 随即移除，否则源 worker 的
+                    // scp/rsync 会照跑完，AI 据「超时」重试就是两个进程并发写同一目标文件。
+                    if matches!(job.phase, CrossCopyPhase::DirectCopying { .. }) {
+                        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // 「信任已确立」或「还在 TrustingB」（信任已发给 worker、回执未到的在途
+                    // 窗口）都可能真的在目标机 authorized_keys 里留了临时公钥，必须补发撤销：
+                    // 只按 trust_established 判定会漏掉在途窗口——总超时命中后 job 立即移除，
+                    // 迟到的 TempKeyTrusted 找不到 job 被静默吞掉，公钥永久残留且无告警。
+                    if job.trust_established || matches!(job.phase, CrossCopyPhase::TrustingB) {
                         let marker = job.marker.clone();
                         let op_id = job.op_id;
                         let dest_uid = job.dest_uid;
-                        if let Some(dest_idx) = self.session_idx_by_uid(dest_uid) {
-                            let _ = self.sessions[dest_idx]
-                                .cmd_tx
-                                .send(UiCommand::UntrustTempKey { op_id, marker });
+                        match self.session_idx_by_uid(dest_uid) {
+                            Some(dest_idx) => {
+                                let sent = self.sessions[dest_idx]
+                                    .cmd_tx
+                                    .send(UiCommand::UntrustTempKey { op_id, marker: marker.clone() })
+                                    .is_ok();
+                                if !sent {
+                                    self.warn_temp_key_residue(
+                                        dest_uid,
+                                        marker,
+                                        "撤销消息发送失败（目标会话后台连接已断开）",
+                                    );
+                                }
+                            }
+                            None => self.warn_temp_key_residue(
+                                dest_uid,
+                                marker,
+                                "目标会话已不存在，无法自动撤销",
+                            ),
                         }
                     }
                     self.fail_cross_copy_job(idx, "跨会话拷贝超时（源或目标 worker 未在超时前返回结果）".into());
@@ -1569,10 +1617,23 @@ impl App {
         let marker = job.marker.clone();
         let op_id = job.op_id;
         let dest_uid = job.dest_uid;
-        if let Some(dest_idx) = self.session_idx_by_uid(dest_uid) {
-            let _ = self.sessions[dest_idx]
-                .cmd_tx
-                .send(UiCommand::UntrustTempKey { op_id, marker });
+        match self.session_idx_by_uid(dest_uid) {
+            Some(dest_idx) => {
+                let sent = self.sessions[dest_idx]
+                    .cmd_tx
+                    .send(UiCommand::UntrustTempKey { op_id, marker: marker.clone() })
+                    .is_ok();
+                if !sent {
+                    // 与 `finish_direct_attempt` 同理：发送失败意味着没有任何在途撤销，
+                    // 必须告警而不是沉默。
+                    self.warn_temp_key_residue(
+                        dest_uid,
+                        marker,
+                        "撤销消息发送失败（目标会话后台连接已断开）",
+                    );
+                }
+            }
+            None => self.warn_temp_key_residue(dest_uid, marker, "目标会话已不存在，无法自动撤销"),
         }
         self.start_relay_fallback(idx);
     }
@@ -1612,12 +1673,25 @@ impl App {
         let marker = job.marker.clone();
         let op_id = job.op_id;
         let dest_uid = job.dest_uid;
-        if let Some(dest_idx) = self.session_idx_by_uid(dest_uid) {
-            let _ = self.sessions[dest_idx]
-                .cmd_tx
-                .send(UiCommand::UntrustTempKey { op_id, marker });
+        match self.session_idx_by_uid(dest_uid) {
+            Some(dest_idx) => {
+                let sent = self.sessions[dest_idx]
+                    .cmd_tx
+                    .send(UiCommand::UntrustTempKey { op_id, marker: marker.clone() })
+                    .is_ok();
+                if !sent {
+                    // 发送失败 = 没有任何在途撤销可等：UNTRUST_WAIT 只会自然收尾，公钥将残留。
+                    // 残留必须对用户可见（状态栏/toast），不能只落日志。
+                    self.warn_temp_key_residue(
+                        dest_uid,
+                        marker,
+                        "撤销消息发送失败（目标会话后台连接已断开）",
+                    );
+                }
+            }
+            // 目标会话已不存在：连补发的通道都没了，同样只能告警。
+            None => self.warn_temp_key_residue(dest_uid, marker, "目标会话已不存在，无法自动撤销"),
         }
-        // 发送失败或目标会话已经不存在都不额外处理：UNTRUST_WAIT 到了会自然收尾。
     }
 
     /// 撤销信任已完成（或等不到回执，超时放弃）：按之前确定的直连结果决定收尾——
@@ -1643,6 +1717,51 @@ impl App {
                 // 而它必定先写好 direct_result。真到了这里就把 job 收掉，不能让它悬着
                 // 永远占着两侧的 pending_file_op。
                 self.fail_cross_copy_job(idx, "内部错误：直连结果丢失".into())
+            }
+        }
+    }
+
+    /// 临时公钥可能残留在目标机 authorized_keys 的告警：落日志 + 目标会话状态栏；会话已经不在
+    /// （连状态栏都没了）时退化到全局 toast。原则：**残留必须对用户可见**，不能只剩一行日志。
+    fn warn_temp_key_residue(&mut self, dest_uid: u64, marker: String, reason: &str) {
+        log::warn!(
+            "copy_between_sessions 临时公钥可能残留（目标 uid {dest_uid}，标记 {marker}）：{reason}"
+        );
+        let text = match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!(
+                "⚠ 临时公钥可能残留在目标机上（{reason}）。请删除对应主机 ~/.ssh/authorized_keys 里含 {marker} 的那一行。"
+            ),
+            crate::i18n::Lang::En => format!(
+                "⚠ The temporary key may remain on the destination host ({reason}). Remove the line containing {marker} from ~/.ssh/authorized_keys there."
+            ),
+        };
+        match self.session_idx_by_uid(dest_uid) {
+            Some(i) => self.sessions[i].status = text,
+            None => self.toast = Some((text, self.ctx.input(|i| i.time))),
+        }
+    }
+
+    /// 进程退出收尾（`on_exit` 调用）：所有「信任已确立」或「还在 TrustingB 在途窗口」的
+    /// 跨会话拷贝作业，补发一次尽力而为的临时公钥撤销。on_exit 返回后进程随即退出、worker
+    /// 随之死掉，这条命令未必来得及生效，所以同时落 warning 日志——authorized_keys 里的
+    /// 标记注释是事后人工清理的唯一线索。
+    pub(super) fn revoke_temp_keys_on_exit(&mut self) {
+        for job in &self.cross_copy_jobs {
+            let maybe_trusted =
+                job.trust_established || matches!(job.phase, CrossCopyPhase::TrustingB);
+            if !maybe_trusted {
+                continue;
+            }
+            log::warn!(
+                "退出时补发临时公钥撤销（尽力而为，可能来不及生效；目标 uid {}，标记 {}）",
+                job.dest_uid,
+                job.marker
+            );
+            if let Some(dest_idx) = self.session_idx_by_uid(job.dest_uid) {
+                let _ = self.sessions[dest_idx].cmd_tx.send(UiCommand::UntrustTempKey {
+                    op_id: job.op_id,
+                    marker: job.marker.clone(),
+                });
             }
         }
     }
@@ -2073,7 +2192,20 @@ impl App {
                         p.resp_tx = Some(resp_tx);
                         p.req_id = id;
                     }
-                    _ => send_err(resp_tx, "run_id 不存在或已结束".into()),
+                    // run_id 对不上 ≠ 运行结束：会话上挂着的是**另一条**运行（还在执行，
+                    // 或结果待取回）——措辞必须区分，否则 AI 会以为这条运行已结束而放弃续等。
+                    Some(_) => send_err(
+                        resp_tx,
+                        "run_id 对不上：该会话上当前是另一条运行（可能仍在执行，或结果待取回）。\
+                         从最新上下文核对 run_id；要释放该会话的运行，调用 interrupt"
+                            .into(),
+                    ),
+                    None => send_err(
+                        resp_tx,
+                        "run_id 不存在或已结束：结果可能已被之前的 poll_run 取走，或运行被 \
+                         interrupt/断线作废。要确认命令最终状态，用 read_screen/read_history 核实"
+                            .into(),
+                    ),
                 }
             }
             McpReqKind::ReadScreen { session_uid } => {
