@@ -932,25 +932,28 @@ impl Terminal {
                 do_paste = true;
                 ui.close();
             }
-            if ui
-                .button(crate::i18n::tr(
-                    "立即注入配对标识",
-                    "Inject pairing token now",
-                ))
-                .on_hover_text(crate::i18n::tr(
-                    "立刻往本终端执行 ` export ISHELL_MCP_TOKEN=…`（回显吞除）。\n\
-                     自动注入只发生在「连接后一个键都没敲过」的会话上；你敲过键盘的会话会\
-                     静默跳过——在其中启动的 AI 没有配对身份，绑定请求会对服务器上所有\
-                     iShell 弹窗。点这里手动补上即可（等价于替你在 shell 里执行那行 export）。",
-                    "Runs ` export ISHELL_MCP_TOKEN=…` in this terminal right now (echo \
-                     swallowed).\n\
-                     Auto-injection only happens in sessions where you haven't typed since \
-                     connecting; a session you typed in is silently skipped — an AI started \
-                     there has no pairing identity and its bind request pops up on EVERY \
-                     iShell on this server. Click here to inject manually (same as typing \
-                     that export yourself).",
-                ))
-                .clicked()
+            // 只在「允许 AI 通过 MCP 控制终端」开启时显示：总开关关了，socket 都没监听，
+            // 注入配对标识毫无意义（自动注入同样被 `pair_inject_allowed` 的总开关前置挡住）。
+            if crate::store::load_mcp_consent()
+                && ui
+                    .button(crate::i18n::tr(
+                        "立即注入配对标识",
+                        "Inject pairing token now",
+                    ))
+                    .on_hover_text(crate::i18n::tr(
+                        "立刻往本终端执行 ` export ISHELL_MCP_TOKEN=…`（回显吞除）。\n\
+                         自动注入只发生在「连接后一个键都没敲过」的会话上；你敲过键盘的会话会\
+                         静默跳过——在其中启动的 AI 没有配对身份，绑定请求会对服务器上所有\
+                         iShell 弹窗。点这里手动补上即可（等价于替你在 shell 里执行那行 export）。",
+                        "Runs ` export ISHELL_MCP_TOKEN=…` in this terminal right now (echo \
+                         swallowed).\n\
+                         Auto-injection only happens in sessions where you haven't typed since \
+                         connecting; a session you typed in is silently skipped — an AI started \
+                         there has no pairing identity and its bind request pops up on EVERY \
+                         iShell on this server. Click here to inject manually (same as typing \
+                         that export yourself).",
+                    ))
+                    .clicked()
             {
                 self.pair_inject_request = true;
                 ui.close();

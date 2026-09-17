@@ -244,6 +244,8 @@ impl Session {
 
     /// 用户从终端右键菜单手动触发「立即注入配对标识」：即刻注入，绕过 never_typed 闸门——
     /// 用户亲手点击等价于本人同意，且他正看着这个终端，注入的回显吞除与否都在他眼皮底下。
+    /// 但不绕过 `ai_busy` 闸门：会话里有正在执行的 AI 命令时注入会打断它（见
+    /// `injection_allowed`），这种时候要求用户等命令结束。发送失败（连接已断）也不伪装成功。
     /// 返回 Err(原因) 时不注入，由调用处显示在会话状态栏。
     pub(super) fn inject_pair_token_now(&mut self) -> Result<(), String> {
         if self.ai_owned {
@@ -267,13 +269,29 @@ impl Session {
             )
             .into());
         }
+        // 与自动注入同一道闸（见 `injection_allowed` 的 `ai_busy`）：本会话有挂起的 AI 命令、
+        // 或终端正武装着哨兵捕获时，`expect_echo` 会覆盖哨兵的吞除状态、打断正在进行的
+        // run_command——用户亲手点的注入也不例外。
+        if self.pending_ai_run.is_some() || self.terminal.ai_capture_pending() {
+            return Err(crate::i18n::tr(
+                "本会话正有 AI 命令在执行，等它结束后再注入",
+                "An AI command is still running in this session — inject again after it finishes",
+            )
+            .into());
+        }
         let cmd = format!(
             " export ISHELL_MCP_TOKEN={}",
             crate::store::mcp_pairing_token()
         );
-        let _ = self
-            .cmd_tx
-            .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
+        self.cmd_tx
+            .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()))
+            .map_err(|_| {
+                crate::i18n::tr(
+                    "命令未能送达（会话连接已断开），等重连后再试",
+                    "The command never reached the session (connection lost) — retry after reconnect",
+                )
+                .to_string()
+            })?;
         self.terminal.expect_echo(&cmd);
         self.mcp_token_injected = true;
         self.pair_inject_skipped = false;

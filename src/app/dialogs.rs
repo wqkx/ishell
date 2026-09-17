@@ -703,11 +703,9 @@ impl App {
     ///   误导去做无用功。
     ///
     /// 代理（≥带来源的版本）会附一行发起人描述（unix 用户/进程名），用户据此判断这是
-    /// 不是自己的 AI。「不再接收此类请求」一键开启「只响应配对请求」——对匿名隐身，
-    /// 这类弹窗从此消失（代价见设置里的说明）。
-    ///
-    /// 落选的那些窗口不需要用户逐个点「拒绝」：代理拿到第一个「允许」后就挂断其余连接，
-    /// `resp_tx.is_closed()` 随即为真，弹窗自动消失（见 `sweep_pending_consents`）。
+    /// 不是自己的 AI。落选的那些窗口不需要用户逐个点「拒绝」：代理拿到第一个「允许」后
+    /// 就挂断其余连接，`resp_tx.is_closed()` 随即为真，弹窗自动消失（见
+    /// `sweep_pending_consents`）。
     pub(super) fn handle_ai_bind_consent(&mut self, ctx: &egui::Context) {
         if self.pending_bind_consent.is_none() {
             return;

@@ -305,8 +305,9 @@ async fn identify_all(prove_token: Option<String>) -> Vec<(Probe, std::path::Pat
 #[cfg(unix)]
 async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
     // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就走双向
-    // 挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；没设则保持原有
-    // 「多实例弹窗让用户选」。见 `store::mcp_pairing_token`。
+    // 挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；没设则从协议 v5
+    // 起直接拒绝并给出配置指引（匿名绑定的广播弹窗是它要根治的东西，见下面的拒绝分支）。
+    // 见 `store::mcp_pairing_token`。
     let want_token = std::env::var("ISHELL_MCP_TOKEN")
         .ok()
         .map(|s| s.trim().to_string())
@@ -354,7 +355,27 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         };
     }
 
-    let all = identify_all(want_token.clone()).await;
+    // v5：未配置配对 token 就不再「匿名发现 + 弹窗选择」。无 token 代理的广播 Bind 正是
+    // 「绑定弹窗落到服务器上每一台 iShell」的那条路径（0.21 的调查结论）；堵住它的正确位置
+    // 是代理自己——单由 GUI 静默不应答，旧代理只会报成一句莫名其妙的「连不上」，排查无门。
+    // 这里直接给出可操作的指引，一次说清。（显式 ISHELL_MCP_SOCKET 的手动隧道是另一回事：
+    // 那是用户点名的路径，意图明确，在上面放行，见上面的分支。）
+    let Some(token) = want_token else {
+        return Err(
+            "这份 ishell-mcp 没有配置配对 token（ISHELL_MCP_TOKEN），而这台 iShell 只响应携\
+             带配对 token 的请求：匿名绑定会让绑定弹窗广播到服务器上**每一台** iShell，先点\
+             「允许」的窗口胜出——误点允许会把别人的 AI 绑到你的电脑上，所以从协议 v5 起不\
+             再提供无 token 的匿名绑定。\n\
+             解决办法（任选其一）：\n\
+             1. 在你自己那台 iShell 的终端会话里启动 AI：iShell 会自动注入配对 token，多数情\
+             况零配置即可；\n\
+             2. 在那台 iShell 的 MCP 设置里点「复制配对配置」，把那一行填进这份 AI 的 MCP \
+             server 环境变量后重启。"
+                .into(),
+        );
+    };
+
+    let all = identify_all(Some(token)).await;
     // 答话了但**版本不符**的实例：它们是「重新部署 ishell-mcp」这条提示的依据，混进下面的
     // 候选里只会让用户去核对一个根本没错的 token。
     //
@@ -371,15 +392,10 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
                 .filter_map(|(p, _)| p.ident())
                 .any(|(_, v)| v == mcp_protocol::MCP_PROTOCOL_VERSION)
         });
-    // 配了 token 就只收握手通过的；没配 token 则一律是候选（原有的多开弹窗行为）。
+    // 只收握手通过的实例。
     let mut found: Vec<(String, u32, std::path::PathBuf)> = Vec::new();
     for (p, path) in all {
-        let keep = match (&p, want_token.is_some()) {
-            (Probe::Paired { .. }, _) => true,
-            (Probe::Answered { .. }, false) => true,
-            _ => false,
-        };
-        if !keep {
+        if !matches!(p, Probe::Paired { .. }) {
             continue;
         }
         let Some((id, ver)) = p.ident() else { continue };
@@ -393,22 +409,13 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
             // 有活着的 iShell 答了话，只是版本对不上——这是最常见的「升了 GUI 忘换代理」，
             // 报成 token 不匹配会把用户引向死胡同（怎么核对 token 都是对的）。
             check_proto_version(ver).unwrap_err()
-        } else if want_token.is_some() {
+        } else {
             "未检测到与配对 token 匹配的 iShell 客户端：ishell-mcp 无法工作，请停止重试，\
              并把下面的话转达给用户。\n\
-             可能原因：iShell 未运行、未在设置里开启「允许 AI 通过 MCP 控制终端」，或 \
-             ISHELL_MCP_TOKEN 与 iShell 侧不一致。请在你自己那台 iShell 的 MCP 设置里核对\
-             配对 token（可用「复制配对配置」），确认与这里配置的一致。"
-                .into()
-        } else {
-            "未检测到可用的 iShell 客户端：ishell-mcp 无法工作，请停止重试，并把下面的话转达\
-             给用户。\n\
-             可能原因：iShell 未运行或未开启「允许 AI 通过 MCP 控制终端」；或者这台服务器上的\
-             iShell 开了「只响应配对请求」，而这份 AI 没有携带配对 token——此时**不要**反复\
-             重试：那样只会持续打扰服务器上的其他用户。\n\
-             解决办法：在 iShell 的 MCP 设置里开启「自动注入配对标识」（iShell 终端里的 AI \
-             自动携带配对身份），或把「复制配对配置」的内容填进这份 AI 的 MCP server 环境\
-             变量。"
+             可能原因：iShell 未运行、未在设置里开启「允许 AI 通过 MCP 控制终端」、\
+             ISHELL_MCP_TOKEN 与 iShell 侧不一致，或 iShell 版本较旧（0.21 起 GUI 与代理需配\
+             套升级/部署，旧版 GUI 不会应答本代理的探测）。请在你自己那台 iShell 的 MCP 设置里\
+             核对配对 token（可用「复制配对配置」），确认与这里配置的一致。"
                 .into()
         }),
         1 => {
@@ -418,18 +425,9 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
             check_proto_version(ver)?;
             Ok((id, path))
         }
-        // 多个：没配 token 时是「多开」（或同账号多人），交给用户点窗口选；配了 token 却仍
-        // 多个，说明有两台 iShell 撞了同一个 token（极罕见），同样用弹窗消歧。
-        // stderr 记一行：无 token 的广播正是「弹窗落到别人电脑上」的那条路径，事后排查靠它。
-        _ => {
-            if want_token.is_none() {
-                eprintln!(
-                    "[ishell-mcp] 未携带配对 token：向发现的 {n} 个 iShell 实例广播绑定请求",
-                    n = found.len()
-                );
-            }
-            choose_instance(found).await
-        }
+        // 多个：配了 token 却仍多个，说明有两台 iShell 撞了同一个 token（极罕见，比如把同
+        // 一份配对配置原样拷到了两台电脑），用弹窗让用户当面消歧。
+        _ => choose_instance(found).await,
     }
 }
 

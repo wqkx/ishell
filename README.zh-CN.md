@@ -216,7 +216,7 @@ cargo run --release
 | 工具 | 作用 |
 |------|------|
 | `list_sessions` / `list_saved_connections` | 列出打开中的会话 / 已保存连接 |
-| `open_session` / `close_session` | 按已保存连接开/关 AI 专用只读会话（首次连接需当面确认） |
+| `open_session` / `close_session` | 按已保存连接开/关 AI 专用只读会话 |
 | `run_command` / `poll_run` / `start_command` | 执行并等待 / 继续等待 / 立即启动长任务（最长 24h） |
 | `send_input` / `interrupt` | 交互输入；Ctrl+C（同时释放卡住的挂起命令） |
 | `read_screen` / `read_history` | 可见屏 / 完整回滚历史 |
@@ -236,9 +236,9 @@ cargo run --release
 
 正确做法（任选其一，推荐 1）：
 
-1. **设置 →「自动注入配对标识（多机共用 AI 服务器）」**（**默认关**）。开启后每个新会话空闲时会被打进 ` export ISHELL_MCP_TOKEN=…`；此后在该终端启动的 AI / `ishell-mcp` 只绑定你这台电脑。默认关是因为它毕竟是程序替你在自己的 shell 里执行命令——只在这种共用服务器的拓扑下才打开。
+1. **在 iShell 的终端会话里启动 AI**：iShell 会在会话空闲时自动注入 ` export ISHELL_MCP_TOKEN=…`（0.21 起为内置行为，随「允许 AI 通过 MCP 控制终端」生效），此后在该终端启动的 AI / `ishell-mcp` 只绑定你这台电脑，多数情况零配置。
 2. AI 不在 iShell 终端里跑时：设置里「复制配对配置」，把 `ISHELL_MCP_TOKEN=…` 写进该 AI 的 MCP server 环境变量。
-3. 未配对仍可点确认窗选机器，但**共享账号下务必配对**。
+3. 从协议 v5（0.21）起，**未配对的代理会被直接拒绝**，并提示上面两条配置方法——「弹窗点选机器」已移除：未配对代理的广播绑定正是「弹窗落到服务器上每一台 iShell、点错绑到别人环境」的那条路径。
 
 配对 token 会进入远端 shell 环境（及同 UID 可见的 `/proc/*/environ`）——这是共享账号上启用配对的代价；不要把 token 发到不可信主机，也不要贴进聊天。
 
@@ -251,7 +251,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 ### 其它注意
 
-- **AI 只能随便动自己开的会话。** 写你自己打开的那些标签，永远要当面授权，没有任何开关能绕过。**设置 →「AI 新开会话无需逐次确认」**（默认开）只管另一档：AI 用某条已保存连接新开一个自己的会话。
+- **AI 只能随便动自己开的会话。** 写你自己打开的那些标签，永远要当面授权，没有任何开关能绕过。AI 用某条已保存连接**新开一个自己的会话**则不再逐次弹框（0.21 起为内置行为）——真正的授权边界是总开关：不开它，socket 根本不监听。
 - AI 命令实时出现在目标标签——它做了什么你始终看得见。
 - GUI 与 `ishell-mcp` 必须同版本；升级后重跑 `install-mcp.sh`。
 

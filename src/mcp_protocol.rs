@@ -238,9 +238,10 @@ pub enum McpReqKind {
     /// **已废弃（v3 的配对方式）**：把配对 token 明文发给对端。v4 起代理不再发送它——
     /// 明文出示密钥给一个尚未认证的对端，本身就是泄露（见本文件「配对握手」一节）。
     ///
-    /// 变体保留、且 v4 的 GUI 仍会答话（但**忽略 token**、不做任何配对判定），纯粹是为了让
-    /// v3 的旧代理能走到它自己的版本校验、打印「请重新部署 ishell-mcp」而不是误报成
-    /// 「token 不匹配」。不构成泄露：它回的 id 与版本，普通 `Identify` 本来就照给。
+    /// 变体保留，v5 起 GUI 只对 **token 正确**的调用方应答（v3 的旧代理凭正确 token 仍
+    /// 能走到它自己的版本校验、打印「请重新部署 ishell-mcp」）；token 不符零应答——v4 及
+    /// 以前 GUI 忽略 token 无条件应答，等于向同账号任何人确认「这里有一台 iShell」，v5 收
+    /// 紧了这一点。应答不构成泄露：token 正确的调用方走 `PairHello` 握手本就能拿到 id。
     IdentifyPair {
         token: String,
     },
@@ -769,12 +770,20 @@ mod addressing_tests {
 /// 调用方出示 token 证明，避免反向转发 socket 上的 Identify 把密钥泄露给同机其它人。
 /// v4：配对改为**双向挑战-应答**（`PairHello`/`PairProve` + `PairChallenge`），token 本身
 /// 不再过线；`IdentifyPair` 降为「只为让 v3 旧代理走到版本校验」的兼容答话，不再做配对判定。
+/// v5：匿名发现语义改变。**无 token 的绑定从此在代理侧就被拒绝**（不再「匿名发现 + 弹窗
+/// 选择」）——无 token 代理的广播 `Bind` 会把绑定弹窗打到服务器上每一台 iShell，这是 0.21
+/// 修的那条路径；由代理自己拒绝才能给出「去配置配对 token」的可操作指引，单靠 GUI 静默
+/// 不应答只会让旧代理报成莫名其妙的「连不上」。GUI 侧配合：匿名 `Identify` 改为**版本
+/// 信标**——照常应答（id 与版本；id 本就不是秘密，见 `ishell-mcp::connect_bound` 的说明），
+/// 旧代理全靠这一问拿到「版本不符，请重新部署」的提示；匿名 `IdentifyPair` 收紧为只应答
+/// **token 正确**的调用方（v3 旧代理凭正确 token 仍能拿到版本提示，token 不符的调用方
+/// 什么也学不到——v4 及以前是无条件应答）。
 ///
 /// 注意 `Identify` 的线格式在所有版本里**逐字节相同**（无字段的单元变体），这是刻意的：
 /// 它是唯一一个跨版本都解得开的请求，版本不一致时全靠它问出对端版本、给出「重新部署」的
 /// 提示。给它加字段会把 JSON 从 `"Identify"` 变成 `{"Identify":{…}}`，旧端直接解析失败、
 /// 被当成死 socket 跳过，于是版本不匹配又会伪装成别的错误——别加。
-pub const MCP_PROTOCOL_VERSION: u32 = 4;
+pub const MCP_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {

@@ -173,12 +173,14 @@ pub fn view_context_menu(resp: &egui::Response) {
                         "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
                          · 只监听本机 Unix socket（0600），不开任何网络端口\n\
                          · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
-                         · 多机共用一台 AI 服务器时：见下面的「自动注入配对标识」",
+                         · 多机共用一台 AI 服务器时：终端会话会自动注入配对 token（见下方\
+                         「配对 token」），代理只回你这台电脑",
                         "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
                          read/write files.\n\
                          · Local Unix socket only (mode 0600) — no network port is opened\n\
                          · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
-                         · Sharing one AI server: see \"auto-inject the pairing token\" below",
+                         · Sharing one AI server: terminal sessions auto-inject the pairing token \
+                         (see \"Pairing token\" below), so the proxy answers only YOUR computer",
                     ))
                     .clicked()
                 {

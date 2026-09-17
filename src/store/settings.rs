@@ -224,38 +224,6 @@ pub fn load_mcp_auto_pair() -> bool {
     true
 }
 
-/// 是否只响应携带配对 token 的发现/绑定，对**匿名** `Identify` 探测不应答。
-///
-/// 0.21 起这是**内置行为、不再是用户选项**：AI 控制总开关（`load_mcp_consent`）打开时
-/// 恒为真。
-///
-/// # 解决什么
-///
-/// 多台电脑（多人）共用同一台服务器账号时，各家 iShell 反向转发的 socket 堆在同一远端
-/// 目录里。未配 `ISHELL_MCP_TOKEN` 的 AI 代理发起绑定时会向**每个**实例广播 `Bind`，
-/// 每个窗口都弹「同意/拒绝」框、先点先赢——别人的 AI 会对你弹窗，误点「允许」还会把
-/// 那个 AI 绑到你的电脑上（见 `app::mcp_bridge::PendingBindConsent`）。
-///
-/// 开启（现在是恒开）后，本实例对匿名探测不应答：代理眼里这条 socket 是死的，广播发不
-/// 起来，弹窗无从出现。配对握手（PairHello/PairProve）不受影响——**它只为知道 token 的
-/// 调用方存在**，而那正是「这台 iShell 归谁」的判据。
-///
-/// # 代价（0.21 前的可选时代需要用户权衡，现为主动默认）
-///
-/// 你自己那些**没配 token** 的 AI 也将完全找不到这台 iShell（报「连不上」）。这是同一个
-/// 行为的两面：对匿名隐身意味着对匿名不可用。配套是自动注入（`load_mcp_auto_pair`，同为
-/// 内置行为）或手动把配对配置填进 AI 的 MCP server 环境变量（设置里的「复制配对配置」）。
-///
-/// #  enforcement 边界（诚实声明）
-///
-/// 它挡的是**发现路径**：正常代理只向探测得到的候选发 Bind。同账号的进程仍可直接向
-/// socket 发 Bind（socket 0600 只挡其他账号）——但绑定最终仍需本机用户在弹窗里点允许，
-/// 且实例标识构成不了机密（同账号可读配置文件），所以这条缝的实际风险是「同账号恶作剧
-/// 弹窗」，不是劫持。彻底堵死需要线协议在 Bind 同连接上出示配对证明（协议 v5）。
-pub fn load_mcp_paired_only() -> bool {
-    true
-}
-
 fn ime_follow_caret_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ime_follow_caret"))
 }

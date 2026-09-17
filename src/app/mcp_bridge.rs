@@ -876,17 +876,19 @@ async fn handle_conn(
     // Identify 在连接层就地回答：它只是「你是谁」，不碰任何会话状态，没必要绕一趟 App
     // 帧循环。代理发现多个实例时会向每一个都问一次，让这条路尽量轻。
     // Identify / IdentifyPair：连接层就地回答，不进 App 帧循环。
-    // v3 起 Instance.token 恒为空——真实配对由 IdentifyPair 让调用方出示 token 证明，
+    // v3 起 Instance.token 恒为空——真实配对走双向挑战-应答让调用方出示证明，
     // 绝不在响应里回传（反向转发后同账号他人也能连上 socket 发 Identify）。
-    // 「只响应配对请求」（store::load_mcp_paired_only）开启时，匿名发现一律不应答：
-    // 代理眼里这条 socket 与死文件无异，无 token 的广播 `Bind` 发不起来，别人的 AI
-    // 不会对你弹窗。配对握手（PairHello/PairProve）不受影响——它只对知道 token 的
-    // 调用方有意义，而那正是「这台 iShell 归谁」的判据。代价与配套用法见 store 注释。
-    let anonymous_probe =
-        matches!(&req.kind, McpReqKind::Identify | McpReqKind::IdentifyPair { .. });
-    if anonymous_probe && crate::store::load_mcp_paired_only() {
-        return; // 静默丢弃：probe 分类为 Dead，实例从候选集里消失
-    }
+    //
+    // v5 起匿名发现的语义（与代理侧「无 token 直接拒绝绑定」配套，见 MCP_PROTOCOL_VERSION
+    // 的版本志）：
+    // - 匿名 `Identify` 照常应答，当**版本信标**用：它是全协议唯一跨版本可解析的请求，
+    //   旧代理的「版本不符，请重新部署」提示全靠它问出版本号。应答不构成泄露——实例 id
+    //   本就不是秘密（`ishell-mcp` 的 `connect_bound` 注释写明并接受了这一点），真正的
+    //   授权边界是绑定 consent 弹窗与配对握手，不在发现层。
+    // - 匿名 `IdentifyPair`（v3 明文配对）只对 **token 正确**的调用方应答：v3 旧代理凭
+    //   正确 token 仍能走到版本校验、打印「请重新部署」；token 不符的调用方零应答（v4 及
+    //   以前 GUI 忽略 token 无条件应答，等于向同账号任何人确认「这里有一台 iShell」，
+    //   v5 收紧）。配对握手（PairHello/PairProve）不受影响。
     match &req.kind {
         McpReqKind::Identify => {
             reply(
@@ -901,12 +903,13 @@ async fn handle_conn(
             .await;
             return;
         }
-        // v3 的旧代理才会发这个。**故意忽略 token、照常答话**：它带来的 id/版本，普通
-        // `Identify` 本来就对任何人都给，不构成额外泄露；而答了它，v3 代理才能走到自己的
-        // `check_proto_version`、打印「请重新部署 ishell-mcp」——不答的话它会把这条连接当成
-        // 死 socket 跳过，最后报成「配对 token 不匹配」，把用户引向完全错误的排查方向。
-        // v4 代理不发这个变体，真正的配对一律走下面的双向握手。
-        McpReqKind::IdentifyPair { .. } => {
+        // v3 的旧代理才会发这个。v5 起**校验 token 才答话**（见上面块注释）：token 正确，
+        // v3 代理才能走到自己的 `check_proto_version`、打印「请重新部署 ishell-mcp」；
+        // token 不符则静默丢弃——调用方什么也学不到。
+        McpReqKind::IdentifyPair { token } => {
+            if *token != crate::store::mcp_pairing_token() {
+                return; // 静默丢弃：probe 分类为 Dead，实例从候选集里消失
+            }
             reply(
                 &mut w,
                 id,
@@ -2977,7 +2980,8 @@ mod pair_handshake_tests {
         assert!(err.contains("PairProve"), "{err}");
     }
 
-    /// 发一行请求，断言**零应答**（对端静默关闭连接）：`paired_only` 模式下匿名探测的期望行为。
+    /// 发一行请求，断言**零应答**（对端静默关闭连接）：token 不符的 `IdentifyPair` 探测在
+    /// v5 下的期望行为——调用方什么也学不到。
     async fn assert_silenced(kind: McpReqKind) {
         let (r, mut w) = serve_one().await.into_split();
         let mut r = BufReader::new(r);
@@ -2993,32 +2997,58 @@ mod pair_handshake_tests {
         w.write_all(line.as_bytes()).await.expect("写请求");
         let mut resp = String::new();
         let n = r.read_line(&mut resp).await.expect("读响应");
-        assert_eq!(n, 0, "只响应配对请求时该探测必须零应答（连接被静默关闭）");
+        assert_eq!(n, 0, "token 不符的探测必须零应答（连接被静默关闭）");
     }
 
-    /// 「只响应配对请求」0.21 起为内置行为（`load_mcp_paired_only` 恒真，不再是用户选项）：
-    /// 匿名 `Identify`/`IdentifyPair` 探测零应答（代理眼里这条 socket 与死文件无异，无 token
-    /// 的广播 `Bind` 发不起来，别人的 AI 不会对你弹窗），而配对握手照常完成——对匿名隐身、
-    /// 对配对可见，否则会把主人自己的 AI 也锁在门外。
+    /// v5 的匿名发现语义：匿名 `Identify` 是**版本信标**，照常应答（旧代理全靠它拿到
+    /// 「版本不符，请重新部署」的提示）；匿名 `IdentifyPair` 只对 **token 正确**的调用方
+    /// 应答（v3 旧代理凭正确 token 走到版本校验），token 不符零应答；配对握手照常完成。
     #[tokio::test]
-    async fn paired_only_silences_anonymous_probes_but_keeps_the_handshake() {
-        assert!(
-            crate::store::load_mcp_paired_only(),
-            "0.21 起「只响应配对请求」是内置行为，必须恒为开"
-        );
-        // 匿名探测：零应答，连接被静默关闭
-        assert_silenced(McpReqKind::Identify).await;
+    async fn anonymous_identify_beacons_version_but_pair_probe_requires_the_token() {
+        // 匿名 Identify：照答——版本信标，全协议唯一跨版本可解析的请求。
+        let (r, mut w) = serve_one().await.into_split();
+        let mut r = BufReader::new(r);
+        match round(&mut r, &mut w, 1, McpReqKind::Identify).await {
+            Ok(McpReqResult::Instance {
+                id, proto_version, ..
+            }) => {
+                assert_eq!(id, crate::store::mcp_instance_id());
+                assert_eq!(
+                    proto_version,
+                    crate::mcp_protocol::MCP_PROTOCOL_VERSION
+                );
+            }
+            other => panic!("匿名 Identify 应当照答（版本信标），实际：{other:?}"),
+        }
+        // 匿名 IdentifyPair：token 不符零应答；token 正确照答（v3 兼容，走到版本校验）。
         assert_silenced(McpReqKind::IdentifyPair {
-            token: "whatever".into(),
+            token: "definitely-not-the-token".into(),
         })
         .await;
-        // 配对握手：知道 token 的调用方照常拿到实例标识
         let token = crate::store::mcp_pairing_token();
+        let (r, mut w) = serve_one().await.into_split();
+        let mut r = BufReader::new(r);
+        match round(
+            &mut r,
+            &mut w,
+            1,
+            McpReqKind::IdentifyPair {
+                token: token.clone(),
+            },
+        )
+        .await
+        {
+            Ok(McpReqResult::Instance { id, .. }) => {
+                assert_eq!(id, crate::store::mcp_instance_id())
+            }
+            other => panic!("正确 token 的 IdentifyPair 应当照答，实际：{other:?}"),
+        }
+        // 配对握手：知道 token 的调用方照常拿到实例标识
         match handshake_with(&token).await {
             Ok(McpReqResult::Instance { id, .. }) => {
                 assert_eq!(id, crate::store::mcp_instance_id())
             }
-            other => panic!("只响应配对请求不应挡住配对握手，实际：{other:?}"),
+            other => panic!("配对握手不应被挡，实际：{other:?}"),
         }
     }
 }
