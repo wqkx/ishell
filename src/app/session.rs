@@ -78,6 +78,10 @@ pub(super) struct Session {
     /// 本会话是否已注入过 MCP 配对 token（export ISHELL_MCP_TOKEN）。断线重连后远端是
     /// 新 shell（env 已丢），Connected 时复位以便重新注入。
     pub(super) mcp_token_injected: bool,
+    /// 「因用户连上后敲过键盘而跳过配对标识自动注入」的提示是否已发过（每连接复位）。
+    /// 不设的话每帧都会满足提示条件——它只在「其余注入条件全满足、只差 never_typed」时为真，
+    /// 那种状态会一直保持到连接结束。
+    pub(super) pair_inject_skipped: bool,
     /// 远端是否支持 /proc 系统监控（None=尚未探测；false 时侧栏提示并跳过杀进程等）
     pub(super) monitor_ok: Option<bool>,
     /// AI/MCP 控制通道正在等待完成的一次命令运行（同一会话同一时刻只允许一条）
@@ -192,6 +196,17 @@ pub(super) fn cwd_restore_expired(
 ///
 /// `ai_busy`：本会话有挂起的 AI 命令，或终端正武装着哨兵捕获。此时注入会用 `expect_echo`
 /// 覆盖掉哨兵的吞除状态，打断正在进行的 `run_command`。
+/// 终端侧的静止判据（不含「用户敲没敲过键」）：不 busy、输出/输入/我们自己上一次注入
+/// 都静止满 `quiet`。`injection_allowed` 与「跳过原因诊断」共用这一套，判据只此一份。
+fn terminal_idle(t: &Terminal, quiet: std::time::Duration) -> bool {
+    !t.appears_busy()
+        && t.output_idle_for(quiet)
+        && t.input_idle_for(quiet)
+        // 距我们自己上一次替用户敲键盘也要满 quiet：`expect_echo` 是整体覆写，两条注入
+        // 挨太近，后一条会把前一条的回显吞除冲掉。见 `Terminal::injection_idle_for`。
+        && t.injection_idle_for(quiet)
+}
+
 fn injection_allowed(
     connected: bool,
     ai_owned: bool,
@@ -202,13 +217,8 @@ fn injection_allowed(
     connected
         && !ai_owned
         && !ai_busy
-        && !t.appears_busy()
-        && t.output_idle_for(quiet)
-        && t.input_idle_for(quiet)
-        // 距我们自己上一次替用户敲键盘也要满 quiet：`expect_echo` 是整体覆写，两条注入
-        // 挨太近，后一条会把前一条的回显吞除冲掉。见 `Terminal::injection_idle_for`。
-        && t.injection_idle_for(quiet)
-        // **本次连接以来用户一个键都没敲过。** 这是安全边界而非优化：上面几条信号分不清
+        && terminal_idle(t, quiet)
+        // **本次连接以来用户一个键都没敲过。** 这是安全边界而非优化：其余信号分不清
         // 「shell 闲在提示符上」和「某个程序正阻塞在 stdin」，而 sudo/ssh 的密码提示符
         // 恰好也是安静不动的。详见 `Terminal::never_typed`。
         //
@@ -230,6 +240,56 @@ impl Session {
             &self.terminal,
             QUIET,
         )
+    }
+
+    /// 用户从终端右键菜单手动触发「立即注入配对标识」：即刻注入，绕过 never_typed 闸门——
+    /// 用户亲手点击等价于本人同意，且他正看着这个终端，注入的回显吞除与否都在他眼皮底下。
+    /// 返回 Err(原因) 时不注入，由调用处显示在会话状态栏。
+    pub(super) fn inject_pair_token_now(&mut self) -> Result<(), String> {
+        if self.ai_owned {
+            return Err(crate::i18n::tr(
+                "AI 专用会话无需注入：里面的 AI 是我们自己开的",
+                "AI sessions need no injection — the AI there was started by us",
+            )
+            .into());
+        }
+        if !self.connected {
+            return Err(crate::i18n::tr(
+                "会话尚未连接，等连上后再试",
+                "Session is not connected yet — try again once connected",
+            )
+            .into());
+        }
+        if self.mcp_token_injected {
+            return Err(crate::i18n::tr(
+                "本会话已注入过配对标识",
+                "This session already has the pairing token",
+            )
+            .into());
+        }
+        let cmd = format!(
+            " export ISHELL_MCP_TOKEN={}",
+            crate::store::mcp_pairing_token()
+        );
+        let _ = self
+            .cmd_tx
+            .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
+        self.terminal.expect_echo(&cmd);
+        self.mcp_token_injected = true;
+        self.pair_inject_skipped = false;
+        Ok(())
+    }
+
+    /// 除「用户一个键都没敲过」外、其余注入条件全部满足——用于区分「跳过注入」的原因。
+    /// true 表示「就因为你连上后敲过键盘，本次连接不再自动注入」：这是唯一一种**后果落在
+    /// 别人头上**的静默降级（在其中启动的 AI 没有配对身份，绑定请求会对服务器上所有
+    /// iShell 弹窗），所以值得一次性提示用户，并给出终端右键「立即注入配对标识」的补救。
+    pub(super) fn shell_idle_for_injection_but_typed(&self) -> bool {
+        const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+        self.connected
+            && !self.ai_owned
+            && !(self.pending_ai_run.is_some() || self.terminal.ai_capture_pending())
+            && terminal_idle(&self.terminal, QUIET)
     }
 
     /// 用户往终端里粘了一张图（Ctrl+V / 右键粘贴，剪贴板里是图片而不是文本）。
@@ -438,6 +498,7 @@ impl App {
             ai_owned: false,
             ai_owner: None,
             ai_owner_label: None,
+            pair_inject_skipped: false,
             pending_file_ops: Vec::new(),
             file_op_tombstones: std::collections::VecDeque::new(),
         });

@@ -165,6 +165,7 @@ pub struct Terminal {
     notify_setup_request: bool,
     /// 右键菜单「把 AI 控制代理装到这台服务器」请求：App 取走后下发 `DeployMcpAgent`。
     deploy_agent_request: bool,
+    pair_inject_request: bool,
     /// 本标签里是否**跑过** AI CLI（claude/codex 等）。裸 BEL 只有在这个标志为真时才当通知，
     /// 否则普通 shell 的补全失败/readline 报错会让每个标签都在弹提醒。见 `is_ai_cli_command`。
     ///
@@ -267,6 +268,7 @@ impl Terminal {
             notices: Vec::new(),
             notify_setup_request: false,
             deploy_agent_request: false,
+            pair_inject_request: false,
             ai_cli_seen: false,
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
@@ -402,6 +404,12 @@ impl Terminal {
     pub fn take_deploy_agent_request(&mut self) -> bool {
         std::mem::take(&mut self.deploy_agent_request)
     }
+
+    /// 取走「立即注入配对标识」请求（右键菜单触发）。
+    pub fn take_pair_inject_request(&mut self) -> bool {
+        std::mem::take(&mut self.pair_inject_request)
+    }
+
     pub fn take_notify_setup_request(&mut self) -> bool {
         std::mem::take(&mut self.notify_setup_request)
     }
@@ -922,6 +930,29 @@ impl Terminal {
             }
             if ui.button(crate::i18n::tr("粘贴", "Paste")).clicked() {
                 do_paste = true;
+                ui.close();
+            }
+            if ui
+                .button(crate::i18n::tr(
+                    "立即注入配对标识",
+                    "Inject pairing token now",
+                ))
+                .on_hover_text(crate::i18n::tr(
+                    "立刻往本终端执行 ` export ISHELL_MCP_TOKEN=…`（回显吞除）。\n\
+                     自动注入只发生在「连接后一个键都没敲过」的会话上；你敲过键盘的会话会\
+                     静默跳过——在其中启动的 AI 没有配对身份，绑定请求会对服务器上所有\
+                     iShell 弹窗。点这里手动补上即可（等价于替你在 shell 里执行那行 export）。",
+                    "Runs ` export ISHELL_MCP_TOKEN=…` in this terminal right now (echo \
+                     swallowed).\n\
+                     Auto-injection only happens in sessions where you haven't typed since \
+                     connecting; a session you typed in is silently skipped — an AI started \
+                     there has no pairing identity and its bind request pops up on EVERY \
+                     iShell on this server. Click here to inject manually (same as typing \
+                     that export yourself).",
+                ))
+                .clicked()
+            {
+                self.pair_inject_request = true;
                 ui.close();
             }
             ui.separator();

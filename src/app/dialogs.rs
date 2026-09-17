@@ -746,22 +746,22 @@ impl App {
                     ui.add_space(4.0);
                 }
                 ui.label(crate::i18n::tr(
-                    "服务器上的一个 AI 正在挑选要连接的 iShell 窗口——可能是你的 AI（比如你\
-                     开了多个窗口），也可能属于同一台服务器上的其他用户。\n\n\
-                     想让它用这个窗口，点「允许」；想用别的窗口，去那个窗口点「允许」——这里不用\
-                     管，框会自己消失。不是你的 AI，点「拒绝」，或「不再接收此类请求」彻底关掉。",
-                    "An AI on this server is looking for an iShell window to connect to — it may \
-                     be yours (e.g. you have several windows open), or it may belong to another \
-                     user of the same server.\n\n\
-                     Click Allow to let it use THIS window. If you want it to use another window, \
-                     click Allow there instead — this prompt will dismiss itself. If it is not \
-                     your AI, click Deny, or \"Stop these prompts\" to opt out for good.",
+                    "服务器上的一个 AI 正在挑选要连接的 iShell 窗口。最常见的场景：你的多台电\
+                     脑/多个 iShell 配了同一个配对 token，它在同时询问每一台——在你想用的窗口\
+                     点「允许」，其余窗口的框会自己消失。\n\n\
+                     如果这个 AI 不属于你（来源见上方），点「拒绝」。",
+                    "An AI on this server is looking for an iShell window to connect to. The \
+                     usual case: several of your computers / iShells share one pairing token, \
+                     and it is asking all of them at once — click Allow on the window you want, \
+                     the other prompts dismiss themselves.\n\n\
+                     If it is not your AI (see origin above), click Deny.",
                 ));
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(crate::i18n::tr(
-                        "允许后，这个 AI 客户端只能操作本窗口，碰不到其它 iShell 窗口",
-                        "Once allowed, this AI client can only act in this window, never the others",
+                        "允许后，这个 AI 绑定到这台 iShell：写你自己打开的会话仍会先弹窗征求同意",
+                        "Once allowed, this AI is bound to this iShell; writing into sessions \
+                         you opened yourself still asks for consent",
                     ))
                     .size(11.0)
                     .color(Palette::TEXT_DIM),
@@ -779,33 +779,6 @@ impl App {
                 if dialog_button(ui, crate::i18n::tr("拒绝", "Deny"), Some(Palette::DANGER), bw) {
                     self.resolve_bind_consent(false);
                 }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .link(crate::i18n::tr(
-                            "不再接收此类请求（开启「只响应配对请求」）",
-                            "Stop these prompts (answer only paired requests)",
-                        ))
-                        .on_hover_text(crate::i18n::tr(
-                            "开启「只响应配对请求」：未携带配对 token 的 AI 将完全看不到这台 \
-                             iShell，这类弹窗从此消失。\n\
-                             代价：你自己未配 token 的 AI 也会连不上它（设置里可同时开启\
-                             「自动注入配对标识」解决）。随时可在 MCP 设置里关掉。",
-                            "Turn on \"answer only paired requests\": AIs without a pairing \
-                             token will no longer see this iShell at all, and these prompts \
-                             stop appearing.\n\
-                             Cost: your own AIs also can't reach it without a token (enable \
-                             \"auto-inject the pairing token\" in settings to fix that). You \
-                             can turn this off anytime in the MCP settings.",
-                        ))
-                        .clicked()
-                    {
-                        crate::store::save_mcp_paired_only(true);
-                        self.resolve_bind_consent(false);
-                    }
-                });
             });
         });
     }

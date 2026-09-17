@@ -58,6 +58,8 @@ impl Session {
                     // 同时复位输入时钟：注入的前提之一是「本次连接以来没敲过键」
                     // （见 Terminal::never_typed），重连后要重新开始计。
                     self.terminal.reset_input_clock();
+                    // 「跳过注入」的提示同理：新连接是全新一轮，若再次被跳过应重新提示。
+                    self.pair_inject_skipped = false;
                     // 重连后恢复工作目录（若断线前由 OSC 7 记录过）。
                     //
                     // **不在这里直接注入。** `Connected` 是「SSH 连上了」，不是「shell 已经在

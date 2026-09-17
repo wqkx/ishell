@@ -210,69 +210,24 @@ pub fn save_ai_notify_mode(m: AiNotifyMode) {
     }
 }
 
-fn mcp_auto_pair_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("mcp_auto_pair"))
-}
-
-/// 「自动向新会话注入配对标识」的出厂默认值。
-const MCP_AUTO_PAIR_DEFAULT: bool = true;
-
-static MCP_AUTO_PAIR_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-
-/// 是否在会话空闲时自动把配对标识注入终端（` export ISHELL_MCP_TOKEN=…` 并回车执行）。
+/// 是否自动把配对标识注入空闲的终端会话（` export ISHELL_MCP_TOKEN=…` 并回车执行）。
 ///
-/// # 为什么默认开
+/// 0.21 起这是**内置行为、不再是用户选项**：AI 控制总开关（`load_mcp_consent`）打开时
+/// 恒为真。它解决的是多用户服务器上「无 token 代理向每台 iShell 广播绑定弹窗」的问题
+/// （见 `app::mcp_bridge::PendingBindConsent`）：token 生效的前提是 AI 的进程环境里有它，
+/// 注入让「iShell 终端里启动的 AI」自动携带配对身份，绑定只回本机。
 ///
-/// 0.19 把「允许 AI 通过 MCP 控制终端」默认打开之后，多用户服务器上「别人的 AI 对每台
-/// iShell 广播绑定弹窗」成了默认体验（见 `app::mcp_bridge::PendingBindConsent`）。配对
-/// token 是根治——AI 带 token，绑定只回自己那台，弹窗消失——而 token 生效的前提是 AI
-/// 的进程环境里有它。默认注入让「iShell 终端里启动的 AI」自动携带配对身份，多数用户无需
-/// 任何配置就拿到正确的多机行为。
-///
-/// # 代价（用户应当知道，UI 里也有提示）
-///
-/// 这是 iShell **替用户在他自己的 shell 里执行一条命令**（回显被吞掉，命令带前导空格配合
-/// HISTCONTROL=ignorespace 不进历史）。更要注意安全面：token 会留在 shell 环境变量里，
-/// **同账号的其他用户可读**——互不信任的共享账号上，这等于让对方跳过弹窗直接绑定你的
-/// 电脑。介意的人应在设置里关掉，改用手动路径（「复制配对配置」填进 AI 的 MCP server
-/// 环境变量）。AI 不在 iShell 终端里跑时注入帮不到它，同样需要手动配置。
+/// 保留本函数（调用点不写死 `true`）是为了让「该不该注入」的判定仍收敛在一处
+/// （见 `app::frame::pair_inject_allowed`），也保住那条「AI 控制开 ≠ 允许替用户敲键盘」
+/// 的回归测试。
 pub fn load_mcp_auto_pair() -> bool {
-    use std::sync::atomic::Ordering;
-    match MCP_AUTO_PAIR_CACHE.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = mcp_auto_pair_path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.trim() == "1")
-                .unwrap_or(MCP_AUTO_PAIR_DEFAULT);
-            MCP_AUTO_PAIR_CACHE.store(on as i8, Ordering::Relaxed);
-            on
-        }
-    }
+    true
 }
-
-/// 保存「自动注入配对标识」开关。
-pub fn save_mcp_auto_pair(on: bool) {
-    MCP_AUTO_PAIR_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
-    if let Some(p) = mcp_auto_pair_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        write_setting(p, if on { "1" } else { "0" });
-    }
-}
-
-fn mcp_paired_only_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("mcp_paired_only"))
-}
-
-/// 「只响应配对请求」的出厂默认值。
-const MCP_PAIRED_ONLY_DEFAULT: bool = false;
-
-static MCP_PAIRED_ONLY_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
 /// 是否只响应携带配对 token 的发现/绑定，对**匿名** `Identify` 探测不应答。
+///
+/// 0.21 起这是**内置行为、不再是用户选项**：AI 控制总开关（`load_mcp_consent`）打开时
+/// 恒为真。
 ///
 /// # 解决什么
 ///
@@ -281,42 +236,24 @@ static MCP_PAIRED_ONLY_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::A
 /// 每个窗口都弹「同意/拒绝」框、先点先赢——别人的 AI 会对你弹窗，误点「允许」还会把
 /// 那个 AI 绑到你的电脑上（见 `app::mcp_bridge::PendingBindConsent`）。
 ///
-/// 开启本开关后，本实例对匿名探测不应答：代理眼里这条 socket 是死的，广播发不起来，
-/// 弹窗无从出现。携带配对 token 的握手（PairHello/PairProve）不受影响——**它只为
-/// 知道 token 的调用方存在**，而那正是「这台 iShell 归谁」的判据。
+/// 开启（现在是恒开）后，本实例对匿名探测不应答：代理眼里这条 socket 是死的，广播发不
+/// 起来，弹窗无从出现。配对握手（PairHello/PairProve）不受影响——**它只为知道 token 的
+/// 调用方存在**，而那正是「这台 iShell 归谁」的判据。
 ///
-/// # 代价（开启前必须知道）
+/// # 代价（0.21 前的可选时代需要用户权衡，现为主动默认）
 ///
 /// 你自己那些**没配 token** 的 AI 也将完全找不到这台 iShell（报「连不上」）。这是同一个
-/// 开关的两面：对匿名隐身意味着对匿名不可用。配套用法是同时开「自动注入配对标识」，
-/// 或手动把配对配置填进 AI 的 MCP server 环境变量。
+/// 行为的两面：对匿名隐身意味着对匿名不可用。配套是自动注入（`load_mcp_auto_pair`，同为
+/// 内置行为）或手动把配对配置填进 AI 的 MCP server 环境变量（设置里的「复制配对配置」）。
 ///
-/// 默认关：单机/单人多窗口依赖匿名发现做「多开弹窗选择」，不能破那个体验。
+/// #  enforcement 边界（诚实声明）
+///
+/// 它挡的是**发现路径**：正常代理只向探测得到的候选发 Bind。同账号的进程仍可直接向
+/// socket 发 Bind（socket 0600 只挡其他账号）——但绑定最终仍需本机用户在弹窗里点允许，
+/// 且实例标识构成不了机密（同账号可读配置文件），所以这条缝的实际风险是「同账号恶作剧
+/// 弹窗」，不是劫持。彻底堵死需要线协议在 Bind 同连接上出示配对证明（协议 v5）。
 pub fn load_mcp_paired_only() -> bool {
-    use std::sync::atomic::Ordering;
-    match MCP_PAIRED_ONLY_CACHE.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = mcp_paired_only_path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.trim() == "1")
-                .unwrap_or(MCP_PAIRED_ONLY_DEFAULT);
-            MCP_PAIRED_ONLY_CACHE.store(on as i8, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// 保存「只响应配对请求」开关。
-pub fn save_mcp_paired_only(on: bool) {
-    MCP_PAIRED_ONLY_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
-    if let Some(p) = mcp_paired_only_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        write_setting(p, if on { "1" } else { "0" });
-    }
+    true
 }
 
 fn ime_follow_caret_path() -> Option<PathBuf> {
@@ -385,54 +322,24 @@ fn mcp_consent_path() -> Option<PathBuf> {
 /// 「允许 AI 通过 MCP 控制终端」的出厂默认值。
 const MCP_CONSENT_DEFAULT: bool = true;
 
-fn mcp_auto_approve_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("mcp_auto_approve"))
-}
-
-/// 「AI 的操作无需逐次当面确认」的出厂默认值。
-const MCP_AUTO_APPROVE_DEFAULT: bool = true;
-
-static MCP_AUTO_APPROVE_CACHE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-
-/// AI 用 `open_session` 首次拿某条已保存连接**开一个自己的新会话**时，是否直接放行、
-/// 不弹确认框。**默认放行**（0.19 起）：AI 干活时会连着开好几个会话，一路点「允许」点到
-/// 最后也不再看内容，那道闸门既挡不住什么又把体验拖垮；真正的授权边界是总开关
-/// [`load_mcp_consent`]——不开它，socket 根本不监听。
+/// AI 用 `open_session` 首次拿某条已保存连接**开一个自己的新会话**时，直接放行、不弹确认框。
+///
+/// 0.21 起这是**内置行为、不再是用户选项**：总开关（`load_mcp_consent`）打开时恒为真。
+/// 理由（0.19 起即为默认行为）：AI 干活时会连着开好几个会话，一路点「允许」点到最后
+/// 也不再看内容，那道闸门既挡不住什么又把体验拖垮；真正的授权边界是总开关——不开它，
+/// socket 根本不监听。
 ///
 /// # 它**管不到**「写用户自己的会话」
 ///
 /// 那一档是硬的：AI 只能随便动**自己开的**会话，要动用户自己开的标签一律当面授权，
-/// **不受本开关影响**（见 `app::mcp_bridge::write_needs_consent`）。0.19 一度让这个开关
+/// **不受本行为影响**（见 `app::mcp_bridge::write_needs_consent`）。0.19 一度让这个开关
 /// 从那里短路过去，用户明确否掉了：「AI 就算可以任意操作会话，也不能在不授权的情况下操作
 /// 用户的会话，AI 只能操作自己开的会话」。
 ///
 /// 它同样**不影响**多开 iShell 时的「点窗口选实例」——那不是权限闸门而是选择器，代理在只有
 /// 一个实例（或只有一个 token 匹配者）时本来就直接绑定、不弹窗，只有真的多开才需要用户指认。
 pub fn load_mcp_auto_approve() -> bool {
-    use std::sync::atomic::Ordering;
-    match MCP_AUTO_APPROVE_CACHE.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = mcp_auto_approve_path()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.trim() == "1")
-                .unwrap_or(MCP_AUTO_APPROVE_DEFAULT);
-            MCP_AUTO_APPROVE_CACHE.store(on as i8, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// 保存「AI 操作无需逐次确认」开关。
-pub fn save_mcp_auto_approve(on: bool) {
-    MCP_AUTO_APPROVE_CACHE.store(on as i8, std::sync::atomic::Ordering::Relaxed);
-    if let Some(p) = mcp_auto_approve_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        write_setting(p, if on { "1" } else { "0" });
-    }
+    true
 }
 
 /// 是否已开启「允许 AI 通过本地 MCP server 控制终端」。

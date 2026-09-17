@@ -2996,16 +2996,16 @@ mod pair_handshake_tests {
         assert_eq!(n, 0, "只响应配对请求时该探测必须零应答（连接被静默关闭）");
     }
 
-    /// 「只响应配对请求」：匿名 `Identify`/`IdentifyPair` 探测零应答（代理眼里这条 socket
-    /// 与死文件无异，无 token 的广播 `Bind` 发不起来，别人的 AI 不会对你弹窗），而配对
-    /// 握手照常完成——对匿名隐身、对配对可见，否则会把主人自己的 AI 也锁在门外。
-    ///
-    /// 两个场景必须放在**同一条**测试里：开关是进程级全局状态，两条测试并行跑会互相
-    /// 踩（restore 的时机不可控）。
+    /// 「只响应配对请求」0.21 起为内置行为（`load_mcp_paired_only` 恒真，不再是用户选项）：
+    /// 匿名 `Identify`/`IdentifyPair` 探测零应答（代理眼里这条 socket 与死文件无异，无 token
+    /// 的广播 `Bind` 发不起来，别人的 AI 不会对你弹窗），而配对握手照常完成——对匿名隐身、
+    /// 对配对可见，否则会把主人自己的 AI 也锁在门外。
     #[tokio::test]
     async fn paired_only_silences_anonymous_probes_but_keeps_the_handshake() {
-        let prev = crate::store::load_mcp_paired_only();
-        crate::store::save_mcp_paired_only(true);
+        assert!(
+            crate::store::load_mcp_paired_only(),
+            "0.21 起「只响应配对请求」是内置行为，必须恒为开"
+        );
         // 匿名探测：零应答，连接被静默关闭
         assert_silenced(McpReqKind::Identify).await;
         assert_silenced(McpReqKind::IdentifyPair {
@@ -3014,9 +3014,7 @@ mod pair_handshake_tests {
         .await;
         // 配对握手：知道 token 的调用方照常拿到实例标识
         let token = crate::store::mcp_pairing_token();
-        let result = handshake_with(&token).await;
-        crate::store::save_mcp_paired_only(prev);
-        match result {
+        match handshake_with(&token).await {
             Ok(McpReqResult::Instance { id, .. }) => {
                 assert_eq!(id, crate::store::mcp_instance_id())
             }

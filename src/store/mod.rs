@@ -27,8 +27,8 @@ pub use settings::{
     load_term_theme, load_zoom, load_mcp_paired_only,
     mcp_instance_id, mcp_pairing_token, mcp_socket_path,
     save_ai_notify_mode, save_conflict_policy, save_cursor_line, save_download_dir, save_editor_font, save_file_cols,
-    save_force_x11, save_ime_follow_caret, save_lang, save_mcp_auto_approve, save_mcp_auto_pair, save_mcp_consent, save_osc7_consent,
-    save_term_theme, save_zoom, save_mcp_paired_only,
+    save_force_x11, save_ime_follow_caret, save_lang, save_mcp_consent, save_osc7_consent,
+    save_term_theme, save_zoom,
     take_setting_write_errors, AiNotifyMode,
 };
 pub use snippets::{load_snippets, save_snippets, Snippet};

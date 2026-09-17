@@ -418,9 +418,18 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
             check_proto_version(ver)?;
             Ok((id, path))
         }
-        // 多个：没配 token 时是正常的「多开」，交给用户点窗口选；配了 token 却仍多个，说明有
-        // 两台 iShell 撞了同一个 token（极罕见），同样用弹窗消歧，让用户当面确定。
-        _ => choose_instance(found).await,
+        // 多个：没配 token 时是「多开」（或同账号多人），交给用户点窗口选；配了 token 却仍
+        // 多个，说明有两台 iShell 撞了同一个 token（极罕见），同样用弹窗消歧。
+        // stderr 记一行：无 token 的广播正是「弹窗落到别人电脑上」的那条路径，事后排查靠它。
+        _ => {
+            if want_token.is_none() {
+                eprintln!(
+                    "[ishell-mcp] 未携带配对 token：向发现的 {n} 个 iShell 实例广播绑定请求",
+                    n = found.len()
+                );
+            }
+            choose_instance(found).await
+        }
     }
 }
 

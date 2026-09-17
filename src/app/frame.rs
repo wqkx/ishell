@@ -181,41 +181,56 @@ impl App {
                 super::session::CwdRestore::Wait => {}
             }
         }
-        // MCP 配对 token 自动注入：多台电脑共用同一台 AI 服务器时，让本会话里启动的 AI
-        // （及其 ishell-mcp 子进程）自动携带配对标识——MCP 请求经既有的 token 匹配精确
-        // 路由回本电脑，不再弹窗打扰其他人（未注入时维持原有「多实例弹窗选择」）。
-        //
-        // **默认开**（见 `store::load_mcp_auto_pair`：0.19 之后多用户服务器的默认体验是
-        // 「别人的 AI 对每台 iShell 广播绑定弹窗」，配对 token 是根治，而 token 生效的前提
-        // 是 AI 环境里有它）。这一步仍是 iShell 替用户在他自己的 shell 里敲一条命令并回车
-        // （0.19 曾把它误挂在「AI 控制已开启」下面，那意味着每个新会话都被打进一条命令——
-        // 用户报的「iShell 往我当前会话里输东西」就是它；现在由**它自己这个开关**把门，
-        // 默认开但可随时在设置里关，见 `pair_inject_tests` 的回归门禁）。
+        // MCP 配对 token 自动注入（0.21 起为内置行为，随「允许 AI 控制终端」生效，不再是
+        // 独立开关，见 `store::load_mcp_auto_pair`）：每个用户会话在「连接后一个键都没敲过」
+        // 的静止窗口里被注入 ` export ISHELL_MCP_TOKEN=…`（回显吞除）——此后该 shell 里启动
+        // 的 AI 自动携带配对身份，绑定只回本机，多用户服务器上不会对其他人的 iShell 弹窗。
         //
         // 闲置判据整体交给 `shell_idle_for_injection`（与 cwd 恢复同一道闸门），其中
         // 「本次连接以来一个键都没敲过」是**安全边界而非优化**：其余信号分不清「shell 闲在
         // 提示符上」和「某个程序正阻塞在 stdin」，而 sudo/ssh 的密码提示符恰好也是安静不动的。
-        // 残余风险：某个保存的连接其远端命令直接落进一个密码提示符——那种情况下用户确实
-        // 一个键都没敲。不在本次修复范围内。
         //
         // 与上面同一条路径、同一批会话，但**不合进同一个循环**：上面那个循环的 `continue`
         // 是为 cwd 意图写的（没有意图就跳过该会话），而配对标识跟有没有 cwd 意图无关。
-        // 分成两趟，语义各自独立；`shell_idle_for_injection` 在第二趟读到的是第一趟注入后
-        // 已更新的状态，同帧覆写因此不可能发生。
+        // 分成两趟，语义各自独立。
         //
-        // 不需要为它另续重绘：`pair_inject_allowed` 以「AI 控制已开启」为前置条件，而那正是
-        // `pump_background` 末尾那条 150ms 心跳的门——能走到这里时心跳一定在转。
+        // 跳过注入时分两类静默处理：开关/会话类型不满足的不打扰用户；**唯独「用户连上后
+        // 敲过键盘」这一种要给一次提示**——它是唯一一种后果落在别人头上的降级（在其中
+        // 启动的 AI 没有配对身份，绑定请求会对服务器上所有 iShell 弹窗），用户自己不敲打
+        // 永远发现不了。提示每会话每连接一次（`Session::pair_inject_skipped`），补救入口在
+        // 终端右键「立即注入配对标识」。不需要另续重绘：能走到这里时 150ms 心跳一定在转。
+        let mut pair_skipped_typed = false;
         for s in &mut self.sessions {
-            if pair_inject_allowed(
+            if !pair_inject_allowed(
                 crate::store::load_mcp_auto_pair(),
                 crate::store::load_mcp_consent(),
                 s.ai_owned,
                 s.mcp_token_injected,
-            ) && s.shell_idle_for_injection()
-            {
+            ) {
+                continue;
+            }
+            if s.shell_idle_for_injection() {
                 inject_mcp_token(s);
                 s.mcp_token_injected = true;
+            } else if !s.pair_inject_skipped && s.shell_idle_for_injection_but_typed() {
+                s.pair_inject_skipped = true;
+                pair_skipped_typed = true;
             }
+        }
+        if pair_skipped_typed {
+            self.toast = Some((
+                crate::i18n::tr(
+                    "有会话因连上后敲过键盘而跳过配对标识自动注入：在其中启动的 AI 没有配对\
+                     身份，绑定请求会对服务器上所有 iShell 弹窗。可在终端右键菜单「立即注入\
+                     配对标识」补救。",
+                    "A session skipped auto-injecting the pairing token (you typed after it \
+                     connected): an AI started there has no pairing identity, and its bind \
+                     request pops up on EVERY iShell on this server. Fix: terminal right-click \
+                     menu → \"Inject pairing token now\".",
+                )
+                .to_string(),
+                self.ctx.input(|i| i.time),
+            ));
         }
     }
 
