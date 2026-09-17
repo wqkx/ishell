@@ -1260,6 +1260,29 @@ fn a_fresh_injection_blocks_the_next_one() {
     assert!(t.injection_idle_for(d), "过了时间窗才放行");
 }
 
+/// RunCommand 的注入竞态守卫必须分清「刚自动注入过」和「上一条 run_command 刚发出」：
+/// 哨兵吞除（`expect_echo`）不该更新自动注入时刻——否则 AI 连续发命令（ls 接 cd）时
+/// 第二条会被误拒，报错还错指成「刚自动注入」；而自动注入（`expect_auto_inject_echo`）
+/// 必须挡住竞态窗口。
+/// 反向对照：让 `expect_echo` 也更新 `auto_inject_armed_at`，第一条断言当场挂。
+#[test]
+fn auto_inject_guard_ignores_sentinel_arm() {
+    let mut t = Terminal::new();
+    t.expect_echo("AI_DONE_x:"); // RunCommand 哨兵路径
+    assert!(
+        t.auto_inject_idle_for(std::time::Duration::from_secs(1)),
+        "哨兵吞除不算自动注入：rapid 连续命令不应被守卫挡住"
+    );
+    let armed = std::time::Instant::now();
+    t.expect_auto_inject_echo(" __ishell_cwd(){ :; }");
+    if armed.elapsed() < std::time::Duration::from_millis(250) {
+        assert!(
+            !t.auto_inject_idle_for(std::time::Duration::from_secs(1)),
+            "自动注入后 1 秒内的竞态窗口要被挡住"
+        );
+    }
+}
+
 
 /// 同步输出（DEC 私有模式 2026）专项测试。
 ///

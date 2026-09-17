@@ -170,7 +170,7 @@ impl App {
                             format!("{cmd}\r").into_bytes(),
                         ));
                     // 吞掉回显，否则 `cd '…'` 会原样留在屏幕上
-                    s.terminal.expect_echo(&cmd);
+                    s.terminal.expect_auto_inject_echo(&cmd);
                     s.restore_cwd = false;
                     s.restore_cwd_until = None;
                 }
@@ -249,7 +249,7 @@ impl App {
                 let _ = s
                     .cmd_tx
                     .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
-                s.terminal.expect_echo(cmd);
+                s.terminal.expect_auto_inject_echo(cmd);
                 s.osc7_injected = true;
             }
         }
@@ -1084,7 +1084,7 @@ fn inject_mcp_token(s: &mut super::Session) {
     let _ = s
         .cmd_tx
         .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
-    s.terminal.expect_echo(&cmd);
+    s.terminal.expect_auto_inject_echo(&cmd);
 }
 
 #[cfg(test)]

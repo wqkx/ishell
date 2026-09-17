@@ -330,7 +330,7 @@ impl Session {
                 )
                 .to_string()
             })?;
-        self.terminal.expect_echo(&cmd);
+        self.terminal.expect_auto_inject_echo(&cmd);
         self.mcp_token_injected = true;
         self.pair_inject_skipped = false;
         Ok(())

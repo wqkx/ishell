@@ -134,7 +134,7 @@ impl App {
                 if s.terminal.take_inject_request() && !s.ai_owned {
                     if osc7_consent() {
                         let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
-                        s.terminal.expect_echo(OSC7_SNIPPET);
+                        s.terminal.expect_auto_inject_echo(OSC7_SNIPPET);
                         s.osc7_pending_reveal = true;
                     } else {
                         s.osc7_confirm = true;
@@ -204,7 +204,7 @@ impl App {
                         Some(true) => {
                             set_osc7_consent(true);
                             let _ = s.cmd_tx.send(UiCommand::TerminalInput(format!("{OSC7_SNIPPET}\r").into_bytes()));
-                            s.terminal.expect_echo(OSC7_SNIPPET);
+                            s.terminal.expect_auto_inject_echo(OSC7_SNIPPET);
                             s.osc7_pending_reveal = true;
                             s.osc7_confirm = false;
                         }

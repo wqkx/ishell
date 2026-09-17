@@ -137,6 +137,10 @@ pub struct Terminal {
     echo_pending: Vec<u8>,
     /// 上一次 `expect_echo` 武装的时刻：见 `injection_idle_for`
     echo_armed_at: Option<std::time::Instant>,
+    /// 上一次**自动注入**（cwd 恢复/配对标识/OSC 7）武装吞除的时刻。与 `echo_armed_at`
+    /// 分开记：RunCommand 的哨兵吞除也更新后者，若守卫看它就会把「上一条 run_command
+    /// 刚发出」误判成「刚注入过」、误拒 rapid 连续命令。见 `expect_auto_inject_echo`。
+    auto_inject_armed_at: Option<std::time::Instant>,
     /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
     ime_preedit: String,
     /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
@@ -260,6 +264,7 @@ impl Terminal {
             echo_tail: false,
             echo_pending: Vec::new(),
             echo_armed_at: None,
+            auto_inject_armed_at: None,
             ime_preedit: String::new(),
             prev_focused: false,
             local_scroll_accum: 0.0,
@@ -331,6 +336,23 @@ impl Terminal {
     /// 放行，第二条注入照样把第一条的吞除状态覆写掉。这里用时间窗兜住那段往返。
     pub fn injection_idle_for(&self, d: std::time::Duration) -> bool {
         self.echo_armed_at.is_none_or(|t| t.elapsed() >= d)
+    }
+
+    /// 自动注入路径专用版本：与 `expect_echo` 相同，但额外记录「自动注入」时刻。
+    /// 只该由程序替用户敲键盘的注入点调用（cwd 恢复/配对标识/OSC 7）——RunCommand 的
+    /// 哨兵吞除走 `expect_echo`、不碰这个时间戳，于是 `auto_inject_idle_for` 能分清
+    /// 「刚自动注入过」和「上一条 run_command 刚发出」这两件事。
+    pub fn expect_auto_inject_echo(&mut self, s: &str) {
+        self.auto_inject_armed_at = Some(std::time::Instant::now());
+        self.expect_echo(s);
+    }
+
+    /// 距上一次自动注入是否已满 `d`（没注入过算满）。`RunCommand` 下发前的竞态守卫用：
+    /// 自动注入刚武装吞除、注入行的回显还没回来时下发，`expect_echo(&marker)` 会整体覆写
+    /// 那条吞除，注入片段的回显会显示在终端上并被捕获进本条命令的输出。窗口约一个
+    /// 网络往返，守卫只认 `expect_auto_inject_echo` 记下的时刻，不受哨兵吞除干扰。
+    pub fn auto_inject_idle_for(&self, d: std::time::Duration) -> bool {
+        self.auto_inject_armed_at.is_none_or(|t| t.elapsed() >= d)
     }
 
     /// 武装一次「等待哨兵」捕获：`prefix` 是唯一前缀（含 nonce），命中后紧跟的退出码数字

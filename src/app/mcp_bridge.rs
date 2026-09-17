@@ -1406,6 +1406,12 @@ impl App {
                 let marker = self.cross_copy_jobs[idx].marker.clone();
                 self.warn_temp_key_residue(dest_uid, marker, &format!("撤销失败（{message}）"));
             }
+            // 回执确认公钥已删：把 trust_established 清回去。否则作业进入中转/后续阶段后
+            // 它仍为真，快败与总超时分支会再补发一次撤销——目标会话恰好不可达时，一条
+            // 其实早已删掉的 key 会触发「请手工删除 authorized_keys」的误报。
+            if ok {
+                self.cross_copy_jobs[idx].trust_established = false;
+            }
             if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
                 self.finish_after_untrust(idx, true);
             }
@@ -1510,7 +1516,10 @@ impl App {
                 // TrustingB 在途窗口（信任已发给 worker、回执未到）里判败必须先补发撤销——
                 // worker 可能在我们断线前已经把公钥写进了 authorized_keys；cmd_tx 是每会话
                 // 持久通道，断线期间发送会缓冲，重连后按 FIFO 在 TrustTempKey 之后处理。
-                // 其余阶段（DirectCopying 及以后）已在 finish_direct_attempt 发过撤销。
+                // 注意 DirectCopying 进行中其实还没到 finish_direct_attempt（那里才发撤销），
+                // 这里补发只会更早清理、不影响已建立的 scp 连接（认证只在建连时发生）；
+                // UntrustingAfterDirect/Relay 阶段确认已发过——回执 ok 时上面已把
+                // trust_established 清回 false，不会再走到这里。
                 if maybe_trusted {
                     self.best_effort_untrust(dest_uid, op_id, marker);
                 }
@@ -2117,13 +2126,15 @@ impl App {
                     );
                     return;
                 }
-                // 注入竞态守卫：cwd 恢复/配对标识/OSC 7 等自动注入刚武装了回显吞除、而注入行
+                // 注入竞态守卫：自动注入（OSC 7/配对标识/cwd 恢复）刚武装了回显吞除、而注入行
                 // 的回显还没回来时，下面的 expect_echo(&marker) 会**整体覆写**那条吞除——
                 // 注入片段（OSC 7 片段约 450 字符）的回显会显示在终端上，并被 arm_ai_capture
-                // 捕获进本条命令的输出。窗口约一个网络往返，AI 连续发命令时很容易撞上。
-                // 宁可让 AI 稍等这一下，不把垃圾带进它的输出。
+                // 捕获进本条命令的输出。窗口约一个网络往返。
+                // 只看 `auto_inject_armed_at`（自动注入专属时间戳）：RunCommand 自己的哨兵
+                // 吞除也更新 echo_armed_at，看它会连 rapid 连续命令（ls 接 cd）一起误拒，
+                // 而那种场景下注入实际还没发生——守卫必须挡住真竞态、放过正常连发。
                 const ECHO_ARM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
-                if !s.terminal.injection_idle_for(ECHO_ARM_GRACE) {
+                if !s.terminal.auto_inject_idle_for(ECHO_ARM_GRACE) {
                     send_err(
                         resp_tx,
                         "会话刚执行一次自动注入（OSC 7 上报/配对标识/cwd 恢复），回显吞除尚未解\
