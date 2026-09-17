@@ -171,55 +171,20 @@ impl App {
                                     let ctx = ui.ctx().clone();
                                     let body_font = egui::TextStyle::Body.resolve(ui.style());
                                     let mut acc = 0.0f32; // 目标布局累计左边界
-                                    // 同名会话消歧：标题撞车的会话追加区分后缀，不撞车的
-                                    // 标签保持原标题、零额外噪声。后缀先取主机（本机/无
-                                    // 主机信息用 #uid）；同名又同主机的（最常见：同名连接
-                                    // 开两个）主机后缀照样撞车，第二遍把 uid 并进后缀——
-                                    // uid 在同一次运行内唯一，兜底无歧义。
-                                    let mut title_counts: std::collections::HashMap<
-                                        &str,
-                                        usize,
-                                    > = std::collections::HashMap::new();
-                                    for s in &self.sessions {
-                                        *title_counts.entry(s.title.as_str()).or_default() += 1;
-                                    }
-                                    let mut display_titles: Vec<String> = self
-                                        .sessions
-                                        .iter()
-                                        .map(|s| {
-                                            if title_counts[s.title.as_str()] > 1 {
-                                                let disambig =
-                                                    if s.cfg.is_local() || s.cfg.host.is_empty() {
-                                                        format!("#{}", s.uid)
-                                                    } else {
-                                                        s.cfg.host.clone()
-                                                    };
-                                                format!("{} · {}", s.title, disambig)
-                                            } else {
-                                                s.title.clone()
-                                            }
-                                        })
-                                        .collect();
-                                    let mut full_counts: std::collections::HashMap<
-                                        String,
-                                        usize,
-                                    > = std::collections::HashMap::new();
-                                    for d in &display_titles {
-                                        *full_counts.entry(d.clone()).or_default() += 1;
-                                    }
-                                    for (s, d) in
-                                        self.sessions.iter().zip(display_titles.iter_mut())
-                                    {
-                                        if full_counts[d.as_str()] > 1 {
-                                            *d = format!("{} · #{}", s.title, s.uid);
-                                        }
-                                    }
+                                    // 同名会话消歧（规则见 `tab_labels`）：标签上只在同名会话
+                                    // 分属不同主机时追加「· 主机」；#uid 不上标签，只在 hover
+                                    // 提示里跟在 user@host 后面。
+                                    let labels = tab_labels(self.sessions.iter().map(|s| {
+                                        let host = (!s.cfg.is_local() && !s.cfg.host.is_empty())
+                                            .then_some(s.cfg.host.as_str());
+                                        (s.title.as_str(), host)
+                                    }));
                                     for (i, s) in self.sessions.iter().enumerate() {
                                         let selected = active == Some(i);
                                         // 标签只显示会话标题：机器人图标、开启者名这类
                                         // MCP 内部标识用户看着只是噪声（归属信息仍在
                                         // list_sessions/写入弹窗里发挥作用，不上屏）。
-                                        let display_title = display_titles[i].clone();
+                                        let (display_title, title_dup) = labels[i].clone();
                                         // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
                                         let title_w = ctx.fonts_mut(|f| {
                                             f.layout_no_wrap(
@@ -269,7 +234,11 @@ impl App {
                                                 egui::Id::new(("tab", s.uid)),
                                                 Sense::click_and_drag(),
                                             )
-                                            .on_hover_text(s.tip.as_str());
+                                            .on_hover_text(tab_hover_text(
+                                                &s.tip,
+                                                title_dup.then_some(s.uid),
+                                                s.ai_owner_label.as_deref(),
+                                            ));
                                         let close_rect = egui::Rect::from_center_size(
                                             egui::pos2(
                                                 tab_rect.right() - 18.0,
@@ -456,5 +425,100 @@ impl App {
                     }
                 });
             });
+    }
+}
+
+/// 标签页显示标题：`items` 为每个会话的 `(标题, 远端主机)`（本机/无主机信息为 `None`），
+/// 返回 `(显示标题, 是否与其他会话同名)`。
+///
+/// 不撞车的标签保持原标题、零额外噪声。同名的一组里，只有主机真的不同（至少两种不同的
+/// 远端主机）才给远端会话追加「· 主机」——同一连接开两个时主机后缀完全相同，加了也分不开，
+/// 只是噪声。#uid 这类内部编号不上标签：同名会话靠 hover 提示区分（见 `tab_hover_text`）。
+fn tab_labels<'a>(items: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> Vec<(String, bool)> {
+    use std::collections::{HashMap, HashSet};
+    let items: Vec<_> = items.collect();
+    let mut groups: HashMap<&str, (usize, HashSet<&str>)> = HashMap::new();
+    for &(title, host) in &items {
+        let g = groups.entry(title).or_default();
+        g.0 += 1;
+        if let Some(h) = host {
+            g.1.insert(h);
+        }
+    }
+    items
+        .iter()
+        .map(|&(title, host)| {
+            let (count, hosts) = &groups[title];
+            let dup = *count > 1;
+            let label = match host {
+                Some(h) if dup && hosts.len() > 1 => format!("{title} · {h}"),
+                _ => title.to_string(),
+            };
+            (label, dup)
+        })
+        .collect()
+}
+
+/// 标签 hover 提示：`user@host:port`（本机为「本机 · 用户」），同名会话在其后追加 `· #uid`
+/// 以便区分，AI 开的会话再追加开启来源。
+fn tab_hover_text(base: &str, dup_uid: Option<u64>, ai_owner_label: Option<&str>) -> String {
+    let mut tip = base.to_string();
+    if let Some(uid) = dup_uid {
+        tip.push_str(&format!(" · #{uid}"));
+    }
+    if let Some(label) = ai_owner_label {
+        tip.push_str(&format!(" · {} {label}", crate::i18n::tr("AI 开启，来源", "AI-opened by")));
+    }
+    tip
+}
+
+#[cfg(test)]
+mod tab_label_tests {
+    use super::{tab_hover_text, tab_labels};
+
+    fn labels(items: &[(&'static str, Option<&'static str>)]) -> Vec<(String, bool)> {
+        tab_labels(items.iter().copied())
+    }
+
+    /// 同名会话的标签上绝不出现 #uid（本机、同主机都一样），且都标记 dup 让 hover 带上 #uid。
+    /// 这是钉子不是门禁：`tab_labels` 的入参里根本没有 uid，现实现下它不可能失败；留着是防
+    /// 将来有人把 uid 传进来、又拼回标签上。
+    #[test]
+    fn duplicate_titles_never_show_uid_on_tab() {
+        for got in [
+            labels(&[("web", Some("10.0.0.1")), ("web", Some("10.0.0.1"))]),
+            labels(&[("本机", None), ("本机", None)]),
+        ] {
+            for (label, dup) in got {
+                assert!(dup, "同名会话要标记 dup，hover 才会带 #uid");
+                assert!(!label.contains('#'), "标签不该出现 #uid：{label}");
+            }
+        }
+    }
+
+    /// 反向对照：把 `hosts.len() > 1` 改成 `>= 1`（同主机也加后缀），第二个断言当场挂。
+    #[test]
+    fn host_suffix_only_when_hosts_differ() {
+        assert_eq!(
+            labels(&[("web", Some("10.0.0.1")), ("web", Some("10.0.0.2")), ("db", Some("10.0.0.1"))]),
+            vec![
+                ("web · 10.0.0.1".to_string(), true),
+                ("web · 10.0.0.2".to_string(), true),
+                ("db".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            labels(&[("web", Some("10.0.0.1")), ("web", Some("10.0.0.1"))]),
+            vec![("web".to_string(), true), ("web".to_string(), true)],
+            "同一连接开两个：主机后缀分不开，不加"
+        );
+    }
+
+    #[test]
+    fn hover_puts_uid_right_after_user_at_host() {
+        assert_eq!(tab_hover_text("root@10.0.0.1:22", Some(3), None), "root@10.0.0.1:22 · #3");
+        assert_eq!(tab_hover_text("root@10.0.0.1:22", None, None), "root@10.0.0.1:22");
+        assert!(tab_hover_text("root@10.0.0.1:22", Some(3), Some("e5-1"))
+            .starts_with("root@10.0.0.1:22 · #3 · "));
     }
 }

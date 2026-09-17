@@ -190,9 +190,17 @@ pub(in crate::ssh) async fn read_file_chunked(
             let msg = if e.to_string().contains("__TOO_LARGE__") {
                 too_large()
             } else {
+                // russh-sftp 的 Status 错误 Display 有「No such file: No such file」式整串
+                // 重复（状态码与其文本各拼一遍），原样透传会让调用方误读成两层错误——
+                // 能确认冒号前后是同一串时折叠成一层。
+                let detail = e.to_string();
+                let collapsed = detail
+                    .split_once(':')
+                    .filter(|(head, tail)| !head.is_empty() && head.trim() == tail.trim())
+                    .map_or(detail.as_str(), |(head, _)| head.trim());
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("打开失败：{e}"),
-                    crate::i18n::Lang::En => format!("Open failed: {e}"),
+                    crate::i18n::Lang::Zh => format!("打开失败：{collapsed}"),
+                    crate::i18n::Lang::En => format!("Open failed: {collapsed}"),
                 }
             };
             sink.send(WorkerEvent::FileLoadFailed { id, message: msg });

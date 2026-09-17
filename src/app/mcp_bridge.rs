@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -432,6 +434,48 @@ fn remote_parent(path: &str) -> String {
     }
 }
 
+/// 把一个 `send_input` 文本里的字面转义解析成原始按键字节。
+///
+/// 支持的转义：`\r` `\n` `\t`、`\xHH`（任意字节，如 `\x04`=Ctrl-D、`\x1b`=Esc）、`\\`
+/// （字面反斜杠）。未识别的 `\c` 原样保留反斜杠和字符两个字符——宁肯多留一点噪声也不
+/// 丢数据。AI 侧的工具描述写明这套表；普通不含反斜杠的文本逐字节原样通过。
+fn unescape_key_text(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.extend_from_slice(c.to_string().as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('r') => out.push(b'\r'),
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('\\') => out.push(b'\\'),
+            Some('x') => {
+                let h: String = chars.by_ref().take(2).collect();
+                match u8::from_str_radix(&h, 16) {
+                    Ok(b) => out.push(b),
+                    Err(_) => {
+                        // 不是合法十六进制：原样保留，别静默吃掉
+                        out.push(b'\\');
+                        out.push(b'x');
+                        out.extend_from_slice(h.as_bytes());
+                    }
+                }
+            }
+            // 文件结尾的单反斜杠，或任何未定义的转义：原样保留
+            other => {
+                out.push(b'\\');
+                if let Some(o) = other {
+                    out.extend_from_slice(o.to_string().as_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 校验一个 `copy_file` 用的远端 POSIX 路径：必须绝对、不含 `.`/`..` 路径段、拆出来的
 /// 文件名非空。三者任一不满足，`remote_parent`/`remote_basename` 拆分出来的目标要么会
 /// 落在意料之外的目录（`.`/`..` 段）、要么文件名为空（`"/"`、`"////"` 这类路径）——
@@ -849,6 +893,16 @@ async fn handle_conn(
     ctx: egui::Context,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    // dup 一份 socket 句柄，留给下面 `is_caller_upload` 分支「拒绝后排干文件体」用
+    // （理由见该处注释）。tokio 的 UnixStream 没有 try_clone（TcpStream 才有），用
+    // libc::dup 复制 fd 再包回——原始句柄来自 tokio accept、已是 non-blocking，dup 与
+    // 原句柄共享同一 open file description，状态一致。失败不致命，只是退回旧行为。
+    let drain_dup = unsafe {
+        let fd = libc::dup(stream.as_raw_fd());
+        (fd >= 0)
+            .then(|| std::os::unix::net::UnixStream::from_raw_fd(fd))
+            .and_then(|std_stream| tokio::net::UnixStream::from_std(std_stream).ok())
+    };
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r.take(MAX_MCP_LINE_BYTES)).lines();
     let Ok(Ok(Some(line))) = tokio::time::timeout(FIRST_LINE_TIMEOUT, lines.next_line()).await
@@ -1043,9 +1097,26 @@ async fn handle_conn(
             id,
             result: Err("iShell 未能处理该请求（可能已关闭）".into()),
         });
+        let is_err = resp.result.is_err();
         if let Ok(mut json) = serde_json::to_string(&resp) {
             json.push('\n');
             let _ = w.write_all(json.as_bytes()).await;
+        }
+        // App 校验拒绝（会话不存在/路径非法/并发满/未授权）或传输中途失败时，调用方此刻
+        // 可能还在推文件体。直接返回关连接的话，它后续的数据段撞上已关闭的 socket 会收到
+        // RST，而它尚未读出的错误响应会被内核随 RST 从接收队列里丢弃——最终只报一句
+        // Broken pipe，真实错误彻底丢失（实测 8MB 文件必现；100KB 因 body 一次写完不受影响）。
+        // 所以先把残留在管道里的字节读到 EOF 再关：新代理读到错误会立即停写断开，EOF 来得
+        // 很快；旧代理会把整个 body 推完。dup 句柄只在 worker 已结束（无论成败）之后使用，
+        // 与 worker 的读取互斥，不会两个读取者抢数据。超时只是兜底——排不干就退回旧行为。
+        if is_err {
+            if let Some(mut dr) = drain_dup {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    tokio::io::copy(&mut dr, &mut tokio::io::sink()),
+                )
+                .await;
+            }
         }
         return;
     }
@@ -1879,15 +1950,9 @@ impl App {
         let s = self.sessions.last_mut().expect("spawn_session 刚 push 了一个会话");
         s.ai_owned = true; // AI 新开的会话：只读，用户键盘输入不转发（见 layout_body.rs）
         s.ai_owner = owner; // 归属：只归开它的那个 AI 进程使用（见 write_needs_consent）
-        s.ai_owner_label = owner_label.clone(); // 标签 hover 上展示「谁开的」
-        if let Some(label) = &owner_label {
-            s.tip = format!(
-                "{} · {} {}",
-                s.tip,
-                crate::i18n::tr("AI 开启，来源", "AI-opened by"),
-                label
-            );
-        }
+        // 标签 hover 上展示「谁开的」：渲染时由 layout_tabs::tab_hover_text 拼接（#uid 要插在
+        // user@host 与来源之间，所以不再把来源预先拼进 tip）。
+        s.ai_owner_label = owner_label.clone();
         let info = McpSessionInfo {
             uid: s.uid,
             title: s.title.clone(),
@@ -2427,7 +2492,7 @@ impl App {
                 }
                 if self.sessions[idx]
                     .cmd_tx
-                    .send(UiCommand::TerminalInput(text.into_bytes()))
+                    .send(UiCommand::TerminalInput(unescape_key_text(&text)))
                     .is_err()
                 {
                     send_err(resp_tx, "这个会话的后台连接似乎已经断开，输入没有送达".into());
@@ -2925,7 +2990,7 @@ mod write_consent_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        remote_basename, remote_parent, trim_leading_echo, validate_local_path,
+        remote_basename, remote_parent, trim_leading_echo, unescape_key_text, validate_local_path,
         validate_remote_path,
     };
 
@@ -2977,6 +3042,24 @@ mod tests {
     #[test]
     fn local_path_rejects_root_and_missing_filename() {
         assert!(validate_local_path("/").is_err());
+    }
+
+    /// send_input 的转义表：`\r` 提交行、`\xHH` 发控制字节（Ctrl-D/Ctrl-C/Esc）、
+    /// `\\` 得到字面反斜杠；未定义的转义**原样保留**（宁留噪声不丢数据）——
+    /// 反向对照：把 unknown 分支改成吞掉反斜杠，最后两条断言当场挂。
+    #[test]
+    fn unescape_key_text_parses_documented_escapes() {
+        assert_eq!(unescape_key_text("ls -l\\r"), b"ls -l\r");
+        assert_eq!(unescape_key_text("a\\tb\\n"), b"a\tb\n");
+        assert_eq!(unescape_key_text("\\x04"), b"\x04");
+        assert_eq!(unescape_key_text("\\x1b:wq\\r"), b"\x1b:wq\r");
+        assert_eq!(unescape_key_text("C:\\\\tmp"), b"C:\\tmp");
+        // 未定义/残缺的转义原样保留
+        assert_eq!(unescape_key_text("a\\qb"), b"a\\qb");
+        assert_eq!(unescape_key_text("a\\"), b"a\\");
+        assert_eq!(unescape_key_text("\\xzz"), b"\\xzz");
+        // 普通文本逐字节原样
+        assert_eq!(unescape_key_text("hello"), b"hello");
     }
 
     #[test]

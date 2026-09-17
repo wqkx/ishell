@@ -80,6 +80,25 @@
   不在目标会话不可达时误报手工清理；回执丢失（仍 true）时补发逻辑不受影响。顺带修正
   快败分支一处注释：DirectCopying 进行中其实尚未发撤销（finish_direct_attempt 才发），
   补发只会更早清理，不影响已建立的 scp 连接。
+- **端到端实测修出的最后一处**（GUI 侧）：上传被提前拒绝时，大文件场景仍只剩
+  Broken pipe——代理侧的并发读/biased select 只能救「body 一次写完」的情形；body 超过
+  双方内核缓冲时，客户端持续写入会触发 RST、内核把尚未读出的错误响应随 RST 从接收队列
+  丢弃，TCP 层无药可救。现在 GUI 在写出错误响应后先把残留文件字节读到 EOF 再关连接
+  （dup 句柄、与 worker 读取互斥、60s 超时兜底），客户端就能稳稳读到真实错误。
+- **实测修出的四个交互缺陷**（真人实测报告）：
+  send_input 控制字符无法发送：描述让 AI 在 text 末尾加 "\r"，但文本原样透传、没有
+  任何一层做转义解析——cat 实测收到字面 hello\r 文本，Ctrl-D 无从表达，vim/REPL 里
+  无法提交行。现在 GUI 侧解析字面转义（\r \n \t \xHH \\，未定义转义原样保留），工具
+  描述写明转义表与示例（提交行 "ls -l\r"、EOF "\x04"、vim "\x1b:q!\r"），补单测。
+  哨兵被交互程序吃掉的引导：cat/REPL 把紧跟其后的完成哨兵当 stdin 吃掉后，运行永远
+  finished=false（与中断路径同机制），run_command/interrupt 描述与总提示词写明标准
+  交互流程——start_command 启动 → send_input 逐键交互 → read_screen 观察 → interrupt
+  释放再开新命令（在提示符上按 Ctrl-C 无害）；raw 模式程序（vim）中断后排队哨兵可能
+  泄漏为一条自擦除的可见行，无害但会混进输出文本，interrupt 描述已写明；哨兵捕获取消
+  本就随 cancel_pending_ai_run 到位，无需改动。
+  read_file 报错文案重复拼接：russh-sftp 的 Status 错误 Display 是「No such file:
+  No such file」式整串重复（状态码与其文本各拼一遍），原样透传误导调用方；现在冒号
+  前后确认同一串时折叠为一层。
 
 ## [0.21.0] - 2026-09-17
 

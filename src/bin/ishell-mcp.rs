@@ -1093,6 +1093,11 @@ impl IshellMcp {
                         序——表现为反复超时、输出却在增长。这时调用 interrupt 释放，用 \
                         read_screen/read_history 核实，并把命令改写为完整单行重试——不要反复 \
                         poll_run 干等（每次都会烧满一个完整超时）。\
+                        **交互式程序**（cat/REPL/ssh 这类读 stdin 的命令）会把紧跟其后的完成哨兵\
+                        当作自己的输入吃掉：程序退出后运行仍永远 finished=false——不是卡死，是哨兵\
+                        没了。标准交互流程：start_command 启动 → send_input 逐键交互（\\r 提交行、\
+                        \\x04 发 EOF）→ read_screen 观察 → 结束后调 interrupt 释放（在提示符上按 \
+                        Ctrl-C 无害），再开新命令。\
                         两个解读输出时容易踩的坑：① output 末尾常带一段 shell 提示符残留（比如 \
                         `(venv) user@host:~$`，有时只剩一个 `$`）——这是刻意不做的清理（早期试过按\
                         「最后一行大概率是提示符」启发式剥掉，但 PS1 为空/不可见时会把真实输出误删，\
@@ -1187,7 +1192,12 @@ impl IshellMcp {
                         那条被中断的命令彻底失去结果——执行到哪一步、是否已产生副作用都无法再确认，仅会\
                         拿到已知的部分输出作参考。（同一时刻只允许一个 poll_run 等待者的限制会在上一个\
                         等待者所在的连接断开——比如它自己的调用方超时放弃——之后自动解除，不需要靠 \
-                        interrupt 才能恢复。）"
+                        interrupt 才能恢复。）\n\
+                        两个交互场景的注意点：① 被中断的程序若把终端设成 raw 模式（vim 这类全屏程序），\
+                        Ctrl-C 不会冲刷输入队列——本次运行排队中的完成哨兵可能随后以一条自擦除的 \
+                        printf 'AI_DONE_…' 泄漏为可见行：无害，但会混进后续命令的输出文本。② 交互式程序\
+                        （cat/REPL）会把哨兵当输入吃掉、运行永远 finished=false——用它收尾：程序退出后\
+                        （无论正常与否）调一次 interrupt 释放，在提示符上按 Ctrl-C 无害。"
     )]
     async fn interrupt(
         &self,
@@ -1257,7 +1267,11 @@ impl IshellMcp {
     #[tool(
         description = "往指定终端直接发送原始文本/按键，不等待、不做完成检测——用于 run_command \
                         覆盖不到的交互式场景（sudo 密码提示、vim/REPL 里继续输入等）。发送后配合 \
-                        read_screen 看效果。不会自动加回车，要按 Enter 就在 text 末尾加 \"\\r\"。"
+                        read_screen 看效果。\n\
+                        text 支持字面转义：\\r=回车 \\n=换行 \\t=Tab \\xHH=任意字节（\\x04=Ctrl-D、\
+                        \\x1b=Esc、\\x03=Ctrl-C）、\\\\=字面反斜杠。例：提交一行用 \"ls -l\\r\"；\
+                        给 cat 发 EOF 用 \"\\x04\"；vim 里保存退出用 \"\\x1b:wq\\r\"。普通文本（不含 \
+                        反斜杠）逐字节原样发送；不会自动加回车。"
     )]
     async fn send_input(
         &self,
@@ -1468,8 +1482,10 @@ impl IshellMcp {
                     · 长构建/长测试：run_command timeout_ms 给足直接等；MCP 客户端自己超时断了就 \
                     poll_run（省略 run_id）续等同一条运行，绝不重发命令。\n\
                     · 终端卡着交互程序（vim/top/sudo 密码提示）：先 read_screen 看前台是什么 → \
-                    send_input 逐键应对（vim 里 :q! 加回车）→ sudo 密码提示符让用户自己输，或征得\
-                    同意后 send_input。"
+                    send_input 逐键应对（vim 退出用 \"\\x1b:q!\\r\"、top 用 \"q\"、提交行在行尾加 \
+                    \\r、给 cat 发 EOF 用 \"\\x04\"）→ sudo 密码提示符让用户自己输，或征得同意后 \
+                    send_input。交互程序会把完成哨兵当输入吃掉：程序退出后运行仍可能永远 \
+                    finished=false，调一次 interrupt 释放（在提示符上按 Ctrl-C 无害）再开新命令。"
 )]
 impl ServerHandler for IshellMcp {}
 
