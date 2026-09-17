@@ -177,7 +177,8 @@ pub struct McpSessionInfo {
     pub title: String,
     pub host: String,
     pub connected: bool,
-    /// 远端当前工作目录（需用户已同意过 OSC 7 注入才有值）。
+    /// 远端当前工作目录（用户会话需已同意过 OSC 7 注入才有值；AI 专用会话自动注入，
+    /// 刚连上的一小段时间内可能还是 null——上报片段要等 shell 闲下来才注入）。
     pub cwd: Option<String>,
     /// 这个会话是不是 AI 自己用 `open_session` 开的。
     ///

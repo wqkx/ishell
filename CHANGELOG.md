@@ -6,7 +6,15 @@
 
 ### Changed
 
-- **AI 会话的界面噪声清理**：AI 开的会话标签不再加机器人图标和开启者名前缀；终端上方的
+- **AI 反馈五连修**（另一个 AI 实际使用 ishell-mcp 后的改进建议）：
+  `run_command`/`start_command` 内置等连接——`open_session` 返回后会话多半还在认证中，
+  这两个工具现在自动轮询 connected、最多等约 20 秒，省掉「先 list_sessions 确认再执行」
+  的固定往返；工具描述与总提示词写清 run_command 的等待会被 MCP 客户端空闲超时切断、
+  长命令优先 start_command + poll_run；`list_sessions` 新增 `filter` 参数（按标题/主机名
+  子串过滤，省上下文）；AI 专用会话自动注入 OSC 7 上报片段（此前 cwd 恒为 null，AI 只能
+  跑 pwd 猜目录；用户会话仍走 consent 弹窗不变）；同名会话的标签自动消歧——标题撞车才
+  追加「· 主机」（本机会话退化为 #uid），不撞车零噪声。
+- AI 会话的界面噪声清理：AI 开的会话标签不再加机器人图标和开启者名前缀；终端上方的
   AI 提示条从「🤖 AI 正在驱动此终端（只读，uid=N）· 当前全部 AI 终端 uid：…」精简为
   「AI 正在驱动此终端（只读）」——uid/开启者列表是 MCP 调用方的内部定位细节，用户看着
   只是噪声（归属信息仍在 list_sessions 与写入弹窗里发挥作用，只是不上屏）。

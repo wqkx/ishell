@@ -815,6 +815,28 @@ async fn call(_kind: McpReqKind) -> Result<McpReqResult, String> {
     Err("ishell-mcp 目前仅支持 Unix（Linux/macOS）系统的本地 IPC，暂不支持 Windows".into())
 }
 
+/// 等一条会话连上（最多 `max`）：`open_session` 刚返回时 connected=false，此刻 run_command
+/// 会原样报错，逼着调用方「先 list_sessions 确认、再 run_command」，每个新会话固定多一轮
+/// 往返。这里代它等：每 300ms 问一次 GUI，连上即返回。超时或会话不存在也返回——把报错
+/// 留给真正的命令调用（会话不存在时那条报错自带可用会话列表，比这里干等更有用）。
+async fn wait_connected(session_uid: u64, max: std::time::Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        match call(McpReqKind::ListSessions).await {
+            Ok(McpReqResult::Sessions(list)) => match list.iter().find(|s| s.uid == session_uid) {
+                Some(s) if s.connected => return,
+                Some(_) => {} // 还在连接/认证中，继续等
+                None => return, // 没这个会话：留给后续调用报错
+            },
+            _ => return, // 查询本身失败（GUI 未运行等）：同样留给后续调用
+        }
+        if start.elapsed() >= max {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
 fn text_result(body: Result<McpReqResult, String>) -> Result<CallToolResult, McpError> {
     let text = match body {
         Ok(r) => serde_json::to_string_pretty(&r).unwrap_or_else(|e| e.to_string()),
@@ -839,6 +861,12 @@ pub struct RunCommandArgs {
     /// 等待命令结束的超时毫秒数；超时仍未结束会返回 finished=false + run_id，可用 poll_run 续等
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListSessionsArgs {
+    /// 可选过滤子串：只返回标题或主机名包含它（不区分大小写）的会话。会话多时用它省上下文
+    pub filter: Option<String>,
 }
 
 /// 启动后立即返回的命令参数。它复用 `run_command` 的哨兵和 `poll_run` 状态机，
@@ -978,7 +1006,8 @@ impl IshellMcp {
                         以及三个归属字段——ai_owned（是不是 AI 开的专用窗口）、ai_owner（开它的\
                         AI 的来源标签，如 `e5-1 (ishell-mcp pid 42)`，用户开的会话为 null）、mine\
                         （**是不是你这个进程自己开的**：true = 你的专用窗口，随便用；false 而\
-                        ai_owned=true = 另一个 AI 开的窗口，写入会弹窗让用户授权）。\n\
+                        ai_owned=true = 另一个 AI 开的窗口，写入会弹窗让用户授权）。同名会话凭\
+                        uid 和 host 区分。可传 filter 只返回标题/主机名匹配的会话，省上下文。\n\
                         归属速查：mine=true 直接用；ai_owned=false 是**用户本人正在用的会话**，\
                         他随时可能在里面敲字，默认不要往里写（run_command / send_input / \
                         interrupt / write_file / copy_to_remote 等）——两路输入会在同一个 shell \
@@ -988,15 +1017,31 @@ impl IshellMcp {
                         的 venv、已经 sudo 的状态），调用会照常发出，但 iShell 会弹窗让用户当面\
                         授权一次，用户同意后该会话不再询问。"
     )]
-    async fn list_sessions(&self) -> Result<CallToolResult, McpError> {
-        text_result(call(McpReqKind::ListSessions).await)
+    async fn list_sessions(
+        &self,
+        Parameters(ListSessionsArgs { filter }): Parameters<ListSessionsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match call(McpReqKind::ListSessions).await {
+            Ok(McpReqResult::Sessions(mut list)) => {
+                if let Some(f) = filter.map(|f| f.to_lowercase()).filter(|f| !f.is_empty()) {
+                    list.retain(|s| {
+                        s.title.to_lowercase().contains(&f)
+                            || s.host.to_lowercase().contains(&f)
+                    });
+                }
+                text_result(Ok(McpReqResult::Sessions(list)))
+            }
+            other => text_result(other),
+        }
     }
 
     #[tool(
         description = "在指定终端会话里运行一条命令，等待其执行完成（或超时）后返回输出与退出码。\
                         命令和输出会实时显示在用户正在看的那个终端标签里，效果等同于用户亲自输入。\
-                        会话还没连上（open_session 刚返回时可能仍在连接/认证中）会直接报错，\
-                        不会挂起——遇到这个错误就用 list_sessions 确认 connected 变 true 后再试。\
+                        会话还在连接/认证中时（open_session 刚返回就是这状态）**会自动等它连上，最\
+                        多约 20 秒**——一般不用先 list_sessions 确认 connected 再发。另一个该知道的\
+                        边界：本工具的等待可能被 MCP 客户端的空闲超时切断（客户端等不到响应会自行\
+                        断开）——预计命令可能跑得很久的，改用 start_command 启动、poll_run 续等。\
                         重要限制：这是往一个真实交互 shell 里打字+回车，不是独立执行通道——\
                         前台如果正跑着 vim/top/REPL/sudo 密码提示等非 shell 程序，或者上一条命令\
                         有反斜杠续行、未闭合引号、heredoc 还没结束，这条命令文本会被当成那个\
@@ -1019,6 +1064,7 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<RunCommandArgs>,
     ) -> Result<CallToolResult, McpError> {
+        wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
             call(McpReqKind::RunCommand {
                 session_uid,
@@ -1032,12 +1078,16 @@ impl IshellMcp {
     #[tool(
         description = "启动一条可能很长的命令，并在至多 100ms 后返回，不会因 MCP 客户端的长时间\
                         空闲限制而占住等待连接。返回 finished=false 时保存 run_id，之后用 poll_run\
-                        以较短 timeout_ms 查询；命令已很快结束时会直接返回 finished=true。"
+                        以较短 timeout_ms 查询；命令已很快结束时会直接返回 finished=true。\
+                        **预计运行时间可能超过 MCP 客户端空闲超时（几十秒到几分钟）的命令优先用\
+                        本工具**：run_command 的等待会被客户端空闲超时切断，本工具不会。会话还在\
+                        连接/认证中时同样会自动等它连上（最多约 20 秒）。"
     )]
     async fn start_command(
         &self,
         Parameters(StartCommandArgs { session_uid, command }): Parameters<StartCommandArgs>,
     ) -> Result<CallToolResult, McpError> {
+        wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
             call(McpReqKind::RunCommand {
                 session_uid,
@@ -1105,8 +1155,8 @@ impl IshellMcp {
                         双击这条已保存连接。name 是已保存连接的名字，不是主机地址，也不是 \
                         list_sessions 里的会话标题——不确定具体拼写时先调 list_saved_connections \
                         核对。返回新会话的 uid；此时通常还没连上（connected=false，正在连接/\
-                        认证中），直接对它调 run_command 会报错——用 list_sessions 确认 \
-                        connected 变 true 后再执行命令。"
+                        认证中）——直接对它调 run_command 即可，它会自动等连接（最多约 20 \
+                        秒），不必先 list_sessions 确认 connected。"
     )]
     async fn open_session(
         &self,
@@ -1329,8 +1379,9 @@ impl IshellMcp {
                     字 → open_session（首次需用户确认）。uid 在同一次 iShell 运行内稳定、断线重连\
                     不变；iShell 重启后重新分配，历史上下文里的旧 uid 可能已指向别的会话——所以\
                     一律从最新的 list_sessions 原样复制。\n\
-                    会话状态与报错：connected=false = 还在连接/认证中或已断线（重连中），此刻发命\
-                    令会报「会话尚未连接」，等它变 true。一个会话同时只能有一条 AI 命令在跑，再发\
+                    会话状态与报错：connected=false = 还在连接/认证中或已断线（重连中）；run_command \
+                    /start_command 会自动等它连上（最多约 20 秒），send_input/interrupt 不会等——\
+                    后两个遇到「会话尚未连接」就等它变 true。一个会话同时只能有一条 AI 命令在跑，再发\
                     会报「已有一条正在执行」——用 poll_run 续等或 interrupt 释放。运行中途断线：进\
                     行中的 run_command/poll_run 会收到「运行已失效、无法再 poll_run」加已知部分输\
                     出，按它判断执行到哪一步，不要整条重发。每条错误文案都写明了类别和下一步（重试\

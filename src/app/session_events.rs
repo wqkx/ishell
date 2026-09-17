@@ -60,6 +60,8 @@ impl Session {
                     self.terminal.reset_input_clock();
                     // 「跳过注入」的提示同理：新连接是全新一轮，若再次被跳过应重新提示。
                     self.pair_inject_skipped = false;
+                    // OSC 7 上报片段同理：新 shell 的 PROMPT_COMMAND/precmd 里没有上报钩子。
+                    self.osc7_injected = false;
                     // 重连后恢复工作目录（若断线前由 OSC 7 记录过）。
                     //
                     // **不在这里直接注入。** `Connected` 是「SSH 连上了」，不是「shell 已经在

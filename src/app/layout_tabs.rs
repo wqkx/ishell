@@ -171,12 +171,30 @@ impl App {
                                     let ctx = ui.ctx().clone();
                                     let body_font = egui::TextStyle::Body.resolve(ui.style());
                                     let mut acc = 0.0f32; // 目标布局累计左边界
+                                    // 同名会话消歧：标题撞车的会话追加区分后缀（主机，本机会话
+                                    // 退化为 uid），不撞车的标签保持原标题、零额外噪声。
+                                    let mut title_counts: std::collections::HashMap<
+                                        &str,
+                                        usize,
+                                    > = std::collections::HashMap::new();
+                                    for s in &self.sessions {
+                                        *title_counts.entry(s.title.as_str()).or_default() += 1;
+                                    }
                                     for (i, s) in self.sessions.iter().enumerate() {
                                         let selected = active == Some(i);
                                         // 标签只显示会话标题：机器人图标、开启者名这类
                                         // MCP 内部标识用户看着只是噪声（归属信息仍在
                                         // list_sessions/写入弹窗里发挥作用，不上屏）。
-                                        let display_title = s.title.clone();
+                                        let display_title = if title_counts[s.title.as_str()] > 1 {
+                                            let disambig = if s.cfg.host.is_empty() {
+                                                format!("#{}", s.uid)
+                                            } else {
+                                                s.cfg.host.clone()
+                                            };
+                                            format!("{} · {}", s.title, disambig)
+                                        } else {
+                                            s.title.clone()
+                                        };
                                         // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
                                         let title_w = ctx.fonts_mut(|f| {
                                             f.layout_no_wrap(

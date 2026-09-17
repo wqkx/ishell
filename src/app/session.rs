@@ -74,6 +74,10 @@ pub(super) struct Session {
     /// 不设的话每帧都会满足提示条件——它只在「其余注入条件全满足、只差 never_typed」时为真，
     /// 那种状态会一直保持到连接结束。
     pub(super) pair_inject_skipped: bool,
+    /// AI 专用会话是否已注入 OSC 7 cwd 上报片段（用户会话的 OSC7 走 consent 弹窗，不经此
+    /// 标记）。AI 会话没有 cwd 的话，MCP 的 list_sessions 只能给出 cwd=null，AI 定位远端
+    /// 目录只能靠跑 pwd。断线重连后远端是新的 shell，Connected 时复位以便重新注入。
+    pub(super) osc7_injected: bool,
     /// 远端是否支持 /proc 系统监控（None=尚未探测；false 时侧栏提示并跳过杀进程等）
     pub(super) monitor_ok: Option<bool>,
     /// AI/MCP 控制通道正在等待完成的一次命令运行（同一会话同一时刻只允许一条）
@@ -509,6 +513,7 @@ impl App {
             ai_owner: None,
             ai_owner_label: None,
             pair_inject_skipped: false,
+            osc7_injected: false,
             pending_file_ops: Vec::new(),
             file_op_tombstones: std::collections::VecDeque::new(),
         });

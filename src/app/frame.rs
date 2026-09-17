@@ -232,6 +232,25 @@ impl App {
                 self.ctx.input(|i| i.time),
             ));
         }
+        // OSC 7 工作目录上报：AI 专用会话自动注入。片段与用户在终端右键菜单里同意注入的
+        // 是同一个（仅当前会话、不写 rc），但 AI 自己的会话无需征求同意——和用户会话不同，
+        // 这里没人「正在用」这个 shell，注入的代价只是提示符上多一条看不见的 OSC 序列。
+        // 注入后远端每次显示提示符都会上报 cwd，`list_sessions` 的 cwd 字段由此有值——
+        // 否则 AI 只能跑 pwd 猜目录。与上面各趟分开：判据同样交给 `shell_idle_for_injection`
+        // （含 injection_idle_for，上一趟注入的回显吞除不会被这趟冲掉）。
+        for s in &mut self.sessions {
+            if !s.ai_owned || !s.connected || s.osc7_injected {
+                continue;
+            }
+            if s.shell_idle_for_injection() {
+                let cmd = super::view_state::OSC7_SNIPPET;
+                let _ = s
+                    .cmd_tx
+                    .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
+                s.terminal.expect_echo(cmd);
+                s.osc7_injected = true;
+            }
+        }
     }
 
     pub(super) fn process_frame_events(&mut self, ui: &mut egui::Ui) {
