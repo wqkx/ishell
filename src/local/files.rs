@@ -171,8 +171,29 @@ async fn read_file(path: &str, force: bool, id: u64, sink: &UiSink) {
     sink.send(WorkerEvent::FileLoadProgress { id, done: 0, total });
 
     let too_large = || match crate::i18n::current() {
-        crate::i18n::Lang::Zh => format!("文件过大（>{}MB）", limit / 1024 / 1024),
-        crate::i18n::Lang::En => format!("File too large (>{}MB)", limit / 1024 / 1024),
+        crate::i18n::Lang::Zh => {
+            if force {
+                format!("文件过大（>{}MB），已是 force 模式硬上限", limit / 1024 / 1024)
+            } else {
+                format!(
+                    "文件过大（>{}MB），如确认需要请用 force=true 重试（硬上限 128MB）",
+                    limit / 1024 / 1024
+                )
+            }
+        }
+        crate::i18n::Lang::En => {
+            if force {
+                format!(
+                    "File too large (>{}MB, hard limit in force mode)",
+                    limit / 1024 / 1024
+                )
+            } else {
+                format!(
+                    "File too large (>{}MB); retry with force=true if you really need it (hard limit 128MB)",
+                    limit / 1024 / 1024
+                )
+            }
+        }
     };
     if total as usize > limit {
         // 非 force 超软限：列表里的旧大小可能过时，交 UI 弹确认可强制打开；force 仍超才真失败。
@@ -311,6 +332,14 @@ async fn write_file(
         done: 0,
         total,
     });
+    // 与远端 write_file 对齐：父目录缺失时自动创建（copy 家族的工具描述承诺过「所在目录
+    // 不存在会自动创建」）。best-effort：已存在是零成本 Ok，真正的权限问题会在随后的写入
+    // 以清晰错误暴露。
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+    }
     match atomic_write(path, bytes.as_ref()).await {
         Ok(()) => {
             sink.send(WorkerEvent::FileSaveProgress {

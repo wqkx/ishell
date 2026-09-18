@@ -211,8 +211,8 @@ pub(super) async fn upload(
                 crate::i18n::tr("已取消", "Canceled").to_string()
             } else {
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("上传失败：{e}"),
-                    crate::i18n::Lang::En => format!("Upload failed: {e}"),
+                    crate::i18n::Lang::Zh => format!("上传失败：{}", crate::ssh::dedup_status(&e.to_string())),
+                    crate::i18n::Lang::En => format!("Upload failed: {}", crate::ssh::dedup_status(&e.to_string())),
                 }
             };
             sink.send(WorkerEvent::TransferDone {

@@ -126,6 +126,12 @@ impl Session {
                         let _ = self.cmd_tx.send(UiCommand::AddForward(spec));
                     }
                 }
+                WorkerEvent::ShellExited(code) => {
+                    // exit N：shell 已死，排队的哨兵永远不会打印。用退出码直接收尾挂起的
+                    // AI 运行（finished=true）；随后的 Disconnected 不再重复处理（pending
+                    // 已清空或只剩缓存结果，cancel 会保留缓存）。
+                    self.finish_ai_run_with_exit_code(code);
+                }
                 WorkerEvent::Disconnected(reason) => {
                     self.connected = false;
                     self.status = reason;
@@ -135,6 +141,7 @@ impl Session {
                     // 断线意味着这个会话上任何挂起的 AI 命令都注定等不到哨兵了（worker 重启
                     // 后旧连接的输出流已经没了）——给还在等的 poll_run 一个明确的"未完成"
                     // 响应，而不是让它一直空等到自己的超时，也避免这个会话被"忙碌"卡住。
+                    // 已缓存结果的（exit N 先于断线到达）不在此列：cancel 内部会保留。
                     self.cancel_pending_ai_run("会话已断线");
                     self.cancel_pending_file_op();
                     // 进行中的传输标记为暂停，等重连后续传（不计为失败）
@@ -294,7 +301,11 @@ impl Session {
                     // 绝大多数情况下没有 MCP 文件操作在等：先廉价判断一下，避免每次普通的
                     // "打开大文件"事件都白白 format! 一次。
                     if self.file_read_op_would_resolve(id) {
-                        self.try_resolve_file_read(id, Err(format!("文件过大（{size} 字节）")));
+                        // MCP 调用方没有 GUI 的「确认后强制打开」弹窗——错误文案里直接给出
+                        // 逃生通道，否则调用方只会看到一句干巴巴的"文件过大"无从下手。
+                        self.try_resolve_file_read(id, Err(format!(
+                            "文件过大（{size} 字节），如确认需要请用 force=true 重试（硬上限 128MB）"
+                        )));
                     } else {
                         self.pending.too_large.push((id, path, size));
                     }

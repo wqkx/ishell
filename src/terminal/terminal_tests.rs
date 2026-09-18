@@ -13,6 +13,147 @@ fn osc7_parsing() {
     assert_eq!(osc::parse_osc7(b"no osc here"), None);
 }
 
+/// OSC 52 剪贴板：TUI 程序（opencode/nvim/tmux）写系统剪贴板的标准通道，远端程序唯一
+/// 通道。选择器只认 `c`；`?` 查询不回读（防剪贴板内容被远端一问一答骗走）；空负载 =
+/// 清剪贴板；base64 剥空白容错（tmux 透传常折行）。反向对照：把 `?` 的 continue 去掉、
+/// 把空白过滤去掉，中间两条断言当场挂。
+#[test]
+fn osc52_parsing() {
+    // aGVsbG8= = "hello"
+    assert_eq!(
+        osc::parse_osc52(b"\x1b]52;c;aGVsbG8=\x07", 0),
+        vec!["hello".to_string()]
+    );
+    // ST 终止符同样认
+    assert_eq!(
+        osc::parse_osc52(b"\x1b]52;c;aGVsbG8=\x1b\\", 0),
+        vec!["hello".to_string()]
+    );
+    // 查询不回读；非 c 选择器不认；空负载 = 清剪贴板
+    assert!(osc::parse_osc52(b"\x1b]52;c;?\x07", 0).is_empty());
+    assert!(osc::parse_osc52(b"\x1b]52;s;aGVsbG8=\x07", 0).is_empty());
+    assert_eq!(
+        osc::parse_osc52(b"\x1b]52;c;\x07", 0),
+        vec![String::new()]
+    );
+    // 负载空白剥掉再解；解不开的跳过不波及其它
+    assert_eq!(
+        osc::parse_osc52(b"\x1b]52;c;aGVs\r\n bG8=\x07", 0),
+        vec!["hello".to_string()]
+    );
+    assert!(osc::parse_osc52(b"\x1b]52;c;!!!not-base64!!!\x07", 0).is_empty());
+    // 终止符落在已扫前缀里（carried）= 上一轮已处理过，跳过
+    assert!(osc::parse_osc52(b"\x1b]52;c;aGVsbG8=\x07", 20).is_empty());
+}
+
+/// OSC 133（shell 集成）：只认 `C`（开始执行）与 `D;<code>`（结束+退出码），`A`/`B` 忽略。
+/// 这是 AI 命令完成检测的**首选**判据——由 shell 自己发，不经过任何程序的 stdin。
+#[test]
+fn osc133_parsing() {
+    use osc::Osc133::*;
+    assert_eq!(osc::parse_osc133(b"\x1b]133;C\x07", 0), vec![(0, CommandStart)]);
+    assert_eq!(
+        osc::parse_osc133(b"\x1b]133;D;42\x07", 0),
+        vec![(0, CommandEnd(Some(42)))]
+    );
+    // ST 终止符、以及不带退出码的 D
+    assert_eq!(
+        osc::parse_osc133(b"\x1b]133;D\x1b\\", 0),
+        vec![(0, CommandEnd(None))]
+    );
+    // 提示符标记与其它 OSC 一概忽略
+    assert!(osc::parse_osc133(b"\x1b]133;A\x07\x1b]7;file://h/tmp\x07", 0).is_empty());
+    // carried：终止符落在已扫前缀里的，上一轮已处理过
+    assert!(osc::parse_osc133(b"\x1b]133;C\x07", 20).is_empty());
+}
+
+/// 集成模式的捕获：`C` 之前的字节（命令行回显/上一个提示符）不算输出，`D` 到达即收束。
+/// 反向对照：把 `C` 的 drain 去掉，第一条断言里会混进提示符与命令行回显。
+#[test]
+fn integration_capture_takes_output_between_c_and_d() {
+    let mut t = Terminal::new();
+    t.arm_ai_capture_integration();
+    t.feed(b"$ echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07$ ");
+    let (code, out) = t.take_ai_done().expect("D 到达即收束");
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "hi", "只取 C 与 D 之间的输出，实际：{out:?}");
+}
+
+/// 跨块到达同样要收束：SSH 一条命令的输出天然会被拆成多个包。
+#[test]
+fn integration_capture_survives_chunk_splits() {
+    let mut t = Terminal::new();
+    t.arm_ai_capture_integration();
+    t.feed(b"\x1b]133;C\x07par");
+    assert!(t.take_ai_done().is_none(), "还没收到 D");
+    t.feed(b"tial\r\n\x1b]13");
+    t.feed(b"3;D;7\x07");
+    let (code, out) = t.take_ai_done().expect("拆包后仍要收束");
+    assert_eq!(code, 7);
+    assert_eq!(out.trim(), "partial");
+}
+
+/// **杂散 D 必须被忽略。** bash 对一个空行（裸回车）不展开 PS0（没有 `C`）却照常跑
+/// PROMPT_COMMAND（发 `D`），而且带的是**上一条**命令的 `$?`。实测（bash 5.1，PTY）：
+/// 输入 `b"\r"` → `\r\n ESC]133;D;5 BEL prompt`。认下这种 D 就是「命令还没跑就报完成、
+/// 退出码还是别人的」。
+/// 反向对照：去掉 `capture_progress` 里 `c_supported && !*started` 那道判据，第一条断言当场挂。
+#[test]
+fn integration_capture_ignores_a_d_without_its_c() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]133;C\x07"); // 这个 shell 发得出 C（此后没有 C 的 D 只能是杂散的）
+    t.feed(b"\x1b]133;D;0\x07$ ");
+    t.arm_ai_capture_integration();
+    t.feed(b"\r\n\x1b]133;D;5\x07$ "); // 空行产生的杂散 D
+    assert!(
+        t.take_ai_done().is_none(),
+        "没有配对 C 的 D 不是本次运行的结束，更不该把上一条命令的退出码当成结果"
+    );
+    t.feed(b"real\r\n\x1b]133;C\x07out\r\n\x1b]133;D;3\x07$ ");
+    let (code, out) = t.take_ai_done().expect("真正配对的 C/D 照常收束");
+    assert_eq!(code, 3);
+    assert_eq!(out.trim(), "out");
+}
+
+/// 反过来：shell **从来发不出** `C`（bash < 4.4 无 PS0）时，`D` 必须照认——否则那种远端上
+/// 每条命令都会等到自动回收。代价是输出多带一段命令行回显，由调用方 trim。
+#[test]
+fn integration_capture_still_finishes_on_shells_that_never_send_c() {
+    let mut t = Terminal::new();
+    t.arm_ai_capture_integration();
+    t.feed(b"echo hi\r\nhi\r\n\x1b]133;D;0\x07$ ");
+    let (code, out) = t.take_ai_done().expect("发不出 C 的 shell 也要能收束");
+    assert_eq!(code, 0);
+    assert!(out.contains("hi"), "实际：{out:?}");
+}
+
+/// 队首等不到回显时必须被丢弃，否则它把后面排队的全堵死（见 `ECHO_ARM_TTL`）。
+/// 反向对照：去掉 `strip_echo` 开头那段 TTL 清扫，断言里的 "hello" 会漏到输出上。
+#[test]
+fn a_head_arm_that_never_echoes_is_dropped_instead_of_blocking_the_queue() {
+    let mut t = Terminal::new();
+    t.expect_echo("never-echoed"); // 例：命令让 vim 进了 raw 模式，这行根本不会被回显
+    t.expect_echo("hello");
+    t.backdate_echo_head(std::time::Duration::from_secs(10));
+    t.feed(b"hello\r\nworld\r\n");
+    let screen = t.screen_text();
+    assert!(
+        !screen.contains("hello"),
+        "队首过期后第二条武装该接上并吞掉它的回显，实际屏幕：{screen:?}"
+    );
+    assert!(screen.contains("world"), "真实输出不能被误吞：{screen:?}");
+}
+
+/// 没有集成的会话（fish/csh、片段没注入）必须仍走哨兵回退，标志别乱置真。
+#[test]
+fn shell_integration_flag_only_turns_on_with_osc133() {
+    let mut t = Terminal::new();
+    t.feed(b"$ ls\r\nfoo bar\r\n");
+    assert!(!t.shell_integration_active());
+    t.feed(b"\x1b]133;D;0\x07");
+    assert!(t.shell_integration_active());
+}
+
 #[test]
 fn highlight_keywords() {
     let mut p = vt100::Parser::new(2, 80, 0);
@@ -1236,8 +1377,8 @@ fn a_connection_with_no_output_yet_is_not_idle() {
     assert!(t.output_idle_for(d), "收到输出并静止之后才算闲");
 }
 
-/// **刚替用户敲过一行，就不能马上再敲第二行。** `expect_echo` 是整体覆写：第二次武装会把
-/// 第一条命令没吞完的回显状态冲掉，那条命令就原样留在屏幕上。
+/// **刚替用户敲过一行，就不能马上再敲第二行。** 两次武装挨太近，提示符上一片注入痕迹
+///（吞除队列按打字顺序各吞各的回显，覆写不再发生——这道时间窗隔开的是观感与注入节奏）。
 ///
 /// 只挡「同一帧」不够——回显要走一个远端往返才回来，而注入走 `cmd_tx`，既不更新
 /// `last_output_at` 也不更新 `last_input_at`，下一帧（重绘心跳 150/200ms）那几道「静止」
@@ -1260,27 +1401,45 @@ fn a_fresh_injection_blocks_the_next_one() {
     assert!(t.injection_idle_for(d), "过了时间窗才放行");
 }
 
-/// RunCommand 的注入竞态守卫必须分清「刚自动注入过」和「上一条 run_command 刚发出」：
-/// 哨兵吞除（`expect_echo`）不该更新自动注入时刻——否则 AI 连续发命令（ls 接 cd）时
-/// 第二条会被误拒，报错还错指成「刚自动注入」；而自动注入（`expect_auto_inject_echo`）
-/// 必须挡住竞态窗口。
-/// 反向对照：让 `expect_echo` 也更新 `auto_inject_armed_at`，第一条断言当场挂。
+/// 回显吞除的排队语义：先武装的注入与后武装的哨兵**同时**挂着，两个回显按打字先后
+/// 各吞各的——后一次武装不再覆盖前一次（旧行为：哨兵 expect_echo 会冲掉注入的吞除，
+/// 450 字符的 OSC 7 片段回显漏进屏幕与捕获输出）。
+/// 反向对照：把 `expect_echo` 改回整体覆写，第一条断言当场挂（片段回显漏上屏幕）。
 #[test]
-fn auto_inject_guard_ignores_sentinel_arm() {
+fn echo_swallow_queues_in_typing_order() {
     let mut t = Terminal::new();
-    t.expect_echo("AI_DONE_x:"); // RunCommand 哨兵路径
-    assert!(
-        t.auto_inject_idle_for(std::time::Duration::from_secs(1)),
-        "哨兵吞除不算自动注入：rapid 连续命令不应被守卫挡住"
-    );
-    let armed = std::time::Instant::now();
-    t.expect_auto_inject_echo(" __ishell_cwd(){ :; }");
-    if armed.elapsed() < std::time::Duration::from_millis(250) {
-        assert!(
-            !t.auto_inject_idle_for(std::time::Duration::from_secs(1)),
-            "自动注入后 1 秒内的竞态窗口要被挡住"
-        );
-    }
+    let osc7 = " __ishell_cwd(){ :; }";
+    let marker = "printf '\\x1eAI_DONE_1:%d\\x1e' $?; printf '\\r\\x1b[K'";
+    t.expect_auto_inject_echo(osc7);
+    t.expect_echo(marker);
+    // 远端回显按打字顺序回来：先 OSC 7 片段行，后标记行
+    let echoed = format!("{osc7}\r\n{marker}\r\n");
+    t.feed(echoed.as_bytes());
+    let screen = t.parser.screen().contents();
+    assert!(!screen.contains(osc7.trim()), "OSC 7 片段回显应被吞掉");
+    assert!(!screen.contains("AI_DONE_1"), "哨兵回显应被吞掉");
+    t.feed(b"real output\r\n");
+    assert!(t.parser.screen().contents().contains("real output"));
+}
+
+/// 哨兵捕获对「未被吞掉的标记回显」免疫：捕获前缀以真实 0x1E 字节开头，而打字回显里
+/// 只有字面 `\x1e` 四个字符、没有控制字节——首条命令与 MOTD 交织导致吞除失配、标记
+/// 回显残留在流里时，捕获不会把回显误当哨兵（旧行为：退出码区域解析出 `%d` 垃圾，
+/// 实测首条命令 exit_code=-1 而命令实际成功）。回显文本仍会作为噪声留在输出里
+/// （那是吞除失配本身的代价，本测试管的是退出码不再退化）。
+#[test]
+fn ai_capture_ignores_literal_escape_text_in_unswallowed_echo() {
+    let mut t = Terminal::new();
+    // 吞除**没有**武装（模拟首条命令时吞除失配的场景）：标记行的打字回显原样留在流里
+    let typed_marker = "printf '\\x1eAI_DONE_7:%d\\x1e' $?; printf '\\r\\x1b[K'";
+    t.arm_ai_capture(b"\x1eAI_DONE_7:".to_vec());
+    t.feed(typed_marker.as_bytes());
+    t.feed(b"\r\n");
+    assert!(t.take_ai_done().is_none(), "字面转义文本不构成哨兵");
+    // 真实的 printf 输出：真实 0x1E 开头 + 退出码 + 真实 0x1E
+    t.feed(b"\x1eAI_DONE_7:0\x1e");
+    let (code, _out) = t.take_ai_done().expect("应命中真实哨兵");
+    assert_eq!(code, 0, "退出码来自真实输出，不能是 -1");
 }
 
 

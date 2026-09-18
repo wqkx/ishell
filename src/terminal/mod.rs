@@ -70,6 +70,36 @@ pub enum NoticeKind {
 pub const NOTICE_TAG_DONE: &str = "ishell:done";
 pub const NOTICE_TAG_NEED: &str = "ishell:need";
 
+/// 一条待吞除的回显武装记录：对应一次「我们替用户/AI 键入命令」的打字。
+/// `expect` 是被打字命令的原文（终端会原样回显）；`pos` 是已匹配的前缀长度
+/// （`pos == expect.len()` 即命令体已吞完、正在吞紧随的回车换行）；`pending` 是部分匹配中
+/// 暂存的疑似字节（证明是巧合后还给真实输出，不能凭空丢）；`head_since` 见 [`ECHO_ARM_TTL`]。
+struct EchoArm {
+    expect: Vec<u8>,
+    pos: usize,
+    pending: Vec<u8>,
+    /// 这条记录**成为队首**的时刻（入队时若队列本来就空，就是入队时刻；否则在前一条出队时
+    /// 刷新）。只有队首会参与匹配，用入队时刻计时会把「排在后面干等」也算进寿命。
+    head_since: std::time::Instant,
+}
+
+/// 队首武装记录的寿命上限：超过它还一个字节都没匹配上（`pos == 0`），就丢弃这条记录。
+///
+/// **这是 FIFO 队列的自愈机制，不能省。** 回显要走一个远端往返才回来，正常情况下远小于
+/// 这个窗口；而「永远等不到回显」是真实存在的：命令让前台程序进了 raw 模式（`vim`）后，
+/// 紧跟着打的哨兵行根本不会被 tty 回显，那条记录就永远停在 `pos == 0`。队首不出队，
+/// 后面排队的记录一条都轮不到——整条连接的回显吞除从此失效，而且队首每撞上一个与
+/// `expect[0]` 相同的字节就会把紧随的换行吞掉（见 `strip_echo` 的部分匹配分支），
+/// 屏幕上表现为行与行黏连。改队列之前，这种卡死会被下一次 `expect_echo` 的整体覆写冲掉，
+/// 是自愈的；队列语义下必须由这个 TTL 把自愈补回来。
+///
+/// **5 秒 > 自动注入的 2 秒静止窗口，这是有意的取舍。** 两者相等的话能得到「闸门一开，
+/// 队首必定干净」这个漂亮的不变量；但代价是：链路慢到回显往返超过 2 秒时，一条**正常**的
+/// 武装会被误丢，那行命令的回显就原样留在用户屏幕上。两种错法的后果同为「漏一行回显」，
+/// 而卡死本来就是异常路径、误丢却打在正常路径上——所以宁可让卡死多活 3 秒。落在 2~5 秒
+/// 之间的那一次注入，其回显会漏出一行，不会丢数据也不会串到别的命令里。
+const ECHO_ARM_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct Terminal {
     parser: vt100::Parser,
     cols: u16,
@@ -126,21 +156,21 @@ pub struct Terminal {
     reveal_cwd: Option<String>,
     /// 无 cwd 时点该菜单 → 请求 App 弹确认框注入 OSC 7
     inject_request: bool,
-    /// 待吞掉的「注入命令」回显（注入是我们替用户键入的，shell 必然回显，这里把它从输出里抹掉）
-    echo_expect: Vec<u8>,
-    echo_pos: usize,
-    /// 回显匹配完成后，再吞掉紧随的回车换行（命令执行的 Enter 回显）
-    echo_tail: bool,
-    /// 部分匹配中暂存的疑似回显字节：真实内容里偶然出现和 `echo_expect` 开头相同的字节时，
-    /// 会先当作「可能是目标回显」而不立即输出；一旦后续字节证明只是巧合（失配），要把这些
-    /// 暂存字节还给真实输出，不能凭空丢掉。
-    echo_pending: Vec<u8>,
+    /// 回显吞除队列：每条「我们替用户/AI 键入的命令」对应一条武装记录，按打字先后排队。
+    /// 到达的字节与**队首**记录做前缀匹配；队首完整命中（含尾随换行）后出队、同一字节
+    /// 继续与新的队首比较。不再是一次武装整体覆写上一条——哨兵吞除与自动注入（OSC 7/
+    /// 配对 token/cwd 恢复）的回显可以同时挂着：谁先打字谁先回显，tty 输出顺序与打字
+    /// 顺序一致，FIFO 天然对齐。深度有界（见 `expect_echo`），溢出丢最旧的一条（回显漏出
+    /// 可见）而不是无限攒。
+    echo_queue: std::collections::VecDeque<EchoArm>,
     /// 上一次 `expect_echo` 武装的时刻：见 `injection_idle_for`
     echo_armed_at: Option<std::time::Instant>,
-    /// 上一次**自动注入**（cwd 恢复/配对标识/OSC 7）武装吞除的时刻。与 `echo_armed_at`
-    /// 分开记：RunCommand 的哨兵吞除也更新后者，若守卫看它就会把「上一条 run_command
-    /// 刚发出」误判成「刚注入过」、误拒 rapid 连续命令。见 `expect_auto_inject_echo`。
-    auto_inject_armed_at: Option<std::time::Instant>,
+    /// 本次连接里是否见过 OSC 133（shell 集成片段已生效）。见 `shell_integration_active`。
+    shell_integration: bool,
+    /// 本次连接里是否见过 OSC 133 的 **`C`**（命令开始执行）。用来区分「这个 shell 发不出
+    /// `C`」和「这条 `D` 是杂散的」——两者的现象都是「收到 D 时没见过 C」，处理方式却相反。
+    /// 见 `capture_progress` 的收束判据。
+    shell_integration_c: bool,
     /// IME 预编辑串（拼音组字中的未提交文本），显示在光标处
     ime_preedit: String,
     /// 上一帧焦点状态（仅用于焦点变化时打印诊断日志）
@@ -212,12 +242,35 @@ pub struct Terminal {
 }
 
 struct AiCapture {
-    /// 待匹配的前缀（含唯一 nonce），命中后紧跟的数字到下一个 `\x1e` 之间即退出码。
-    prefix: Vec<u8>,
-    /// 武装以来喂入的原始字节（命中前的这段即命令输出，剥 ANSI 后返回给 AI）。
+    mode: CaptureMode,
+    /// 武装以来喂入的原始字节（命令结束前的这段即命令输出，剥 ANSI 后返回给 AI）。
     /// 超过上限会从前端裁掉最早的部分并标记 `truncated`（极端长输出兜底，不做无界增长）。
     buf: Vec<u8>,
     truncated: bool,
+}
+
+/// AI 命令「何时算跑完、退出码是多少」的两种判据。
+///
+/// - [`CaptureMode::Integration`] 是**首选**：shell 集成（OSC 133）由 shell 自己在执行前/
+///   打印提示符时发序列，不往 tty 里多打任何东西——读 stdin 的程序（cat/REPL/ssh）吃不掉它，
+///   也没有回显要吞、没有「命令形态吞掉哨兵」那一族问题，退出码来自 shell 的 `$?`。
+/// - [`CaptureMode::Sentinel`] 是**回退**：目标 shell 不支持集成片段（fish/csh、或注入还没
+///   发生）时，仍用「多打一行 printf 哨兵」的老办法。它脆弱的地方一条没少，所以只在集成
+///   不可用时才用（见 `Terminal::shell_integration_active`）。
+enum CaptureMode {
+    /// 哨兵前缀（含唯一 nonce，以真实 0x1E 开头），命中后紧跟的数字到下一个 `\x1e` 即退出码。
+    Sentinel { prefix: Vec<u8> },
+    /// 等 OSC 133：`C` 到达时把它之前的字节（命令行回显等）丢掉，`D;<code>` 到达即完成。
+    ///
+    /// `started` 记录「本次运行已经收到过 `C`」，并且**参与收束判据**：只有
+    /// `started` 或「这个 shell 从来发不出 `C`」（`shell_integration_c == false`）时，
+    /// `D` 才算本次运行的结束。两种「收到 D 却没见过 C」必须分开处理：
+    /// - shell 发不出 `C`（bash < 4.4 没有 PS0）——这是降级，`D` 要认，代价是输出多带一段
+    ///   命令行回显，由调用方的 trim 处理；
+    /// - shell 发得出 `C`，这条 `D` 却没有配对的 `C`——这是**杂散 D**，必须忽略。空行
+    ///   （裸回车）就会产生它：bash 不展开 PS0（无 `C`）却照常跑 PROMPT_COMMAND（有 `D`），
+    ///   而且带的是**上一条**命令的 `$?`。认下来就是「命令没跑就报完成、退出码还是别人的」。
+    Integration { started: bool },
 }
 
 /// 逐行裁掉行尾空白，再裁掉结尾的连续空行——`screen_text`/`history_text` 共用的收尾步骤。
@@ -259,12 +312,10 @@ impl Terminal {
             osc7_cwd: None,
             reveal_cwd: None,
             inject_request: false,
-            echo_expect: Vec::new(),
-            echo_pos: 0,
-            echo_tail: false,
-            echo_pending: Vec::new(),
+            echo_queue: Default::default(),
             echo_armed_at: None,
-            auto_inject_armed_at: None,
+            shell_integration: false,
+            shell_integration_c: false,
             ime_preedit: String::new(),
             prev_focused: false,
             local_scroll_accum: 0.0,
@@ -316,54 +367,77 @@ impl Terminal {
     /// 登记一段「我们替用户键入」的命令文本，其 shell 回显将从输出中被吞掉（不显示在终端）。
     /// 须在发送命令后、回显到达前调用（即点击注入的同一帧）。
     ///
-    /// **整体覆写**：后一次武装会把前一次未吞完的状态冲掉，那条命令的回显就漏到屏幕上。
-    /// 所有注入点都会经过这里，所以顺手在这里记下武装时刻，`injection_idle_for` 据此把
-    /// 「刚替用户敲过一行」挡在下一次自动注入之前——挡的责任放在这里，调用方不会漏。
+    /// **按打字顺序排队**（FIFO），后来的武装不再覆盖先来的：哨兵吞除与自动注入的回显
+    /// 可以同时挂着，谁先打字谁先回显，顺序天然对齐。队列深度封顶 8——超出说明注入逻辑
+    /// 出了异常，丢最旧的一条（它的回显会漏到屏幕上，可见）而不是无限攒内存。
+    /// 等不到回显的队首由 [`ECHO_ARM_TTL`] 兜底丢弃，队列不会被一条卡死的记录堵死。
     pub fn expect_echo(&mut self, s: &str) {
-        self.echo_expect = s.as_bytes().to_vec();
-        self.echo_pos = 0;
-        self.echo_tail = false;
-        self.echo_pending.clear();
+        if self.echo_queue.len() >= 8 {
+            log::warn!("回显吞除队列溢出（>8），丢最旧的一条武装：{:?}", s);
+            self.echo_queue.pop_front();
+        }
+        self.echo_queue.push_back(EchoArm {
+            expect: s.as_bytes().to_vec(),
+            pos: 0,
+            pending: Vec::new(),
+            head_since: std::time::Instant::now(),
+        });
         self.echo_armed_at = Some(std::time::Instant::now());
     }
 
-    /// 距上一次「替用户键入」是否已过 `d`。自动注入类操作的安全前提之一。
+    /// 距上一次「替用户键入」是否已过 `d`。自动注入类操作的节流前提之一。
     ///
-    /// 不能用 `echo_expect` 是否为空来判：那个字段命中之后**故意不清空**（见
-    /// `strip_echo`，清了真正的目标回显就不会被吞了），所以它一旦武装就永远非空。也不能
-    /// 只挡同一帧：回显要走一个远端往返才回来，而注入走 `cmd_tx`，既不碰 `last_output_at`
-    /// 也不碰 `last_input_at`——下一帧（重绘心跳 150/200ms）那几道「静止」判据仍然全部
-    /// 放行，第二条注入照样把第一条的吞除状态覆写掉。这里用时间窗兜住那段往返。
+    /// 不能用「队列是否非空」来判：记录命中后**就出队**了，队列空不代表回显已经回到
+    /// 屏幕（也不代表没有武装——只是吞完了）。也不能只挡同一帧：回显要走一个远端往返才
+    /// 回来，而注入走 `cmd_tx`，既不碰 `last_output_at` 也不碰 `last_input_at`——下一帧
+    /// （重绘心跳 150/200ms）那几道「静止」判据仍然全部放行，第二条注入紧跟着第一条打出、
+    /// 提示符上一片注入痕迹。这里用时间窗把两次自动注入隔开。（覆写问题本身已由
+    /// `echo_queue` 的排队语义解决，覆写不再发生。）
     pub fn injection_idle_for(&self, d: std::time::Duration) -> bool {
         self.echo_armed_at.is_none_or(|t| t.elapsed() >= d)
     }
 
-    /// 自动注入路径专用版本：与 `expect_echo` 相同，但额外记录「自动注入」时刻。
-    /// 只该由程序替用户敲键盘的注入点调用（cwd 恢复/配对标识/OSC 7）——RunCommand 的
-    /// 哨兵吞除走 `expect_echo`、不碰这个时间戳，于是 `auto_inject_idle_for` 能分清
-    /// 「刚自动注入过」和「上一条 run_command 刚发出」这两件事。
+    /// 自动注入路径的吞除登记。回显吞除改为 FIFO 队列（`echo_queue`）后，注入与哨兵的
+    /// 吞除按打字顺序各吞各的、不再相互覆写，这里与 `expect_echo` 不再有行为差别——
+    /// 保留单独的方法名，只是让注入点在代码里自标注「这是程序替用户敲的键盘」，方便审查。
     pub fn expect_auto_inject_echo(&mut self, s: &str) {
-        self.auto_inject_armed_at = Some(std::time::Instant::now());
         self.expect_echo(s);
-    }
-
-    /// 距上一次自动注入是否已满 `d`（没注入过算满）。`RunCommand` 下发前的竞态守卫用：
-    /// 自动注入刚武装吞除、注入行的回显还没回来时下发，`expect_echo(&marker)` 会整体覆写
-    /// 那条吞除，注入片段的回显会显示在终端上并被捕获进本条命令的输出。窗口约一个
-    /// 网络往返，守卫只认 `expect_auto_inject_echo` 记下的时刻，不受哨兵吞除干扰。
-    pub fn auto_inject_idle_for(&self, d: std::time::Duration) -> bool {
-        self.auto_inject_armed_at.is_none_or(|t| t.elapsed() >= d)
     }
 
     /// 武装一次「等待哨兵」捕获：`prefix` 是唯一前缀（含 nonce），命中后紧跟的退出码数字
     /// 到下一个 `\x1e` 之间会被解析出来，见 `take_ai_done`。
     pub fn arm_ai_capture(&mut self, prefix: Vec<u8>) {
+        self.arm_capture(CaptureMode::Sentinel { prefix });
+    }
+
+    /// 武装一次 **shell 集成**捕获：不需要任何哨兵，`OSC 133;C` 起算输出、`D;<code>` 收束。
+    /// 调用方须先确认 [`Self::shell_integration_active`]——否则永远等不到 D。
+    pub fn arm_ai_capture_integration(&mut self) {
+        self.arm_capture(CaptureMode::Integration { started: false });
+    }
+
+    fn arm_capture(&mut self, mode: CaptureMode) {
         self.ai_capture = Some(AiCapture {
-            prefix,
+            mode,
             buf: Vec::new(),
             truncated: false,
         });
         self.ai_done = None;
+    }
+
+    /// 测试用：把队首武装记录的「成为队首时刻」往前拨，免得测 [`ECHO_ARM_TTL`] 要真等 5 秒。
+    #[cfg(test)]
+    pub(super) fn backdate_echo_head(&mut self, by: std::time::Duration) {
+        if let Some(a) = self.echo_queue.front_mut() {
+            a.head_since -= by;
+        }
+    }
+
+    /// 这个会话的 shell 是否已经在发 OSC 133（集成片段生效）。只要见过一条就为真——
+    /// 片段注入后 shell 打印下一个提示符时就会发 `D`，所以它几乎是注入成功的同义词。
+    /// 断线重连会新建 `Terminal`，标记随之复位（新 shell 尚未注入）。
+    pub fn shell_integration_active(&self) -> bool {
+        self.shell_integration
     }
 
     /// 是否已有一次 AI 捕获正在等待（同一时刻只允许一个，见调用方的 busy 判断）。
@@ -1180,3 +1254,8 @@ impl Terminal {
 #[cfg(test)]
 #[path = "terminal_tests.rs"]
 mod tests;
+
+/// 场景测试层：真 bash + 真 PTY 跑一遍 AI 命令链路，见文件头的说明。
+#[cfg(test)]
+#[path = "shell_integration_tests.rs"]
+mod shell_integration_tests;

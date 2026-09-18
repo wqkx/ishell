@@ -67,6 +67,16 @@ impl UiSink {
     }
 }
 
+/// russh-sftp 的 Status 错误 Display 有「Permission denied: Permission denied」式整串
+/// 重复（状态码与其文本各拼一遍），原样包进文案会让调用方误读成两层不同的错误。所有
+/// 「把 SFTP 错误包进人读文案」的出口统一走这里：冒号前后确认是同一串时折叠为一层。
+pub(in crate::ssh) fn dedup_status(msg: &str) -> &str {
+    match msg.split_once(':') {
+        Some((head, tail)) if !head.is_empty() && head.trim() == tail.trim() => head.trim(),
+        _ => msg,
+    }
+}
+
 /// worker 入口：在 tokio 任务中运行，直到断开。所有错误都转成 UI 事件上报。
 pub async fn run(
     cfg: ConnectConfig,
@@ -320,6 +330,17 @@ pub async fn run(
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         sink.send(WorkerEvent::TerminalData(data.to_vec()));
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        // exit N：shell 死了，排队的哨兵永远不会打印。把退出码带给 UI，
+                        // 让它给挂起的 AI 运行一个 finished=true + 真实退出码的收尾，
+                        // 而不是等随后的 EOF 落成一句笼统的「远程关闭了会话」。
+                        //
+                        // 依赖「它排在 Eof/Close 之前到达」——SSH 协议里 exit-status 是关通道
+                        // 前发的，实测也如此。万一顺序反了（或对端根本不发 exit-status），
+                        // 下面的 Eof 分支会 break，退出码丢失、退回「断线」那条旧路径：
+                        // 降级而非出错，但别把这个顺序当成保证。
+                        sink.send(WorkerEvent::ShellExited(exit_status as i32));
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                         sink.send(WorkerEvent::Disconnected(crate::i18n::tr("远程关闭了会话", "Remote closed the session").into()));
@@ -608,7 +629,14 @@ pub async fn run(
                             tokio::spawn(async move {
                                 match read_image_file(&sftp, &path).await {
                                     Ok(data) => s.send(WorkerEvent::ImageOpened { path, data }),
-                                    Err(e) => s.send(WorkerEvent::Error(match crate::i18n::current() { crate::i18n::Lang::Zh => format!("打开失败：{e}"), crate::i18n::Lang::En => format!("Open failed: {e}") })),
+                                    Err(e) => {
+                                        let raw = e.to_string();
+                                        let detail = dedup_status(&raw);
+                                        s.send(WorkerEvent::Error(match crate::i18n::current() {
+                                            crate::i18n::Lang::Zh => format!("打开失败：{detail}"),
+                                            crate::i18n::Lang::En => format!("Open failed: {detail}"),
+                                        }))
+                                    }
                                 }
                             });
                         }

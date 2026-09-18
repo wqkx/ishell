@@ -64,7 +64,12 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
             chunk = out_rx.recv() => match chunk {
                 Some(bytes) => sink.send(WorkerEvent::TerminalData(bytes)),
                 None => {
-                    let _ = child.wait();
+                    // 读线程 EOF = shell 已退出。退出码带给 UI：挂起的 AI 运行能拿到
+                    // finished=true + 真实退出码（exit 42 不再丢码），而不是笼统的断线。
+                    // portable_pty 的 ExitStatus 是自有结构体（不是 std 的枚举）：
+                    // exit_code() 直接给出码；被信号杀死时它记为 code=1。
+                    let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
+                    sink.send(WorkerEvent::ShellExited(code));
                     sink.send(WorkerEvent::Disconnected(
                         crate::i18n::tr("本机终端已退出", "Local terminal exited").into(),
                     ));

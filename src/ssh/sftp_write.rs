@@ -377,6 +377,16 @@ pub(in crate::ssh) async fn handle_fs_op(
                         crate::i18n::Lang::En => format!("⚠ Some chars aren't representable in {encoding}; written as substitutions: {path}"),
                     }));
                 }
+                // 与 copy_to_remote 对齐：父目录不存在时自动逐级创建——copy 家族的工具描述
+                // 承诺过「所在目录不存在会自动创建」，write_file 此前照 SFTP 默认直写，目录
+                // 缺失就裸抛一个 Status 错误，同一套 MCP 接口里两个工具行为不一致。先探一次
+                // metadata，已存在则零额外往返；逐级 create_dir 对已存在的层报错一律忽略，
+                // 真正的权限/同名占位问题会在随后的写入以清晰错误暴露
+                // （create_remote_dir_all 的 best-effort 语义）。
+                let parent = remote_parent(&path);
+                if sftp.metadata(&parent).await.is_err() {
+                    super::create_remote_dir_all(sftp, &parent).await;
+                }
                 match sftp_write_atomic(sftp, &path, bytes.as_ref(), sink).await {
                     Ok(_) => {
                         let nm = sftp
@@ -399,11 +409,14 @@ pub(in crate::ssh) async fn handle_fs_op(
                         ))
                     }
                     Err(e) => {
-                        // 专用失败事件（带路径）：UI 据此复位 saving、保留 dirty，不再只有匿名 Error
+                        // 专用失败事件（带路径）：UI 据此复位 saving、保留 dirty，不再只有匿名 Error。
+                        // russh-sftp Status 的 Display 会整串重复（「No such file: No such file」），
+                        // 经 dedup_status 折叠后再上报（与读取路径一致）。
+                        let raw = e.to_string();
                         sink.send(WorkerEvent::FileSaveFailed {
                             id,
                             path: path.clone(),
-                            message: e.to_string(),
+                            message: crate::ssh::dedup_status(&raw).to_string(),
                         });
                         Ok((String::new(), None))
                     }
@@ -420,8 +433,8 @@ pub(in crate::ssh) async fn handle_fs_op(
         }),
         Err(e) => {
             let message = match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("操作失败：{e}"),
-                crate::i18n::Lang::En => format!("Operation failed: {e}"),
+                crate::i18n::Lang::Zh => format!("操作失败：{}", crate::ssh::dedup_status(&e.to_string())),
+                crate::i18n::Lang::En => format!("Operation failed: {}", crate::ssh::dedup_status(&e.to_string())),
             };
             match op_path {
                 // 失败也可能改变了目录内容（部分创建/目标状态未知），刷新父目录一致化

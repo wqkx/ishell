@@ -74,9 +74,10 @@ pub(super) struct Session {
     /// 不设的话每帧都会满足提示条件——它只在「其余注入条件全满足、只差 never_typed」时为真，
     /// 那种状态会一直保持到连接结束。
     pub(super) pair_inject_skipped: bool,
-    /// AI 专用会话是否已注入 OSC 7 cwd 上报片段（用户会话的 OSC7 走 consent 弹窗，不经此
-    /// 标记）。AI 会话没有 cwd 的话，MCP 的 list_sessions 只能给出 cwd=null，AI 定位远端
-    /// 目录只能靠跑 pwd。断线重连后远端是新的 shell，Connected 时复位以便重新注入。
+    /// AI 专用会话是否已注入 `AI_SESSION_SNIPPET`（OSC 7 cwd 上报 + shell 集成 OSC 133）。
+    /// 用户会话的 OSC 7 走 consent 弹窗、不经此标记。没注入的后果有两条：list_sessions 的
+    /// cwd 恒为 null（AI 只能跑 pwd 猜目录），且命令完成检测只能退回脆弱的哨兵办法
+    /// （见 `terminal::CaptureMode`）。断线重连后远端是新 shell，Connected 时复位以便重注。
     pub(super) osc7_injected: bool,
     /// 远端是否支持 /proc 系统监控（None=尚未探测；false 时侧栏提示并跳过杀进程等）
     pub(super) monitor_ok: Option<bool>,
@@ -198,8 +199,9 @@ fn terminal_idle(t: &Terminal, quiet: std::time::Duration) -> bool {
     !t.appears_busy()
         && t.output_idle_for(quiet)
         && t.input_idle_for(quiet)
-        // 距我们自己上一次替用户敲键盘也要满 quiet：`expect_echo` 是整体覆写，两条注入
-        // 挨太近，后一条会把前一条的回显吞除冲掉。见 `Terminal::injection_idle_for`。
+        // 距我们自己上一次替用户敲键盘也要满 quiet：两次注入挨太近，提示符上一片注入
+        // 痕迹（覆写问题本身已由吞除队列的排队语义解决，这里隔开的是观感与注入节奏）。
+        // 见 `Terminal::injection_idle_for`。
         && t.injection_idle_for(quiet)
 }
 
@@ -235,8 +237,8 @@ fn injection_allowed(
 ///   AI 会话不成立：字节根本不送达远端，被吃掉的不是任何人的输入。
 ///
 /// 保留的判据：`connected`（断线不注）、`ai_busy`（有挂起的 AI 命令/哨兵捕获时不注——
-/// `expect_echo` 会整体覆写吞除状态、打断正在进行的 run_command）、`terminal_idle`
-/// （没见过提示符 / 还在动 / 我们自己刚注过，都不注）。
+/// 注入行会打进正在运行的命令的终端：污染它的捕获输出、或被前台程序当输入吃掉）、
+/// `terminal_idle`（没见过提示符 / 还在动 / 我们自己刚注过，都不注）。
 ///
 /// 残余风险（可接受，写在这里防漂移）：AI 用 send_input 起过 sudo/ssh 这类阻塞在 stdin
 /// 的程序时，静止判据分不清「shell 闲在提示符上」和「密码提示符」——注入行会被当密码
@@ -282,17 +284,11 @@ impl Session {
 
     /// 用户从终端右键菜单手动触发「立即注入配对标识」：即刻注入，绕过 never_typed 闸门——
     /// 用户亲手点击等价于本人同意，且他正看着这个终端，注入的回显吞除与否都在他眼皮底下。
-    /// 但不绕过 `ai_busy` 闸门：会话里有正在执行的 AI 命令时注入会打断它（见
+    /// AI 专用会话同样允许：嵌套 AI 需要从环境继承配对身份（自动注入的空档没等到时的人工
+    /// 补救）。但不绕过 `ai_busy` 闸门：会话里有正在执行的 AI 命令时注入会打断它（见
     /// `injection_allowed`），这种时候要求用户等命令结束。发送失败（连接已断）也不伪装成功。
     /// 返回 Err(原因) 时不注入，由调用处显示在会话状态栏。
     pub(super) fn inject_pair_token_now(&mut self) -> Result<(), String> {
-        if self.ai_owned {
-            return Err(crate::i18n::tr(
-                "AI 专用会话无需注入：里面的 AI 是我们自己开的",
-                "AI sessions need no injection — the AI there was started by us",
-            )
-            .into());
-        }
         if !self.connected {
             return Err(crate::i18n::tr(
                 "会话尚未连接，等连上后再试",
@@ -863,8 +859,8 @@ mod injection_gate_tests {
         );
     }
 
-    /// 我们自己刚敲过一行，闸门也要关着：`expect_echo` 是整体覆写，两条注入挨太近，
-    /// 后一条会把前一条的回显吞除冲掉，那行命令就原样留在屏幕上。
+    /// 我们自己刚敲过一行，闸门也要关着：两条注入挨太近，提示符上一片注入痕迹（吞除
+    /// 队列按序各吞各的，冲掉不再发生——这里隔开的是观感与注入节奏）。
     #[test]
     fn our_own_last_injection_also_closes_the_gate() {
         let mut t = Terminal::new();

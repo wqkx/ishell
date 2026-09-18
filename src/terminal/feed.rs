@@ -3,9 +3,12 @@
 use std::io::Write;
 
 use super::{
-    osc::{count_bel, parse_osc7, parse_osc_notify, unterminated_string_tail},
+    osc::{
+        count_bel, parse_osc133, parse_osc52, parse_osc7, parse_osc_notify,
+        unterminated_string_tail, Osc133,
+    },
     vt::{find_sub, incomplete_utf8_tail, serialize_row, strip_ansi_to_text},
-    Terminal, DEFAULT_SCROLLBACK,
+    CaptureMode, Terminal, DEFAULT_SCROLLBACK,
 };
 
 /// AI 捕获缓冲上限：超过后从前端裁掉最早的部分（兜底极端长输出，不做无界增长）。
@@ -56,54 +59,167 @@ impl Terminal {
         replies
     }
 
-    /// 从输入字节里剥掉待吞的注入命令回显。武装后目标回显之前可能先到达其它真实内容（如
-    /// AI 命令场景里先发的真实命令自己的回显）——这些字节原样透传、不影响继续等待目标出现。
-    /// 真实内容里偶然出现和目标回显开头相同的字节时，会先暂存（`echo_pending`）当作「可能是
-    /// 目标回显」而不立即输出；一旦后续字节证明只是巧合（失配），把暂存字节原样还给真实输出，
-    /// 并从当前字节重新判断是否是新一轮匹配的开头——不清空 `echo_expect`（否则真正的目标回显
-    /// 到达时也不会被吞了），只重置匹配进度，继续等目标出现。
-    fn strip_echo(&mut self, input: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(input.len());
-        for &b in input {
-            if self.echo_pos < self.echo_expect.len() {
-                if b == self.echo_expect[self.echo_pos] {
-                    self.echo_pos += 1;
-                    self.echo_pending.push(b);
-                    if self.echo_pos >= self.echo_expect.len() {
-                        self.echo_tail = true; // 命令体已吞完，接着吞回车换行
-                        self.echo_pending.clear(); // 确认命中，暂存字节真正吞掉
+    /// 推进 AI 命令捕获：追加本块字节，再按模式判定「命令是否已结束」。
+    ///
+    /// - 集成模式：`OSC 133;C` 把它之前的字节（命令行回显、上一个提示符）从缓冲里丢掉，
+    ///   `D;<code>` 收束成结果。收不到 C 也能在 D 收束（bash<4.4 无 PS4/PS0 时的降级）。
+    /// - 哨兵模式：老办法，在缓冲里找哨兵前缀 + 退出码。
+    ///
+    /// `events` 的下标是相对 `scan`（含上一块留下的 `carried` 前缀）的，这里换算回本块
+    /// `bytes` 里的下标；落在 carried 里的事件属于上一块残尾，按 0 处理（缓冲里没有它）。
+    fn capture_progress(&mut self, bytes: &[u8], events: &[(usize, Osc133)], carried: usize) {
+        // 借用 `cap` 之前读出来：收束判据要用它（见 `CaptureMode::Integration`）。
+        // 本块里的 `C` 已经在调用方（`feed`）更新过这个标记，顺序不会反。
+        let c_supported = self.shell_integration_c;
+        let Some(cap) = &mut self.ai_capture else {
+            return;
+        };
+        let base = cap.buf.len();
+        cap.buf.extend_from_slice(bytes);
+        // 借用检查：结果先落在局部量上，`cap` 的可变借用结束后再写回 self 的两个字段。
+        let done: Option<(i32, String)> = match &mut cap.mode {
+            CaptureMode::Sentinel { prefix } => find_sub(&cap.buf, prefix).and_then(|p0| {
+                let after = p0 + prefix.len();
+                let p1 = find_sub(&cap.buf[after..], b"\x1e")?;
+                let code = std::str::from_utf8(&cap.buf[after..after + p1])
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(-1);
+                Some((code, Self::capture_text(&cap.buf[..p0], cap.truncated)))
+            }),
+            CaptureMode::Integration { started } => {
+                // 同一块里可能既有 C 又有 D：按出现顺序处理，每次 drain 之后后续下标左移
+                // `removed` 个字节。事件下标相对 `scan`，换算成「本次追加前的 buf 长度 +
+                // 它在 bytes 里的位置」，再减去已经 drain 掉的量。
+                let mut removed = 0usize;
+                let mut done = None;
+                for (at_scan, ev) in events {
+                    let idx = (base + at_scan.saturating_sub(carried))
+                        .saturating_sub(removed)
+                        .min(cap.buf.len());
+                    match ev {
+                        Osc133::CommandStart => {
+                            // 命令开始执行：此前的是命令行回显/上一个提示符，不算本次输出。
+                            cap.buf.drain(..idx);
+                            removed += idx;
+                            *started = true;
+                            cap.truncated = false;
+                        }
+                        Osc133::CommandEnd(code) => {
+                            if c_supported && !*started {
+                                // 杂散 D（没有配对的 C）：不是本次运行的结束，跳过。空行、
+                                // 以及 shell 在我们打的命令**之前**先跑完的那一行都会发它。
+                                // 见 `CaptureMode::Integration`。
+                                continue;
+                            }
+                            // 退出码缺省（shell 只发了 `133;D`）按 -1 上报，与哨兵模式一致。
+                            done = Some((
+                                code.unwrap_or(-1),
+                                Self::capture_text(&cap.buf[..idx], cap.truncated),
+                            ));
+                            break;
+                        }
                     }
-                    continue;
                 }
-                if (b == b'\r' || b == b'\n') && self.echo_pos > 0 {
-                    continue; // 部分匹配中，终端自动换行/回显格式，忽略
-                }
-                // 失配：先把暂存的疑似字节还给真实输出（之前只是巧合的部分匹配），
-                // 再看这个字节本身是不是新一轮匹配的开头。
-                out.append(&mut self.echo_pending);
-                self.echo_pos = 0;
-                if b == self.echo_expect[0] {
-                    self.echo_pos = 1;
-                    self.echo_pending.push(b);
-                    if self.echo_pos >= self.echo_expect.len() {
-                        // echo_expect 只有一个字节：这一个字节本身就已经是完整匹配，
-                        // 需要立即确认命中，否则这个字节会卡在「已匹配完但没置 echo_tail」
-                        // 的状态里，既不会被吞掉标记为完成，也不会被当成正常字节输出。
-                        self.echo_tail = true;
-                        self.echo_pending.clear();
-                    }
-                } else {
-                    out.push(b);
-                }
-            } else if self.echo_tail {
-                if b == b'\r' || b == b'\n' {
-                    continue;
-                }
-                self.echo_tail = false;
-                out.push(b);
-            } else {
-                out.push(b);
+                done
             }
+        };
+        if let Some(result) = done {
+            self.ai_done = Some(result);
+            self.ai_capture = None;
+            return;
+        }
+        // 兜底：命令迟迟不结束、输出持续增长时只保留最近一段，避免无界内存增长。
+        if let Some(cap) = &mut self.ai_capture {
+            if cap.buf.len() > AI_CAPTURE_CAP {
+                let keep = AI_CAPTURE_CAP / 2;
+                let drop = cap.buf.len() - keep;
+                cap.buf.drain(..drop);
+                cap.truncated = true;
+            }
+        }
+    }
+
+    fn capture_text(raw: &[u8], truncated: bool) -> String {
+        let text = strip_ansi_to_text(raw);
+        if truncated {
+            format!("[输出过长，已截断保留末尾部分]\n{text}")
+        } else {
+            text
+        }
+    }
+
+    /// 把到达字节与吞除队列的**队首**记录做前缀匹配，命中后出队（同字节继续与新的队首
+    /// 比较），把匹配命中的回显字节从输出里抹掉。
+    ///
+    /// 真实内容里偶然出现和队首记录开头相同的字节时，会先暂存（`pending`）当作「可能是
+    /// 目标回显」而不立即输出；一旦后续字节证明只是巧合（失配），把暂存字节原样还给真实
+    /// 输出，并从当前字节重新判断是否是新一轮匹配的开头——不清记录本身（否则真正的目标
+    /// 回显到达时也不会被吞了），只重置匹配进度，继续等目标出现。
+    fn strip_echo(&mut self, input: &[u8]) -> Vec<u8> {
+        // 队首等不到回显就会把后面排队的全堵死（理由与后果见 `ECHO_ARM_TTL`）。每块字节
+        // 检查一次（不是每字节——`Instant::now()` 不该进内层循环）：只丢**一个字节都没匹配上**
+        // 的队首，匹配到一半的不动（那是真回显正在分块到达）。
+        while self
+            .echo_queue
+            .front()
+            .is_some_and(|a| a.pos == 0 && a.head_since.elapsed() >= super::ECHO_ARM_TTL)
+        {
+            let dropped = self.echo_queue.pop_front();
+            log::warn!(
+                "回显吞除队首 {:?} 超时未见回显，丢弃以免堵住队列",
+                dropped.map(|a| String::from_utf8_lossy(&a.expect).chars().take(40).collect::<String>())
+            );
+            if let Some(next) = self.echo_queue.front_mut() {
+                next.head_since = std::time::Instant::now(); // 它才刚成为队首，寿命从现在算
+            }
+        }
+        let mut out = Vec::with_capacity(input.len());
+        'bytes: for &b in input {
+            while let Some(arm) = self.echo_queue.front_mut() {
+                if arm.pos < arm.expect.len() {
+                    if b == arm.expect[arm.pos] {
+                        arm.pos += 1;
+                        arm.pending.push(b);
+                        if arm.pos >= arm.expect.len() {
+                            // 命令体已吞完（下面的 tail 阶段接着吞回车换行）
+                            arm.pending.clear(); // 确认命中，暂存字节真正吞掉
+                        }
+                        continue 'bytes;
+                    }
+                    if (b == b'\r' || b == b'\n') && arm.pos > 0 {
+                        continue 'bytes; // 部分匹配中，终端自动换行/回显格式，忽略
+                    }
+                    // 失配：先把暂存的疑似字节还给真实输出（之前只是巧合的部分匹配），
+                    // 再看这个字节本身是不是新一轮匹配的开头。
+                    out.append(&mut arm.pending);
+                    arm.pos = 0;
+                    if b == arm.expect[0] {
+                        arm.pos = 1;
+                        arm.pending.push(b);
+                        if arm.pos >= arm.expect.len() {
+                            // 这条命令只有一个字节：这一个字节本身就已经是完整匹配，
+                            // 需要立即确认命中，否则它会卡在「已匹配完但暂存没清」的
+                            // 状态里，既不会被吞掉，也不会被当成正常字节输出。
+                            arm.pending.clear();
+                        }
+                    } else {
+                        out.push(b);
+                    }
+                    continue 'bytes;
+                }
+                // tail 阶段：吞掉紧随的 \r\n；第一个非换行字节放行并让本条出队，
+                // 同字节继续与队列里的下一条比较（它可能就是下一条命令回显的开头）。
+                if b == b'\r' || b == b'\n' {
+                    continue 'bytes;
+                }
+                self.echo_queue.pop_front();
+                if let Some(next) = self.echo_queue.front_mut() {
+                    next.head_since = std::time::Instant::now(); // 从成为队首起算寿命
+                }
+                continue;
+            }
+            out.push(b);
         }
         out
     }
@@ -188,40 +304,14 @@ impl Terminal {
         self.last_output_at = Some(std::time::Instant::now());
         // 注入命令的回显吞除（仅当有待吞内容时）
         let stripped;
-        let bytes: &[u8] = if self.echo_pos < self.echo_expect.len() || self.echo_tail {
+        let bytes: &[u8] = if !self.echo_queue.is_empty() {
             stripped = self.strip_echo(bytes);
             &stripped
         } else {
             bytes
         };
-        // AI/MCP 命令补全检测：扫描哨兵前缀，命中后解析退出码。纯只读扫描，不影响
-        // 后续渲染/日志——与 strip_echo 状态完全独立，不耦合已在生产使用的回显吞除逻辑。
-        // 哨兵行自身的可见性由注入方（见 mcp_bridge）用 `\r\x1b[K` 自擦除处理，这里无需
-        // 剔除字节、也就不影响 parser.process() 的正常喂入顺序。
-        if let Some(cap) = &mut self.ai_capture {
-            cap.buf.extend_from_slice(bytes);
-            if let Some(p0) = find_sub(&cap.buf, &cap.prefix) {
-                let after = p0 + cap.prefix.len();
-                if let Some(p1) = find_sub(&cap.buf[after..], b"\x1e") {
-                    let code = std::str::from_utf8(&cap.buf[after..after + p1])
-                        .ok()
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(-1);
-                    let mut text = strip_ansi_to_text(&cap.buf[..p0]);
-                    if cap.truncated {
-                        text = format!("[输出过长，已截断保留末尾部分]\n{text}");
-                    }
-                    self.ai_done = Some((code, text));
-                    self.ai_capture = None;
-                }
-            } else if cap.buf.len() > AI_CAPTURE_CAP {
-                // 兜底：命令迟迟不结束、输出持续增长时，只保留最近一段，避免无界内存增长
-                let keep = AI_CAPTURE_CAP / 2;
-                let drop = cap.buf.len() - keep;
-                cap.buf.drain(..drop);
-                cap.truncated = true;
-            }
-        }
+        // AI/MCP 命令完成检测：见 `capture_progress`（在下面 `scan` 算好之后调用——
+        // 集成模式要用同一份 OSC 扫描结果）。捕获是纯只读追加，不影响渲染/日志。
         // 会话日志：原样落盘（可用 cat 回放）
         if let Some(f) = &mut self.log_file {
             let _ = f.write_all(bytes);
@@ -281,6 +371,23 @@ impl Terminal {
             };
             self.notices.push(super::TermNotice { title, body, kind });
         }
+        // OSC 52 剪贴板（opencode/nvim/tmux 等 TUI 的「复制」走这条；远端程序的唯一通道）。
+        // 同一块里有多条时后者覆盖前者，与序列到达顺序一致。
+        for text in parse_osc52(scan, carried) {
+            self.set_clipboard_from_osc52(text);
+        }
+        // shell 集成（OSC 133）：见过一条就说明片段生效了，AI 命令的完成检测据此改走集成
+        // 判据（不再多打哨兵行）。事件同时驱动正在进行的捕获。
+        let osc133 = parse_osc133(scan, carried);
+        if !osc133.is_empty() {
+            self.shell_integration = true;
+            // 见过一次 `C` 就说明这个 shell 发得出它（bash ≥ 4.4 的 PS0 / zsh 的 preexec）。
+            // 此后「没有 C 的 D」就只能是杂散的，见 `CaptureMode::Integration`。
+            if osc133.iter().any(|(_, e)| *e == Osc133::CommandStart) {
+                self.shell_integration_c = true;
+            }
+        }
+        self.capture_progress(bytes, &osc133, carried);
         // BEL 响铃：Claude Code 等 AI CLI 等待确认/任务完成时的标准提示信号。
         // 只统计转义序列之外的 BEL（OSC 通知序列自身的 BEL 终止符不算响铃）。
         // 预览在 process 之后取（那时响铃前的提示文本已上屏）。

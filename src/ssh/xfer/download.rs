@@ -368,8 +368,8 @@ pub(super) async fn download(
                 crate::i18n::tr("已取消", "Canceled").to_string()
             } else {
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("下载失败：{e}"),
-                    crate::i18n::Lang::En => format!("Download failed: {e}"),
+                    crate::i18n::Lang::Zh => format!("下载失败：{}", crate::ssh::dedup_status(&e.to_string())),
+                    crate::i18n::Lang::En => format!("Download failed: {}", crate::ssh::dedup_status(&e.to_string())),
                 }
             };
             sink.send(WorkerEvent::TransferDone {

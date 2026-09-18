@@ -112,8 +112,29 @@ pub(in crate::ssh) async fn read_file_chunked(
     // 先报 0 进度：占位标签立即显示空进度条
     sink.send(WorkerEvent::FileLoadProgress { id, done: 0, total });
     let too_large = || match crate::i18n::current() {
-        crate::i18n::Lang::Zh => format!("文件过大（>{}MB）", limit / 1024 / 1024),
-        crate::i18n::Lang::En => format!("File too large (>{}MB)", limit / 1024 / 1024),
+        crate::i18n::Lang::Zh => {
+            if force {
+                format!("文件过大（>{}MB），已是 force 模式硬上限", limit / 1024 / 1024)
+            } else {
+                format!(
+                    "文件过大（>{}MB），如确认需要请用 force=true 重试（硬上限 128MB）",
+                    limit / 1024 / 1024
+                )
+            }
+        }
+        crate::i18n::Lang::En => {
+            if force {
+                format!(
+                    "File too large (>{}MB, hard limit in force mode)",
+                    limit / 1024 / 1024
+                )
+            } else {
+                format!(
+                    "File too large (>{}MB); retry with force=true if you really need it (hard limit 128MB)",
+                    limit / 1024 / 1024
+                )
+            }
+        }
     };
     if total as usize > limit {
         // 非 force 超限：列表里的旧大小可能已过时（小文件被写大），交 UI 弹确认可强制打开；
@@ -191,16 +212,13 @@ pub(in crate::ssh) async fn read_file_chunked(
                 too_large()
             } else {
                 // russh-sftp 的 Status 错误 Display 有「No such file: No such file」式整串
-                // 重复（状态码与其文本各拼一遍），原样透传会让调用方误读成两层错误——
-                // 能确认冒号前后是同一串时折叠成一层。
-                let detail = e.to_string();
-                let collapsed = detail
-                    .split_once(':')
-                    .filter(|(head, tail)| !head.is_empty() && head.trim() == tail.trim())
-                    .map_or(detail.as_str(), |(head, _)| head.trim());
+                // 重复（状态码与其文本各拼一遍）——统一经 `dedup_status` 折叠，调用方不会
+                // 误读成两层不同的错误。
+                let raw = e.to_string();
+                let detail = crate::ssh::dedup_status(&raw);
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("打开失败：{collapsed}"),
-                    crate::i18n::Lang::En => format!("Open failed: {collapsed}"),
+                    crate::i18n::Lang::Zh => format!("打开失败：{detail}"),
+                    crate::i18n::Lang::En => format!("Open failed: {detail}"),
                 }
             };
             sink.send(WorkerEvent::FileLoadFailed { id, message: msg });

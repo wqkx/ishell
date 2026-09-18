@@ -115,6 +115,102 @@ pub(super) fn parse_osc_notify(data: &[u8], carried: usize) -> Vec<(Option<Strin
     out
 }
 
+/// 解析 OSC 52 剪贴板序列（`ESC ] 52 ; <选择器> ; <base64> BEL|ST`），返回选择器为 `c`
+/// （系统剪贴板）的解码文本列表；空负载表示「清剪贴板」（返回空串）。
+///
+/// 这是 TUI 程序（opencode/nvim/tmux 等）往**用户系统剪贴板**写东西的标准通道，也是
+/// 远端主机上的程序**唯一**可用的通道（本机程序能直接访问 OS 剪贴板，远端的只能经
+/// 终端转发）。iShell 此前不支持它——远端 TUI 里的「复制」因此全部失灵（实测 opencode
+/// 内复制无反应）。`carried` 语义同 `parse_osc_notify`：终止符落在已扫前缀里的序列
+/// 上一轮已处理过，跳过。
+///
+/// 三个刻意的取舍：
+/// - **`?`（查询）不响应**：回读等于把剪贴板内容吐给远端——剪贴板常含密码/密钥，绝
+///   不能被一问一答骗走（alacritty 同款取舍；kitty 的授权询问模式超出这里的威胁模型）。
+/// - 选择器只认 `c`（clipboard）：`s`/`p`/`q`/`0`-`7`（primary/secondary/剪贴板池）在
+///   现代桌面上大多无对应物，忽略。
+/// - base64 容错：先剥空白（tmux 透传常把负载折行）再解，单条解不开就跳过不波及其它。
+pub(super) fn parse_osc52(data: &[u8], carried: usize) -> Vec<String> {
+    use base64::Engine as _;
+    let mut out = Vec::new();
+    for (seq_start, body_start, end) in osc_sequences(data) {
+        // 终止符在已扫过的前缀里 = 上一轮已经处理过这一条
+        if end < carried {
+            continue;
+        }
+        let payload = &data[body_start..end];
+        let _ = seq_start;
+        let Some(rest) = payload.strip_prefix(b"52;") else { continue };
+        // [u8]::split_once 至今未稳定（slice_split_once），手动切：第一段是选择器。
+        let Some(idx) = rest.iter().position(|&b| b == b';') else { continue };
+        let (sel, data_b64) = (&rest[..idx], &rest[idx + 1..]);
+        if sel != b"c" {
+            continue;
+        }
+        if data_b64 == b"?" {
+            continue; // 查询：不回读剪贴板，见函数注释
+        }
+        let text = if data_b64.is_empty() {
+            String::new() // 清剪贴板
+        } else {
+            let cleaned: Vec<u8> = data_b64
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(cleaned) else {
+                continue;
+            };
+            let Ok(s) = String::from_utf8(bytes) else { continue };
+            s
+        };
+        out.push(text);
+    }
+    out
+}
+
+/// shell 集成（OSC 133）事件：命令开始执行 / 命令结束并带退出码。
+///
+/// 这是 iTerm2/VSCode/kitty 的「semantic prompt」协议里我们用得到的两条。对 iShell 的
+/// 意义：AI 命令的完成检测不必再往 tty 里**多打一行哨兵**——标记由 shell 自己在执行前/
+/// 打印提示符时发出，任何读 stdin 的程序（cat/REPL）都吃不掉它，回显也不必吞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Osc133 {
+    /// `OSC 133;C` —— 命令开始执行（输出从这里起算）。
+    CommandStart,
+    /// `OSC 133;D;<code>` —— 命令结束，带退出码。缺省/解析不出退出码时给 `None`。
+    CommandEnd(Option<i32>),
+}
+
+/// 解析一块字节里的 OSC 133 事件，返回 `(序列在 data 中的起始下标, 事件)`，按出现顺序。
+///
+/// `carried` 语义同 `parse_osc_notify`：终止符落在已扫前缀里的序列上一轮已处理过，跳过。
+/// `A`（提示符开始）/`B`（提示符结束）我们用不到，直接忽略——只认 C 与 D，少一条依赖。
+pub(super) fn parse_osc133(data: &[u8], carried: usize) -> Vec<(usize, Osc133)> {
+    let mut out = Vec::new();
+    for (seq_start, body_start, end) in osc_sequences(data) {
+        if end < carried {
+            continue;
+        }
+        let Some(rest) = data[body_start..end].strip_prefix(b"133;") else {
+            continue;
+        };
+        match rest.first() {
+            Some(b'C') => out.push((seq_start, Osc133::CommandStart)),
+            Some(b'D') => {
+                // `133;D` 可以不带退出码（shell 未取到 $? 时），也可以是 `133;D;<code>`。
+                let code = rest
+                    .strip_prefix(b"D;")
+                    .and_then(|c| std::str::from_utf8(c).ok())
+                    .and_then(|c| c.trim().parse::<i32>().ok());
+                out.push((seq_start, Osc133::CommandEnd(code)));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// `OSC 9` 的这段负载（已去掉 `9;` 前缀）是不是 ConEmu 的**进度条**上报，而不是通知。
 ///
 /// `OSC 9;4;<state>;<percent>` 是 ConEmu / Windows Terminal 的进度协议，如今 cargo、

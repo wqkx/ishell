@@ -959,8 +959,14 @@ pub struct ReadHistoryArgs {
 pub struct SendInputArgs {
     /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
     pub session_uid: u64,
-    /// 要发送的原始文本/按键，不会自动加回车——要按 Enter 就在末尾加 "\r"
+    /// 要发送的文本/按键，不会自动加回车。默认逐字节原样发送：反斜杠就是反斜杠，"\r" 两个
+    /// 字符收到的是两个字符、不是回车；发控制键（回车/Ctrl-D/Esc 等）必须设 escapes=true
+    /// （写 "\r" 字面转义即真实回车；真实控制字节也会原样通过）
     pub text: String,
+    /// 可选，默认 false。true 时把 text 里的字面转义解析成按键：\r \n \t \\ 与 \xHH
+    /// （00-7F）；写错（未定义转义、\x 后不足两位十六进制）会直接报错、不发送
+    #[serde(default)]
+    pub escapes: bool,
 }
 
 fn default_file_timeout_ms() -> u64 {
@@ -1043,11 +1049,14 @@ impl IshellMcp {
     #[tool(
         description = "列出 iShell 当前打开的所有终端会话。每个会话返回：uid（整数，后续所有\
                         工具的 session_uid 都直接复制它）、标题、主机、连接状态、远端工作目录、\
-                        以及三个归属字段——ai_owned（是不是 AI 开的专用窗口）、ai_owner（开它的\
+                        以及四个归属/状态字段——ai_owned（是不是 AI 开的专用窗口）、ai_owner（开它的\
                         AI 的来源标签，如 `e5-1 (ishell-mcp pid 42)`，用户开的会话为 null）、mine\
                         （**是不是你这个进程自己开的**：true = 你的专用窗口，随便用；false 而\
-                        ai_owned=true = 另一个 AI 开的窗口，写入会弹窗让用户授权）。同名会话凭\
-                        uid 和 host 区分。可传 filter 只返回标题/主机名匹配的会话，省上下文。\n\
+                        ai_owned=true = 另一个 AI 开的窗口，写入会弹窗让用户授权）、token_injected\
+                        （配对 token 是否已注入该 shell：**false = 在这里面启动 AI 会拿不到 \
+                        ISHELL_MCP_TOKEN、绑定被拒**——用户会话多是连上后敲过键盘被跳过，可让用户\
+                        在终端右键「立即注入配对标识」补救；AI 会话等 shell 空下来会自动补注）。\
+                        同名会话凭 uid 和 host 区分。可传 filter 只返回标题/主机名匹配的会话，省上下文。\n\
                         归属速查：mine=true 直接用；ai_owned=false 是**用户本人正在用的会话**，\
                         他随时可能在里面敲字，默认不要往里写（run_command / send_input / \
                         interrupt / write_file / copy_to_remote 等）——两路输入会在同一个 shell \
@@ -1088,23 +1097,32 @@ impl IshellMcp {
                         程序/续行的输入吃掉，完成检测可能永远等不到，且可能改动那个程序里的\
                         数据。不确定当前前台状态时，先用 read_screen 看一眼再决定要不要发命令，\
                         或者改用 send_input 应对交互式场景。\
+                        **command 必须是一条单行命令**：里面的换行等于按下 Enter，shell 会把它拆成\
+                        多条依次执行，而完成检测只认得第一条——所以含换行（含 heredoc）或为空的 \
+                        command 会被直接拒绝并附改写建议。要多步就用 `;` / `&&` 连接成一行，\
+                        要跑长脚本就先 write_file 落一个文件再执行它。\
                         还有一类命令形态会连**完成哨兵**一起吞掉、让运行永远等不到结束：命令以 `#`\
-                        注释结尾、引号未闭合、以反斜杠续行结尾，或多行命令的中间行进入交互程\
-                        序——表现为反复超时、输出却在增长。这时调用 interrupt 释放，用 \
-                        read_screen/read_history 核实，并把命令改写为完整单行重试——不要反复 \
-                        poll_run 干等（每次都会烧满一个完整超时）。\
-                        **交互式程序**（cat/REPL/ssh 这类读 stdin 的命令）会把紧跟其后的完成哨兵\
-                        当作自己的输入吃掉：程序退出后运行仍永远 finished=false——不是卡死，是哨兵\
-                        没了。标准交互流程：start_command 启动 → send_input 逐键交互（\\r 提交行、\
-                        \\x04 发 EOF）→ read_screen 观察 → 结束后调 interrupt 释放（在提示符上按 \
-                        Ctrl-C 无害），再开新命令。\
+                        注释结尾、引号未闭合、以反斜杠续行结尾——表现为反复超时、输出却在增长。\
+                        这时调用 interrupt 释放，用 read_screen/read_history 核实，并把命令改写为\
+                        完整单行重试——不要反复 poll_run 干等（每次都会烧满一个完整超时）。\
+                        **交互式命令（cat/REPL/ssh）在 AI 专用会话里可以正常收尾**：那里的 shell \
+                        装了完成上报（OSC 133），命令的开始/结束/退出码由 shell 自己发，不经过任何\
+                        程序的 stdin。流程照旧：start_command 启动 → send_input 逐键交互（控制键写法\
+                        见 send_input 描述）→ read_screen 观察 → 程序自己退出（如给 cat 发 EOF）即\
+                        收到 finished=true 与退出码。\
+                        **用户自己开的会话**没装这个上报，只能退回老办法（往终端多打一行完成哨兵），\
+                        那里仍有这条限制：读 stdin 的程序会把哨兵当输入吃掉，运行永远 finished=false；\
+                        此时用 interrupt 释放，再用 read_screen 确认提示符干净、无残留的 printf \
+                        'AI_DONE_…' 行，然后发新命令。list_sessions 的 ai_owned 能区分这两类会话。\
                         两个解读输出时容易踩的坑：① output 末尾常带一段 shell 提示符残留（比如 \
                         `(venv) user@host:~$`，有时只剩一个 `$`）——这是刻意不做的清理（早期试过按\
                         「最后一行大概率是提示符」启发式剥掉，但 PS1 为空/不可见时会把真实输出误删，\
                         权衡后选择宁可留一点噪声也不丢数据），解析时自己按需忽略即可；② 超时返回的是\
                         finished=false 加**这一轮已产生的部分输出**（可能是空字符串）——空输出不代表\
                         命令什么都没打印，只代表还没等到完成哨兵，用 poll_run 续等或用 read_screen \
-                        看实时内容。"
+                        看实时内容。**整条命令是 exit [n]/logout 时会自动改写到子 shell 执行**：退出码\
+                        照拿（exit 42 返回 42）、登录 shell 不受影响；想关掉 AI 自己开的会话请用 \
+                        close_session，不要靠 exit。"
     )]
     async fn run_command(
         &self,
@@ -1132,9 +1150,11 @@ impl IshellMcp {
                         以较短 timeout_ms 查询；命令已很快结束时会直接返回 finished=true。\
                         **预计运行时间可能超过 MCP 客户端空闲超时（几十秒到几分钟）的命令优先用\
                         本工具**：run_command 的等待会被客户端空闲超时切断，本工具不会。\
-                        完成哨兵与 run_command 是同一套：若命令形态把哨兵吞掉（以 # 注释结尾、\
-                        引号未闭合、反斜杠续行结尾），运行同样永远等不到结束——按 run_command \
-                        描述里的处理办法 interrupt 释放、改写成完整单行重试。"
+                        command 的要求与 run_command 完全相同：**必须是一条单行非空命令**（含换行\
+                        会被拒绝，用 `;`/`&&` 连接或先 write_file 落脚本）。完成检测也是同一套：\
+                        若命令形态把哨兵吞掉（以 # 注释结尾、引号未闭合、反斜杠续行结尾），运行\
+                        同样永远等不到结束——按 run_command 描述里的处理办法 interrupt 释放、\
+                        改写成完整单行重试。"
     )]
     async fn start_command(
         &self,
@@ -1193,11 +1213,13 @@ impl IshellMcp {
                         拿到已知的部分输出作参考。（同一时刻只允许一个 poll_run 等待者的限制会在上一个\
                         等待者所在的连接断开——比如它自己的调用方超时放弃——之后自动解除，不需要靠 \
                         interrupt 才能恢复。）\n\
-                        两个交互场景的注意点：① 被中断的程序若把终端设成 raw 模式（vim 这类全屏程序），\
-                        Ctrl-C 不会冲刷输入队列——本次运行排队中的完成哨兵可能随后以一条自擦除的 \
-                        printf 'AI_DONE_…' 泄漏为可见行：无害，但会混进后续命令的输出文本。② 交互式程序\
-                        （cat/REPL）会把哨兵当输入吃掉、运行永远 finished=false——用它收尾：程序退出后\
-                        （无论正常与否）调一次 interrupt 释放，在提示符上按 Ctrl-C 无害。"
+                        AI 专用会话里中断本身就有结论：shell 的完成上报会把 Ctrl-C 结束的命令报成 \
+                        exit 130，不需要额外补救。用户自己开的会话走哨兵回退，才有这两个注意点：\
+                        ① 被中断的程序若把终端设成 raw 模式（vim 这类全屏程序），Ctrl-C 不会冲刷输入\
+                        队列——排队中的完成哨兵可能随后以一条自擦除的 printf 'AI_DONE_…' 泄漏为可见行：\
+                        无害，但会混进后续命令的输出文本。② 读 stdin 的程序（cat/REPL）会把哨兵当输入\
+                        吃掉、运行永远 finished=false——程序退出后调一次 interrupt 释放（在提示符上按 \
+                        Ctrl-C 无害）。"
     )]
     async fn interrupt(
         &self,
@@ -1213,8 +1235,10 @@ impl IshellMcp {
                         双击这条已保存连接。name 是已保存连接的名字，不是主机地址，也不是 \
                         list_sessions 里的会话标题——不确定具体拼写时先调 list_saved_connections \
                         核对。返回新会话的 uid；此时通常还没连上（connected=false，正在连接/\
-                        认证中）——直接对它调 run_command 即可，它会自动等连接（最多约 20 \
-                        秒），不必先 list_sessions 确认 connected。"
+                        认证中）——直接对它用任何会话工具即可：run_command/start_command 以及 \
+                        read_file/write_file/copy_to_remote/copy_from_remote/copy_between_sessions \
+                        都会自动等它连上（最多约 20 秒），不必先 list_sessions 确认 connected。\
+                        只有 send_input/interrupt 不等（这两个遇到「会话尚未连接」等它变 true 再试）。"
     )]
     async fn open_session(
         &self,
@@ -1267,16 +1291,30 @@ impl IshellMcp {
     #[tool(
         description = "往指定终端直接发送原始文本/按键，不等待、不做完成检测——用于 run_command \
                         覆盖不到的交互式场景（sudo 密码提示、vim/REPL 里继续输入等）。发送后配合 \
-                        read_screen 看效果。\n\
-                        text 支持字面转义：\\r=回车 \\n=换行 \\t=Tab \\xHH=任意字节（\\x04=Ctrl-D、\
-                        \\x1b=Esc、\\x03=Ctrl-C）、\\\\=字面反斜杠。例：提交一行用 \"ls -l\\r\"；\
-                        给 cat 发 EOF 用 \"\\x04\"；vim 里保存退出用 \"\\x1b:wq\\r\"。普通文本（不含 \
-                        反斜杠）逐字节原样发送；不会自动加回车。"
+                        read_screen 看效果。不会自动加回车。\n\
+                        **默认 text 逐字节原样发送**：反斜杠就是反斜杠——写成 \"\\r\" 收到的就是\
+                        反斜杠+r 两个字符、**不是回车**；往 REPL/vim 里敲带 \\n 的代码、密码、正则都\
+                        不会被改动。**要发控制键（回车、Ctrl-D、Esc 等）必须设 escapes=true**：此时 \
+                        text 里的字面转义才会被解析成真实按键——\\r 回车、\\n 换行、\\t、\\\\（字面\
+                        反斜杠）与 \\xHH（两位十六进制、00-7F，如 \\x04=Ctrl-D、\\x1b=Esc），写错\
+                        直接报错、不发送；真实控制字节则原样通过，两种写法都安全。例：提交一行 \
+                        \"ls -l\\r\"、给 cat 发 EOF \"\\x04\"、vim 保存退出 \"\\x1b:wq\\r\"。注意 \
+                        escapes=true 时正文里原本的反斜杠必须写成 \\\\，含代码/密码的长文本不要开\
+                        它；混合场景分两次调用：先 escapes=true 发控制键，再默认模式发正文。"
     )]
     async fn send_input(
         &self,
-        Parameters(SendInputArgs { session_uid, text }): Parameters<SendInputArgs>,
+        Parameters(SendInputArgs { session_uid, text, escapes }): Parameters<SendInputArgs>,
     ) -> Result<CallToolResult, McpError> {
+        // 转义在代理侧解析、线协议不变：GUI 永远原样发送收到的 text，新旧版本任意组合行为一致。
+        let text = if escapes {
+            match mcp_protocol::unescape_key_text(&text) {
+                Ok(t) => t,
+                Err(e) => return text_result(Err(e)),
+            }
+        } else {
+            text
+        };
         text_result(call(McpReqKind::SendInput { session_uid, text }).await)
     }
 
@@ -1296,6 +1334,7 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<WriteFileArgs>,
     ) -> Result<CallToolResult, McpError> {
+        wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
             call(McpReqKind::WriteFile {
                 session_uid,
@@ -1322,6 +1361,7 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<ReadFileArgs>,
     ) -> Result<CallToolResult, McpError> {
+        wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
             call(McpReqKind::ReadFile {
                 session_uid,
@@ -1351,6 +1391,7 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<CopyToRemoteArgs>,
     ) -> Result<CallToolResult, McpError> {
+        wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(copy_to_remote_from_caller(session_uid, local_path, remote_path, timeout_ms).await)
     }
 
@@ -1374,6 +1415,7 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<CopyFromRemoteArgs>,
     ) -> Result<CallToolResult, McpError> {
+        wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(copy_from_remote_to_caller(session_uid, remote_path, local_path, timeout_ms).await)
     }
 
@@ -1404,6 +1446,8 @@ impl IshellMcp {
             timeout_ms,
         }): Parameters<CopyBetweenSessionsArgs>,
     ) -> Result<CallToolResult, McpError> {
+        wait_connected(src_session_uid, std::time::Duration::from_secs(20)).await;
+        wait_connected(dest_session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
             call(McpReqKind::CopyBetweenSessions {
                 src_session_uid,
@@ -1456,7 +1500,11 @@ impl IshellMcp {
                     「run_id 不存在或已结束」而你不确定命令执行没有，用 read_screen/read_history \
                     核实再决定，勿盲目重试有副作用的命令。看到「命令可能已执行、结果未知」先核实\
                     屏幕。报「已经有一个 poll_run 在等待」说明旧等待者还挂着：别并发 poll，旧等待\
-                    者不要了就 interrupt 释放。\n\
+                    者不要了就 interrupt 释放。报「未检测到 iShell」或绑定/握手被拒：先 list_sessions \
+                    看目标会话的 token_injected——false 说明该终端的 shell 没拿到 ISHELL_MCP_TOKEN（\
+                    用户会话多是连上后敲过键盘被跳过自动注入），让用户在终端右键「立即注入配对标识」\
+                    后重启 AI；在 tmux/screen 里启动的 AI 继承的是会话**之前**的环境，换到注入后的 \
+                    shell 里启动。\n\
                     定位目录与环境：先 list_sessions 的 cwd 字段（用户没同意 OSC7 注入时为空）→ \
                     再看 read_screen 里提示符显示的路径 → 还定不了就在你自己的会话 run_command 跑 \
                     `pwd; ls; git rev-parse --show-toplevel 2>/dev/null` 这类只读探测；用户会话只用\
@@ -1482,10 +1530,11 @@ impl IshellMcp {
                     · 长构建/长测试：run_command timeout_ms 给足直接等；MCP 客户端自己超时断了就 \
                     poll_run（省略 run_id）续等同一条运行，绝不重发命令。\n\
                     · 终端卡着交互程序（vim/top/sudo 密码提示）：先 read_screen 看前台是什么 → \
-                    send_input 逐键应对（vim 退出用 \"\\x1b:q!\\r\"、top 用 \"q\"、提交行在行尾加 \
-                    \\r、给 cat 发 EOF 用 \"\\x04\"）→ sudo 密码提示符让用户自己输，或征得同意后 \
-                    send_input。交互程序会把完成哨兵当输入吃掉：程序退出后运行仍可能永远 \
-                    finished=false，调一次 interrupt 释放（在提示符上按 Ctrl-C 无害）再开新命令。"
+                    send_input 逐键应对（top 用 \"q\"；回车/EOF/Esc 等控制键写法见 send_input 描述，\
+                    如 escapes=true 时 vim 退出 \"\\x1b:q!\\r\"）→ sudo 密码提示符让用户自己输，或征得同意后 \
+                    send_input。交互程序在**用户自己开的会话**里会把完成哨兵当输入吃掉（程序退出后\
+                    运行仍 finished=false，调一次 interrupt 释放再开新命令）；AI 专用会话装了 shell \
+                    完成上报，不受此限。"
 )]
 impl ServerHandler for IshellMcp {}
 

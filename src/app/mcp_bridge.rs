@@ -55,12 +55,41 @@ impl Session {
     /// （而不是让它继续空等到超时），并取消哨兵捕获、清空 `pending_ai_run`。
     /// 用于打断（`interrupt`）、断线等"这条运行注定等不到哨兵了"的场景。
     pub(super) fn cancel_pending_ai_run(&mut self, reason: &str) {
+        self.end_pending_ai_run(reason, true);
+    }
+
+    /// 无条件丢弃这条运行，**连已缓存的结果一起**：`interrupt` 与「卡死自动回收」用。
+    /// 两者的语义都是「把这个会话的闸门还回来」——保留缓存结果会让 `pending_ai_run` 继续
+    /// 占着闸门，调用方收到「已中断」却发不出下一条命令。
+    pub(super) fn discard_pending_ai_run(&mut self, reason: &str) {
+        self.end_pending_ai_run(reason, false);
+    }
+
+    fn end_pending_ai_run(&mut self, reason: &str, keep_finished: bool) {
         if let Some(mut pending) = self.pending_ai_run.take() {
+            if keep_finished && pending.finished_result.is_some() {
+                // 运行**其实已经完成了**（exit N 的退出码经 ShellExited 先于断线到达、
+                // 已缓存进 finished_result）：结果是有效的，保留给 poll_run 取走——断线
+                // 不能把它抹成一句「已断线」。
+                // 捕获仍要撤：结果已经在手上，留着它只会让 `ai_capture_pending()` 一直为真、
+                // 把注入闸门堵到断线重建 Terminal 为止。
+                self.terminal.cancel_ai_capture();
+                self.pending_ai_run = Some(pending);
+                return;
+            }
             if let Some(tx) = pending.resp_tx.take() {
                 // 明确回错误，而不是 Ok(Run{finished:false})——后者会让调用方以为"命令还在
                 // 跑，可以继续 poll_run"，但这条 run_id 已经被清空、注定 poll 不到了。
                 // 命令实际执行到哪一步、有没有副作用都无法确认，输出仅供参考。
                 let output = self.terminal.peek_ai_output().unwrap_or_default();
+                let output = output.trim_end();
+                let output = if output.is_empty() {
+                    output.to_string()
+                } else {
+                    // 部分输出常以半截行收尾（被 ^C 打断的行没有换行）：补一个换行，
+                    // 错误文案的边界才清晰，不会和后面的字串粘在一起。
+                    format!("{output}\n")
+                };
                 let _ = tx.send(McpResponse {
                     id: pending.req_id,
                     result: Err(format!(
@@ -72,6 +101,38 @@ impl Session {
             }
         }
         self.terminal.cancel_ai_capture();
+    }
+
+    /// shell 退出（`WorkerEvent::ShellExited`，`exit N`/崩溃）时调用：排队的哨兵注定
+    /// 不会再打印，用通道上报的退出码直接给这条运行一个 finished=true 的收尾。
+    /// 有等待者直发；没有（此前已超时返回过 finished=false）则缓存进 finished_result，
+    /// 等下一次 poll_run 取走——`exit 42` 的 42 因此不再丢失。
+    pub(super) fn finish_ai_run_with_exit_code(&mut self, code: i32) {
+        if let Some(mut pending) = self.pending_ai_run.take() {
+            // 输出与另外两条收尾路径同样处理：去掉命令行回显、按上限截断。少一处都会让
+            // 「同一条命令、不同收尾路径」给出形状不一样的 output（超长输出还会撑爆响应）。
+            let output = self.terminal.peek_ai_output().unwrap_or_default();
+            let output = cap_output_for_ai(trim_leading_echo(&output, &pending.command));
+            if let Some(tx) = pending.resp_tx.take() {
+                let _ = tx.send(McpResponse {
+                    id: pending.req_id,
+                    result: Ok(McpReqResult::Run(McpRunResult {
+                        run_id: pending.run_id,
+                        finished: true,
+                        output,
+                        exit_code: Some(code),
+                    })),
+                });
+                self.terminal.cancel_ai_capture();
+            } else {
+                // 与哨兵完成的缓存路径同语义：结果留待 poll_run 取走，运行继续保持挂起态。
+                // 捕获同样要撤（理由见 `end_pending_ai_run`）：退出码已经拿到，shell 也死了，
+                // 再等下去只是把注入闸门堵着。
+                self.terminal.cancel_ai_capture();
+                pending.finished_result = Some((code, output));
+                self.pending_ai_run = Some(pending);
+            }
+        }
     }
 
     /// 放弃**全部**挂起的文件读写（write_file/read_file/copy_*）：给每个还在等待的响应
@@ -370,10 +431,103 @@ pub(super) struct McpCall {
     download_sink: Option<oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>>,
 }
 
+/// `run_command`/`start_command` 的命令文本校验：必须是**一条单行命令**。
+///
+/// 为什么非拦不可（而不是"尽力而为地跑"）：命令是当作按键打进真实 tty 的，里面的换行就是
+/// 用户按下的回车，shell 会把它拆成**多条**命令依次执行。两种完成检测都对不上：
+/// - shell 集成：每一行各发一对 `OSC 133;C/D`，捕获在**第一行**的 `D` 就收束——调用方拿到
+///   `finished=true` 和第一行的退出码，后面几行还在跑，它们的 `D` 又会被下一条运行的捕获
+///   吃掉，一路错位。实测（bash 5.1）：`echo one\necho two` 产生两对 C/D。
+/// - 哨兵：哨兵行排在最后一行之后，多行本身能跑通，但未闭合的引号/heredoc 会把哨兵行当作
+///   内容吞掉，表现为永远等不到完成（工具描述里那条"反复超时、输出却在增长"就是它）。
+///
+/// 两条路各有各的错法，而**它们的正确用法是同一个**：改写成单行（`;`/`&&`），或者用
+/// `write_file` 落一个脚本再执行。所以这里一律拒绝，错误文案直接给出改写方式——比让调用方
+/// 从一个形状古怪的结果里反推发生了什么便宜得多。
+fn validate_run_command(command: &str) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Err("command 为空：空命令只会让 shell 打一个新提示符，不会执行任何东西（\
+                    shell 集成下还会误报成上一条命令的退出码）。要单纯看屏幕请用 read_screen"
+            .into());
+    }
+    if command.contains('\n') || command.contains('\r') {
+        return Err("command 含换行：命令是当作按键打进真实终端的，换行会被 shell 当成回车、\
+                    拆成多条命令依次执行，完成检测只认得第一条——请改写成单行（用 `;` 或 \
+                    `&&` 连接），或先用 write_file 写一个脚本再执行它"
+            .into());
+    }
+    Ok(())
+}
+
+/// `exit [n]` / `logout` 会直接杀掉登录 shell：会话断线重连，正在跑的这条 run 被作废、
+/// 退出码丢失，cwd/环境变量等 shell 状态全丢。而 run_command 的语义是「执行命令并拿回
+/// 退出码」，不是「关掉会话」——关会话有专用工具 close_session，且只能关 AI 自己的。
+/// 所以整条命令就是 exit/logout 时改写进子 shell 执行：`(exit 42)` 的退出码与原命令
+/// 一致（shell 集成与哨兵两条完成检测路都能照常捕获），会话本身不受影响。
+///
+/// 刻意只认「整条命令就是 exit/logout」这一种形态：`cd /x; exit` 里 exit 只是一环的
+/// 写法拦不住（要拦就得给所有命令套子 shell，那会弄丢 cd/export 跨 run_command 保持的
+/// 状态，代价不成比例）；`exit $var` 这类带变量/非数值参数的也不碰——形态太多，
+/// 误判风险配不上收益。
+fn wrap_session_ender(command: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = command
+        .trim()
+        .trim_end_matches(|c: char| c == ';' || c == '&' || c.is_whitespace());
+    let mut parts = trimmed.split_whitespace();
+    let Some(head) = parts.next() else {
+        return std::borrow::Cow::Borrowed(command);
+    };
+    if head != "exit" && head != "logout" {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    let numeric = |s: &str| {
+        let digits = s.strip_prefix('-').unwrap_or(s);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    match (parts.next(), parts.next()) {
+        (None, None) => {}
+        (Some(arg), None) if numeric(arg) => {}
+        _ => return std::borrow::Cow::Borrowed(command),
+    }
+    std::borrow::Cow::Owned(format!("({trimmed})"))
+}
+
+/// 一条运行「被放弃」的判据：没人在等、终端也不再有输出、且已经很久没人来 `poll_run`。
+///
+/// 三个条件缺一不可——**有人等 / 有输出 / 有轮询，任一成立就不回收**：
+/// - 有等待者（`run_command` 还在等，或 `poll_run` 挂着）→ 有人在意，不回收；
+/// - 终端仍在输出（构建/测试在跑）→ 命令活着，不回收；
+/// - 最近轮询过 → AI 还在跟进，不回收。
+///
+/// 反过来，「完成信号被 `cat`/REPL 吃掉 + AI 不再 poll」正好三条全中，闸门被永久占死的
+/// 那种状态会被回收。**不按声明超时推算绝对期限**——`start_command` 的声明超时是协议
+/// 最小值（100ms），按倍数推算会把一条正常的长命令在几分钟内误杀。
+///
+/// **残余误判（明说，别再指望它不存在）**：一条长时间既不输出、AI 又不轮询的命令
+/// （`start_command("sleep 3600")` 之后只用 `read_screen` 盯着）同样三条全中，会在
+/// `RECLAIM_IDLE` 后被回收。闸门还回来了，但回收会取消捕获——命令真跑完时那个完成信号
+/// 落到空处，**那条命令的退出码再也取不回来**。回收文案里写明了这一点。
+fn run_is_abandoned(
+    since_last_poll: Duration,
+    terminal_output_idle: bool,
+    has_live_waiter: bool,
+) -> bool {
+    !has_live_waiter && terminal_output_idle && since_last_poll >= RECLAIM_IDLE
+}
+
+/// 自动回收的静默时长：既要远大于 AI 正常的轮询间隔（秒级），又要让卡死的闸门在一次
+/// 人机会话里能自己解开。
+const RECLAIM_IDLE: Duration = Duration::from_secs(600);
+
 /// 某会话上一次正在等待的 AI 命令运行（`run_command` 武装，`poll_run` 续等）。
 pub(super) struct PendingAiRun {
     run_id: u64,
+    /// 当前这次调用的耐心：到期先把 finished=false + 部分输出回给等待者，**不**清运行——
+    /// 等 poll_run 续等时会按它自己的 timeout_ms 重新武装。
     deadline: Instant,
+    /// 最近一次「有人在意这条运行」的时刻：武装时置位，每次 `poll_run` 续等时刷新。
+    /// 与终端输出静止一起构成自动回收的判据，见 [`run_is_abandoned`]。
+    last_poll_at: Instant,
     /// 当前这次调用（run_command 或最近一次 poll_run）待回填的响应通道 + 请求 id。
     resp_tx: Option<oneshot::Sender<McpResponse>>,
     req_id: u64,
@@ -432,48 +586,6 @@ fn remote_parent(path: &str) -> String {
         Some(0) | None => "/".into(),
         Some(i) => trimmed[..i].to_string(),
     }
-}
-
-/// 把一个 `send_input` 文本里的字面转义解析成原始按键字节。
-///
-/// 支持的转义：`\r` `\n` `\t`、`\xHH`（任意字节，如 `\x04`=Ctrl-D、`\x1b`=Esc）、`\\`
-/// （字面反斜杠）。未识别的 `\c` 原样保留反斜杠和字符两个字符——宁肯多留一点噪声也不
-/// 丢数据。AI 侧的工具描述写明这套表；普通不含反斜杠的文本逐字节原样通过。
-fn unescape_key_text(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.extend_from_slice(c.to_string().as_bytes());
-            continue;
-        }
-        match chars.next() {
-            Some('r') => out.push(b'\r'),
-            Some('n') => out.push(b'\n'),
-            Some('t') => out.push(b'\t'),
-            Some('\\') => out.push(b'\\'),
-            Some('x') => {
-                let h: String = chars.by_ref().take(2).collect();
-                match u8::from_str_radix(&h, 16) {
-                    Ok(b) => out.push(b),
-                    Err(_) => {
-                        // 不是合法十六进制：原样保留，别静默吃掉
-                        out.push(b'\\');
-                        out.push(b'x');
-                        out.extend_from_slice(h.as_bytes());
-                    }
-                }
-            }
-            // 文件结尾的单反斜杠，或任何未定义的转义：原样保留
-            other => {
-                out.push(b'\\');
-                if let Some(o) = other {
-                    out.extend_from_slice(o.to_string().as_bytes());
-                }
-            }
-        }
-    }
-    out
 }
 
 /// 校验一个 `copy_file` 用的远端 POSIX 路径：必须绝对、不含 `.`/`..` 路径段、拆出来的
@@ -884,6 +996,25 @@ async fn reply(
     }
 }
 
+/// 调用方上传字节流的包装：本身只是透传读取，被 drop 时顺带丢弃 `_drop_tx`，让持有对应
+/// `oneshot::Receiver` 的一方知道「再没有别的读取者了」（见 `handle_conn` 的排干逻辑）。
+#[cfg(unix)]
+struct NotifyOnDrop<R> {
+    inner: R,
+    _drop_tx: oneshot::Sender<()>,
+}
+
+#[cfg(unix)]
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for NotifyOnDrop<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 /// 一条连接只处理一问一答：读一行 JSON 请求，转发进 mpsc，等 App 帧循环回填后写一行 JSON 响应。
 /// `_permit` 只用来在这个连接存活期间占着信号量里的一个名额，函数退出时自动释放。
 #[cfg(unix)]
@@ -893,16 +1024,6 @@ async fn handle_conn(
     ctx: egui::Context,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    // dup 一份 socket 句柄，留给下面 `is_caller_upload` 分支「拒绝后排干文件体」用
-    // （理由见该处注释）。tokio 的 UnixStream 没有 try_clone（TcpStream 才有），用
-    // libc::dup 复制 fd 再包回——原始句柄来自 tokio accept、已是 non-blocking，dup 与
-    // 原句柄共享同一 open file description，状态一致。失败不致命，只是退回旧行为。
-    let drain_dup = unsafe {
-        let fd = libc::dup(stream.as_raw_fd());
-        (fd >= 0)
-            .then(|| std::os::unix::net::UnixStream::from_raw_fd(fd))
-            .and_then(|std_stream| tokio::net::UnixStream::from_std(std_stream).ok())
-    };
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r.take(MAX_MCP_LINE_BYTES)).lines();
     let Ok(Ok(Some(line))) = tokio::time::timeout(FIRST_LINE_TIMEOUT, lines.next_line()).await
@@ -1086,7 +1207,22 @@ async fn handle_conn(
         let mut buffered_reader = lines.into_inner();
         let head = buffered_reader.buffer().to_vec();
         let rest = buffered_reader.into_inner().into_inner();
-        let source = tokio::io::AsyncReadExt::chain(std::io::Cursor::new(head), rest);
+        // dup 一份 socket 句柄，留给下面「报错后排干文件体」用（理由见该处注释）。tokio 的
+        // UnixStream 没有 try_clone，用 libc::dup 复制 fd 再包回——原句柄来自 tokio accept、
+        // 已是 non-blocking，dup 与它共享同一 open file description。失败不致命，只是不排干。
+        let drain_dup = unsafe {
+            let fd = libc::dup(rest.as_ref().as_raw_fd());
+            (fd >= 0)
+                .then(|| std::os::unix::net::UnixStream::from_raw_fd(fd))
+                .and_then(|std_stream| tokio::net::UnixStream::from_std(std_stream).ok())
+        };
+        // source 被释放（App 拒绝时随 McpCall 丢弃；worker 读完/失败后随上传函数返回丢弃）
+        // 的那一刻 `source_dropped` 就绪——排干必须等到这之后，见下方注释。
+        let (drop_tx, source_dropped) = oneshot::channel::<()>();
+        let source = NotifyOnDrop {
+            inner: tokio::io::AsyncReadExt::chain(std::io::Cursor::new(head), rest),
+            _drop_tx: drop_tx,
+        };
         let upload_source = Some(Box::new(source) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
         let (resp_tx, resp_rx) = oneshot::channel();
         if tx.send(McpCall { req, resp_tx, upload_source, download_sink: None }).is_err() {
@@ -1107,14 +1243,19 @@ async fn handle_conn(
         // RST，而它尚未读出的错误响应会被内核随 RST 从接收队列里丢弃——最终只报一句
         // Broken pipe，真实错误彻底丢失（实测 8MB 文件必现；100KB 因 body 一次写完不受影响）。
         // 所以先把残留在管道里的字节读到 EOF 再关：新代理读到错误会立即停写断开，EOF 来得
-        // 很快；旧代理会把整个 body 推完。dup 句柄只在 worker 已结束（无论成败）之后使用，
-        // 与 worker 的读取互斥，不会两个读取者抢数据。超时只是兜底——排不干就退回旧行为。
+        // 很快；旧代理会把整个 body 推完。
+        //
+        // **必须等 source 被释放后才排干**：报错不等于 worker 已停——文件操作超时
+        // （`check_file_op_timeouts`）到点就回 Err，而 worker 的上传无法取消、仍在读 source。
+        // 此时排干就是两个读取者抢同一路字节流（worker 必然「提前结束」失败，本可能成功的
+        // 上传被搅黄）。source 释放 = 再没有别的读取者，排干才安全。整段共用一个兜底时限，
+        // 等不到释放就放弃排干、退回旧行为。
         if is_err {
             if let Some(mut dr) = drain_dup {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    tokio::io::copy(&mut dr, &mut tokio::io::sink()),
-                )
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    let _ = source_dropped.await; // 发送端被丢弃即就绪（Err(Canceled)）
+                    let _ = tokio::io::copy(&mut dr, &mut tokio::io::sink()).await;
+                })
                 .await;
             }
         }
@@ -1234,6 +1375,26 @@ impl App {
             self.handle_mcp_call(call);
         }
         for s in &mut self.sessions {
+            // 自动回收要在借用 pending 之前判定：哨兵被交互程序吃掉后运行永远完不成，AI 又
+            // 弃疗不再 poll——这条运行会把「一个会话只允许一条挂起」的闸门**永久**占死，
+            // 后续命令全被「已有一条」拒绝且毫无解释。判据见 [`run_is_abandoned`]。
+            let abandoned = s.pending_ai_run.as_ref().is_some_and(|p| {
+                p.finished_result.is_none()
+                    && run_is_abandoned(
+                        p.last_poll_at.elapsed(),
+                        s.terminal.output_idle_for(RECLAIM_IDLE),
+                        p.resp_tx.as_ref().is_some_and(|tx| !tx.is_closed()),
+                    )
+            });
+            if abandoned {
+                s.discard_pending_ai_run(
+                    "运行长时间无输出、也无人续等，已自动回收（完成信号很可能被命令或前台程序\
+                     当作输入吃掉——交互式命令常见）：会话闸门已释放，可以发新命令。这条运行的\
+                     退出码已不可恢复，即使命令后来跑完了也拿不回来；要确认它的实际状态用 \
+                     read_screen/read_history。长时间静默但确实在跑的命令（如 sleep/等待型任务）\
+                     请用 poll_run 续等，轮询本身就会阻止回收",
+                );
+            }
             let Some(pending) = s.pending_ai_run.as_mut() else {
                 continue;
             };
@@ -1246,51 +1407,68 @@ impl App {
                     pending.finished_result = Some((code, output));
                 }
             }
-            if let Some((code, output)) = pending.finished_result.take() {
-                if let Some(tx) = pending.resp_tx.take() {
-                    let resp = McpResponse {
-                        id: pending.req_id,
-                        result: Ok(McpReqResult::Run(McpRunResult {
-                            run_id: pending.run_id,
-                            finished: true,
-                            output,
-                            exit_code: Some(code),
-                        })),
-                    };
-                    let _ = tx.send(resp);
-                    s.pending_ai_run = None;
-                } else {
-                    // 没有 waiter：把结果放回去缓存着，等下一次 poll_run 打进来再取走。
-                    pending.finished_result = Some((code, output));
+            // 下面的投递要清/换 pending_ai_run 本体，改为 take-改-放回的所有权结构：
+            // as_mut 借用跨分支存活会被借用检查器拒（完成分支要清空、超时分支要改 deadline）。
+            // 不用 let-else：循环 + 条件移动组合会触发 rustc 的再初始化分析误报（E0382）。
+            let mut pending = match s.pending_ai_run.take() {
+                Some(p) => p,
+                None => continue,
+            };
+            match pending.finished_result.take() {
+                Some((code, output)) => {
+                    if let Some(tx) = pending.resp_tx.take() {
+                        let _ = tx.send(McpResponse {
+                            id: pending.req_id,
+                            result: Ok(McpReqResult::Run(McpRunResult {
+                                run_id: pending.run_id,
+                                finished: true,
+                                output,
+                                exit_code: Some(code),
+                            })),
+                        });
+                        // 已投递，整条移除（哨兵命中时捕获已自清）。
+                    } else {
+                        // 没有 waiter：把结果放回去缓存着，等下一次 poll_run 打进来再取走。
+                        pending.finished_result = Some((code, output));
+                        s.pending_ai_run = Some(pending);
+                    }
                 }
-            } else if Instant::now() >= pending.deadline {
-                let output = s.terminal.peek_ai_output().unwrap_or_default();
-                let output = trim_leading_echo(&output, &pending.command);
-                let output = cap_output_for_ai(output);
-                let resp = McpResponse {
-                    id: pending.req_id,
-                    result: Ok(McpReqResult::Run(McpRunResult {
-                        run_id: pending.run_id,
-                        finished: false,
-                        output,
-                        exit_code: None,
-                    })),
-                };
-                if let Some(tx) = pending.resp_tx.take() {
-                    let _ = tx.send(resp);
+                None => {
+                    if Instant::now() >= pending.deadline {
+                        let output = s.terminal.peek_ai_output().unwrap_or_default();
+                        let output = trim_leading_echo(&output, &pending.command);
+                        let output = cap_output_for_ai(output);
+                        let resp = McpResponse {
+                            id: pending.req_id,
+                            result: Ok(McpReqResult::Run(McpRunResult {
+                                run_id: pending.run_id,
+                                finished: false,
+                                output,
+                                exit_code: None,
+                            })),
+                        };
+                        if let Some(tx) = pending.resp_tx.take() {
+                            let _ = tx.send(resp);
+                        }
+                        // 本次等待的耐心已兑现：把 deadline 拨回未来。否则「停在过去的
+                        // deadline」会让 `arm_timeout_repaint` 每帧算出 request_repaint_after(0)
+                        // ——GUI 全速空转（且每帧对捕获缓冲做一次 ANSI 剥离），直到哨兵到达/
+                        // interrupt/poll_run 重新武装 deadline 为止。重绘心跳与数据事件照常
+                        // 驱动帧，完成检测不会丢；poll_run 会按自己的 timeout_ms 重新武装。
+                        pending.deadline = Instant::now() + std::time::Duration::from_secs(3600);
+                    }
+                    // 未完成：放回，等下一次 poll_run 续等（不重发命令）
+                    s.pending_ai_run = Some(pending);
                 }
-                // 本次等待的耐心已兑现：把 deadline 拨回未来。否则「停在过去的 deadline」
-                // 会让 `arm_timeout_repaint` 每帧算出 request_repaint_after(0)——GUI 全速
-                // 空转（且每帧对捕获缓冲做一次 ANSI 剥离），直到哨兵到达/interrupt/poll_run
-                // 重新武装 deadline 为止。重绘心跳与数据事件照常驱动帧，完成检测不会丢；
-                // poll_run 会按自己的 timeout_ms 重新武装 deadline。
-                pending.deadline = Instant::now() + std::time::Duration::from_secs(3600);
-                // 未完成：保留 pending_ai_run，等下一次 poll_run 续等（不重发命令）
             }
         }
-        if let Some(pending) = self.pending_open_consent.as_mut() {
+        // open consent 超时（**App 级**，不属于任何会话）：整个 McpCall 被扣在这里，超时
+        // 必须回一条错，否则调用方那边就是一条永远不回的请求。
+        // 写法与下面的 use consent 对齐（`as_ref` + `take`），两处收尾方式一致，便于对读。
+        if let Some(pending) = self.pending_open_consent.as_ref() {
             if Instant::now() >= pending.deadline {
-                if let Some(tx) = pending.resp_tx.take() {
+                let pending = self.pending_open_consent.take().expect("上一行刚确认是 Some");
+                if let Some(tx) = pending.resp_tx {
                     let _ = tx.send(McpResponse {
                         id: pending.req_id,
                         result: Err(
@@ -1299,7 +1477,6 @@ impl App {
                         ),
                     });
                 }
-                self.pending_open_consent = None;
             }
         }
         if let Some(pending) = self.pending_use_consent.as_ref() {
@@ -1361,8 +1538,11 @@ impl App {
         let sessions = self.sessions.iter().flat_map(|s| {
             s.pending_ai_run
                 .as_ref()
-                .map(|p| p.deadline)
                 .into_iter()
+                // 两个时刻都要排重绘：本次等待的耐心（deadline），以及自动回收的静默期
+                // （last_poll_at + RECLAIM_IDLE）——漏掉后者，卡死的闸门要等某个不相干的
+                // 事件偶然唤起一帧才解得开。
+                .flat_map(|p| [p.deadline, p.last_poll_at + RECLAIM_IDLE])
                 .chain(s.pending_file_ops.iter().map(|op| op.deadline))
                 // 「重连后恢复 cwd」的截止时刻：到点要有一帧把过期的意图清掉
                 // （`expire_cwd_restore_intents`），否则它会一直挂到某个不相干的事件
@@ -1962,6 +2142,7 @@ impl App {
             ai_owned: s.ai_owned,
             ai_owner: s.ai_owner_label.clone(),
             mine: true, // 开它的就是发起者自己
+            token_injected: s.mcp_token_injected,
         };
         let _ = resp_tx.send(McpResponse {
             id,
@@ -2186,6 +2367,7 @@ impl App {
                         // 是不是「发起本次查询的这个 AI」自己开的——按进程标识比对；
                         // 旧代理（不带 actor）开的共享池窗口对任何调用方都报 false。
                         mine: s.ai_owner.is_some() && s.ai_owner == caller_actor,
+                        token_injected: s.mcp_token_injected,
                     })
                     .collect();
                 let _ = resp_tx.send(McpResponse {
@@ -2219,68 +2401,78 @@ impl App {
                     );
                     return;
                 }
-                // 注入竞态守卫：自动注入（OSC 7/配对标识/cwd 恢复）刚武装了回显吞除、而注入行
-                // 的回显还没回来时，下面的 expect_echo(&marker) 会**整体覆写**那条吞除——
-                // 注入片段（OSC 7 片段约 450 字符）的回显会显示在终端上，并被 arm_ai_capture
-                // 捕获进本条命令的输出。窗口约一个网络往返。
-                // 只看 `auto_inject_armed_at`（自动注入专属时间戳）：RunCommand 自己的哨兵
-                // 吞除也更新 echo_armed_at，看它会连 rapid 连续命令（ls 接 cd）一起误拒，
-                // 而那种场景下注入实际还没发生——守卫必须挡住真竞态、放过正常连发。
-                const ECHO_ARM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
-                if !s.terminal.auto_inject_idle_for(ECHO_ARM_GRACE) {
-                    send_err(
-                        resp_tx,
-                        "会话刚执行一次自动注入（OSC 7 上报/配对标识/cwd 恢复），回显吞除尚未解\
-                         除（约 1 秒）；此刻下发命令会把注入片段的回显混进本条命令的输出，请稍后\
-                         重试"
-                            .into(),
-                    );
+                if let Err(msg) = validate_run_command(&command) {
+                    send_err(resp_tx, msg);
                     return;
                 }
+                // 注：这里**曾经**有「自动注入后 1 秒内拒发命令」的守卫——防 expect_echo 整体
+                // 覆写注入吞除。回显吞除改为 FIFO 队列（terminal::EchoArm）后覆写不再发生：
+                // 注入回显与哨兵回显按打字顺序各吞各的，守卫连同它的误拒一起退役。
+                // exit/logout 单独改写进子 shell（见 wrap_session_ender）：退出码照拿、会话不死。
+                let sent_command = wrap_session_ender(&command);
                 let nonce = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                // 前缀本身只含可打印字符：这段文本会被终端「原样打字回显」，如果直接嵌入原始
-                // 0x1E 控制字节，大多数远端终端默认开着 ECHOCTL，回显时会把控制字节渲染成
-                // `^^` 这样的两个可打印字符而不是原始字节，导致 expect_echo 的逐字节匹配失配。
-                // 真正的分隔符 \x1e 只让 printf 在**执行后的输出**里产生（程序自己写 stdout，
-                // 不经过终端的按键回显路径，不受 ECHOCTL 影响）。
-                let prefix = format!("AI_DONE_{nonce}:");
-                // 命令本身正常回显+输出，用户实时可见；标记行自身回显用 expect_echo 吞掉，
-                // 其打印出的哨兵再用 \r\x1b[K 自擦除（不渲染进可见终端），无需改动 feed() 管线。
-                let marker = format!("printf '{prefix}%d\\x1e' $?; printf '\\r\\x1b[K'");
+                // 完成检测有两条路，**优先 shell 集成**（见 `terminal::CaptureMode`）：
+                //
+                // - 集成可用（本会话见过 OSC 133 = AI 会话的集成片段已注入生效）：只发命令
+                //   本身，一个字节的哨兵都不打。开始/结束/退出码由 shell 自己在执行前与打印
+                //   提示符时发出，`cat`/REPL 吃不掉、interrupt 不留残渣、也没有哨兵回显要吞。
+                // - 集成不可用（fish/csh、片段还没注入、用户会话）：回退到哨兵。它脆弱的地方
+                //   一条没少（命令形态吞掉哨兵、回显吞除失配……），所以只在这一分支里还活着。
+                //
+                // 哨兵前缀分两个形态：捕获前缀以**真实** 0x1E 开头，哨兵输出因此不可能与
+                // 「标记行的打字回显」撞车（回显里是字面 `\x1e` 四个字符）；打字文本里保持字面
+                // 4 字符、交给远端 printf 转成真实控制字节——若直接嵌原始控制字节，ECHOCTL 会
+                // 把它渲染成 `^^` 导致回显吞除逐字节失配（程序输出不走按键回显路径，不受影响）。
+                let marker = (!s.terminal.shell_integration_active()).then(|| {
+                    let capture_prefix = format!("\x1eAI_DONE_{nonce}:");
+                    let typed_prefix = capture_prefix.replace('\x1e', "\\x1e");
+                    // 标记行自身回显用 expect_echo 吞掉，其打印出的哨兵再用 \r\x1b[K 自擦除。
+                    let typed = format!("printf '{typed_prefix}%d\\x1e' $?; printf '\\r\\x1b[K'");
+                    (capture_prefix, typed)
+                });
                 // worker 可能刚退出（Disconnected 事件这一帧还没被处理，s.connected 仍是
                 // 上一帧的旧值）——cmd_tx 是 unbounded channel，send 只在接收端已经掉了才会
-                // 失败。两条输入分两次 send，不是原子的：命令那条可能已经送达并可能已经
-                // 产生副作用，标记那条却失败——这种情况下不能假装"什么都没发生"，必须明确
-                // 告诉调用方"命令可能已执行、结果未知"，不能让它误以为可以直接重试。
+                // 失败。哨兵模式下两条输入分两次 send，不是原子的：命令那条可能已经送达并
+                // 可能已经产生副作用，标记那条却失败——这种情况下不能假装"什么都没发生"，
+                // 必须明确告诉调用方"命令可能已执行、结果未知"。（集成模式没有第二条 send，
+                // 这个半成功窗口自然也就不存在了。）
                 let command_sent = s
                     .cmd_tx
-                    .send(UiCommand::TerminalInput(format!("{command}\r").into_bytes()))
+                    .send(UiCommand::TerminalInput(format!("{sent_command}\r").into_bytes()))
                     .is_ok();
                 if !command_sent {
                     send_err(resp_tx, "会话的后台连接似乎已经断开，命令未发送，请稍后重试".into());
                     return;
                 }
-                let marker_sent = s
-                    .cmd_tx
-                    .send(UiCommand::TerminalInput(format!("{marker}\r").into_bytes()))
-                    .is_ok();
-                if !marker_sent {
-                    send_err(
-                        resp_tx,
-                        "命令可能已经发送执行，但完成标记发送失败、结果未知——请用 read_screen \
-                         或 read_history 核实实际状态，不要盲目重试有副作用的命令"
-                            .into(),
-                    );
-                    return;
+                match &marker {
+                    Some((capture_prefix, typed)) => {
+                        let marker_sent = s
+                            .cmd_tx
+                            .send(UiCommand::TerminalInput(format!("{typed}\r").into_bytes()))
+                            .is_ok();
+                        if !marker_sent {
+                            send_err(
+                                resp_tx,
+                                "命令可能已经发送执行，但完成标记发送失败、结果未知——请用 read_screen \
+                                 或 read_history 核实实际状态，不要盲目重试有副作用的命令"
+                                    .into(),
+                            );
+                            return;
+                        }
+                        s.terminal.expect_echo(typed);
+                        s.terminal.arm_ai_capture(capture_prefix.clone().into_bytes());
+                    }
+                    // 集成模式：命令已经发出去了，此外什么都不用打。
+                    None => s.terminal.arm_ai_capture_integration(),
                 }
-                s.terminal.expect_echo(&marker);
-                s.terminal.arm_ai_capture(prefix.into_bytes());
+                let born = Instant::now();
                 s.pending_ai_run = Some(PendingAiRun {
                     run_id: nonce as u64,
-                    deadline: Instant::now() + clamp_timeout(timeout_ms),
+                    deadline: born + clamp_timeout(timeout_ms),
+                    last_poll_at: born,
                     resp_tx: Some(resp_tx),
                     req_id: id,
                     command,
@@ -2316,6 +2508,7 @@ impl App {
                             return;
                         }
                         p.deadline = Instant::now() + clamp_timeout(timeout_ms);
+                        p.last_poll_at = Instant::now(); // 有人在等 = 这条运行没被放弃
                         p.resp_tx = Some(resp_tx);
                         p.req_id = id;
                     }
@@ -2374,7 +2567,10 @@ impl App {
                 }
                 // 打断意味着放弃这条命令的哨兵检测：被打断的程序（比如 `cat`）很可能会把
                 // 紧跟着排的标记行当成自己的输入吃掉，哨兵永远等不到。
-                s.cancel_pending_ai_run("命令已被 interrupt 中断");
+                // 用 discard 而不是 cancel：interrupt 的语义就是「把闸门还回来」，连已缓存
+                // 的结果一起丢——保留的话 pending 还占着闸门，调用方收到「已中断」却发不出
+                // 下一条命令。
+                s.discard_pending_ai_run("命令已被 interrupt 中断");
                 let _ = resp_tx.send(McpResponse {
                     id,
                     result: Ok(McpReqResult::Ok),
@@ -2492,7 +2688,7 @@ impl App {
                 }
                 if self.sessions[idx]
                     .cmd_tx
-                    .send(UiCommand::TerminalInput(unescape_key_text(&text)))
+                    .send(UiCommand::TerminalInput(text.into_bytes()))
                     .is_err()
                 {
                     send_err(resp_tx, "这个会话的后台连接似乎已经断开，输入没有送达".into());
@@ -2898,6 +3094,109 @@ impl App {
 }
 
 #[cfg(test)]
+mod timeout_chokepoint_tests {
+    /// **所有超时判定都是每帧轮询的**，而 egui 按需重绘：没人给「最近的那个 deadline」排一次
+    /// 定时重绘，空闲窗口里它到点也不会被求值——调用方那边就是一条永远不回的请求。
+    /// `arm_timeout_repaint` 是这件事唯一的收口点，它自己的注释也承诺「新加的超时只要挂在
+    /// 这些字段上就自动被覆盖」。这条测试把那句承诺变成门禁。
+    ///
+    /// **覆盖面写明白，别当成全面保障**：只扫**本文件**里形如 `<名字>: Instant,` 的字段
+    /// 声明——`Option<Instant>`、结构体最后一个不带逗号的字段、以及别的文件（如 `session.rs`）
+    /// 里的截止时刻都不在范围内。它挡的是「照着现有字段照抄一个新的超时，却忘了排重绘」
+    /// 这一种最常见的漏法；换个写法加超时仍然要靠人。
+    ///
+    /// 反向对照：把 `p.last_poll_at + RECLAIM_IDLE` 从 `arm_timeout_repaint` 里删掉，本条
+    /// 当场挂——那正是「自动回收要等某个不相干的事件偶然唤起一帧」的漏法（历史上
+    /// `abs_deadline` 就是这么漏的）。
+    #[test]
+    fn every_instant_field_is_reachable_from_arm_timeout_repaint() {
+        let src = include_str!("mcp_bridge.rs");
+        let body = {
+            let at = src
+                .find("pub(super) fn arm_timeout_repaint")
+                .expect("收口函数改名了？同步改这条测试");
+            let rest = &src[at..];
+            // 函数体到下一个顶层 `    }` 为止（本文件里 impl 内的函数都是 4 空格缩进）。
+            let end = rest.find("\n    }\n").expect("找不到函数体结尾");
+            // **必须剔掉注释行**：否则函数体里一句提到字段名的说明就能让这条门禁误判通过
+            // （第一版就是这么漏的：注释里写着 `last_poll_at + RECLAIM_IDLE`，把它从代码里
+            // 删掉测试照样绿）。
+            rest[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut missing: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            let line = line.trim();
+            // 同理：字段声明的扫描也只看代码行
+            // 形如 `deadline: Instant,` 的字段声明（跳过注释与函数签名里的参数）
+            let Some(name) = line.strip_suffix(": Instant,") else {
+                continue;
+            };
+            if line.starts_with("//") || name.contains(' ') || name.contains('(') {
+                continue;
+            }
+            if !body.contains(name) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "这些超时字段没被 arm_timeout_repaint 覆盖，空闲窗口里它们到点不会被求值：{missing:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_command_validation_tests {
+    use super::validate_run_command;
+
+    /// 命令必须是单行非空。多行的后果见 `validate_run_command` 的说明——实测（bash 5.1）
+    /// `echo one\necho two` 会产生**两对** OSC 133 C/D，集成模式在第一对就收束，调用方拿到
+    /// 的是「第一行的退出码 + 第一行的输出 + finished=true」，剩下的还在跑。
+    /// 反向对照：把 `contains('\n')` 那条去掉，第三、四条断言当场挂。
+    #[test]
+    fn only_a_single_non_empty_line_is_accepted() {
+        assert!(validate_run_command("ls -l").is_ok());
+        assert!(validate_run_command("cd /tmp && ls; echo done").is_ok(), "单行里的 ; && 照常");
+        assert!(validate_run_command("echo one\necho two").is_err());
+        assert!(validate_run_command("cat <<EOF\nbody\nEOF").is_err(), "heredoc 也是多行");
+        assert!(validate_run_command("ls\r").is_err(), "裸回车同样是「按下 Enter」");
+        assert!(validate_run_command("").is_err());
+        assert!(validate_run_command("   \t ").is_err(), "只有空白等于空命令");
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::{run_is_abandoned, RECLAIM_IDLE};
+    use std::time::Duration;
+
+    /// 自动回收只该打中「闸门被占死」那一种状态：没人等 + 没输出 + 很久没人 poll。
+    /// 反向对照：把判据换回「按声明超时推算绝对期限」（历史实现），第二条断言当场挂——
+    /// `start_command` 的声明超时是协议最小值，正常长命令几分钟内就会被误杀。
+    #[test]
+    fn only_an_abandoned_run_is_reclaimed() {
+        let long = RECLAIM_IDLE + Duration::from_secs(1);
+        assert!(run_is_abandoned(long, true, false), "没人等、无输出、久未轮询：该回收");
+        assert!(
+            !run_is_abandoned(long, false, false),
+            "终端还在输出（构建/测试在跑）：命令活着，不能回收"
+        );
+        assert!(
+            !run_is_abandoned(long, true, true),
+            "有等待者挂着：有人在意这条运行，不能回收"
+        );
+        assert!(
+            !run_is_abandoned(Duration::from_secs(1), true, false),
+            "刚轮询过：AI 还在跟进，不能回收"
+        );
+    }
+}
+
+#[cfg(test)]
 mod untrust_route_tests {
     use super::untrust_route;
 
@@ -2990,9 +3289,39 @@ mod write_consent_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        remote_basename, remote_parent, trim_leading_echo, unescape_key_text, validate_local_path,
-        validate_remote_path,
+        remote_basename, remote_parent, trim_leading_echo, validate_local_path,
+        validate_remote_path, wrap_session_ender,
     };
+
+    #[test]
+    fn session_enders_get_subshell_wrapped() {
+        // 纯 exit/logout（带可选数值码、容忍首尾空白与行尾分隔符）→ 子 shell 包裹，
+        // 退出码保留、登录 shell 不死。
+        assert_eq!(wrap_session_ender("exit"), "(exit)");
+        assert_eq!(wrap_session_ender("exit 42"), "(exit 42)");
+        assert_eq!(wrap_session_ender("  exit 0 ;  "), "(exit 0)");
+        assert_eq!(wrap_session_ender("logout"), "(logout)");
+        assert_eq!(wrap_session_ender("exit -1"), "(exit -1)");
+    }
+
+    #[test]
+    fn non_session_enders_pass_through_unchanged() {
+        // 普通命令、exit 只是命令链一环、非数值参数——一律原样，不动调用方的文本。
+        for cmd in [
+            "ls -l",
+            "cd /x; exit",
+            "exit $code",
+            "exit $(false; echo 1)",
+            "exiting",
+            "echo exit",
+            "exit 1 2",
+            "exit && reboot",
+        ] {
+            assert_eq!(wrap_session_ender(cmd), cmd, "不应改写：{cmd}");
+        }
+        // 形近但不同：trim 后为空也不是 exit。
+        assert_eq!(wrap_session_ender(""), "");
+    }
 
     #[test]
     fn remote_path_must_be_absolute() {
@@ -3042,24 +3371,6 @@ mod tests {
     #[test]
     fn local_path_rejects_root_and_missing_filename() {
         assert!(validate_local_path("/").is_err());
-    }
-
-    /// send_input 的转义表：`\r` 提交行、`\xHH` 发控制字节（Ctrl-D/Ctrl-C/Esc）、
-    /// `\\` 得到字面反斜杠；未定义的转义**原样保留**（宁留噪声不丢数据）——
-    /// 反向对照：把 unknown 分支改成吞掉反斜杠，最后两条断言当场挂。
-    #[test]
-    fn unescape_key_text_parses_documented_escapes() {
-        assert_eq!(unescape_key_text("ls -l\\r"), b"ls -l\r");
-        assert_eq!(unescape_key_text("a\\tb\\n"), b"a\tb\n");
-        assert_eq!(unescape_key_text("\\x04"), b"\x04");
-        assert_eq!(unescape_key_text("\\x1b:wq\\r"), b"\x1b:wq\r");
-        assert_eq!(unescape_key_text("C:\\\\tmp"), b"C:\\tmp");
-        // 未定义/残缺的转义原样保留
-        assert_eq!(unescape_key_text("a\\qb"), b"a\\qb");
-        assert_eq!(unescape_key_text("a\\"), b"a\\");
-        assert_eq!(unescape_key_text("\\xzz"), b"\\xzz");
-        // 普通文本逐字节原样
-        assert_eq!(unescape_key_text("hello"), b"hello");
     }
 
     #[test]
@@ -3375,7 +3686,8 @@ mod upload_stream_tests {
     }
 
     /// 发一条 `CopyToRemoteFromCaller` 请求 + `size` 字节负载，返回 worker 侧实际收到的字节数。
-    async fn upload_bytes(size: usize) -> usize {
+    /// `err_while_reading`：模拟「App 已回报错（如文件操作超时）、worker 却还活着在读」。
+    async fn upload_bytes_with(size: usize, err_while_reading: bool) -> usize {
         let (stream, mut rx) = serve_one_keep_rx().await;
         let (_r, mut w) = stream.into_split();
         let mut line = serde_json::to_string(&McpRequest {
@@ -3411,6 +3723,11 @@ mod upload_stream_tests {
 
         let call = rx.recv().await.expect("handle_conn 应把请求转进来");
         let mut src = call.upload_source.expect("上传请求必须带字节流");
+        if err_while_reading {
+            let _ = call.resp_tx.send(McpResponse { id: 1, result: Err("文件操作超时".into()) });
+            // 给「报错即排干」的错误实现留足抢数据的时间
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
         let mut got = 0usize;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -3424,6 +3741,24 @@ mod upload_stream_tests {
         // CI 只会超时，给不出任何诊断。
         writer.abort();
         got
+    }
+
+    async fn upload_bytes(size: usize) -> usize {
+        upload_bytes_with(size, false).await
+    }
+
+    /// 报错 ≠ worker 已停：文件操作超时到点就回 Err，worker 的上传却无法取消、仍在读 source。
+    /// 这时 `handle_conn` 若立刻排干，就是两个读取者抢同一路字节流——worker 收不全、上传
+    /// 必然「提前结束」。排干必须等 source 被释放。
+    /// 反向对照：去掉排干前的 `source_dropped.await`，本条当场挂（worker 收到的字节少于 size）。
+    #[tokio::test]
+    async fn error_response_does_not_steal_bytes_from_live_worker() {
+        let size = 4 * 1024 * 1024;
+        assert_eq!(
+            upload_bytes_with(size, true).await,
+            size,
+            "worker 仍在读时排干抢走了字节"
+        );
     }
 
     /// `MAX_MCP_LINE_BYTES` 只该限请求行，不该限跟在它后面的文件流。

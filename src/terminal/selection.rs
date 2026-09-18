@@ -184,6 +184,17 @@ impl Terminal {
         self.clipboard.as_mut()?.get_text().ok()
     }
 
+    /// OSC 52 落剪贴板：远端/TUI 程序「复制」的终点。复用 Terminal 已有的 arboard 实例。
+    /// 失败静默——无剪贴板服务的环境（某些无头/远程桌面）里序列不生效，但终端不受影响。
+    pub(super) fn set_clipboard_from_osc52(&mut self, text: String) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if let Some(c) = self.clipboard.as_mut() {
+            let _ = c.set_text(text);
+        }
+    }
+
     /// 剪贴板里若是图片，编码成 PNG 存进 `paste_image`，等 App 取走。
     ///
     /// 编码放在这里（而不是交给 App 拿原始 RGBA）是因为 arboard 的 `ImageData` 借的是

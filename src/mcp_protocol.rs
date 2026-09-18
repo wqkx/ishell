@@ -197,6 +197,12 @@ pub struct McpSessionInfo {
     /// 调用方都报 `false`——它们属于旧版的共享池。
     #[serde(default)]
     pub mine: bool,
+    /// 配对 token（`ISHELL_MCP_TOKEN`）是否已注入这个会话的 shell。`false` 意味着在该
+    /// 终端里启动的 AI 拿不到配对身份、绑定会被拒——用户会话多是「连上后敲过键盘」被
+    /// 跳过（可终端右键「立即注入配对标识」补救），AI 会话在新 shell 的空档里会自动补注。
+    /// 旧代理/GUI 组合没有这个字段时默认 false（保守，不代表真的没注入）。
+    #[serde(default)]
+    pub token_injected: bool,
 }
 
 /// 一条已保存连接的摘要（`list_saved_connections` 的返回项）。不含密码/密钥等敏感字段——
@@ -421,6 +427,73 @@ impl McpReqKind {
             // CloseSession 走的是更严的门禁（只能关 AI 自己开的，不接受授权——关闭权限不
             // 应该超过打开权限），不走这条授权路。
             McpReqKind::CloseSession { .. } => Vec::new(),
+        }
+    }
+}
+
+/// `send_input` 在 `escapes=true` 时的字面转义解析（代理侧做，线协议不变）。
+///
+/// 支持 `\r` `\n` `\t` `\\` 与 `\xHH`（恰好两位十六进制、值 00-7F——结果要作为 JSON
+/// 字符串上线，必须是合法 UTF-8；控制键全在这个范围内）。这是调用方**显式开启**的模式，
+/// 所以写错一律报错、不发送：未定义转义、`\x` 后不足两位或非十六进制（含 `+` 号）、
+/// 超出 7F、末尾孤立反斜杠。宁可让调用方改一次，也不把半截按键序列打进终端。
+#[allow(dead_code)] // 只有 ishell-mcp 那个 crate 用；本文件被两个 crate 各编一遍
+pub fn unescape_key_text(text: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('r') => out.push('\r'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                // 先确认恰好两位十六进制数字：from_str_radix 自己会接受 `+` 号和一位数
+                let byte = (hex.len() == 2 && hex.chars().all(|h| h.is_ascii_hexdigit()))
+                    .then(|| u8::from_str_radix(&hex, 16).ok())
+                    .flatten()
+                    .filter(u8::is_ascii)
+                    .ok_or_else(|| {
+                        format!("escapes=true：\\x 后必须是两位十六进制且不超过 7F，实际是 \\x{hex}")
+                    })?;
+                out.push(byte as char);
+            }
+            Some(other) => {
+                return Err(format!(
+                    "escapes=true：未定义的转义 \\{other}（支持 \\r \\n \\t \\\\ \\xHH；字面反斜杠写成 \\\\）"
+                ))
+            }
+            None => return Err("escapes=true：text 以孤立的反斜杠结尾（字面反斜杠写成 \\\\）".into()),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod unescape_key_text_tests {
+    use super::unescape_key_text;
+
+    #[test]
+    fn documented_escapes_become_keys() {
+        assert_eq!(unescape_key_text("ls -l\\r").unwrap(), "ls -l\r");
+        assert_eq!(unescape_key_text("a\\tb\\n").unwrap(), "a\tb\n");
+        assert_eq!(unescape_key_text("\\x04").unwrap(), "\u{4}");
+        assert_eq!(unescape_key_text("\\x1b:wq\\r").unwrap(), "\u{1b}:wq\r");
+        assert_eq!(unescape_key_text("C:\\\\tmp").unwrap(), "C:\\tmp");
+        assert_eq!(unescape_key_text("中文 hello").unwrap(), "中文 hello");
+    }
+
+    /// 显式开启的模式写错必须报错、绝不半截发送。
+    /// 反向对照：把 `\x` 的校验放宽回 `from_str_radix` 直接解析，`\x+1`、`\x4` 两条当场挂。
+    #[test]
+    fn malformed_escapes_are_rejected() {
+        for bad in ["a\\qb", "a\\", "\\xzz", "\\x+1", "\\x4", "\\xff"] {
+            assert!(unescape_key_text(bad).is_err(), "应当报错：{bad:?}");
         }
     }
 }

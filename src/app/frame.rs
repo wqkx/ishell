@@ -123,9 +123,9 @@ impl App {
     /// 事（程序替用户敲键盘），判据早已共用 `Session::shell_idle_for_injection`，现在求值
     /// 时机也统一：同一条每帧路径、同一次会话遍历、cwd 在前。
     ///
-    /// **顺序是有意的**：`cd` 一旦注入就 `expect_echo` 武装了回显吞除，而 `expect_echo`
-    /// 是整体覆写；同一轮里紧跟着的配对标识注入会读到刚更新的 `injection_idle_for`，
-    /// 因而必然被挡下，`cd` 的回显不会被冲掉。
+    /// **顺序是有意的**：`cd` 一旦注入就 `expect_echo` 武装了回显吞除、并把
+    /// `injection_idle_for` 刷新到当下；同一轮里紧跟着的配对标识注入会读到这个刚更新的
+    /// 时间窗，因而必然被挡下一帧——两条注入错开出现，`cd` 的注入痕迹不会糊成一团。
     ///
     /// **这里是与标签页无关的每帧路径，这一点是本函数存在的全部理由。** 它一度写在
     /// `right_body` 里，而 `right_body` 只对**当前活动标签**调用（`mod.rs` 的
@@ -201,6 +201,24 @@ impl App {
         // 终端右键「立即注入配对标识」。不需要另续重绘：能走到这里时 150ms 心跳一定在转。
         let mut pair_skipped_typed = false;
         for s in &mut self.sessions {
+            if s.ai_owned {
+                // AI 专用会话**同样**注入配对 token：嵌套 AI（用户在这个终端里又启动了别
+                // 的 AI）需要从环境继承配对身份，否则它的代理无 token、绑定直接被拒——
+                // 「AI 会话无需注入」的旧假设只覆盖「里面是我们自己开的 AI」这一种用法。
+                // 闸门用 AI 专用的 `ai_shell_idle_for_injection`：与用户闸门不同，AI 会话
+                // 的只读键盘也会被记录按键时刻，never_typed 会把注入永久封死（同 OSC 7
+                // 注入的理由）；运行期间不注是 ai_busy 闸门的事：注入行会打进正在运行的
+                // 命令的终端（污染捕获输出或被前台程序吃掉），吞除本身已由队列按序各吞各的。
+                if !s.mcp_token_injected
+                    && crate::store::load_mcp_auto_pair()
+                    && crate::store::load_mcp_consent()
+                    && s.ai_shell_idle_for_injection()
+                {
+                    inject_mcp_token(s);
+                    s.mcp_token_injected = true;
+                }
+                continue;
+            }
             if !pair_inject_allowed(
                 crate::store::load_mcp_auto_pair(),
                 crate::store::load_mcp_consent(),
@@ -232,11 +250,12 @@ impl App {
                 self.ctx.input(|i| i.time),
             ));
         }
-        // OSC 7 工作目录上报：AI 专用会话自动注入。片段与用户在终端右键菜单里同意注入的
-        // 是同一个（仅当前会话、不写 rc），但 AI 自己的会话无需征求同意——和用户会话不同，
-        // 这里没人「正在用」这个 shell，注入的代价只是提示符上多一条看不见的 OSC 序列。
-        // 注入后远端每次显示提示符都会上报 cwd，`list_sessions` 的 cwd 字段由此有值——
-        // 否则 AI 只能跑 pwd 猜目录。与上面各趟分开：判据走 AI 专用闸门
+        // AI 专用会话自动注入：OSC 7 工作目录上报 + shell 集成（OSC 133）。用户会话只在
+        // 右键同意后注入 OSC 7，AI 自己的会话无需征求同意——没人「正在用」这个 shell，代价
+        // 只是提示符上多两条看不见的 OSC 序列。
+        // 注入后：`list_sessions` 的 cwd 字段有值（否则 AI 只能跑 pwd 猜目录），且 AI 命令的
+        // 完成检测改走集成判据、不再往 tty 里多打哨兵行（见 `view_state::AI_SESSION_SNIPPET`）。
+        // 与上面各趟分开：判据走 AI 专用闸门
         // `ai_shell_idle_for_injection`（同样含 injection_idle_for，上一趟注入的回显吞除
         // 不会被这趟冲掉；不能用 `shell_idle_for_injection`——它的 !ai_owned/never_typed
         // 是为用户 shell 设计的，对 AI 会话恒假）。
@@ -245,7 +264,7 @@ impl App {
                 continue;
             }
             if s.ai_shell_idle_for_injection() {
-                let cmd = super::view_state::OSC7_SNIPPET;
+                let cmd = super::view_state::AI_SESSION_SNIPPET;
                 let _ = s
                     .cmd_tx
                     .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));

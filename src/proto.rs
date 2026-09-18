@@ -350,6 +350,10 @@ pub enum WorkerEvent {
     Status(String),
     /// 连接并打开 shell 成功
     Connected,
+    /// 交互 shell 进程退出（`exit N`、shell 崩溃等），携带通道上报的退出码。
+    /// 排在 EOF/Disconnected 之前到达：此时排队的哨兵注定不会再打印，UI 可用这个退出码
+    /// 直接给挂起的 AI 运行收尾（finished=true），而不是等断线后报一句笼统的「已断线」。
+    ShellExited(i32),
     /// 连接断开（携带原因）
     Disconnected(String),
     /// 来自远程 shell 的原始字节，喂给 vt100 解析器

@@ -2,7 +2,9 @@
 
 mod types;
 mod util;
-mod view_state;
+// `pub(crate)`：注入片段是「iShell 替用户敲进 shell 的东西」的唯一出处，终端侧的场景
+// 测试要用同一份常量跑真 bash（见 terminal::shell_integration_tests）。
+pub(crate) mod view_state;
 mod widgets;
 pub(in crate::app) use types::{
     DirectFallback, DirectJob, DocKind, EditorState, EditorTab, FileClip, ForwardEntry, ForwardUi,
