@@ -320,35 +320,34 @@ const LAUNCH_TOKEN_VAR: &str = "ISHELL_PAIR_TOKEN";
 #[cfg(unix)]
 const CONFIG_TOKEN_VAR: &str = "ISHELL_MCP_TOKEN";
 
-/// 本代理该用哪个配对 token。**「启动这个 AI 的那个终端」说了算，MCP 配置文件里写死的值只
-/// 作兜底。**
+/// 本代理该用哪个配对 token。**「启动这个 AI 的那个终端」注入的专用变量优先，MCP 配置
+/// 里写的值只作兜底。**
 ///
-/// 为什么不能直接读自己的 `ISHELL_MCP_TOKEN`（多机串台的真正根因，2026-09-18 在生产服务器
-/// 上实测）：AI 客户端（Claude Code 等）spawn MCP server 时，会用配置里 `env` 块的值**覆盖**
-/// 从终端继承来的同名变量。共用服务器账号时，`~/.claude.json` 的 user 级配置是**所有人共用**
-/// 的——只要有一个人按「复制配对配置」把自己的 token 写进了那里，服务器上所有人的 AI 起的
-/// 代理就都带着**他的** token：iShell 在各自终端里注入的正确 token 被静默覆盖，握手只和他那
-/// 台电脑配得上，所有人的请求都落到他的电脑上。实测：来自 4 个不同 IP 的 claude 进程，自身
-/// 环境里 token 各不相同，它们起的代理却全都带着同一个 token。
+/// 为什么不能直接读 `ISHELL_MCP_TOKEN`（多机串台的真正根因，2026-09-18 在生产服务器上实测）：
+/// AI 客户端（Claude Code 等）spawn MCP server 时，会用配置里 `env` 块的值**覆盖**从终端继承
+/// 来的同名变量。共用服务器账号时，`~/.claude.json` 的 user 级配置是**所有人共用**的——只要
+/// 有一个人把自己的 token 写进了那里，服务器上所有人的代理就都带着**他的** token：iShell 在
+/// 各自终端里注入的正确值被静默覆盖，所有人的请求都落到他的电脑上。实测：来自 4 个不同 IP 的
+/// claude 进程，自身环境里 token 各不相同，它们起的代理却全都带着同一个 token。
 ///
 /// 取值顺序：
-/// 1. 自身环境的 [`LAUNCH_TOKEN_VAR`]：只由终端注入，配置文件里没人写它，所以不会被覆盖。
-/// 2. （Linux）**父进程**环境里的 `ISHELL_MCP_TOKEN`：父进程就是 AI 客户端本身，
-///    `/proc/<ppid>/environ` 是它被启动那一刻从终端继承的环境，配置文件的覆盖只作用于它
-///    spawn 出来的子进程（也就是本代理），碰不到它自己。这一条让旧版 iShell 注入过的终端
-///    （只有旧变量名）在代理升级后立即恢复正确路由，不必等每台电脑都升级。
-/// 3. 自身环境的 `ISHELL_MCP_TOKEN`：AI 不是从 iShell 终端启动的（IDE 里跑等），只能靠配置。
-///    这正是会被共享配置带偏的那条路，所以来源与终端不一致时打一条告警到 stderr。
+/// 1. [`LAUNCH_TOKEN_VAR`]：只由终端注入、没人往配置里写，所以不会被覆盖。
+/// 2. `ISHELL_MCP_TOKEN`：AI 不是从 iShell 终端启动的（IDE 里跑等），只能靠配置或启动前缀。
+///
+/// 两者不一致时按 1，并在 stderr 告警（配置里那个多半是别人写进共享配置的）。
+///
+/// 这里**刻意不去读父进程环境里的旧变量**：v6 起配对 token 已整体换新（见
+/// `store::mcp_pairing_token`），旧版 iShell 注入的 `ISHELL_MCP_TOKEN` 只可能是作废的旧值，
+/// 读它只会压过配置里正确的新值、再打一条方向相反的告警。
 #[cfg(unix)]
 fn pairing_token() -> Option<String> {
     let (token, overridden) = resolve_pairing_token(
         std::env::var(LAUNCH_TOKEN_VAR).ok(),
-        parent_env_var(CONFIG_TOKEN_VAR),
         std::env::var(CONFIG_TOKEN_VAR).ok(),
     );
     if overridden {
         eprintln!(
-            "ishell-mcp: 终端注入的配对 token 与 MCP 配置里 env.{CONFIG_TOKEN_VAR} 不一致，\
+            "ishell-mcp: 终端注入的 {LAUNCH_TOKEN_VAR} 与 MCP 配置里 env.{CONFIG_TOKEN_VAR} 不一致，\
              按终端的来（配置里的值多半是别人写进共享配置的，会把请求路由到他的电脑）。\
              建议从 AI 的 MCP 配置（如 ~/.claude.json）里删掉 {CONFIG_TOKEN_VAR}。"
         );
@@ -359,43 +358,15 @@ fn pairing_token() -> Option<String> {
 /// [`pairing_token`] 的纯判定：`(选定的 token, 是否推翻了配置里的值)`。空白值一律视同没设。
 #[cfg(unix)]
 fn resolve_pairing_token(
-    own_launch: Option<String>,
-    parent_config_var: Option<String>,
-    own_config: Option<String>,
+    launch: Option<String>,
+    config: Option<String>,
 ) -> (Option<String>, bool) {
     let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let launch = clean(own_launch).or_else(|| clean(parent_config_var));
-    match (launch, clean(own_config)) {
+    match (clean(launch), clean(config)) {
         (Some(l), Some(c)) if l != c => (Some(l), true),
         (Some(l), _) => (Some(l), false),
         (None, c) => (c, false),
     }
-}
-
-/// 读父进程启动时的某个环境变量（Linux 的 `/proc/<ppid>/environ`）。读不到一律 `None`：
-/// 别的平台、父进程已退出、权限不够——都退回「只看自己的环境」的旧行为，不报错。
-#[cfg(unix)]
-fn parent_env_var(name: &str) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        let ppid = std::os::unix::process::parent_id();
-        let raw = std::fs::read(format!("/proc/{ppid}/environ")).ok()?;
-        env_lookup(&raw, name)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        None
-    }
-}
-
-/// 在 `/proc/*/environ` 格式（`KEY=VALUE\0KEY=VALUE\0…`）的字节里找一个变量。
-#[cfg(unix)]
-fn env_lookup(raw: &[u8], name: &str) -> Option<String> {
-    raw.split(|&b| b == 0).find_map(|kv| {
-        let rest = kv.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
-        String::from_utf8(rest.to_vec()).ok()
-    })
 }
 
 /// 决定这个代理这辈子只操作哪个 iShell 实例。只在首次需要连接时跑一次。
@@ -1711,20 +1682,69 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 本代理**进程**的身份标识：启动时生成的随机串（16 位十六进制），同进程内所有请求一致、
-/// 不同 AI 进程互不相同。iShell 用它落实「窗口归开它的那个 AI 专用」：`open_session` 记录
-/// 它，此后只有同一个 actor 能读写那个会话（用户的、别的 AI 的窗口一律拒绝）。v6 起 iShell
-/// 在配对握手时记下这个值并绑到连接凭据上，业务请求里自报的 actor 不再被信任——冒用别人的
-/// actor 拿不走别人的窗口。
+/// 本代理的身份标识（`actor`）。iShell 用它落实「窗口归开它的那个 AI 专用」：`open_session`
+/// 记录它，此后只有同一个 actor 能读写那个会话（用户的、别的 AI 的窗口一律拒绝）。v6 起 iShell
+/// 在配对握手时记下这个值并绑到连接凭据上，业务请求里自报的 actor 不再被信任。
+///
+/// **它标识的是 AI 客户端，不是代理进程。** 代理是 AI 客户端（Claude Code 等）的子进程，而
+/// 客户端会在 `/mcp` 重连、MCP server 崩溃重启时换一个新的代理进程，自己却没变。此前 actor 是
+/// 代理启动时的随机数，一重连就换——AI 刚开的会话立刻变成「不是你的」：看不见、读不了、关不掉，
+/// 里面在跑的命令结果也拿不回来。所以在 Linux 上从**父进程**（即 AI 客户端）派生：本机开机
+/// 标识 + 父进程 pid + 父进程启动时刻，三者合起来在一台机器的一次开机内唯一、跨机器不撞，同一个
+/// 客户端换多少次代理都得到同一个值。
+///
+/// 客户端**整个重启**后是新进程，actor 随之改变，旧会话不再归它——这是刻意的：放宽「接管」
+/// 规则就会回到「谁都能碰别人的窗口」。取不到父进程信息（非 Linux、/proc 不可读）时退回
+/// 进程级随机值，行为同旧版。
+///
+/// 不是保密凭据：同一配对 token 下的代理本来就能声明任意 actor，身份隔离靠的是 iShell 签发、
+/// 绑定 actor 的连接凭据。
 fn current_actor() -> String {
     static ACTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ACTOR
         .get_or_init(|| {
-            mcp_protocol::random_hex(8)
+            client_actor()
+                .or_else(|| mcp_protocol::random_hex(8))
                 // 熵源失败（实际不会发生）：退回 pid——只是进程区分，允许弱。
                 .unwrap_or_else(|| format!("fallback-pid{}", std::process::id()))
         })
         .clone()
+}
+
+/// 从父进程（AI 客户端）派生 actor：`<开机标识前 16 位>-<父 pid>-<父进程启动时刻>`。
+/// 任何一项取不到都返回 `None`，由调用方退回随机值。
+fn client_actor() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let ppid = std::os::unix::process::parent_id();
+        if ppid <= 1 {
+            return None; // 父进程已退出、被 init 收养：没有可跟随的客户端
+        }
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let stat = std::fs::read_to_string(format!("/proc/{ppid}/stat")).ok()?;
+        actor_from_parts(&boot, ppid, proc_start_time(&stat)?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// 拼出 actor。开机标识去掉连字符取前 16 位十六进制（64 位，足以区分不同机器/不同次开机）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn actor_from_parts(boot_id: &str, ppid: u32, start_ticks: u64) -> Option<String> {
+    let boot: String = boot_id.chars().filter(|c| c.is_ascii_hexdigit()).take(16).collect();
+    (boot.len() == 16).then(|| format!("{boot}-{ppid}-{start_ticks}"))
+}
+
+/// 从 `/proc/<pid>/stat` 取进程启动时刻（第 22 个字段，开机以来的时钟滴答数）。
+///
+/// 第 2 个字段是括号包着的进程名，里面可以有空格和括号（进程名可被任意设置），所以必须从
+/// **最后一个** `)` 之后开始数：那之后第一个字段是第 3 个（状态），第 22 个即下标 19。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// 绑定弹窗里给被询问用户看的来源描述：哪个 unix 用户、哪个进程在发起。纯展示信息，
@@ -1802,46 +1822,60 @@ mod tests {
     /// 进程标识：16 位十六进制，同进程内多次取必须一致（OnceLock 缓存）。
     /// **多机串台的根因回归门禁**（2026-09-18 生产服务器实测）：共用账号时 `~/.claude.json`
     /// 的 user 级 MCP 配置里写死了某人的 token，AI 客户端 spawn 代理时用它**覆盖**了终端注入
-    /// 的正确 token——所有人的代理都带着同一个 token，全部路由到那一台电脑。
-    /// 终端来源（自身的 ISHELL_PAIR_TOKEN，或父进程——AI 客户端本身——启动时的
-    /// ISHELL_MCP_TOKEN）必须赢过配置。反向对照：把 `resolve_pairing_token` 改成优先
-    /// `own_config`，前两条断言当场挂。
+    /// 的同名变量——所有人的代理都带着同一个 token，全部路由到那一台电脑。终端注入的专用变量
+    /// （配置里没人写它）必须赢过配置。
+    /// 反向对照：把 `resolve_pairing_token` 改成优先 `config`，第一条断言当场挂。
     #[test]
     fn the_launching_terminal_beats_a_token_hardcoded_in_shared_mcp_config() {
         use super::resolve_pairing_token;
         let s = |v: &str| Some(v.to_string());
-        // 旧版 iShell 注入的终端：只在父进程（claude）的环境里有正确值，自身环境被配置覆盖。
         assert_eq!(
-            resolve_pairing_token(None, s("mine"), s("someone-elses")),
+            resolve_pairing_token(s("mine"), s("someone-elses")),
             (s("mine"), true),
-            "配置里写死的别人的 token 不能覆盖启动终端注入的 token"
+            "配置里写死的别人的 token 不能覆盖终端注入的 token"
         );
-        // 新版 iShell 注入的专用变量名：配置里没人写它，直接胜出。
-        assert_eq!(resolve_pairing_token(s("mine"), None, s("someone-elses")), (s("mine"), true));
-        // 两处一致：没有冲突。
-        assert_eq!(resolve_pairing_token(None, s("mine"), s("mine")), (s("mine"), false));
-        // 终端没注入（AI 在 IDE 里启动等）：只能用配置，行为同旧版。
-        assert_eq!(resolve_pairing_token(None, None, s("cfg")), (s("cfg"), false));
+        assert_eq!(resolve_pairing_token(s("mine"), s("mine")), (s("mine"), false));
+        // 终端没注入（AI 在 IDE 里启动等）：只能用配置。
+        assert_eq!(resolve_pairing_token(None, s("cfg")), (s("cfg"), false));
         // 空白等于没设。
-        assert_eq!(resolve_pairing_token(s("  "), s(""), s("cfg")), (s("cfg"), false));
-        assert_eq!(resolve_pairing_token(None, None, None), (None, false));
+        assert_eq!(resolve_pairing_token(s("  "), s("cfg")), (s("cfg"), false));
+        assert_eq!(resolve_pairing_token(None, None), (None, false));
+    }
+
+    /// actor 跟着 AI 客户端（父进程）走：同一个客户端换代理进程（`/mcp` 重连）得到同一个值，
+    /// 否则它刚开的会话立刻变成「不是你的」。这里钉住派生规则本身：同输入同输出、任一要素
+    /// 不同即不同。反向对照：把 `actor_from_parts` 改成混入随机数，第一条断言挂。
+    #[test]
+    fn actor_is_derived_from_the_client_not_the_proxy_process() {
+        use super::actor_from_parts;
+        let boot = "3f2a9c1e-7b4d-4e11-9a0b-5c6d7e8f9012\n";
+        let a = actor_from_parts(boot, 4242, 987654).expect("完整输入应能派生");
+        assert_eq!(Some(a.clone()), actor_from_parts(boot, 4242, 987654), "同一个客户端 → 同一个 actor");
+        assert_eq!(a, "3f2a9c1e7b4d4e11-4242-987654");
+        assert_ne!(Some(a.clone()), actor_from_parts(boot, 4243, 987654), "不同父进程");
+        assert_ne!(Some(a.clone()), actor_from_parts(boot, 4242, 987655), "pid 被复用给了新进程");
+        assert_ne!(
+            Some(a),
+            actor_from_parts("0000000000000000", 4242, 987654),
+            "另一台机器/另一次开机"
+        );
+        assert_eq!(actor_from_parts("short", 1, 1), None, "开机标识不完整就不派生");
+    }
+
+    /// `/proc/<pid>/stat` 的进程名在括号里、可以含空格和括号——必须从最后一个 `)` 往后数。
+    #[test]
+    fn proc_start_time_survives_hostile_process_names() {
+        use super::proc_start_time;
+        let tail = "S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 555000 19 20";
+        assert_eq!(proc_start_time(&format!("123 (claude) {tail}")), Some(555000));
+        assert_eq!(proc_start_time(&format!("123 (a) b (c d) {tail}")), Some(555000));
+        assert_eq!(proc_start_time("garbage"), None);
     }
 
     #[test]
-    fn env_lookup_reads_proc_environ_format() {
-        use super::env_lookup;
-        let raw = b"HOME=/root\0ISHELL_MCP_TOKEN=abc123\0ISHELL_MCP_TOKENX=nope\0";
-        assert_eq!(env_lookup(raw, "ISHELL_MCP_TOKEN").as_deref(), Some("abc123"));
-        assert_eq!(env_lookup(raw, "ISHELL_MCP_TOKENX").as_deref(), Some("nope"));
-        assert_eq!(env_lookup(raw, "ISHELL_PAIR_TOKEN"), None);
-        assert_eq!(env_lookup(b"", "HOME"), None);
-    }
-
-    #[test]
-    fn current_actor_is_stable_random_hex_within_a_process() {
+    fn current_actor_is_stable_within_a_process() {
         let a = current_actor();
         assert_eq!(a, current_actor(), "同进程内 actor 必须稳定");
-        assert_eq!(a.len(), 16, "16 位十六进制，实际：{a}");
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "应为十六进制：{a}");
+        assert!(!a.is_empty());
     }
 }
