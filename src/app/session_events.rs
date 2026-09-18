@@ -304,7 +304,8 @@ impl Session {
                         // MCP 调用方没有 GUI 的「确认后强制打开」弹窗——错误文案里直接给出
                         // 逃生通道，否则调用方只会看到一句干巴巴的"文件过大"无从下手。
                         self.try_resolve_file_read(id, Err(format!(
-                            "文件过大（{size} 字节），如确认需要请用 force=true 重试（硬上限 128MB）"
+                            "文件过大（{size} 字节），如确认需要请用 force=true 重试（硬上限 {}MB）",
+                            crate::limits::FILE_HARD_LIMIT / 1024 / 1024
                         )));
                     } else {
                         self.pending.too_large.push((id, path, size));

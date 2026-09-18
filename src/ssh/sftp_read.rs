@@ -111,28 +111,26 @@ pub(in crate::ssh) async fn read_file_chunked(
     let file_mtime = meta.as_ref().and_then(|m| m.mtime).unwrap_or(0);
     // 先报 0 进度：占位标签立即显示空进度条
     sink.send(WorkerEvent::FileLoadProgress { id, done: 0, total });
-    let too_large = || match crate::i18n::current() {
-        crate::i18n::Lang::Zh => {
-            if force {
-                format!("文件过大（>{}MB），已是 force 模式硬上限", limit / 1024 / 1024)
-            } else {
-                format!(
-                    "文件过大（>{}MB），如确认需要请用 force=true 重试（硬上限 128MB）",
-                    limit / 1024 / 1024
-                )
+    // 这段文案 GUI 编辑器与 MCP 调用方都会看到（非 force 下只在「读取途中文件长过软上限」时
+    // 出现，预检超限走 FileTooLarge），所以不提任何一方的专有操作（MCP 的 force=true 参数
+    // GUI 用户看不懂）；MCP 那边的逃生通道由 session_events 的 FileTooLarge 分支单独给出。
+    // 上限一律从 limits 算，改限额时文案不会漂。
+    let too_large = || {
+        let mb = |b: u64| b / 1024 / 1024;
+        let (soft, hard) = (
+            mb(crate::limits::FILE_SOFT_LIMIT),
+            mb(crate::limits::FILE_HARD_LIMIT),
+        );
+        match (crate::i18n::current(), force) {
+            (crate::i18n::Lang::Zh, true) => format!("文件过大（>{hard}MB，已达强制读取的上限）"),
+            (crate::i18n::Lang::Zh, false) => {
+                format!("文件过大（>{soft}MB，强制读取时上限可放宽到 {hard}MB）")
             }
-        }
-        crate::i18n::Lang::En => {
-            if force {
-                format!(
-                    "File too large (>{}MB, hard limit in force mode)",
-                    limit / 1024 / 1024
-                )
-            } else {
-                format!(
-                    "File too large (>{}MB); retry with force=true if you really need it (hard limit 128MB)",
-                    limit / 1024 / 1024
-                )
+            (crate::i18n::Lang::En, true) => {
+                format!("File too large (>{hard}MB, the hard limit even when forced)")
+            }
+            (crate::i18n::Lang::En, false) => {
+                format!("File too large (>{soft}MB; forcing raises the limit to {hard}MB)")
             }
         }
     };

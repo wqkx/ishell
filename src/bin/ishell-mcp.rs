@@ -1120,9 +1120,11 @@ impl IshellMcp {
                         权衡后选择宁可留一点噪声也不丢数据），解析时自己按需忽略即可；② 超时返回的是\
                         finished=false 加**这一轮已产生的部分输出**（可能是空字符串）——空输出不代表\
                         命令什么都没打印，只代表还没等到完成哨兵，用 poll_run 续等或用 read_screen \
-                        看实时内容。**整条命令是 exit [n]/logout 时会自动改写到子 shell 执行**：退出码\
-                        照拿（exit 42 返回 42）、登录 shell 不受影响；想关掉 AI 自己开的会话请用 \
-                        close_session，不要靠 exit。"
+                        看实时内容。**命令最后一段是 exit [n] 时（`exit 42`、`make || exit 1`）会自动改写到子 \
+                        shell 执行**：退出码照拿（exit 42 返回 42）、登录 shell 不受影响。exit 后面\
+                        **还接着命令**会被拒绝——改写后的 exit 拦不住后续命令（`cond || exit 1; rm …` \
+                        的守卫会失效），请改成条件分支 `cond && rm …`。logout 一律拒绝。想关掉 AI \
+                        自己开的会话请用 close_session，不要靠 exit/logout。"
     )]
     async fn run_command(
         &self,

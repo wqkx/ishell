@@ -456,29 +456,61 @@ fn validate_run_command(command: &str) -> Result<(), String> {
                     `&&` 连接），或先用 write_file 写一个脚本再执行它"
             .into());
     }
+    // 整条命令、或命令链里单独成段的一环是 `logout`：它的本意是「关掉这个会话」，那是
+    // close_session 的事。不能照 `exit` 的办法包进子 shell——子 shell 永远不是登录 shell，
+    // 实测 `(logout)` 必报「logout: not login shell」并返回 1（父进程是登录 shell 也一样），
+    // 调用方拿到的是一个莫名其妙的失败；直接发出去又会杀掉登录 shell、作废这条运行。
+    // 两条路都不对，拒绝。（分段扫描与改写 exit 共用同一份判据，两处不会漂移。）
+    for (s, e) in top_level_command_segments(command) {
+        if normalized_session_ender(&command[s..e]).is_some_and(|(head, _)| head == "logout") {
+            return Err("command 里含有 logout：run_command 用来执行命令，不用来关会话——关掉你\
+                        自己开的会话请用 close_session；只是想拿一个退出码请用 `exit N`（会在\
+                        子 shell 里执行，会话不受影响）"
+                .into());
+        }
+    }
+    // `exit` 后面还接着命令：原语义里 exit 一执行 shell 就终止，后面的命令**一条都不会跑**
+    // ——`cond || exit 1; rm -rf build` 这类守卫写法全靠这一点。可 run_command 为了保住会话
+    // 要把 exit 改写进子 shell，`(exit 1)` 只结束子 shell，后面的命令照跑，守卫就此失效
+    // （实测 bash：`test -f /nonexistent || (exit 1); echo DANGER` 打印 DANGER）。改写保不住
+    // 这个语义，原样发出去又会杀掉登录 shell——拒绝，让调用方把后续命令改成条件分支。
+    if exit_followed_by_command(command) {
+        return Err("command 里的 exit 后面还有命令：在 run_command 里 exit 会被改写进子 shell \
+                    执行（为了不杀掉会话），它**无法终止**后面的命令——`cond || exit 1; rm …` \
+                    这类守卫会失效、rm 照跑。请把后续命令改成条件分支（`cond && rm …`），或把 \
+                    exit 放到命令最后"
+            .into());
+    }
     Ok(())
 }
 
-/// `exit [n]` / `logout` 会直接杀掉登录 shell：会话断线重连，正在跑的这条 run 被作废、
-/// 退出码丢失，cwd/环境变量等 shell 状态全丢。而 run_command 的语义是「执行命令并拿回
-/// 退出码」，不是「关掉会话」——关会话有专用工具 close_session，且只能关 AI 自己的。
-/// 所以整条命令就是 exit/logout 时改写进子 shell 执行：`(exit 42)` 的退出码与原命令
-/// 一致（shell 集成与哨兵两条完成检测路都能照常捕获），会话本身不受影响。
-///
-/// 刻意只认「整条命令就是 exit/logout」这一种形态：`cd /x; exit` 里 exit 只是一环的
-/// 写法拦不住（要拦就得给所有命令套子 shell，那会弄丢 cd/export 跨 run_command 保持的
-/// 状态，代价不成比例）；`exit $var` 这类带变量/非数值参数的也不碰——形态太多，
-/// 误判风险配不上收益。
-fn wrap_session_ender(command: &str) -> std::borrow::Cow<'_, str> {
+/// 命令里是否有「顶层独立的 `exit [n]` 段，且它后面还有非空的命令段」。注释与末尾的空段
+/// （`cmd; exit;`）不算后续命令。
+fn exit_followed_by_command(command: &str) -> bool {
+    let segs: Vec<&str> = top_level_command_segments(command)
+        .into_iter()
+        .map(|(s, e)| &command[s..e])
+        .filter(|seg| !seg.trim().is_empty())
+        .collect();
+    let Some((_, init)) = segs.split_last() else {
+        return false;
+    };
+    init.iter()
+        .any(|seg| normalized_session_ender(seg).is_some_and(|(head, _)| head == "exit"))
+}
+
+/// 把「整条命令就是 exit/logout」这种形态规范化出来：返回 `(命令字, 规范化后的整条)`。
+/// 容忍首尾空白与行尾的 `;`/`&`；参数只认一个可选的整数（`exit $var`/`exit 1 2` 等形态
+/// 太多、误判风险配不上收益，一律不认）。`wrap_session_ender` 与 `validate_run_command`
+/// 共用这一份判据，两处不会漂移。
+fn normalized_session_ender(command: &str) -> Option<(&str, &str)> {
     let trimmed = command
         .trim()
         .trim_end_matches(|c: char| c == ';' || c == '&' || c.is_whitespace());
     let mut parts = trimmed.split_whitespace();
-    let Some(head) = parts.next() else {
-        return std::borrow::Cow::Borrowed(command);
-    };
+    let head = parts.next()?;
     if head != "exit" && head != "logout" {
-        return std::borrow::Cow::Borrowed(command);
+        return None;
     }
     let numeric = |s: &str| {
         let digits = s.strip_prefix('-').unwrap_or(s);
@@ -487,9 +519,152 @@ fn wrap_session_ender(command: &str) -> std::borrow::Cow<'_, str> {
     match (parts.next(), parts.next()) {
         (None, None) => {}
         (Some(arg), None) if numeric(arg) => {}
-        _ => return std::borrow::Cow::Borrowed(command),
+        _ => return None,
     }
-    std::borrow::Cow::Owned(format!("({trimmed})"))
+    Some((head, trimmed))
+}
+
+/// `#` 是否处于「词首」位置（注释只能从这里开始）：命令开头、空白后、或命令分隔/括号
+/// 操作符之后。
+///
+/// **不含 `{`/`}`**：它们在 bash 里不是操作符，只有后面跟空白时才是保留字——`${#arr[@]}`
+/// 里的 `#` 是取长度，不是注释（实测 `x=abc; echo ${#x}` 输出 3）。算进来的话扫描会在
+/// `{#` 处截断，其后的 `logout`/`exit` 全部漏检。
+fn is_shell_word_start(prev: u8) -> bool {
+    prev == 0
+        || prev.is_ascii_whitespace()
+        || matches!(prev, b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>')
+}
+
+/// 把单行命令切成顶层命令段，返回每段的字节区间（不含分隔符）。
+///
+/// 状态机跟踪单引号、双引号（含 `\` 转义）、反引号与 `()` 深度（子 shell / 命令替换 /
+/// 算术替换）：它们内部的 `;` 不是顶层分隔符——子 shell 里的 `exit` 本来就杀不掉登录
+/// shell，命令替换里的更是连触发都触发不了。顶层分隔符为 `;`、`&&`、`||` 与单个 `&`、
+/// `|`；单个 `&`/`|` 要避让 `>&`、`<&`、`&>`、`>|` 这些双字符重定向操作符。词首的 `#`
+/// 把剩余内容全部当作注释（当前段截到这里、扫描结束）。返回的段保证不含任何顶层注释
+/// 与分隔符，切点都在 ASCII 字节上，天然是合法的字符串切分边界。
+fn top_level_command_segments(command: &str) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum St {
+        Normal,
+        SQuote,
+        DQuote,
+        Backtick,
+    }
+    let bytes = command.as_bytes();
+    let mut segs = Vec::new();
+    let (mut st, mut depth, mut start) = (St::Normal, 0usize, 0usize);
+    let mut prev = 0u8;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let mut next = i + 1;
+        match st {
+            St::Normal => match b {
+                b'\'' => st = St::SQuote,
+                b'"' => st = St::DQuote,
+                b'`' => st = St::Backtick,
+                b'\\' => next = (i + 2).min(bytes.len()),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b'#' if depth == 0 && is_shell_word_start(prev) => {
+                    segs.push((start, i));
+                    return segs;
+                }
+                b';' if depth == 0 => {
+                    segs.push((start, i));
+                    start = i + 1;
+                }
+                b'&' if depth == 0 => match bytes.get(i + 1) {
+                    _ if prev == b'>' || prev == b'<' => {} // >&、<&：重定向操作符的一部分
+                    Some(b'>') => {}                         // &>
+                    Some(b'&') => {
+                        segs.push((start, i));
+                        start = i + 2;
+                        next = i + 2;
+                    }
+                    _ => {
+                        segs.push((start, i));
+                        start = i + 1;
+                    }
+                },
+                b'|' if depth == 0 => match bytes.get(i + 1) {
+                    _ if prev == b'>' => {} // >|
+                    Some(b'|') | Some(b'&') => {
+                        segs.push((start, i));
+                        start = i + 2;
+                        next = i + 2;
+                    }
+                    _ => {
+                        segs.push((start, i));
+                        start = i + 1;
+                    }
+                },
+                _ => {}
+            },
+            St::SQuote => {
+                if b == b'\'' {
+                    st = St::Normal;
+                }
+            }
+            St::DQuote => match b {
+                b'"' => st = St::Normal,
+                b'\\' => next = (i + 2).min(bytes.len()),
+                _ => {}
+            },
+            St::Backtick => match b {
+                b'`' => st = St::Normal,
+                b'\\' => next = (i + 2).min(bytes.len()),
+                _ => {}
+            },
+        }
+        prev = b;
+        i = next;
+    }
+    segs.push((start, bytes.len()));
+    segs
+}
+
+/// `exit [n]` 会直接杀掉登录 shell：会话断线重连，正在跑的这条 run 被作废、退出码丢失，
+/// cwd/环境变量等 shell 状态全丢。而 run_command 的语义是「执行命令并拿回退出码」，不是
+/// 「关掉会话」——关会话有专用工具 close_session，且只能关 AI 自己的。所以**命令的最后
+/// 一段**是顶层独立的 `exit [n]` 时（整条就是它，或 `cd /x; exit 7`、`make || exit 1`），
+/// 把这一段改写进子 shell 执行：`(exit 42)` 的退出码与原命令一致（`(exit)` 同样沿用上一条
+/// 命令的 `$?`），shell 集成与哨兵两条完成检测路都能照常捕获，会话本身不受影响。只替换
+/// 这一段本身，分隔符与注释保持原位，其余文本逐字节不动。
+///
+/// **只改最后一段，这是语义等价的前提**：exit 后面没有命令时，「shell 终止」与「子 shell
+/// 结束」对调用方唯一可见的差别就是会话死不死；exit 后面**还有**命令时，原语义是那些命令
+/// 永远不执行（`cond || exit 1; rm …` 的守卫），而 `(exit 1)` 拦不住它们——那种形态由
+/// `validate_run_command` 直接拒绝，根本到不了这里。
+///
+/// **只包 exit，不包 logout**：子 shell 不是登录 shell，`(logout)` 必然报错返回 1，与原命令
+/// 的语义毫不相干——logout 由 `validate_run_command` 直接拒绝（含复合命令里的段）。
+///
+/// 仍拦不住、维持「shell 死掉 → 运行作废、报错明确、自动重连兜底」旧路径的形态：
+/// - 控制流体内打头的 exit（`if …; then exit; fi`、`while …; do exit; done`、`f() { exit; }`）；
+/// - 非数值参数（`exit $?`、`exit $code`、`exit "$(cmd)"`）——形态太多，误判风险配不上收益。
+fn wrap_session_ender(command: &str) -> std::borrow::Cow<'_, str> {
+    let Some((s, e)) = top_level_command_segments(command)
+        .into_iter()
+        .rev()
+        .find(|&(s, e)| !command[s..e].trim().is_empty())
+    else {
+        return std::borrow::Cow::Borrowed(command);
+    };
+    let seg = &command[s..e];
+    let Some(("exit", trimmed)) = normalized_session_ender(seg) else {
+        return std::borrow::Cow::Borrowed(command);
+    };
+    // 只替换段内 trim 后的主体，段首/段尾空白、分隔符与注释原样保留。
+    let lead = seg.len() - seg.trim_start().len();
+    let body_end = s + lead + seg.trim().len();
+    std::borrow::Cow::Owned(format!(
+        "{}({trimmed}){}",
+        &command[..s + lead],
+        &command[body_end..]
+    ))
 }
 
 /// 一条运行「被放弃」的判据：没人在等、终端也不再有输出、且已经很久没人来 `poll_run`。
@@ -2408,7 +2583,8 @@ impl App {
                 // 注：这里**曾经**有「自动注入后 1 秒内拒发命令」的守卫——防 expect_echo 整体
                 // 覆写注入吞除。回显吞除改为 FIFO 队列（terminal::EchoArm）后覆写不再发生：
                 // 注入回显与哨兵回显按打字顺序各吞各的，守卫连同它的误拒一起退役。
-                // exit/logout 单独改写进子 shell（见 wrap_session_ender）：退出码照拿、会话不死。
+                // exit 改写进子 shell（整条或命令链单独成段的一环，见 wrap_session_ender）：
+                // 退出码照拿、会话不死。logout 已在上面的校验里拒绝。
                 let sent_command = wrap_session_ender(&command);
                 let nonce = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2475,7 +2651,10 @@ impl App {
                     last_poll_at: born,
                     resp_tx: Some(resp_tx),
                     req_id: id,
-                    command,
+                    // 存**实际打进终端的**那一版：`trim_leading_echo` 拿它和回显做前缀匹配，
+                    // 存原文的话 `exit 42` 对不上回显里的 `(exit 42)`，哨兵模式下输出开头
+                    // 会多出一行命令回显。
+                    command: sent_command.into_owned(),
                     finished_result: None,
                 });
             }
@@ -3295,32 +3474,111 @@ mod tests {
 
     #[test]
     fn session_enders_get_subshell_wrapped() {
-        // 纯 exit/logout（带可选数值码、容忍首尾空白与行尾分隔符）→ 子 shell 包裹，
+        // 纯 exit（带可选数值码、容忍首尾空白与行尾分隔符）→ 子 shell 包裹，
         // 退出码保留、登录 shell 不死。
         assert_eq!(wrap_session_ender("exit"), "(exit)");
         assert_eq!(wrap_session_ender("exit 42"), "(exit 42)");
-        assert_eq!(wrap_session_ender("  exit 0 ;  "), "(exit 0)");
-        assert_eq!(wrap_session_ender("logout"), "(logout)");
+        // 段首尾空白、分隔符原样保留，只替换 exit 主体。
+        assert_eq!(wrap_session_ender("  exit 0 ;  "), "  (exit 0) ;  ");
         assert_eq!(wrap_session_ender("exit -1"), "(exit -1)");
+        // 命令链的**最后一段**：只替换该段，分隔符与注释保持原位。
+        assert_eq!(wrap_session_ender("cd /x; exit"), "cd /x; (exit)");
+        assert_eq!(wrap_session_ender("cd /x; exit 7"), "cd /x; (exit 7)");
+        assert_eq!(wrap_session_ender("make && exit 1"), "make && (exit 1)");
+        assert_eq!(wrap_session_ender("make || exit 1"), "make || (exit 1)");
+        assert_eq!(wrap_session_ender("cmd; exit 3 # done"), "cmd; (exit 3) # done");
+        assert_eq!(wrap_session_ender("cmd; exit 3;"), "cmd; (exit 3);", "末尾空段不算后续命令");
+        assert_eq!(wrap_session_ender("cmd & exit 3"), "cmd & (exit 3)");
+        assert_eq!(wrap_session_ender("cmd | exit 3"), "cmd | (exit 3)");
+        // 重定向双字符操作符不能被当成段分隔符。
+        assert_eq!(wrap_session_ender("echo hi >&2; exit 1"), "echo hi >&2; (exit 1)");
+        assert_eq!(wrap_session_ender("echo hi 2>&1; exit 1"), "echo hi 2>&1; (exit 1)");
+        // 引号里的分隔符不成段。
+        assert_eq!(
+            wrap_session_ender("echo \"a; exit\"; exit 3"),
+            "echo \"a; exit\"; (exit 3)"
+        );
+        assert_eq!(wrap_session_ender("echo '; exit'; exit 3"), "echo '; exit'; (exit 3)");
     }
 
     #[test]
     fn non_session_enders_pass_through_unchanged() {
-        // 普通命令、exit 只是命令链一环、非数值参数——一律原样，不动调用方的文本。
+        // 普通命令、exit 只是参数/词干/非顶层段、非数值参数——一律原样，不动调用方的文本。
         for cmd in [
             "ls -l",
-            "cd /x; exit",
             "exit $code",
             "exit $(false; echo 1)",
             "exiting",
             "echo exit",
             "exit 1 2",
+            "EXIT 3",
+            // 子 shell / 命令替换里的 exit 本来就杀不掉登录 shell。
+            "(exit 3)",
+            "$(exit 3)",
+            // 控制流体内的 exit 拦不住（文档已声明，走断线重连兜底）。
+            "if true; then exit 1; fi",
+            "while true; do exit; done",
+            // -exec 的参数不是顶层命令；分号被转义、不成段。
+            "find . -name x -exec exit 1 \\;",
+            // 分隔符在引号 / 注释里：段根本不存在，exit 也从未真正存在。
+            "echo \"; exit\"",
+            "echo '; exit'",
+            "echo hi # ; exit 3",
+            "echo a#b",
+            // exit 不是最后一段：不改写（这种形态由 validate_run_command 拒绝，见下面的测试）。
             "exit && reboot",
+            "cmd; exit 1; echo after",
         ] {
             assert_eq!(wrap_session_ender(cmd), cmd, "不应改写：{cmd}");
         }
         // 形近但不同：trim 后为空也不是 exit。
         assert_eq!(wrap_session_ender(""), "");
+        // logout 不包：`(logout)` 在子 shell 里必报「not login shell」，由校验直接拒绝。
+        assert_eq!(wrap_session_ender("logout"), "logout");
+        assert_eq!(wrap_session_ender("cmd; logout"), "cmd; logout");
+    }
+
+    /// logout 必须被拒绝而不是包进子 shell——实测 `bash -lic "(logout)"` 报
+    /// 「logout: not login shell」返回 1。反向对照：删掉 validate_run_command 里的 logout
+    /// 分支，前几条断言当场挂。
+    #[test]
+    fn logout_is_rejected_with_a_pointer_to_close_session() {
+        use super::validate_run_command;
+        let err = validate_run_command("logout").expect_err("logout 应被拒绝");
+        assert!(err.contains("close_session"), "报错要指明替代做法：{err}");
+        assert!(validate_run_command("  logout ; ").is_err());
+        assert!(validate_run_command("cmd; logout").is_err(), "命令链里的 logout 也要拒绝");
+        assert!(validate_run_command("cmd && logout 2").is_err());
+        assert!(validate_run_command("logout # 注释").is_err());
+        assert!(validate_run_command("exit 3").is_ok(), "exit 走子 shell 包裹，不拒绝");
+        assert!(validate_run_command("cd /x; exit 7").is_ok(), "复合命令里的 exit 同样不拒绝");
+        assert!(validate_run_command("echo logout").is_ok());
+        assert!(validate_run_command("echo \"logout\"").is_ok());
+        assert!(validate_run_command("echo hi # ; logout").is_ok(), "注释里的 logout 不是命令");
+        // `${#x}` 是取长度不是注释：扫描不能在 `{#` 处截断，否则其后的 logout 漏检。
+        // 反向对照：把 `{`/`}` 加回 is_shell_word_start，这条当场挂。
+        assert!(validate_run_command("echo ${#x}; logout").is_err(), "${{#…}} 后面的 logout 必须检出");
+    }
+
+    /// **exit 后面还有命令必须拒绝。** 原语义里 exit 一执行 shell 就终止、后面一条都不跑，
+    /// `cond || exit 1; rm -rf build` 这类守卫全靠它；改写成 `(exit 1)` 只结束子 shell，rm
+    /// 照跑（实测 bash：`test -f /nonexistent || (exit 1); echo DANGER` 打印 DANGER）。
+    /// 反向对照：删掉 validate_run_command 里 `exit_followed_by_command` 那道检查，前三条挂。
+    #[test]
+    fn exit_followed_by_more_commands_is_rejected() {
+        use super::validate_run_command;
+        let err = validate_run_command("test -f x || exit 1; rm -rf build")
+            .expect_err("守卫式 exit 后接命令必须拒绝");
+        assert!(err.contains("条件分支"), "报错要给出改写方式：{err}");
+        assert!(validate_run_command("exit && reboot").is_err());
+        assert!(validate_run_command("cmd; exit 1; echo after").is_err());
+        // exit 是最后一段：语义可以保住，放行（由 wrap_session_ender 改写）。
+        assert!(validate_run_command("cd /x; exit 7").is_ok());
+        assert!(validate_run_command("make || exit 1").is_ok());
+        assert!(validate_run_command("cmd; exit 3; # 注释").is_ok(), "末尾空段与注释不算后续命令");
+        // 不是顶层 exit 段：与这条规则无关。
+        assert!(validate_run_command("echo exit; ls").is_ok());
+        assert!(validate_run_command("(exit 3); ls").is_ok(), "子 shell 里的 exit 本来就不终止");
     }
 
     #[test]
