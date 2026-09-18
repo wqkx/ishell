@@ -232,7 +232,7 @@ Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal se
 
 With the switch on, each SSH connect reverse-forwards the local MCP socket to `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). Remote `ishell-mcp` auto-discovers it — usually no path to configure.
 
-**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Reaching the socket lets a caller open its own sessions and read; writing into a session *you* opened still requires your on-screen consent every time.
+**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Even then, only a proxy that completes the pairing handshake gets a connection credential from your iShell (protocol v6), and an AI can only read and act in sessions it opened itself — sessions *you* opened are invisible and off-limits to it.
 
 ### ⚠️ Several computers sharing one AI server (read this)
 
@@ -240,9 +240,9 @@ Typical setup: the AI runs on a shared server; several people connect with their
 
 Do one of these (prefer 1):
 
-1. **Settings → “Auto-inject the pairing token (shared AI server)”** (**off by default**). Each new session then gets ` export ISHELL_MCP_TOKEN=…` typed into it once it goes idle; AI / `ishell-mcp` started in that shell binds only to *your* computer. It is off by default because it is still the program running a command in your own shell — turn it on only for this shared-server topology.
-2. If the AI is *not* started inside an iShell terminal: Settings → “Copy pairing config”, put `ISHELL_MCP_TOKEN=…` into that AI's MCP server env.
-3. Without pairing you can still click the consent dialog, but **on a shared account you should pair**.
+1. **Start the AI inside an iShell terminal.** Once the session goes idle, iShell types ` export ISHELL_PAIR_TOKEN=… ISHELL_MCP_TOKEN=…` into it (built in since 0.21, active whenever “Allow AI to control terminals via MCP” is on); AI / `ishell-mcp` started in that shell binds only to *your* computer. Zero configuration in most cases.
+2. If the AI is *not* started inside an iShell terminal: Settings → “Copy pairing config”, and prefix the AI's launch command with it (e.g. `ISHELL_PAIR_TOKEN=… claude`). **Do not put the token in the AI's global MCP config** (such as the user-level `env` in `~/.claude.json`) on a server account shared by several people: that file is shared, and a token written there overrides everyone's terminal-injected token, routing every user's AI to your computer.
+3. Since protocol v5 (0.21) an **unpaired proxy is refused outright** with the two options above — the “click a window to choose” dialog is gone: an unpaired proxy's broadcast bind is exactly how the prompt reached every iShell on the server and one wrong click bound someone else's AI to you.
 
 The pairing token ends up in the remote shell environment (and same-UID `/proc/*/environ`) — that's the cost of pairing on a shared account. Don't put the token on untrusted hosts or paste it into chat.
 
@@ -255,7 +255,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 ### Other notes
 
-- **The AI may act freely only in sessions it opened itself.** Writing into a session *you* opened always needs on-screen consent — no setting can bypass that. **Settings → “Don't ask before the AI opens a session”** (on by default) covers only the other case: the AI opening a new session of its own from a saved connection.
+- **The AI can only read and act in sessions it opened itself.** Sessions *you* opened and other AIs' sessions are refused outright — running commands, keystrokes, interrupting, reading the screen/scrollback, reading/writing/copying files — and `list_sessions` does not even show them. There is no consent prompt and no setting that can allow it. **Settings → “Don't ask before the AI opens a session”** (on by default) covers only the other case: the AI opening a new session of its own from a saved connection.
 - AI commands appear live in the target tab — you always see what it did.
 - GUI and `ishell-mcp` must be the same version; re-run `install-mcp.sh` after upgrades.
 
@@ -263,7 +263,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
-- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port; the AI may act freely only in sessions it opened itself — writing into your own sessions always needs on-screen consent, which no setting can bypass; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
+- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port; every request must carry a credential your iShell issued after a successful pairing handshake (protocol v6), and the AI can only read and act in sessions it opened itself — your own sessions are refused, with no prompt and no setting to allow it; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
 
 ## 📄 License
 

@@ -253,6 +253,22 @@ fn ai_injection_allowed(
     connected && !ai_busy && terminal_idle(t, quiet)
 }
 
+/// 注入配对 token 的那行命令（自动注入与右键「立即注入」共用，两处不会漂移）。
+///
+/// **同时导出两个名字**：
+/// - `ISHELL_PAIR_TOKEN`：新代理优先读它。它只由终端注入、从不出现在 AI 的 MCP 配置里，
+///   所以不会被配置文件的 `env` 覆盖——共用服务器账号时，`~/.claude.json` 里别人写死的
+///   `ISHELL_MCP_TOKEN` 会覆盖掉终端注入的同名变量，把所有人的 AI 都路由到他的电脑
+///   （2026-09-18 生产实测的串台根因，见 ishell-mcp 的 `pairing_token`）。
+/// - `ISHELL_MCP_TOKEN`：旧代理只认这个名字，保留以兼容。
+///
+/// 前导空格：配合 bash/zsh 常见的 HISTCONTROL=ignorespace，不进 shell 历史。token 是十六
+/// 进制串（无 shell 特殊字符），无需引号。
+pub(super) fn pair_token_export_cmd() -> String {
+    let t = crate::store::mcp_pairing_token();
+    format!(" export ISHELL_PAIR_TOKEN={t} ISHELL_MCP_TOKEN={t}")
+}
+
 impl Session {
     /// 见 [`injection_allowed`]。与 MCP 配对标识的自动注入共用同一道闸门**是有意的**：
     /// 两处干的是同一件事（程序替用户敲键盘），判据分成两份迟早会漂移，而漂移的后果是
@@ -313,10 +329,7 @@ impl Session {
             )
             .into());
         }
-        let cmd = format!(
-            " export ISHELL_MCP_TOKEN={}",
-            crate::store::mcp_pairing_token()
-        );
+        let cmd = pair_token_export_cmd();
         self.cmd_tx
             .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()))
             .map_err(|_| {

@@ -191,7 +191,7 @@ pub fn view_context_menu(resp: &egui::Response) {
                 // 0.21 起，原来的三个子开关（「AI 新开会话无需逐次确认」「自动注入配对标识」
                 // 「只响应配对请求」）不再是用户选项：全部内化为总开关的固定行为——总开关打开时，
                 // 新开会话默认不逐次打扰、每个会话自动注入配对标识、对匿名 AI 隐身。判定收敛在
-                // store 的三个 loader（恒真）与 `pair_inject_allowed`/`write_needs_consent` 里。
+                // store 的三个 loader（恒真）与 `pair_inject_allowed`/`session_owned_by` 里。
                 // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的
                 // socket 会堆在一起、代理无从区分谁是谁（见 store::mcp_pairing_token）。
                 // iShell 终端会话会在空闲时自动注入它（export ISHELL_MCP_TOKEN），多数情况
@@ -215,17 +215,24 @@ pub fn view_context_menu(resp: &egui::Response) {
                             crate::i18n::tr("复制配对配置", "Copy pairing config")
                         ))
                         .on_hover_text(crate::i18n::tr(
-                            "iShell 终端会自动注入 ISHELL_MCP_TOKEN，多数情况无需手动配置。\n\
-                             仅当 AI 不在 iShell 终端里跑时，把这行写进该 AI 的 MCP server 环境\
-                             变量，代理便只绑定你这台电脑。",
-                            "iShell terminals auto-inject ISHELL_MCP_TOKEN; manual setup is usually \
-                             unnecessary.\n\
-                             Only if the AI is not started inside an iShell terminal, put this line \
-                             in that AI's MCP server env so the proxy binds only to YOUR computer.",
+                            "iShell 终端会自动注入配对 token，多数情况无需手动配置。\n\
+                             仅当 AI 不在 iShell 终端里启动时，把复制的内容加在启动命令前面\
+                             （如 `ISHELL_PAIR_TOKEN=… claude`）。\n\
+                             不要写进 AI 的全局 MCP 配置（如 ~/.claude.json 的 user 级 env）：\
+                             多人共用服务器账号时那份配置是所有人共用的，会把所有人的 AI 都绑到\
+                             你这台电脑上。",
+                            "iShell terminals auto-inject the pairing token; manual setup is \
+                             usually unnecessary.\n\
+                             Only if the AI is not started inside an iShell terminal, prefix its \
+                             launch command with the copied text (e.g. `ISHELL_PAIR_TOKEN=… claude`).\n\
+                             Do NOT put it in the AI's global MCP config (e.g. user-level env in \
+                             ~/.claude.json): on a server account shared by several people that \
+                             config is shared, and it would bind everyone's AI to YOUR computer.",
                         ))
                         .clicked()
                     {
-                        ui.ctx().copy_text(format!("ISHELL_MCP_TOKEN={token}"));
+                        // 新变量名：只有它不会被别人写进共享 MCP 配置的 ISHELL_MCP_TOKEN 覆盖。
+                        ui.ctx().copy_text(format!("ISHELL_PAIR_TOKEN={token}"));
                         ui.close();
                     }
                 }

@@ -11,7 +11,7 @@
 //! 避免为共享几个 struct 拆出独立的 lib crate。
 
 // 这一份是「代理侧」的编译产物：同一个文件也被主二进制编一遍，两边用到的子集不同——
-// 授权门禁（`write_target_uids`）和实例校验（`is_addressed_to`）都只在 GUI 那侧执行，
+// 会话归属门禁（`session_target_uids`）和实例校验（`is_addressed_to`）都只在 GUI 那侧执行，
 // 代理这边只用到线协议类型本身。故只在这个 crate 上整模块 allow(dead_code)，否则每加一个
 // 「只有 GUI 用得到」的协议方法就要多一条假警告；主二进制那侧不 allow，真正的死代码照样抓得到。
 #[allow(dead_code)]
@@ -47,6 +47,12 @@ static BOUND_INSTANCE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::co
 /// 拒绝）。所以路径只是缓存，失效了就按实例标识重新找回来。
 #[cfg(unix)]
 static PATH_CACHE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// 绑定实例签发给本代理的**连接凭据**（v6，见 `McpRequest::ticket`）。每条业务请求都要带上；
+/// 被拒（`TICKET_REJECTED`）时重新握手换一张，见 [`refresh_ticket`]。与 `BOUND_INSTANCE` 分开
+/// 放：实例一辈子不变，凭据可以换。
+#[cfg(unix)]
+static TICKET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// 等用户在某个 iShell 窗口上点「允许」的超时。GUI 侧的确认框自己有 5 分钟上限、到点会回
 /// 一条 Err，正常情况下轮不到这个超时——它只防「GUI 卡死导致工具调用永远挂起」，所以比
@@ -105,8 +111,8 @@ enum Probe {
     Dead,
     /// 答话了，但没通过配对（token 不符），或压根没配 token 时的普通发现。
     Answered { id: String, ver: u32 },
-    /// 答话了，且双向配对握手通过。
-    Paired { id: String, ver: u32 },
+    /// 答话了，且双向配对握手通过；`ticket` 是对端签发的连接凭据。
+    Paired { id: String, ver: u32, ticket: String },
 }
 
 #[cfg(unix)]
@@ -114,7 +120,7 @@ impl Probe {
     fn ident(&self) -> Option<(String, u32)> {
         match self {
             Probe::Dead => None,
-            Probe::Answered { id, ver } | Probe::Paired { id, ver } => Some((id.clone(), *ver)),
+            Probe::Answered { id, ver } | Probe::Paired { id, ver, .. } => Some((id.clone(), *ver)),
         }
     }
 }
@@ -143,16 +149,16 @@ async fn probe(path: &std::path::Path, prove_token: Option<&str>) -> Probe {
         return Probe::Answered { id, ver };
     }
     match pair_handshake(path, token).await {
-        Some((id, ver)) => Probe::Paired { id, ver },
+        Some((id, ver, ticket)) => Probe::Paired { id, ver, ticket },
         None => Probe::Answered { id, ver },
     }
 }
 
-/// 在一条**新连接**上跑完双向配对握手，成功返回对端的 (id, 版本)。
+/// 在一条**新连接**上跑完双向配对握手，成功返回对端的 (id, 版本, 连接凭据)。
 ///
 /// 两问两答共用同一条连接：两个方向的证明必须绑定同一对随机数，拆连接就绑不住了。
 #[cfg(unix)]
-async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, u32)> {
+async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, u32, String)> {
     let nonce_c = mcp_protocol::pair_nonce()?; // 熵源不可用：中止，绝不用可预测值凑合
     let stream = connect_timeout(path).await.ok()?.ok()?;
     let (r, mut w) = stream.into_split();
@@ -164,7 +170,9 @@ async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, 
             id,
             instance: None,
             origin: None, // 握手阶段还没有「来源」可言，也不该有
-            actor: None,
+            // v6：声明本进程身份——iShell 把签发的凭据绑到它上面，此后以它为准。
+            actor: Some(current_actor()),
+            ticket: None,
             kind,
         })
         .ok()?;
@@ -226,7 +234,8 @@ async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, 
         .ok()?;
     let resp2: McpResponse = serde_json::from_str(line2.trim()).ok()?;
     match resp2.result.ok()? {
-        McpReqResult::Instance { .. } => Some((id, ver)),
+        // 没签发凭据的应答（空串）等于握手没成：拿着它发业务请求只会被拒。
+        McpReqResult::Instance { ticket, .. } if !ticket.is_empty() => Some((id, ver, ticket)),
         _ => None,
     }
 }
@@ -251,7 +260,7 @@ async fn identify(path: &std::path::Path) -> Option<(String, u32)> {
         }
         _ => return None,
     };
-    match exchange(stream, None, None, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
+    match exchange(stream, None, None, None, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
         Ok(McpReqResult::Instance { id, proto_version, .. }) => Some((id, proto_version)),
         _ => None,
     }
@@ -302,17 +311,101 @@ async fn identify_all(prove_token: Option<String>) -> Vec<(Probe, std::path::Pat
     out
 }
 
+/// 终端注入专用的配对变量名。iShell 往自己的终端会话里注入它（同时注入旧名
+/// `ISHELL_MCP_TOKEN` 兼容旧代理）。**它必须是一个 MCP 配置里不会出现的名字**，理由见
+/// [`pairing_token`]。
+#[cfg(unix)]
+const LAUNCH_TOKEN_VAR: &str = "ISHELL_PAIR_TOKEN";
+/// 旧名：既是早期终端注入的变量，也是「复制配对配置」让用户写进 MCP server env 的变量。
+#[cfg(unix)]
+const CONFIG_TOKEN_VAR: &str = "ISHELL_MCP_TOKEN";
+
+/// 本代理该用哪个配对 token。**「启动这个 AI 的那个终端」说了算，MCP 配置文件里写死的值只
+/// 作兜底。**
+///
+/// 为什么不能直接读自己的 `ISHELL_MCP_TOKEN`（多机串台的真正根因，2026-09-18 在生产服务器
+/// 上实测）：AI 客户端（Claude Code 等）spawn MCP server 时，会用配置里 `env` 块的值**覆盖**
+/// 从终端继承来的同名变量。共用服务器账号时，`~/.claude.json` 的 user 级配置是**所有人共用**
+/// 的——只要有一个人按「复制配对配置」把自己的 token 写进了那里，服务器上所有人的 AI 起的
+/// 代理就都带着**他的** token：iShell 在各自终端里注入的正确 token 被静默覆盖，握手只和他那
+/// 台电脑配得上，所有人的请求都落到他的电脑上。实测：来自 4 个不同 IP 的 claude 进程，自身
+/// 环境里 token 各不相同，它们起的代理却全都带着同一个 token。
+///
+/// 取值顺序：
+/// 1. 自身环境的 [`LAUNCH_TOKEN_VAR`]：只由终端注入，配置文件里没人写它，所以不会被覆盖。
+/// 2. （Linux）**父进程**环境里的 `ISHELL_MCP_TOKEN`：父进程就是 AI 客户端本身，
+///    `/proc/<ppid>/environ` 是它被启动那一刻从终端继承的环境，配置文件的覆盖只作用于它
+///    spawn 出来的子进程（也就是本代理），碰不到它自己。这一条让旧版 iShell 注入过的终端
+///    （只有旧变量名）在代理升级后立即恢复正确路由，不必等每台电脑都升级。
+/// 3. 自身环境的 `ISHELL_MCP_TOKEN`：AI 不是从 iShell 终端启动的（IDE 里跑等），只能靠配置。
+///    这正是会被共享配置带偏的那条路，所以来源与终端不一致时打一条告警到 stderr。
+#[cfg(unix)]
+fn pairing_token() -> Option<String> {
+    let (token, overridden) = resolve_pairing_token(
+        std::env::var(LAUNCH_TOKEN_VAR).ok(),
+        parent_env_var(CONFIG_TOKEN_VAR),
+        std::env::var(CONFIG_TOKEN_VAR).ok(),
+    );
+    if overridden {
+        eprintln!(
+            "ishell-mcp: 终端注入的配对 token 与 MCP 配置里 env.{CONFIG_TOKEN_VAR} 不一致，\
+             按终端的来（配置里的值多半是别人写进共享配置的，会把请求路由到他的电脑）。\
+             建议从 AI 的 MCP 配置（如 ~/.claude.json）里删掉 {CONFIG_TOKEN_VAR}。"
+        );
+    }
+    token
+}
+
+/// [`pairing_token`] 的纯判定：`(选定的 token, 是否推翻了配置里的值)`。空白值一律视同没设。
+#[cfg(unix)]
+fn resolve_pairing_token(
+    own_launch: Option<String>,
+    parent_config_var: Option<String>,
+    own_config: Option<String>,
+) -> (Option<String>, bool) {
+    let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let launch = clean(own_launch).or_else(|| clean(parent_config_var));
+    match (launch, clean(own_config)) {
+        (Some(l), Some(c)) if l != c => (Some(l), true),
+        (Some(l), _) => (Some(l), false),
+        (None, c) => (c, false),
+    }
+}
+
+/// 读父进程启动时的某个环境变量（Linux 的 `/proc/<ppid>/environ`）。读不到一律 `None`：
+/// 别的平台、父进程已退出、权限不够——都退回「只看自己的环境」的旧行为，不报错。
+#[cfg(unix)]
+fn parent_env_var(name: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let ppid = std::os::unix::process::parent_id();
+        let raw = std::fs::read(format!("/proc/{ppid}/environ")).ok()?;
+        env_lookup(&raw, name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// 在 `/proc/*/environ` 格式（`KEY=VALUE\0KEY=VALUE\0…`）的字节里找一个变量。
+#[cfg(unix)]
+fn env_lookup(raw: &[u8], name: &str) -> Option<String> {
+    raw.split(|&b| b == 0).find_map(|kv| {
+        let rest = kv.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+        String::from_utf8(rest.to_vec()).ok()
+    })
+}
+
 /// 决定这个代理这辈子只操作哪个 iShell 实例。只在首次需要连接时跑一次。
 #[cfg(unix)]
-async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
+async fn bind_instance() -> Result<(String, std::path::PathBuf, String), String> {
     // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就走双向
     // 挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；没设则从协议 v5
     // 起直接拒绝并给出配置指引（匿名绑定的广播弹窗是它要根治的东西，见下面的拒绝分支）。
     // 见 `store::mcp_pairing_token`。
-    let want_token = std::env::var("ISHELL_MCP_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let want_token = pairing_token();
 
     // 显式指定：脚本化/手动隧道场景的逃生口。最明确的意图，永远优先，也不弹任何窗。
     //
@@ -329,15 +422,18 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
             )
         };
         let Some(token) = want_token.as_deref() else {
-            // 没设 token：保持原有行为，连上问一句 id 就绑。
-            let (id, ver) = identify(&path).await.ok_or_else(dead)?;
-            check_proto_version(ver)?;
-            return Ok((id, path));
+            // v6 起没有 token 就拿不到连接凭据，iShell 不会执行任何请求——指定了 socket 也一样。
+            return Err(format!(
+                "ISHELL_MCP_SOCKET 指定了 {}，但没有配对 token：iShell（协议 v6 起）只执行完成\
+                 配对握手的请求。请同时设置 {LAUNCH_TOKEN_VAR}（在你那台 iShell 的 MCP 设置里\
+                 「复制配对配置」）",
+                path.display()
+            ));
         };
         return match probe(&path, Some(token)).await {
-            Probe::Paired { id, ver } => {
+            Probe::Paired { id, ver, ticket } => {
                 check_proto_version(ver)?;
-                Ok((id, path))
+                Ok((id, path, ticket))
             }
             // 活着但没通过握手。先看版本——版本不符时 `probe` 本来就跳过握手，
             // 报成 token 不符会把人引向死胡同（怎么核对 token 都是对的）。
@@ -370,8 +466,10 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
              解决办法（任选其一）：\n\
              1. 在你自己那台 iShell 的终端会话里启动 AI：iShell 会自动注入配对 token，多数情\
              况零配置即可；\n\
-             2. 在那台 iShell 的 MCP 设置里点「复制配对配置」，把那一行填进这份 AI 的 MCP \
-             server 环境变量后重启。"
+             2. AI 不在 iShell 终端里启动时：在那台 iShell 的 MCP 设置里点「复制配对配置」，\
+             启动 AI 时把它加在命令前面（如 `ISHELL_PAIR_TOKEN=… claude`）。**不要**写进 AI 的\
+             全局 MCP 配置（如 ~/.claude.json 的 user 级 env）——多人共用服务器账号时那份配置\
+             是所有人共用的，会把所有人的 AI 都绑到你的电脑上。"
                 .into(),
         );
     };
@@ -393,16 +491,15 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
                 .filter_map(|(p, _)| p.ident())
                 .any(|(_, v)| v == mcp_protocol::MCP_PROTOCOL_VERSION)
         });
-    // 只收握手通过的实例。
-    let mut found: Vec<(String, u32, std::path::PathBuf)> = Vec::new();
+    // 只收握手通过的实例（连同它签发的凭据）。
+    let mut found: Vec<(String, u32, std::path::PathBuf, String)> = Vec::new();
     for (p, path) in all {
-        if !matches!(p, Probe::Paired { .. }) {
+        let Probe::Paired { id, ver, ticket } = p else {
             continue;
-        }
-        let Some((id, ver)) = p.ident() else { continue };
+        };
         // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
-        if !found.iter().any(|(known, _, _)| *known == id) {
-            found.push((id, ver, path));
+        if !found.iter().any(|(known, ..)| *known == id) {
+            found.push((id, ver, path, ticket));
         }
     }
     match found.len() {
@@ -422,12 +519,12 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
         1 => {
             // 唯一实例（配了 token 时是唯一匹配者）：直接绑定，不弹窗——token 本身就是操作者
             // 的显式配对意图，无需再点一次窗口。
-            let (id, ver, path) = found.pop().expect("上一行刚确认只有一个");
+            let (id, ver, path, ticket) = found.pop().expect("上一行刚确认只有一个");
             check_proto_version(ver)?;
-            Ok((id, path))
+            Ok((id, path, ticket))
         }
-        // 多个：配了 token 却仍多个，说明有两台 iShell 撞了同一个 token（极罕见，比如把同
-        // 一份配对配置原样拷到了两台电脑），用弹窗让用户当面消歧。
+        // 多个：同一个 token 被多个 iShell 进程认领。最常见的是**同一台电脑**开了两个 iShell
+        // （token 按安装存、实例 id 按进程生成），这是正常的多开，用弹窗让用户点窗口选。
         _ => choose_instance(found).await,
     }
 }
@@ -442,11 +539,11 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf), String> {
 /// 标识是纯内部的东西，把它抬到用户面前只会要求他先给窗口取个名、再把名字念给 AI 听。
 #[cfg(unix)]
 async fn choose_instance(
-    found: Vec<(String, u32, std::path::PathBuf)>,
-) -> Result<(String, std::path::PathBuf), String> {
+    found: Vec<(String, u32, std::path::PathBuf, String)>,
+) -> Result<(String, std::path::PathBuf, String), String> {
     let count = found.len();
     let mut set = tokio::task::JoinSet::new();
-    for (id, ver, path) in found {
+    for (id, ver, path, ticket) in found {
         set.spawn(async move {
             let stream = connect_timeout(&path)
                 .await
@@ -457,18 +554,19 @@ async fn choose_instance(
                 Some(id.clone()),
                 Some(caller_origin()),
                 Some(current_actor()),
+                Some(ticket.clone()),
                 McpReqKind::Bind,
                 BIND_TIMEOUT,
             )
             .await?;
-            Ok::<_, String>((id, ver, path))
+            Ok::<_, String>((id, ver, path, ticket))
         });
     }
     while let Some(joined) = set.join_next().await {
-        if let Ok(Ok((id, ver, path))) = joined {
+        if let Ok(Ok((id, ver, path, ticket))) = joined {
             // set 在这里被丢弃 → 其余任务 abort → 落选窗口的框自动消失。
             check_proto_version(ver)?;
-            return Ok((id, path));
+            return Ok((id, path, ticket));
         }
     }
     Err(format!(
@@ -479,52 +577,74 @@ async fn choose_instance(
     ))
 }
 
-/// 拿一条连向**绑定实例**的连接，外加要填进请求的实例标识。
+/// 拿一条连向**绑定实例**的连接，外加要填进请求的实例标识与连接凭据。
 #[cfg(unix)]
-async fn connect_bound() -> Result<(UnixStream, String), String> {
+async fn connect_bound() -> Result<(UnixStream, String, String), String> {
     let id = BOUND_INSTANCE
         .get_or_try_init(|| async {
-            let (id, path) = bind_instance().await?;
+            let (id, path, ticket) = bind_instance().await?;
             *PATH_CACHE.lock().unwrap() = Some(path);
+            *TICKET.lock().unwrap() = Some(ticket);
             Ok::<_, String>(id)
         })
         .await?
         .clone();
     let cached = PATH_CACHE.lock().unwrap().clone();
+    let ticket = TICKET.lock().unwrap().clone().unwrap_or_default();
     if let Some(path) = cached {
         if let Ok(Ok(stream)) = connect_timeout(&path).await {
-            return Ok((stream, id));
+            return Ok((stream, id, ticket));
         }
     }
-    // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。在候选里重新找回**同一个
-    // 实例**——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上。
-    //
-    // ⚠ 配了 token 就必须**重新走一遍握手**，不能只比对 id：instance id 不是秘密，任何人发
-    // 一句普通 `Identify` 就能问到。只认 id 的话，同账号的攻击者只要拿到受害者的 id、再摆一个
-    // 会冒充该 id 的 socket，就能在受害者 SSH 重连（缓存路径失效）的那一刻把后续所有
-    // `run_command`/`read_file` 接管过去。没配 token 时保持只认 id 的既有行为——那时本来
-    // 就没有更强的凭据可用。
-    let want_token = std::env::var("ISHELL_MCP_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    for (p, path) in identify_all(want_token.clone()).await {
-        let ok = match (&p, want_token.is_some()) {
-            (Probe::Paired { id: found, .. }, _) => *found == id,
-            // 没配 token：退回只认 id（既有行为，也是此时唯一可用的判据）。
-            (Probe::Answered { id: found, .. }, false) => *found == id,
-            _ => false,
-        };
-        if ok {
-            if let Ok(Ok(stream)) = connect_timeout(&path).await {
-                *PATH_CACHE.lock().unwrap() = Some(path);
-                return Ok((stream, id));
+    // 缓存路径连不上了：多半是反向转发那条 SSH 重连、换了随机名。重新握手找回**同一个实例**
+    // ——只认 id，绝不因为「反正只剩这一个连得上」就顺手绑到别人身上；而且必须重新握手（id
+    // 不是秘密，只认 id 的话，同账号的人摆一个冒充该 id 的 socket 就能接管后续请求）。
+    let (path, ticket) = rediscover_bound(&id).await?;
+    let stream = connect_timeout(&path)
+        .await
+        .map_err(|_| "连接 iShell socket 超时".to_string())?
+        .map_err(|e| e.to_string())?;
+    Ok((stream, id, ticket))
+}
+
+/// 在候选里重新握手，找回已绑定的那个实例：更新路径缓存与凭据并返回。
+#[cfg(unix)]
+async fn rediscover_bound(id: &str) -> Result<(std::path::PathBuf, String), String> {
+    let lost = || {
+        "找不到当初绑定的那个 iShell 实例了（它可能已经退出）。代理不会自动改绑到别的实例——\
+         多开时静默换一个实例执行，命令就会落到你没预期的机器上。请重新发起 MCP 连接。"
+            .to_string()
+    };
+    let token = pairing_token().ok_or_else(lost)?;
+    for (p, path) in identify_all(Some(token)).await {
+        if let Probe::Paired { id: found, ticket, .. } = p {
+            if found == id {
+                *PATH_CACHE.lock().unwrap() = Some(path.clone());
+                *TICKET.lock().unwrap() = Some(ticket.clone());
+                return Ok((path, ticket));
             }
         }
     }
-    Err("找不到当初绑定的那个 iShell 实例了（它可能已经退出）。代理不会自动改绑到别的实例——\
-         多开时静默换一个实例执行，命令就会落到你没预期的机器上。请重新发起 MCP 连接。"
-        .into())
+    Err(lost())
+}
+
+/// 凭据被拒（iShell 淘汰/过期）后重新握手换一张：先试缓存路径，不行再全量找回同一实例。
+#[cfg(unix)]
+async fn refresh_ticket() -> Result<(), String> {
+    let Some(id) = BOUND_INSTANCE.get().cloned() else {
+        return Err("尚未绑定任何 iShell 实例".into());
+    };
+    let token = pairing_token().ok_or("没有配对 token，无法重新握手")?;
+    let cached = PATH_CACHE.lock().unwrap().clone();
+    if let Some(path) = cached {
+        if let Some((found, _, ticket)) = pair_handshake(&path, &token).await {
+            if found == id {
+                *TICKET.lock().unwrap() = Some(ticket);
+                return Ok(());
+            }
+        }
+    }
+    rediscover_bound(&id).await.map(|_| ())
 }
 
 /// 在一条已建立的连接上完成一问一答：写一行请求 JSON，读一行响应 JSON。
@@ -540,6 +660,7 @@ async fn exchange(
     instance: Option<String>,
     origin: Option<String>,
     actor: Option<String>,
+    ticket: Option<String>,
     kind: McpReqKind,
     response_timeout: std::time::Duration,
 ) -> Result<McpReqResult, String> {
@@ -550,6 +671,7 @@ async fn exchange(
         instance,
         origin,
         actor,
+        ticket,
         kind,
     })
     .map_err(|e| e.to_string())?;
@@ -589,16 +711,55 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 
 /// 在所有平台上都能正常编译。
 #[cfg(unix)]
 async fn call(kind: McpReqKind) -> Result<McpReqResult, String> {
-    let (stream, instance) = connect_bound().await?;
-    exchange(
-        stream,
-        Some(instance),
-        Some(caller_origin()),
-        Some(current_actor()),
-        kind,
-        RESPONSE_TIMEOUT,
-    )
-    .await
+    let send = |stream, instance, ticket, kind| {
+        exchange(
+            stream,
+            Some(instance),
+            Some(caller_origin()),
+            Some(current_actor()),
+            Some(ticket),
+            kind,
+            RESPONSE_TIMEOUT,
+        )
+    };
+    let (stream, instance, ticket) = connect_bound().await?;
+    match send(stream, instance, ticket, kind.clone()).await {
+        // 凭据被拒（iShell 按空闲时长淘汰了它）：重新握手换一张，重试一次。被拒发生在 iShell
+        // 执行任何东西之前（`handle_conn` 先验凭据），所以重试不会让命令执行两遍。
+        Err(e) if e.starts_with(mcp_protocol::TICKET_REJECTED) => {
+            refresh_ticket().await?;
+            let (stream, instance, ticket) = connect_bound().await?;
+            send(stream, instance, ticket, kind).await
+        }
+        other => other,
+    }
+}
+
+/// 流式拷贝版的「凭据被拒就重新握手、重试一次」（普通请求见 [`call`]）。拷贝函数每次调用都
+/// 重新打开文件、重新建连接，整体重跑一遍是安全的；被拒发生在 iShell 执行之前（上传的文件体
+/// 会被 iShell 排干后才回错，错误不会被 RST 吞掉），不会拷两遍。
+#[cfg(unix)]
+async fn with_ticket_retry<F, Fut>(f: F) -> Result<McpReqResult, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<McpReqResult, String>>,
+{
+    match f().await {
+        Err(e) if e.starts_with(mcp_protocol::TICKET_REJECTED) => {
+            refresh_ticket().await?;
+            f().await
+        }
+        other => other,
+    }
+}
+
+#[cfg(not(unix))]
+async fn with_ticket_retry<F, Fut>(f: F) -> Result<McpReqResult, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<McpReqResult, String>>,
+{
+    f().await
 }
 
 /// 校验一个调用方本机路径：必须绝对、不含 `.`/`..` 路径段。跟 GUI 侧
@@ -638,13 +799,14 @@ async fn copy_to_remote_from_caller(
     }
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let (stream, instance) = connect_bound().await?;
+    let (stream, instance, ticket) = connect_bound().await?;
     let (read_half, mut write_half) = stream.into_split();
     let request = McpRequest {
         id,
         instance: Some(instance),
         origin: Some(caller_origin()),
         actor: Some(current_actor()),
+        ticket: Some(ticket),
         kind: McpReqKind::CopyToRemoteFromCaller {
             session_uid,
             remote_path,
@@ -749,13 +911,14 @@ async fn copy_from_remote_to_caller(
     let path = std::path::PathBuf::from(&local_path);
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let (stream, instance) = connect_bound().await?;
+    let (stream, instance, ticket) = connect_bound().await?;
     let (read_half, mut write_half) = stream.into_split();
     let request = McpRequest {
         id,
         instance: Some(instance),
         origin: Some(caller_origin()),
         actor: Some(current_actor()),
+        ticket: Some(ticket),
         kind: McpReqKind::CopyFromRemoteToCaller { session_uid, remote_path, timeout_ms },
     };
     let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;
@@ -1047,24 +1210,15 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "列出 iShell 当前打开的所有终端会话。每个会话返回：uid（整数，后续所有\
-                        工具的 session_uid 都直接复制它）、标题、主机、连接状态、远端工作目录、\
-                        以及四个归属/状态字段——ai_owned（是不是 AI 开的专用窗口）、ai_owner（开它的\
-                        AI 的来源标签，如 `e5-1 (ishell-mcp pid 42)`，用户开的会话为 null）、mine\
-                        （**是不是你这个进程自己开的**：true = 你的专用窗口，随便用；false 而\
-                        ai_owned=true = 另一个 AI 开的窗口，写入会弹窗让用户授权）、token_injected\
-                        （配对 token 是否已注入该 shell：**false = 在这里面启动 AI 会拿不到 \
-                        ISHELL_MCP_TOKEN、绑定被拒**——用户会话多是连上后敲过键盘被跳过，可让用户\
-                        在终端右键「立即注入配对标识」补救；AI 会话等 shell 空下来会自动补注）。\
-                        同名会话凭 uid 和 host 区分。可传 filter 只返回标题/主机名匹配的会话，省上下文。\n\
-                        归属速查：mine=true 直接用；ai_owned=false 是**用户本人正在用的会话**，\
-                        他随时可能在里面敲字，默认不要往里写（run_command / send_input / \
-                        interrupt / write_file / copy_to_remote 等）——两路输入会在同一个 shell \
-                        里交织，轻则互相打断、重则把 run_command 判断命令结束用的哨兵标记搅乱，\
-                        还可能误操作用户正在做的事。需要执行东西就用 open_session 开一个自己的\
-                        会话。确实必须用用户那个会话时（比如要复用他已经 cd 到的目录、已经激活\
-                        的 venv、已经 sudo 的状态），调用会照常发出，但 iShell 会弹窗让用户当面\
-                        授权一次，用户同意后该会话不再询问。"
+        description = "列出**你自己**（本 AI 进程）用 open_session 开的终端会话。用户自己打开的\
+                        窗口、其它 AI 开的窗口**不会出现在这里**，你也不能读取或操作它们（硬规则，\
+                        没有授权弹窗）。每个会话返回：uid（整数，后续所有工具的 session_uid 都直接\
+                        复制它）、标题、主机、连接状态、远端工作目录（上报片段注入后才有值，刚连上\
+                        的一小段时间可能为 null）、token_injected（配对 token 是否已注入该 shell；\
+                        false = 在这里面再启动 AI 会拿不到配对身份，等 shell 空下来会自动补注），\
+                        以及兼容字段 ai_owned/ai_owner/mine（列表里全是你的会话，mine 恒为 true）。\
+                        同名会话凭 uid 和 host 区分。可传 filter 只返回标题/主机名匹配的会话，省上下文。\
+                        列表为空或没有目标机器：list_saved_connections 查连接名 → open_session。"
     )]
     async fn list_sessions(
         &self,
@@ -1110,10 +1264,11 @@ impl IshellMcp {
                         程序的 stdin。流程照旧：start_command 启动 → send_input 逐键交互（控制键写法\
                         见 send_input 描述）→ read_screen 观察 → 程序自己退出（如给 cat 发 EOF）即\
                         收到 finished=true 与退出码。\
-                        **用户自己开的会话**没装这个上报，只能退回老办法（往终端多打一行完成哨兵），\
-                        那里仍有这条限制：读 stdin 的程序会把哨兵当输入吃掉，运行永远 finished=false；\
-                        此时用 interrupt 释放，再用 read_screen 确认提示符干净、无残留的 printf \
-                        'AI_DONE_…' 行，然后发新命令。list_sessions 的 ai_owned 能区分这两类会话。\
+                        没装上这个上报的会话（刚连上、上报片段还没注入时的头一条命令，或 fish/csh \
+                        这类 shell）只能退回老办法（往终端多打一行完成哨兵），那里仍有这条限制：读 \
+                        stdin 的程序会把哨兵当输入吃掉，运行永远 finished=false；此时用 interrupt 释放，\
+                        再用 read_screen 确认提示符干净、无残留的 printf 'AI_DONE_…' 行，然后发新命令。\
+                        （用户自己打开的窗口 AI 碰不到，不在此列。）\
                         两个解读输出时容易踩的坑：① output 末尾常带一段 shell 提示符残留（比如 \
                         `(venv) user@host:~$`，有时只剩一个 `$`）——这是刻意不做的清理（早期试过按\
                         「最后一行大概率是提示符」启发式剥掉，但 PS1 为空/不可见时会把真实输出误删，\
@@ -1216,7 +1371,7 @@ impl IshellMcp {
                         等待者所在的连接断开——比如它自己的调用方超时放弃——之后自动解除，不需要靠 \
                         interrupt 才能恢复。）\n\
                         AI 专用会话里中断本身就有结论：shell 的完成上报会把 Ctrl-C 结束的命令报成 \
-                        exit 130，不需要额外补救。用户自己开的会话走哨兵回退，才有这两个注意点：\
+                        exit 130，不需要额外补救。没装上完成上报、走哨兵回退的会话才有这两个注意点：\
                         ① 被中断的程序若把终端设成 raw 模式（vim 这类全屏程序），Ctrl-C 不会冲刷输入\
                         队列——排队中的完成哨兵可能随后以一条自擦除的 printf 'AI_DONE_…' 泄漏为可见行：\
                         无害，但会混进后续命令的输出文本。② 读 stdin 的程序（cat/REPL）会把哨兵当输入\
@@ -1231,7 +1386,7 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "**已有合适会话时优先复用（见 list_sessions），别为同一台机器重复开新会话**\
+        description = "**你自己已经开着合适的会话时优先复用（见 list_sessions），别为同一台机器重复开新会话**\
                         ——新会话是全新登录，没有现成的 cwd/venv/登录态。确实需要新登录时：用一\
                         个已保存的连接（按名称）新开一个终端会话/标签，等价于用户在 iShell 侧栏里\
                         双击这条已保存连接。name 是已保存连接的名字，不是主机地址，也不是 \
@@ -1394,7 +1549,12 @@ impl IshellMcp {
         }): Parameters<CopyToRemoteArgs>,
     ) -> Result<CallToolResult, McpError> {
         wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
-        text_result(copy_to_remote_from_caller(session_uid, local_path, remote_path, timeout_ms).await)
+        text_result(
+            with_ticket_retry(|| {
+                copy_to_remote_from_caller(session_uid, local_path.clone(), remote_path.clone(), timeout_ms)
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -1418,7 +1578,12 @@ impl IshellMcp {
         }): Parameters<CopyFromRemoteArgs>,
     ) -> Result<CallToolResult, McpError> {
         wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
-        text_result(copy_from_remote_to_caller(session_uid, remote_path, local_path, timeout_ms).await)
+        text_result(
+            with_ticket_retry(|| {
+                copy_from_remote_to_caller(session_uid, remote_path.clone(), local_path.clone(), timeout_ms)
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -1466,27 +1631,18 @@ impl IshellMcp {
 #[tool_handler(
     instructions = "这是 iShell——一个由用户盯着运行的真实终端管理器——的 MCP 桥。你操作的是**真\
                     实的交互式终端**（能看到你在打字，前台程序、提示符、sudo 都会受影响），不是\
-                    无状态的执行沙箱。用户能看见你做的每件事；写不属于你的会话前 iShell 会替你\
-                    弹窗征求同意。\n\
-                    概念与优先级：已保存连接（list_saved_connections）只是凭据模板，用来 \
-                    open_session 发起全新登录；会话（list_sessions）是已经打开的终端标签。用户\
-                    说「在 e5 上跑一下」时，e5 通常已是其中一个会话——**优先复用已有会话**，别为了\
-                    干净就开新的：新会话是全新登录，没有他现成的 cwd/venv/登录态，还多占一条\
-                    连接和一个标签。\n\
-                    会话归属（list_sessions 的 mine / ai_owned / ai_owner）：\n\
-                    · mine=true：你这个进程自己 open_session 开的专用窗口，随便用，用户不能往里\
-                    打字。\n\
-                    · ai_owned=true 且 mine=false：另一个 AI 开的窗口，别往里写——会像写用户会话\
-                    一样弹窗。\n\
-                    · ai_owned=false：用户本人的会话。只读（read_screen/read_history/read_file/\
-                    list_*）随意；写入会弹窗授权（本次运行内只需同意一次）。用户点名要用它时就\
-                    这样做：照常调用、等用户点允许；被拒或超时再 open_session 开自己的。\n\
-                    定位目标会话：list_sessions 按 host/title/cwd 匹配用户说的机器，多个候选用 \
-                    read_screen 看内容敲定。报「会话不存在」时别猜新 uid——错误里自带当前可用会\
-                    话列表（uid:标题），按它重新匹配；确实没有才去 list_saved_connections 核对名\
-                    字 → open_session。uid 在同一次 iShell 运行内稳定、断线重连\
-                    不变；iShell 重启后重新分配，历史上下文里的旧 uid 可能已指向别的会话——所以\
-                    一律从最新的 list_sessions 原样复制。\n\
+                    无状态的执行沙箱。用户能看见你做的每件事。**你只能读写自己用 open_session \
+                    开的会话**：用户自己打开的窗口、其它 AI 的窗口对你不可见，读和写都会被直接拒绝\
+                    （硬规则，没有授权弹窗，重试也没用）。\n\
+                    概念：已保存连接（list_saved_connections）是凭据模板，用来 open_session 发起\
+                    全新登录；会话（list_sessions）是**你自己**已经开着的终端标签。用户说「在 e5 上\
+                    跑一下」：先 list_sessions 看你自己有没有连着 e5 的会话，有就复用（保留你之前的\
+                    cwd/环境，也不多占连接）；没有就 list_saved_connections 核对连接名 → \
+                    open_session。即使用户说「用我那个窗口」，你也碰不到它——开你自己的会话去做，\
+                    并告诉用户原因。\n\
+                    定位会话：报「会话不存在」时别猜新 uid——错误里自带你当前的会话列表（uid:标题），\
+                    按它重新匹配。uid 在同一次 iShell 运行内稳定、断线重连不变；iShell 重启后重新\
+                    分配，历史上下文里的旧 uid 可能已失效——所以一律从最新的 list_sessions 原样复制。\n\
                     会话状态与报错：connected=false = 还在连接/认证中或已断线（重连中）；run_command \
                     /start_command 会自动等它连上（最多约 20 秒），send_input/interrupt 不会等——\
                     后两个遇到「会话尚未连接」就等它变 true。一个会话同时只能有一条 AI 命令在跑，再发\
@@ -1502,15 +1658,13 @@ impl IshellMcp {
                     「run_id 不存在或已结束」而你不确定命令执行没有，用 read_screen/read_history \
                     核实再决定，勿盲目重试有副作用的命令。看到「命令可能已执行、结果未知」先核实\
                     屏幕。报「已经有一个 poll_run 在等待」说明旧等待者还挂着：别并发 poll，旧等待\
-                    者不要了就 interrupt 释放。报「未检测到 iShell」或绑定/握手被拒：先 list_sessions \
-                    看目标会话的 token_injected——false 说明该终端的 shell 没拿到 ISHELL_MCP_TOKEN（\
-                    用户会话多是连上后敲过键盘被跳过自动注入），让用户在终端右键「立即注入配对标识」\
-                    后重启 AI；在 tmux/screen 里启动的 AI 继承的是会话**之前**的环境，换到注入后的 \
-                    shell 里启动。\n\
-                    定位目录与环境：先 list_sessions 的 cwd 字段（用户没同意 OSC7 注入时为空）→ \
-                    再看 read_screen 里提示符显示的路径 → 还定不了就在你自己的会话 run_command 跑 \
-                    `pwd; ls; git rev-parse --show-toplevel 2>/dev/null` 这类只读探测；用户会话只用\
-                    只读手段看，别猜。\n\
+                    者不要了就 interrupt 释放。报「未检测到 iShell」或绑定/握手被拒：说明启动你的那个终端\
+                    没拿到配对 token——请用户在自己的 iShell 终端里启动 AI（iShell 会自动注入），或\
+                    在终端右键「立即注入配对标识」后重启 AI；在 tmux/screen 里启动的 AI 继承的是会话\
+                    **之前**的环境，换到注入后的 shell 里启动。\n\
+                    定位目录与环境：先 list_sessions 的 cwd 字段 → 再看 read_screen 里提示符显示的\
+                    路径 → 还定不了就 run_command 跑 `pwd; ls; git rev-parse --show-toplevel \
+                    2>/dev/null` 这类只读探测；用户没告诉你路径就问他，别猜。\n\
                     上下文管理：你的上下文是宝贵的，终端输出不是。\n\
                     · read_screen 只看一屏；read_history 从 max_lines 小的值开始（默认 200），\
                     别一次性吞整个回滚。\n\
@@ -1524,9 +1678,9 @@ impl IshellMcp {
                     端命令/文件优先走本工具集，不要另开 `ssh host cmd`（会丢 cwd/环境/历史，用户也看\
                     不见）。\n\
                     典型任务：\n\
-                    · 在用户已打开的 e5 会话跑测试：list_sessions（host/title 找 e5，cwd 确认是目\
-                    标仓库）→ run_command ./run_tests.sh（用户会话会弹窗，等允许）→ 超时 poll_run \
-                    续等 → read_screen 看结果。\n\
+                    · 在 e5 上跑测试：list_sessions 看你自己有没有连着 e5 的会话；没有就 \
+                    open_session 开一个 → run_command 先 cd 到仓库（路径不确定就问用户）再 \
+                    ./run_tests.sh → 超时 poll_run 续等 → read_screen 看结果。\n\
                     · 机器还没有打开会话：list_saved_connections 核对名字 → open_session → 等 \
                     connected=true → run_command `pwd; ls` 探测环境 → 干活 → close_session。\n\
                     · 长构建/长测试：run_command timeout_ms 给足直接等；MCP 客户端自己超时断了就 \
@@ -1534,9 +1688,9 @@ impl IshellMcp {
                     · 终端卡着交互程序（vim/top/sudo 密码提示）：先 read_screen 看前台是什么 → \
                     send_input 逐键应对（top 用 \"q\"；回车/EOF/Esc 等控制键写法见 send_input 描述，\
                     如 escapes=true 时 vim 退出 \"\\x1b:q!\\r\"）→ sudo 密码提示符让用户自己输，或征得同意后 \
-                    send_input。交互程序在**用户自己开的会话**里会把完成哨兵当输入吃掉（程序退出后\
-                    运行仍 finished=false，调一次 interrupt 释放再开新命令）；AI 专用会话装了 shell \
-                    完成上报，不受此限。"
+                    send_input。没装上完成上报、走哨兵回退的会话里，交互程序会把完成哨兵当输入吃掉（程序\
+                    退出后运行仍 finished=false，调一次 interrupt 释放再开新命令）；装好上报的 AI 专用\
+                    会话不受此限。"
 )]
 impl ServerHandler for IshellMcp {}
 
@@ -1559,8 +1713,9 @@ async fn main() -> anyhow::Result<()> {
 
 /// 本代理**进程**的身份标识：启动时生成的随机串（16 位十六进制），同进程内所有请求一致、
 /// 不同 AI 进程互不相同。iShell 用它落实「窗口归开它的那个 AI 专用」：`open_session` 记录
-/// 它，之后写入类请求带上的 actor 与记录不符，iShell 就按「动别人/用户的会话」弹窗授权。
-/// 纯进程身份、**不是保密凭据**——防同账号冒名是配对 token 那一层的事。
+/// 它，此后只有同一个 actor 能读写那个会话（用户的、别的 AI 的窗口一律拒绝）。v6 起 iShell
+/// 在配对握手时记下这个值并绑到连接凭据上，业务请求里自报的 actor 不再被信任——冒用别人的
+/// actor 拿不走别人的窗口。
 fn current_actor() -> String {
     static ACTOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ACTOR
@@ -1645,6 +1800,43 @@ mod tests {
     }
 
     /// 进程标识：16 位十六进制，同进程内多次取必须一致（OnceLock 缓存）。
+    /// **多机串台的根因回归门禁**（2026-09-18 生产服务器实测）：共用账号时 `~/.claude.json`
+    /// 的 user 级 MCP 配置里写死了某人的 token，AI 客户端 spawn 代理时用它**覆盖**了终端注入
+    /// 的正确 token——所有人的代理都带着同一个 token，全部路由到那一台电脑。
+    /// 终端来源（自身的 ISHELL_PAIR_TOKEN，或父进程——AI 客户端本身——启动时的
+    /// ISHELL_MCP_TOKEN）必须赢过配置。反向对照：把 `resolve_pairing_token` 改成优先
+    /// `own_config`，前两条断言当场挂。
+    #[test]
+    fn the_launching_terminal_beats_a_token_hardcoded_in_shared_mcp_config() {
+        use super::resolve_pairing_token;
+        let s = |v: &str| Some(v.to_string());
+        // 旧版 iShell 注入的终端：只在父进程（claude）的环境里有正确值，自身环境被配置覆盖。
+        assert_eq!(
+            resolve_pairing_token(None, s("mine"), s("someone-elses")),
+            (s("mine"), true),
+            "配置里写死的别人的 token 不能覆盖启动终端注入的 token"
+        );
+        // 新版 iShell 注入的专用变量名：配置里没人写它，直接胜出。
+        assert_eq!(resolve_pairing_token(s("mine"), None, s("someone-elses")), (s("mine"), true));
+        // 两处一致：没有冲突。
+        assert_eq!(resolve_pairing_token(None, s("mine"), s("mine")), (s("mine"), false));
+        // 终端没注入（AI 在 IDE 里启动等）：只能用配置，行为同旧版。
+        assert_eq!(resolve_pairing_token(None, None, s("cfg")), (s("cfg"), false));
+        // 空白等于没设。
+        assert_eq!(resolve_pairing_token(s("  "), s(""), s("cfg")), (s("cfg"), false));
+        assert_eq!(resolve_pairing_token(None, None, None), (None, false));
+    }
+
+    #[test]
+    fn env_lookup_reads_proc_environ_format() {
+        use super::env_lookup;
+        let raw = b"HOME=/root\0ISHELL_MCP_TOKEN=abc123\0ISHELL_MCP_TOKENX=nope\0";
+        assert_eq!(env_lookup(raw, "ISHELL_MCP_TOKEN").as_deref(), Some("abc123"));
+        assert_eq!(env_lookup(raw, "ISHELL_MCP_TOKENX").as_deref(), Some("nope"));
+        assert_eq!(env_lookup(raw, "ISHELL_PAIR_TOKEN"), None);
+        assert_eq!(env_lookup(b"", "HOME"), None);
+    }
+
     #[test]
     fn current_actor_is_stable_random_hex_within_a_process() {
         let a = current_actor();

@@ -184,8 +184,7 @@ pub struct McpSessionInfo {
     ///
     /// `false` = 用户自己打开的会话。这类会话用户本人随时可能在里面敲字，AI 再往同一个
     /// shell 里写就是两路输入交织：轻则互相打断，重则把 `run_command` 用来判断命令结束的
-    /// 哨兵标记行搅乱。所以写入类操作（见 `McpReqKind::write_target_uids`）默认走不通，
-    /// 需要用户当面授权一次。调用方应当优先 `open_session` 开自己的专用会话。
+    /// 哨兵标记行搅乱。所以（v6 起）AI 对这类会话读写都不允许，`list_sessions` 也根本不会列出它。
     pub ai_owned: bool,
     /// 开启它的 AI 的可读来源标签（代理请求里的 `origin` 快照，如 `e5-1 (ishell-mcp pid
     /// 42)`）。旧代理开的会话没有（`None`），`ai_owned=false` 时为 `None`。
@@ -384,49 +383,42 @@ pub enum McpReqKind {
 }
 
 impl McpReqKind {
-    /// 本请求会「往 shell 里打字」或「改远端状态」的目标会话 uid。
+    /// 本请求**涉及的会话** uid——读和写都算。这些会话必须全部是发起方自己用 `open_session`
+    /// 开的，否则 iShell 直接拒绝整条请求（见 GUI 侧 `mcp_bridge::session_owned_by`）。
     ///
-    /// 用户自己打开的会话，对这些操作要用户当面一次性授权后才放行；只读类操作不在此列——
-    /// 它们既不干扰用户的 shell、也不改远端状态，而「让 AI 看看你会话里出了什么事」本身
-    /// 是有用的能力，没必要拦。
+    /// 用户拍板（2026-09-18）：AI 只能读写自己开的窗口，用户的窗口、其它 AI 的窗口连读都不行。
+    /// 所以这里不再区分读写，只回答「这条请求碰了哪些会话」。
     ///
-    /// 集中判定放在这里、而不是散在各分支里，是为了让「新加一个工具要不要授权」变成一个
-    /// **必须显式回答**的问题：下面的 match 故意不写 `_ =>` 通配，新增变体时编译器会在这里
-    /// 报错，逼着作者表态，而不是默默继承「不需要授权」。
-    pub fn write_target_uids(&self) -> Vec<u64> {
+    /// match 故意不写 `_ =>` 通配：新增变体时编译器会在这里报错，逼作者表态它碰不碰会话，
+    /// 而不是默默继承「不涉及会话、不用校验」。
+    pub fn session_target_uids(&self) -> Vec<u64> {
         match self {
             McpReqKind::RunCommand { session_uid, .. }
             | McpReqKind::SendInput { session_uid, .. }
             | McpReqKind::Interrupt { session_uid }
             | McpReqKind::WriteFile { session_uid, .. }
             | McpReqKind::CopyToRemote { session_uid, .. }
-            | McpReqKind::CopyToRemoteFromCaller { session_uid, .. } => vec![*session_uid],
-            // 源和目标都要授权：直连模式会往「源」主机落一份临时私钥、往「目标」主机的
-            // authorized_keys 里临时写一行，两边都是在改远端状态。
+            | McpReqKind::CopyToRemoteFromCaller { session_uid, .. }
+            | McpReqKind::PollRun { session_uid, .. }
+            | McpReqKind::ReadScreen { session_uid }
+            | McpReqKind::ReadHistory { session_uid, .. }
+            | McpReqKind::ReadFile { session_uid, .. }
+            | McpReqKind::CopyFromRemoteToCaller { session_uid, .. }
+            | McpReqKind::CloseSession { session_uid } => vec![*session_uid],
             McpReqKind::CopyBetweenSessions {
                 src_session_uid,
                 dest_session_uid,
                 ..
             } => vec![*src_session_uid, *dest_session_uid],
-            // 连接级握手，根本不涉及任何会话（连 session_uid 字段都没有），自然谈不上授权。
-            // Bind 本身就是一个弹窗确认，再套一层会话授权既无对象也无意义。
+            // 连接级握手 / 列表 / 新开会话：不指向任何已有会话。
             McpReqKind::Identify
             | McpReqKind::IdentifyPair { .. }
             | McpReqKind::PairHello { .. }
             | McpReqKind::PairProve { .. }
             | McpReqKind::Bind
-            // 只读：不往 shell 里发东西，也不改远端。
             | McpReqKind::ListSessions
             | McpReqKind::ListSavedConnections
-            | McpReqKind::OpenSession { .. }
-            | McpReqKind::PollRun { .. }
-            | McpReqKind::ReadScreen { .. }
-            | McpReqKind::ReadHistory { .. }
-            | McpReqKind::ReadFile { .. }
-            | McpReqKind::CopyFromRemoteToCaller { .. } => Vec::new(),
-            // CloseSession 走的是更严的门禁（只能关 AI 自己开的，不接受授权——关闭权限不
-            // 应该超过打开权限），不走这条授权路。
-            McpReqKind::CloseSession { .. } => Vec::new(),
+            | McpReqKind::OpenSession { .. } => Vec::new(),
         }
     }
 }
@@ -499,13 +491,14 @@ mod unescape_key_text_tests {
 }
 
 #[cfg(test)]
-mod write_gate_tests {
+mod session_target_tests {
     use super::*;
 
-    /// 会往 shell 里打字或改远端状态的操作，必须报出目标会话——漏一个，AI 就能不经用户授权
-    /// 插手用户正在用的 shell。
+    /// 碰会话的操作（**读和写都算**）必须报出目标会话——漏一个，AI 就能读到或操作不是它开的
+    /// 窗口（用户 2026-09-18 拍板：AI 只能读写自己开的会话）。
+    /// 反向对照：把 `ReadScreen` 挪回「不涉及会话」那一组，本条当场挂。
     #[test]
-    fn write_ops_report_their_target_session() {
+    fn session_ops_report_their_target_session() {
         let cases: Vec<McpReqKind> = vec![
             McpReqKind::RunCommand {
                 session_uid: 7,
@@ -535,34 +528,6 @@ mod write_gate_tests {
                 size: 1,
                 timeout_ms: 0,
             },
-        ];
-        for kind in cases {
-            assert_eq!(kind.write_target_uids(), vec![7], "漏判写入操作：{kind:?}");
-        }
-    }
-
-    /// 直连模式会往「源」主机落临时私钥、往「目标」主机的 authorized_keys 临时写一行——
-    /// 两边都在改远端状态，所以两个 uid 都得授权，不能只拦目标。
-    #[test]
-    fn cross_session_copy_gates_both_hosts() {
-        let kind = McpReqKind::CopyBetweenSessions {
-            src_session_uid: 3,
-            src_remote_path: "/src".into(),
-            dest_session_uid: 9,
-            dest_remote_path: "/dst".into(),
-            timeout_ms: 0,
-        };
-        assert_eq!(kind.write_target_uids(), vec![3, 9]);
-    }
-
-    /// 只读操作不该要授权：它们不碰用户的 shell、也不改远端，而「让 AI 看看用户会话里出了
-    /// 什么事」本身有用。拦了它们只会逼 AI 绕路，并不会更安全。
-    #[test]
-    fn read_only_ops_need_no_authorisation() {
-        let cases: Vec<McpReqKind> = vec![
-            McpReqKind::ListSessions,
-            McpReqKind::ListSavedConnections,
-            McpReqKind::OpenSession { name: "s2".into() },
             McpReqKind::PollRun {
                 session_uid: 7,
                 run_id: None,
@@ -584,8 +549,33 @@ mod write_gate_tests {
                 remote_path: "/a".into(),
                 timeout_ms: 0,
             },
-            // 关会话走的是更严的 ai_owned 门禁（只能关 AI 自己开的，不接受授权），不是这条路。
             McpReqKind::CloseSession { session_uid: 7 },
+        ];
+        for kind in cases {
+            assert_eq!(kind.session_target_uids(), vec![7], "漏报了目标会话：{kind:?}");
+        }
+    }
+
+    /// 跨会话拷贝两端都是会话：两个 uid 都必须是发起方自己的，不能只看目标。
+    #[test]
+    fn cross_session_copy_gates_both_hosts() {
+        let kind = McpReqKind::CopyBetweenSessions {
+            src_session_uid: 3,
+            src_remote_path: "/src".into(),
+            dest_session_uid: 9,
+            dest_remote_path: "/dst".into(),
+            timeout_ms: 0,
+        };
+        assert_eq!(kind.session_target_uids(), vec![3, 9]);
+    }
+
+    /// 不指向任何已有会话的操作：列表、新开会话、连接级握手。
+    #[test]
+    fn non_session_ops_have_no_target() {
+        let cases: Vec<McpReqKind> = vec![
+            McpReqKind::ListSessions,
+            McpReqKind::ListSavedConnections,
+            McpReqKind::OpenSession { name: "s2".into() },
             // 连接级握手，不涉及任何会话。
             McpReqKind::Identify,
             McpReqKind::IdentifyPair {
@@ -601,8 +591,8 @@ mod write_gate_tests {
         ];
         for kind in cases {
             assert!(
-                kind.write_target_uids().is_empty(),
-                "只读操作被误判成需要授权：{kind:?}"
+                kind.session_target_uids().is_empty(),
+                "不涉及会话的操作被报出了目标：{kind:?}"
             );
         }
     }
@@ -637,8 +627,29 @@ pub struct McpRequest {
     /// 窗口维持旧版「AI 窗口共享池」行为。可选且向后兼容。
     #[serde(default)]
     pub actor: Option<String>,
+    /// **连接凭据**（v6）：配对握手成功时 iShell 签发的随机串（见 `McpReqResult::Instance`
+    /// 的 `ticket`）。除 `Identify`/`IdentifyPair`/`PairHello`/`PairProve` 外，每条请求都必须
+    /// 带上一张 iShell 自己签发过的有效凭据，否则直接拒绝（`TICKET_REJECTED`）。
+    ///
+    /// 为什么需要它：此前 iShell 对业务请求只核对 `instance`，而实例 id 任何人发一句匿名
+    /// `Identify` 就能问到——握手只决定「诚实的代理挑哪台」，iShell 自己并不要求来者证明过
+    /// token。于是任何拿到 id 的客户端（旧代理、脚本、被错误配置的代理）都能直接驱动它。
+    /// 凭据只在握手验过对方的 token 证明之后才签发，没有 token 就拿不到。
+    ///
+    /// 凭据同时绑定握手时声明的 `actor`：iShell 以凭据记录的 actor 为准、覆盖请求里自报的
+    /// 值，冒用别人的 actor 拿不走别人的窗口。
+    ///
+    /// 能力边界（明说）：它是**持有即有效**的凭据，同一个 UNIX 账号下的进程可以读别的进程
+    /// 内存/环境——防不住同账号下蓄意窃取，防的是「没有配对 token 的客户端也能驱动别人的
+    /// iShell」这一整类问题。
+    #[serde(default)]
+    pub ticket: Option<String>,
     pub kind: McpReqKind,
 }
+
+/// iShell 拒绝「没带凭据 / 凭据无效或过期」的请求时，错误文案以此开头。代理据此识别并自动
+/// 重新握手、重试一次（凭据按空闲时长过期，iShell 也可能淘汰旧凭据）。
+pub const TICKET_REJECTED: &str = "连接凭据无效或已过期";
 
 impl McpRequest {
     /// 这条请求是不是该由标识为 `own_instance` 的实例来执行。
@@ -751,6 +762,7 @@ mod addressing_tests {
             instance: instance.map(str::to_string),
             origin: None,
             actor: None,
+            ticket: None,
             kind,
         }
     }
@@ -854,11 +866,17 @@ mod addressing_tests {
 /// **token 正确**的调用方（v3 旧代理凭正确 token 仍能拿到版本提示，token 不符的调用方
 /// 什么也学不到——v4 及以前是无条件应答）。
 ///
+/// v6：**iShell 端强制身份校验**。配对握手成功后 iShell 签发连接凭据（`Instance.ticket`），
+/// 除发现与握手外的每条请求都必须带上（`McpRequest::ticket`），否则拒绝——此前 iShell 只核对
+/// 公开的实例 id，隔离全靠代理自觉。凭据绑定握手时声明的 actor，iShell 以它为准。同版本起
+/// AI 只能读写自己开的会话（用户与其它 AI 的窗口一律拒绝、不再列出），配对 token 也换了新
+/// 文件（旧 token 作废）。
+///
 /// 注意 `Identify` 的线格式在所有版本里**逐字节相同**（无字段的单元变体），这是刻意的：
 /// 它是唯一一个跨版本都解得开的请求，版本不一致时全靠它问出对端版本、给出「重新部署」的
 /// 提示。给它加字段会把 JSON 从 `"Identify"` 变成 `{"Identify":{…}}`，旧端直接解析失败、
 /// 被当成死 socket 跳过，于是版本不匹配又会伪装成别的错误——别加。
-pub const MCP_PROTOCOL_VERSION: u32 = 5;
+pub const MCP_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {
@@ -875,6 +893,10 @@ pub enum McpReqResult {
         /// token）。字段保留仅为线格式兼容；代理不得再依赖此字段做过滤。
         #[serde(default)]
         token: String,
+        /// v6：**只在配对握手成功（`PairProve` 验过）的应答里**携带的连接凭据，其余场景恒为
+        /// 空。代理此后把它填进每条请求的 `McpRequest::ticket`。
+        #[serde(default)]
+        ticket: String,
     },
     /// `PairHello` 的应答：对端的随机数 + 它的 `Server` 证明。代理**先验这个证明**，
     /// 通过了才在同一条连接上发 `PairProve`——否则一个连 token 都不知道的假 socket 就能把
@@ -932,6 +954,7 @@ mod tests {
             id: "1234-abcd".into(),
             proto_version: MCP_PROTOCOL_VERSION,
             token: String::new(),
+            ticket: String::new(),
         };
         let json = serde_json::to_string(&inst).unwrap();
         let back: McpReqResult = serde_json::from_str(&json).unwrap();
@@ -940,10 +963,12 @@ mod tests {
                 id,
                 proto_version,
                 token,
+                ticket,
             } => {
                 assert_eq!(id, "1234-abcd");
                 assert_eq!(proto_version, MCP_PROTOCOL_VERSION);
                 assert_eq!(token, "");
+                assert_eq!(ticket, "", "非握手应答不带凭据");
             }
             other => panic!("应解析回 Instance，实际：{other:?}"),
         }
@@ -1019,6 +1044,7 @@ mod tests {
             instance: Some("1234-a1b2c3d4".into()),
             origin: None,
             actor: None,
+            ticket: None,
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 11,
                 remote_path: "/srv/project/cuda_eri.py".into(),

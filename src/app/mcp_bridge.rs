@@ -883,28 +883,6 @@ pub(super) struct PendingOpenConsent {
     deadline: Instant,
 }
 
-/// AI 想对**用户自己打开的**会话做写入类操作（往 shell 里打字、改远端文件），而这个会话
-/// 本次运行期间还没被授权过——弹窗让用户当面确认。
-///
-/// 这里扣住的是**整个** `McpCall`（连同 `upload_source`/`download_sink` 两条字节流通道），
-/// 用户点「允许」后原样丢回 `handle_mcp_call` 重跑一遍即可，不需要把请求拆开重建：那样既
-/// 要为每个变体写一遍恢复逻辑，也很容易在新增变体时漏掉。重跑时 uid 已进批准集合，不会
-/// 再次落到这个分支，所以不会递归。
-pub(super) struct PendingUseConsent {
-    call: McpCall,
-    /// 待授权的会话 uid（`write_target_uids` 里第一个未获批的）。
-    pub(super) uid: u64,
-    /// 会话标签名，给弹窗显示用（发起时刻的快照）。
-    pub(super) title: String,
-    /// 若目标本身是 AI 开的窗口：开启者的来源标签（弹窗据此说明「这是另一个 AI 的窗口」）。
-    pub(super) owner_label: Option<String>,
-    /// 发起方代理的可读来源（请求里的 origin 快照），弹窗「来源」行展示。
-    pub(super) origin: Option<String>,
-    /// 给用户看的一句话：AI 具体想干什么。
-    pub(super) action: String,
-    deadline: Instant,
-}
-
 /// 一个尚未绑定的 AI 客户端请求接管本 iShell 窗口——弹窗让用户当面选。
 ///
 /// 只在用户同时开着多个 iShell 时才会出现：代理发现多个实例后，会向**每一个**都发一条
@@ -921,128 +899,47 @@ pub(super) struct PendingBindConsent {
     deadline: Instant,
 }
 
-/// 写入门禁的目标分类。
-#[derive(Debug, Clone, PartialEq)]
-enum WriteTarget {
-    /// 会话不存在：**不在这道门拦**（沿用既有设计——拦下来只能含混地说一句「需要授权」，
-    /// 放它过去各分支会回「会话不存在 + 当前可用会话列表」，那条报错有用得多）。
-    Missing,
-    /// 用户本人开的会话。
-    User,
-    /// 旧代理（不带 actor）开的 AI 窗口：旧版「AI 窗口共享池」，维持兼容——旧代理
-    /// （actor=None）随便写，新代理写它需授权。
-    AiSharedLegacy,
-    /// 新代理开的 AI 窗口，携带开启者的进程标识。
-    AiOwned(String),
+/// **AI 只能碰它自己开的会话**：读和写一样。
+///
+/// 用户拍板（2026-09-18）：「AI 只能读取自己打开的窗口，不允许读取和操作客户自己的窗口，否则
+/// 太乱了」「严禁操作其他人的客户端」。所以不再区分「用户的窗口」「另一个 AI 的窗口」「只读还是
+/// 写入」，也不再有授权弹窗——判据只剩一条：这个会话是不是**发起这条请求的 AI 进程**用
+/// `open_session` 开的（按代理进程标识 `actor` 与会话记录的 `ai_owner` 比对）。
+///
+/// 此前的版本：用户窗口只读随意、写入弹窗一次后整个运行期放行，且那次授权不分发起方——点一次
+/// 允许，之后任何 AI（包括被错误路由过来的别人的 AI）都能读写这个窗口。
+///
+/// 旧版代理（不带 `actor`）开的共享池窗口不属于任何人；不带 `actor` 的请求也不拥有任何窗口。
+/// 两者在 v6 起本来就过不了协议版本校验，这里按「不是你的」处理，不留兼容口子。
+///
+/// `actor` 由 iShell 在配对握手时记下、此后按连接凭据回填（见 `handle_conn`），不是调用方
+/// 自报的值——自报的话，冒用别人的 actor 就能拿走别人的窗口。
+fn session_owned_by(ai_owned: bool, ai_owner: Option<&str>, actor: Option<&str>) -> bool {
+    ai_owned && actor.is_some() && ai_owner == actor
 }
 
-fn write_target(ai_owned: bool, ai_owner: Option<String>) -> WriteTarget {
-    if !ai_owned {
-        WriteTarget::User
-    } else if let Some(o) = ai_owner {
-        WriteTarget::AiOwned(o)
-    } else {
-        WriteTarget::AiSharedLegacy
-    }
+/// 一条请求涉及的会话里，第一个**不属于发起方**的 uid（`None` = 全部是它自己的，放行）。
+///
+/// `lookup(uid)` 给出会话的 `(ai_owned, ai_owner)`；返回 `None` 表示这个 uid 没有对应会话——
+/// **不在这道门拦**：放过去，由各分支回「会话不存在 + 你自己的会话列表」那条有用的报错。
+/// 抽成纯函数是为了能测：调用方 `App` 在测试里造不出来。
+fn first_foreign_session<'a>(
+    uids: &[u64],
+    lookup: impl Fn(u64) -> Option<(bool, Option<&'a str>)>,
+    actor: Option<&str>,
+) -> Option<u64> {
+    uids.iter().copied().find(|&uid| {
+        lookup(uid).is_some_and(|(ai_owned, owner)| !session_owned_by(ai_owned, owner, actor))
+    })
 }
 
-/// 这次写入要不要当面授权。
-///
-/// 不用问的只有两种：目标是**发起请求的 AI 自己开的**会话（归属按代理进程标识 `actor`
-/// 比对），或者用户**本次运行里已经为这个会话授权过**。
-///
-/// 注意参数里**没有**任何设置项，这是刻意的：用户明确要求过「AI 只能自由操作自己开的
-/// 会话，动用户（或其他 AI）的会话必须授权」。0.19 一度让 `mcp_auto_approve` 从这里短路
-/// 过去，那是错的。谁要再加一个能绕过它的开关，先来改这个函数、并解释为什么。
-///
-/// `actor` 只是进程标识、不是保密凭据：它防的是**误用**（两个 AI 的窗口互相串门），同账号
-/// 下的主动伪造由配对 token 那一层负责。
-fn write_needs_consent(target: WriteTarget, actor: Option<&str>, already_approved: bool) -> bool {
-    match target {
-        WriteTarget::Missing => false,
-        WriteTarget::User => !already_approved,
-        // 旧版共享池：旧代理（不带 actor）维持原行为；新代理写它要授权。
-        WriteTarget::AiSharedLegacy => actor.is_some() && !already_approved,
-        WriteTarget::AiOwned(owner) => actor != Some(owner.as_str()) && !already_approved,
-    }
-}
-
-/// 给用户看的一句话：AI 具体想拿这个会话干什么。
-///
-/// 授权弹窗必须靠它做到知情同意——只说一句「AI 想操作这个会话」，用户没有任何依据判断该不该
-/// 点允许；把真实的命令/路径摆出来，才谈得上"当面确认"。
-fn action_summary(kind: &McpReqKind) -> String {
-    /// 命令和文件内容可能很长、还可能带换行，弹窗里要能一眼看完：压成单行再按**字符**截断
-    /// （不能按字节切，中文会切出半个字导致 panic）。
-    fn brief(s: &str, max: usize) -> String {
-        let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
-        match one.char_indices().nth(max) {
-            None => one,
-            Some((i, _)) => format!("{}…", &one[..i]),
-        }
-    }
-    let zh = matches!(crate::i18n::current(), crate::i18n::Lang::Zh);
-    match kind {
-        McpReqKind::RunCommand { command, .. } => {
-            let c = brief(command, 80);
-            if zh {
-                format!("执行命令：{c}")
-            } else {
-                format!("run the command: {c}")
-            }
-        }
-        McpReqKind::SendInput { text, .. } => {
-            let t = brief(text, 40);
-            if zh {
-                format!("直接发送按键/文本：{t}")
-            } else {
-                format!("send raw keystrokes/text: {t}")
-            }
-        }
-        McpReqKind::Interrupt { .. } => {
-            if zh {
-                "发送 Ctrl+C 中断当前前台程序".into()
-            } else {
-                "send Ctrl+C to interrupt the foreground program".into()
-            }
-        }
-        McpReqKind::WriteFile { path, .. } => {
-            if zh {
-                format!("覆盖写入远端文件：{path}")
-            } else {
-                format!("overwrite the remote file: {path}")
-            }
-        }
-        McpReqKind::CopyToRemote { remote_path, .. }
-        | McpReqKind::CopyToRemoteFromCaller { remote_path, .. } => {
-            if zh {
-                format!("复制文件到远端：{remote_path}")
-            } else {
-                format!("copy a file to: {remote_path}")
-            }
-        }
-        McpReqKind::CopyBetweenSessions {
-            src_remote_path,
-            dest_remote_path,
-            ..
-        } => {
-            if zh {
-                format!("跨主机复制文件：{src_remote_path} → {dest_remote_path}")
-            } else {
-                format!("copy a file across hosts: {src_remote_path} → {dest_remote_path}")
-            }
-        }
-        // 只读类操作的 `write_target_uids` 返回空，根本走不到授权弹窗。这里给兜底文案而不是
-        // `unreachable!()`：万一将来改动漏了判定，弹一句"未知操作"让用户去拒绝，比让整个
-        // 应用 panic 掉安全得多。
-        _ => {
-            if zh {
-                "未知操作".into()
-            } else {
-                "an unrecognised operation".into()
-            }
-        }
-    }
+/// 拒绝时回给 AI 的话：说清规则与下一步，不透露那个会话的任何信息（标题/主机都不给）。
+fn foreign_session_refusal(uid: u64) -> String {
+    format!(
+        "会话 uid={uid} 不是你用 open_session 开的：AI 只能读写**自己开的**会话，用户自己打开的\
+         窗口和其它 AI 的窗口一律不许读取或操作（硬规则，没有授权弹窗，重试也没用）。需要在\
+         某台机器上干活，请用 list_saved_connections 查连接名、open_session 开你自己的会话"
+    )
 }
 
 /// 启动 socket 监听（若用户未在设置里开启 AI 控制，返回一个永远收不到数据的空通道）。
@@ -1171,6 +1068,69 @@ async fn reply(
     }
 }
 
+/// iShell 签发的**连接凭据**（v6，见 `McpRequest::ticket`）：配对握手验过对方的 token 证明
+/// 之后才签发，之后每条业务请求都要出示。凭据 → 握手时声明的 actor。
+///
+/// 只活在本进程内存里：iShell 重启即全部作废（实例 id 也随之换掉，代理本来就得重新绑定）。
+/// 有界：按空闲时长过期，超过上限淘汰最久没用过的——代理被拒后会自动重新握手（见
+/// `TICKET_REJECTED`），所以淘汰只多一次握手、不会让 AI 失联。
+#[cfg(unix)]
+mod tickets {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// 空闲这么久没用过的凭据作废。远长于一次 AI 会话里的调用间隔。
+    const IDLE_EXPIRY: Duration = Duration::from_secs(7 * 24 * 3600);
+    /// 存量上限：每次代理探测/重连都会握手签发一张，不设上限会随运行时长无界增长。
+    const CAP: usize = 4096;
+
+    struct Entry {
+        actor: String,
+        last_used: Instant,
+    }
+
+    static STORE: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
+
+    /// 为握手通过的一方签发凭据，绑定它声明的 actor。熵源不可用返回 `None`（宁可握手失败，
+    /// 也不签一张可预测的凭据）。
+    pub(super) fn issue(actor: String) -> Option<String> {
+        // 两个 32 字节随机数拼起来：512 位，远超猜测可能。
+        let ticket = format!(
+            "{}{}",
+            crate::mcp_protocol::pair_nonce()?,
+            crate::mcp_protocol::pair_nonce()?
+        );
+        let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        map.retain(|_, e| now.duration_since(e.last_used) < IDLE_EXPIRY);
+        if map.len() >= CAP {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(ticket.clone(), Entry { actor, last_used: now });
+        Some(ticket)
+    }
+
+    /// 核对凭据：有效则刷新使用时刻并返回它绑定的 actor。
+    pub(super) fn redeem(ticket: &str) -> Option<String> {
+        let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.as_mut()?.get_mut(ticket)?;
+        let now = Instant::now();
+        if now.duration_since(entry.last_used) >= IDLE_EXPIRY {
+            return None;
+        }
+        entry.last_used = now;
+        Some(entry.actor.clone())
+    }
+}
+
 /// 调用方上传字节流的包装：本身只是透传读取，被 drop 时顺带丢弃 `_drop_tx`，让持有对应
 /// `oneshot::Receiver` 的一方知道「再没有别的读取者了」（见 `handle_conn` 的排干逻辑）。
 #[cfg(unix)]
@@ -1205,7 +1165,7 @@ async fn handle_conn(
     else {
         return; // 对端没写完就断了连接/超时/超长，没东西可读也没法回应
     };
-    let req: McpRequest = match serde_json::from_str(&line) {
+    let mut req: McpRequest = match serde_json::from_str(&line) {
         Ok(r) => r,
         Err(e) => {
             // JSON 解不出来时，之前是直接静默关闭连接——对端只会看到一个空响应/EOF，
@@ -1263,6 +1223,7 @@ async fn handle_conn(
                     id: own.to_string(),
                     proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
                     token: String::new(),
+                    ticket: String::new(),
                 }),
             )
             .await;
@@ -1282,6 +1243,7 @@ async fn handle_conn(
                     id: own.to_string(),
                     proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
                     token: String::new(),
+                    ticket: String::new(),
                 }),
             )
             .await;
@@ -1291,6 +1253,8 @@ async fn handle_conn(
         // 全协议唯一一处「一条连接两问两答」——双向证明必须共用同一对随机数。
         McpReqKind::PairHello { nonce_c } => {
             let nonce_c = nonce_c.clone();
+            // 握手时声明的进程身份：握手通过后绑到签发的凭据上，此后以它为准（见 `tickets`）。
+            let hello_actor = req.actor.clone();
             let token = crate::store::mcp_pairing_token();
             // 熵源失败一律拒绝握手，绝不用可预测的值凑合（那等于把挑战-应答降级成静态口令）。
             let Some(nonce_s) = crate::mcp_protocol::pair_nonce() else {
@@ -1340,6 +1304,16 @@ async fn handle_conn(
             };
             match ok {
                 Some((id2, true)) => {
+                    // 验过了才签发凭据。没声明 actor 的握手不签：凭据要绑一个身份，否则 iShell
+                    // 没法把「窗口归开它的那个 AI」落到实处。
+                    let Some(actor) = hello_actor else {
+                        reply(&mut w, id2, Err("配对握手缺少 actor（代理进程标识），不签发连接凭据".into())).await;
+                        return;
+                    };
+                    let Some(ticket) = tickets::issue(actor) else {
+                        reply(&mut w, id2, Err("本机熵源不可用，无法签发连接凭据".into())).await;
+                        return;
+                    };
                     reply(
                         &mut w,
                         id2,
@@ -1347,6 +1321,7 @@ async fn handle_conn(
                             id: own.to_string(),
                             proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
                             token: String::new(),
+                            ticket,
                         }),
                     )
                     .await;
@@ -1366,6 +1341,40 @@ async fn handle_conn(
             return;
         }
         _ => {}
+    }
+    // **iShell 端身份校验（v6）**：除上面的发现与握手，其余每条请求都必须出示本进程签发过的
+    // 有效连接凭据。这是「严禁操作其他人的客户端」的执行点，而且放在权威侧——此前这里只核对
+    // 公开的实例 id，谁拿到 id 谁就能驱动这台 iShell，隔离全靠代理自觉。
+    // 凭据绑定的 actor 覆盖请求里自报的值：归属判定（只能碰自己开的会话）用的是 iShell 自己
+    // 记下的身份，冒用别人的 actor 没有用。
+    match req.ticket.as_deref().and_then(tickets::redeem) {
+        Some(actor) => req.actor = Some(actor),
+        None => {
+            reply(
+                &mut w,
+                id,
+                Err(format!(
+                    "{}：这台 iShell 只接受完成配对握手的请求（需要与它配对 token 一致的 \
+                     ishell-mcp，协议 v{}）。代理会自动重新握手；仍失败请重新连接 MCP",
+                    crate::mcp_protocol::TICKET_REJECTED,
+                    crate::mcp_protocol::MCP_PROTOCOL_VERSION
+                )),
+            )
+            .await;
+            // 上传请求：调用方此刻多半还在推文件体。直接关连接，它后续的写会撞上 RST，尚未
+            // 读出的这条错误随 RST 被内核丢掉，只剩一句 Broken pipe——代理就认不出「凭据被拒」、
+            // 也就不会自动重新握手。先把残留字节读到 EOF 再关（与下方上传报错路径同一个道理），
+            // 带兜底时限。
+            if matches!(req.kind, McpReqKind::CopyToRemoteFromCaller { .. }) {
+                let mut rest = lines.into_inner().into_inner().into_inner();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    tokio::io::copy(&mut rest, &mut tokio::io::sink()),
+                )
+                .await;
+            }
+            return;
+        }
     }
     let is_caller_upload = matches!(&req.kind, McpReqKind::CopyToRemoteFromCaller { .. });
     if is_caller_upload {
@@ -1654,23 +1663,7 @@ impl App {
                 }
             }
         }
-        if let Some(pending) = self.pending_use_consent.as_ref() {
-            if Instant::now() >= pending.deadline {
-                // 整个 McpCall 被扣在这里，超时必须把它取出来回一条错，否则调用方那边就是
-                // 一条永远不回的请求（只能干等到它自己的 timeout_ms）。
-                let pending = self.pending_use_consent.take().expect("上一行刚确认是 Some");
-                let id = pending.call.req.id;
-                let _ = pending.call.resp_tx.send(McpResponse {
-                    id,
-                    result: Err(
-                        "等待用户确认超时（5 分钟），已自动拒绝：这是用户自己打开的会话，需要\
-                         用户当面授权。请改用 open_session 开一个 AI 专用会话，或让用户切回\
-                         iShell 点击确认弹窗后重试".into(),
-                    ),
-                });
-            }
-        }
-        // 绑定弹窗的清扫比另外两个多一条「对端走了」：代理把 Bind 同时发给了每一个实例，
+        // 绑定弹窗的清扫比新开会话那个多一条「对端走了」：代理把 Bind 同时发给了每一个实例，
         // 用户在某个窗口点「允许」之后，代理立刻挂断其余连接。落选的窗口据此静默收起弹窗，
         // 用户不必挨个去点「拒绝」——他已经用点击表达过选择了，再逼他关掉 N-1 个框是骚扰。
         if let Some(pending) = self.pending_bind_consent.as_ref() {
@@ -1707,7 +1700,6 @@ impl App {
     pub(super) fn arm_timeout_repaint(&self) {
         let consents = [
             self.pending_open_consent.as_ref().map(|p| p.deadline),
-            self.pending_use_consent.as_ref().map(|p| p.deadline),
             self.pending_bind_consent.as_ref().map(|p| p.deadline),
         ];
         let sessions = self.sessions.iter().flat_map(|s| {
@@ -2304,7 +2296,7 @@ impl App {
         self.active = prev_active;
         let s = self.sessions.last_mut().expect("spawn_session 刚 push 了一个会话");
         s.ai_owned = true; // AI 新开的会话：只读，用户键盘输入不转发（见 layout_body.rs）
-        s.ai_owner = owner; // 归属：只归开它的那个 AI 进程使用（见 write_needs_consent）
+        s.ai_owner = owner; // 归属：只归开它的那个 AI 进程使用（见 session_owned_by）
         // 标签 hover 上展示「谁开的」：渲染时由 layout_tabs::tab_hover_text 拼接（#uid 要插在
         // user@host 与来源之间，所以不再把来源预先拼进 tip）。
         s.ai_owner_label = owner_label.clone();
@@ -2375,115 +2367,61 @@ impl App {
     /// 猜不出是自己传错了、还是 iShell 重启后整张会话表都换了（比如 MCP 更新后重启，
     /// 所有 uid 会从 1 重新分配）——报错里直接列出来，不用再额外调一次 list_sessions
     /// 才能定位问题。
-    fn session_not_found_msg(&self, uid: u64) -> String {
-        if self.sessions.is_empty() {
-            return format!("会话不存在（uid={uid}）：当前没有任何打开的会话，可能是 iShell 刚重启");
-        }
+    fn session_not_found_msg(&self, uid: u64, actor: Option<&str>) -> String {
+        // 只列发起方自己的会话：别人的窗口连 uid/标题都不该透露（见 `session_owned_by`）。
         let list = self
             .sessions
             .iter()
+            .filter(|s| session_owned_by(s.ai_owned, s.ai_owner.as_deref(), actor))
             .map(|s| format!("{}:{}", s.uid, s.title))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        if list.is_empty() {
+            return format!(
+                "会话不存在（uid={uid}）：你当前没有自己开的会话（iShell 重启后 uid 会重新分配）。\
+                 用 open_session 开一个"
+            );
+        }
         format!(
             "会话不存在（uid={uid}）：可能是 iShell 已重启（重启后 uid 会重新分配）或这个会话\
-             已被关闭。当前可用会话（uid:标题）：{list}"
+             已被关闭。你自己的会话（uid:标题）：{}",
+            list.join(", ")
         )
     }
 
-    /// 写入类操作的会话门禁：目标若是**用户（或另一个 AI）的**会话且本次运行还没授权过，
-    /// 扣下请求弹窗等用户当面确认。放行则原样返回 `call`；扣下（或直接回错）返回 `None`。
+    /// 会话门禁：请求涉及的每一个会话都必须是**发起方自己开的**，否则整条直接拒绝。
+    /// 放行则原样返回 `call`；拒绝（已回错）返回 `None`。
     ///
-    /// # 这道闸门没有任何开关可以绕过
+    /// # 这道闸门没有任何开关可以绕过，也没有授权弹窗
     ///
-    /// AI 能随便用的只有**它自己 `open_session` 开出来的**会话（按代理进程标识 `actor`
-    /// 归属，见 `write_needs_consent`）。用户自己开的那些标签里有他正在做的事——半截命令、
-    /// sudo 提示符、连着生产库的 psql——往里面打字是两路输入交织，轻则互相打断，重则改到他
-    /// 没想改的东西上；另一个 AI 开的窗口同理。所以「动不属于自己的会话」必须每次当面授权，
-    /// **不受任何设置影响**：`mcp_auto_approve` 只管「AI 新开会话」那一档，绝不能拿到这里
-    /// 来短路（0.19 曾经这么干过，是错的，已改回）。判定见 [`write_needs_consent`]。
-    fn gate_user_session_write(&mut self, call: McpCall) -> Option<McpCall> {
-        // 目标会话不存在时不在这里拦：让它照常走下去，由各分支回「会话不存在 + 当前可用
-        // 会话列表」那条更有用的报错，而不是在这里含混地说一句"需要授权"。
-        let caller_actor = call.req.actor.clone();
-        let Some(uid) = call.req.kind.write_target_uids().into_iter().find(|uid| {
-            // `Missing` = 这个 uid 没有对应的会话。**必须原样传给判定**，不能在这里塌成
-            // 「不存在就当成用户会话」——那会让不存在的会话被判成「需要授权」并选中，随后
-            // 撞上下面那句 expect 直接 panic（AI 手里攥着一个 iShell 重启前的旧 uid 就够了，
-            // 重启后 uid 从 1 重新分配）。
-            let target = self.session_idx_by_uid(*uid).map(|idx| {
-                let s = &self.sessions[idx];
-                write_target(s.ai_owned, s.ai_owner.clone())
-            });
-            write_needs_consent(
-                target.unwrap_or(WriteTarget::Missing),
-                caller_actor.as_deref(),
-                self.mcp_use_approved.contains(uid),
-            )
-        }) else {
+    /// 判据见 [`session_owned_by`]；覆盖范围见 `McpReqKind::session_target_uids`（读写都在内）。
+    /// 任何设置都不影响它：`mcp_auto_approve` 只管「AI 新开会话」那一档，绝不能拿到这里来短路。
+    fn gate_foreign_sessions(&mut self, call: McpCall) -> Option<McpCall> {
+        let actor = call.req.actor.clone();
+        let uids = call.req.kind.session_target_uids();
+        let foreign = first_foreign_session(
+            &uids,
+            |uid| {
+                self.session_idx_by_uid(uid).map(|idx| {
+                    let s = &self.sessions[idx];
+                    (s.ai_owned, s.ai_owner.as_deref())
+                })
+            },
+            actor.as_deref(),
+        );
+        let Some(uid) = foreign else {
             return Some(call);
         };
         let id = call.req.id;
-        // 同一时刻只挂一个确认框：两个叠在一起用户根本分不清在批准哪个。
-        if self.pending_use_consent.is_some() || self.pending_open_consent.is_some() {
-            let _ = call.resp_tx.send(McpResponse {
-                id,
-                result: Err("已有一个请求正在等待用户确认，请稍候重试".into()),
-            });
-            return None;
-        }
-        let idx = self
-            .session_idx_by_uid(uid)
-            .expect("WriteTarget::Missing 恒为 false，被选中的 uid 必然存在");
-        let title = self.sessions[idx].title.clone();
-        let owner_label = self.sessions[idx].ai_owner_label.clone();
-        let action = action_summary(&call.req.kind);
-        let origin = call.req.origin.clone();
-        self.pending_use_consent = Some(PendingUseConsent {
-            call,
-            uid,
-            title,
-            owner_label,
-            origin,
-            action,
-            // 与 open_session 的确认框同样给 5 分钟：用户可能不在电脑前。
-            deadline: Instant::now() + Duration::from_secs(300),
+        let _ = call.resp_tx.send(McpResponse {
+            id,
+            result: Err(foreign_session_refusal(uid)),
         });
         None
     }
 
-    /// 用户在写入授权弹窗里点了「允许」/「拒绝」。
-    pub(super) fn resolve_use_consent(&mut self, allow: bool) {
-        let Some(pending) = self.pending_use_consent.take() else {
-            return;
-        };
-        if !allow {
-            let id = pending.call.req.id;
-            let msg = match &pending.owner_label {
-                // 目标是另一个 AI 开的窗口：报错要指明归属，引导调用方去用自己的会话。
-                Some(label) => format!(
-                    "用户拒绝对会话 uid={} 的这次操作——那是另一个 AI（{label}）开的窗口，\
-                     不是发起请求的 AI 的。请改用 open_session 开一个自己的专用会话",
-                    pending.uid
-                ),
-                None => format!(
-                    "用户拒绝了对会话 uid={} 的这次操作。这是用户自己打开的会话，AI 不应直接\
-                     使用——请改用 open_session 开一个自己的专用会话",
-                    pending.uid
-                ),
-            };
-            let _ = pending.call.resp_tx.send(McpResponse { id, result: Err(msg) });
-            return;
-        }
-        // 记住这个会话 uid，后续写入不再打扰用户。uid 由 next_uid 单调分配、只增不复用
-        // （session.rs），且这个集合只活在进程内存里，所以不存在"授权被后开的会话捡到"。
-        self.mcp_use_approved.insert(pending.uid);
-        self.handle_mcp_call(pending.call);
-    }
-
     fn handle_mcp_call(&mut self, call: McpCall) {
-        // 先过会话门禁：放行的才继续。重跑时 uid 已在批准集合里，不会再落回这里，不递归。
-        let Some(call) = self.gate_user_session_write(call) else {
+        // 先过会话门禁：只有「涉及的会话全是发起方自己开的」才继续。
+        let Some(call) = self.gate_foreign_sessions(call) else {
             return;
         };
         let McpCall { req, resp_tx, upload_source, download_sink } = call;
@@ -2527,9 +2465,14 @@ impl App {
                 });
             }
             McpReqKind::ListSessions => {
+                // 只列发起方自己开的会话：用户的窗口、其它 AI 的窗口连标题/主机/cwd 都不给看
+                // （见 `session_owned_by`）。
                 let list = self
                     .sessions
                     .iter()
+                    .filter(|s| {
+                        session_owned_by(s.ai_owned, s.ai_owner.as_deref(), caller_actor.as_deref())
+                    })
                     .map(|s| McpSessionInfo {
                         uid: s.uid,
                         title: s.title.clone(),
@@ -2539,9 +2482,8 @@ impl App {
                         ai_owned: s.ai_owned,
                         // 归属展示：谁开的（可读标签）。旧代理开的窗口没有标签。
                         ai_owner: s.ai_owner_label.clone(),
-                        // 是不是「发起本次查询的这个 AI」自己开的——按进程标识比对；
-                        // 旧代理（不带 actor）开的共享池窗口对任何调用方都报 false。
-                        mine: s.ai_owner.is_some() && s.ai_owner == caller_actor,
+                        // 列表里只剩自己的会话，恒为 true；字段保留是线格式兼容。
+                        mine: true,
                         token_injected: s.mcp_token_injected,
                     })
                     .collect();
@@ -2556,7 +2498,7 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -2664,7 +2606,7 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 match self.sessions[idx].pending_ai_run.as_mut() {
@@ -2709,7 +2651,7 @@ impl App {
             }
             McpReqKind::ReadScreen { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let text = self.sessions[idx].terminal.screen_text();
@@ -2720,7 +2662,7 @@ impl App {
             }
             McpReqKind::Interrupt { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 // Ctrl-C 没送出去就**绝不能**丢掉这条运行的跟踪状态：远端命令多半还在跑，
@@ -2767,9 +2709,8 @@ impl App {
                     self.do_open_session(&c, id, resp_tx, req.actor, req.origin);
                     return;
                 }
-                // 两种确认框（新开会话 / 写入用户会话）任一挂着就不再叠第二个：两个 modal
-                // 同时弹出来，用户根本分不清自己在批准哪一个。
-                if self.pending_open_consent.is_some() || self.pending_use_consent.is_some() {
+                // 同一时刻只挂一个确认框：两个 modal 叠在一起，用户根本分不清自己在批准哪一个。
+                if self.pending_open_consent.is_some() {
                     send_err(resp_tx, "已有一个请求正在等待用户确认，请稍候重试".into());
                     return;
                 }
@@ -2789,11 +2730,11 @@ impl App {
             }
             McpReqKind::CloseSession { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 // 只允许关「自己（这个 AI 进程）」开的会话：不能关用户的，也不能关另一个
-                // AI 开的——关闭权限不超过归属权（归属见 write_needs_consent）。
+                // AI 开的——关闭权限不超过归属权（归属见 session_owned_by）。
                 let s = &self.sessions[idx];
                 let can_close = s.ai_owned
                     && match (&s.ai_owner, caller_actor.as_deref()) {
@@ -2827,7 +2768,7 @@ impl App {
                 max_lines,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let text = self.sessions[idx]
@@ -2855,7 +2796,7 @@ impl App {
             }
             McpReqKind::SendInput { session_uid, text } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 // 和 run_command 同样的前置检查。此前这里既不看 connected、也不看 send 的
@@ -2893,7 +2834,7 @@ impl App {
                     return;
                 }
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -2948,7 +2889,7 @@ impl App {
                     return;
                 }
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -2994,7 +2935,7 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -3061,7 +3002,7 @@ impl App {
                     return;
                 };
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -3115,7 +3056,7 @@ impl App {
                     return;
                 };
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -3170,7 +3111,7 @@ impl App {
                     return;
                 }
                 let Some(src_idx) = self.session_idx_by_uid(src_session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(src_session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(src_session_uid, caller_actor.as_deref()));
                     return;
                 };
                 if !self.sessions[src_idx].connected {
@@ -3182,7 +3123,7 @@ impl App {
                     return;
                 }
                 let Some(dest_idx) = self.session_idx_by_uid(dest_session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(dest_session_uid));
+                    send_err(resp_tx, self.session_not_found_msg(dest_session_uid, caller_actor.as_deref()));
                     return;
                 };
                 if !self.sessions[dest_idx].connected {
@@ -3306,6 +3247,11 @@ mod timeout_chokepoint_tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        // 显式豁免：**不是**帧循环轮询的截止时刻、到点也不需要谁来处理的 `Instant` 字段。
+        // 每加一条都要写明理由——这份清单就是门禁的「逃生口」，不写理由等于把门拆了。
+        // - `last_used`（`tickets::Entry`）：连接凭据的最近使用时刻。过期是在下一次签发/核对时
+        //   顺手判断的（惰性），过期那一刻没有任何人在等结果，不需要排重绘。
+        const NOT_FRAME_POLLED: &[&str] = &["last_used"];
         let mut missing: Vec<&str> = Vec::new();
         for line in src.lines() {
             let line = line.trim();
@@ -3317,7 +3263,7 @@ mod timeout_chokepoint_tests {
             if line.starts_with("//") || name.contains(' ') || name.contains('(') {
                 continue;
             }
-            if !body.contains(name) {
+            if !body.contains(name) && !NOT_FRAME_POLLED.contains(&name) {
                 missing.push(name);
             }
         }
@@ -3391,77 +3337,39 @@ mod untrust_route_tests {
 }
 
 #[cfg(test)]
-mod write_consent_tests {
-    use super::{write_needs_consent, write_target, WriteTarget};
+mod session_ownership_tests {
+    use super::{first_foreign_session, session_owned_by};
 
-    /// **AI 只能随便动自己开的会话。** 用户自己开的那些标签里有他正在做的事——半截命令、
-    /// sudo 提示符、连着生产库的 psql——往里面打字是两路输入交织，轻则互相打断，重则改到
-    /// 他没想改的东西上。所以写它必须当面授权。
-    ///
-    /// 0.19 一度让「AI 操作无需逐次确认」这个设置从这里短路过去，用户当场否掉了：
-    /// 「AI 就算可以任意操作会话，也不能在不授权的情况下操作用户的会话」。这条门禁盯的就是
-    /// 那次错误——注意 `write_needs_consent` 的签名里没有任何设置项，想再加一个能绕过它的
-    /// 开关，就得先改这个函数，那时这条测试会把你拦下来。
+    /// **AI 只能碰自己开的会话**（用户 2026-09-18 拍板：「AI 只能读取自己打开的窗口，不允许
+    /// 读取和操作客户自己的窗口」）。用户的窗口、其它 AI 的窗口、旧版代理的共享池窗口，一律
+    /// 不是你的；不带 actor 的请求也不拥有任何窗口。
+    /// 反向对照：把 `session_owned_by` 改回「用户窗口放行」（`!ai_owned ||`），第一条挂。
     #[test]
-    fn writing_a_user_owned_session_always_needs_consent() {
-        assert!(
-            write_needs_consent(WriteTarget::User, None, false),
-            "用户自己开的会话、且本次运行没授权过——必须当面确认，任何设置都不该绕过"
-        );
-        assert!(
-            write_needs_consent(WriteTarget::User, Some("actor-x"), false),
-            "无论谁发起，写用户的会话都要授权"
-        );
+    fn only_the_opener_owns_a_session() {
+        assert!(!session_owned_by(false, None, Some("me")), "用户自己打开的窗口：不是任何 AI 的");
+        assert!(session_owned_by(true, Some("me"), Some("me")));
+        assert!(!session_owned_by(true, Some("other"), Some("me")), "另一个 AI 的窗口");
+        assert!(!session_owned_by(true, None, Some("me")), "旧版代理的共享池窗口");
+        assert!(!session_owned_by(true, None, None), "不带 actor 的请求不拥有任何窗口");
+        assert!(!session_owned_by(true, Some("me"), None));
     }
 
-    /// AI 自己开的会话随便用：`mine=true` 的窗口是只读给用户看的，他的键盘输入根本进不去，
-    /// 不存在两路输入交织的问题。归属按代理进程标识 `actor` 比对——不是「任何 AI 开的窗口
-    /// 都能随便写」。
+    /// 门禁的合并规则：涉及的会话里**任何一个**不是自己的，整条拒绝（跨会话拷贝两端都要是
+    /// 自己的）；不存在的 uid 不在这里拦（放过去回「会话不存在 + 你的会话列表」）。
+    /// 反向对照：把 `first_foreign_session` 改成只看第一个 uid，第二条断言挂。
     #[test]
-    fn ai_owned_sessions_need_no_consent_only_for_their_owner() {
-        let mine = write_target(true, Some("actor-me".into()));
-        assert!(!write_needs_consent(mine.clone(), Some("actor-me"), false));
-        assert!(!write_needs_consent(mine.clone(), Some("actor-me"), true));
-        // 另一个 AI 写我开的窗口：必须授权（且授权后不再问）。
-        assert!(write_needs_consent(mine.clone(), Some("actor-other"), false));
-        assert!(!write_needs_consent(mine, Some("actor-other"), true));
-    }
-
-    /// 旧代理（不带 actor）开的窗口 = 旧版「AI 窗口共享池」：旧代理（actor=None）维持原行为
-    /// 随便写；新代理写它要授权。这是行为兼容的边界——旧组合不回归，新组合收紧。
-    #[test]
-    fn legacy_shared_ai_windows_keep_legacy_behavior() {
-        let legacy = write_target(true, None);
-        assert!(!write_needs_consent(legacy.clone(), None, false));
-        assert!(write_needs_consent(legacy, Some("actor-new"), false));
-    }
-
-    /// 不带 actor 的新请求写「明确归属某个 actor 的窗口」：按「不是主人」处理，要授权。
-    #[test]
-    fn actorless_request_is_not_treated_as_owner() {
-        let owned = write_target(true, Some("actor-me".into()));
-        assert!(write_needs_consent(owned, None, false));
-    }
-
-    /// **会话不存在时不在这道门拦。** 这条既是体验（放过去才能回「会话不存在 + 当前可用会话
-    /// 列表」那条有用的报错，而不是含混的「需要授权」），也是安全边界：判定返回 true 的 uid
-    /// 会被选中，而选中之后的代码用 `expect` 断言它存在——一旦这里对 `Missing` 返回 true，
-    /// 任何一条点名不存在 uid 的写请求都会把 UI 线程打 panic。AI 手里攥着一个 iShell 重启前
-    /// 的旧 uid 就够了（重启后 uid 从 1 重新分配）。
-    #[test]
-    fn a_uid_with_no_session_is_not_gated_here() {
-        assert!(
-            !write_needs_consent(WriteTarget::Missing, Some("actor-x"), false),
-            "不存在的会话被判成「需要授权」——它会被选中，然后撞上 expect 直接 panic"
-        );
-        assert!(!write_needs_consent(WriteTarget::Missing, None, true));
-    }
-
-    /// 用户为某个会话授权过一次之后，本次运行内不再打扰他。
-    /// uid 由 `next_uid` 单调分配、只增不复用，所以不存在「授权被后开的会话捡到」。
-    #[test]
-    fn an_approved_session_is_not_asked_again() {
-        assert!(!write_needs_consent(WriteTarget::User, None, true));
+    fn any_foreign_session_in_the_request_refuses_it() {
+        let table = |uid: u64| match uid {
+            1 => Some((true, Some("me"))),
+            2 => Some((false, None)),             // 用户的窗口
+            3 => Some((true, Some("other"))),     // 别的 AI 的窗口
+            _ => None,                            // 不存在
+        };
+        assert_eq!(first_foreign_session(&[1], table, Some("me")), None);
+        assert_eq!(first_foreign_session(&[1, 2], table, Some("me")), Some(2));
+        assert_eq!(first_foreign_session(&[3], table, Some("me")), Some(3));
+        assert_eq!(first_foreign_session(&[99], table, Some("me")), None, "不存在的 uid 放过去");
+        assert_eq!(first_foreign_session(&[], table, Some("me")), None);
     }
 }
 
@@ -3700,7 +3608,9 @@ mod pair_handshake_tests {
             id,
             instance: None,
             origin: None,
-            actor: None,
+            // v6：握手要声明 actor 才签发凭据（签发的凭据绑定它）。
+            actor: Some(TEST_ACTOR.into()),
+            ticket: None,
             kind,
         })
         .unwrap();
@@ -3842,6 +3752,103 @@ mod pair_handshake_tests {
         assert!(err.contains("PairProve"), "{err}");
     }
 
+    /// 测试握手声明的进程身份。
+    const TEST_ACTOR: &str = "test-actor";
+
+    /// 发一条点名本实例的业务请求（`ListSessions`），带上给定凭据与自报 actor，返回原始响应。
+    async fn business_request(ticket: Option<String>, claimed_actor: &str) -> Result<McpReqResult, String> {
+        let (r, mut w) = serve_one().await.into_split();
+        let mut r = BufReader::new(r);
+        let mut line = serde_json::to_string(&McpRequest {
+            id: 1,
+            instance: Some(crate::store::mcp_instance_id().to_string()),
+            origin: None,
+            actor: Some(claimed_actor.into()),
+            ticket,
+            kind: McpReqKind::ListSessions,
+        })
+        .unwrap();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.expect("写请求");
+        let mut resp = String::new();
+        r.read_line(&mut resp).await.expect("读响应");
+        match serde_json::from_str::<McpResponse>(resp.trim()) {
+            Ok(r) => r.result,
+            // serve_one 的接收端已丢弃：通过了门禁的请求递不进 App，连接会被直接收掉——
+            // 这正说明它**通过了**凭据校验。
+            Err(_) => Ok(McpReqResult::Ok),
+        }
+    }
+
+    /// **iShell 端身份校验（v6）**：点名点对了实例、却没带有效凭据的业务请求，必须拒绝。
+    /// 此前这里只核对实例 id——而 id 任何人发一句匿名 Identify 就能问到，于是任何客户端都能
+    /// 驱动别人的 iShell（用户：「严禁操作其他人的客户端」）。
+    /// 反向对照：删掉 `handle_conn` 里凭据核对那一段，前两条断言当场挂。
+    #[tokio::test]
+    async fn a_request_without_a_valid_ticket_is_refused_even_with_the_right_instance() {
+        let err = business_request(None, TEST_ACTOR).await.expect_err("没带凭据必须拒绝");
+        assert!(err.starts_with(crate::mcp_protocol::TICKET_REJECTED), "{err}");
+        let err = business_request(Some("f".repeat(128)), TEST_ACTOR)
+            .await
+            .expect_err("伪造的凭据必须拒绝");
+        assert!(err.starts_with(crate::mcp_protocol::TICKET_REJECTED), "{err}");
+        // 握手拿到的凭据：放行。
+        let ticket = match handshake_with(&crate::store::mcp_pairing_token()).await {
+            Ok(McpReqResult::Instance { ticket, .. }) => ticket,
+            other => panic!("握手应签发凭据，实际：{other:?}"),
+        };
+        assert!(!ticket.is_empty(), "握手成功的应答里必须带凭据");
+        assert!(business_request(Some(ticket), TEST_ACTOR).await.is_ok());
+    }
+
+    /// 凭据绑定握手时声明的 actor，iShell 以它为准——请求里自报别人的 actor 没用。
+    /// 反向对照：把 `req.actor = Some(actor)` 那一行删掉，本条挂（自报的 impostor 会被采信）。
+    #[tokio::test]
+    async fn the_ticket_pins_the_actor_declared_at_handshake() {
+        let ticket = match handshake_with(&crate::store::mcp_pairing_token()).await {
+            Ok(McpReqResult::Instance { ticket, .. }) => ticket,
+            other => panic!("握手应签发凭据，实际：{other:?}"),
+        };
+        let (stream, mut rx) = serve_keep_rx().await;
+        let (r, mut w) = stream.into_split();
+        let mut line = serde_json::to_string(&McpRequest {
+            id: 1,
+            instance: Some(crate::store::mcp_instance_id().to_string()),
+            origin: None,
+            actor: Some("impostor".into()),
+            ticket: Some(ticket),
+            kind: McpReqKind::ListSessions,
+        })
+        .unwrap();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.expect("写请求");
+        let call = rx.recv().await.expect("带有效凭据的请求应递进 App");
+        assert_eq!(call.req.actor.as_deref(), Some(TEST_ACTOR), "应以凭据绑定的 actor 为准");
+        drop(r);
+    }
+
+    /// 与 `serve_one` 相同，但保留接收端，用来看请求递进 App 时的样子。
+    async fn serve_keep_rx() -> (UnixStream, mpsc::UnboundedReceiver<McpCall>) {
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-ticket-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let listener = UnixListener::bind(&dir).expect("绑定测试 socket");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ctx = egui::Context::default();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = sem.acquire_owned().await.expect("permit");
+            handle_conn(stream, tx, ctx, permit).await;
+        });
+        let s = UnixStream::connect(&dir).await.expect("连接测试 socket");
+        let _ = std::fs::remove_file(&dir);
+        (s, rx)
+    }
+
     /// 发一行请求，断言**零应答**（对端静默关闭连接）：token 不符的 `IdentifyPair` 探测在
     /// v5 下的期望行为——调用方什么也学不到。
     async fn assert_silenced(kind: McpReqKind) {
@@ -3852,6 +3859,7 @@ mod pair_handshake_tests {
             instance: None,
             origin: None,
             actor: None,
+            ticket: None,
             kind,
         })
         .unwrap();
@@ -3954,6 +3962,8 @@ mod upload_stream_tests {
             instance: Some(crate::store::mcp_instance_id().to_string()),
             origin: None,
             actor: None,
+            // v6：业务请求必须带 iShell 签发的凭据（这里直接签一张，握手本身另有测试）
+            ticket: super::tickets::issue("upload-test".into()),
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 1,
                 remote_path: "/tmp/whatever".into(),

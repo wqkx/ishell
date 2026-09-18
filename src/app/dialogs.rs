@@ -606,94 +606,6 @@ impl App {
         });
     }
 
-    /// AI 想对**不属于发起它的那个 AI 的**会话（用户的、或另一个 AI 开的）做写入类操作时的
-    /// 授权弹窗（见 `PendingUseConsent`）。
-    ///
-    /// 和上面「新开会话」那个确认框是两回事：那个批准的是"动用某条已保存连接的凭据"，
-    /// 这个批准的是"往我正在用的这个 shell 里插手"——AI 开的会话是只读的、不会和用户抢
-    /// 输入，用户自己的会话没这层保护，所以要单独确认，且授权只对这一个会话生效。
-    pub(super) fn handle_ai_use_consent(&mut self, ctx: &egui::Context) {
-        let Some((title, action, owner_label, origin)) = self
-            .pending_use_consent
-            .as_ref()
-            .map(|p| (p.title.clone(), p.action.clone(), p.owner_label.clone(), p.origin.clone()))
-        else {
-            return;
-        };
-        egui::Modal::new(egui::Id::new("ai_use_consent_modal")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new(crate::i18n::tr(
-                        "AI 请求操作你的终端会话",
-                        "AI wants to act in your terminal session",
-                    ))
-                    .size(16.0)
-                    .strong(),
-                );
-                ui.add_space(6.0);
-                if let Some(origin) = &origin {
-                    ui.label(
-                        RichText::new(format!("{}：{origin}", crate::i18n::tr("来源", "From")))
-                            .size(12.0)
-                            .color(Palette::TEXT_DIM),
-                    );
-                    ui.add_space(4.0);
-                }
-                ui.label(match (&owner_label, crate::i18n::current()) {
-                    // 目标是另一个 AI 开的窗口：文案要说明归属——它不是「你的」会话，
-                    // 而是某个 AI 的专用窗口，被别的 AI 插手。
-                    (Some(label), crate::i18n::Lang::Zh) => format!(
-                        "“{title}” 是另一个 AI（{label}）开的专用会话，当前这个 AI 想在里面{action}。\n\n\
-                         允许后两个 AI 会往同一个 shell 里输入，互相打断、哨兵标记被搅乱的风险都在。\
-                         更稳妥的做法是拒绝，让发起方用 open_session 开一个它自己的会话。"
-                    ),
-                    (Some(label), crate::i18n::Lang::En) => format!(
-                        "“{title}” is a dedicated session opened by another AI ({label}), and the \
-                         AI you are talking to wants to {action} in it.\n\n\
-                         If you allow this, two AIs will type into the same shell — they can \
-                         interrupt each other and corrupt the sentinel lines that detect command \
-                         completion. Denying is usually safer: the caller can open_session to get \
-                         a session of its own."
-                    ),
-                    (None, crate::i18n::Lang::Zh) => format!(
-                        "“{title}” 是你自己打开的会话，AI 想在里面{action}。\n\n\
-                         允许后你和 AI 会同时能往这个 shell 里输入，两边的按键可能互相打断。\
-                         更稳妥的做法是拒绝，让 AI 用 open_session 开一个它专用的只读会话。"
-                    ),
-                    (None, crate::i18n::Lang::En) => format!(
-                        "“{title}” is a session you opened yourself, and AI wants to {action} in it.\n\n\
-                         If you allow this, you and AI can both type into the same shell and your \
-                         keystrokes may interleave. Denying is usually safer: AI can call \
-                         open_session to get a read-only session of its own."
-                    ),
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(crate::i18n::tr(
-                        "允许后这个会话在本次运行期间不再询问（重启 iShell 后失效）",
-                        "Allowing stops the prompts for this session until iShell restarts",
-                    ))
-                    .size(11.0)
-                    .color(Palette::TEXT_DIM),
-                );
-            });
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let bw = 96.0;
-                let total = bw * 2.0 + ui.spacing().item_spacing.x;
-                let space = ((ui.available_width() - total) / 2.0).max(0.0);
-                ui.add_space(space);
-                if dialog_button(ui, crate::i18n::tr("允许", "Allow"), Some(Palette::ACCENT), bw) {
-                    self.resolve_use_consent(true);
-                }
-                if dialog_button(ui, crate::i18n::tr("拒绝", "Deny"), Some(Palette::DANGER), bw) {
-                    self.resolve_use_consent(false);
-                }
-            });
-        });
-    }
-
     /// 一个 AI 客户端想接管这个 iShell 窗口。
     ///
     /// 两种场景都会触发，弹窗文案必须同时覆盖：
@@ -710,10 +622,10 @@ impl App {
         if self.pending_bind_consent.is_none() {
             return;
         }
-        // 另外两个授权框优先：它们问的是「要不要动这个具体会话」，用户正在回答；绑定框只问
-        // 「你想让我用哪个窗口」，可以等。两个 Modal 叠在一起只会让人不知道自己在答哪个。
-        // 等它们结束后这个框会在后续帧里自然出现（清扫每帧都在按 deadline 排定时重绘）。
-        if self.pending_open_consent.is_some() || self.pending_use_consent.is_some() {
+        // 新开会话的确认框优先：它问的是「要不要用某条连接的凭据开会话」，用户正在回答；绑定框
+        // 只问「你想让我用哪个窗口」，可以等。两个 Modal 叠在一起只会让人不知道自己在答哪个。
+        // 等它结束后这个框会在后续帧里自然出现（清扫每帧都在按 deadline 排定时重绘）。
+        if self.pending_open_consent.is_some() {
             return;
         }
         let origin = self
@@ -757,9 +669,9 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(crate::i18n::tr(
-                        "允许后，这个 AI 绑定到这台 iShell：写你自己打开的会话仍会先弹窗征求同意",
-                        "Once allowed, this AI is bound to this iShell; writing into sessions \
-                         you opened yourself still asks for consent",
+                        "允许后，这个 AI 绑定到这台 iShell：它只能读写自己开的会话，你自己打开的窗口它看不到也碰不了",
+                        "Once allowed, this AI is bound to this iShell: it can only read and act in \
+                         sessions it opens itself — windows you opened are invisible and off-limits to it",
                     ))
                     .size(11.0)
                     .color(Palette::TEXT_DIM),

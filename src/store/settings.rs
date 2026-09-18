@@ -297,10 +297,10 @@ const MCP_CONSENT_DEFAULT: bool = true;
 /// 也不再看内容，那道闸门既挡不住什么又把体验拖垮；真正的授权边界是总开关——不开它，
 /// socket 根本不监听。
 ///
-/// # 它**管不到**「写用户自己的会话」
+/// # 它**管不到**「碰别人的会话」
 ///
-/// 那一档是硬的：AI 只能随便动**自己开的**会话，要动用户自己开的标签一律当面授权，
-/// **不受本行为影响**（见 `app::mcp_bridge::write_needs_consent`）。0.19 一度让这个开关
+/// 那一档是硬的：AI 只能读写**自己开的**会话，用户自己打开的窗口和其它 AI 的窗口一律拒绝、
+/// 没有授权弹窗，**不受本行为影响**（见 `app::mcp_bridge::session_owned_by`）。0.19 一度让这个开关
 /// 从那里短路过去，用户明确否掉了：「AI 就算可以任意操作会话，也不能在不授权的情况下操作
 /// 用户的会话，AI 只能操作自己开的会话」。
 ///
@@ -397,23 +397,30 @@ pub fn mcp_socket_path() -> Option<PathBuf> {
     Some(config_dir()?.join(format!("mcp-{}.sock", mcp_instance_id())))
 }
 
+/// 配对 token 的落盘文件。**v6 起换了文件名**（旧的是 `mcp_pairing_token`），效果是每台电脑
+/// 升级后自动生成一个全新的 token、旧 token 作废。
+///
+/// 为什么要作废旧 token：多人共用 AI 服务器账号时，有人把自己的旧 token 写进了共享的
+/// `~/.claude.json` MCP 配置，它会覆盖每个人终端注入的 token、把所有人的 AI 都路由到他的
+/// 电脑（2026-09-18 生产实测）。换新 token 之后，那个写死的旧值再也匹配不上任何 iShell，
+/// 不用去动别人共用的配置文件就自然失效。旧文件原样留着，不删（删了无益，留着便于排查）。
 fn mcp_pairing_token_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("mcp_pairing_token"))
+    Some(config_dir()?.join("mcp_pairing_token_v2"))
 }
 
 /// 本安装的 **MCP 配对 token**：稳定、每安装唯一、跨重启不变。首次调用时自动生成并以
 /// `0600` 持久化。
 ///
 /// 用途：多台电脑共用同一台 AI 服务器的同一个账号时，各家 iShell 反向转发的 socket 会全堆在
-/// 同一个目录里，代理无从区分谁是谁。操作者把本机 token 放进环境变量 `ISHELL_MCP_TOKEN`
-/// （终端自动注入，或手动写进 AI 的 MCP server env）——代理与 iShell 之间跑一次**双向
+/// 同一个目录里，代理无从区分谁是谁。iShell 在自己的终端会话里注入环境变量
+/// `ISHELL_PAIR_TOKEN`（AI 不在 iShell 终端里启动时，手动加在启动命令前面；**不要**写进多人
+/// 共用的 MCP 配置）——代理与 iShell 之间跑一次**双向
 /// 挑战-应答**握手（`McpReqKind::PairHello`/`PairProve`）来互证知道该 token，请求只落到
 /// 自己电脑。**token 本身永不过线**：线上只出现 `HMAC(token, 两个随机数)`，任何一方都不会
 /// 把密钥出示给尚未证明过身份的对端。
 ///
-/// 因此这个 token 是货真价实的 HMAC 密钥，长度就是安全边界：新生成的是 128 位。更早版本
-/// 生成的是 64 位（16 个十六进制字符），仍然可用，但若在意离线暴力破解，删掉
-/// `mcp_pairing_token` 文件让它重新生成、并同步更新各处的 `ISHELL_MCP_TOKEN` 即可。
+/// 因此这个 token 是货真价实的 HMAC 密钥，长度就是安全边界：生成的是 128 位。要手动换新，
+/// 删掉 `mcp_pairing_token_v2` 文件让它重新生成即可（终端会在下次连接时自动注入新值）。
 ///
 /// 与 [`mcp_instance_id`] 的关键区别：instance_id 是**每进程**的、随进程生灭（用于同机多开
 /// 去重），**绝不持久化**；pairing token 是**每安装**的、必须**稳定持久**。二者用途正交。

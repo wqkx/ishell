@@ -1090,16 +1090,14 @@ fn pair_inject_allowed(
     auto_pair_on && mcp_on && !ai_owned && !already_injected
 }
 
-/// 往会话终端注入 `export ISHELL_MCP_TOKEN=<本机配对 token>`（回显吞除）。
+/// 往会话终端注入配对 token（`ISHELL_PAIR_TOKEN` + 兼容旧名 `ISHELL_MCP_TOKEN`，见
+/// `session::pair_token_export_cmd`；回显吞除）。
 /// 此后该 shell 里启动的 AI / ishell-mcp 子进程自动继承这个环境变量，MCP 绑定走
 /// ishell-mcp 既有的 token 匹配路径（`bind_instance`），请求精确路由回这台电脑。
 /// 前导空格：配合 bash/zsh 常见的 HISTCONTROL=ignorespace，不进 shell 历史。
 /// token 是 16 位 hex（无 shell 特殊字符），无需引号。
 fn inject_mcp_token(s: &mut super::Session) {
-    let cmd = format!(
-        " export ISHELL_MCP_TOKEN={}",
-        crate::store::mcp_pairing_token()
-    );
+    let cmd = super::session::pair_token_export_cmd();
     let _ = s
         .cmd_tx
         .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
