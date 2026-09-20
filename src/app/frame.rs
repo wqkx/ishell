@@ -234,8 +234,8 @@ impl App {
                 s.pair_inject_skipped = true;
                 pair_skipped_typed = true;
                 s.status = crate::i18n::tr(
-                    "已跳过配对标识自动注入（连上后敲过键盘）。在此启动的 AI 可能绑到别人的机器；可在终端右键「立即注入配对标识」补救。",
-                    "Skipped auto-injecting the pairing token (you typed after connect). An AI started here may bind to another machine. Fix: terminal right-click → Inject pairing token now.",
+                    "已跳过配对标识自动注入（连上后敲过键盘）。在此启动的 AI 没有配对身份，绑定会被拒绝；可在终端右键「立即注入配对标识」补救。",
+                    "Skipped auto-injecting the pairing token (you typed after connect). An AI started here has no pairing identity and bind will be refused. Fix: terminal right-click → Inject pairing token now.",
                 )
                 .to_string();
             }
@@ -244,11 +244,11 @@ impl App {
             self.toast = Some((
                 crate::i18n::tr(
                     "有会话因连上后敲过键盘而跳过配对标识自动注入：在其中启动的 AI 没有配对\
-                     身份，绑定请求会对服务器上所有 iShell 弹窗。可在终端右键菜单「立即注入\
+                     身份，绑定会被拒绝（不会对其他 iShell 弹窗）。可在终端右键菜单「立即注入\
                      配对标识」补救。",
                     "A session skipped auto-injecting the pairing token (you typed after it \
-                     connected): an AI started there has no pairing identity, and its bind \
-                     request pops up on EVERY iShell on this server. Fix: terminal right-click \
+                     connected): an AI started there has no pairing identity, and bind will \
+                     be refused (it will not pop up on other iShells). Fix: terminal right-click \
                      menu → \"Inject pairing token now\".",
                 )
                 .to_string(),

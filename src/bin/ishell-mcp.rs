@@ -407,11 +407,60 @@ fn reject_if_host_mismatch(peer_host: &str) -> Result<(), String> {
     if mcp_protocol::hosts_match(&mine, peer_host) {
         return Ok(());
     }
-    Err(format!(
-        "配对 token 对应的 iShell 在主机 {peer_host}，但本 AI 是从主机 {mine} 的终端启动的。\
+    Err(host_mismatch_msg(&mine, std::slice::from_ref(&peer_host)))
+}
+
+/// 绑定弹窗发出去之前，按终端注入的 `ISHELL_HOST` 筛掉别的机器。
+///
+/// 只在绑定成功后再 `reject_if_host_mismatch` 会先让别的电脑弹出「允许绑定」，用户点了
+/// 才报主机不一致——一对多场景里这是误导，也打扰了不相关的人。旧 GUI（空/`unknown-host`）
+/// 无法校验，仍保留给后续 `reject_if_host_mismatch` 放行。没注入主机名时不过滤（IDE 启动）。
+#[cfg(unix)]
+fn keep_instances_for_launch_host(
+    found: Vec<(String, u32, std::path::PathBuf, String, String)>,
+    launch: Option<&str>,
+) -> Result<Vec<(String, u32, std::path::PathBuf, String, String)>, String> {
+    let Some(mine) = launch.filter(|h| !h.is_empty() && *h != "unknown-host") else {
+        return Ok(found);
+    };
+    // 本来就没人配对成功：把「空列表」交给外层报 token/版本，不要冒充主机不一致。
+    if found.is_empty() {
+        return Ok(found);
+    }
+    let seen: Vec<String> = found
+        .iter()
+        .map(|(_, _, _, _, h)| h.clone())
+        .collect();
+    let kept: Vec<_> = found
+        .into_iter()
+        .filter(|(_, _, _, _, h)| {
+            h.is_empty() || h == "unknown-host" || mcp_protocol::hosts_match(mine, h)
+        })
+        .collect();
+    if kept.is_empty() {
+        let listed: Vec<&str> = seen
+            .iter()
+            .map(String::as_str)
+            .filter(|h| !h.is_empty() && *h != "unknown-host")
+            .collect();
+        return Err(host_mismatch_msg(mine, &listed));
+    }
+    Ok(kept)
+}
+
+#[cfg(unix)]
+fn host_mismatch_msg(mine: &str, peers: &[&str]) -> String {
+    let where_ = if peers.is_empty() {
+        "未知主机".to_string()
+    } else {
+        peers.join("、")
+    };
+    format!(
+        "配对 token 对应的 iShell 不在主机 {mine} 上（发现的实例在 {where_}）。\
          这通常意味着配置里的 {CONFIG_TOKEN_VAR} 来自另一台机器，或多台机器同步了同一份 token。\
-         请在你当前这台 iShell 里重新注入配对标识（终端右键），并从 MCP 配置中删掉别人的 token。"
-    ))
+         请在你当前这台 iShell 的终端里启动 AI（会自动注入 {LAUNCH_TOKEN_VAR} 与 {LAUNCH_HOST_VAR}），\
+         并从 MCP 配置中删掉别人的 token。"
+    )
 }
 
 /// [`pairing_token`] 的纯判定：`(选定的 token, 是否推翻了配置里的值, 是否仅用了配置兜底)`。
@@ -500,7 +549,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String), String>
              1. 在你自己那台 iShell 的终端会话里启动 AI：iShell 会自动注入配对 token，多数情\
              况零配置即可；\n\
              2. AI 不在 iShell 终端里启动时：在那台 iShell 的 MCP 设置里点「复制配对配置」，\
-             启动 AI 时把它加在命令前面（如 `ISHELL_PAIR_TOKEN=… claude`）。**不要**写进 AI 的\
+             启动 AI 时把它加在命令前面（如 `ISHELL_PAIR_TOKEN=… ISHELL_HOST=… claude`）。**不要**写进 AI 的\
              全局 MCP 配置（如 ~/.claude.json 的 user 级 env）——多人共用服务器账号时那份配置\
              是所有人共用的，会把所有人的 AI 都绑到你的电脑上。"
                 .into(),
@@ -539,6 +588,12 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String), String>
             found.push((id, ver, path, ticket, host));
         }
     }
+    // 多机共用 token 时先告警（过滤前，才能看见「不同主机」），再按 ISHELL_HOST 丢掉
+    // 别人的电脑——否则 choose_instance 会先向那些窗口发 Bind 弹窗。
+    if found.len() > 1 {
+        warn_if_shared_token_across_hosts(&found);
+    }
+    let mut found = keep_instances_for_launch_host(found, launch_host().as_deref())?;
     match found.len() {
         0 => Err(if let Some(ver) = stale {
             // 有活着的 iShell 答了话，只是版本对不上——这是最常见的「升了 GUI 忘换代理」，
@@ -558,11 +613,8 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String), String>
         }
         // 多个：同一个 token 被多个 iShell 进程认领。最常见的是**同一台电脑**开了两个 iShell
         // （token 按安装存、实例 id 按进程生成），这是正常的多开，用弹窗让用户点窗口选。
-        // 若它们报告了**不同主机名**，更像是配置同步让多台机器共用了 token。
-        _ => {
-            warn_if_shared_token_across_hosts(&found);
-            choose_instance(found).await
-        }
+        // 不同主机的实例已在上面按 ISHELL_HOST 滤掉，不会再弹到别人电脑上。
+        _ => choose_instance(found).await,
     }
 }
 
@@ -979,6 +1031,9 @@ fn validate_caller_path(path_str: &str, field: &str) -> Result<(), String> {
     }
     if path_str.split('/').any(|seg| seg == "." || seg == "..") {
         return Err(format!("{field} 不能包含 \".\" 或 \"..\" 路径段"));
+    }
+    if path.file_name().is_none() {
+        return Err(format!("{field} 缺少有效的文件名"));
     }
     Ok(())
 }
@@ -1430,6 +1485,7 @@ impl IshellMcp {
     ) -> Result<CallToolResult, McpError> {
         match call(McpReqKind::ListSessions).await {
             Ok(McpReqResult::Sessions(mut list)) => {
+                let had_filter = filter.as_ref().is_some_and(|f| !f.trim().is_empty());
                 if let Some(f) = filter.map(|f| f.to_lowercase()).filter(|f| !f.is_empty()) {
                     list.retain(|s| {
                         s.title.to_lowercase().contains(&f)
@@ -1437,16 +1493,19 @@ impl IshellMcp {
                     });
                 }
                 if list.is_empty() {
+                    let note = if had_filter {
+                        "没有标题或主机名匹配该 filter 的会话。list_sessions 只列出你自己用 \
+                         open_session 开的会话；放宽或去掉 filter 再试，或 list_saved_connections \
+                         → open_session 开新会话。"
+                    } else {
+                        "说明：列表为空是因为你只能看到自己用 open_session 开的会话；\
+                         用户自己打开的窗口不会出现在这里（硬规则，没有授权弹窗）。\
+                         要操作某台机器请 list_saved_connections → open_session。\
+                         绑定的是启动时选定的 iShell 实例，不是用户当前正在看的那个窗口。"
+                    };
                     return Ok(CallToolResult::success(vec![
                         ContentBlock::text("[]"),
-                        ContentBlock::text(
-                            "说明：列表为空是因为你只能看到自己用 open_session 开的会话；\
-                             用户自己打开的窗口不会出现在这里（硬规则，没有授权弹窗）。\
-                             要操作某台机器请 list_saved_connections → open_session。\
-                             若你其实是想跟着用户当前正在看的那个客户端走，那不是本列表的问题——\
-                             绑定的是启动时选定的 iShell 实例。"
-                                .to_string(),
-                        ),
+                        ContentBlock::text(note.to_string()),
                     ]));
                 }
                 text_result(Ok(McpReqResult::Sessions(list)))
@@ -1457,7 +1516,8 @@ impl IshellMcp {
 
     #[tool(
         description = "在指定终端会话里运行一条命令，等待其执行完成（或超时）后返回输出与退出码。\
-                        命令和输出会实时显示在用户正在看的那个终端标签里，效果等同于用户亲自输入。\
+                        命令和输出会实时显示在该会话对应的终端标签里（AI 自己开的会话通常在后台，\
+                        不会抢走用户当前正在看的窗口），效果等同于用户亲自输入。\
                         会话还在连接/认证中时（open_session 刚返回就是这状态）**会自动等它连上，最\
                         多约 20 秒**——一般不用先 list_sessions 确认 connected 再发。另一个该知道的\
                         边界：本工具的等待可能被 MCP 客户端的空闲超时切断（客户端等不到响应会自行\
@@ -1875,10 +1935,12 @@ impl IshellMcp {
                     「run_id 不存在或已结束」而你不确定命令执行没有，用 read_screen/read_history \
                     核实再决定，勿盲目重试有副作用的命令。看到「命令可能已执行、结果未知」先核实\
                     屏幕。报「已经有一个 poll_run 在等待」说明旧等待者还挂着：别并发 poll，旧等待\
-                    者不要了就 interrupt 释放。报「未检测到 iShell」或绑定/握手被拒：说明启动你的那个终端\
-                    没拿到配对 token——请用户在自己的 iShell 终端里启动 AI（iShell 会自动注入），或\
-                    在终端右键「立即注入配对标识」后重启 AI；在 tmux/screen 里启动的 AI 继承的是会话\
-                    **之前**的环境，换到注入后的 shell 里启动。\n\
+                    者不要了就 interrupt 释放。报「未检测到 iShell」或绑定/握手被拒：按错误文案排查，\
+                    常见原因不只是缺 token——① 启动你的那个终端没拿到配对 token（请用户在自己的 \
+                    iShell 终端里启动 AI，或右键「立即注入配对标识」后重启 AI；tmux/screen 继承的是\
+                    会话**之前**的环境）；② iShell 刚重启过（进程换了，重新发起 MCP 连接）；③ 配对 \
+                    token 来自另一台机器（错误会写明主机不一致，从 MCP 配置删掉别人的 token）；④ \
+                    SSH 反向转发断了，或设置里关掉了 AI 控制。不要把绑定失败一律当成缺 token。\n\
                     定位目录与环境：先 list_sessions 的 cwd 字段 → 再看 read_screen 里提示符显示的\
                     路径 → 还定不了就 run_command 跑 `pwd; ls; git rev-parse --show-toplevel \
                     2>/dev/null` 这类只读探测；用户没告诉你路径就问他，别猜。\n\
@@ -1898,8 +1960,8 @@ impl IshellMcp {
                     · 在 e5 上跑测试：list_sessions 看你自己有没有连着 e5 的会话；没有就 \
                     open_session 开一个 → run_command 先 cd 到仓库（路径不确定就问用户）再 \
                     ./run_tests.sh → 超时 poll_run 续等 → read_screen 看结果。\n\
-                    · 机器还没有打开会话：list_saved_connections 核对名字 → open_session → 等 \
-                    connected=true → run_command `pwd; ls` 探测环境 → 干活 → close_session。\n\
+                    · 机器还没有打开会话：list_saved_connections 核对名字 → open_session → \
+                    直接 run_command `pwd; ls`（会自动等连上）探测环境 → 干活 → close_session。\n\
                     · 长构建/长测试：run_command timeout_ms 给足直接等；MCP 客户端自己超时断了就 \
                     poll_run（省略 run_id）续等同一条运行，绝不重发命令。\n\
                     · 终端卡着交互程序（vim/top/sudo 密码提示）：先 read_screen 看前台是什么 → \
@@ -2225,5 +2287,85 @@ mod tests {
         assert!(!is_reverse_forward_sock(std::path::Path::new(
             "/tmp/mcp-123.sock"
         )));
+    }
+
+    fn found_inst(id: &str, host: &str) -> (String, u32, std::path::PathBuf, String, String) {
+        (
+            id.into(),
+            super::mcp_protocol::MCP_PROTOCOL_VERSION,
+            std::path::PathBuf::from(format!("/tmp/{id}.sock")),
+            "t".into(),
+            host.into(),
+        )
+    }
+
+    /// 一对多：带 ISHELL_HOST 时必须在发 Bind 弹窗之前丢掉别人的电脑。
+    /// 反向对照：把 keep_instances_for_launch_host 改成原样返回，第一条断言挂。
+    #[test]
+    fn host_filter_drops_other_machines_before_bind_popup() {
+        use super::keep_instances_for_launch_host;
+        let kept = keep_instances_for_launch_host(
+            vec![found_inst("a", "other"), found_inst("b", "mine")],
+            Some("mine"),
+        )
+        .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "b");
+    }
+
+    #[test]
+    fn host_filter_errors_when_all_instances_are_elsewhere() {
+        use super::keep_instances_for_launch_host;
+        let err = keep_instances_for_launch_host(vec![found_inst("a", "other")], Some("mine"))
+            .unwrap_err();
+        assert!(err.contains("other") && err.contains("mine"), "{err}");
+    }
+
+    #[test]
+    fn host_filter_keeps_unknown_host_for_old_gui() {
+        use super::keep_instances_for_launch_host;
+        let kept = keep_instances_for_launch_host(
+            vec![
+                found_inst("a", "unknown-host"),
+                found_inst("b", ""),
+                found_inst("c", "other"),
+            ],
+            Some("mine"),
+        )
+        .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].0, "a");
+        assert_eq!(kept[1].0, "b");
+    }
+
+    #[test]
+    fn host_filter_noop_without_launch_host() {
+        use super::keep_instances_for_launch_host;
+        let kept = keep_instances_for_launch_host(vec![found_inst("a", "other")], None).unwrap();
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn host_filter_leaves_empty_list_for_token_mismatch() {
+        use super::keep_instances_for_launch_host;
+        let kept = keep_instances_for_launch_host(Vec::new(), Some("mine")).unwrap();
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn host_filter_accepts_short_name_vs_fqdn() {
+        use super::keep_instances_for_launch_host;
+        let kept =
+            keep_instances_for_launch_host(vec![found_inst("a", "box.lan")], Some("box")).unwrap();
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn caller_path_rejects_root_like_gui_local_path() {
+        use super::validate_caller_path;
+        assert!(validate_caller_path("/", "local_path").is_err());
+        assert!(validate_caller_path("/tmp/notes.txt", "local_path").is_ok());
+        assert!(validate_caller_path("/tmp/./notes.txt", "local_path").is_err());
+        assert!(validate_caller_path("notes.txt", "local_path").is_err());
     }
 }

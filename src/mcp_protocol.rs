@@ -191,9 +191,9 @@ pub struct McpSessionInfo {
     #[serde(default)]
     pub ai_owner: Option<String>,
     /// 这个 AI 窗口是不是**发起本次 list_sessions 的这个 AI** 自己开的（按代理进程的
-    /// `actor` 身份比对）。`true` = 你的专用窗口，随便用；`false` 而 `ai_owned=true` =
-    /// **另一个 AI** 开的窗口，写入会弹窗让用户授权。旧代理（不带 actor）开的窗口对任何
-    /// 调用方都报 `false`——它们属于旧版的共享池。
+    /// `actor` 身份比对）。v6 起 `list_sessions` 只返回自己的会话，所以列表里恒为 `true`；
+    /// 字段保留是线格式兼容。其它 AI 的窗口不会出现在列表里，读写也是硬拒绝（没有授权弹窗）。
+    /// 旧代理（不带 actor）开的窗口对任何调用方都报 `false`——它们属于旧版的共享池。
     #[serde(default)]
     pub mine: bool,
     /// 配对 token（`ISHELL_MCP_TOKEN`）是否已注入这个会话的 shell。`false` 意味着在该

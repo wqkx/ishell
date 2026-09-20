@@ -163,8 +163,8 @@ impl App {
                 }
                 // 右键菜单「立即注入配对标识」：用户亲手点的 = 本人同意，即刻注入，绕过
                 // 「连接后没敲过键」的自动注入闸门——那种会话自动循环只会静默跳过（后果
-                // 是 AI 无配对身份、绑定广播弹到别人的窗口，见 advance_auto_injections 的
-                // 提示分支），这里是它的手动补救。
+                // 是 AI 无配对身份、绑定会被拒，v5 起没有 token 不会广播弹窗，见
+                // advance_auto_injections 的提示分支），这里是它的手动补救。
                 if s.terminal.take_pair_inject_request() {
                     s.status = match s.inject_pair_token_now() {
                         Ok(()) => crate::i18n::tr("已注入配对标识", "Pairing token injected").into(),

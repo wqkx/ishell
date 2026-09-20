@@ -2444,6 +2444,20 @@ impl App {
     }
 
     fn handle_mcp_call(&mut self, call: McpCall) {
+        // 设置里关掉 MCP 后立刻拒绝业务请求（含 Bind 弹窗）。监听 socket 仍要等重启才撤，
+        // 但用户把开关拧掉的意图是「现在别再动我的终端」，不能再等一次重启才生效。
+        if !crate::store::load_mcp_consent() {
+            let id = call.req.id;
+            let _ = call.resp_tx.send(McpResponse {
+                id,
+                result: Err(
+                    "用户已在设置里关闭「允许 AI 通过 MCP 控制终端」，本次请求未执行。\
+                     重新开启后需要重启 iShell。"
+                        .into(),
+                ),
+            });
+            return;
+        }
         // 先过会话门禁：只有「涉及的会话全是发起方自己开的」才继续。
         let Some(call) = self.gate_foreign_sessions(call) else {
             return;

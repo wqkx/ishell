@@ -165,8 +165,8 @@ pub fn view_context_menu(resp: &egui::Response) {
                     .checkbox(
                         &mut mcp_on,
                         crate::i18n::tr(
-                            "允许 AI 通过 MCP 控制终端（重启生效）",
-                            "Allow AI to control terminal via MCP (restart)",
+                            "允许 AI 通过 MCP 控制终端（关立即停，开需重启）",
+                            "Allow AI to control terminal via MCP (off now, on needs restart)",
                         ),
                     )
                     .on_hover_text(crate::i18n::tr(
@@ -174,13 +174,15 @@ pub fn view_context_menu(resp: &egui::Response) {
                          · 只监听本机 Unix socket（0600），不开任何网络端口\n\
                          · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
                          · 多机共用一台 AI 服务器时：终端会话会自动注入配对 token（见下方\
-                         「配对 token」），代理只回你这台电脑",
+                         「配对 token」），代理只回你这台电脑\n\
+                         · 关闭后立刻拒绝新的 MCP 操作；重新打开后需要重启 iShell 才会开始监听",
                         "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
                          read/write files.\n\
                          · Local Unix socket only (mode 0600) — no network port is opened\n\
                          · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
                          · Sharing one AI server: terminal sessions auto-inject the pairing token \
-                         (see \"Pairing token\" below), so the proxy answers only YOUR computer",
+                         (see \"Pairing token\" below), so the proxy answers only YOUR computer\n\
+                         · Turning off refuses new MCP ops immediately; turning on needs an iShell restart to listen",
                     ))
                     .clicked()
                 {
@@ -215,16 +217,17 @@ pub fn view_context_menu(resp: &egui::Response) {
                             crate::i18n::tr("复制配对配置", "Copy pairing config")
                         ))
                         .on_hover_text(crate::i18n::tr(
-                            "iShell 终端会自动注入配对 token，多数情况无需手动配置。\n\
+                            "iShell 终端会自动注入配对 token 和主机名，多数情况无需手动配置。\n\
                              仅当 AI 不在 iShell 终端里启动时，把复制的内容加在启动命令前面\
-                             （如 `ISHELL_PAIR_TOKEN=… claude`）。\n\
+                             （如 `ISHELL_PAIR_TOKEN=… ISHELL_HOST=… claude`）。\n\
                              不要写进 AI 的全局 MCP 配置（如 ~/.claude.json 的 user 级 env）：\
                              多人共用服务器账号时那份配置是所有人共用的，会把所有人的 AI 都绑到\
                              你这台电脑上。",
-                            "iShell terminals auto-inject the pairing token; manual setup is \
-                             usually unnecessary.\n\
+                            "iShell terminals auto-inject the pairing token and hostname; manual \
+                             setup is usually unnecessary.\n\
                              Only if the AI is not started inside an iShell terminal, prefix its \
-                             launch command with the copied text (e.g. `ISHELL_PAIR_TOKEN=… claude`).\n\
+                             launch command with the copied text (e.g. `ISHELL_PAIR_TOKEN=… \
+                             ISHELL_HOST=… claude`).\n\
                              Do NOT put it in the AI's global MCP config (e.g. user-level env in \
                              ~/.claude.json): on a server account shared by several people that \
                              config is shared, and it would bind everyone's AI to YOUR computer.",
@@ -232,7 +235,14 @@ pub fn view_context_menu(resp: &egui::Response) {
                         .clicked()
                     {
                         // 新变量名：只有它不会被别人写进共享 MCP 配置的 ISHELL_MCP_TOKEN 覆盖。
-                        ui.ctx().copy_text(format!("ISHELL_PAIR_TOKEN={token}"));
+                        // 一并带上 ISHELL_HOST，手动前缀才和终端注入一样能挡住绑到别的机器。
+                        let host = crate::mcp_protocol::local_hostname();
+                        let text = if host.is_empty() || host == "unknown-host" {
+                            format!("ISHELL_PAIR_TOKEN={token}")
+                        } else {
+                            format!("ISHELL_PAIR_TOKEN={token} ISHELL_HOST={host}")
+                        };
+                        ui.ctx().copy_text(text);
                         ui.close();
                     }
                 }
