@@ -233,6 +233,11 @@ impl App {
             } else if !s.pair_inject_skipped && s.shell_idle_for_injection_but_typed() {
                 s.pair_inject_skipped = true;
                 pair_skipped_typed = true;
+                s.status = crate::i18n::tr(
+                    "已跳过配对标识自动注入（连上后敲过键盘）。在此启动的 AI 可能绑到别人的机器；可在终端右键「立即注入配对标识」补救。",
+                    "Skipped auto-injecting the pairing token (you typed after connect). An AI started here may bind to another machine. Fix: terminal right-click → Inject pairing token now.",
+                )
+                .to_string();
             }
         }
         if pair_skipped_typed {

@@ -651,6 +651,57 @@ pub struct McpRequest {
 /// 重新握手、重试一次（凭据按空闲时长过期，iShell 也可能淘汰旧凭据）。
 pub const TICKET_REJECTED: &str = "连接凭据无效或已过期";
 
+/// 本机主机名：注入 `ISHELL_HOST`、填进 `Instance.host`。取不到时返回 `"unknown-host"`，
+/// 调用方应把空/unknown 当成「无法校验」，不要据此拒绝绑定。
+pub fn local_hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let raw = String::from_utf8_lossy(&buf[..len]);
+            let cleaned = sanitize_hostname(&raw);
+            if !cleaned.is_empty() {
+                return cleaned;
+            }
+        }
+    }
+    let fallback = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".into());
+    let cleaned = sanitize_hostname(&fallback);
+    if cleaned.is_empty() {
+        "unknown-host".into()
+    } else {
+        cleaned
+    }
+}
+
+/// 主机名只保留 DNS 安全字符，去掉会污染 `export ISHELL_HOST=…` 的 shell 元字符。
+pub fn sanitize_hostname(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+        .take(128)
+        .collect()
+}
+
+/// 两个主机名是否指向同一台机器：大小写不敏感，且接受短名 vs FQDN（`box` 与 `box.lan`）。
+pub fn hosts_match(a: &str, b: &str) -> bool {
+    let a = a.trim().to_ascii_lowercase();
+    let b = b.trim().to_ascii_lowercase();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    // 短名对 FQDN：只认「一边没有点、另一边以短名+点开头」，避免 box.lan 误配 box.office.lan。
+    (!a.contains('.') && b.starts_with(&a) && b.as_bytes().get(a.len()) == Some(&b'.'))
+        || (!b.contains('.') && a.starts_with(&b) && a.as_bytes().get(b.len()) == Some(&b'.'))
+}
+
 impl McpRequest {
     /// 这条请求是不是该由标识为 `own_instance` 的实例来执行。
     ///
@@ -872,11 +923,15 @@ mod addressing_tests {
 /// AI 只能读写自己开的会话（用户与其它 AI 的窗口一律拒绝、不再列出），配对 token 也换了新
 /// 文件（旧 token 作废）。
 ///
+/// v7：`Instance.host` 携带本机主机名（`serde default` 空串，旧端可忽略）。代理用它检测
+/// 「多台机器同步了同一配对 token」，并在终端注入的 `ISHELL_HOST` 与绑定实例不一致时拒绝
+/// 静默串台。同版本起：找不到旧 instance_id 且恰好只剩一个 token 匹配实例时允许改绑。
+///
 /// 注意 `Identify` 的线格式在所有版本里**逐字节相同**（无字段的单元变体），这是刻意的：
 /// 它是唯一一个跨版本都解得开的请求，版本不一致时全靠它问出对端版本、给出「重新部署」的
 /// 提示。给它加字段会把 JSON 从 `"Identify"` 变成 `{"Identify":{…}}`，旧端直接解析失败、
 /// 被当成死 socket 跳过，于是版本不匹配又会伪装成别的错误——别加。
-pub const MCP_PROTOCOL_VERSION: u32 = 6;
+pub const MCP_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpReqResult {
@@ -897,6 +952,10 @@ pub enum McpReqResult {
         /// 空。代理此后把它填进每条请求的 `McpRequest::ticket`。
         #[serde(default)]
         ticket: String,
+        /// v7：运行此 iShell 的机器主机名。不是秘密（Identify 对任何人都会给），用于代理
+        /// 发现「多台机器共用同一 token」以及核对终端注入的 `ISHELL_HOST`。旧端缺省为空。
+        #[serde(default)]
+        host: String,
     },
     /// `PairHello` 的应答：对端的随机数 + 它的 `Server` 证明。代理**先验这个证明**，
     /// 通过了才在同一条连接上发 `PairProve`——否则一个连 token 都不知道的假 socket 就能把
@@ -955,6 +1014,7 @@ mod tests {
             proto_version: MCP_PROTOCOL_VERSION,
             token: String::new(),
             ticket: String::new(),
+            host: "box".into(),
         };
         let json = serde_json::to_string(&inst).unwrap();
         let back: McpReqResult = serde_json::from_str(&json).unwrap();
@@ -964,17 +1024,22 @@ mod tests {
                 proto_version,
                 token,
                 ticket,
+                host,
             } => {
                 assert_eq!(id, "1234-abcd");
                 assert_eq!(proto_version, MCP_PROTOCOL_VERSION);
                 assert_eq!(token, "");
                 assert_eq!(ticket, "", "非握手应答不带凭据");
+                assert_eq!(host, "box");
             }
             other => panic!("应解析回 Instance，实际：{other:?}"),
         }
         let legacy = r#"{"Instance":{"id":"x","proto_version":1}}"#;
         match serde_json::from_str::<McpReqResult>(legacy).unwrap() {
-            McpReqResult::Instance { token, .. } => assert_eq!(token, ""),
+            McpReqResult::Instance { token, host, .. } => {
+                assert_eq!(token, "");
+                assert_eq!(host, "", "旧负载缺 host 应落成空串");
+            }
             other => panic!("应解析回 Instance，实际：{other:?}"),
         }
     }
@@ -1059,5 +1124,25 @@ mod tests {
             decoded.kind,
             McpReqKind::CopyToRemoteFromCaller { size: 95_232, .. }
         ));
+    }
+
+    #[test]
+    fn sanitize_hostname_strips_shell_metacharacters() {
+        assert_eq!(sanitize_hostname("box.lan"), "box.lan");
+        assert_eq!(sanitize_hostname("  my-host_1  "), "my-host_1");
+        assert_eq!(sanitize_hostname("bad;rm -rf /"), "badrm-rf");
+        assert_eq!(sanitize_hostname("$(id)"), "id");
+        assert_eq!(sanitize_hostname(""), "");
+    }
+
+    #[test]
+    fn hosts_match_accepts_short_name_and_fqdn() {
+        assert!(hosts_match("Box", "box"));
+        assert!(hosts_match("box", "box.lan"));
+        assert!(hosts_match("box.office.lan", "box"));
+        assert!(!hosts_match("box.lan", "box.office.lan"));
+        assert!(!hosts_match("box", "other"));
+        assert!(!hosts_match("", "box"));
+        assert!(!hosts_match("box", ""));
     }
 }

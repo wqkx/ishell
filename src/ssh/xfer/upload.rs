@@ -248,7 +248,23 @@ pub(super) async fn upload_from_mcp(
     use russh_sftp::protocol::OpenFlags;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let name = remote_path
+    // 与 `upload()` 同一套目标解析：跟随符号链接、拒绝目录、记下原权限。
+    // 事务写是「建新 inode 再 rename 顶上去」，不接这套就会：覆盖后权限变 umask 默认、
+    // symlink 被换成普通文件、目录被换成文件并留下孤儿 .bak。
+    let (target, orig_perm) = match resolve_upload_target(sftp, &remote_path).await {
+        Ok(v) => v,
+        Err(error) => {
+            sink.send(WorkerEvent::TransferDone {
+                id,
+                ok: false,
+                message: format!("Upload failed: {error}"),
+                refresh_dir: Some(remote_parent(&remote_path)),
+            });
+            return;
+        }
+    };
+
+    let name = target
         .trim_end_matches('/')
         .rsplit('/')
         .next()
@@ -267,7 +283,7 @@ pub(super) async fn upload_from_mcp(
     // 中转落盘承诺"目录不存在自动创建"；copy_to_remote 一并受益）。先探一次 metadata，仅在
     // 确实缺失时才逐级建，避免对已存在的深路径做无谓的多次 create_dir 往返。best-effort：
     // 建目录若因权限等失败，紧接着 open_with_flags 会以清晰错误报出，不在这里抢先判定。
-    let parent = remote_parent(&remote_path);
+    let parent = remote_parent(&target);
     if sftp.metadata(&parent).await.is_err() {
         create_remote_dir_all(sftp, &parent).await;
     }
@@ -275,7 +291,7 @@ pub(super) async fn upload_from_mcp(
     // 事务写：先把调用方字节流写进**临时文件**，全部校验通过后才原子换入最终路径。
     // 直接以 TRUNCATE 打开最终路径的旧写法，一旦断线 / 超时 / 源文件变化中途失败，就会在远端
     // 留下一个空/半截文件、破坏原有内容——事务写保证「失败即原文件分毫未动」。
-    let tmp = format!("{remote_path}.ishell-mcp-tmp-{}", super::rand_hex(6));
+    let tmp = format!("{target}.ishell-mcp-tmp-{}", super::rand_hex(6));
     let result: anyhow::Result<()> = async {
         // 1) 写入临时文件（绝不触碰最终路径）
         let mut remote = sftp
@@ -284,6 +300,13 @@ pub(super) async fn upload_from_mcp(
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
             )
             .await?;
+        // 权限必须在写内容之前落到临时文件上：个别服务器的 SETSTAT 会把文件截断成 0
+        // （见 upload_file_once / sftp_write.rs）。此刻文件刚被 TRUNCATE、本来就是空的。
+        if let Some(mode) = orig_perm {
+            let _ = sftp
+                .set_metadata(&tmp, super::super::sftp::perm_only_attrs(mode))
+                .await;
+        }
         let mut buffer = vec![0_u8; 128 * 1024];
         let mut written = 0_u64;
         let mut last_reported = 0_u64;
@@ -292,7 +315,13 @@ pub(super) async fn upload_from_mcp(
                 anyhow::bail!("canceled");
             }
             let wanted = (size - written).min(buffer.len() as u64) as usize;
-            let read = source.read(&mut buffer[..wanted]).await?;
+            // 源读取挂死（FUSE/网络盘）不能把 MCP 连接占满 24h：单次读超过此时限即失败。
+            let read = tokio::time::timeout(
+                MCP_SOURCE_READ_IDLE,
+                source.read(&mut buffer[..wanted]),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("调用方文件流读取超时（{MCP_SOURCE_IDLE_SECS}s 无数据）"))??;
             if read == 0 {
                 anyhow::bail!("调用方文件流提前结束：期望 {size} 字节，实际收到 {written} 字节");
             }
@@ -305,7 +334,10 @@ pub(super) async fn upload_from_mcp(
         }
         // 再读一个字节，拒绝声明大小之外的尾随数据，防止下一次协议复用时发生串流。
         let mut trailing = [0_u8; 1];
-        if source.read(&mut trailing).await? != 0 {
+        let extra = tokio::time::timeout(MCP_SOURCE_READ_IDLE, source.read(&mut trailing))
+            .await
+            .map_err(|_| anyhow::anyhow!("调用方文件流读取超时（{MCP_SOURCE_IDLE_SECS}s 无数据）"))??;
+        if extra != 0 {
             anyhow::bail!("调用方文件流超过声明的 {size} 字节");
         }
         remote.flush().await?;
@@ -323,15 +355,15 @@ pub(super) async fn upload_from_mcp(
         }
         // 3) 原子换入：SFTP rename 在目标已存在时可能失败（非 POSIX rename），故先把已存在的
         //    原文件挪到 .bak，再换入 tmp，失败则从 .bak 还原——任一步失败原文件都不丢。
-        let bak = format!("{remote_path}.ishell-mcp-bak-{}", super::rand_hex(6));
-        let backed_up = match sftp.rename(&remote_path, &bak).await {
+        let bak = format!("{target}.ishell-mcp-bak-{}", super::rand_hex(6));
+        let backed_up = match sftp.rename(&target, &bak).await {
             Ok(()) => true,
             Err(e) if is_sftp_not_found(&e) => false, // 原文件不存在：全新写入，无需备份
             Err(e) => anyhow::bail!("无法确认原文件状态（备份步骤失败，非「文件不存在」）：{e}"),
         };
-        if let Err(e) = sftp.rename(&tmp, &remote_path).await {
+        if let Err(e) = sftp.rename(&tmp, &target).await {
             // 换入失败：尽力从备份还原原文件
-            let restored = backed_up && sftp.rename(&bak, &remote_path).await.is_ok();
+            let restored = backed_up && sftp.rename(&bak, &target).await.is_ok();
             if backed_up && !restored {
                 anyhow::bail!("换入失败且未能还原，原文件备份在 {bak}：{e}");
             }
@@ -352,30 +384,24 @@ pub(super) async fn upload_from_mcp(
         Ok(()) => sink.send(WorkerEvent::TransferDone {
             id,
             ok: true,
-            message: format!("Uploaded {remote_path}"),
-            refresh_dir: Some(
-                remote_path
-                    .rsplit_once('/')
-                    .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
-                    .unwrap_or("/")
-                    .to_string(),
-            ),
+            message: format!("Uploaded {target}"),
+            refresh_dir: Some(remote_parent(&target)),
         }),
         Err(error) => sink.send(WorkerEvent::TransferDone {
             id,
             ok: false,
             message: format!("Upload failed: {error}"),
             // 失败也刷新目标父目录：写入/换入可能已部分生效，且目标目录可能已不存在
-            refresh_dir: Some(
-                remote_path
-                    .rsplit_once('/')
-                    .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
-                    .unwrap_or("/")
-                    .to_string(),
-            ),
+            refresh_dir: Some(remote_parent(&target)),
         }),
     }
 }
+
+/// 调用方上传源（MCP socket / 中转管道）单次 read 的空闲上限。卡住的 FUSE/网络盘
+/// 若按文件操作 deadline（最长 24h）一直占着 worker，会把 MCP 连接信号量吃光。
+const MCP_SOURCE_IDLE_SECS: u64 = 60;
+const MCP_SOURCE_READ_IDLE: std::time::Duration =
+    std::time::Duration::from_secs(MCP_SOURCE_IDLE_SECS);
 
 /// 解析一个上传目标：跟随符号链接到真实路径，并确认它不是目录。
 ///

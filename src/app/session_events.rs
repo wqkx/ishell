@@ -323,18 +323,17 @@ impl Session {
                         // message 是远端可执行文件的绝对路径。把注册命令**打进终端但不回车**
                         // ——注册要在这台服务器上执行一次，用户看得见命令内容再决定按不按，
                         // 和「配置 AI 完成通知」那条菜单是同一个套路。
-                        let path = message;
-                        let cmd = format!("claude mcp add ishell -s user -- {path}");
+                        let cmd = super::session::mcp_register_cmd(&message);
                         let _ = self
                             .cmd_tx
                             .send(crate::proto::UiCommand::TerminalInput(cmd.clone().into_bytes()));
                         self.terminal.push_input_line(&cmd);
                         self.status = match crate::i18n::current() {
                             crate::i18n::Lang::Zh => format!(
-                                "已部署 {path}（版本与本 iShell 一致）。终端里已备好注册命令，回车执行即可。"
+                                "已部署 {message}（版本与本 iShell 一致）。终端里已备好注册命令，回车执行即可。"
                             ),
                             crate::i18n::Lang::En => format!(
-                                "Deployed {path} (same version as this iShell). The register command is                                  typed into the terminal — press Enter to run it."
+                                "Deployed {message} (same version as this iShell). The register command is typed into the terminal — press Enter to run it."
                             ),
                         };
                     } else {

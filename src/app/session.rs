@@ -120,7 +120,7 @@ pub(super) enum XferSpec {
 /// `windows_style`：目标 shell 是 cmd/PowerShell（只有「本机」会话且 iShell 跑在 Windows 上
 /// 才成立）。那两个 shell 不认 POSIX 的单引号转义，用双引号；而 Windows 路径里不可能出现
 /// `"`（文件名非法字符），所以双引号里不需要再转义什么。
-fn quote_shell_arg(path: &str, windows_style: bool) -> String {
+pub(super) fn quote_shell_arg(path: &str, windows_style: bool) -> String {
     let needs = path.is_empty()
         || path
             .chars()
@@ -134,6 +134,15 @@ fn quote_shell_arg(path: &str, windows_style: bool) -> String {
         // POSIX：单引号里除了单引号本身什么都不用转义
         format!("'{}'", path.replace('\'', "'\\''"))
     }
+}
+
+/// 部署 MCP 代理成功后打进终端、等用户回车的注册命令。路径必须经过 [`quote_shell_arg`]：
+/// `deploy_mcp_agent` 只拒绝含单引号的家目录，含空格/`$`/反引号的 home 不引就会被截断或注入。
+pub(super) fn mcp_register_cmd(path: &str) -> String {
+    format!(
+        "claude mcp add ishell -s user -- {}",
+        quote_shell_arg(path, false)
+    )
 }
 
 /// 恢复工作目录这一步该怎么走。
@@ -255,18 +264,25 @@ fn ai_injection_allowed(
 
 /// 注入配对 token 的那行命令（自动注入与右键「立即注入」共用，两处不会漂移）。
 ///
-/// **同时导出两个名字**：
+/// **同时导出两个名字**（以及本机主机名）：
 /// - `ISHELL_PAIR_TOKEN`：新代理优先读它。它只由终端注入、从不出现在 AI 的 MCP 配置里，
 ///   所以不会被配置文件的 `env` 覆盖——共用服务器账号时，`~/.claude.json` 里别人写死的
 ///   `ISHELL_MCP_TOKEN` 会覆盖掉终端注入的同名变量，把所有人的 AI 都路由到他的电脑
 ///   （2026-09-18 生产实测的串台根因，见 ishell-mcp 的 `pairing_token`）。
 /// - `ISHELL_MCP_TOKEN`：旧代理只认这个名字，保留以兼容。
+/// - `ISHELL_HOST`：本机主机名。代理绑定后与 `Instance.host` 对照，拿着别人的 token 时
+///   会变成响亮报错而不是静默串台。
 ///
 /// 前导空格：配合 bash/zsh 常见的 HISTCONTROL=ignorespace，不进 shell 历史。token 是十六
 /// 进制串（无 shell 特殊字符），无需引号。
 pub(super) fn pair_token_export_cmd() -> String {
     let t = crate::store::mcp_pairing_token();
-    format!(" export ISHELL_PAIR_TOKEN={t} ISHELL_MCP_TOKEN={t}")
+    let host = crate::mcp_protocol::local_hostname();
+    if host.is_empty() || host == "unknown-host" {
+        format!(" export ISHELL_PAIR_TOKEN={t} ISHELL_MCP_TOKEN={t}")
+    } else {
+        format!(" export ISHELL_PAIR_TOKEN={t} ISHELL_MCP_TOKEN={t} ISHELL_HOST={host}")
+    }
 }
 
 impl Session {
@@ -737,6 +753,23 @@ mod paste_path_tests {
         assert_eq!(quote_shell_arg("/tmp/$(id).png", false), "'/tmp/$(id).png'");
         assert_eq!(quote_shell_arg("/tmp/a`id`.png", false), "'/tmp/a`id`.png'");
         assert_eq!(quote_shell_arg("", false), "''");
+    }
+
+    #[test]
+    fn mcp_register_cmd_quotes_metacharacters_in_the_agent_path() {
+        use super::mcp_register_cmd;
+        assert_eq!(
+            mcp_register_cmd("/home/u/.ishell-mcp/bin/ishell-mcp"),
+            "claude mcp add ishell -s user -- /home/u/.ishell-mcp/bin/ishell-mcp"
+        );
+        assert_eq!(
+            mcp_register_cmd("/home/u name/.ishell-mcp/bin/ishell-mcp"),
+            "claude mcp add ishell -s user -- '/home/u name/.ishell-mcp/bin/ishell-mcp'"
+        );
+        assert_eq!(
+            mcp_register_cmd("/home/u$(id)/.ishell-mcp/bin/ishell-mcp"),
+            "claude mcp add ishell -s user -- '/home/u$(id)/.ishell-mcp/bin/ishell-mcp'"
+        );
     }
 }
 

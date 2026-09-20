@@ -1003,19 +1003,27 @@ pub(super) fn spawn_mcp_listener(
             let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
         }
         // 这个 socket 会被反向转发到远端主机（见 src/ssh/mod.rs），意味着任何能连到那台
-        // 远端主机的人都摸得到它——不能像纯本地场景那样假设连接数天然很少。用信号量限制
-        // 并发连接数，防止大量"连上但不发完整请求"的连接把任务/fd 堆起来。
-        let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_CONNECTIONS));
+        // 远端主机的人都摸得到它——不能像纯本地场景那样假设连接数天然很少。握手/Identify
+        // 与长操作分两档信号量：上传卡住时仍要让新的 Identify 进得来，否则整个 MCP 发现层
+        // 会被 32 个挂死的 copy_to_remote 堵死约 24h。
+        let handshake_limit = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_HANDSHAKES));
+        let work_limit = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_CONNECTIONS));
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
-            let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
-                // 并发已达上限：直接丢弃这个连接（不回应也不占用任务），
+            let Ok(permit) = Arc::clone(&handshake_limit).try_acquire_owned() else {
+                // 半开连接已达上限：直接丢弃这个连接（不回应也不占用任务），
                 // 对端会看到连接被关闭，比无限堆积任务安全。
                 continue;
             };
-            tokio::spawn(handle_conn(stream, tx.clone(), ctx.clone(), permit));
+            tokio::spawn(handle_conn(
+                stream,
+                tx.clone(),
+                ctx.clone(),
+                permit,
+                Arc::clone(&work_limit),
+            ));
         }
     });
     rx
@@ -1030,9 +1038,13 @@ pub(super) fn spawn_mcp_listener(
     rx
 }
 
-/// 并发连接数上限（见 spawn_mcp_listener 里的信号量）。
+/// 并发连接数上限（见 spawn_mcp_listener 里的工作信号量）。长操作（上传/命令）占这一档。
 #[cfg(unix)]
 const MAX_MCP_CONNECTIONS: usize = 32;
+/// 读首行 + Identify/握手的并发上限。必须高于 `MAX_MCP_CONNECTIONS`，否则挂死的上传会把
+/// 发现层一起堵死。
+#[cfg(unix)]
+const MAX_MCP_HANDSHAKES: usize = 64;
 /// 首行请求的最大字节数：整条请求（含 write_file 的 content）作为一行 JSON 读入内存，故这个
 /// 上限同时是「单连接请求缓冲的峰值」。32 MiB 对 write_file 的文本/源码同步已绰绰有余（真正的
 /// 大文件/二进制走 copy_to_remote 的分块字节流，不塞进 JSON 行），又把「MAX_MCP_CONNECTIONS
@@ -1071,7 +1083,8 @@ async fn reply(
 /// iShell 签发的**连接凭据**（v6，见 `McpRequest::ticket`）：配对握手验过对方的 token 证明
 /// 之后才签发，之后每条业务请求都要出示。凭据 → 握手时声明的 actor。
 ///
-/// 只活在本进程内存里：iShell 重启即全部作废（实例 id 也随之换掉，代理本来就得重新绑定）。
+/// 只活在本进程内存里：iShell 重启即全部作废（实例 id 也随之换掉）。代理在找不到旧 id、
+/// 且恰好只剩一个 token 匹配实例时会改绑到新实例并换一张凭据；多开时仍拒绝静默换绑。
 /// 有界：按空闲时长过期，超过上限淘汰最久没用过的——代理被拒后会自动重新握手（见
 /// `TICKET_REJECTED`），所以淘汰只多一次握手、不会让 AI 失联。
 #[cfg(unix)]
@@ -1150,14 +1163,28 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for NotifyOnDrop<R> {
     }
 }
 
+/// Identify / 握手应答共用：带上本机主机名（v7），旧代理会忽略未知字段。
+#[cfg(unix)]
+fn instance_hello(ticket: String) -> McpReqResult {
+    McpReqResult::Instance {
+        id: crate::store::mcp_instance_id().to_string(),
+        proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
+        token: String::new(),
+        ticket,
+        host: crate::mcp_protocol::local_hostname(),
+    }
+}
+
 /// 一条连接只处理一问一答：读一行 JSON 请求，转发进 mpsc，等 App 帧循环回填后写一行 JSON 响应。
-/// `_permit` 只用来在这个连接存活期间占着信号量里的一个名额，函数退出时自动释放。
+/// `handshake_permit` 覆盖读首行与 Identify/握手；业务请求随后换成 `work_limit` 里的名额，
+/// 好让卡住的上传不堵住新的发现探测。
 #[cfg(unix)]
 async fn handle_conn(
     stream: UnixStream,
     tx: mpsc::UnboundedSender<McpCall>,
     ctx: egui::Context,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
+    work_limit: Arc<tokio::sync::Semaphore>,
 ) {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r.take(MAX_MCP_LINE_BYTES)).lines();
@@ -1191,8 +1218,8 @@ async fn handle_conn(
             &mut w,
             id,
             Err("这条请求点名的是另一个 iShell 实例（或没有点名）。请重新发起 MCP 连接：\
-                 你绑定的那个 iShell 可能已经退出了，代理不会自动改绑到别的实例上——\
-                 多开时静默换一个实例执行，命令就会落到你没预期的机器上"
+                 绑定的那个 iShell 可能已经退出或重启；代理会在只剩一个匹配实例时改绑，\
+                 多开时仍不会静默换到别的窗口——命令落到你没预期的机器上更糟"
                 .to_string()),
         )
         .await;
@@ -1219,12 +1246,7 @@ async fn handle_conn(
             reply(
                 &mut w,
                 id,
-                Ok(McpReqResult::Instance {
-                    id: own.to_string(),
-                    proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
-                    token: String::new(),
-                    ticket: String::new(),
-                }),
+                Ok(instance_hello(String::new())),
             )
             .await;
             return;
@@ -1239,12 +1261,7 @@ async fn handle_conn(
             reply(
                 &mut w,
                 id,
-                Ok(McpReqResult::Instance {
-                    id: own.to_string(),
-                    proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
-                    token: String::new(),
-                    ticket: String::new(),
-                }),
+                Ok(instance_hello(String::new())),
             )
             .await;
             return;
@@ -1277,8 +1294,8 @@ async fn handle_conn(
                 }),
             )
             .await;
-            // 第二行必须带超时：对端开了个头就赖着不说话的话，这条连接会一直占着信号量里的
-            // 名额（`_permit`），几条半开握手就能把整个 MCP 通道堵死。
+            // 第二行必须带超时：对端开了个头就赖着不说话的话，这条连接会一直占着握手
+            // 信号量里的名额（`handshake_permit`），几条半开握手就能把发现层堵死。
             let second = tokio::time::timeout(FIRST_LINE_TIMEOUT, lines.next_line()).await;
             let Ok(Ok(Some(line2))) = second else {
                 return; // 超时/断开：没什么可回的，直接收工
@@ -1317,12 +1334,7 @@ async fn handle_conn(
                     reply(
                         &mut w,
                         id2,
-                        Ok(McpReqResult::Instance {
-                            id: own.to_string(),
-                            proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
-                            token: String::new(),
-                            ticket,
-                        }),
+                        Ok(instance_hello(ticket)),
                     )
                     .await;
                 }
@@ -1342,6 +1354,18 @@ async fn handle_conn(
         }
         _ => {}
     }
+    // 业务请求换到工作信号量：Identify/握手已在上面 return，不再占握手名额。
+    // 上传卡死时新的发现探测仍能进来。
+    let Ok(_work) = work_limit.try_acquire_owned() else {
+        reply(
+            &mut w,
+            id,
+            Err("iShell MCP 并发已达上限，请稍后重试".into()),
+        )
+        .await;
+        return;
+    };
+    drop(handshake_permit);
     // **iShell 端身份校验（v6）**：除上面的发现与握手，其余每条请求都必须出示本进程签发过的
     // 有效连接凭据。这是「严禁操作其他人的客户端」的执行点，而且放在权威侧——此前这里只核对
     // 公开的实例 id，谁拿到 id 谁就能驱动这台 iShell，隔离全靠代理自觉。
@@ -3590,7 +3614,8 @@ mod pair_handshake_tests {
             let (stream, _) = listener.accept().await.expect("accept");
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
             let permit = sem.acquire_owned().await.expect("permit");
-            handle_conn(stream, tx, ctx, permit).await;
+            let work = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            handle_conn(stream, tx, ctx, permit, work).await;
         });
         let s = UnixStream::connect(&dir).await.expect("连接测试 socket");
         let _ = std::fs::remove_file(&dir); // 路径已不需要，连接照常存活
@@ -3842,7 +3867,8 @@ mod pair_handshake_tests {
             let (stream, _) = listener.accept().await.expect("accept");
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
             let permit = sem.acquire_owned().await.expect("permit");
-            handle_conn(stream, tx, ctx, permit).await;
+            let work = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            handle_conn(stream, tx, ctx, permit, work).await;
         });
         let s = UnixStream::connect(&dir).await.expect("连接测试 socket");
         let _ = std::fs::remove_file(&dir);
@@ -3944,7 +3970,8 @@ mod upload_stream_tests {
             let (stream, _) = listener.accept().await.expect("accept");
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
             let permit = sem.acquire_owned().await.expect("permit");
-            handle_conn(stream, tx, ctx, permit).await;
+            let work = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            handle_conn(stream, tx, ctx, permit, work).await;
         });
         let s = UnixStream::connect(&path).await.expect("连接测试 socket");
         let _ = std::fs::remove_file(&path);
