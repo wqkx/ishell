@@ -5,8 +5,8 @@
 //! 唯一的进程状态是**绑定**：这个代理默认一辈子只操作一个 iShell 实例（见 `BOUND_INSTANCE`）。
 //! 用户可能同时开着多个 iShell——本机的、以及别的机器上反向转发过来的——而每个实例的会话
 //! uid 都从 1 开始，所以「这次调用发给谁」绝不能靠猜。首次连接时定下实例，此后每条请求都
-//! 点名，由对端自己校验（`McpRequest::instance`）。原实例消失且恰好只剩一个 token 匹配者
-//! 时才改绑（覆盖 iShell 重启）；多开时仍要用户点窗口。
+//! 点名，由对端自己校验（`McpRequest::instance`）。原实例消失、恰好只剩一个 token 匹配者、
+//! **且主机与当初绑定的一致**时才改绑（覆盖 iShell 重启）；多开或换到另一台机器仍要用户重连。
 //! 与主二进制共享同一份线协议类型（见 src/mcp_protocol.rs），这里用 #[path] 直接纳入，
 //! 避免为共享几个 struct 拆出独立的 lib crate。
 
@@ -33,8 +33,8 @@ use mcp_protocol::{McpReqKind, McpReqResult, McpRequest, McpResponse};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// 本代理进程绑定的 iShell 实例标识。首次连接时确定；**原实例已消失且恰好只剩一个
-/// token 匹配者时允许改绑**（iShell 重启换了 instance_id 是最常见场景）。
+/// 本代理进程绑定的 iShell 实例标识。首次连接时确定；**原实例已消失、恰好只剩一个
+/// token 匹配者、且主机与当初绑定的一致时允许改绑**（iShell 重启换了 instance_id 是最常见场景）。
 ///
 /// 原实例仍活着时绝不改绑：每个 iShell 实例的会话 uid 都从 1 开始（见 `src/app/session.rs`），
 /// 中途换一个实例执行，`session_uid=1` 会安静地落到另一台机器上。此前按 socket 文件 mtime
@@ -55,6 +55,19 @@ static PATH_CACHE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mut
 /// 放：实例一辈子不变，凭据可以换。
 #[cfg(unix)]
 static TICKET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 当初绑定时对端报告的主机名。改绑时即使没注入 `ISHELL_HOST`（连上 2s 内敲过键 / IDE 启动）
+/// 也能挡住「原实例下线、唯一剩余匹配者在另一台机器」这条窄角。
+#[cfg(unix)]
+static BOUND_HOST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(unix)]
+fn store_binding(id: String, path: std::path::PathBuf, ticket: String, host: String) {
+    *BOUND_INSTANCE.lock().unwrap() = Some(id);
+    *PATH_CACHE.lock().unwrap() = Some(path);
+    *TICKET.lock().unwrap() = Some(ticket);
+    *BOUND_HOST.lock().unwrap() = Some(host);
+}
 
 /// 等用户在某个 iShell 窗口上点「允许」的超时。GUI 侧的确认框自己有 5 分钟上限、到点会回
 /// 一条 Err，正常情况下轮不到这个超时——它只防「GUI 卡死导致工具调用永远挂起」，所以比
@@ -410,6 +423,35 @@ fn reject_if_host_mismatch(peer_host: &str) -> Result<(), String> {
     Err(host_mismatch_msg(&mine, std::slice::from_ref(&peer_host)))
 }
 
+/// 改绑时对照**当初绑定记下的主机**，不依赖终端是否注入了 `ISHELL_HOST`。
+///
+/// 窄角：IDE 启动 / 连上 2s 内敲过键 → 没有 `ISHELL_HOST`；原实例下线后附近只剩另一台
+/// 共用 token 的机器。`reject_if_host_mismatch` 此时无主机可校验会放行。拿绑定当时的
+/// `Instance.host` 就能挡住。旧 GUI（空/`unknown-host`）无法对照，仍放行。
+#[cfg(unix)]
+fn rebind_host_ok(old_host: Option<&str>, new_host: &str) -> Result<(), String> {
+    let Some(old) = old_host.filter(|h| !h.is_empty() && *h != "unknown-host") else {
+        return Ok(());
+    };
+    if new_host.is_empty() || new_host == "unknown-host" {
+        return Ok(());
+    }
+    if mcp_protocol::hosts_match(old, new_host) {
+        return Ok(());
+    }
+    Err(format!(
+        "当初绑定的 iShell 在主机 {old}，现在唯一匹配的实例在 {new_host}。\
+         不会静默改绑到另一台机器。请重新发起 MCP 连接；若确实要换机器，\
+         请在那台 iShell 的终端里启动 AI（会注入 {LAUNCH_HOST_VAR}）。"
+    ))
+}
+
+#[cfg(unix)]
+fn reject_if_rebind_cross_host(new_host: &str) -> Result<(), String> {
+    let old = BOUND_HOST.lock().unwrap().clone();
+    rebind_host_ok(old.as_deref(), new_host)
+}
+
 /// 绑定弹窗发出去之前，按终端注入的 `ISHELL_HOST` 筛掉别的机器。
 ///
 /// 只在绑定成功后再 `reject_if_host_mismatch` 会先让别的电脑弹出「允许绑定」，用户点了
@@ -480,8 +522,9 @@ fn resolve_pairing_token(
 }
 
 /// 决定这个代理这辈子只操作哪个 iShell 实例。只在首次需要连接时跑一次。
+/// 返回 `(id, path, ticket, host)`。
 #[cfg(unix)]
-async fn bind_instance() -> Result<(String, std::path::PathBuf, String), String> {
+async fn bind_instance() -> Result<(String, std::path::PathBuf, String, String), String> {
     // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就走双向
     // 挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；没设则从协议 v5
     // 起直接拒绝并给出配置指引（匿名绑定的广播弹窗是它要根治的东西，见下面的拒绝分支）。
@@ -515,7 +558,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String), String>
             Probe::Paired { id, ver, ticket, host } => {
                 check_proto_version(ver)?;
                 reject_if_host_mismatch(&host)?;
-                Ok((id, path, ticket))
+                Ok((id, path, ticket, host))
             }
             // 活着但没通过握手。先看版本——版本不符时 `probe` 本来就跳过握手，
             // 报成 token 不符会把人引向死胡同（怎么核对 token 都是对的）。
@@ -609,7 +652,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String), String>
             check_proto_version(ver)?;
             reject_if_host_mismatch(&host)?;
             eprintln!("ishell-mcp: 已绑定 iShell 实例 {id}（主机 {host}）");
-            Ok((id, path, ticket))
+            Ok((id, path, ticket, host))
         }
         // 多个：同一个 token 被多个 iShell 进程认领。最常见的是**同一台电脑**开了两个 iShell
         // （token 按安装存、实例 id 按进程生成），这是正常的多开，用弹窗让用户点窗口选。
@@ -666,7 +709,7 @@ fn warn_if_shared_token_across_hosts(found: &[(String, u32, std::path::PathBuf, 
 #[cfg(unix)]
 async fn choose_instance(
     found: Vec<(String, u32, std::path::PathBuf, String, String)>,
-) -> Result<(String, std::path::PathBuf, String), String> {
+) -> Result<(String, std::path::PathBuf, String, String), String> {
     let count = found.len();
     let mut set = tokio::task::JoinSet::new();
     for (id, ver, path, ticket, host) in found {
@@ -694,7 +737,7 @@ async fn choose_instance(
             check_proto_version(ver)?;
             reject_if_host_mismatch(&host)?;
             eprintln!("ishell-mcp: 已绑定 iShell 实例 {id}（主机 {host}，用户在窗口上点了允许）");
-            return Ok((id, path, ticket));
+            return Ok((id, path, ticket, host));
         }
     }
     Err(format!(
@@ -711,10 +754,8 @@ async fn choose_instance(
 async fn connect_bound() -> Result<(UnixStream, String, String), String> {
     BOUND_INIT
         .get_or_try_init(|| async {
-            let (id, path, ticket) = bind_instance().await?;
-            *PATH_CACHE.lock().unwrap() = Some(path);
-            *TICKET.lock().unwrap() = Some(ticket);
-            *BOUND_INSTANCE.lock().unwrap() = Some(id);
+            let (id, path, ticket, host) = bind_instance().await?;
+            store_binding(id, path, ticket, host);
             Ok::<_, String>(())
         })
         .await?;
@@ -867,9 +908,8 @@ async fn rediscover_bound(id: &str) -> Result<(std::path::PathBuf, String), Stri
             host,
         } => {
             reject_if_host_mismatch(&host)?;
-            *BOUND_INSTANCE.lock().unwrap() = Some(new_id.clone());
-            *PATH_CACHE.lock().unwrap() = Some(path.clone());
-            *TICKET.lock().unwrap() = Some(ticket.clone());
+            reject_if_rebind_cross_host(&host)?;
+            store_binding(new_id.clone(), path.clone(), ticket.clone(), host.clone());
             eprintln!(
                 "ishell-mcp: 原实例 {id} 已消失，已改绑到 {new_id}（主机 {host}）。\
                  此前所有 session uid 全部失效，请重新 list_sessions / open_session。"
@@ -2367,5 +2407,22 @@ mod tests {
         assert!(validate_caller_path("/tmp/notes.txt", "local_path").is_ok());
         assert!(validate_caller_path("/tmp/./notes.txt", "local_path").is_err());
         assert!(validate_caller_path("notes.txt", "local_path").is_err());
+    }
+
+    /// 改绑窄角：没注入 ISHELL_HOST 时，仍用当初绑定记下的主机挡住换到别人电脑。
+    /// 反向对照：把 rebind_host_ok 改成一律 Ok，第三条断言挂。
+    #[test]
+    fn rebind_refuses_a_unique_match_on_another_host() {
+        use super::rebind_host_ok;
+        assert!(rebind_host_ok(Some("box"), "box").is_ok());
+        assert!(rebind_host_ok(Some("box"), "box.lan").is_ok(), "短名 vs FQDN 算同一台");
+        assert!(
+            rebind_host_ok(Some("box"), "other").is_err(),
+            "原实例下线后唯一匹配者在另一台机器，不能静默改绑"
+        );
+        assert!(rebind_host_ok(None, "other").is_ok(), "没记下旧主机时无法对照");
+        assert!(rebind_host_ok(Some("unknown-host"), "other").is_ok(), "旧 GUI 无法对照");
+        assert!(rebind_host_ok(Some("box"), "unknown-host").is_ok());
+        assert!(rebind_host_ok(Some(""), "other").is_ok());
     }
 }

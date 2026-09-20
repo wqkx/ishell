@@ -165,8 +165,8 @@ pub fn view_context_menu(resp: &egui::Response) {
                     .checkbox(
                         &mut mcp_on,
                         crate::i18n::tr(
-                            "允许 AI 通过 MCP 控制终端（关立即停，开需重启）",
-                            "Allow AI to control terminal via MCP (off now, on needs restart)",
+                            "允许 AI 通过 MCP 控制终端（关闭立即生效）",
+                            "Allow AI to control terminal via MCP (off takes effect now)",
                         ),
                     )
                     .on_hover_text(crate::i18n::tr(
@@ -175,14 +175,18 @@ pub fn view_context_menu(resp: &egui::Response) {
                          · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
                          · 多机共用一台 AI 服务器时：终端会话会自动注入配对 token（见下方\
                          「配对 token」），代理只回你这台电脑\n\
-                         · 关闭后立刻拒绝新的 MCP 操作；重新打开后需要重启 iShell 才会开始监听",
+                         · 关闭后立刻拒绝新的 MCP 操作；若本次启动时开关已开（监听还在），\
+                         再打开即恢复，不必重启\n\
+                         · 若启动时开关是关的，打开后需要重启 iShell 才会开始监听",
                         "Let AI (Claude Code, …) drive open terminals: run commands, read output, \
                          read/write files.\n\
                          · Local Unix socket only (mode 0600) — no network port is opened\n\
                          · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
                          · Sharing one AI server: terminal sessions auto-inject the pairing token \
                          (see \"Pairing token\" below), so the proxy answers only YOUR computer\n\
-                         · Turning off refuses new MCP ops immediately; turning on needs an iShell restart to listen",
+                         · Turning off refuses new MCP ops immediately; if the switch was on at \
+                         startup (listener already running), turning it back on resumes without restart\n\
+                         · If it was off at startup, turning it on needs an iShell restart to listen",
                     ))
                     .clicked()
                 {

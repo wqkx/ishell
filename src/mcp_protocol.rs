@@ -127,6 +127,7 @@ pub fn pair_nonce() -> Option<String> {
 
 /// 生成 `n` 字节的随机十六进制串（如代理进程标识 `actor`）。熵源失败返回 `None`——
 /// 调用方自行决定是报错还是退回弱一些的形态（`actor` 只是进程区分，不是保密凭据）。
+#[allow(dead_code)] // 只在 ishell-mcp 用；GUI 各编一遍会看到未引用
 pub fn random_hex(n: usize) -> Option<String> {
     let mut buf = vec![0u8; n];
     getrandom::getrandom(&mut buf).ok()?;
@@ -688,6 +689,8 @@ pub fn sanitize_hostname(raw: &str) -> String {
 }
 
 /// 两个主机名是否指向同一台机器：大小写不敏感，且接受短名 vs FQDN（`box` 与 `box.lan`）。
+/// 两个 crate 各编一遍；比对逻辑只在代理绑定/改绑时用，GUI 侧编译会看到未引用。
+#[allow(dead_code)]
 pub fn hosts_match(a: &str, b: &str) -> bool {
     let a = a.trim().to_ascii_lowercase();
     let b = b.trim().to_ascii_lowercase();
