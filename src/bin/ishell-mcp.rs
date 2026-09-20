@@ -2426,3 +2426,683 @@ mod tests {
         assert!(rebind_host_ok(Some(""), "other").is_ok());
     }
 }
+
+/// 假环境：同一 unix 账号下多个「用户」把 iShell 反向转发到同一台 AI 服务器
+/// （`~/.ishell-mcp/mcp-*.sock` 堆在一起）。假对端按真实线协议答 Identify / 配对握手 / Bind，
+/// 代理走 `bind_instance` / `identify_all` 全路径——不是再拿元组手搓过滤。
+///
+/// 环境变量（HOME / token / host）进程内全局，场景之间用锁串行。
+#[cfg(all(test, unix))]
+mod fake_farm_tests {
+    use super::mcp_protocol::{
+        pair_nonce, pair_proof, pair_proof_matches, McpReqKind, McpReqResult, McpRequest,
+        McpResponse, PairRole, MCP_PROTOCOL_VERSION,
+    };
+    use super::{
+        bind_instance, classify_rediscover, identify_all, rebind_host_ok, RediscoverOutcome,
+    };
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+
+    static FARM_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Copy)]
+    enum BindPolicy {
+        Allow,
+        Deny,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SockDir {
+        /// 共享 AI 服务器上的反向转发目录（多用户冲突发生地）
+        Reverse,
+        /// 本机 GUI 的 socket
+        Local,
+    }
+
+    struct Spec {
+        id: &'static str,
+        token: &'static str,
+        host: &'static str,
+        proto: u32,
+        bind: BindPolicy,
+        dir: SockDir,
+    }
+
+    impl Spec {
+        fn user(id: &'static str, token: &'static str, host: &'static str) -> Self {
+            Self {
+                id,
+                token,
+                host,
+                proto: MCP_PROTOCOL_VERSION,
+                bind: BindPolicy::Allow,
+                dir: SockDir::Reverse,
+            }
+        }
+    }
+
+    struct Counters {
+        identify: AtomicU32,
+        pair_ok: AtomicU32,
+        pair_fail: AtomicU32,
+        bind: AtomicU32,
+    }
+
+    struct Peer {
+        spec: Spec,
+        path: PathBuf,
+        tickets: Mutex<HashSet<String>>,
+        ticket_n: AtomicU32,
+        counters: Counters,
+    }
+
+    impl Peer {
+        fn binds(&self) -> u32 {
+            self.counters.bind.load(Ordering::SeqCst)
+        }
+        fn pair_ok(&self) -> u32 {
+            self.counters.pair_ok.load(Ordering::SeqCst)
+        }
+    }
+
+    struct Farm {
+        home: PathBuf,
+        peers: Vec<Arc<Peer>>,
+        abort: Vec<tokio::task::AbortHandle>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        /// 持有到 Farm 结束，Drop 时把 HOME/token 环境变量还回去。
+        #[allow(dead_code)]
+        env: EnvGuard,
+    }
+
+    impl Drop for Farm {
+        fn drop(&mut self) {
+            for a in &self.abort {
+                a.abort();
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn env_guard(pairs: &[(&'static str, Option<&str>)]) -> EnvGuard {
+        let saved = pairs
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .collect();
+        for (k, v) in pairs {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        EnvGuard { saved }
+    }
+
+    async fn reply(w: &mut tokio::net::unix::OwnedWriteHalf, id: u64, result: Result<McpReqResult, String>) {
+        let mut line = serde_json::to_string(&McpResponse { id, result }).expect("resp json");
+        line.push('\n');
+        let _ = w.write_all(line.as_bytes()).await;
+    }
+
+    fn instance(peer: &Peer, ticket: String) -> McpReqResult {
+        McpReqResult::Instance {
+            id: peer.spec.id.into(),
+            proto_version: peer.spec.proto,
+            token: String::new(),
+            ticket,
+            host: peer.spec.host.into(),
+        }
+    }
+
+    async fn handle_conn(stream: UnixStream, peer: Arc<Peer>) {
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let Ok(Some(line)) = lines.next_line().await else {
+            return;
+        };
+        let Ok(req) = serde_json::from_str::<McpRequest>(&line) else {
+            return;
+        };
+        match req.kind {
+            McpReqKind::Identify => {
+                peer.counters.identify.fetch_add(1, Ordering::SeqCst);
+                reply(&mut w, req.id, Ok(instance(&peer, String::new()))).await;
+            }
+            McpReqKind::IdentifyPair { token } => {
+                if token != peer.spec.token {
+                    return; // v5：token 不符零应答
+                }
+                reply(&mut w, req.id, Ok(instance(&peer, String::new()))).await;
+            }
+            McpReqKind::PairHello { nonce_c } => {
+                let Some(nonce_s) = pair_nonce() else {
+                    reply(&mut w, req.id, Err("熵源不可用".into())).await;
+                    return;
+                };
+                reply(
+                    &mut w,
+                    req.id,
+                    Ok(McpReqResult::PairChallenge {
+                        id: peer.spec.id.into(),
+                        proto_version: peer.spec.proto,
+                        nonce_s: nonce_s.clone(),
+                        server_proof: pair_proof(&peer.spec.token, &nonce_c, &nonce_s, PairRole::Server),
+                    }),
+                )
+                .await;
+                let Ok(Some(line2)) = lines.next_line().await else {
+                    return;
+                };
+                let Ok(req2) = serde_json::from_str::<McpRequest>(&line2) else {
+                    return;
+                };
+                let McpReqKind::PairProve { client_proof } = req2.kind else {
+                    reply(&mut w, req2.id, Err("第二步应当是 PairProve".into())).await;
+                    return;
+                };
+                if !pair_proof_matches(
+                    &peer.spec.token,
+                    &nonce_c,
+                    &nonce_s,
+                    PairRole::Client,
+                    &client_proof,
+                ) {
+                    peer.counters.pair_fail.fetch_add(1, Ordering::SeqCst);
+                    reply(&mut w, req2.id, Err("配对证明不符".into())).await;
+                    return;
+                }
+                if req.actor.is_none() {
+                    reply(&mut w, req2.id, Err("缺少 actor".into())).await;
+                    return;
+                }
+                let n = peer.ticket_n.fetch_add(1, Ordering::SeqCst);
+                let ticket = format!("tk-{}-{n}", peer.spec.id);
+                peer.tickets.lock().unwrap().insert(ticket.clone());
+                peer.counters.pair_ok.fetch_add(1, Ordering::SeqCst);
+                reply(&mut w, req2.id, Ok(instance(&peer, ticket))).await;
+            }
+            McpReqKind::Bind => {
+                peer.counters.bind.fetch_add(1, Ordering::SeqCst);
+                if req.instance.as_deref() != Some(peer.spec.id) {
+                    reply(&mut w, req.id, Err("点名的是另一个实例".into())).await;
+                    return;
+                }
+                let ticket = req.ticket.as_deref().unwrap_or("");
+                if !peer.tickets.lock().unwrap().contains(ticket) {
+                    reply(&mut w, req.id, Err("连接凭据无效或已过期".into())).await;
+                    return;
+                }
+                match peer.spec.bind {
+                    BindPolicy::Allow => reply(&mut w, req.id, Ok(McpReqResult::Ok)).await,
+                    BindPolicy::Deny => reply(&mut w, req.id, Err("用户拒绝".into())).await,
+                }
+            }
+            _ => reply(&mut w, req.id, Err("假对端未实现该请求".into())).await,
+        }
+    }
+
+    async fn start_farm(specs: Vec<Spec>, pair: Option<&str>, config: Option<&str>, host: Option<&str>) -> Farm {
+        let lock = FARM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "ishell-mcp-farm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".ishell-mcp")).unwrap();
+        std::fs::create_dir_all(home.join(".config").join("ishell")).unwrap();
+
+        let mut peers = Vec::new();
+        let mut abort = Vec::new();
+        for spec in specs {
+            let dir = match spec.dir {
+                SockDir::Reverse => home.join(".ishell-mcp"),
+                SockDir::Local => home.join(".config").join("ishell"),
+            };
+            let path = dir.join(format!("mcp-{}.sock", spec.id));
+            let _ = std::fs::remove_file(&path);
+            let peer = Arc::new(Peer {
+                spec,
+                path: path.clone(),
+                tickets: Mutex::new(HashSet::new()),
+                ticket_n: AtomicU32::new(0),
+                counters: Counters {
+                    identify: AtomicU32::new(0),
+                    pair_ok: AtomicU32::new(0),
+                    pair_fail: AtomicU32::new(0),
+                    bind: AtomicU32::new(0),
+                },
+            });
+            let listener = UnixListener::bind(&path).unwrap_or_else(|e| panic!("bind {}: {e}", path.display()));
+            let p = peer.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((s, _)) => {
+                            let p = p.clone();
+                            tokio::spawn(handle_conn(s, p));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            abort.push(handle.abort_handle());
+            peers.push(peer);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let home_s = home.to_string_lossy().into_owned();
+        let socket_none: Option<&str> = None;
+        let env = env_guard(&[
+            ("HOME", Some(home_s.as_str())),
+            ("ISHELL_PAIR_TOKEN", pair),
+            ("ISHELL_MCP_TOKEN", config),
+            ("ISHELL_HOST", host),
+            ("ISHELL_MCP_SOCKET", socket_none),
+        ]);
+        // home_s 必须活过 env_guard 的 set_var——上面已经 copy 进环境，可以 drop。
+        let _ = home_s;
+        Farm {
+            home,
+            peers,
+            abort,
+            _lock: lock,
+            env,
+        }
+    }
+
+    fn peer<'a>(farm: &'a Farm, id: &str) -> &'a Peer {
+        farm.peers
+            .iter()
+            .find(|p| p.spec.id == id)
+            .unwrap_or_else(|| panic!("没有名为 {id} 的假对端"))
+    }
+
+    /// Alice / Bob / Carol 三人共用一台 AI 服务器账号，token 各不相同。
+    /// Alice 的代理只能绑到 Alice，Bob 的 socket 上不得出现 Bind 弹窗。
+    #[tokio::test]
+    async fn distinct_tokens_never_cross_bind() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "token-alice", "alice-pc"),
+                Spec::user("bob", "token-bob", "bob-pc"),
+                Spec::user("carol", "token-carol", "carol-pc"),
+            ],
+            Some("token-alice"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
+        let (id, _, _, host) = bind_instance().await.expect("Alice 应绑上自己的 iShell");
+        assert_eq!(id, "alice");
+        assert_eq!(host, "alice-pc");
+        assert_eq!(peer(&farm, "alice").binds(), 0, "唯一匹配不弹窗");
+        assert_eq!(peer(&farm, "bob").binds(), 0, "别人的机器不许弹 Bind");
+        assert_eq!(peer(&farm, "carol").binds(), 0);
+        assert!(peer(&farm, "alice").pair_ok() >= 1);
+        assert_eq!(peer(&farm, "bob").pair_ok(), 0, "token 不同，握手不得成功");
+    }
+
+    /// 配置里写了 Bob 的 token，终端注入了 Alice 的：注入必须赢，不能绑到 Bob。
+    #[tokio::test]
+    async fn injected_token_beats_shared_mcp_config() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "token-alice", "alice-pc"),
+                Spec::user("bob", "token-bob", "bob-pc"),
+            ],
+            Some("token-alice"),
+            Some("token-bob"),
+            Some("alice-pc"),
+        )
+        .await;
+        let (id, _, _, _) = bind_instance().await.expect("应按终端注入的 token 绑 Alice");
+        assert_eq!(id, "alice");
+        assert_eq!(peer(&farm, "bob").binds(), 0);
+        assert_eq!(peer(&farm, "bob").pair_ok(), 0);
+    }
+
+    /// 配置同步：Alice 和 Bob 共用同一 token。有 ISHELL_HOST 时必须在弹窗前丢掉 Bob。
+    #[tokio::test]
+    async fn shared_token_host_filter_does_not_popup_the_other_machine() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "shared", "alice-pc"),
+                Spec::user("bob", "shared", "bob-pc"),
+            ],
+            Some("shared"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
+        let (id, _, _, host) = bind_instance().await.expect("应绑 Alice");
+        assert_eq!(id, "alice");
+        assert_eq!(host, "alice-pc");
+        assert_eq!(peer(&farm, "bob").binds(), 0, "主机过滤必须发生在 Bind 之前");
+        assert!(
+            peer(&farm, "bob").pair_ok() >= 1,
+            "握手仍会发生（才能读到 host），但不得弹窗"
+        );
+        assert_eq!(peer(&farm, "alice").binds(), 0, "过滤后只剩 Alice，唯一绑定不弹窗");
+    }
+
+    /// 共用 token 且 ISHELL_HOST 指向一台根本不在的机器 → 拒绝，不绑到别人电脑。
+    #[tokio::test]
+    async fn shared_token_wrong_launch_host_refuses_instead_of_binding_elsewhere() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "shared", "alice-pc"),
+                Spec::user("bob", "shared", "bob-pc"),
+            ],
+            Some("shared"),
+            None,
+            Some("mallory-pc"),
+        )
+        .await;
+        let err = bind_instance().await.expect_err("主机对不上必须拒绝");
+        assert!(err.contains("mallory-pc"), "{err}");
+        assert!(err.contains("alice-pc") || err.contains("bob-pc"), "{err}");
+        assert_eq!(peer(&farm, "alice").binds(), 0);
+        assert_eq!(peer(&farm, "bob").binds(), 0);
+    }
+
+    /// 同一人开了两个 iShell（同主机同 token）：应向两个窗口发 Bind，先点允许的胜出。
+    /// 别人的机器仍不得弹窗。
+    #[tokio::test]
+    async fn two_windows_on_same_host_popup_only_there() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice-1", "shared", "alice-pc"),
+                Spec::user("alice-2", "shared", "alice-pc"),
+                Spec::user("bob", "shared", "bob-pc"),
+            ],
+            Some("shared"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
+        let (id, _, _, host) = bind_instance().await.expect("应在 Alice 的某一窗口上绑定");
+        assert!(id == "alice-1" || id == "alice-2", "绑到了 {id}");
+        assert_eq!(host, "alice-pc");
+        assert_eq!(peer(&farm, "bob").binds(), 0);
+        let binds = peer(&farm, "alice-1").binds() + peer(&farm, "alice-2").binds();
+        assert!(binds >= 1, "同机多开必须走弹窗，至少有一个 Bind");
+    }
+
+    /// 无配对 token：直接拒绝匿名绑定，即使目录里躺满别人的 socket。
+    #[tokio::test]
+    async fn no_token_refuses_anonymous_bind() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "token-alice", "alice-pc"),
+                Spec::user("bob", "token-bob", "bob-pc"),
+            ],
+            None,
+            None,
+            None,
+        )
+        .await;
+        let err = bind_instance().await.expect_err("无 token 必须拒绝");
+        assert!(err.contains("ISHELL_MCP_TOKEN") || err.contains("配对 token"), "{err}");
+        assert_eq!(peer(&farm, "alice").binds(), 0);
+        assert_eq!(peer(&farm, "bob").binds(), 0);
+    }
+
+    /// 活着的都是别人的 token：报 token 不一致，而不是「未检测到 iShell」。
+    #[tokio::test]
+    async fn wrong_token_reports_mismatch_not_nobody_home() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "token-alice", "alice-pc"),
+                Spec::user("bob", "token-bob", "bob-pc"),
+            ],
+            Some("token-mallory"),
+            None,
+            Some("mallory-pc"),
+        )
+        .await;
+        let err = bind_instance().await.expect_err("token 全不对");
+        assert!(err.contains("token") || err.contains("握手"), "{err}");
+        assert!(!err.contains("未检测到 iShell"), "有人应答就不要报没客户端：{err}");
+        assert_eq!(peer(&farm, "alice").binds(), 0);
+    }
+
+    /// 版本信标：只有一台旧版 iShell 时给出重新部署提示，而不是 token 错。
+    #[tokio::test]
+    async fn stale_proto_asks_to_redeploy() {
+        let mut spec = Spec::user("old", "token-alice", "alice-pc");
+        spec.proto = 5;
+        let _farm = start_farm(vec![spec], Some("token-alice"), None, Some("alice-pc")).await;
+        let err = bind_instance().await.expect_err("版本不符");
+        assert!(err.contains("重新部署") || err.contains("版本不一致"), "{err}");
+    }
+
+    /// 同一实例出现在本机目录和反向转发目录：按 id 去重，唯一绑定。
+    #[tokio::test]
+    async fn duplicate_paths_to_the_same_instance_dedup() {
+        let local = Spec {
+            id: "alice",
+            token: "token-alice",
+            host: "alice-pc",
+            proto: MCP_PROTOCOL_VERSION,
+            bind: BindPolicy::Allow,
+            dir: SockDir::Local,
+        };
+        let fwd = Spec::user("alice", "token-alice", "alice-pc");
+        // 两个 spec 同 id 会绑两个 socket 文件、两个 listener，Identify 都报 id=alice。
+        let farm = start_farm(vec![local, fwd], Some("token-alice"), None, Some("alice-pc")).await;
+        let (id, _, _, _) = bind_instance().await.expect("去重后唯一");
+        assert_eq!(id, "alice");
+        let binds: u32 = farm.peers.iter().map(|p| p.binds()).sum();
+        assert_eq!(binds, 0, "去重后唯一，不应弹窗");
+    }
+
+    /// 显式 ISHELL_MCP_SOCKET 指向 Bob、手里拿的是 Alice 的 token：握手失败，不退而绑 Bob。
+    #[tokio::test]
+    async fn explicit_socket_still_requires_matching_token() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "token-alice", "alice-pc"),
+                Spec::user("bob", "token-bob", "bob-pc"),
+            ],
+            Some("token-alice"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
+        let bob_path = peer(&farm, "bob").path.clone();
+        std::env::set_var("ISHELL_MCP_SOCKET", &bob_path);
+        let err = bind_instance().await.expect_err("点名了别人的 socket 也不能越过 token");
+        assert!(
+            err.contains("握手") || err.contains("token") || err.contains("配对"),
+            "{err}"
+        );
+        std::env::remove_var("ISHELL_MCP_SOCKET");
+    }
+
+    /// 发现层：Alice 下线、Bob（共用 token）还在时，改绑判定必须是 Rebound 然后被主机闸拒绝。
+    #[tokio::test]
+    async fn rediscover_does_not_rebind_to_the_other_user() {
+        let farm = start_farm(
+            vec![
+                Spec::user("alice", "shared", "alice-pc"),
+                Spec::user("bob", "shared", "bob-pc"),
+            ],
+            Some("shared"),
+            None,
+            None, // 故意不注入 ISHELL_HOST，只靠当初绑定记下的主机
+        )
+        .await;
+        let probes = identify_all(Some("shared".into())).await;
+        match classify_rediscover("alice", &probes) {
+            RediscoverOutcome::Same { .. } => {}
+            other => panic!("Alice 还在时应沿用，实际 {other:?}"),
+        }
+
+        // 停掉 Alice 的监听：abort 对应 task。peers[0] 是 alice。
+        farm.abort[0].abort();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let _ = std::fs::remove_file(&peer(&farm, "alice").path);
+
+        let probes = identify_all(Some("shared".into())).await;
+        match classify_rediscover("alice", &probes) {
+            RediscoverOutcome::Rebound { new_id, host, .. } => {
+                assert_eq!(new_id, "bob");
+                assert_eq!(host, "bob-pc");
+                let err = rebind_host_ok(Some("alice-pc"), &host).expect_err("不能改绑到 Bob");
+                assert!(err.contains("alice-pc") && err.contains("bob-pc"), "{err}");
+            }
+            other => panic!("Alice 下线后应判定 Rebound 到 Bob 再由主机闸拒绝，实际 {other:?}"),
+        }
+    }
+
+    /// 同机重启：旧 id 消失、同 host 新 id 是唯一匹配者 → 允许改绑。
+    #[tokio::test]
+    async fn rediscover_rebinds_when_same_host_restarts() {
+        let farm = start_farm(
+            vec![Spec::user("alice-old", "token-alice", "alice-pc")],
+            Some("token-alice"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
+        farm.abort[0].abort();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let _ = std::fs::remove_file(&peer(&farm, "alice-old").path);
+
+        // 在同一 HOME 下再挂一个新实例（同 token 同 host 新 id）。
+        let spec = Spec::user("alice-new", "token-alice", "alice-pc");
+        let path = farm.home.join(".ishell-mcp").join("mcp-alice-new.sock");
+        let peer = Arc::new(Peer {
+            spec,
+            path: path.clone(),
+            tickets: Mutex::new(HashSet::new()),
+            ticket_n: AtomicU32::new(0),
+            counters: Counters {
+                identify: AtomicU32::new(0),
+                pair_ok: AtomicU32::new(0),
+                pair_fail: AtomicU32::new(0),
+                bind: AtomicU32::new(0),
+            },
+        });
+        let listener = UnixListener::bind(&path).unwrap();
+        let p = peer.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        let p = p.clone();
+                        tokio::spawn(handle_conn(s, p));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let probes = identify_all(Some("token-alice".into())).await;
+        match classify_rediscover("alice-old", &probes) {
+            RediscoverOutcome::Rebound { new_id, host, .. } => {
+                assert_eq!(new_id, "alice-new");
+                assert!(rebind_host_ok(Some("alice-pc"), &host).is_ok());
+            }
+            other => panic!("同机重启应改绑，实际 {other:?}"),
+        }
+    }
+
+    /// Identify 应答不得回传真实 token（v3 起恒空）。
+    #[tokio::test]
+    async fn identify_does_not_echo_the_pairing_token() {
+        let farm = start_farm(
+            vec![Spec::user("alice", "super-secret-token", "alice-pc")],
+            Some("super-secret-token"),
+            None,
+            None,
+        )
+        .await;
+        let stream = UnixStream::connect(&peer(&farm, "alice").path)
+            .await
+            .expect("connect");
+        let (r, mut w) = stream.into_split();
+        let mut line = serde_json::to_string(&McpRequest {
+            id: 1,
+            instance: None,
+            origin: None,
+            actor: None,
+            ticket: None,
+            kind: McpReqKind::Identify,
+        })
+        .unwrap();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        BufReader::new(r).read_line(&mut resp).await.unwrap();
+        assert!(!resp.contains("super-secret-token"), "Identify 把 token 漏出来了：{resp}");
+        let decoded: McpResponse = serde_json::from_str(resp.trim()).unwrap();
+        match decoded.result.unwrap() {
+            McpReqResult::Instance { token, host, id, .. } => {
+                assert!(token.is_empty(), "v3+ token 字段必须恒空");
+                assert_eq!(id, "alice");
+                assert_eq!(host, "alice-pc");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 同机两个窗口都点拒绝：绑定失败，且不得改绑到另一台共用 token 的机器。
+    #[tokio::test]
+    async fn all_local_windows_denied_does_not_fall_through_to_another_host() {
+        let mut a1 = Spec::user("alice-1", "shared", "alice-pc");
+        let mut a2 = Spec::user("alice-2", "shared", "alice-pc");
+        a1.bind = BindPolicy::Deny;
+        a2.bind = BindPolicy::Deny;
+        let farm = start_farm(
+            vec![a1, a2, Spec::user("bob", "shared", "bob-pc")],
+            Some("shared"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
+        let err = bind_instance().await.expect_err("用户拒绝后不能偷偷绑别人");
+        assert!(err.contains("批准") || err.contains("拒绝"), "{err}");
+        assert_eq!(peer(&farm, "bob").binds(), 0);
+    }
+
+    /// 发现目录里躺着崩溃残留的死 socket，不得把活着的 Alice 掩盖掉。
+    #[tokio::test]
+    async fn leftover_dead_socket_does_not_hide_the_live_peer() {
+        let farm = start_farm(
+            vec![Spec::user("alice", "token-alice", "alice-pc")],
+            Some("token-alice"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
+        let dead = farm.home.join(".ishell-mcp").join("mcp-dead.sock");
+        std::fs::write(&dead, b"").unwrap();
+        let (id, _, _, _) = bind_instance().await.expect("死文件应被跳过");
+        assert_eq!(id, "alice");
+    }
+}
