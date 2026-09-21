@@ -164,13 +164,14 @@ fn incomplete_stream_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize 
         None => {
             // 前缀落在未终止的 DCS/APC 负载里时不算：包边界切在负载内的 `\x1b`
             // 上，扣进 query_tail 会把下一块开头的 `[6n` 拼成假 CPR，或把 `]8;`
-            // 拼成假 OSC 8。与 `incomplete_query_keep` 同一道守卫。
+            // 拼成假 OSC 8。与 `incomplete_query_keep` 同一道守卫，但 OSC 8 自己的
+            // 引导字节就是这段未终止序列的起点，起点上的前缀必须留下。
             let open = unterminated_string_tail(rest);
             const P: &[u8] = b"\x1b]8;";
             for n in 1..P.len() {
                 if rest.len() >= n && rest.ends_with(&P[..n]) {
                     let at = rest.len() - n;
-                    if open.is_some_and(|start| at >= start) {
+                    if open.is_some_and(|start| at > start) {
                         continue;
                     }
                     keep = keep.max(n);

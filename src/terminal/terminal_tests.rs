@@ -728,6 +728,26 @@ fn search_soft_wrap_spans_more_than_two_rows() {
 }
 
 #[test]
+fn search_soft_wrap_hit_can_start_on_a_later_row() {
+    let mut t = Terminal::new();
+    assert!(t.resize(4, 8));
+    // xxxx | HELL | OWOR | LD
+    t.feed(b"xxxxHELLOWORLD");
+    assert!(t.parser.screen().row_wrapped(0));
+    assert!(t.parser.screen().row_wrapped(1));
+    t.find = Some(search::Find {
+        query: "HELLOWORLD".into(),
+        ..Default::default()
+    });
+    t.run_search();
+    let hits = &t.find.as_ref().unwrap().hits;
+    assert!(
+        hits.iter().any(|&abs| abs >= 1),
+        "匹配从第二行软折开始，命中应落在那一行：{hits:?}"
+    );
+}
+
+#[test]
 fn search_hard_newline_regex_can_end_on_the_break() {
     let mut t = Terminal::new();
     assert!(t.resize(40, 6));
@@ -741,6 +761,23 @@ fn search_hard_newline_regex_can_end_on_the_break() {
     assert!(
         !t.find.as_ref().unwrap().hits.is_empty(),
         "正则 foo\\n 应命中硬换行"
+    );
+}
+
+#[test]
+fn search_hard_newline_regex_can_continue_into_the_next_line() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 6));
+    t.feed(b"foo\r\nbar\r\n");
+    t.find = Some(search::Find {
+        query: "foo\nbar".into(),
+        regex: true,
+        ..Default::default()
+    });
+    t.run_search();
+    assert!(
+        !t.find.as_ref().unwrap().hits.is_empty(),
+        "正则 foo\\nbar 应跨硬换行命中"
     );
 }
 
@@ -2040,6 +2077,29 @@ fn resize_reflow_keeps_blink_strike_double_underline() {
 }
 
 #[test]
+fn resize_reflow_keeps_single_underline_distinct_from_double() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 10));
+    t.feed(b"\x1b[4mU\x1b[0m\r\n");
+    assert!(t.resize(20, 6));
+    let screen = t.parser.screen();
+    let mut saw = false;
+    for row in 0..t.rows {
+        for col in 0..t.cols {
+            let Some(c) = screen.cell(row, col) else {
+                continue;
+            };
+            if c.contents() == "U" {
+                assert!(c.underline(), "单下划线重排后丢了");
+                assert!(!c.double_underline(), "单下划线不应变成双下划线");
+                saw = true;
+            }
+        }
+    }
+    assert!(saw, "重排后应还能找到 U");
+}
+
+#[test]
 fn osc8_hyperlink_span_and_split_across_feeds() {
     let mut t = Terminal::new();
     // 标准 OSC 8：开始 → 文本 → 结束
@@ -2090,6 +2150,73 @@ fn osc8_hard_newline_does_not_include_blanks_or_next_col0() {
     assert_eq!(url, "https://e.co");
     assert_eq!(*abs, 0);
     assert_eq!((*sc, *ec), (0, 1));
+}
+
+#[test]
+fn osc8_st_terminator_and_params_are_not_part_of_the_url() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]8;id=1;https://st.example\x1b\\click\x1b]8;;\x1b\\");
+    assert_eq!(t.osc8_spans.len(), 1, "{:?}", t.osc8_spans);
+    assert_eq!(t.osc8_spans[0].3, "https://st.example");
+    assert_eq!((t.osc8_spans[0].1, t.osc8_spans[0].2), (0, 4));
+    assert!(t.screen_text().contains("click"));
+    assert!(!t.screen_text().contains("st.example"));
+}
+
+#[test]
+fn malformed_osc8_does_not_hide_a_later_real_link() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]8;http://bad\x07\x1b]8;;https://ok.example\x07go\x1b]8;;\x07");
+    let text = t.screen_text();
+    assert!(text.contains("go"), "{text:?}");
+    assert_eq!(t.osc8_spans.len(), 1, "{:?}", t.osc8_spans);
+    assert_eq!(t.osc8_spans[0].3, "https://ok.example");
+}
+
+#[test]
+fn osc8_prefix_split_outside_a_string_is_kept() {
+    let mut t = Terminal::new();
+    t.feed(b"pre\x1b]8");
+    assert!(t.osc8_spans.is_empty());
+    assert!(t.screen_text().contains("pre"));
+    t.feed(b";;https://p.co\x07ab\x1b]8;;\x07");
+    assert_eq!(t.osc8_spans.len(), 1, "{:?}", t.osc8_spans);
+    assert_eq!(t.osc8_spans[0].3, "https://p.co");
+    assert!(t.screen_text().contains("ab"));
+}
+
+#[test]
+fn osc8_trim_follows_the_live_row_while_scrolled_back() {
+    let mut t = Terminal::new();
+    assert!(t.resize(20, 5));
+    for _ in 0..10 {
+        t.feed(b"history line\r\n");
+    }
+    t.parser.screen_mut().set_scrollback(3);
+    t.feed(b"\x1b]8;;https://e.co\x07hi\r\n\x1b]8;;\x07");
+    assert_eq!(t.osc8_spans.len(), 1, "{:?}", t.osc8_spans);
+    let (_, sc, ec, url) = &t.osc8_spans[0];
+    assert_eq!(url, "https://e.co");
+    assert_eq!(
+        (*sc, *ec),
+        (0, 1),
+        "回看历史时行尾空格仍应裁掉：{:?}",
+        t.osc8_spans
+    );
+    // 同一条换行在回看时会让 scrollback 跟着加一（视口不跳）。裁剪中途会把
+    // scrollback 拨到 0 去读活屏，放不回去的话这里会停在 0，而不是和普通换行一样。
+    let mut plain = Terminal::new();
+    assert!(plain.resize(20, 5));
+    for _ in 0..10 {
+        plain.feed(b"history line\r\n");
+    }
+    plain.parser.screen_mut().set_scrollback(3);
+    plain.feed(b"hi\r\n");
+    assert_eq!(
+        t.parser.screen().scrollback(),
+        plain.parser.screen().scrollback(),
+        "裁剪不该改掉用户的回看位置"
+    );
 }
 
 #[test]
@@ -2182,4 +2309,30 @@ fn osc8_prefix_inside_dcs_is_not_held() {
         "DCS 里的 ESC 不能和下一块的 [6n 拼成 CPR：{r2:?}"
     );
     assert!(t.screen_text().contains("OK"), "{}", t.screen_text());
+}
+
+#[test]
+fn osc8_introducer_inside_dcs_is_not_a_link() {
+    let mut t = Terminal::new();
+    // 包切在未终止 DCS 的 ESC 之后。下一块以 ]8; 开头时不能拼出超链接。
+    t.feed(b"\x1bPpayload\x1b");
+    t.feed(b"]8;;https://phantom.example\x07nope\x1b\\AFTER");
+    assert!(
+        t.osc8_spans.is_empty(),
+        "DCS 里的 ESC]8; 不能变成链接：{:?}",
+        t.osc8_spans
+    );
+    let text = t.screen_text();
+    assert!(text.contains("AFTER"), "{text:?}");
+    assert!(!text.contains("phantom"), "{text:?}");
+}
+
+#[test]
+fn malformed_osc8_closed_in_one_packet_does_not_hold_the_next() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]8;http://x\x07");
+    t.feed(b"OK");
+    let text = t.screen_text();
+    assert!(text.contains("OK"), "{text:?}");
+    assert!(t.osc8_spans.is_empty(), "{:?}", t.osc8_spans);
 }

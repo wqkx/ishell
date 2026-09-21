@@ -288,6 +288,27 @@ mod shell_fallback_tests {
         let sh = resolve_unix_shell();
         assert!(super::path_is_executable(&sh), "应落到可执行的 shell：{sh}");
     }
+
+    #[test]
+    fn non_executable_file_is_not_a_shell() {
+        let dir = std::env::temp_dir().join(format!("ishell-shell-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("not-a-shell");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        let mut perm = std::fs::metadata(&path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(0o644);
+        std::fs::set_permissions(&path, perm).unwrap();
+        assert!(
+            !super::path_is_executable(path.to_str().unwrap()),
+            "没有可执行位的普通文件不能当 shell"
+        );
+        assert!(!super::path_is_executable(
+            dir.join("missing").to_str().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 本机家目录：unix `$HOME`，Windows `%USERPROFILE%`。取不到则 None（PTY 用继承的 cwd）。

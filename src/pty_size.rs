@@ -129,4 +129,51 @@ mod tests {
             Some(UiCommand::TerminalInput(_))
         ));
     }
+
+    #[tokio::test]
+    async fn seeded_disconnect_returns_without_waiting() {
+        // sender 还活着且通道为空：要是没认出 Disconnect，就会空等满 1.5 秒。
+        let (_tx, mut rx) = unbounded_channel();
+        let mut seed = VecDeque::new();
+        seed.push_back(UiCommand::TerminalInput(b"x".to_vec()));
+        seed.push_back(UiCommand::Disconnect);
+        seed.push_back(UiCommand::Resize {
+            cols: 200,
+            rows: 40,
+        });
+        let (c, r, mut prelude) = resolve_initial_pty_size(&mut rx, seed).await;
+        assert_eq!((c, r), (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS));
+        assert!(matches!(prelude.pop_front(), Some(UiCommand::Disconnect)));
+        assert!(matches!(
+            prelude.pop_front(),
+            Some(UiCommand::TerminalInput(_))
+        ));
+        assert!(prelude.is_empty(), "Disconnect 之后的尺寸不该被消化");
+    }
+
+    #[tokio::test]
+    async fn zero_size_resize_falls_back_to_default() {
+        let (_tx, mut rx) = unbounded_channel::<UiCommand>();
+        drop(_tx);
+        let mut seed = VecDeque::new();
+        seed.push_back(UiCommand::Resize { cols: 0, rows: 24 });
+        let (c, r, _) = resolve_initial_pty_size(&mut rx, seed).await;
+        assert_eq!((c, r), (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS));
+    }
+
+    #[tokio::test]
+    async fn later_channel_resize_overrides_seeded_size() {
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(UiCommand::Resize { cols: 90, rows: 50 }).unwrap();
+        tx.send(UiCommand::Resize { cols: 0, rows: 10 }).unwrap();
+        let mut seed = VecDeque::new();
+        seed.push_back(UiCommand::Resize { cols: 10, rows: 10 });
+        seed.push_back(UiCommand::TerminalInput(b"k".to_vec()));
+        let (c, r, mut prelude) = resolve_initial_pty_size(&mut rx, seed).await;
+        assert_eq!((c, r), (90, 50));
+        assert!(matches!(
+            prelude.pop_front(),
+            Some(UiCommand::TerminalInput(_))
+        ));
+    }
 }

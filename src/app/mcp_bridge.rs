@@ -4046,7 +4046,7 @@ mod pair_handshake_tests {
 #[cfg(all(unix, test))]
 mod upload_stream_tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
     /// 起一个只服务一条连接的 `handle_conn`，把 `McpCall` 的接收端一并交回给测试
     /// （握手测试那份 helper 丢掉了 rx，这里必须留着才能拿到 upload_source）。
@@ -4170,5 +4170,75 @@ mod upload_stream_tests {
     async fn small_upload_stream_is_intact() {
         let size = 3 * 1024 * 1024;
         assert_eq!(upload_bytes(size).await, size);
+    }
+
+    /// 工作名额用尽时仍要把上传体读完再关连接。否则内核会对还堆着未读字节的 socket
+    /// 发 RST，调用方刚写进去的「并发已达上限」会一起丢掉。
+    #[tokio::test]
+    async fn work_limit_reject_drains_upload_and_keeps_the_error() {
+        let path = std::env::temp_dir().join(format!(
+            "ishell-worklimit-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("绑定测试 socket");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = egui::Context::default();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = sem.acquire_owned().await.expect("permit");
+            let work = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            handle_conn(stream, tx, ctx, permit, work).await;
+        });
+        let stream = UnixStream::connect(&path).await.expect("连接测试 socket");
+        let _ = std::fs::remove_file(&path);
+        let (r, mut w) = stream.into_split();
+        let mut line = serde_json::to_string(&McpRequest {
+            id: 7,
+            instance: Some(crate::store::mcp_instance_id().to_string()),
+            origin: None,
+            actor: None,
+            ticket: None,
+            kind: McpReqKind::CopyToRemoteFromCaller {
+                session_uid: 1,
+                remote_path: "/tmp/whatever".into(),
+                size: (512 * 1024) as u64,
+                timeout_ms: 60_000,
+            },
+        })
+        .expect("序列化请求");
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.expect("写请求行");
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0xABu8; 64 * 1024];
+            let mut left = 512 * 1024;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                w.write_all(&chunk[..n]).await?;
+                left -= n;
+            }
+            w.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let mut reader = tokio::io::BufReader::new(r);
+        let mut resp = String::new();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .expect("读错误响应超时：上传体没被排干，错误行被 RST 丢掉了")
+        .expect("读错误响应失败");
+        assert!(n > 0, "对端没写错误行就关了：{resp:?}");
+        assert!(
+            resp.contains("并发已达上限"),
+            "应能读到并发上限错误：{resp:?}"
+        );
+        writer
+            .await
+            .expect("写任务 panic")
+            .expect("上传体应被对端读完，而不是写到一半被重置");
     }
 }

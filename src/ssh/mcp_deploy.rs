@@ -15,6 +15,19 @@ use super::auth::{exec_capture, exec_capture_bytes, exec_status, open_sftp, Clie
 use super::sftp::sftp_write_atomic;
 use super::UiSink;
 
+/// 探测远端架构。不要加 `2>/dev/null`：csh/tcsh 会把它当成语法错误，uname 根本不跑。
+fn arch_probe_command() -> &'static str {
+    "uname -m"
+}
+
+/// 两级都 `mkdir -p -m 700`，再 `chmod 700`。`-m` 只作用于新建的最后一级，已有的
+/// 755 目录不会被 mkdir 改掉，所以 chmod 必须点名家目录下的 `.ishell-mcp` 和 bin 目录。
+fn ensure_private_mcp_dirs_command(home: &str, dir: &str) -> String {
+    format!(
+        "mkdir -p -m 700 '{home}/.ishell-mcp' && mkdir -p -m 700 '{dir}' && chmod 700 '{home}/.ishell-mcp' '{dir}'"
+    )
+}
+
 /// 部署结果：`(是否成功, 给用户看的话)`。第二个返回值成功时是远端可执行文件的绝对路径。
 pub(super) async fn deploy_mcp_agent(
     handle: &Handle<ClientHandler>,
@@ -29,7 +42,7 @@ pub(super) async fn deploy_mcp_agent(
 
     // 1) 架构。不用 `2>/dev/null`：csh/tcsh 把这写成语法错误，uname 根本没跑，
     //    stdout 是空的，后面就报「这台服务器是 ，…」。stderr 本来也不进 exec_capture。
-    let uname = match exec_capture(handle, "uname -m").await {
+    let uname = match exec_capture(handle, arch_probe_command()).await {
         Ok(u) => u,
         Err(e) => fail!(
             format!("探测服务器架构失败：{e}"),
@@ -93,12 +106,7 @@ pub(super) async fn deploy_mcp_agent(
     // 建成 755，socket 目录就悄悄变松了。`-m` 只作用于**最后一级**，所以两级各建一次。
     // `-m` 只作用于新建目录，已存在的 755 `~/.ishell-mcp` 不会被改。socket 落在这里，
     // 补一次 chmod，把以前用默认 umask 建出来的目录收紧。
-    match exec_status(
-        handle,
-        &format!(
-            "mkdir -p -m 700 '{home}/.ishell-mcp' && mkdir -p -m 700 '{dir}' && chmod 700 '{home}/.ishell-mcp' '{dir}'"
-        ),
-    )
+    match exec_status(handle, &ensure_private_mcp_dirs_command(&home, &dir))
     .await
     {
         Ok((0, _)) => {}
@@ -199,6 +207,21 @@ mod version_line_tests {
             "sh: /home/u/.ishell-mcp/bin/ishell-mcp: not found"
         ));
         assert!(!mcp_version_line_ok("ISHELL-MCP 1.0 proto 1"));
+        assert!(!mcp_version_line_ok("ishell-mcp 0.23.0 proto 7 extra"));
+        assert!(!mcp_version_line_ok("ishell-mcp .. proto 7"));
+        assert!(!mcp_version_line_ok("ishell-mcp 0.23.0 protocol 7"));
+        assert!(!mcp_version_line_ok(""));
+        assert!(mcp_version_line_ok("  ishell-mcp 1 proto 12  "));
+    }
+
+    #[test]
+    fn arch_probe_is_plain_uname_and_dirs_are_chmodded() {
+        assert_eq!(super::arch_probe_command(), "uname -m");
+        assert!(!super::arch_probe_command().contains('>'));
+        let cmd = super::ensure_private_mcp_dirs_command("/home/u", "/home/u/.ishell-mcp/bin");
+        assert!(cmd.contains("mkdir -p -m 700 '/home/u/.ishell-mcp'"));
+        assert!(cmd.contains("mkdir -p -m 700 '/home/u/.ishell-mcp/bin'"));
+        assert!(cmd.contains("chmod 700 '/home/u/.ishell-mcp' '/home/u/.ishell-mcp/bin'"));
     }
 }
 

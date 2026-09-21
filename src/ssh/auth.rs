@@ -1554,5 +1554,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, super::KbdWaitEnd::Cancelled));
+        let cancel = super::kbd_aborted(super::KbdWaitEnd::Cancelled).to_string();
+        let closed_msg = super::kbd_aborted(super::KbdWaitEnd::Closed).to_string();
+        assert_ne!(cancel, closed_msg);
+        assert!(
+            !cancel.contains("密钥") && !cancel.to_ascii_lowercase().contains("credential"),
+            "取消不该说成凭据错误：{cancel}"
+        );
+
+        let (tx, mut rx) = unbounded_channel();
+        drop(tx);
+        let err = super::wait_kbd_answers(&mut rx, &mut prelude)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::KbdWaitEnd::Closed));
+    }
+
+    #[test]
+    fn x11_prefix_little_endian_and_rejects_a_short_header() {
+        let fake = [3u8; 16];
+        let real = [4u8; 16];
+        let name = b"MIT-MAGIC-COOKIE-1";
+        let mut buf = vec![b'l', 0, 0, 11, 0, 0, name.len() as u8, 0, 16, 0, 0, 0];
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&fake);
+        let out = super::rewrite_x11_client_prefix(&buf, &fake, &real).unwrap();
+        assert!(out.windows(16).any(|w| w == real));
+        assert!(super::rewrite_x11_client_prefix(&buf[..8], &fake, &real).is_err());
+        buf[12] = b'X';
+        assert!(super::rewrite_x11_client_prefix(&buf, &fake, &real).is_err());
     }
 }
