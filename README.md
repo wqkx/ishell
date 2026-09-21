@@ -240,7 +240,7 @@ Typical setup: the AI runs on a shared server; several people connect with their
 
 Do one of these (prefer 1):
 
-1. **Start the AI inside an iShell terminal.** Once the session goes idle, iShell types ` export ISHELL_PAIR_TOKEN=… ISHELL_MCP_TOKEN=…` into it (built in since 0.21, active whenever “Allow AI to control terminals via MCP” is on); AI / `ishell-mcp` started in that shell binds only to *your* computer. Zero configuration in most cases.
+1. **Start the AI inside an iShell terminal.** Once the session goes idle, iShell types ` export ISHELL_PAIR_TOKEN=…` into it (built in since 0.21, active whenever “Allow AI to control terminals via MCP” is on); AI / `ishell-mcp` started in that shell binds only to *your* computer. Zero configuration in most cases.
 2. If the AI is *not* started inside an iShell terminal: Settings → “Copy pairing config”, and prefix the AI's launch command with it (e.g. `ISHELL_PAIR_TOKEN=… claude`). **Do not put the token in the AI's global MCP config** (such as the user-level `env` in `~/.claude.json`) on a server account shared by several people: that file is shared, and a token written there overrides everyone's terminal-injected token, routing every user's AI to your computer.
 3. Since protocol v5 (0.21) an **unpaired proxy is refused outright** with the two options above — the “click a window to choose” dialog is gone: an unpaired proxy's broadcast bind is exactly how the prompt reached every iShell on the server and one wrong click bound someone else's AI to you.
 

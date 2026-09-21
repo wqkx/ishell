@@ -150,7 +150,7 @@ fn a_head_arm_that_never_echoes_is_dropped_instead_of_blocking_the_queue() {
 fn partial_echo_match_stops_swallowing_newlines_after_cap() {
     let mut t = Terminal::new();
     // 注入命令以 "export" 开头；用户恰好敲了 "exp" + 回车
-    t.expect_echo("export ISHELL_MCP_TOKEN=secret");
+    t.expect_echo("export ISHELL_PAIR_TOKEN=secret");
     t.feed(b"exp\r\n");
     t.feed(b"bash: exp: command not found\r\n");
     let screen = t.screen_text();

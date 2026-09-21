@@ -241,7 +241,7 @@ cargo run --release
 
 正确做法（任选其一，推荐 1）：
 
-1. **在 iShell 的终端会话里启动 AI**：iShell 会在会话空闲时自动注入 ` export ISHELL_PAIR_TOKEN=… ISHELL_MCP_TOKEN=…`（0.21 起为内置行为，随「允许 AI 通过 MCP 控制终端」生效），此后在该终端启动的 AI / `ishell-mcp` 只绑定你这台电脑，多数情况零配置。
+1. **在 iShell 的终端会话里启动 AI**：iShell 会在会话空闲时自动注入 ` export ISHELL_PAIR_TOKEN=…`（0.21 起为内置行为，随「允许 AI 通过 MCP 控制终端」生效），此后在该终端启动的 AI / `ishell-mcp` 只绑定你这台电脑，多数情况零配置。
 2. AI 不在 iShell 终端里跑时：设置里「复制配对配置」，加在启动命令前面（如 `ISHELL_PAIR_TOKEN=… claude`）。**多人共用服务器账号时，不要把 token 写进 AI 的全局 MCP 配置**（如 `~/.claude.json` 的 user 级 `env`）：那份配置是所有人共用的，写进去的 token 会覆盖每个人终端注入的 token，把所有人的 AI 都路由到你的电脑。
 3. 从协议 v5（0.21）起，**未配对的代理会被直接拒绝**，并提示上面两条配置方法——「弹窗点选机器」已移除：未配对代理的广播绑定正是「弹窗落到服务器上每一台 iShell、点错绑到别人环境」的那条路径。
 

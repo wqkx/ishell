@@ -210,7 +210,7 @@ pub fn save_ai_notify_mode(m: AiNotifyMode) {
     }
 }
 
-/// 是否自动把配对标识注入空闲的终端会话（` export ISHELL_MCP_TOKEN=…` 并回车执行）。
+/// 是否自动把配对标识注入空闲的终端会话（` export ISHELL_PAIR_TOKEN=…` 并回车执行）。
 ///
 /// 0.21 起这是**内置行为、不再是用户选项**：AI 控制总开关（`load_mcp_consent`）打开时
 /// 恒为真。它解决的是多用户服务器上「无 token 代理向每台 iShell 广播绑定弹窗」的问题

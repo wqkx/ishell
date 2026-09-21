@@ -346,54 +346,49 @@ async fn identify_all(prove_token: Option<String>) -> Vec<(Probe, std::path::Pat
     out
 }
 
-/// 终端注入专用的配对变量名。iShell 往自己的终端会话里注入它（同时注入旧名
-/// `ISHELL_MCP_TOKEN` 兼容旧代理）。**它必须是一个 MCP 配置里不会出现的名字**，理由见
-/// [`pairing_token`]。
+/// 终端注入专用的配对变量名。iShell 往自己的终端会话里注入它。
+/// **它必须是一个 MCP 配置里不会出现的名字**，理由见 [`pairing_token`]。
 #[cfg(unix)]
 const LAUNCH_TOKEN_VAR: &str = "ISHELL_PAIR_TOKEN";
-/// 旧名：既是早期终端注入的变量，也是「复制配对配置」让用户写进 MCP server env 的变量。
+/// 已废弃的旧环境变量名：仅作遗留 MCP 配置 / 旧启动前缀的静默兜底读取。
+/// **用户指引与报错文案一律用 [`LAUNCH_TOKEN_VAR`]，不要再提示设置本变量。**
 #[cfg(unix)]
-const CONFIG_TOKEN_VAR: &str = "ISHELL_MCP_TOKEN";
+const LEGACY_CONFIG_TOKEN_VAR: &str = "ISHELL_MCP_TOKEN";
 
 #[cfg(unix)]
 const LAUNCH_HOST_VAR: &str = "ISHELL_HOST";
 
-/// 本代理该用哪个配对 token。**「启动这个 AI 的那个终端」注入的专用变量优先，MCP 配置
-/// 里写的值只作兜底。**
+/// 本代理该用哪个配对 token。**「启动这个 AI 的那个终端」注入的专用变量优先，遗留配置
+/// 里写的旧变量名只作兜底。**
 ///
-/// 为什么不能直接读 `ISHELL_MCP_TOKEN`（多机串台的真正根因，2026-09-18 在生产服务器上实测）：
-/// AI 客户端（Claude Code 等）spawn MCP server 时，会用配置里 `env` 块的值**覆盖**从终端继承
-/// 来的同名变量。共用服务器账号时，`~/.claude.json` 的 user 级配置是**所有人共用**的——只要
-/// 有一个人把自己的 token 写进了那里，服务器上所有人的代理就都带着**他的** token：iShell 在
-/// 各自终端里注入的正确值被静默覆盖，所有人的请求都落到他的电脑上。实测：来自 4 个不同 IP 的
-/// claude 进程，自身环境里 token 各不相同，它们起的代理却全都带着同一个 token。
+/// 为什么主路径用 [`LAUNCH_TOKEN_VAR`] 而不是旧名（多机串台的真正根因，2026-09-18 在生产
+/// 服务器上实测）：AI 客户端（Claude Code 等）spawn MCP server 时，会用配置里 `env` 块的值
+/// **覆盖**从终端继承来的同名变量。共用服务器账号时，`~/.claude.json` 的 user 级配置是
+/// **所有人共用**的——只要有一个人把自己的 token 写进了那里，服务器上所有人的代理就都带着
+/// **他的** token：iShell 在各自终端里注入的正确值被静默覆盖，所有人的请求都落到他的电脑上。
 ///
 /// 取值顺序：
-/// 1. [`LAUNCH_TOKEN_VAR`]：只由终端注入、没人往配置里写，所以不会被覆盖。
-/// 2. `ISHELL_MCP_TOKEN`：AI 不是从 iShell 终端启动的（IDE 里跑等），只能靠配置或启动前缀。
+/// 1. [`LAUNCH_TOKEN_VAR`]：只由终端注入 / 「复制配对配置」启动前缀提供。
+/// 2. [`LEGACY_CONFIG_TOKEN_VAR`]：遗留配置或旧前缀；**不要再引导用户设置它**。
 ///
-/// 两者不一致时按 1，并在 stderr 告警（配置里那个多半是别人写进共享配置的）。
-/// **只有配置值**（注入缺失）时也会告警一次——这是静默串台最危险的形态。
-///
-/// 这里**刻意不去读父进程环境里的旧变量**：v6 起配对 token 已整体换新（见
-/// `store::mcp_pairing_token`），旧版 iShell 注入的 `ISHELL_MCP_TOKEN` 只可能是作废的旧值，
-/// 读它只会压过配置里正确的新值、再打一条方向相反的告警。
+/// 两者不一致时按 1，并在 stderr 告警。**只有遗留配置值**（注入缺失）时也会告警一次。
 #[cfg(unix)]
 fn pairing_token() -> Option<String> {
     let (token, overridden, config_only) = resolve_pairing_token(
         std::env::var(LAUNCH_TOKEN_VAR).ok(),
-        std::env::var(CONFIG_TOKEN_VAR).ok(),
+        std::env::var(LEGACY_CONFIG_TOKEN_VAR).ok(),
     );
     if overridden {
         eprintln!(
-            "ishell-mcp: 终端注入的 {LAUNCH_TOKEN_VAR} 与 MCP 配置里 env.{CONFIG_TOKEN_VAR} 不一致，\
-             按终端的来（配置里的值多半是别人写进共享配置的，会把请求路由到他的电脑）。\
-             建议从 AI 的 MCP 配置（如 ~/.claude.json）里删掉 {CONFIG_TOKEN_VAR}。"
+            "ishell-mcp: 终端注入的 {LAUNCH_TOKEN_VAR} 与环境里遗留的 {LEGACY_CONFIG_TOKEN_VAR} 不一致，\
+             按终端的来（遗留值多半是别人写进共享 MCP 配置的，会把请求路由到他的电脑）。\
+             建议从 AI 的 MCP 配置（如 ~/.claude.json）里删掉 {LEGACY_CONFIG_TOKEN_VAR}，\
+             改用设置里「复制配对配置」给出的 {LAUNCH_TOKEN_VAR} 启动前缀。"
         );
     }
     if config_only {
         eprintln!(
-            "ishell-mcp: 未检测到终端注入的 {LAUNCH_TOKEN_VAR}，正在使用配置中的 {CONFIG_TOKEN_VAR}。\
+            "ishell-mcp: 未检测到终端注入的 {LAUNCH_TOKEN_VAR}，正在使用遗留变量 {LEGACY_CONFIG_TOKEN_VAR}。\
              若它不是你本机的 token，请求会静默路由到别的机器。建议从 iShell 终端启动 AI，\
              或在终端右键「立即注入配对标识」后再启动；不要把别人的 token 写进 ~/.claude.json。"
         );
@@ -499,7 +494,8 @@ fn host_mismatch_msg(mine: &str, peers: &[&str]) -> String {
     };
     format!(
         "配对 token 对应的 iShell 不在主机 {mine} 上（发现的实例在 {where_}）。\
-         这通常意味着配置里的 {CONFIG_TOKEN_VAR} 来自另一台机器，或多台机器同步了同一份 token。\
+         这通常意味着环境里的 {LAUNCH_TOKEN_VAR}（或遗留的 {LEGACY_CONFIG_TOKEN_VAR}）来自另一台机器，\
+         或多台机器同步了同一份 token。\
          请在你当前这台 iShell 的终端里启动 AI（会自动注入 {LAUNCH_TOKEN_VAR} 与 {LAUNCH_HOST_VAR}），\
          并从 MCP 配置中删掉别人的 token。"
     )
@@ -525,9 +521,9 @@ fn resolve_pairing_token(
 /// 返回 `(id, path, ticket, host)`。
 #[cfg(unix)]
 async fn bind_instance() -> Result<(String, std::path::PathBuf, String, String), String> {
-    // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_MCP_TOKEN` 就走双向
-    // 挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；没设则从协议 v5
-    // 起直接拒绝并给出配置指引（匿名绑定的广播弹窗是它要根治的东西，见下面的拒绝分支）。
+    // 配对 token（多机共用同一 AI 服务器账号时的隔离）：设了 `ISHELL_PAIR_TOKEN`（或遗留的
+    // 旧环境变量）就走双向挑战-应答握手、**只认握手通过的实例**，请求绝不会串到别人的电脑上；
+    // 没设则从协议 v5 起直接拒绝并给出配置指引（匿名绑定的广播弹窗是它要根治的东西）。
     // 见 `store::mcp_pairing_token`。
     let want_token = pairing_token();
 
@@ -566,7 +562,7 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String, String),
                 check_proto_version(ver)?;
                 Err(format!(
                     "ISHELL_MCP_SOCKET 指向的 iShell 没有通过配对握手：{}\n\
-                     同时设置了 ISHELL_MCP_TOKEN，说明你要求只连自己那台 iShell，\
+                     同时设置了 {LAUNCH_TOKEN_VAR}，说明你要求只连自己那台 iShell，\
                      所以这里不会退而求其次去连它。常见原因是这条 ISHELL_MCP_SOCKET \
                      是早先手工隧道留下的、已经指向别人（或别的）iShell——去掉它即可\
                      改回按 token 自动发现；若确实要用这条 socket，请核对两边的配对 token。",
@@ -584,7 +580,8 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String, String),
     // 那是用户点名的路径，意图明确，在上面放行，见上面的分支。）
     let Some(token) = want_token else {
         return Err(
-            "这份 ishell-mcp 没有配置配对 token（ISHELL_MCP_TOKEN），而这台 iShell 只响应携\
+            format!(
+            "这份 ishell-mcp 没有配置配对 token（{LAUNCH_TOKEN_VAR}），而这台 iShell 只响应携\
              带配对 token 的请求：匿名绑定会让绑定弹窗广播到服务器上**每一台** iShell，先点\
              「允许」的窗口胜出——误点允许会把别人的 AI 绑到你的电脑上，所以从协议 v5 起不\
              再提供无 token 的匿名绑定。\n\
@@ -592,10 +589,10 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String, String),
              1. 在你自己那台 iShell 的终端会话里启动 AI：iShell 会自动注入配对 token，多数情\
              况零配置即可；\n\
              2. AI 不在 iShell 终端里启动时：在那台 iShell 的 MCP 设置里点「复制配对配置」，\
-             启动 AI 时把它加在命令前面（如 `ISHELL_PAIR_TOKEN=… ISHELL_HOST=… claude`）。**不要**写进 AI 的\
+             启动 AI 时把它加在命令前面（如 `{LAUNCH_TOKEN_VAR}=… ISHELL_HOST=… claude`）。**不要**写进 AI 的\
              全局 MCP 配置（如 ~/.claude.json 的 user 级 env）——多人共用服务器账号时那份配置\
              是所有人共用的，会把所有人的 AI 都绑到你的电脑上。"
-                .into(),
+            ),
         );
     };
 
@@ -666,7 +663,8 @@ fn bind_none_matched_msg(answered: usize) -> String {
     if answered > 0 {
         format!(
             "检测到 {answered} 个活着的 iShell，但都没有通过配对握手（token 不一致）。\
-             这通常是 MCP 配置里的 {CONFIG_TOKEN_VAR} 来自别人或旧机器，请求被路由错了。\
+             这通常是环境里的 {LAUNCH_TOKEN_VAR}（或遗留的 {LEGACY_CONFIG_TOKEN_VAR}）来自别人或旧机器，\
+             请求被路由错了。\
              请在你自己的 iShell 终端里启动 AI（会自动注入 {LAUNCH_TOKEN_VAR}），\
              或终端右键「立即注入配对标识」后再启动，并删掉 ~/.claude.json 里别人的 token。"
         )
@@ -848,7 +846,7 @@ fn format_lost(want_id: &str, paired: &[(String, String)], answered: usize) -> S
     if paired.is_empty() {
         return format!(
             "当初绑定的 iShell 实例（id {want_id}）已消失，附近有 {answered} 个活着的 iShell \
-             但都没通过配对握手（token 不一致）。请核对 {LAUNCH_TOKEN_VAR}/{CONFIG_TOKEN_VAR}，\
+             但都没通过配对握手（token 不一致）。请核对 {LAUNCH_TOKEN_VAR}，\
              并重新发起 MCP 连接。"
         );
     }
@@ -2865,7 +2863,7 @@ mod fake_farm_tests {
         )
         .await;
         let err = bind_instance().await.expect_err("无 token 必须拒绝");
-        assert!(err.contains("ISHELL_MCP_TOKEN") || err.contains("配对 token"), "{err}");
+        assert!(err.contains("ISHELL_PAIR_TOKEN") || err.contains("配对 token"), "{err}");
         assert_eq!(peer(&farm, "alice").binds(), 0);
         assert_eq!(peer(&farm, "bob").binds(), 0);
     }

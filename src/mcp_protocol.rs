@@ -79,7 +79,7 @@ where
 
 // ---------- MCP 配对握手（v4）：双向挑战-应答 ----------
 //
-// 解决的问题：v3 让代理把 `ISHELL_MCP_TOKEN` **明文发给每一条候选 socket**（见
+// 解决的问题：v3 让代理把配对 token **明文发给每一条候选 socket**（见
 // `candidate_paths`，共用账号时那个目录里躺着别人的转发 socket）。方向虽然从"服务器公布
 // 密钥"翻成了"调用方出示密钥"，但向一个**未经认证的验证方**出示 bearer secret 同样是泄露，
 // 而且是一次泄露给所有验证方。改成挑战-应答后，线上只出现 `HMAC(token, nonce)`，token 本身
@@ -197,7 +197,7 @@ pub struct McpSessionInfo {
     /// 旧代理（不带 actor）开的窗口对任何调用方都报 `false`——它们属于旧版的共享池。
     #[serde(default)]
     pub mine: bool,
-    /// 配对 token（`ISHELL_MCP_TOKEN`）是否已注入这个会话的 shell。`false` 意味着在该
+    /// 配对 token（`ISHELL_PAIR_TOKEN`）是否已注入这个会话的 shell。`false` 意味着在该
     /// 终端里启动的 AI 拿不到配对身份、绑定会被拒——用户会话多是「连上后敲过键盘」被
     /// 跳过（可终端右键「立即注入配对标识」补救），AI 会话在新 shell 的空档里会自动补注。
     /// 旧代理/GUI 组合没有这个字段时默认 false（保守，不代表真的没注入）。

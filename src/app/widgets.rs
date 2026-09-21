@@ -200,9 +200,9 @@ pub fn view_context_menu(resp: &egui::Response) {
                 // store 的三个 loader（恒真）与 `pair_inject_allowed`/`session_owned_by` 里。
                 // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的
                 // socket 会堆在一起、代理无从区分谁是谁（见 store::mcp_pairing_token）。
-                // iShell 终端会话会在空闲时自动注入它（export ISHELL_MCP_TOKEN），多数情况
+                // iShell 终端会话会在空闲时自动注入它（export ISHELL_PAIR_TOKEN），多数情况
                 // 无需手动配置；只有 AI 跑在 iShell 终端之外时才需要把下面这行填进那份 AI
-                // 的配置。
+                // 的启动前缀（不要写进全局 MCP 配置 env）。
                 if mcp_on {
                     let token = crate::store::mcp_pairing_token();
                     ui.separator();
@@ -238,7 +238,7 @@ pub fn view_context_menu(resp: &egui::Response) {
                         ))
                         .clicked()
                     {
-                        // 新变量名：只有它不会被别人写进共享 MCP 配置的 ISHELL_MCP_TOKEN 覆盖。
+                        // 只复制 ISHELL_PAIR_TOKEN（+ HOST）：不要再用已废弃的旧变量名。
                         // 一并带上 ISHELL_HOST，手动前缀才和终端注入一样能挡住绑到别的机器。
                         let host = crate::mcp_protocol::local_hostname();
                         let text = if host.is_empty() || host == "unknown-host" {

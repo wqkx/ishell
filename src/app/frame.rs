@@ -180,7 +180,7 @@ impl App {
         }
         // MCP 配对 token 自动注入（0.21 起为内置行为，随「允许 AI 控制终端」生效，不再是
         // 独立开关，见 `store::load_mcp_auto_pair`）：每个用户会话在「连接后一个键都没敲过」
-        // 的静止窗口里被注入 ` export ISHELL_MCP_TOKEN=…`（回显吞除）——此后该 shell 里启动
+        // 的静止窗口里被注入 ` export ISHELL_PAIR_TOKEN=…`（回显吞除）——此后该 shell 里启动
         // 的 AI 自动携带配对身份，绑定只回本机，多用户服务器上不会对其他人的 iShell 弹窗。
         //
         // 闲置判据整体交给 `shell_idle_for_injection`（与 cwd 恢复同一道闸门），其中
@@ -1092,7 +1092,7 @@ fn pair_inject_allowed(
     auto_pair_on && mcp_on && !ai_owned && !already_injected
 }
 
-/// 往会话终端注入配对 token（`ISHELL_PAIR_TOKEN` + 兼容旧名 `ISHELL_MCP_TOKEN`，见
+/// 往会话终端注入配对 token（`ISHELL_PAIR_TOKEN`，见
 /// `session::pair_token_export_cmd`；回显吞除）。
 /// 此后该 shell 里启动的 AI / ishell-mcp 子进程自动继承这个环境变量，MCP 绑定走
 /// ishell-mcp 既有的 token 匹配路径（`bind_instance`），请求精确路由回这台电脑。
@@ -1114,7 +1114,7 @@ mod pair_inject_tests {
     /// 自己的 shell 里敲一条命令并回车。
     ///
     /// 0.19 把 AI 控制的默认值翻成开启之后，自动注入的门还挂在那个开关上，于是每一个新连上
-    /// 的会话都会被自动打进 ` export ISHELL_MCP_TOKEN=…` 并执行——用户报的「iShell 往我当前
+    /// 的会话都会被自动打进 ` export ISHELL_PAIR_TOKEN=…` 并执行——用户报的「iShell 往我当前
     /// 会话里输东西」就是它。注入必须由**它自己那个默认关闭的开关**把门。
     #[test]
     fn enabling_ai_control_alone_never_authorises_typing_into_the_users_shell() {

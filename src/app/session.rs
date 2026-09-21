@@ -70,7 +70,7 @@ pub(super) struct Session {
     /// 「在终端打开当前目录」忙碌拦截的强制窗口：首次点击若终端疑似在跑任务则 toast 拦截，
     /// 在此刻之前再次点击视为用户确认、强制注入 cd（应对任务已停但判定信号未消失的误拦）
     pub(super) cd_force_until: Option<std::time::Instant>,
-    /// 本会话是否已注入过 MCP 配对 token（export ISHELL_MCP_TOKEN）。断线重连后远端是
+    /// 本会话是否已注入过配对 token（`export ISHELL_PAIR_TOKEN=…`）。断线重连后远端是
     /// 新 shell（env 已丢），Connected 时复位以便重新注入。
     pub(super) mcp_token_injected: bool,
     /// 「因用户连上后敲过键盘而跳过配对标识自动注入」的提示是否已发过（每连接复位）。
@@ -278,12 +278,12 @@ fn ai_injection_allowed(
 
 /// 注入配对 token 的那行命令（自动注入与右键「立即注入」共用，两处不会漂移）。
 ///
-/// **同时导出两个名字**（以及本机主机名）：
-/// - `ISHELL_PAIR_TOKEN`：新代理优先读它。它只由终端注入、从不出现在 AI 的 MCP 配置里，
-///   所以不会被配置文件的 `env` 覆盖——共用服务器账号时，`~/.claude.json` 里别人写死的
-///   `ISHELL_MCP_TOKEN` 会覆盖掉终端注入的同名变量，把所有人的 AI 都路由到他的电脑
-///   （2026-09-18 生产实测的串台根因，见 ishell-mcp 的 `pairing_token`）。
-/// - `ISHELL_MCP_TOKEN`：旧代理只认这个名字，保留以兼容。
+/// 只导出：
+/// - `ISHELL_PAIR_TOKEN`：代理优先读它。它只由终端注入 / 「复制配对配置」前缀提供，
+///   **不要**写进 AI 的全局 MCP 配置 `env`——共用服务器账号时，`~/.claude.json` 里别人
+///   写死的同名变量会覆盖终端注入值，把所有人的 AI 都路由到他的电脑（2026-09-18 生产
+///   实测串台根因）。旧名 `ISHELL_MCP_TOKEN` 已废弃，不再注入；代理仍可能从环境静默
+///   读到它作兜底（遗留配置），但用户指引与提示一律只提 `ISHELL_PAIR_TOKEN`。
 /// - `ISHELL_HOST`：本机主机名。代理绑定后与 `Instance.host` 对照，拿着别人的 token 时
 ///   会变成响亮报错而不是静默串台。
 ///
@@ -293,9 +293,9 @@ pub(super) fn pair_token_export_cmd() -> String {
     let t = crate::store::mcp_pairing_token();
     let host = crate::mcp_protocol::local_hostname();
     if host.is_empty() || host == "unknown-host" {
-        format!(" export ISHELL_PAIR_TOKEN={t} ISHELL_MCP_TOKEN={t}")
+        format!(" export ISHELL_PAIR_TOKEN={t}")
     } else {
-        format!(" export ISHELL_PAIR_TOKEN={t} ISHELL_MCP_TOKEN={t} ISHELL_HOST={host}")
+        format!(" export ISHELL_PAIR_TOKEN={t} ISHELL_HOST={host}")
     }
 }
 

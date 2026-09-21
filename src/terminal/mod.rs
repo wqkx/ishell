@@ -1053,11 +1053,11 @@ impl Terminal {
                         "Inject pairing token now",
                     ))
                     .on_hover_text(crate::i18n::tr(
-                        "立刻往本终端执行 ` export ISHELL_MCP_TOKEN=…`（回显吞除）。\n\
+                        "立刻往本终端执行 ` export ISHELL_PAIR_TOKEN=…`（回显吞除）。\n\
                          自动注入只发生在「连接后一个键都没敲过」的会话上；你敲过键盘的会话会\
                          静默跳过——在其中启动的 AI 没有配对身份，绑定请求会对服务器上所有\
                          iShell 弹窗。点这里手动补上即可（等价于替你在 shell 里执行那行 export）。",
-                        "Runs ` export ISHELL_MCP_TOKEN=…` in this terminal right now (echo \
+                        "Runs ` export ISHELL_PAIR_TOKEN=…` in this terminal right now (echo \
                          swallowed).\n\
                          Auto-injection only happens in sessions where you haven't typed since \
                          connecting; a session you typed in is silently skipped — an AI started \
