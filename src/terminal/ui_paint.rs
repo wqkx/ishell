@@ -236,21 +236,24 @@ impl Terminal {
             }
         }
 
-        // 悬停的链接：手型光标 + 下划线；点击打开
-        if let Some(p) = hover_pos {
-            if let Some((r, _)) = link_rects.iter().find(|(r, _)| r.contains(p)) {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                let uy = (origin.y + ((r.top() - origin.y) / char_h).round() * char_h)
-                    + (char_h + glyph_h) / 2.0
-                    - 1.0;
-                painter.hline(
-                    r.left()..=r.right(),
-                    uy,
-                    Stroke::new(1.0, crate::theme::Palette::ACCENT),
-                );
+        // 悬停链接：按住 Ctrl 才变成可点（手型 + 强调下划线），避免选词时误开浏览器。
+        let ctrl_click = ui.input(|i| i.modifiers.ctrl);
+        if ctrl_click {
+            if let Some(p) = hover_pos {
+                if let Some((r, _)) = link_rects.iter().find(|(r, _)| r.contains(p)) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    let uy = (origin.y + ((r.top() - origin.y) / char_h).round() * char_h)
+                        + (char_h + glyph_h) / 2.0
+                        - 1.0;
+                    painter.hline(
+                        r.left()..=r.right(),
+                        uy,
+                        Stroke::new(1.0, crate::theme::Palette::ACCENT),
+                    );
+                }
             }
         }
-        if resp.clicked() {
+        if ctrl_click && resp.clicked() {
             if let Some(url) = &hover_link {
                 open_url(url);
             }
