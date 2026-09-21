@@ -530,6 +530,23 @@ impl EditorState {
         self.close_confirm = false;
         self.trim_request = true;
     }
+
+    /// 会话关闭时丢掉该会话的全部编辑器标签（含未保存）。
+    /// 无 egui Context：跳过 TextEditState 细清，靠 `trim_request` 在下一帧收口。
+    pub(super) fn drop_tabs_for_session(&mut self, uid: u64) {
+        let before = self.tabs.len();
+        self.tabs.retain(|t| t.uid != uid);
+        if self.tabs.len() == before {
+            return;
+        }
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        self.close_tab_confirm = None;
+        self.trim_request = true;
+    }
 }
 
 /// 主窗口会话标签条的拖拽重排 + 滚动状态（从 App 抽出的内聚字段组）。

@@ -4,9 +4,11 @@ use std::io::Write;
 
 use super::{
     osc::{
-        count_bel, parse_osc133, parse_osc52, parse_osc7, parse_osc_notify,
+        count_bel, find_sub_outside_string_escapes, osc_rgb_reply, parse_osc133,
+        parse_osc52, parse_osc7, parse_osc_color_queries, parse_osc_notify, parse_osc_title,
         unterminated_string_tail, Osc133,
     },
+    theme::TermColors,
     vt::{find_sub, incomplete_utf8_tail, serialize_row, strip_ansi_to_text},
     CaptureMode, Terminal, DEFAULT_SCROLLBACK,
 };
@@ -35,10 +37,11 @@ enum ReplyKind {
 }
 
 /// 在 `hay` 里找最早出现的查询；同起点取更长匹配（`ESC[0c` 优先于 `ESC[c`）。
+/// 在 OSC/DCS 负载内的同款字节不算——见 `find_sub_outside_string_escapes`。
 fn find_next_query(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<(usize, ReplyKind, usize)> {
     let mut best: Option<(usize, ReplyKind, usize)> = None;
     for &(pat, kind) in queries {
-        if let Some(at) = find_sub(hay, pat) {
+        if let Some(at) = find_sub_outside_string_escapes(hay, pat) {
             let better = match best {
                 None => true,
                 Some((bat, _, blen)) => at < bat || (at == bat && pat.len() > blen),
@@ -414,6 +417,24 @@ impl Terminal {
         if let Some(p) = parse_osc7(scan) {
             self.osc7_cwd = Some(p);
         }
+        // OSC 0/2 窗口标题（vim/ssh 会话名等）；空串清掉动态标题，回落到连接名。
+        if let Some(t) = parse_osc_title(scan, carried) {
+            self.window_title = if t.is_empty() { None } else { Some(t) };
+        }
+        // OSC 10/11 颜色查询：WezTerm/kitty/现代 TUI 会问；按当前主题回 rgb:RRRR/GGGG/BBBB。
+        let mut osc_color_replies = Vec::new();
+        let color_qs = parse_osc_color_queries(scan, carried);
+        if !color_qs.is_empty() {
+            let tc = TermColors::by_index(self.theme);
+            for n in color_qs {
+                let c = match n {
+                    10 => tc.fg,
+                    11 => tc.bg,
+                    _ => continue,
+                };
+                osc_color_replies.extend(osc_rgb_reply(n, c.r(), c.g(), c.b()));
+            }
+        }
         // OSC 9/777 桌面通知（codex 走这条、`printf '\e]9;done\a'` 类脚本也是）。
         // **不设门槛**：发这个序列本身就是程序在明确要求"提醒用户"，不像裸 BEL 那样含糊。
         for (title, body) in parse_osc_notify(scan, carried) {
@@ -487,7 +508,8 @@ impl Terminal {
             return Vec::new();
         }
 
-        let replies = self.process_with_sync(bytes);
+        let mut replies = osc_color_replies;
+        replies.extend(self.process_with_sync(bytes));
         self.ensure_cursor_after_alt();
         if bel {
             self.push_bel_notice();
@@ -501,8 +523,9 @@ impl Terminal {
         // `clear` 会发 ESC[2J（清屏）+ ESC[3J（清回滚缓冲）。vt100 不处理 [3J，
         // 导致旧内容仍留在 scrollback（可上滚看到）。这里在 [3J 处重建解析器，
         // 真正清空回滚缓冲；[3J 之后的字节（新提示符等）喂入全新解析器。
-        if find_sub(bytes, b"\x1b[2J").is_some() {
-            if let Some(pos) = find_sub(bytes, b"\x1b[3J") {
+        // 必须在 OSC/DCS 负载外匹配：tmux 透传等序列里碰巧含同款字节时绝不能重建。
+        if find_sub_outside_string_escapes(bytes, b"\x1b[2J").is_some() {
+            if let Some(pos) = find_sub_outside_string_escapes(bytes, b"\x1b[3J") {
                 let (before, after) = bytes.split_at(pos + 4);
                 let mut replies = self.process_with_replies(before);
                 // 与 resize 的普通屏重建同理：清屏该清的是内容和回滚缓冲，不该连带清掉鼠标

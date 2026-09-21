@@ -699,7 +699,13 @@ impl App {
             return;
         }
         let s = self.sessions.remove(idx);
+        let uid = s.uid;
         let _ = s.cmd_tx.send(UiCommand::Disconnect);
+        // 会话没了，它打开的编辑器标签也不该挂着：保存只会 30s 超时失败且提示误导。
+        {
+            let mut es = lock_mutex(&self.editor_state);
+            es.drop_tabs_for_session(uid);
+        }
         if self.sessions.is_empty() {
             self.active = None;
         } else {

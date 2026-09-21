@@ -709,7 +709,7 @@ pub(super) async fn connect(
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
 ) -> anyhow::Result<(Handle<ClientHandler>, Option<Handle<JumpHandler>>)> {
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(3600)),
+        inactivity_timeout: Some(Duration::from_secs(120)), // keepalive 30s × ~4；原 3600 时 TCP 黑洞最坏近 1h 才感知
         keepalive_interval: Some(Duration::from_secs(30)),
         ..Default::default()
     });

@@ -526,6 +526,87 @@ fn replies_to_dsr_status_and_device_attributes() {
     assert_eq!(t.feed(b"c"), b"\x1b[?1;2c");
 }
 
+/// DCS/OSC 负载里碰巧出现的清屏/查询字节绝不能触发重建解析器或假应答。
+#[test]
+fn clear_and_cpr_inside_dcs_are_ignored() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 5));
+    t.feed(b"keep-me\r\n");
+    // 撑满可见屏，把 keep-me 推进 scrollback——否则裸 2J（vt100 自清屏）也会抹掉它，
+    // 分不清是「误触发了我们的 [3J 重建」还是「vt100 清了当前屏」。
+    for _ in 0..8 {
+        t.feed(b"pad\r\n");
+    }
+    assert!(
+        t.history_text(50).contains("keep-me"),
+        "前置条件：keep-me 应已在历史里"
+    );
+    let replies = t.feed(b"\x1bPtmux;\x1b[2J\x1b[3J\x1b[6n\x1b\\");
+    assert!(replies.is_empty(), "DCS 内查询不应应答：{replies:?}");
+    let hist = t.history_text(50);
+    assert!(hist.contains("keep-me"), "DCS 内假 clear 清掉了历史：{hist:?}");
+    // 真 clear 仍生效
+    t.feed(b"\x1b[2J\x1b[3Jfresh\r\n");
+    let hist = t.history_text(50);
+    assert!(hist.contains("fresh"), "{hist:?}");
+    assert!(!hist.contains("keep-me"), "真 clear 后旧历史应消失：{hist:?}");
+}
+
+/// OSC 10/11 颜色查询按当前主题回 rgb:RRRR/GGGG/BBBB。
+#[test]
+fn replies_to_osc_color_queries() {
+    let mut t = Terminal::new();
+    let r = t.feed(b"\x1b]10;?\x07\x1b]11;?\x07");
+    let s = String::from_utf8_lossy(&r);
+    assert!(s.contains("]10;rgb:"), "缺前景应答：{s}");
+    assert!(s.contains("]11;rgb:"), "缺背景应答：{s}");
+}
+
+/// OSC 0/2 设置窗口标题；空串清除。
+#[test]
+fn osc_sets_and_clears_window_title() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]0;vim: main.rs\x07");
+    assert_eq!(t.window_title(), Some("vim: main.rs"));
+    t.feed(b"\x1b]2;\x07");
+    assert_eq!(t.window_title(), None);
+}
+
+/// 搜索命中用绝对历史行锚定：scrollback 满后修剪不改 scrollback_total，命中仍指向同一内容。
+#[test]
+fn search_hits_survive_scrollback_trim() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 5));
+    // 灌满超过默认 scrollback 上限，迫使修剪 retained 行。
+    for i in 0..5200 {
+        t.feed(format!("line-{i:04}\r\n").as_bytes());
+    }
+    t.feed(b"UNIQUE-NEEDLE\r\n");
+    t.find = Some(search::Find {
+        query: "UNIQUE-NEEDLE".into(),
+        ..Default::default()
+    });
+    t.run_search();
+    let f = t.find.as_ref().expect("find state");
+    assert!(!f.hits.is_empty(), "应命中 UNIQUE-NEEDLE");
+    let hit = f.hits[0];
+    // 再推几行触发更多修剪
+    for i in 0..100 {
+        t.feed(format!("pad-{i}\r\n").as_bytes());
+    }
+    t.jump_to_current();
+    let total = t.parser.screen().scrollback_total();
+    let kept = t.parser.screen().scrollback_rows();
+    assert!(
+        hit + kept >= total,
+        "绝对命中 {hit} 已漂出 retained 窗（total={total} kept={kept}）"
+    );
+    assert!(
+        t.search_hl.is_some(),
+        "跳转到命中后应有高亮行"
+    );
+}
+
 /// 进出备用屏须清本地选区，否则在 less 上拖选、退出后复制会拿到主屏陈旧内容。
 #[test]
 fn entering_or_leaving_alt_screen_clears_selection() {

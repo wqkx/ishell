@@ -160,6 +160,8 @@ pub struct Terminal {
     highlight: bool,
     /// 由 OSC 7 解析到的当前工作目录（用于断线重连后恢复）
     osc7_cwd: Option<String>,
+    /// 由 OSC 0/2 设置的动态窗口标题；标签栏优先显示，空/`None` 回落到连接名
+    window_title: Option<String>,
     /// 右键菜单「在文件列表中显示当前目录」请求：App 取走后导航文件区
     reveal_cwd: Option<String>,
     /// 无 cwd 时点该菜单 → 请求 App 弹确认框注入 OSC 7
@@ -321,6 +323,7 @@ impl Terminal {
             log_file: None,
             highlight: true,
             osc7_cwd: None,
+            window_title: None,
             reveal_cwd: None,
             inject_request: false,
             echo_queue: Default::default(),
@@ -356,6 +359,11 @@ impl Terminal {
     /// 由 OSC 7 解析到的当前工作目录（若 shell 上报）。
     pub fn cwd(&self) -> Option<&str> {
         self.osc7_cwd.as_deref()
+    }
+
+    /// 由 OSC 0/2 设置的动态窗口标题（若远端上报）。
+    pub fn window_title(&self) -> Option<&str> {
+        self.window_title.as_deref()
     }
     /// 取走「在文件列表中显示当前目录」请求（右键菜单触发）。
     pub fn take_reveal_cwd(&mut self) -> Option<String> {

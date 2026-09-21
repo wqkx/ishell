@@ -414,3 +414,154 @@ fn hex_val(c: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+/// 在**字符串类转义之外**找子串：跳过 OSC / DCS / SOS / PM / APC 的负载。
+///
+/// `feed` 里对 `ESC[2J`/`ESC[3J`/`ESC[6n` 等的识别若用裸 `find_sub`，会把 DCS 透传
+/// （tmux）或 OSC 负载里碰巧出现的同款字节当成真清屏/真查询——重建解析器、清
+/// scrollback、甚至回一条远端没要的 CPR。与 `count_bel` 同一套跳过规则。
+pub(super) fn find_sub_outside_string_escapes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if hay[i] != 0x1b {
+            if hay[i..].starts_with(needle) {
+                return Some(i);
+            }
+            i += 1;
+            continue;
+        }
+        // 起点就是 needle（CSI 查询/清屏都是 ESC 开头）——在跳过序列之前先匹配。
+        if hay[i..].starts_with(needle) {
+            return Some(i);
+        }
+        match hay.get(i + 1) {
+            Some(b']') => {
+                i += 2;
+                while i < hay.len() {
+                    if hay[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if hay[i] == 0x1b && hay.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+                i += 2;
+                while i < hay.len() {
+                    if hay[i] == 0x1b && hay.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            Some(b'[') => {
+                i += 2;
+                while i < hay.len() {
+                    let done = (0x40..=0x7e).contains(&hay[i]);
+                    i += 1;
+                    if done {
+                        break;
+                    }
+                }
+            }
+            Some(_) => i += 2,
+            None => break,
+        }
+    }
+    None
+}
+
+/// OSC 0/2 窗口标题：返回本块里**最后一条**完整标题（空串表示远端清标题）。
+/// `carried` 语义同 `parse_osc_notify`。
+pub(super) fn parse_osc_title(data: &[u8], carried: usize) -> Option<String> {
+    let mut last = None;
+    for (seq_start, body_start, end) in osc_sequences(data) {
+        let _ = seq_start;
+        if end < carried {
+            continue;
+        }
+        let payload = &data[body_start..end];
+        // `0;` 同时设 icon+title；`2;` 只设 title。icon-only（`1;`）忽略。
+        let Some(title) = payload
+            .strip_prefix(b"0;")
+            .or_else(|| payload.strip_prefix(b"2;"))
+        else {
+            continue;
+        };
+        let Ok(s) = std::str::from_utf8(title) else {
+            continue;
+        };
+        last = Some(s.to_string());
+    }
+    last
+}
+
+/// OSC 10/11 颜色查询（`ESC]10;?BEL` / `ESC]11;?BEL|ST`）：返回本块里按出现顺序的
+/// 查询号（10=前景，11=背景）。`carried` 语义同通知扫描。
+pub(super) fn parse_osc_color_queries(data: &[u8], carried: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (seq_start, body_start, end) in osc_sequences(data) {
+        let _ = seq_start;
+        if end < carried {
+            continue;
+        }
+        let payload = &data[body_start..end];
+        match payload {
+            b"10;?" => out.push(10),
+            b"11;?" => out.push(11),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 把 8-bit RGB 编成 xterm 常用的 `rgb:RRRR/GGGG/BBBB`（每分量 16-bit，字节复制到高低位）。
+pub(super) fn osc_rgb_reply(osc: u8, r: u8, g: u8, b: u8) -> Vec<u8> {
+    format!(
+        "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
+        osc, r, r, g, g, b, b
+    )
+    .into_bytes()
+}
+
+#[cfg(test)]
+mod string_escape_scan_tests {
+    use super::{find_sub_outside_string_escapes, parse_osc_color_queries, parse_osc_title};
+
+    #[test]
+    fn clear_inside_dcs_is_not_found() {
+        let dcs = b"\x1bPtmux;\x1b[2J\x1b[3J\x1b\\";
+        assert!(find_sub_outside_string_escapes(dcs, b"\x1b[2J").is_none());
+        assert!(find_sub_outside_string_escapes(dcs, b"\x1b[3J").is_none());
+    }
+
+    #[test]
+    fn clear_after_dcs_is_still_found() {
+        let data = b"\x1bPpayload\x1b\\\x1b[2J\x1b[3J";
+        assert_eq!(find_sub_outside_string_escapes(data, b"\x1b[2J"), Some(11));
+        assert_eq!(find_sub_outside_string_escapes(data, b"\x1b[3J"), Some(15));
+    }
+
+    #[test]
+    fn cpr_inside_osc_payload_is_ignored() {
+        let osc = b"\x1b]9;oops\x1b[6n\x07";
+        assert!(find_sub_outside_string_escapes(osc, b"\x1b[6n").is_none());
+    }
+
+    #[test]
+    fn osc_title_and_color_query_helpers() {
+        assert_eq!(
+            parse_osc_title(b"\x1b]0;hello\x07\x1b]2;world\x07", 0).as_deref(),
+            Some("world")
+        );
+        assert_eq!(parse_osc_color_queries(b"\x1b]10;?\x07\x1b]11;?\x1b\\", 0), vec![10, 11]);
+    }
+}
