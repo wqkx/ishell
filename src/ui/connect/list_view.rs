@@ -293,11 +293,20 @@ impl ConnectForm {
                 }
                 if let Some(i) = connect_idx {
                     self.load_saved(i);
-                    if self.saved[i].secret_decrypt_failed {
+                    let needs_password = self.saved[i].auth_kind == "password"
+                        && self.password.is_empty();
+                    if self.saved[i].secret_decrypt_failed || needs_password {
                         self.mode = Mode::Form;
                         self.focus_host = true;
-                    } else if let Ok(cfg) = self.build() {
-                        *result = Some(cfg);
+                    } else {
+                        match self.build() {
+                            Ok(cfg) => *result = Some(cfg),
+                            Err(e) => {
+                                self.error = Some(e);
+                                self.mode = Mode::Form;
+                                self.focus_host = true;
+                            }
+                        }
                     }
                 }
                 if let Some(i) = edit_idx {

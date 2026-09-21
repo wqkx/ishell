@@ -92,16 +92,22 @@ fn keychain_read() -> KeychainRead {
     if !keychain_available() {
         return KeychainRead::Unavailable;
     }
-    let Some(entry) = keychain_entry() else {
-        return KeychainRead::Transient;
-    };
-    match with_timeout(move || entry.get_password()) {
+    // Entry::new / get_password 都必须在工作线程里：async-secret-service 在 UI 线程上
+    // 调会和 tokio/zbus 死锁，窗口就彻底点不动了。
+    match with_timeout(|| {
+        let entry = match keychain_entry() {
+            Some(e) => e,
+            None => return Err(None),
+        };
+        entry.get_password().map_err(Some)
+    }) {
         KeychainWait::TimedOut => {
             log::warn!("读取系统钥匙串超时，不会为此生成新的主密钥");
             KeychainRead::Transient
         }
-        KeychainWait::Ok(Err(keyring::Error::NoEntry)) => KeychainRead::NotFound,
-        KeychainWait::Ok(Err(e)) => {
+        KeychainWait::Ok(Err(None)) => KeychainRead::Transient,
+        KeychainWait::Ok(Err(Some(keyring::Error::NoEntry))) => KeychainRead::NotFound,
+        KeychainWait::Ok(Err(Some(e))) => {
             log::warn!("读取系统钥匙串失败（{e}），不会为此生成新的主密钥");
             KeychainRead::Transient
         }

@@ -11,6 +11,9 @@ impl ConnectForm {
     pub(super) fn form_view(&mut self, ui: &mut egui::Ui, result: &mut Option<ConnectConfig>) {
         ui.set_min_width(340.0);
         let w = 250.0;
+        egui::ScrollArea::vertical()
+            .max_height(520.0)
+            .show(ui, |ui| {
         egui::Grid::new("conn_form")
             .num_columns(2)
             .spacing([12.0, 12.0])
@@ -76,11 +79,14 @@ impl ConnectForm {
         self.jump_host_section(ui, w);
         if let Some(msg) = &self.notice {
             ui.add_space(6.0);
-            ui.label(RichText::new(msg).color(Palette::WARN).size(12.0));
+            ui.add(
+                egui::Label::new(RichText::new(msg).color(Palette::WARN).size(12.0)).wrap(),
+            );
         }
         self.error_section(ui);
         self.credential_notice(ui);
         self.action_buttons(ui, result);
+            });
     }
 
     fn auth_fields(&mut self, ui: &mut egui::Ui, w: f32) {
