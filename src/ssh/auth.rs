@@ -357,7 +357,9 @@ where
 {
     let ok = match auth {
         AuthMethod::Interactive => authenticate_interactive(handle, username, sink, cmd_rx).await?,
-        AuthMethod::Password(pw) => handle.authenticate_password(username, pw).await?.success(),
+        AuthMethod::Password(pw) => {
+            authenticate_password_login(handle, username, pw, sink, cmd_rx).await?
+        }
         AuthMethod::KeyFile { path, passphrase } => {
             let key = russh::keys::load_secret_key(path, passphrase.as_deref())?;
             // RSA 密钥须用 rsa-sha2-512 签名（None 会退化为 SHA-1 的 ssh-rsa，被现代 OpenSSH 拒绝）。
@@ -375,6 +377,112 @@ where
         AuthMethod::Agent => authenticate_agent(handle, username).await?,
     };
     Ok(ok)
+}
+
+/// 落盘密文的前缀（与 `store::crypto::ENC_PREFIX` 相同）。解密失败时 `decrypt_secret`
+/// 会把密文原串交回来，拿去当密码必然认证失败。
+const UNDECRYPTED_SECRET_PREFIX: &str = "enc:v1:";
+
+fn password_looks_undecrypted(pw: &str) -> bool {
+    pw.starts_with(UNDECRYPTED_SECRET_PREFIX)
+}
+
+/// 「密码」认证：先走 keyboard-interactive（多数发行版 sshd 把 PAM 密码挂在这上面，
+/// 并关掉了 SSH 协议里的 password 方法），不行再试 `authenticate_password`。
+///
+/// 不这么做的话，用户选「密码」、服务器只开 kbd-int，就会显示「认证被拒绝」，
+/// 而 OpenSSH 命令行客户端在同一台机器上是能登进去的。
+async fn authenticate_password_login<H>(
+    handle: &mut Handle<H>,
+    username: &str,
+    pw: &str,
+    sink: &UiSink,
+    cmd_rx: &mut UnboundedReceiver<UiCommand>,
+) -> anyhow::Result<bool>
+where
+    H: Handler,
+    H::Error: std::error::Error + Send + Sync + 'static,
+{
+    if password_looks_undecrypted(pw) {
+        anyhow::bail!(
+            "{}",
+            crate::i18n::tr(
+                "保存的密码无法解密（钥匙串或主密钥不可用）。请重新编辑该连接并填写密码。",
+                "Saved password could not be decrypted (keychain/master key unavailable). Re-edit the connection and enter the password again."
+            )
+        );
+    }
+    match authenticate_password_via_kbd(handle, username, pw, sink, cmd_rx).await {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(e) => log::debug!("keyboard-interactive 密码尝试未成功：{e}"),
+    }
+    Ok(handle.authenticate_password(username, pw).await?.success())
+}
+
+/// 用已保存的密码应答 kbd-int 里不回显的提示（典型就是 PAM 的 Password:）。
+/// 出现回显提示（OTP / 用户名）时改弹窗让用户填，避免把登录密码填进验证码框。
+async fn authenticate_password_via_kbd<H>(
+    handle: &mut Handle<H>,
+    username: &str,
+    pw: &str,
+    sink: &UiSink,
+    cmd_rx: &mut UnboundedReceiver<UiCommand>,
+) -> anyhow::Result<bool>
+where
+    H: Handler,
+    H::Error: std::error::Error + Send + Sync + 'static,
+{
+    use client::KeyboardInteractiveAuthResponse as Resp;
+    let mut resp = handle
+        .authenticate_keyboard_interactive_start(username.to_string(), None)
+        .await?;
+    loop {
+        match resp {
+            Resp::Success => return Ok(true),
+            Resp::Failure { .. } => return Ok(false),
+            Resp::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                if prompts.is_empty() {
+                    resp = handle
+                        .authenticate_keyboard_interactive_respond(Vec::new())
+                        .await?;
+                    continue;
+                }
+                let answers = if prompts.iter().all(|p| !p.echo) {
+                    vec![pw.to_string(); prompts.len()]
+                } else {
+                    sink.send(WorkerEvent::KbdPrompt {
+                        name,
+                        instructions,
+                        prompts: prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect(),
+                    });
+                    match wait_kbd_answers(cmd_rx).await {
+                        Some(a) => a,
+                        None => return Ok(false),
+                    }
+                };
+                resp = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await?;
+            }
+        }
+    }
+}
+
+async fn wait_kbd_answers(
+    cmd_rx: &mut UnboundedReceiver<UiCommand>,
+) -> Option<Vec<String>> {
+    loop {
+        match cmd_rx.recv().await {
+            Some(UiCommand::KbdResponse(a)) => return Some(a),
+            Some(UiCommand::Disconnect) | None => return None,
+            _ => {}
+        }
+    }
 }
 
 /// 用本机 ssh-agent 中的私钥逐个尝试认证。
@@ -511,12 +619,8 @@ where
                     prompts: prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect(),
                 });
                 // 等 UI 回答；连接前不会有其它指令，收到断开/通道关闭即视为取消
-                let answers = loop {
-                    match cmd_rx.recv().await {
-                        Some(UiCommand::KbdResponse(a)) => break a,
-                        Some(UiCommand::Disconnect) | None => return Ok(false),
-                        _ => {}
-                    }
+                let Some(answers) = wait_kbd_answers(cmd_rx).await else {
+                    return Ok(false);
                 };
                 resp = handle
                     .authenticate_keyboard_interactive_respond(answers)
@@ -769,4 +873,18 @@ pub(super) async fn exec_status(
         }
     }
     Ok((code, String::from_utf8_lossy(&err).into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{password_looks_undecrypted, UNDECRYPTED_SECRET_PREFIX};
+
+    #[test]
+    fn undecrypted_ciphertext_is_not_sent_as_a_password() {
+        assert!(password_looks_undecrypted(&format!(
+            "{UNDECRYPTED_SECRET_PREFIX}abc"
+        )));
+        assert!(!password_looks_undecrypted("hunter2"));
+        assert!(!password_looks_undecrypted(""));
+    }
 }
