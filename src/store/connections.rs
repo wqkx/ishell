@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::crypto::{decrypt_secret, encrypt_secret, restrict_perms, ENC_PREFIX};
+use super::crypto::{encrypt_secret, restrict_perms, try_decrypt_secret, ENC_PREFIX};
 use super::paths::{config_path, expand_tilde, home_dir, write_atomic};
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -49,6 +49,21 @@ pub struct SavedConnection {
     /// 标签（逗号分隔，自由文本），参与搜索
     #[serde(default)]
     pub tags: String,
+    /// 磁盘上的密码/口令是 `enc:v1:`，但当前主密钥解不开。内存里已清空，避免把密文
+    /// 再当明文存一遍；UI 应提示用户重新填写，不要直接拿去连。
+    #[serde(skip)]
+    pub secret_decrypt_failed: bool,
+}
+
+fn decrypt_field(s: &str, failed: &mut bool) -> String {
+    match try_decrypt_secret(s) {
+        Ok(p) => p,
+        Err(reason) => {
+            log::warn!("已保存的密码/密钥口令解密失败（{reason}），已清空内存以免把密文再存一遍");
+            *failed = true;
+            String::new()
+        }
+    }
 }
 
 fn default_auth() -> String {
@@ -88,12 +103,15 @@ pub fn load() -> Vec<SavedConnection> {
             || is_plain(&c.jump_password)
             || is_plain(&c.jump_passphrase)
     });
-    // 解密到内存明文
+    // 解密到内存明文。解不开就留空并打标——绝不能把 `enc:v1:` 原串留在内存里，
+    // 否则用户一点保存就会把密文当明文再加密一层，连手工抢救的机会都没了。
     for c in &mut list {
-        c.password = decrypt_secret(&c.password);
-        c.passphrase = decrypt_secret(&c.passphrase);
-        c.jump_password = decrypt_secret(&c.jump_password);
-        c.jump_passphrase = decrypt_secret(&c.jump_passphrase);
+        let mut failed = false;
+        c.password = decrypt_field(&c.password, &mut failed);
+        c.passphrase = decrypt_field(&c.passphrase, &mut failed);
+        c.jump_password = decrypt_field(&c.jump_password, &mut failed);
+        c.jump_passphrase = decrypt_field(&c.jump_passphrase, &mut failed);
+        c.secret_decrypt_failed = failed;
     }
     if needs_migrate {
         if let Err(e) = save(&list) {
@@ -314,6 +332,7 @@ fn parse_ssh_config_text(text: &str, default_user: &str) -> Vec<SavedConnection>
             jump_passphrase: String::new(),
             group: crate::i18n::tr("导入", "Imported").to_string(),
             tags: String::new(),
+            secret_decrypt_failed: false,
         });
     }
     out

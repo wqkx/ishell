@@ -408,8 +408,8 @@ where
         anyhow::bail!(
             "{}",
             crate::i18n::tr(
-                "保存的密码无法解密（钥匙串或主密钥不可用）。请重新编辑该连接并填写密码。",
-                "Saved password could not be decrypted (keychain/master key unavailable). Re-edit the connection and enter the password again."
+                "保存的密码无法解密：主密钥与密文不匹配。请重新编辑该连接并填写密码。",
+                "Saved password could not be decrypted (master key mismatch). Re-edit the connection and enter the password again."
             )
         );
     }

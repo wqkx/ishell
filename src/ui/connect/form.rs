@@ -107,7 +107,17 @@ impl ConnectForm {
             "agent" => AuthKind::Agent,
             _ => AuthKind::Password,
         };
-        self.error = None;
+        self.error = if c.secret_decrypt_failed {
+            Some(
+                crate::i18n::tr(
+                    "保存的密码无法解密：钥匙串里的主密钥已经对不上。请重新填写密码后再连接（不必删这条连接）。",
+                    "Saved password could not be decrypted: the master key in the keychain no longer matches. Re-enter the password, then connect (you can keep this saved connection).",
+                )
+                .into(),
+            )
+        } else {
+            None
+        };
     }
 
     pub(super) fn save_current(&mut self) {
@@ -146,6 +156,7 @@ impl ConnectForm {
             jump_passphrase: self.j_passphrase.clone(),
             group: self.group.trim().to_string(),
             tags: self.tags.trim().to_string(),
+            secret_decrypt_failed: false,
         };
         let slot = match &self.editing {
             Some((on, oh)) => self

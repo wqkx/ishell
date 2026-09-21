@@ -37,8 +37,8 @@ const KEYCHAIN_MAX_INFLIGHT: usize = 2;
 /// 计数**必须**走 Drop、不能写在工作线程末尾：`keyring` 是第三方 crate，其调用一旦
 /// panic（或将来某次改动引入了 `?`/提前返回），写在末尾的 `fetch_sub` 就永远执行不到，
 /// 名额只减不增。攒够 `KEYCHAIN_MAX_INFLIGHT` 次之后 `with_timeout` 会对**每一次**调用
-/// 直接返回 `None`，于是 `keychain_get_key`/`keychain_set_key` 永久失效 → 主密钥被判为
-/// 「不可用」→ `decrypt_secret` 全线走 fallback 返回密文原串 → 所有已保存的密码都登录失败。
+/// 直接返回超时，于是 `keychain_get_key`/`keychain_set_key` 永久失效 → 主密钥被判为
+/// 「不可用」→ `decrypt_secret` 全线失败 → 所有已保存的密码都登录失败。
 /// 线程展开时 Drop 照常执行，这一条就堵死了。
 struct KeychainSlot;
 impl Drop for KeychainSlot {
@@ -47,14 +47,20 @@ impl Drop for KeychainSlot {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum KeychainWait<T> {
+    Ok(T),
+    TimedOut,
+}
+
 /// 在限定时间内执行可能阻塞的钥匙串操作；超时则放弃。
 /// 超时线程可能短暂存活至钥匙串返回，但并发数有上限，避免无限堆积。
-fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> KeychainWait<T> {
     use std::sync::atomic::Ordering;
     let prev = KEYCHAIN_INFLIGHT.fetch_add(1, Ordering::SeqCst);
     if prev >= KEYCHAIN_MAX_INFLIGHT {
         KEYCHAIN_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-        return None;
+        return KeychainWait::TimedOut;
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -62,20 +68,54 @@ fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Op
         let _slot = KeychainSlot;
         let _ = tx.send(f());
     });
-    // 超时：工作线程结束后自行减计数
-    rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(v) => KeychainWait::Ok(v),
+        Err(_) => KeychainWait::TimedOut,
+    }
 }
 
 fn keychain_entry() -> Option<keyring::Entry> {
     keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).ok()
 }
 
-/// 从系统钥匙串读取 32 字节主密钥（base64 存储）。
-fn keychain_get_key() -> Option<[u8; 32]> {
+/// 读钥匙串必须分清「没有条目」和「暂时读不到」。后者若当成没有，就会生成一把新主密钥
+/// 写进去，把还能解开已存密码的旧密钥覆盖掉——用户只会看到所有保存的密码突然解不开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeychainRead {
+    Found([u8; 32]),
+    NotFound,
+    Unavailable,
+    Transient,
+}
+
+fn keychain_read() -> KeychainRead {
     if !keychain_available() {
-        return None;
+        return KeychainRead::Unavailable;
     }
-    let s = with_timeout(|| keychain_entry()?.get_password().ok())??;
+    let Some(entry) = keychain_entry() else {
+        return KeychainRead::Transient;
+    };
+    match with_timeout(move || entry.get_password()) {
+        KeychainWait::TimedOut => {
+            log::warn!("读取系统钥匙串超时，不会为此生成新的主密钥");
+            KeychainRead::Transient
+        }
+        KeychainWait::Ok(Err(keyring::Error::NoEntry)) => KeychainRead::NotFound,
+        KeychainWait::Ok(Err(e)) => {
+            log::warn!("读取系统钥匙串失败（{e}），不会为此生成新的主密钥");
+            KeychainRead::Transient
+        }
+        KeychainWait::Ok(Ok(s)) => match decode_master_key(&s) {
+            Some(k) => KeychainRead::Found(k),
+            None => {
+                log::warn!("钥匙串里的主密钥格式无法识别，不会覆盖它");
+                KeychainRead::Transient
+            }
+        },
+    }
+}
+
+fn decode_master_key(s: &str) -> Option<[u8; 32]> {
     let b = STANDARD.decode(s).ok()?;
     (b.len() == 32).then(|| {
         let mut k = [0u8; 32];
@@ -90,12 +130,14 @@ fn keychain_set_key(k: &[u8; 32]) -> bool {
         return false;
     }
     let v = STANDARD.encode(k);
-    with_timeout(move || {
+    match with_timeout(move || {
         keychain_entry()
             .and_then(|e| e.set_password(&v).ok())
             .is_some()
-    })
-    .unwrap_or(false)
+    }) {
+        KeychainWait::Ok(ok) => ok,
+        KeychainWait::TimedOut => false,
+    }
 }
 
 /// 进程内缓存的主密钥（仅加载一次，避免反复访问钥匙串）。
@@ -133,47 +175,201 @@ fn load_or_create_key() -> Option<[u8; 32]> {
     *MASTER_KEY.get_or_init(compute_master_key)
 }
 
-fn compute_master_key() -> Option<[u8; 32]> {
-    // 1) 系统钥匙串优先
-    if let Some(k) = keychain_get_key() {
-        let _ = KEY_STORAGE.set(KeyStorage::Keychain);
-        return Some(k);
-    }
-    let path = config_dir()?.join("key");
-    // 2) 迁移：旧 key 文件 → 钥匙串；确认可读回后删除明文文件
-    if let Ok(bytes) = std::fs::read(&path) {
-        if bytes.len() == 32 {
-            // 权限校验：本地 key 文件应为 0600；过宽（group/other 可访问）则记录并立即收紧
-            check_key_perms(&path);
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&bytes);
-            if keychain_set_key(&k) && keychain_get_key() == Some(k) {
-                let _ = std::fs::remove_file(&path);
-                let _ = KEY_STORAGE.set(KeyStorage::Keychain);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterKeyPlan {
+    UseKeychain,
+    UseLocal { migrate: bool },
+    MintNew,
+    None,
+}
+
+/// 纯决策：读钥匙串失败（超时/锁定）绝不能当成「没有密钥」去生成一把新的。
+fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) -> MasterKeyPlan {
+    match read {
+        KeychainRead::Found(_) => MasterKeyPlan::UseKeychain,
+        KeychainRead::NotFound => {
+            if has_local {
+                MasterKeyPlan::UseLocal { migrate: true }
+            } else if has_ciphertext {
+                MasterKeyPlan::None
             } else {
-                let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
+                MasterKeyPlan::MintNew
             }
-            return Some(k);
+        }
+        KeychainRead::Unavailable | KeychainRead::Transient => {
+            if has_local {
+                MasterKeyPlan::UseLocal { migrate: false }
+            } else {
+                MasterKeyPlan::None
+            }
         }
     }
-    // 3) 新建密钥：优先存钥匙串，不可用则落本地文件（保持旧行为）
+}
+
+fn read_local_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(path).ok()?;
+    (bytes.len() == 32).then(|| {
+        check_key_perms(path);
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&bytes);
+        k
+    })
+}
+
+fn saved_secrets_need_existing_key() -> bool {
+    let Some(path) = super::paths::config_path() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return text.contains(ENC_PREFIX);
+    };
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
+    arr.iter().any(|item| {
+        ["password", "passphrase", "jump_password", "jump_passphrase"]
+            .iter()
+            .any(|key| {
+                item.get(*key)
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| s.starts_with(ENC_PREFIX))
+            })
+    })
+}
+
+fn decrypt_with_key(k: &[u8; 32], s: &str) -> Option<String> {
+    let rest = s.strip_prefix(ENC_PREFIX)?;
+    let blob = STANDARD.decode(rest).ok()?;
+    if blob.len() < 12 {
+        return None;
+    }
+    let c = ChaCha20Poly1305::new(Key::from_slice(k));
+    let (nonce, ct) = blob.split_at(12);
+    c.decrypt(Nonce::from_slice(nonce), ct)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+}
+
+fn first_ciphertext_sample() -> Option<String> {
+    let path = super::paths::config_path()?;
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    for item in v.as_array()? {
+        for key in ["password", "passphrase", "jump_password", "jump_passphrase"] {
+            if let Some(s) = item.get(key).and_then(|x| x.as_str()) {
+                if s.starts_with(ENC_PREFIX) {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn key_opens_saved_secrets(k: &[u8; 32]) -> bool {
+    match first_ciphertext_sample() {
+        Some(sample) => decrypt_with_key(k, &sample).is_some(),
+        None => true,
+    }
+}
+
+fn persist_local_backup(path: &std::path::Path, k: &[u8; 32]) {
+    if let Some(existing) = read_local_key(path) {
+        if existing == *k {
+            return;
+        }
+        // 本地还是旧密钥、且它能解开已存密码：绝不覆盖，那是唯一的找回手段。
+        if key_opens_saved_secrets(&existing) && !key_opens_saved_secrets(k) {
+            log::warn!("本地 key 文件仍能解开已存密码，钥匙串里的密钥对不上；保留本地文件不覆盖");
+            return;
+        }
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = write_key_file(path, k) {
+        log::warn!("写入本地主密钥备份失败：{e}");
+    }
+}
+
+fn mint_new_key(path: &std::path::Path) -> Option<[u8; 32]> {
     let mut k = [0u8; 32];
     getrandom::getrandom(&mut k).ok()?;
     if keychain_set_key(&k) {
+        persist_local_backup(path, &k);
         let _ = KEY_STORAGE.set(KeyStorage::Keychain);
         return Some(k);
     }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // 原子创建并落 0600：经 0600 临时文件写入 + rename 到位，消除「先 write(默认 umask 0644) 再 chmod」
-    // 的暴露窗口——该文件是解密全部已存密码的主密钥。
-    if write_key_file(&path, &k).is_err() {
+    if write_key_file(path, &k).is_err() {
         let _ = KEY_STORAGE.set(KeyStorage::None);
         return None;
     }
     let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
     Some(k)
+}
+
+fn compute_master_key() -> Option<[u8; 32]> {
+    let path = match config_dir() {
+        Some(dir) => dir.join("key"),
+        None => {
+            let _ = KEY_STORAGE.set(KeyStorage::None);
+            return None;
+        }
+    };
+    let local = read_local_key(&path);
+    let has_ciphertext = saved_secrets_need_existing_key();
+    let read = keychain_read();
+    let keychain_key = match read {
+        KeychainRead::Found(k) => Some(k),
+        _ => None,
+    };
+    match plan_master_key(read, local.is_some(), has_ciphertext) {
+        MasterKeyPlan::UseKeychain => {
+            let k = keychain_key.expect("Found 才走 UseKeychain");
+            if has_ciphertext && !key_opens_saved_secrets(&k) {
+                if let Some(local_k) = local {
+                    if key_opens_saved_secrets(&local_k) {
+                        log::warn!("钥匙串主密钥解不开已存密码，改用仍能解开的本地 key 文件");
+                        let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
+                        return Some(local_k);
+                    }
+                }
+                log::error!(
+                    "钥匙串里的主密钥与已保存的密码不匹配。不会再生成新密钥去覆盖。请重新填写那些连接的密码。"
+                );
+            }
+            persist_local_backup(&path, &k);
+            let _ = KEY_STORAGE.set(KeyStorage::Keychain);
+            Some(k)
+        }
+        MasterKeyPlan::UseLocal { migrate } => {
+            let k = local.expect("has_local 才走 UseLocal");
+            if migrate && keychain_set_key(&k) {
+                match keychain_read() {
+                    KeychainRead::Found(got) if got == k => {
+                        let _ = KEY_STORAGE.set(KeyStorage::Keychain);
+                        return Some(k);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
+            Some(k)
+        }
+        MasterKeyPlan::MintNew => mint_new_key(&path),
+        MasterKeyPlan::None => {
+            log::error!(
+                "主密钥不可用（钥匙串暂时读不到，又没有本地备份）。已存密码不会被一把新密钥毁掉。"
+            );
+            let _ = KEY_STORAGE.set(KeyStorage::None);
+            None
+        }
+    }
 }
 
 /// 以 0600 原子写入主密钥文件：写 0600 临时文件后 rename 覆盖到位（rename 保留临时文件权限）。
@@ -255,8 +451,20 @@ pub fn encrypt_secret(plain: &str) -> Result<String, String> {
     if plain.is_empty() {
         return Ok(String::new());
     }
-    if is_genuine_ciphertext(plain) {
-        return Ok(plain.to_string()); // 确认已是本机密钥能解开的密文，不用再加密一遍
+    // 看起来像本格式的密文：能解开就原样落盘；解不开就拒绝再包一层——那会把唯一的
+    // 旧密文毁掉，再也救不回来。
+    if plain.starts_with(ENC_PREFIX) {
+        if is_genuine_ciphertext(plain) {
+            return Ok(plain.to_string());
+        }
+        return Err(match crate::i18n::current() {
+            crate::i18n::Lang::Zh => {
+                "保存的密码是旧密文，但当前主密钥解不开。请重新填写密码后再保存。".into()
+            }
+            crate::i18n::Lang::En => {
+                "Saved secret looks encrypted but the current master key cannot open it. Re-enter the password before saving.".into()
+            }
+        });
     }
     let Some(c) = cipher() else {
         return Err(match crate::i18n::current() {
@@ -286,35 +494,38 @@ pub fn encrypt_secret(plain: &str) -> Result<String, String> {
     }
 }
 
-/// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回。解密失败时**返回原串**——当明文
-/// 用会导致一次登录失败，但绝不把已存密码静默变成空串；调用方（目前都还是"返回一个
-/// String 直接拿去用"的既有约定，为避免大范围改调用点没有改成 Result）看不出这是失败
-/// 回退还是真的原文，但至少把具体原因（主密钥不可用/密文格式损坏/AEAD 认证失败，分别
-/// 对应"钥匙串不可用或换了机器"“文件被截断/手改坏了”“密钥不匹配或数据被篡改"三种不同
-/// 情况）打到日志里——之前这里完全静默，用户只会看到一次不明不白的 SSH 认证失败，
-/// 排查时无从下手。
-pub fn decrypt_secret(s: &str) -> String {
+/// 解密。非 `enc:v1:` 前缀视为明文（旧数据）。解不开返回 Err，由调用方决定是留空还是报错；
+/// 不要把密文原串当密码发出去。
+pub(super) fn try_decrypt_secret(s: &str) -> Result<String, String> {
     let Some(rest) = s.strip_prefix(ENC_PREFIX) else {
-        return s.to_string();
-    };
-    let fallback = |reason: &str| {
-        log::warn!("已保存的密码/密钥口令解密失败（{reason}），将按原文尝试，很可能导致后续认证失败");
-        s.to_string()
+        return Ok(s.to_string());
     };
     let Some(c) = cipher() else {
-        return fallback("主密钥不可用，可能是系统钥匙串访问不了或换了一台机器");
+        return Err("主密钥不可用，可能是系统钥匙串访问不了或换了一台机器".into());
     };
     let Ok(blob) = STANDARD.decode(rest) else {
-        return fallback("密文不是合法的 base64，格式已损坏");
+        return Err("密文不是合法的 base64，格式已损坏".into());
     };
     if blob.len() < 12 {
-        return fallback("密文长度不足，格式已损坏");
+        return Err("密文长度不足，格式已损坏".into());
     }
     let (nonce, ct) = blob.split_at(12);
     c.decrypt(Nonce::from_slice(nonce), ct)
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| fallback("AEAD 认证未通过（密钥不匹配，或数据已损坏/被篡改）"))
+        .ok_or_else(|| "AEAD 认证未通过（密钥不匹配，或数据已损坏/被篡改）".to_string())
+}
+
+/// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回。解密失败时**返回原串**——当明文
+/// 用会导致一次登录失败，但绝不把已存密码静默变成空串。新代码请走 [`try_decrypt_secret`]。
+pub fn decrypt_secret(s: &str) -> String {
+    match try_decrypt_secret(s) {
+        Ok(p) => p,
+        Err(reason) => {
+            log::warn!("已保存的密码/密钥口令解密失败（{reason}），将按原文尝试，很可能导致后续认证失败");
+            s.to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,7 +580,7 @@ mod keychain_slot_tests {
 
         assert_eq!(
             with_timeout(|| 42_u8),
-            Some(42),
+            super::KeychainWait::Ok(42),
             "连续 panic 之后名额没还回来——钥匙串会被永久判定为不可用，\
              已保存的密码将全部解不开"
         );
@@ -378,6 +589,36 @@ mod keychain_slot_tests {
     /// 正常路径：超时封装本身不改变返回值。
     #[test]
     fn normal_calls_pass_the_value_through() {
-        assert_eq!(with_timeout(|| "ok".to_string()), Some("ok".to_string()));
+        assert_eq!(
+            with_timeout(|| "ok".to_string()),
+            super::KeychainWait::Ok("ok".to_string())
+        );
+    }
+
+    #[test]
+    fn keychain_timeout_or_error_never_mints_a_new_key() {
+        use super::{plan_master_key, KeychainRead, MasterKeyPlan};
+        assert_eq!(
+            plan_master_key(KeychainRead::Transient, false, true),
+            MasterKeyPlan::None,
+            "钥匙串暂时读不到时，哪怕磁盘上有密文，也绝不能生成新主密钥"
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::NotFound, false, true),
+            MasterKeyPlan::None,
+            "钥匙串是空的但磁盘上已有密文：生成新密钥也解不开，只会把局面搞得更糟"
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::NotFound, false, false),
+            MasterKeyPlan::MintNew
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::Transient, true, true),
+            MasterKeyPlan::UseLocal { migrate: false }
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::Found([0; 32]), false, true),
+            MasterKeyPlan::UseKeychain
+        );
     }
 }

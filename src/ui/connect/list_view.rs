@@ -293,7 +293,10 @@ impl ConnectForm {
                 }
                 if let Some(i) = connect_idx {
                     self.load_saved(i);
-                    if let Ok(cfg) = self.build() {
+                    if self.saved[i].secret_decrypt_failed {
+                        self.mode = Mode::Form;
+                        self.focus_host = true;
+                    } else if let Ok(cfg) = self.build() {
                         *result = Some(cfg);
                     }
                 }
