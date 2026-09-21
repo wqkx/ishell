@@ -701,7 +701,10 @@ impl Grid {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
+            // 1 行终端：pos.row 恒为 0，row_inc_scroll 仍可能返回 scrolled=1
+            // （滚出唯一一行进 scrollback）。`-=` 会对 u16 下溢 panic，拖矮面板 +
+            // 远端超长输出即可崩掉整个应用。saturating_sub：scrolled>row 时记 0。
+            prev_pos.row = prev_pos.row.saturating_sub(scrolled);
             let new_pos = self.pos;
             self.drawing_row_mut(prev_pos.row)
                 // we assume self.pos.row is always valid, and so prev_pos.row

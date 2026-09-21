@@ -90,18 +90,15 @@ impl App {
         // 不转帧，它们就永远不被求值。这一下按最近的 deadline 排定时重绘，保证到点必有一帧。
         self.arm_timeout_repaint();
 
-        // AI/MCP 控制的响应性兜底节奏。
+        // 远端输出唤醒 UI 的可靠心跳。
         //
-        // 背景：MCP 请求到达 socket 后由后台 tokio 线程 `ctx.request_repaint()` 唤醒 UI
-        // 线程来排空。但实测发现——窗口彻底空闲、eframe 停在 `ControlFlow::Wait` 时，
-        // **跨线程的 `request_repaint()` 唤醒会丢**：请求只能干等到别的事件偶然唤起一帧，
-        // 实测单条 `list_sessions` 卡了 157 秒。而 MCP 代理是「每次工具调用新开一条连接」，
-        // 所以这不是首次连接的一次性问题，每个调用都可能中招。
+        // 背景：SSH/本机 worker 在收到输出后跨线程 `ctx.request_repaint()`，但窗口彻底空闲、
+        // eframe 停在 `ControlFlow::Wait` 时该调用会丢（仓内实测单条请求卡 157 秒）。字节
+        // 已进队列，屏幕却不刷新，直到偶然事件唤帧——延迟无上限。
         //
-        // 修法：改用可靠的 `request_repaint_after`——它设的 `WaitUntil` 是 OS 层定时唤醒。
-        // 只要 AI 控制已启用且有已连接会话（此时反向转发 socket 正暴露、随时可能来请求），
-        // 就每帧续一个短定时重绘。门控为假时完全不介入，零额外开销。
-        if crate::store::load_mcp_consent() && self.sessions.iter().any(|s| s.connected) {
+        // 修法：`request_repaint_after` 设 OS 层 `WaitUntil`，每帧续 150ms。只要有已连接
+        // 会话就续（不再门控 MCP/AI——没开 AI 的用户同样需要看到远端输出）。无连接时零开销。
+        if self.sessions.iter().any(|s| s.connected) {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
         // 「重连后恢复 cwd」意图挂着期间，同样得保证出帧。
@@ -143,7 +140,8 @@ impl App {
             // 时刻要到 `Connected` 才武装（`restore_cwd_until` 还是 `None`）。少了这个门，
             // 判据全落在「未连接」那一侧——`idle` 恒假、`never_typed` 恒真（终端刚重建），
             // 意图只会被白白丢掉。
-            let live = s.connected && s.restore_cwd && !s.last_cwd.is_empty() && !s.ai_owned;
+            // AI 专用会话同样恢复 cwd（见 session_events Connected 注释）。
+            let live = s.connected && s.restore_cwd && !s.last_cwd.is_empty();
             if !live {
                 // 未连接时也要让已过期的意图消失：否则 200ms 续帧会一直转着。
                 if s.restore_cwd && super::session::cwd_restore_expired(s.restore_cwd_until, now) {
@@ -153,15 +151,14 @@ impl App {
                 continue;
             }
             let expired = super::session::cwd_restore_expired(s.restore_cwd_until, now);
-            match super::session::cwd_restore_decision(
-                // 这里再读一次 `never_typed` **不是**跟闸门重复：闸门问的是「现在敲键盘
-                // 安不安全」（不安全就等下一帧），这里问的是「这个意图还该不该留着」——
-                // 用户已经上手了就直接放弃，而不是干等到 15s 超时。同一个字段，两个不同
-                // 的问题、两种不同的结果。
-                s.terminal.never_typed(),
-                s.shell_idle_for_injection(),
-                expired,
-            ) {
+            // AI 会话只读键盘也会记按键时刻；`never_typed` 对它恒假会把恢复永久封死。
+            // 闲置闸门同理：用户闸门的 `!ai_owned` 对 AI 恒拒，改用 AI 专用闸门。
+            let (never_typed, idle) = if s.ai_owned {
+                (true, s.ai_shell_idle_for_injection())
+            } else {
+                (s.terminal.never_typed(), s.shell_idle_for_injection())
+            };
+            match super::session::cwd_restore_decision(never_typed, idle, expired) {
                 super::session::CwdRestore::Inject => {
                     let cmd = format!("cd '{}'", s.last_cwd.replace('\'', "'\\''"));
                     let _ = s

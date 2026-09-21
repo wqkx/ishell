@@ -144,6 +144,30 @@ fn a_head_arm_that_never_echoes_is_dropped_instead_of_blocking_the_queue() {
     assert!(screen.contains("world"), "真实输出不能被误吞：{screen:?}");
 }
 
+/// 部分匹配（pos>0）期间无限吞换行会把「巧合前缀 + 用户回车」黏成一行，且队列卡死。
+/// 反向对照：去掉 `ECHO_PARTIAL_NEWLINE_CAP` 分支，"exp" 与 "bash" 黏在一起、换行消失。
+#[test]
+fn partial_echo_match_stops_swallowing_newlines_after_cap() {
+    let mut t = Terminal::new();
+    // 注入命令以 "export" 开头；用户恰好敲了 "exp" + 回车
+    t.expect_echo("export ISHELL_MCP_TOKEN=secret");
+    t.feed(b"exp\r\n");
+    t.feed(b"bash: exp: command not found\r\n");
+    let screen = t.screen_text();
+    assert!(
+        screen.contains("exp"),
+        "巧合前缀不应永久吞掉：{screen:?}"
+    );
+    assert!(
+        screen.contains("bash: exp: command not found")
+            || screen.contains("command not found"),
+        "真实换行后的输出行必须独立上屏：{screen:?}"
+    );
+    // 队列应已自愈：后续真回显仍可被吞（或至少不再卡死导致整段漏出——这里验证不 panic / 可继续喂）
+    t.feed(b"more\r\n");
+    assert!(t.screen_text().contains("more"));
+}
+
 /// 没有集成的会话（fish/csh、片段没注入）必须仍走哨兵回退，标志别乱置真。
 #[test]
 fn shell_integration_flag_only_turns_on_with_osc133() {
@@ -231,6 +255,16 @@ fn prefix_history_search() {
     t.input_line.clear();
     t.hist = None;
     assert_eq!(t.history_nav(true), b"\x1b[A");
+}
+
+/// 普通提示符下（有输入但还没进历史导航）按 Down：必须发 CSI B，不能吞成「按了没反应」。
+/// 反向对照：`hist.is_none()` 时 `return Vec::new()`，这条挂。
+#[test]
+fn down_arrow_without_hist_nav_is_forwarded() {
+    let mut t = Terminal::new();
+    t.input_line = "partial".into();
+    t.hist = None;
+    assert_eq!(t.history_nav(false), b"\x1b[B");
 }
 
 #[test]
@@ -1116,6 +1150,38 @@ fn feed_never_panics_on_arbitrary_bytes() {
             let _ = t2.screen_text();
             assert!(i < nasty.len()); // 走到这里就算过（没 panic）
         }
+    }
+}
+
+/// 1 行高终端：写满一行再多写 1 字符会触发 col_wrap → row_inc_scroll。
+/// 上游 vt100 在 `prev_pos.row -= scrolled` 处对 u16 下溢 panic（debug）；面板可拖到
+/// 1 行，远端任意超长输出就能把整个 UI 崩掉。反向对照：把 saturating_sub 改回 `-=` 即挂。
+#[test]
+fn one_row_terminal_wrap_never_panics() {
+    let mut t = Terminal::new();
+    assert!(t.resize(80, 1));
+    // 写满 80 列再多一个字符：必定走 col_wrap
+    let line = vec![b'x'; 81];
+    let _ = t.feed(&line);
+    let _ = t.screen_text();
+    // 再灌一长串，覆盖连续折行 / scrollback 路径
+    let _ = t.feed(&vec![b'y'; 200]);
+    let _ = t.history_text(50);
+}
+
+/// 同上场景也必须被「任意字节绝不 panic」覆盖（1 行尺寸 + nasty 字节）。
+#[test]
+fn feed_never_panics_on_one_row_terminal() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 1));
+    let nasty: &[&[u8]] = &[
+        b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxY", // 刚好折行
+        b"\xff\xfe\x1b[999m",
+        b"\x1b[?2026hpartial\x1b[?2026l",
+    ];
+    for data in nasty {
+        let _ = t.feed(data);
+        let _ = t.screen_text();
     }
 }
 

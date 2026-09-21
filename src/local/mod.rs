@@ -57,6 +57,11 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
     };
     sink.send(WorkerEvent::Connected);
 
+    // 后台作业继承 slave fd 时 master 读端永远等不到 EOF——不能只靠 out_rx 关闭判定退出。
+    // 轮询 child.try_wait：shell 已死就收尾（先排空残留输出，再发 ShellExited）。
+    let mut child_poll = tokio::time::interval(std::time::Duration::from_millis(200));
+    child_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             biased;
@@ -74,6 +79,23 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
                         crate::i18n::tr("本机终端已退出", "Local terminal exited").into(),
                     ));
                     break;
+                }
+            },
+            _ = child_poll.tick() => {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        // 排空读线程已送出、尚未被 select 取走的残留输出
+                        while let Ok(bytes) = out_rx.try_recv() {
+                            sink.send(WorkerEvent::TerminalData(bytes));
+                        }
+                        let code = status.exit_code() as i32;
+                        sink.send(WorkerEvent::ShellExited(code));
+                        sink.send(WorkerEvent::Disconnected(
+                            crate::i18n::tr("本机终端已退出", "Local terminal exited").into(),
+                        ));
+                        break;
+                    }
+                    Ok(None) | Err(_) => {}
                 }
             },
             cmd = cmd_rx.recv() => match cmd {

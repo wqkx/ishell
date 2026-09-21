@@ -34,9 +34,14 @@ use xfer::{
 };
 
 /// 发往 UI 的事件通道（std mpsc），附带 egui 上下文用于主动请求重绘。
+/// worker → UI 主事件通道容量。有界是为了在窗口最小化 / UI 卡顿时给生产端背压，
+/// 避免 `yes` / `cat` 大文件把无界队列撑到 OOM（sysinfo 早因此改成了 watch）。
+/// 512 × 典型 8KiB chunk ≈ 4MiB 量级上限；控制类事件远小于此。
+pub const WORKER_EVT_CAP: usize = 512;
+
 #[derive(Clone)]
 pub struct UiSink {
-    tx: std::sync::mpsc::Sender<WorkerEvent>,
+    tx: std::sync::mpsc::SyncSender<WorkerEvent>,
     ctx: egui::Context,
     /// 系统信息走独立的 watch 通道而非 mpsc 队列：窗口最小化等导致 UI 长时间不排空时，
     /// mpsc 会把每 2 秒一份的快照无限堆积（真实内存暴涨根因）；watch 只保留「最新一份」，
@@ -46,7 +51,7 @@ pub struct UiSink {
 
 impl UiSink {
     pub fn new(
-        tx: std::sync::mpsc::Sender<WorkerEvent>,
+        tx: std::sync::mpsc::SyncSender<WorkerEvent>,
         ctx: egui::Context,
         sysinfo_tx: Arc<tokio::sync::watch::Sender<Option<crate::proto::SysInfo>>>,
     ) -> Self {
@@ -57,8 +62,24 @@ impl UiSink {
         }
     }
     pub(crate) fn send(&self, ev: WorkerEvent) {
-        let _ = self.tx.send(ev);
-        self.ctx.request_repaint();
+        match self.tx.try_send(ev) {
+            Ok(()) => {
+                self.ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TrySendError::Full(ev)) => {
+                // 背压：终端数据可丢（UI 已落后，再攒只会 OOM）；生命周期/控制事件必须送达。
+                match ev {
+                    WorkerEvent::TerminalData(_) => {
+                        self.ctx.request_repaint();
+                    }
+                    other => {
+                        let _ = self.tx.send(other);
+                        self.ctx.request_repaint();
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
     }
     /// 周期性系统信息快照：覆盖式发送（只留最新），不进入 mpsc 队列。
     pub(crate) fn send_sysinfo(&self, info: crate::proto::SysInfo) {

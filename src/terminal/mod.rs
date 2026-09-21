@@ -81,6 +81,9 @@ struct EchoArm {
     /// 这条记录**成为队首**的时刻（入队时若队列本来就空，就是入队时刻；否则在前一条出队时
     /// 刷新）。只有队首会参与匹配，用入队时刻计时会把「排在后面干等」也算进寿命。
     head_since: std::time::Instant,
+    /// 部分匹配（pos>0）期间已连续吞掉的 `\r`/`\n` 个数。真实输出偶发首字节命中 expect
+    /// 后紧跟用户回车时，旧逻辑会无限吞换行并把行黏在一起；设上限后超限按失配自愈。
+    newlines_swallowed: u8,
 }
 
 /// 队首武装记录的寿命上限：超过它还一个字节都没匹配上（`pos == 0`），就丢弃这条记录。
@@ -99,6 +102,11 @@ struct EchoArm {
 /// 而卡死本来就是异常路径、误丢却打在正常路径上——所以宁可让卡死多活 3 秒。落在 2~5 秒
 /// 之间的那一次注入，其回显会漏出一行，不会丢数据也不会串到别的命令里。
 const ECHO_ARM_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 部分匹配期间最多吞几个连续换行。注入命令极少跨行回显；超过此数几乎肯定是
+/// 「巧合前缀 + 用户真实回车」——继续吞会把命令行与输出黏成一行，且队列可能卡死。
+/// 取 1：允许一次异常折行字节，`\r\n` 的第二字节会触发自愈（见对应单测）。
+const ECHO_PARTIAL_NEWLINE_CAP: u8 = 1;
 
 pub struct Terminal {
     parser: vt100::Parser,
@@ -163,6 +171,9 @@ pub struct Terminal {
     /// 顺序一致，FIFO 天然对齐。深度有界（见 `expect_echo`），溢出丢最旧的一条（回显漏出
     /// 可见）而不是无限攒。
     echo_queue: std::collections::VecDeque<EchoArm>,
+    /// 队列溢出丢弃队首时，若队首正卡在部分匹配，其 `pending` 是真实输出字节——
+    /// 不能随记录一起丢掉（否则屏幕缺字）。下一次 `strip_echo` 开头吐出。
+    echo_orphan_pending: Vec<u8>,
     /// 上一次 `expect_echo` 武装的时刻：见 `injection_idle_for`
     echo_armed_at: Option<std::time::Instant>,
     /// 本次连接里是否见过 OSC 133（shell 集成片段已生效）。见 `shell_integration_active`。
@@ -313,6 +324,7 @@ impl Terminal {
             reveal_cwd: None,
             inject_request: false,
             echo_queue: Default::default(),
+            echo_orphan_pending: Vec::new(),
             echo_armed_at: None,
             shell_integration: false,
             shell_integration_c: false,
@@ -374,13 +386,17 @@ impl Terminal {
     pub fn expect_echo(&mut self, s: &str) {
         if self.echo_queue.len() >= 8 {
             log::warn!("回显吞除队列溢出（>8），丢最旧的一条武装：{:?}", s);
-            self.echo_queue.pop_front();
+            if let Some(mut dropped) = self.echo_queue.pop_front() {
+                // 部分匹配暂存的是真实输出，不能随武装一起扔
+                self.echo_orphan_pending.append(&mut dropped.pending);
+            }
         }
         self.echo_queue.push_back(EchoArm {
             expect: s.as_bytes().to_vec(),
             pos: 0,
             pending: Vec::new(),
             head_since: std::time::Instant::now(),
+            newlines_swallowed: 0,
         });
         self.echo_armed_at = Some(std::time::Instant::now());
     }

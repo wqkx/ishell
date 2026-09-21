@@ -64,11 +64,16 @@ impl Terminal {
         };
 
         let lines = self.collect_lines();
+        // 命中用「历史绝对行」锚定（与选区同口径）：scrollback 满后修剪不减
+        // scrollback_total，retained 下标会整体偏移，存 collect 下标会跳错行/高亮错位。
+        let total = self.parser.screen().scrollback_total();
+        let kept = self.parser.screen().scrollback_rows();
+        let base = total.saturating_sub(kept);
         let hits: Vec<usize> = lines
             .iter()
             .enumerate()
             .filter(|(_, l)| re.is_match(l))
-            .map(|(i, _)| i)
+            .map(|(i, _)| base + i)
             .collect();
         if let Some(f) = &mut self.find {
             f.hits = hits;
@@ -96,16 +101,37 @@ impl Terminal {
                 return;
             }
         };
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        let sb = self.parser.screen().scrollback();
+        let total = self.parser.screen().scrollback_total();
+        let kept = self.parser.screen().scrollback_rows();
+        // 已被修剪的命中：跳到最近仍保留的命中，否则清高亮
+        if line_idx + kept < total {
+            if let Some(f) = &mut self.find {
+                if let Some((new_cur, _)) = f
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .find(|(_, &abs)| abs + kept >= total)
+                {
+                    f.cur = new_cur;
+                    return self.jump_to_current();
+                }
+                f.hits.clear();
+            }
+            self.search_hl = None;
+            return;
+        }
         let rows = self.rows as usize;
         let r = rows / 3;
-        let start_idx = line_idx.saturating_sub(r);
-        let off = sb.saturating_sub(start_idx);
+        let start_abs = line_idx.saturating_sub(r);
+        let off = total.saturating_sub(start_abs);
         self.parser.screen_mut().set_scrollback(off);
+        let sb = self.parser.screen().scrollback();
         self.scrollback = off.min(sb);
-        let win_start = sb.saturating_sub(self.scrollback);
-        self.search_hl = line_idx.checked_sub(win_start).map(|r| r as u16);
+        let win_start = total.saturating_sub(self.scrollback);
+        self.search_hl = line_idx
+            .checked_sub(win_start)
+            .filter(|&r| (r as u16) < self.rows)
+            .map(|r| r as u16);
     }
 
     pub(super) fn recompute_search_hl(&mut self) {
@@ -116,10 +142,13 @@ impl Terminal {
                 return;
             }
         };
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        let sb = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(self.scrollback);
-        let win_start = sb.saturating_sub(self.scrollback);
+        let total = self.parser.screen().scrollback_total();
+        let kept = self.parser.screen().scrollback_rows();
+        if line_idx + kept < total {
+            self.search_hl = None;
+            return;
+        }
+        let win_start = total.saturating_sub(self.scrollback);
         self.search_hl = match line_idx.checked_sub(win_start) {
             Some(r) if (r as u16) < self.rows => Some(r as u16),
             _ => None,

@@ -256,7 +256,7 @@ impl App {
                 self.toast = Some((msg, now));
             }
             FileAction::CdTerminal(path) => {
-                // 以 POSIX 单引号转义路径后在终端 cd，并聚焦终端
+                // 以 shell 安全引号转义路径后在终端 cd，并聚焦终端
                 // ai_owned 会话是只读的（AI 专用），这个入口不能往里面灌命令
                 if !s.ai_owned {
                     // 前台疑似在跑任务（全屏 TUI/持续输出）时不注入：字符会被任务吃掉或
@@ -275,7 +275,11 @@ impl App {
                         self.toast = Some((msg, self.ctx.input(|i| i.time)));
                     } else {
                         s.cd_force_until = None;
-                        let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+                        // 与 type_pasted_path 同口径：本机 Windows 用双引号，其余 POSIX 单引号
+                        let quoted = super::session::quote_shell_arg(
+                            &path,
+                            s.cfg.is_local() && cfg!(windows),
+                        );
                         let _ = s.cmd_tx.send(UiCommand::TerminalInput(
                             format!("cd {quoted}\r").into_bytes(),
                         ));

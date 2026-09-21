@@ -61,6 +61,14 @@ pub(super) fn encode_key(key: Key, mods: Modifiers, app_cursor: bool, out: &mut 
             out.push((c as u8 - b'a') + 1);
             return;
         }
+        // Ctrl+0..9 → 0x10..0x19（与字母同：清 bit5）。缺了这条按 Ctrl+数字什么都不发。
+        if let Some(d) = key_to_ascii_digit(key) {
+            if mods.alt {
+                out.push(0x1b);
+            }
+            out.push(d & 0x1f);
+            return;
+        }
         if let Some(c) = ctrl_symbol(key, &mods) {
             if mods.alt {
                 out.push(0x1b);
@@ -374,6 +382,16 @@ mod encode_tests {
         // Alt+Ctrl+B：ESC 前缀 + 0x02
         let ca = Modifiers { ctrl: true, alt: true, ..Default::default() };
         assert_eq!(enc(Key::B, ca, false), vec![0x1b, 0x02]);
+    }
+
+    /// Ctrl+0..9 → 0x10..0x19（清 bit5）。缺了这条按 Ctrl+数字什么都不发。
+    #[test]
+    fn ctrl_digits_map_to_control_characters() {
+        assert_eq!(enc(Key::Num0, ctrl(), false), vec![0x10]);
+        assert_eq!(enc(Key::Num1, ctrl(), false), vec![0x11]);
+        assert_eq!(enc(Key::Num9, ctrl(), false), vec![0x19]);
+        let ca = Modifiers { ctrl: true, alt: true, ..Default::default() };
+        assert_eq!(enc(Key::Num2, ca, false), vec![0x1b, 0x12]);
     }
 
     /// Ctrl+Shift+C/V/F 留给复制/粘贴/查找，**不能**当终端输入发出去。

@@ -787,7 +787,7 @@ mod live_sftp_tests {
     }
 
     fn sink() -> (crate::ssh::UiSink, std::sync::mpsc::Receiver<WorkerEvent>) {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let (sys_tx, _sys_rx) = tokio::sync::watch::channel(None);
         (
             crate::ssh::UiSink::new(tx, egui::Context::default(), Arc::new(sys_tx)),

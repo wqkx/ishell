@@ -174,13 +174,15 @@ impl Terminal {
                 next.head_since = std::time::Instant::now(); // 它才刚成为队首，寿命从现在算
             }
         }
-        let mut out = Vec::with_capacity(input.len());
+        let mut out = std::mem::take(&mut self.echo_orphan_pending);
+        out.reserve(input.len());
         'bytes: for &b in input {
             while let Some(arm) = self.echo_queue.front_mut() {
                 if arm.pos < arm.expect.len() {
                     if b == arm.expect[arm.pos] {
                         arm.pos += 1;
                         arm.pending.push(b);
+                        arm.newlines_swallowed = 0; // 匹配推进了，折行计数清零
                         if arm.pos >= arm.expect.len() {
                             // 命令体已吞完（下面的 tail 阶段接着吞回车换行）
                             arm.pending.clear(); // 确认命中，暂存字节真正吞掉
@@ -188,12 +190,24 @@ impl Terminal {
                         continue 'bytes;
                     }
                     if (b == b'\r' || b == b'\n') && arm.pos > 0 {
-                        continue 'bytes; // 部分匹配中，终端自动换行/回显格式，忽略
+                        // 部分匹配中：容忍终端自动折行，但有上限——真实输出偶发命中
+                        // expect 首字节后用户敲回车时，无限吞换行会把行黏死且卡住队列。
+                        if arm.newlines_swallowed < super::ECHO_PARTIAL_NEWLINE_CAP {
+                            arm.newlines_swallowed += 1;
+                            continue 'bytes;
+                        }
+                        // 超限：按失配自愈——暂存字节 + 当前换行还给真实输出，重置进度
+                        out.append(&mut arm.pending);
+                        out.push(b);
+                        arm.pos = 0;
+                        arm.newlines_swallowed = 0;
+                        continue 'bytes;
                     }
                     // 失配：先把暂存的疑似字节还给真实输出（之前只是巧合的部分匹配），
                     // 再看这个字节本身是不是新一轮匹配的开头。
                     out.append(&mut arm.pending);
                     arm.pos = 0;
+                    arm.newlines_swallowed = 0;
                     if b == arm.expect[0] {
                         arm.pos = 1;
                         arm.pending.push(b);
@@ -448,6 +462,9 @@ impl Terminal {
                 let restore = Self::mode_restore_bytes(self.parser.screen());
                 self.parser = vt100::Parser::new(self.rows, self.cols, DEFAULT_SCROLLBACK);
                 self.scrollback = 0;
+                // 与 resize 重建同理：内容坐标体系已换，旧选区绝对行失效 → 复制会错位
+                self.sel_anchor = None;
+                self.sel_cursor = None;
                 replies.extend(self.process_with_replies(after));
                 self.parser.process(&restore);
                 return replies;

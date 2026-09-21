@@ -30,6 +30,8 @@ pub(super) async fn run_sampler(sink: UiSink) {
     sink.send(WorkerEvent::MonitorSupport(true));
     let mut sampler = SysSampler::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    // 与 SSH 侧同款：高负载下探测超过 2s 时不把欠 tick 背靠背补齐（否则 CPU% 差分失真）。
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         if let Some(raw) = run_shell(PROBE_CMD.to_string()).await {

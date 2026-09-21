@@ -274,8 +274,9 @@ impl Terminal {
             }
             Vec::new()
         } else {
+            // 尚未进入历史导航：Down 应交给远端（普通提示符），不能吞掉变成「按了没反应」
             if self.hist.is_none() {
-                return Vec::new();
+                return b"\x1b[B".to_vec();
             }
             let mut i = start + 1;
             while (i as usize) < self.history.len() {

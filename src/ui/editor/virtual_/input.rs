@@ -47,6 +47,12 @@ pub(super) fn handle_input(
     let prev_caret = ed.vcaret;
     // 自绘 IME（同 egui 路径，绕开 egui Commit 门）：处理组字/提交，并在下方上报 o.ime 激活+定位候选框。
     if focused {
+        if ed.is_readonly() {
+            // 只读/跟随：IME 绝不能改写缓冲。旧路径在只读门之前无条件跑 IME 并把事件
+            // 从流里剔除，导致中文组字/提交绕过只读门、置 dirty。
+            v_cancel_preedit(ed);
+            ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
+        } else {
         let ime_events: Vec<egui::ImeEvent> = ui.input(|i| {
             i.events
                 .iter()
@@ -115,6 +121,7 @@ pub(super) fn handle_input(
                 v_cancel_preedit(ed);
             }
         }
+        } // !readonly
     }
     if !focused {
         ed.complete = None; // 失焦关闭补全弹窗

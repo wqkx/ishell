@@ -34,8 +34,19 @@ impl Session {
             if evt_budget == 0 || term_budget == 0 {
                 return true; // 预算耗尽且可能仍有积压
             }
-            let Ok(ev) = self.evt_rx.try_recv() else {
-                return false;
+            let ev = match self.evt_rx.try_recv() {
+                Ok(ev) => ev,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                // worker 任务结束且未发 Disconnected（panic 监视漏网 / 旧路径）：通道断开
+                // 不能再当「没有事件」——否则 connected 永真、输入全哑、永不重连。
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if self.connected {
+                        self.apply_disconnected(
+                            crate::i18n::tr("会话已断开", "Session disconnected").into(),
+                        );
+                    }
+                    return false;
+                }
             };
             evt_budget -= 1;
             match ev {
@@ -51,6 +62,7 @@ impl Session {
                     self.was_connected = true;
                     self.reconnect_tries = 0;
                     self.reconnect_at = None;
+                    self.shell_exited = false;
                     self.status = crate::i18n::tr("已连接", "Connected").into();
                     // （重）连后是全新的远端 shell：此前注入的 MCP 配对 token（export 进 shell
                     // env）已随旧 shell 丢失——复位标记，等静止窗口出现时重新注入。
@@ -72,9 +84,10 @@ impl Session {
                     // 整套闲置判据，这里改成复用它：先记下意图，等 shell 真的闲下来再注入
                     // （见 layout_body.rs 里的分支与 `cwd_restore_decision`）。
                     //
-                    // ai_owned 会话从不做 OSC 7 注入，`restore_cwd` 理论上不会为 true，这里
-                    // 仍显式排除一下，避免以后有别的路径意外置位时悄悄破了只读约定。
-                    if self.restore_cwd && !self.last_cwd.is_empty() && !self.ai_owned {
+                    // AI 专用会话同样需要恢复 cwd：它是唯一自动做 OSC 7 注入的会话，重连后
+                    // 若跳过 cd，list_sessions / 后续命令会落在 $HOME 而非断线前目录。
+                    // （旧注释「ai_owned 从不做 OSC 7」已过时，见 frame.rs AI_SESSION_SNIPPET。）
+                    if self.restore_cwd && !self.last_cwd.is_empty() {
                         self.restore_cwd_until =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
                     } else {
@@ -130,51 +143,15 @@ impl Session {
                     // exit N：shell 已死，排队的哨兵永远不会打印。用退出码直接收尾挂起的
                     // AI 运行（finished=true）；随后的 Disconnected 不再重复处理（pending
                     // 已清空或只剩缓存结果，cancel 会保留缓存）。
+                    //
+                    // ShellExited 常先于 Eof/Disconnected 到达——这是用户敲 `exit` 的明确
+                    // 关闭意图，必须抑制随后 Disconnected 触发的自动重连（否则会重连最多
+                    // 5 次、~60s，关不掉会话）。
+                    self.shell_exited = true;
                     self.finish_ai_run_with_exit_code(code);
                 }
                 WorkerEvent::Disconnected(reason) => {
-                    self.connected = false;
-                    self.status = reason;
-                    // 断线时丢弃未完成的同步帧：半帧属于已死的会话，留着会被重连后
-                    // 的看门狗刷进新会话屏幕。
-                    self.terminal.reset_sync();
-                    // 断线意味着这个会话上任何挂起的 AI 命令都注定等不到哨兵了（worker 重启
-                    // 后旧连接的输出流已经没了）——给还在等的 poll_run 一个明确的"未完成"
-                    // 响应，而不是让它一直空等到自己的超时，也避免这个会话被"忙碌"卡住。
-                    // 已缓存结果的（exit N 先于断线到达）不在此列：cancel 内部会保留。
-                    self.cancel_pending_ai_run("会话已断线");
-                    self.cancel_pending_file_op();
-                    // 进行中的传输标记为暂停，等重连后续传（不计为失败）
-                    for t in &mut self.transfers {
-                        if t.spec.is_some() && t.ok != Some(true) {
-                            t.ok = None;
-                            t.paused = true;
-                            t.speed = 0.0;
-                            t.message =
-                                crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume")
-                                    .into();
-                        }
-                    }
-                    // 仅对"曾连上又掉线"的会话自动重连，最多 5 次，指数退避。本机会话不自动
-                    // 重连：shell 退出（用户敲 exit）是明确的关闭意图，自动重开会让人永远关不掉。
-                    const MAX_TRIES: u32 = 5;
-                    if self.was_connected && !self.cfg.is_local() && self.reconnect_tries < MAX_TRIES {
-                        let secs = (2u64 << self.reconnect_tries.min(4)).min(30); // 2,4,8,16,30
-                        self.reconnect_at =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
-                        let tail = match crate::i18n::current() {
-                            crate::i18n::Lang::Zh => format!("{secs}s 后重连"),
-                            crate::i18n::Lang::En => format!("reconnect in {secs}s"),
-                        };
-                        self.status = format!("{} · {}", self.status, tail);
-                    } else if self.was_connected && self.reconnect_tries >= MAX_TRIES {
-                        let msg = crate::i18n::tr(
-                            "自动重连已停止（已达 5 次），请手动重新连接",
-                            "Auto-reconnect stopped after 5 tries; reconnect manually",
-                        );
-                        self.status = format!("{} · {}", self.status, msg);
-                        self.pending.warn.push(msg.into());
-                    }
+                    self.apply_disconnected(reason);
                 }
                 WorkerEvent::MonitorSupport(ok) => {
                     self.monitor_ok = Some(ok);
@@ -527,6 +504,57 @@ impl Session {
                 }
                 WorkerEvent::Error(e) => self.status = e,
             }
+        }
+    }
+
+    /// 统一处理「会话已断开」：显式 `Disconnected` 事件与通道 `TryRecvError::Disconnected`
+    /// （worker 静默死亡）共用，避免两条路径状态分叉。
+    fn apply_disconnected(&mut self, reason: String) {
+        self.connected = false;
+        self.status = reason;
+        // 断线时丢弃未完成的同步帧：半帧属于已死的会话，留着会被重连后
+        // 的看门狗刷进新会话屏幕。
+        self.terminal.reset_sync();
+        // 断线意味着这个会话上任何挂起的 AI 命令都注定等不到哨兵了（worker 重启
+        // 后旧连接的输出流已经没了）——给还在等的 poll_run 一个明确的"未完成"
+        // 响应，而不是让它一直空等到自己的超时，也避免这个会话被"忙碌"卡住。
+        // 已缓存结果的（exit N 先于断线到达）不在此列：cancel 内部会保留。
+        self.cancel_pending_ai_run("会话已断线");
+        self.cancel_pending_file_op();
+        // 进行中的传输标记为暂停，等重连后续传（不计为失败）
+        for t in &mut self.transfers {
+            if t.spec.is_some() && t.ok != Some(true) {
+                t.ok = None;
+                t.paused = true;
+                t.speed = 0.0;
+                t.message =
+                    crate::i18n::tr("已中断，重连后续传", "Interrupted; will resume").into();
+            }
+        }
+        // 仅对"曾连上又掉线"的会话自动重连，最多 5 次，指数退避。
+        // 本机会话不自动重连；远端敲 `exit`（ShellExited 已置位）也不重连——那是明确关闭意图。
+        const MAX_TRIES: u32 = 5;
+        if super::session::should_auto_reconnect(
+            self.was_connected,
+            self.cfg.is_local(),
+            self.shell_exited,
+            self.reconnect_tries,
+        ) {
+            let secs = (2u64 << self.reconnect_tries.min(4)).min(30); // 2,4,8,16,30
+            self.reconnect_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+            let tail = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("{secs}s 后重连"),
+                crate::i18n::Lang::En => format!("reconnect in {secs}s"),
+            };
+            self.status = format!("{} · {}", self.status, tail);
+        } else if self.was_connected && !self.shell_exited && self.reconnect_tries >= MAX_TRIES {
+            let msg = crate::i18n::tr(
+                "自动重连已停止（已达 5 次），请手动重新连接",
+                "Auto-reconnect stopped after 5 tries; reconnect manually",
+            );
+            self.status = format!("{} · {}", self.status, msg);
+            self.pending.warn.push(msg.into());
         }
     }
 }

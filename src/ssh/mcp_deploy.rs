@@ -194,7 +194,7 @@ mod live_deploy_tests {
         let Some(cfg) = cfg_or_skip() else { return };
 
         // 产品用的那套 sink：事件收到一个普通 channel 里，测试不关心内容。
-        let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
+        let (evt_tx, _evt_rx) = std::sync::mpsc::sync_channel(64);
         let (sysinfo_tx, _sysinfo_rx) = tokio::sync::watch::channel(None);
         let sink = UiSink::new(
             evt_tx,

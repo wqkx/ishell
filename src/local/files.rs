@@ -950,7 +950,7 @@ mod tests {
 
     /// 造一个只用于收事件的 UiSink（egui::Context 默认构造即可，测试里不会真重绘）。
     pub(super) fn test_sink() -> (UiSink, std::sync::mpsc::Receiver<WorkerEvent>) {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let (sys_tx, _sys_rx) = tokio::sync::watch::channel(None);
         (
             UiSink::new(tx, egui::Context::default(), std::sync::Arc::new(sys_tx)),

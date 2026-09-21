@@ -4,7 +4,10 @@ use egui::{Color32, FontId, Rect, Response, Stroke, Vec2};
 
 use super::{
     osc::open_url,
-    paint::{cell_format, find_row_urls, highlight_colors, paint_row_backgrounds, row_content_hash},
+    paint::{
+        cell_format, find_row_urls, highlight_colors, paint_row_backgrounds, row_content_hash,
+        vt_color,
+    },
     theme::TermColors,
     Terminal,
 };
@@ -229,18 +232,45 @@ impl Terminal {
             }
         }
 
-        // 光标
+        // 光标：聚焦时反色绘制其下字符（终端惯例，实心填充会盖住字符）。
+        // 失焦时珊瑚色描边，避免点到文件栏/侧栏后光标看似「消失」。
         if !screen.hide_cursor() && self.scrollback == 0 {
             let (cr, cc) = screen.cursor_position();
             let cpos = origin + Vec2::new(cc as f32 * char_w, cr as f32 * char_h);
             let crect = Rect::from_min_size(cpos, cell);
-            // 失焦时仍用珊瑚色描边（而非低对比灰），避免点到文件栏/侧栏后光标看似「消失」
             if focused {
-                painter.rect_filled(
-                    crect,
-                    1.0,
-                    crate::theme::Palette::ACCENT.gamma_multiply(0.6),
-                );
+                let (inv_bg, inv_fg) = match screen.cell(cr, cc) {
+                    Some(c) => {
+                        let fg = vt_color(c.fgcolor(), tc.fg, &tc);
+                        let bg = vt_color(c.bgcolor(), tc.bg, &tc);
+                        // 反色：背景用字色、字用底色；默认底上用强调色以免与屏同色看不见
+                        if bg == tc.bg {
+                            (
+                                crate::theme::Palette::ACCENT.gamma_multiply(0.85),
+                                tc.bg,
+                            )
+                        } else {
+                            (fg, bg)
+                        }
+                    }
+                    None => (
+                        crate::theme::Palette::ACCENT.gamma_multiply(0.85),
+                        tc.bg,
+                    ),
+                };
+                painter.rect_filled(crect, 1.0, inv_bg);
+                if let Some(c) = screen.cell(cr, cc) {
+                    let ch = c.contents();
+                    if !ch.is_empty() && !c.is_wide_continuation() {
+                        painter.text(
+                            cpos + Vec2::new(0.0, (char_h - glyph_h) * 0.5),
+                            egui::Align2::LEFT_TOP,
+                            ch,
+                            font.clone(),
+                            inv_fg,
+                        );
+                    }
+                }
             } else {
                 painter.rect_stroke(
                     crect,
@@ -276,8 +306,9 @@ impl Terminal {
                     cursor_rect: irect,
                 });
             });
-            // 在光标处显示 IME 预编辑（组字中的拼音/候选），铺底 + 下划线以便辨识
-            if !self.ime_preedit.is_empty() {
+            // 在光标处显示 IME 预编辑（组字中的拼音/候选），铺底 + 下划线以便辨识。
+            // 与光标同门：上滚看历史时不画在历史内容上（光标本身已有 scrollback==0 门）。
+            if !self.ime_preedit.is_empty() && self.scrollback == 0 {
                 let font = egui::FontId::monospace(self.font_size / crate::theme::CJK_SCALE);
                 let galley = painter.layout_no_wrap(
                     self.ime_preedit.clone(),

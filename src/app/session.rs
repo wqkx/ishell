@@ -53,6 +53,9 @@ pub(super) struct Session {
     pub(super) reconnect_at: Option<std::time::Instant>,
     /// 已自动重连次数
     pub(super) reconnect_tries: u32,
+    /// 远端/本机 shell 已发过 `ShellExited`（用户敲 `exit` 等）。随后的 Disconnected
+    /// 不得触发自动重连——否则关不掉会话（最多 5 次、~60s）。
+    pub(super) shell_exited: bool,
     /// 由 OSC 7 记录的终端工作目录（断线重连后用于 cd 恢复）
     pub(super) last_cwd: String,
     /// 重连后待恢复 cwd
@@ -192,6 +195,17 @@ pub(super) fn cwd_restore_expired(
     now: std::time::Instant,
 ) -> bool {
     until.is_some_and(|t| now >= t)
+}
+
+/// 断线后是否安排自动重连。抽成纯函数便于钉死「exit 抑制重连」等边界。
+pub(super) fn should_auto_reconnect(
+    was_connected: bool,
+    is_local: bool,
+    shell_exited: bool,
+    reconnect_tries: u32,
+) -> bool {
+    const MAX_TRIES: u32 = 5;
+    was_connected && !is_local && !shell_exited && reconnect_tries < MAX_TRIES
 }
 
 /// 「现在往这个 shell 里替用户敲一行东西安全吗」——「提示符几乎确定闲着」的那套判据。
@@ -494,17 +508,35 @@ impl App {
         UnboundedSender<bool>,
     ) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::sync_channel(ssh::WORKER_EVT_CAP);
         let (sysinfo_tx, sysinfo_rx) = tokio::sync::watch::channel(None);
         let (hostkey_tx, hostkey_rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = UiSink::new(evt_tx, self.ctx.clone(), std::sync::Arc::new(sysinfo_tx));
         // 按传输类型分叉：本机会话跑本地 PTY worker（不连任何主机），其余走 SSH worker。
         // 本机 worker 不需要 hostkey_rx（无 TOFU 主机密钥确认），忽略即可。
-        if cfg.is_local() {
-            self.runtime.spawn(crate::local::run(cfg, cmd_rx, sink));
+        //
+        // panic 监视：裸 spawn 时 worker panic → sink drop → 通道断开，而 drain_events 曾把
+        // Disconnected 当「无事件」，会话永久僵尸、「已连接」但输入全哑。clone 一份 sink，
+        // JoinError::is_panic 时显式发 Disconnected。
+        let panic_sink = sink.clone();
+        let worker = if cfg.is_local() {
+            self.runtime.spawn(crate::local::run(cfg, cmd_rx, sink))
         } else {
-            self.runtime.spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx));
-        }
+            self.runtime.spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx))
+        };
+        self.runtime.spawn(async move {
+            if let Err(e) = worker.await {
+                if e.is_panic() {
+                    panic_sink.send(WorkerEvent::Disconnected(
+                        crate::i18n::tr(
+                            "会话内部错误（已断开）",
+                            "Session internal error (disconnected)",
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        });
         (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx)
     }
 
@@ -566,6 +598,7 @@ impl App {
             was_connected: false,
             reconnect_at: None,
             reconnect_tries: 0,
+            shell_exited: false,
             last_cwd: String::new(),
             restore_cwd: false,
             restore_cwd_until: None,
@@ -618,6 +651,7 @@ impl App {
         s.pending_hostkey = None;
         s.kbd_prompt = None;
         s.reconnect_at = None;
+        s.shell_exited = false;
         s.restore_cwd = true; // 重连成功后尝试 cd 回 last_cwd（保留不清空）
         // 截止时刻属于**上一轮**连接，必须一并清掉：连接抖动（刚连上又断）时它可能已经
         // 过期，留着会让这一轮新置下的意图被 `expire_cwd_restore_intents` 当场清掉。
@@ -770,6 +804,25 @@ mod paste_path_tests {
             mcp_register_cmd("/home/u$(id)/.ishell-mcp/bin/ishell-mcp"),
             "claude mcp add ishell -s user -- '/home/u$(id)/.ishell-mcp/bin/ishell-mcp'"
         );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_gate_tests {
+    use super::should_auto_reconnect;
+
+    /// 远端敲 exit → ShellExited 先于 Disconnected：绝不能自动重连。
+    /// 反向对照：去掉 `!shell_exited`，这条挂。
+    #[test]
+    fn shell_exit_suppresses_auto_reconnect() {
+        assert!(should_auto_reconnect(true, false, false, 0));
+        assert!(
+            !should_auto_reconnect(true, false, true, 0),
+            "用户敲 exit 后不应自动重连"
+        );
+        assert!(!should_auto_reconnect(true, true, false, 0), "本机不重连");
+        assert!(!should_auto_reconnect(false, false, false, 0), "从未连上不重连");
+        assert!(!should_auto_reconnect(true, false, false, 5), "满 5 次停");
     }
 }
 
