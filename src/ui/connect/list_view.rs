@@ -293,9 +293,12 @@ impl ConnectForm {
                 }
                 if let Some(i) = connect_idx {
                     self.load_saved(i);
-                    let needs_password = self.saved[i].auth_kind == "password"
-                        && self.password.is_empty();
-                    if self.saved[i].secret_decrypt_failed || needs_password {
+                    let needs_secret = self.saved[i].any_secret_decrypt_failed()
+                        || (self.saved[i].auth_kind == "password" && self.password.is_empty())
+                        || (self.saved[i].use_jump
+                            && self.saved[i].jump_auth_kind == "password"
+                            && self.j_password.is_empty());
+                    if needs_secret {
                         self.mode = Mode::Form;
                         self.focus_host = true;
                     } else {

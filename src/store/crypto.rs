@@ -146,8 +146,16 @@ fn keychain_set_key(k: &[u8; 32]) -> bool {
     }
 }
 
-/// 进程内缓存的主密钥（仅加载一次，避免反复访问钥匙串）。
-static MASTER_KEY: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+/// 进程内缓存的主密钥。成功的密钥一直留着；读失败只记时间戳，过一会儿再试，
+/// 避免 OnceLock 把一次超时钉成整次进程都没有主密钥。
+#[derive(Clone, Copy)]
+enum MasterKeyCache {
+    Unset,
+    Key([u8; 32]),
+    FailedAt(std::time::Instant),
+}
+static MASTER_KEY: std::sync::Mutex<MasterKeyCache> = std::sync::Mutex::new(MasterKeyCache::Unset);
+const MASTER_KEY_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 主密钥的存放方式——用于向用户**透明展示**所存密码的保护级别。
 /// 注意：无论哪种方式，密码本身都已用 ChaCha20Poly1305 加密；差异在于「主密钥存哪」。
@@ -178,7 +186,21 @@ pub fn key_perms_were_loose() -> bool {
 
 /// 取（或创建）加密主密钥。优先系统钥匙串；不可用时回退到本地 `key` 文件（0600）。
 fn load_or_create_key() -> Option<[u8; 32]> {
-    *MASTER_KEY.get_or_init(compute_master_key)
+    let mut cache = match MASTER_KEY.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match *cache {
+        MasterKeyCache::Key(k) => return Some(k),
+        MasterKeyCache::FailedAt(at) if at.elapsed() < MASTER_KEY_RETRY => return None,
+        MasterKeyCache::Unset | MasterKeyCache::FailedAt(_) => {}
+    }
+    let k = compute_master_key();
+    *cache = match k {
+        Some(key) => MasterKeyCache::Key(key),
+        None => MasterKeyCache::FailedAt(std::time::Instant::now()),
+    };
+    k
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +211,8 @@ enum MasterKeyPlan {
     None,
 }
 
-/// 纯决策：读钥匙串失败（超时/锁定）绝不能当成「没有密钥」去生成一把新的。
+/// 纯决策：超时/锁定绝不能当成「没有密钥」去生成一把新的。
+/// 钥匙串根本不存在、磁盘上也没有密文时，仍应在本地新建，否则没有会话总线就永远存不了密码。
 fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) -> MasterKeyPlan {
     match read {
         KeychainRead::Found(_) => MasterKeyPlan::UseKeychain,
@@ -202,7 +225,16 @@ fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) ->
                 MasterKeyPlan::MintNew
             }
         }
-        KeychainRead::Unavailable | KeychainRead::Transient => {
+        KeychainRead::Unavailable => {
+            if has_local {
+                MasterKeyPlan::UseLocal { migrate: false }
+            } else if has_ciphertext {
+                MasterKeyPlan::None
+            } else {
+                MasterKeyPlan::MintNew
+            }
+        }
+        KeychainRead::Transient => {
             if has_local {
                 MasterKeyPlan::UseLocal { migrate: false }
             } else {
@@ -281,13 +313,23 @@ fn key_opens_saved_secrets(k: &[u8; 32]) -> bool {
     }
 }
 
+/// 解不开已存密文的钥匙串密钥不能写成本地备份：以后钥匙串一超时就会稳定地用这把废钥匙。
+fn may_persist_as_local_backup(key_opens_secrets: bool, has_ciphertext: bool) -> bool {
+    key_opens_secrets || !has_ciphertext
+}
+
 fn persist_local_backup(path: &std::path::Path, k: &[u8; 32]) {
+    let key_opens = key_opens_saved_secrets(k);
+    if !may_persist_as_local_backup(key_opens, saved_secrets_need_existing_key()) {
+        log::warn!("钥匙串密钥解不开已存密码，不把它写成本地备份");
+        return;
+    }
     if let Some(existing) = read_local_key(path) {
         if existing == *k {
             return;
         }
         // 本地还是旧密钥、且它能解开已存密码：绝不覆盖，那是唯一的找回手段。
-        if key_opens_saved_secrets(&existing) && !key_opens_saved_secrets(k) {
+        if key_opens_saved_secrets(&existing) && !key_opens {
             log::warn!("本地 key 文件仍能解开已存密码，钥匙串里的密钥对不上；保留本地文件不覆盖");
             return;
         }
@@ -348,6 +390,8 @@ fn compute_master_key() -> Option<[u8; 32]> {
                 log::error!(
                     "钥匙串里的主密钥与已保存的密码不匹配。不会再生成新密钥去覆盖。请重新填写那些连接的密码。"
                 );
+                let _ = KEY_STORAGE.set(KeyStorage::Keychain);
+                return Some(k);
             }
             persist_local_backup(&path, &k);
             let _ = KEY_STORAGE.set(KeyStorage::Keychain);
@@ -372,7 +416,7 @@ fn compute_master_key() -> Option<[u8; 32]> {
             log::error!(
                 "主密钥不可用（钥匙串暂时读不到，又没有本地备份）。已存密码不会被一把新密钥毁掉。"
             );
-            let _ = KEY_STORAGE.set(KeyStorage::None);
+            // 不写入 KEY_STORAGE：超时这次失败，钥匙串恢复后这次进程里还应该能再读。
             None
         }
     }
@@ -528,7 +572,9 @@ pub fn decrypt_secret(s: &str) -> String {
     match try_decrypt_secret(s) {
         Ok(p) => p,
         Err(reason) => {
-            log::warn!("已保存的密码/密钥口令解密失败（{reason}），将按原文尝试，很可能导致后续认证失败");
+            log::warn!(
+                "已保存的密码/密钥口令解密失败（{reason}），将按原文尝试，很可能导致后续认证失败"
+            );
             s.to_string()
         }
     }
@@ -625,6 +671,31 @@ mod keychain_slot_tests {
         assert_eq!(
             plan_master_key(KeychainRead::Found([0; 32]), false, true),
             MasterKeyPlan::UseKeychain
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::Unavailable, false, false),
+            MasterKeyPlan::MintNew,
+            "没有会话总线、磁盘上也没有密文时，应在本地生成主密钥，否则密码永远存不了"
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::Unavailable, false, true),
+            MasterKeyPlan::None,
+            "没有会话总线但已有密文：不能生成新密钥，否则会解不开旧密码"
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::Transient, false, false),
+            MasterKeyPlan::None,
+            "超时不能生成新密钥，以免覆盖钥匙串里还能用的那把"
+        );
+        assert_eq!(
+            plan_master_key(KeychainRead::Unavailable, true, false),
+            MasterKeyPlan::UseLocal { migrate: false }
+        );
+        assert!(super::may_persist_as_local_backup(true, true));
+        assert!(super::may_persist_as_local_backup(false, false));
+        assert!(
+            !super::may_persist_as_local_backup(false, true),
+            "对不上已存密文的钥匙串密钥不能写成本地备份"
         );
     }
 }

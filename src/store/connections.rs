@@ -49,10 +49,23 @@ pub struct SavedConnection {
     /// 标签（逗号分隔，自由文本），参与搜索
     #[serde(default)]
     pub tags: String,
-    /// 磁盘上的密码/口令是 `enc:v1:`，但当前主密钥解不开。内存里已清空，避免把密文
-    /// 再当明文存一遍；UI 应提示用户重新填写，不要直接拿去连。
+    /// 磁盘上对应字段是 `enc:v1:`，但当前主密钥解不开。内存里已清空；
+    /// 保存时空字段只在对应 flag 为真时才把磁盘旧密文填回去，以免用户故意清空口令后又被写回。
     #[serde(skip)]
-    pub secret_decrypt_failed: bool,
+    pub password_decrypt_failed: bool,
+    #[serde(skip)]
+    pub passphrase_decrypt_failed: bool,
+    #[serde(skip)]
+    pub jump_password_decrypt_failed: bool,
+    #[serde(skip)]
+    pub jump_passphrase_decrypt_failed: bool,
+    /// 读盘时的名称/主机/用户名。保存时即使用户改了这三项，也能对上磁盘上那条旧密文。
+    #[serde(skip)]
+    pub prev_name: String,
+    #[serde(skip)]
+    pub prev_host: String,
+    #[serde(skip)]
+    pub prev_username: String,
 }
 
 fn decrypt_field(s: &str, failed: &mut bool) -> String {
@@ -63,6 +76,15 @@ fn decrypt_field(s: &str, failed: &mut bool) -> String {
             *failed = true;
             String::new()
         }
+    }
+}
+
+impl SavedConnection {
+    pub fn any_secret_decrypt_failed(&self) -> bool {
+        self.password_decrypt_failed
+            || self.passphrase_decrypt_failed
+            || self.jump_password_decrypt_failed
+            || self.jump_passphrase_decrypt_failed
     }
 }
 
@@ -106,12 +128,14 @@ pub fn load() -> Vec<SavedConnection> {
     // 解密到内存明文。解不开就留空并打标——绝不能把 `enc:v1:` 原串留在内存里，
     // 否则用户一点保存就会把密文当明文再加密一层，连手工抢救的机会都没了。
     for c in &mut list {
-        let mut failed = false;
-        c.password = decrypt_field(&c.password, &mut failed);
-        c.passphrase = decrypt_field(&c.passphrase, &mut failed);
-        c.jump_password = decrypt_field(&c.jump_password, &mut failed);
-        c.jump_passphrase = decrypt_field(&c.jump_passphrase, &mut failed);
-        c.secret_decrypt_failed = failed;
+        c.password = decrypt_field(&c.password, &mut c.password_decrypt_failed);
+        c.passphrase = decrypt_field(&c.passphrase, &mut c.passphrase_decrypt_failed);
+        c.jump_password = decrypt_field(&c.jump_password, &mut c.jump_password_decrypt_failed);
+        c.jump_passphrase =
+            decrypt_field(&c.jump_passphrase, &mut c.jump_passphrase_decrypt_failed);
+        c.prev_name = c.name.clone();
+        c.prev_host = c.host.clone();
+        c.prev_username = c.username.clone();
     }
     if needs_migrate {
         if let Err(e) = save(&list) {
@@ -133,10 +157,28 @@ fn load_encrypted_file() -> Vec<SavedConnection> {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-fn keep_if_empty(new: &mut String, old: &str) {
-    if new.is_empty() && !old.is_empty() {
+fn keep_if_empty(new: &mut String, old: &str, restore: bool) {
+    if restore && new.is_empty() && !old.is_empty() {
         *new = old.to_string();
     }
+}
+
+fn find_previous<'a>(
+    previous: &'a [SavedConnection],
+    e: &SavedConnection,
+) -> Option<&'a SavedConnection> {
+    previous
+        .iter()
+        .find(|p| p.name == e.name && p.host == e.host && p.username == e.username)
+        .or_else(|| {
+            if e.prev_name.is_empty() && e.prev_host.is_empty() {
+                None
+            } else {
+                previous.iter().find(|p| {
+                    p.name == e.prev_name && p.host == e.prev_host && p.username == e.prev_username
+                })
+            }
+        })
 }
 
 /// 写回连接列表（密码/口令加密后落盘）。
@@ -159,13 +201,24 @@ pub fn save(list: &[SavedConnection]) -> Result<(), String> {
         e.passphrase = encrypt_secret(&c.passphrase)?;
         e.jump_password = encrypt_secret(&c.jump_password)?;
         e.jump_passphrase = encrypt_secret(&c.jump_passphrase)?;
-        if let Some(old) = previous.iter().find(|p| {
-            p.name == e.name && p.host == e.host && p.username == e.username
-        }) {
-            keep_if_empty(&mut e.password, &old.password);
-            keep_if_empty(&mut e.passphrase, &old.passphrase);
-            keep_if_empty(&mut e.jump_password, &old.jump_password);
-            keep_if_empty(&mut e.jump_passphrase, &old.jump_passphrase);
+        if let Some(old) = find_previous(&previous, c) {
+            // 只在「解不开所以内存是空的」时保留磁盘密文。用户故意清空口令/密码必须能写空。
+            keep_if_empty(&mut e.password, &old.password, c.password_decrypt_failed);
+            keep_if_empty(
+                &mut e.passphrase,
+                &old.passphrase,
+                c.passphrase_decrypt_failed,
+            );
+            keep_if_empty(
+                &mut e.jump_password,
+                &old.jump_password,
+                c.jump_password_decrypt_failed,
+            );
+            keep_if_empty(
+                &mut e.jump_passphrase,
+                &old.jump_passphrase,
+                c.jump_passphrase_decrypt_failed,
+            );
         }
         encrypted.push(e);
     }
@@ -359,7 +412,7 @@ fn parse_ssh_config_text(text: &str, default_user: &str) -> Vec<SavedConnection>
             jump_passphrase: String::new(),
             group: crate::i18n::tr("导入", "Imported").to_string(),
             tags: String::new(),
-            secret_decrypt_failed: false,
+            ..Default::default()
         });
     }
     out
@@ -446,10 +499,13 @@ Host pat-*
     #[test]
     fn empty_in_memory_secret_does_not_clobber_existing_ciphertext() {
         let mut new = String::new();
-        keep_if_empty(&mut new, "enc:v1:abc");
+        keep_if_empty(&mut new, "enc:v1:abc", true);
         assert_eq!(new, "enc:v1:abc");
         let mut typed = "hunter2".to_string();
-        keep_if_empty(&mut typed, "enc:v1:abc");
+        keep_if_empty(&mut typed, "enc:v1:abc", true);
         assert_eq!(typed, "hunter2");
+        let mut cleared = String::new();
+        keep_if_empty(&mut cleared, "enc:v1:abc", false);
+        assert!(cleared.is_empty(), "用户故意清空时不得把旧密文填回去");
     }
 }

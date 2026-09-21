@@ -387,12 +387,28 @@ fn password_looks_undecrypted(pw: &str) -> bool {
     pw.starts_with(UNDECRYPTED_SECRET_PREFIX)
 }
 
-/// 「密码」认证：先走 SSH 协议里的 `password` 方法（0.23 及更早就是这样），
-/// 不行再试 keyboard-interactive。
+/// 「密码」认证：先走 SSH 协议里的 `password` 方法（0.23 及更早就是这样）。
 ///
-/// 顺序不能反：不少 sshd 同时开两种方法，kbd-int 先失败会占掉 MaxAuthTries，
-/// 甚至直接拆掉连接，原来能用密码登上的机器就会变成「认证被拒绝」。
-/// kbd-int 回退只补「PasswordAuthentication no、只留 PAM 键盘交互」那一类。
+/// kbd-int 只在 password **已经不在** remaining_methods 里、但还有
+/// keyboard-interactive 时再试（`PasswordAuthentication no` 那一类）。
+/// 两种方法都开着时，密码错了 remaining 里仍有 password——再打一遍 kbd-int
+/// 会把同一密码送两次，MaxAuthTries / fail2ban / 域账号锁定都按两次失败计。
+///
+/// `partial_success` 表示这一步被接受、还要继续别的方法：可以接着做 kbd-int，
+/// 但不要再自动填登录密码。
+fn should_try_kbd_after_password(
+    remaining_methods: &russh::MethodSet,
+    partial_success: bool,
+) -> bool {
+    use russh::MethodKind;
+    remaining_methods.contains(&MethodKind::KeyboardInteractive)
+        && (!remaining_methods.contains(&MethodKind::Password) || partial_success)
+}
+
+fn should_autofill_kbd_password(already_filled: bool, echo: &[bool]) -> bool {
+    !already_filled && echo.len() == 1 && !echo[0]
+}
+
 async fn authenticate_password_login<H>(
     handle: &mut Handle<H>,
     username: &str,
@@ -414,27 +430,47 @@ where
         );
     }
     match handle.authenticate_password(username, pw).await {
-        Ok(r) if r.success() => return Ok(true),
-        Ok(_) => {}
-        Err(e) => log::debug!("password 方法未成功：{e}"),
-    }
-    match authenticate_password_via_kbd(handle, username, pw, sink, cmd_rx).await {
-        Ok(ok) => Ok(ok),
+        Ok(russh::client::AuthResult::Success) => return Ok(true),
+        Ok(russh::client::AuthResult::Failure {
+            remaining_methods,
+            partial_success,
+        }) => {
+            if !should_try_kbd_after_password(&remaining_methods, partial_success) {
+                return Ok(false);
+            }
+            match authenticate_password_via_kbd(
+                handle,
+                username,
+                pw,
+                sink,
+                cmd_rx,
+                !partial_success,
+            )
+            .await
+            {
+                Ok(ok) => Ok(ok),
+                Err(e) => {
+                    log::debug!("keyboard-interactive 密码尝试未成功：{e}");
+                    Ok(false)
+                }
+            }
+        }
         Err(e) => {
-            log::debug!("keyboard-interactive 密码尝试未成功：{e}");
+            log::debug!("password 方法未成功：{e}");
             Ok(false)
         }
     }
 }
 
-/// 用已保存的密码应答 kbd-int 里不回显的提示（典型就是 PAM 的 Password:）。
-/// 出现回显提示（OTP / 用户名）时改弹窗让用户填，避免把登录密码填进验证码框。
+/// 用已保存的密码应答 kbd-int：最多自动填**第一轮、且只有一个不回显提示**。
+/// 常见 PAM OTP（Google Authenticator）也是 echo=false，后续轮次必须弹窗。
 async fn authenticate_password_via_kbd<H>(
     handle: &mut Handle<H>,
     username: &str,
     pw: &str,
     sink: &UiSink,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    auto_fill: bool,
 ) -> anyhow::Result<bool>
 where
     H: Handler,
@@ -444,6 +480,7 @@ where
     let mut resp = handle
         .authenticate_keyboard_interactive_start(username.to_string(), None)
         .await?;
+    let mut already_filled = false;
     loop {
         match resp {
             Resp::Success => return Ok(true),
@@ -459,8 +496,11 @@ where
                         .await?;
                     continue;
                 }
-                let answers = if prompts.iter().all(|p| !p.echo) {
-                    vec![pw.to_string(); prompts.len()]
+                let echoes: Vec<bool> = prompts.iter().map(|p| p.echo).collect();
+                let answers = if auto_fill && should_autofill_kbd_password(already_filled, &echoes)
+                {
+                    already_filled = true;
+                    vec![pw.to_string()]
                 } else {
                     sink.send(WorkerEvent::KbdPrompt {
                         name,
@@ -480,9 +520,7 @@ where
     }
 }
 
-async fn wait_kbd_answers(
-    cmd_rx: &mut UnboundedReceiver<UiCommand>,
-) -> Option<Vec<String>> {
+async fn wait_kbd_answers(cmd_rx: &mut UnboundedReceiver<UiCommand>) -> Option<Vec<String>> {
     loop {
         match cmd_rx.recv().await {
             Some(UiCommand::KbdResponse(a)) => return Some(a),
@@ -884,7 +922,15 @@ pub(super) async fn exec_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{password_looks_undecrypted, UNDECRYPTED_SECRET_PREFIX};
+    use super::{
+        password_looks_undecrypted, should_autofill_kbd_password, should_try_kbd_after_password,
+        UNDECRYPTED_SECRET_PREFIX,
+    };
+    use russh::{MethodKind, MethodSet};
+
+    fn methods(kinds: &[MethodKind]) -> MethodSet {
+        MethodSet::from(kinds)
+    }
 
     #[test]
     fn undecrypted_ciphertext_is_not_sent_as_a_password() {
@@ -893,5 +939,47 @@ mod tests {
         )));
         assert!(!password_looks_undecrypted("hunter2"));
         assert!(!password_looks_undecrypted(""));
+    }
+
+    #[test]
+    fn kbd_not_tried_when_password_still_offered() {
+        let remaining = methods(&[MethodKind::Password, MethodKind::KeyboardInteractive]);
+        assert!(
+            !should_try_kbd_after_password(&remaining, false),
+            "密码错了 remaining 里通常还有 password，再打 kbd-int 会把同一密码计两次失败"
+        );
+        assert!(
+            should_try_kbd_after_password(&remaining, true),
+            "partial_success 表示这一步被接受，可以接着做 kbd-int"
+        );
+    }
+
+    #[test]
+    fn kbd_tried_when_only_keyboard_interactive_remains() {
+        let remaining = methods(&[MethodKind::KeyboardInteractive]);
+        assert!(should_try_kbd_after_password(&remaining, false));
+        assert!(should_try_kbd_after_password(&remaining, true));
+    }
+
+    #[test]
+    fn kbd_not_tried_when_keyboard_interactive_absent() {
+        let remaining = methods(&[MethodKind::Password]);
+        assert!(!should_try_kbd_after_password(&remaining, false));
+        assert!(!should_try_kbd_after_password(&remaining, true));
+        let none = MethodSet::empty();
+        assert!(!should_try_kbd_after_password(&none, false));
+    }
+
+    #[test]
+    fn autofill_only_first_single_non_echo_prompt() {
+        assert!(should_autofill_kbd_password(false, &[false]));
+        assert!(
+            !should_autofill_kbd_password(true, &[false]),
+            "第二轮 OTP 不能再填登录密码"
+        );
+        assert!(!should_autofill_kbd_password(false, &[false, false]));
+        assert!(!should_autofill_kbd_password(false, &[true]));
+        assert!(!should_autofill_kbd_password(false, &[]));
+        assert!(!should_autofill_kbd_password(false, &[false, true]));
     }
 }

@@ -3,6 +3,35 @@ use crate::store::{self, SavedConnection};
 
 use super::{AuthKind, ConnectForm};
 
+fn decrypt_reenter_notice(c: &SavedConnection) -> Option<String> {
+    let mut parts = Vec::new();
+    if c.password_decrypt_failed {
+        parts.push(crate::i18n::tr("登录密码", "login password"));
+    }
+    if c.passphrase_decrypt_failed {
+        parts.push(crate::i18n::tr("私钥口令", "key passphrase"));
+    }
+    if c.jump_password_decrypt_failed {
+        parts.push(crate::i18n::tr("跳板密码", "jump password"));
+    }
+    if c.jump_passphrase_decrypt_failed {
+        parts.push(crate::i18n::tr("跳板私钥口令", "jump key passphrase"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(match crate::i18n::current() {
+        crate::i18n::Lang::Zh => format!(
+            "{}解不开（主密钥已更换）。请重新填写后再点「连接」——会按现在的密钥重新保存。",
+            parts.join("、")
+        ),
+        crate::i18n::Lang::En => format!(
+            "{} could not be decrypted (master key changed). Re-enter, then Connect — it will be re-saved with the current key.",
+            parts.join(", ")
+        ),
+    })
+}
+
 impl ConnectForm {
     pub(super) fn open_import_dialog(&mut self) {
         let imported = store::import_ssh_config();
@@ -79,6 +108,7 @@ impl ConnectForm {
 
     pub(super) fn load_saved(&mut self, i: usize) {
         let c = self.saved[i].clone();
+        self.notice = decrypt_reenter_notice(&c);
         self.editing = Some((c.name.clone(), c.host.clone()));
         self.name = c.name;
         self.host = c.host;
@@ -109,17 +139,6 @@ impl ConnectForm {
             _ => AuthKind::Password,
         };
         self.error = None;
-        self.notice = if c.secret_decrypt_failed {
-            Some(
-                crate::i18n::tr(
-                    "已存密码解不开（主密钥已更换）。请在密码栏重新输入，再点「连接」——会按现在的密钥重新保存。不必删这条连接。",
-                    "Saved password cannot be decrypted (master key changed). Type it again in the password field, then Connect — it will be re-saved with the current key. You can keep this connection.",
-                )
-                .into(),
-            )
-        } else {
-            None
-        };
     }
 
     pub(super) fn save_current(&mut self) {
@@ -128,6 +147,15 @@ impl ConnectForm {
         } else {
             self.name.trim().to_string()
         };
+        let prev = match &self.editing {
+            Some((on, oh)) => self
+                .saved
+                .iter()
+                .find(|c| &c.name == on && &c.host == oh)
+                .cloned(),
+            None => None,
+        };
+        let still_failed = |typed: &str, was_failed: bool| typed.is_empty() && was_failed;
         let entry = SavedConnection {
             name: name.clone(),
             host: self.host.trim().to_string(),
@@ -158,7 +186,36 @@ impl ConnectForm {
             jump_passphrase: self.j_passphrase.clone(),
             group: self.group.trim().to_string(),
             tags: self.tags.trim().to_string(),
-            secret_decrypt_failed: false,
+            password_decrypt_failed: still_failed(
+                &self.password,
+                prev.as_ref().is_some_and(|p| p.password_decrypt_failed),
+            ),
+            passphrase_decrypt_failed: still_failed(
+                &self.passphrase,
+                prev.as_ref().is_some_and(|p| p.passphrase_decrypt_failed),
+            ),
+            jump_password_decrypt_failed: still_failed(
+                &self.j_password,
+                prev.as_ref()
+                    .is_some_and(|p| p.jump_password_decrypt_failed),
+            ),
+            jump_passphrase_decrypt_failed: still_failed(
+                &self.j_passphrase,
+                prev.as_ref()
+                    .is_some_and(|p| p.jump_passphrase_decrypt_failed),
+            ),
+            prev_name: prev
+                .as_ref()
+                .map(|p| p.prev_name.clone())
+                .unwrap_or_default(),
+            prev_host: prev
+                .as_ref()
+                .map(|p| p.prev_host.clone())
+                .unwrap_or_default(),
+            prev_username: prev
+                .as_ref()
+                .map(|p| p.prev_username.clone())
+                .unwrap_or_default(),
         };
         let slot = match &self.editing {
             Some((on, oh)) => self
@@ -207,6 +264,18 @@ impl ConnectForm {
                 if self.key_path.trim().is_empty() {
                     return Err(crate::i18n::tr("请填写私钥路径", "Enter key file").into());
                 }
+                if self.passphrase.is_empty()
+                    && self.editing.as_ref().is_some_and(|(on, oh)| {
+                        self.saved
+                            .iter()
+                            .find(|c| &c.name == on && &c.host == oh)
+                            .is_some_and(|c| c.passphrase_decrypt_failed)
+                    })
+                {
+                    return Err(
+                        crate::i18n::tr("请重新填写私钥口令", "Re-enter key passphrase").into(),
+                    );
+                }
                 AuthMethod::KeyFile {
                     path: self.key_path.trim().to_string(),
                     passphrase: if self.passphrase.is_empty() {
@@ -229,7 +298,12 @@ impl ConnectForm {
                 return Err(crate::i18n::tr("请填写跳板用户名", "Enter jump user").into());
             }
             let jauth = match self.j_auth {
-                AuthKind::Password => AuthMethod::Password(self.j_password.clone()),
+                AuthKind::Password => {
+                    if self.j_password.is_empty() {
+                        return Err(crate::i18n::tr("请填写跳板密码", "Enter jump password").into());
+                    }
+                    AuthMethod::Password(self.j_password.clone())
+                }
                 AuthKind::Agent => AuthMethod::Agent,
                 AuthKind::Interactive => AuthMethod::Interactive,
                 AuthKind::Key => {
@@ -237,6 +311,20 @@ impl ConnectForm {
                         return Err(
                             crate::i18n::tr("请填写跳板私钥路径", "Enter jump key file").into()
                         );
+                    }
+                    if self.j_passphrase.is_empty()
+                        && self.editing.as_ref().is_some_and(|(on, oh)| {
+                            self.saved
+                                .iter()
+                                .find(|c| &c.name == on && &c.host == oh)
+                                .is_some_and(|c| c.jump_passphrase_decrypt_failed)
+                        })
+                    {
+                        return Err(crate::i18n::tr(
+                            "请重新填写跳板私钥口令",
+                            "Re-enter jump key passphrase",
+                        )
+                        .into());
                     }
                     AuthMethod::KeyFile {
                         path: self.j_key_path.trim().to_string(),
