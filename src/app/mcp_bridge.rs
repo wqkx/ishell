@@ -396,16 +396,36 @@ fn auth_method(kind: &str, password: &str, key_path: &str, passphrase: &str) -> 
     }
 }
 
-/// 把一条已保存连接直接转成 `ConnectConfig`，等价于侧栏双击该连接时
-/// `load_saved()` + `build()` 这一对函数联合做的事。
-fn connect_config_from_saved(c: &SavedConnection) -> ConnectConfig {
+/// 把一条已保存连接转成 `ConnectConfig`。闸门与侧栏双击相同：这次认证用得上、
+/// 但解不开的密文拒绝直接连，并说明要用户在连接编辑里重填。故意留空的密码可以连。
+fn connect_config_from_saved(c: &SavedConnection) -> Result<ConnectConfig, String> {
+    if let Some(msg) = direct_connect_refusal(c) {
+        return Err(msg);
+    }
+    if c.auth_kind == "key" && c.key_path.trim().is_empty() {
+        return Err(
+            "这条连接用私钥登录，但没有私钥路径。请让用户在 iShell 的连接编辑里补上后再试 open_session。"
+                .into(),
+        );
+    }
+    if c.use_jump && c.jump_auth_kind == "key" && c.jump_key_path.trim().is_empty() {
+        return Err(
+            "这条连接的跳板用私钥登录，但没有跳板私钥路径。请让用户在 iShell 的连接编辑里补上后再试 open_session。"
+                .into(),
+        );
+    }
     let jump = c.use_jump.then(|| JumpHost {
         host: c.jump_host.clone(),
         port: c.jump_port,
         username: c.jump_username.clone(),
-        auth: auth_method(&c.jump_auth_kind, &c.jump_password, &c.jump_key_path, &c.jump_passphrase),
+        auth: auth_method(
+            &c.jump_auth_kind,
+            &c.jump_password,
+            &c.jump_key_path,
+            &c.jump_passphrase,
+        ),
     });
-    ConnectConfig {
+    Ok(ConnectConfig {
         host: c.host.clone(),
         port: c.port,
         username: c.username.clone(),
@@ -414,7 +434,28 @@ fn connect_config_from_saved(c: &SavedConnection) -> ConnectConfig {
         jump,
         forward_agent: c.forward_agent,
         transport: crate::proto::Transport::Ssh,
+    })
+}
+
+fn direct_connect_refusal(c: &SavedConnection) -> Option<String> {
+    let blocked = c.blocked_secrets();
+    if blocked.is_empty() {
+        return None;
     }
+    let names: Vec<&str> = blocked
+        .iter()
+        .map(|s| match s {
+            crate::store::BlockedSecret::Password => "登录密码",
+            crate::store::BlockedSecret::Passphrase => "私钥口令",
+            crate::store::BlockedSecret::JumpPassword => "跳板密码",
+            crate::store::BlockedSecret::JumpPassphrase => "跳板私钥口令",
+        })
+        .collect();
+    Some(format!(
+        "连接「{}」的{}解不开（主密钥与密文不匹配），不能直接连接。请让用户在 iShell 的连接编辑里重新填写，保存后再试 open_session。不要猜测或编造密码。",
+        c.name,
+        names.join("、")
+    ))
 }
 
 /// 一次从 socket 收到的请求，附带用于回填响应的 oneshot。
@@ -2312,7 +2353,16 @@ impl App {
         owner: Option<String>,
         owner_label: Option<String>,
     ) {
-        let cfg = connect_config_from_saved(c);
+        let cfg = match connect_config_from_saved(c) {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                let _ = resp_tx.send(McpResponse {
+                    id,
+                    result: Err(msg),
+                });
+                return;
+            }
+        };
         // AI 开的会话要**静默**落在新标签：spawn_session 会把新标签置为活动并请求滚动过去，
         // 焦点被从用户正在交互的会话里拽走是最糟糕的打扰——先把当前活动标签记下来，开完恢复。
         let prev_active = self.active;
@@ -3414,9 +3464,29 @@ mod session_ownership_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        remote_basename, remote_parent, trim_leading_echo, validate_local_path,
-        validate_remote_path, wrap_session_ender,
+        direct_connect_refusal, remote_basename, remote_parent, trim_leading_echo,
+        validate_local_path, validate_remote_path, wrap_session_ender,
     };
+    use crate::store::SavedConnection;
+
+    #[test]
+    fn open_session_refuses_undecryptable_password_and_says_to_reenter() {
+        let c = SavedConnection {
+            name: "web".into(),
+            auth_kind: "password".into(),
+            password_decrypt_failed: true,
+            ..SavedConnection::default()
+        };
+        let msg = direct_connect_refusal(&c).expect("解不开的密码必须拒绝");
+        assert!(msg.contains("web"));
+        assert!(msg.contains("重新填写"));
+        assert!(msg.contains("不要猜测"));
+        let empty = SavedConnection {
+            auth_kind: "password".into(),
+            ..SavedConnection::default()
+        };
+        assert!(direct_connect_refusal(&empty).is_none());
+    }
 
     #[test]
     fn session_enders_get_subshell_wrapped() {

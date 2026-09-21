@@ -79,12 +79,39 @@ fn decrypt_field(s: &str, failed: &mut bool) -> String {
     }
 }
 
+/// 这次连接真正会用到、但磁盘密文解不开的字段。
+/// 空密码本身合法（有的主机就是空密码）；没启用的跳板、当前认证方式用不到的口令不算。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockedSecret {
+    Password,
+    Passphrase,
+    JumpPassword,
+    JumpPassphrase,
+}
+
+fn kind_uses_password(kind: &str) -> bool {
+    // 与连接表单、MCP 的 `_ => Password` 一致：不是 key/agent/interactive 就按密码认证。
+    !matches!(kind, "key" | "agent" | "interactive")
+}
+
 impl SavedConnection {
-    pub fn any_secret_decrypt_failed(&self) -> bool {
-        self.password_decrypt_failed
-            || self.passphrase_decrypt_failed
-            || self.jump_password_decrypt_failed
-            || self.jump_passphrase_decrypt_failed
+    pub fn blocked_secrets(&self) -> Vec<BlockedSecret> {
+        let mut out = Vec::new();
+        if kind_uses_password(&self.auth_kind) && self.password_decrypt_failed {
+            out.push(BlockedSecret::Password);
+        }
+        if self.auth_kind == "key" && self.passphrase_decrypt_failed {
+            out.push(BlockedSecret::Passphrase);
+        }
+        if self.use_jump {
+            if kind_uses_password(&self.jump_auth_kind) && self.jump_password_decrypt_failed {
+                out.push(BlockedSecret::JumpPassword);
+            }
+            if self.jump_auth_kind == "key" && self.jump_passphrase_decrypt_failed {
+                out.push(BlockedSecret::JumpPassphrase);
+            }
+        }
+        out
     }
 }
 
@@ -507,5 +534,35 @@ Host pat-*
         let mut cleared = String::new();
         keep_if_empty(&mut cleared, "enc:v1:abc", false);
         assert!(cleared.is_empty(), "用户故意清空时不得把旧密文填回去");
+    }
+
+    #[test]
+    fn empty_password_does_not_block_direct_connect() {
+        let c = SavedConnection {
+            auth_kind: "password".into(),
+            ..SavedConnection::default()
+        };
+        assert!(
+            c.blocked_secrets().is_empty(),
+            "合法空密码必须能直接连，不能当成没填"
+        );
+    }
+
+    #[test]
+    fn only_secrets_this_login_will_use_block_direct_connect() {
+        let mut c = SavedConnection {
+            auth_kind: "key".into(),
+            password_decrypt_failed: true,
+            passphrase_decrypt_failed: true,
+            use_jump: false,
+            jump_password_decrypt_failed: true,
+            jump_passphrase_decrypt_failed: true,
+            ..SavedConnection::default()
+        };
+        assert_eq!(c.blocked_secrets(), vec![BlockedSecret::Passphrase]);
+        c.passphrase_decrypt_failed = false;
+        c.use_jump = true;
+        c.jump_auth_kind = "password".into();
+        assert_eq!(c.blocked_secrets(), vec![BlockedSecret::JumpPassword]);
     }
 }

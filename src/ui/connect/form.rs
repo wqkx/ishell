@@ -4,31 +4,44 @@ use crate::store::{self, SavedConnection};
 use super::{AuthKind, ConnectForm};
 
 fn decrypt_reenter_notice(c: &SavedConnection) -> Option<String> {
-    let mut parts = Vec::new();
-    if c.password_decrypt_failed {
-        parts.push(crate::i18n::tr("登录密码", "login password"));
-    }
-    if c.passphrase_decrypt_failed {
-        parts.push(crate::i18n::tr("私钥口令", "key passphrase"));
-    }
-    if c.jump_password_decrypt_failed {
-        parts.push(crate::i18n::tr("跳板密码", "jump password"));
-    }
-    if c.jump_passphrase_decrypt_failed {
-        parts.push(crate::i18n::tr("跳板私钥口令", "jump key passphrase"));
-    }
+    let parts: Vec<&str> = c
+        .blocked_secrets()
+        .into_iter()
+        .map(|s| match s {
+            store::BlockedSecret::Password => crate::i18n::tr("登录密码", "login password"),
+            store::BlockedSecret::Passphrase => crate::i18n::tr("私钥口令", "key passphrase"),
+            store::BlockedSecret::JumpPassword => crate::i18n::tr("跳板密码", "jump password"),
+            store::BlockedSecret::JumpPassphrase => {
+                crate::i18n::tr("跳板私钥口令", "jump key passphrase")
+            }
+        })
+        .collect();
     if parts.is_empty() {
         return None;
     }
-    Some(match crate::i18n::current() {
-        crate::i18n::Lang::Zh => format!(
-            "{}解不开（主密钥已更换）。请重新填写后再点「连接」——会按现在的密钥重新保存。",
-            parts.join("、")
-        ),
-        crate::i18n::Lang::En => format!(
-            "{} could not be decrypted (master key changed). Re-enter, then Connect — it will be re-saved with the current key.",
-            parts.join(", ")
-        ),
+    let joined_zh_en = parts.join(if crate::i18n::current() == crate::i18n::Lang::Zh {
+        "、"
+    } else {
+        ", "
+    });
+    Some(if store::key_storage() == store::KeyStorage::None {
+        match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!(
+                "{joined_zh_en}解不开，而且主密钥暂时不可用（钥匙串超时或被锁定）。填上之后这次可以连接，但保存不了；请等钥匙串恢复后再保存。不要删除 connections.json。"
+            ),
+            crate::i18n::Lang::En => format!(
+                "{joined_zh_en} could not be decrypted, and the master key is temporarily unavailable (keychain timed out or is locked). You can connect with what you type, but it will not be saved. Wait for the keychain, then save. Do not delete connections.json."
+            ),
+        }
+    } else {
+        match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!(
+                "{joined_zh_en}解不开（主密钥已更换）。请重新填写后再点「连接」——会按现在的密钥重新保存。"
+            ),
+            crate::i18n::Lang::En => format!(
+                "{joined_zh_en} could not be decrypted (master key changed). Re-enter, then Connect — it will be re-saved with the current key."
+            ),
+        }
     })
 }
 
@@ -239,6 +252,11 @@ impl ConnectForm {
         }
     }
 
+    fn editing_saved(&self) -> Option<&SavedConnection> {
+        let (on, oh) = self.editing.as_ref()?;
+        self.saved.iter().find(|c| &c.name == on && &c.host == oh)
+    }
+
     pub(super) fn build(&self) -> Result<ConnectConfig, String> {
         if self.host.trim().is_empty() {
             return Err(crate::i18n::tr("请填写主机地址", "Enter host").into());
@@ -253,8 +271,12 @@ impl ConnectForm {
         }
         let auth = match self.auth {
             AuthKind::Password => {
-                if self.password.is_empty() {
-                    return Err(crate::i18n::tr("请填写密码", "Enter password").into());
+                if self.password.is_empty()
+                    && self
+                        .editing_saved()
+                        .is_some_and(|c| c.password_decrypt_failed)
+                {
+                    return Err(crate::i18n::tr("请重新填写密码", "Re-enter password").into());
                 }
                 AuthMethod::Password(self.password.clone())
             }
@@ -265,12 +287,9 @@ impl ConnectForm {
                     return Err(crate::i18n::tr("请填写私钥路径", "Enter key file").into());
                 }
                 if self.passphrase.is_empty()
-                    && self.editing.as_ref().is_some_and(|(on, oh)| {
-                        self.saved
-                            .iter()
-                            .find(|c| &c.name == on && &c.host == oh)
-                            .is_some_and(|c| c.passphrase_decrypt_failed)
-                    })
+                    && self
+                        .editing_saved()
+                        .is_some_and(|c| c.passphrase_decrypt_failed)
                 {
                     return Err(
                         crate::i18n::tr("请重新填写私钥口令", "Re-enter key passphrase").into(),
@@ -299,8 +318,14 @@ impl ConnectForm {
             }
             let jauth = match self.j_auth {
                 AuthKind::Password => {
-                    if self.j_password.is_empty() {
-                        return Err(crate::i18n::tr("请填写跳板密码", "Enter jump password").into());
+                    if self.j_password.is_empty()
+                        && self
+                            .editing_saved()
+                            .is_some_and(|c| c.jump_password_decrypt_failed)
+                    {
+                        return Err(
+                            crate::i18n::tr("请重新填写跳板密码", "Re-enter jump password").into(),
+                        );
                     }
                     AuthMethod::Password(self.j_password.clone())
                 }
@@ -313,12 +338,9 @@ impl ConnectForm {
                         );
                     }
                     if self.j_passphrase.is_empty()
-                        && self.editing.as_ref().is_some_and(|(on, oh)| {
-                            self.saved
-                                .iter()
-                                .find(|c| &c.name == on && &c.host == oh)
-                                .is_some_and(|c| c.jump_passphrase_decrypt_failed)
-                        })
+                        && self
+                            .editing_saved()
+                            .is_some_and(|c| c.jump_passphrase_decrypt_failed)
                     {
                         return Err(crate::i18n::tr(
                             "请重新填写跳板私钥口令",

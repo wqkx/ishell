@@ -274,8 +274,8 @@ impl ConnectForm {
                 store::KeyStorage::None => (
                     eicon::WARNING_CIRCLE,
                     crate::i18n::tr(
-                        "加密不可用，密码将以明文保存",
-                        "Encryption unavailable — passwords stored in plaintext",
+                        "主密钥不可用：已存密码解不开，新密码也保存不了（不会改成明文）",
+                        "Master key unavailable — saved passwords cannot be decrypted or re-saved (not stored in plaintext)",
                     ),
                     Palette::DANGER,
                 ),
@@ -319,7 +319,9 @@ impl ConnectForm {
                 match self.build() {
                     Ok(_) => {
                         self.save_current();
-                        self.mode = Mode::List;
+                        if self.error.is_none() {
+                            self.mode = Mode::List;
+                        }
                     }
                     Err(e) => self.error = Some(e),
                 }

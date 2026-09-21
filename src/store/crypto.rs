@@ -211,8 +211,8 @@ enum MasterKeyPlan {
     None,
 }
 
-/// 纯决策：超时/锁定绝不能当成「没有密钥」去生成一把新的。
-/// 钥匙串根本不存在、磁盘上也没有密文时，仍应在本地新建，否则没有会话总线就永远存不了密码。
+/// 纯决策：超时/锁定绝不能当成「没有密钥」去生成一把新的（那会覆盖钥匙串里还能用的密钥）。
+/// 钥匙串根本不存在时仍在本地新建，哪怕磁盘上已有旧密文——否则卸掉钥匙串后重新填写也无法落盘。
 fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) -> MasterKeyPlan {
     match read {
         KeychainRead::Found(_) => MasterKeyPlan::UseKeychain,
@@ -228,9 +228,10 @@ fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) ->
         KeychainRead::Unavailable => {
             if has_local {
                 MasterKeyPlan::UseLocal { migrate: false }
-            } else if has_ciphertext {
-                MasterKeyPlan::None
             } else {
+                // 钥匙串根本不在（不是超时）。旧版本迁到钥匙串后会删掉本地 key，
+                // 这时若拒绝新建，用户重新填写也落不了盘，除非手工清掉 connections.json。
+                // 新密钥只写本地文件（钥匙串不可用时 set 直接失败），旧密文仍由保存路径留在磁盘上。
                 MasterKeyPlan::MintNew
             }
         }
@@ -501,20 +502,11 @@ pub fn encrypt_secret(plain: &str) -> Result<String, String> {
     if plain.is_empty() {
         return Ok(String::new());
     }
-    // 看起来像本格式的密文：能解开就原样落盘；解不开就拒绝再包一层——那会把唯一的
-    // 旧密文毁掉，再也救不回来。
-    if plain.starts_with(ENC_PREFIX) {
-        if is_genuine_ciphertext(plain) {
-            return Ok(plain.to_string());
-        }
-        return Err(match crate::i18n::current() {
-            crate::i18n::Lang::Zh => {
-                "保存的密码是旧密文，但当前主密钥解不开。请重新填写密码后再保存。".into()
-            }
-            crate::i18n::Lang::En => {
-                "Saved secret looks encrypted but the current master key cannot open it. Re-enter the password before saving.".into()
-            }
-        });
+    // 能用当前密钥解开的密文原样落盘。解不开则当成明文再加密——真实密码碰巧以
+    // `enc:v1:` 开头时必须能保存。解不开的密文不会走到这里：读盘时已清空并打标，
+    // 保存路径只在那个标志为真时才把磁盘上的旧密文填回去。
+    if is_genuine_ciphertext(plain) {
+        return Ok(plain.to_string());
     }
     let Some(c) = cipher() else {
         return Err(match crate::i18n::current() {
@@ -601,6 +593,22 @@ mod tests {
             Err(e) => assert!(!e.is_empty()),
         }
     }
+
+    #[test]
+    fn plaintext_that_starts_with_the_ciphertext_prefix_can_be_saved() {
+        let weird = "enc:v1:not-ciphertext";
+        match encrypt_secret(weird) {
+            Ok(ct) => {
+                assert!(ct.starts_with(ENC_PREFIX));
+                assert_ne!(ct, weird);
+                assert_eq!(decrypt_secret(&ct), weird);
+            }
+            Err(e) => assert!(
+                !e.contains("旧密文") && !e.contains("cannot open"),
+                "碰巧带 enc:v1: 前缀的明文必须能保存，不能当成解不开的密文拒绝：{e}"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,8 +687,8 @@ mod keychain_slot_tests {
         );
         assert_eq!(
             plan_master_key(KeychainRead::Unavailable, false, true),
-            MasterKeyPlan::None,
-            "没有会话总线但已有密文：不能生成新密钥，否则会解不开旧密码"
+            MasterKeyPlan::MintNew,
+            "钥匙串已卸掉、只剩旧密文时仍应在本地新建，否则重新填写也无法落盘"
         );
         assert_eq!(
             plan_master_key(KeychainRead::Transient, false, false),

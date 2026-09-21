@@ -435,31 +435,36 @@ where
             remaining_methods,
             partial_success,
         }) => {
+            // russh 在回复通道关掉时（对端拆连接）给的是 Ok(Failure) 而不是 Err。
+            // 这时不能报成密码错。
+            if handle.is_closed() {
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::tr(
+                        "连接在认证过程中中断",
+                        "Connection lost during authentication"
+                    )
+                );
+            }
             if !should_try_kbd_after_password(&remaining_methods, partial_success) {
                 return Ok(false);
             }
-            match authenticate_password_via_kbd(
-                handle,
-                username,
-                pw,
-                sink,
-                cmd_rx,
-                !partial_success,
-            )
-            .await
-            {
-                Ok(ok) => Ok(ok),
-                Err(e) => {
-                    log::debug!("keyboard-interactive 密码尝试未成功：{e}");
-                    Ok(false)
-                }
-            }
+            authenticate_password_via_kbd(handle, username, pw, sink, cmd_rx, !partial_success)
+                .await
+                .map_err(auth_transport_error)
         }
-        Err(e) => {
-            log::debug!("password 方法未成功：{e}");
-            Ok(false)
-        }
+        Err(e) => Err(auth_transport_error(e)),
     }
+}
+
+fn auth_transport_error(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {e}",
+        crate::i18n::tr(
+            "连接在认证过程中中断",
+            "Connection lost during authentication",
+        )
+    )
 }
 
 /// 用已保存的密码应答 kbd-int：最多自动填**第一轮、且只有一个不回显提示**。
@@ -484,7 +489,12 @@ where
     loop {
         match resp {
             Resp::Success => return Ok(true),
-            Resp::Failure { .. } => return Ok(false),
+            Resp::Failure { .. } => {
+                if handle.is_closed() {
+                    anyhow::bail!("disconnected");
+                }
+                return Ok(false);
+            }
             Resp::InfoRequest {
                 name,
                 instructions,

@@ -16,7 +16,7 @@ mod paths;
 mod settings;
 mod snippets;
 
-pub use connections::{import_ssh_config, load, save, SavedConnection};
+pub use connections::{import_ssh_config, load, save, BlockedSecret, SavedConnection};
 #[allow(unused_imports)]
 pub use crypto::{decrypt_secret, encrypt_secret, key_perms_were_loose, key_storage, KeyStorage};
 pub use favorites::{load_favorites, save_favorites, remove_favorite, toggle_favorite};
