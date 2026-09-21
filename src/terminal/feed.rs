@@ -37,40 +37,83 @@ enum ReplyKind {
 
 /// 控制流切分事件：CSI 查询应答，或 OSC 8 超链接起止。
 enum StreamEvent {
-    Query { at: usize, kind: ReplyKind, len: usize },
-    Osc8 { at: usize, len: usize, url: Option<String> },
+    Query {
+        at: usize,
+        kind: ReplyKind,
+        len: usize,
+    },
+    Osc8 {
+        at: usize,
+        len: usize,
+        url: Option<String>,
+    },
+}
+
+/// 第一条 BEL 或 ST（`ESC \`）相对 `body` 的位置：`(负载结束, 序列结束)`。
+///
+/// OSC 的合法终止符只有这两个。参数里的 `;` 和 URI 都必须落在这条边界之内——
+/// 少写一个 `;` 的 `\e]8;http://x\a` 若一路扫到缓冲尾，会把后面的颜色序列和
+/// 标题 OSC 一起当成 URI 吞掉，屏幕上整段消失。
+fn osc8_terminator(body: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == 0x07 {
+            return Some((i, i + 1));
+        }
+        if body[i] == 0x1b && body.get(i + 1) == Some(&b'\\') {
+            return Some((i, i + 2));
+        }
+        i += 1;
+    }
+    None
+}
+
+enum Osc8Scan {
+    /// 完整且带参数分号的 OSC 8。
+    Link {
+        at: usize,
+        len: usize,
+        url: Option<String>,
+    },
+    /// 看见 `ESC]8;` 但还没有 BEL/ST。`at` 是引导字节的起点。
+    Unterminated { at: usize },
+}
+
+/// 从左到右看 OSC 8。已终止但缺参数分号的（常见笔误 `\e]8;http://x\a`）直接跳过，
+/// 不当成超链接，也不挡住它后面真正的 OSC 8。
+fn scan_osc8(hay: &[u8]) -> Option<Osc8Scan> {
+    let mut from = 0;
+    while from < hay.len() {
+        let rel = find_sub_outside_string_escapes(&hay[from..], b"\x1b]8;")?;
+        let at = from + rel;
+        let body_at = at + 4;
+        let Some((content_end, seq_end)) = osc8_terminator(&hay[body_at..]) else {
+            return Some(Osc8Scan::Unterminated { at });
+        };
+        let content = &hay[body_at..body_at + content_end];
+        if let Some(semi) = content.iter().position(|&b| b == b';') {
+            let uri = &content[semi + 1..];
+            let url = if uri.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(uri).into_owned())
+            };
+            return Some(Osc8Scan::Link {
+                at,
+                len: body_at + seq_end - at,
+                url,
+            });
+        }
+        from = body_at + seq_end;
+    }
+    None
 }
 
 fn find_next_osc8(hay: &[u8]) -> Option<(usize, usize, Option<String>)> {
-    // `find_sub_outside_string_escapes` 在跳过 OSC 前会先匹配 needle，故能命中 `ESC]8;`。
-    let at = find_sub_outside_string_escapes(hay, b"\x1b]8;")?;
-    let body = at + 4; // 过 `ESC]8;`
-    // 参数段到下一个 `;`，其后是 URI（空 URI = 结束链接）
-    let semi_rel = hay[body..].iter().position(|&b| b == b';')?;
-    let uri_at = body + semi_rel + 1;
-    let mut end = uri_at;
-    while end < hay.len() {
-        if hay[end] == 0x07 {
-            let uri = &hay[uri_at..end];
-            let url = if uri.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(uri).into_owned())
-            };
-            return Some((at, end + 1 - at, url));
-        }
-        if hay[end] == 0x1b && hay.get(end + 1) == Some(&b'\\') {
-            let uri = &hay[uri_at..end];
-            let url = if uri.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(uri).into_owned())
-            };
-            return Some((at, end + 2 - at, url));
-        }
-        end += 1;
+    match scan_osc8(hay)? {
+        Osc8Scan::Link { at, len, url } => Some((at, len, url)),
+        Osc8Scan::Unterminated { .. } => None,
     }
-    None // 未终止
 }
 
 fn find_next_stream_event(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<StreamEvent> {
@@ -82,11 +125,7 @@ fn find_next_stream_event(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<
         (None, Some((at, len, url))) => Some(StreamEvent::Osc8 { at, len, url }),
         (Some((qa, kind, len)), Some((oa, olen, url))) => {
             if qa <= oa {
-                Some(StreamEvent::Query {
-                    at: qa,
-                    kind,
-                    len,
-                })
+                Some(StreamEvent::Query { at: qa, kind, len })
             } else {
                 Some(StreamEvent::Osc8 {
                     at: oa,
@@ -107,8 +146,9 @@ const OSC8_URI_CAP: usize = 8 * 1024;
 fn incomplete_stream_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize {
     let mut keep = incomplete_query_keep(rest, queries);
     // 完整 OSC 8 已被消费；这里只处理「看得见开头但没收尾」或「半截前缀」。
-    if find_next_osc8(rest).is_none() {
-        if let Some(at) = find_sub_outside_string_escapes(rest, b"\x1b]8;") {
+    // 已经遇到 BEL/ST 的序列（哪怕缺分号、不是超链接）不算未完成，不能再整段扣住。
+    match scan_osc8(rest) {
+        Some(Osc8Scan::Unterminated { at }) => {
             let pending = rest.len() - at;
             let body = &rest[at + 4..];
             let cap = if body.contains(&b';') {
@@ -119,10 +159,20 @@ fn incomplete_stream_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize 
             if pending <= cap {
                 keep = keep.max(pending);
             }
-        } else {
+        }
+        Some(Osc8Scan::Link { .. }) => {}
+        None => {
+            // 前缀落在未终止的 DCS/APC 负载里时不算：包边界切在负载内的 `\x1b`
+            // 上，扣进 query_tail 会把下一块开头的 `[6n` 拼成假 CPR，或把 `]8;`
+            // 拼成假 OSC 8。与 `incomplete_query_keep` 同一道守卫。
+            let open = unterminated_string_tail(rest);
             const P: &[u8] = b"\x1b]8;";
             for n in 1..P.len() {
-                if rest.ends_with(&P[..n]) {
+                if rest.len() >= n && rest.ends_with(&P[..n]) {
+                    let at = rest.len() - n;
+                    if open.is_some_and(|start| at >= start) {
+                        continue;
+                    }
                     keep = keep.max(n);
                 }
             }
@@ -133,10 +183,9 @@ fn incomplete_stream_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize 
 
 /// 未完成且已超过暂存上限的 OSC 8 起点。这种序列不能再扣着，也不能原样喂进 vt100。
 fn abandoned_osc8(rest: &[u8]) -> Option<usize> {
-    if find_next_osc8(rest).is_some() {
+    let Osc8Scan::Unterminated { at } = scan_osc8(rest)? else {
         return None;
-    }
-    let at = find_sub_outside_string_escapes(rest, b"\x1b]8;")?;
+    };
     let pending = rest.len() - at;
     let body = &rest[at + 4..];
     let cap = if body.contains(&b';') {
@@ -149,7 +198,10 @@ fn abandoned_osc8(rest: &[u8]) -> Option<usize> {
 
 /// 在 `hay` 里找最早出现的查询；同起点取更长匹配（`ESC[0c` 优先于 `ESC[c`）。
 /// 在 OSC/DCS 负载内的同款字节不算——见 `find_sub_outside_string_escapes`。
-fn find_next_query(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<(usize, ReplyKind, usize)> {
+fn find_next_query(
+    hay: &[u8],
+    queries: &[(&[u8], ReplyKind)],
+) -> Option<(usize, ReplyKind, usize)> {
     let mut best: Option<(usize, ReplyKind, usize)> = None;
     for &(pat, kind) in queries {
         if let Some(at) = find_sub_outside_string_escapes(hay, pat) {
@@ -239,16 +291,22 @@ impl Terminal {
         if let Some(at) = abandoned_osc8(rest) {
             // 超限的未完成 OSC 8：引导字节丢掉，余下当普通输出。若整段喂给 vt100，
             // 解析器会停在 OSC 里，把后面的输出一直吞到 BEL/ST。
+            // 余下那段的尾部仍可能是半截查询，要走同一套暂存，否则下一包的 CPR 对不上。
             self.parser.process(&rest[..at]);
-            let body = at + 4; // 过 `ESC]8;`
-            if body < rest.len() {
-                self.parser.process(&rest[body..]);
-            }
-            self.query_tail.clear();
+            let body = if at + 4 < rest.len() {
+                &rest[at + 4..]
+            } else {
+                &[]
+            };
+            let keep = incomplete_stream_keep(body, QUERIES);
+            let split = body.len() - keep;
+            self.parser.process(&body[..split]);
+            self.query_tail.extend_from_slice(&body[split..]);
         } else {
             let keep = incomplete_stream_keep(rest, QUERIES);
             self.parser.process(&rest[..rest.len() - keep]);
-            self.query_tail.extend_from_slice(&rest[rest.len() - keep..]);
+            self.query_tail
+                .extend_from_slice(&rest[rest.len() - keep..]);
         }
         replies
     }
@@ -313,7 +371,7 @@ impl Terminal {
             return;
         }
         let total = self.parser.screen().scrollback_total();
-        let sb = self.parser.screen().scrollback();
+        let saved_sb = self.parser.screen().scrollback();
         for abs in start_abs..=end_abs {
             let sc = if abs == start_abs { start_col } else { 0 };
             let mut excl = if abs == end_abs {
@@ -321,23 +379,21 @@ impl Terminal {
             } else {
                 self.cols as usize
             };
-            let view = abs + sb;
-            if view >= total {
-                let view_row = (view - total) as u16;
-                if view_row < self.rows {
-                    let screen = self.parser.screen();
-                    while excl > sc as usize {
-                        let col = (excl - 1) as u16;
-                        let cell = screen.cell(view_row, col);
-                        if cell.is_some_and(|c| c.is_wide_continuation()) {
-                            break;
-                        }
-                        let empty = cell.map(|c| c.contents().is_empty()).unwrap_or(true);
-                        if empty {
-                            excl -= 1;
-                        } else {
-                            break;
-                        }
+            // 行尾空格裁剪必须读到这一绝对行本身。用户正回看历史时 scrollback
+            // 偏移会让 `cell()` 指到别的行，可见窗口公式对不上就把旧内容算进可点区。
+            if let Some(view_row) = self.osc8_row_on_screen(abs, total) {
+                let screen = self.parser.screen();
+                while excl > sc as usize {
+                    let col = (excl - 1) as u16;
+                    let cell = screen.cell(view_row, col);
+                    if cell.is_some_and(|c| c.is_wide_continuation()) {
+                        break;
+                    }
+                    let empty = cell.map(|c| c.contents().is_empty()).unwrap_or(true);
+                    if empty {
+                        excl -= 1;
+                    } else {
+                        break;
                     }
                 }
             }
@@ -346,6 +402,7 @@ impl Terminal {
                     .push((abs, sc, (excl - 1) as u16, url.clone()));
             }
         }
+        self.parser.screen_mut().set_scrollback(saved_sb);
         // 容量封顶，丢掉最旧的
         const CAP: usize = 256;
         if self.osc8_spans.len() > CAP {
@@ -353,6 +410,24 @@ impl Terminal {
             self.osc8_spans.drain(..drop);
         }
         self.osc8_anchor = None;
+    }
+
+    /// 把绝对行 `abs` 摆进 `cell()` 能读到的那一屏，返回可见行号。
+    /// 活屏行强制 scrollback=0（光标坐标就是这套）；已经滚进历史的行则把该行顶到第 0 行。
+    fn osc8_row_on_screen(&mut self, abs: usize, total: usize) -> Option<u16> {
+        if abs >= total {
+            let row = (abs - total) as u16;
+            if row >= self.rows {
+                return None;
+            }
+            self.parser.screen_mut().set_scrollback(0);
+            return Some(row);
+        }
+        let want = total - abs;
+        self.parser.screen_mut().set_scrollback(want);
+        let sb = self.parser.screen().scrollback();
+        let top = self.parser.screen().scrollback_total().saturating_sub(sb);
+        (top == abs).then_some(0)
     }
 
     /// 推进 AI 命令捕获：追加本块字节，再按模式判定「命令是否已结束」。
@@ -464,7 +539,10 @@ impl Terminal {
             let dropped = self.echo_queue.pop_front();
             log::warn!(
                 "回显吞除队首 {:?} 超时未见回显，丢弃以免堵住队列",
-                dropped.map(|a| String::from_utf8_lossy(&a.expect).chars().take(40).collect::<String>())
+                dropped.map(|a| String::from_utf8_lossy(&a.expect)
+                    .chars()
+                    .take(40)
+                    .collect::<String>())
             );
             if let Some(next) = self.echo_queue.front_mut() {
                 next.head_since = std::time::Instant::now(); // 它才刚成为队首，寿命从现在算
@@ -652,7 +730,7 @@ impl Terminal {
         let tail = std::mem::take(&mut self.notice_tail);
         // 留下来的这截**上一轮已经扫过**了。对响铃无所谓（未终止序列不计数），但对通知有所谓：
         // 一条已经终止的 OSC 可能整个躺在这截里（典型是包在未终止 DCS 里的 tmux 透传通知），
-        // 不告诉 parse_osc_notify 跳过它，同一条通知会弹两次。见 parse_osc_notify 的说明。
+        // 不告诉扫描跳过它，同一条通知会弹两次。终止符落在 `carried` 前缀里的序列必须略过。
         let carried = tail.len();
         let scan: &[u8] = if tail.is_empty() {
             bytes
@@ -805,7 +883,10 @@ impl Terminal {
         let mut replies = Vec::new();
         // 看门狗：上一帧一直没等到 `2026l`，先把超时的半帧刷掉再继续。
         if self.sync_active && self.sync_since.elapsed() >= SYNC_WATCHDOG {
-            log::debug!("同步帧看门狗触发：{}ms 未等到 2026l，强刷半帧", self.sync_since.elapsed().as_millis());
+            log::debug!(
+                "同步帧看门狗触发：{}ms 未等到 2026l，强刷半帧",
+                self.sync_since.elapsed().as_millis()
+            );
             replies.extend(self.flush_sync());
         }
         let mut rest = bytes;
@@ -833,7 +914,10 @@ impl Terminal {
                     if self.sync_active {
                         self.sync_buf.extend_from_slice(rest);
                         if self.sync_buf.len() >= SYNC_BUF_CAP {
-                            log::debug!("同步帧缓冲超上限（{} 字节），强制刷掉", self.sync_buf.len());
+                            log::debug!(
+                                "同步帧缓冲超上限（{} 字节），强制刷掉",
+                                self.sync_buf.len()
+                            );
                             replies.extend(self.flush_sync());
                         }
                     } else {

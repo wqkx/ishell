@@ -28,7 +28,8 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
     ));
 
     let (pty_cols, pty_rows, mut cmd_prelude) =
-        crate::pty_size::resolve_initial_pty_size(&mut cmd_rx).await;
+        crate::pty_size::resolve_initial_pty_size(&mut cmd_rx, std::collections::VecDeque::new())
+            .await;
 
     let (master, mut child, out_rx, in_tx) = match spawn_pty(pty_cols, pty_rows) {
         Ok(v) => v,
@@ -221,7 +222,7 @@ fn spawn_pty(
     Ok((master, child, out_rx, in_tx))
 }
 
-/// 本机默认交互式 shell：unix 取 `$SHELL`，不存在或不在白名单路径时依次试
+/// 本机默认交互式 shell：unix 取 `$SHELL`（须是可执行文件），否则依次试
 /// bash → zsh → sh；Windows 取 `%COMSPEC%`（回退 `powershell.exe`）。
 fn default_shell() -> String {
     #[cfg(unix)]
@@ -244,14 +245,20 @@ fn resolve_unix_shell() -> String {
                 v.push(s);
             }
         }
-        for p in ["/bin/bash", "/bin/zsh", "/bin/sh", "/usr/bin/bash", "/usr/bin/zsh", "/usr/bin/sh"]
-        {
+        for p in [
+            "/bin/bash",
+            "/bin/zsh",
+            "/bin/sh",
+            "/usr/bin/bash",
+            "/usr/bin/zsh",
+            "/usr/bin/sh",
+        ] {
             v.push(p.into());
         }
         v
     };
     for c in &candidates {
-        if std::path::Path::new(c).is_file() {
+        if path_is_executable(c) {
             return c.clone();
         }
     }
@@ -262,6 +269,15 @@ fn resolve_unix_shell() -> String {
         .unwrap_or_else(|| "/bin/sh".into())
 }
 
+#[cfg(unix)]
+fn path_is_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let p = std::path::Path::new(path);
+    p.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod shell_fallback_tests {
@@ -270,10 +286,7 @@ mod shell_fallback_tests {
     #[test]
     fn resolves_to_an_existing_executable() {
         let sh = resolve_unix_shell();
-        assert!(
-            std::path::Path::new(&sh).is_file(),
-            "应落到存在的 shell：{sh}"
-        );
+        assert!(super::path_is_executable(&sh), "应落到可执行的 shell：{sh}");
     }
 }
 

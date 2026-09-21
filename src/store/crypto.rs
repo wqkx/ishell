@@ -560,6 +560,7 @@ pub(super) fn try_decrypt_secret(s: &str) -> Result<String, String> {
 
 /// 解密；非 `enc:v1:` 前缀视为明文（旧数据）原样返回。解密失败时**返回原串**——当明文
 /// 用会导致一次登录失败，但绝不把已存密码静默变成空串。新代码请走 [`try_decrypt_secret`]。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn decrypt_secret(s: &str) -> String {
     match try_decrypt_secret(s) {
         Ok(p) => p,

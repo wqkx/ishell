@@ -98,6 +98,7 @@ fn write_map(map: &HashMap<String, Vec<String>>) {
 /// ⚠ 这是「用调用方的整份列表覆盖该服务器条目」的语义，只适合调用方**确信自己拿的是最新
 /// 数据**的场合。UI 里的收藏增删请一律走 [`toggle_favorite`] / [`remove_favorite`]，
 /// 它们是读盘→改→写回，不会拿陈旧快照覆盖别的标签页刚加的收藏。
+#[allow(dead_code)]
 pub fn save_favorites(server: &str, list: &[String]) {
     let Some(path) = favorites_path() else {
         return;

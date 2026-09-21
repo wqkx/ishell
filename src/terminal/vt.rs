@@ -66,6 +66,9 @@ struct CellAttrs {
     dim: bool,
     italic: bool,
     underline: bool,
+    double_underline: bool,
+    blink: bool,
+    strikethrough: bool,
     inverse: bool,
 }
 
@@ -77,6 +80,9 @@ impl CellAttrs {
         dim: false,
         italic: false,
         underline: false,
+        double_underline: false,
+        blink: false,
+        strikethrough: false,
         inverse: false,
     };
     fn of(c: &vt100::Cell) -> Self {
@@ -87,6 +93,9 @@ impl CellAttrs {
             dim: c.dim(),
             italic: c.italic(),
             underline: c.underline(),
+            double_underline: c.double_underline(),
+            blink: c.blink(),
+            strikethrough: c.strikethrough(),
             inverse: c.inverse(),
         }
     }
@@ -102,11 +111,20 @@ impl CellAttrs {
         if self.italic {
             p.push("3".into());
         }
-        if self.underline {
+        if self.double_underline {
+            // 21 同时置下划线与双下划线（vt100 的 set_double_underline 就是这么做的）
+            p.push("21".into());
+        } else if self.underline {
             p.push("4".into());
+        }
+        if self.blink {
+            p.push("5".into());
         }
         if self.inverse {
             p.push("7".into());
+        }
+        if self.strikethrough {
+            p.push("9".into());
         }
         push_sgr_color(&mut p, self.fg, true);
         push_sgr_color(&mut p, self.bg, false);

@@ -1405,6 +1405,15 @@ async fn handle_conn(
             Err("iShell MCP 并发已达上限，请稍后重试".into()),
         )
         .await;
+        // 与凭据拒绝同一条路：上传还在推文件体时直接关连接，错误响应会随 RST 丢掉。
+        if matches!(req.kind, McpReqKind::CopyToRemoteFromCaller { .. }) {
+            let mut rest = lines.into_inner().into_inner().into_inner();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                tokio::io::copy(&mut rest, &mut tokio::io::sink()),
+            )
+            .await;
+        }
         return;
     };
     drop(handshake_permit);
@@ -1454,7 +1463,7 @@ async fn handle_conn(
         //
         // `Lines` 持有的 BufReader 可能已经预读了紧随 JSON 行的文件字节，不能丢掉它——
         // 取出缓冲区里的首块，和摘掉 `Take` 后的裸读端接起来交给 worker。
-        let mut buffered_reader = lines.into_inner();
+        let buffered_reader = lines.into_inner();
         let head = buffered_reader.buffer().to_vec();
         let rest = buffered_reader.into_inner().into_inner();
         // dup 一份 socket 句柄，留给下面「报错后排干文件体」用（理由见该处注释）。tokio 的

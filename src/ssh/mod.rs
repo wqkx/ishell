@@ -111,7 +111,7 @@ pub async fn run(
     }));
 
     // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
-    let (handle, _jump_handle, remote_fwds, x11) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
+    let (handle, _jump_handle, remote_fwds, x11, kbd_prelude) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
         Ok(h) => h,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
@@ -126,7 +126,7 @@ pub async fn run(
     // 等 UI 上报真实窗口尺寸再开 PTY，避免 80×24 → 真尺寸的闪一下。
     // 鉴权期间 layout 通常已把 Resize 打进通道；prelude 里其它命令主循环优先消化。
     let (pty_cols, pty_rows, mut cmd_prelude) =
-        crate::pty_size::resolve_initial_pty_size(&mut cmd_rx).await;
+        crate::pty_size::resolve_initial_pty_size(&mut cmd_rx, kbd_prelude).await;
 
     // 1) 交互式 shell 通道
     let mut shell = match open_shell(

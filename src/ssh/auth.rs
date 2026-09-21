@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,8 +38,7 @@ pub(crate) struct ClientHandler {
 }
 
 /// 用户 `-R` 转发路由表（与 `ClientHandler` / `run_forward` 共享）。
-pub(super) type RemoteFwdTable =
-    Arc<Mutex<HashMap<(String, u32), (String, u16)>>>;
+pub(super) type RemoteFwdTable = Arc<Mutex<HashMap<(String, u32), (String, u16)>>>;
 
 /// 本机 X11 转发材料。`fake` 发给远端，`real` 只留在本机，回连握手时替换。
 #[derive(Clone)]
@@ -288,9 +287,7 @@ impl Handler for ClientHandler {
     ) -> Result<(), Self::Error> {
         let target = lookup_remote_fwd(&self.remote_fwds, connected_address, connected_port);
         let Some((host, port)) = target else {
-            log::debug!(
-                "收到未登记的 forwarded-tcpip {connected_address}:{connected_port}，忽略"
-            );
+            log::debug!("收到未登记的 forwarded-tcpip {connected_address}:{connected_port}，忽略");
             return Ok(());
         };
         tokio::spawn(async move {
@@ -426,15 +423,18 @@ async fn authenticate<H>(
     auth: &AuthMethod,
     sink: &UiSink,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    prelude: &mut VecDeque<UiCommand>,
 ) -> anyhow::Result<bool>
 where
     H: Handler,
     H::Error: std::error::Error + Send + Sync + 'static,
 {
     let ok = match auth {
-        AuthMethod::Interactive => authenticate_interactive(handle, username, sink, cmd_rx).await?,
+        AuthMethod::Interactive => {
+            authenticate_interactive(handle, username, sink, cmd_rx, prelude).await?
+        }
         AuthMethod::Password(pw) => {
-            authenticate_password_login(handle, username, pw, sink, cmd_rx).await?
+            authenticate_password_login(handle, username, pw, sink, cmd_rx, prelude).await?
         }
         AuthMethod::KeyFile { path, passphrase } => {
             let key = russh::keys::load_secret_key(path, passphrase.as_deref())?;
@@ -491,6 +491,7 @@ async fn authenticate_password_login<H>(
     pw: &str,
     sink: &UiSink,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    prelude: &mut VecDeque<UiCommand>,
 ) -> anyhow::Result<bool>
 where
     H: Handler,
@@ -525,9 +526,16 @@ where
             if !should_try_kbd_after_password(&remaining_methods, partial_success) {
                 return Ok(false);
             }
-            authenticate_password_via_kbd(handle, username, pw, sink, cmd_rx, !partial_success)
-                .await
-                .map_err(auth_transport_error)
+            authenticate_password_via_kbd(
+                handle,
+                username,
+                pw,
+                sink,
+                cmd_rx,
+                prelude,
+                !partial_success,
+            )
+            .await
         }
         Err(e) => Err(auth_transport_error(e)),
     }
@@ -551,6 +559,7 @@ async fn authenticate_password_via_kbd<H>(
     pw: &str,
     sink: &UiSink,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    prelude: &mut VecDeque<UiCommand>,
     auto_fill: bool,
 ) -> anyhow::Result<bool>
 where
@@ -560,7 +569,8 @@ where
     use client::KeyboardInteractiveAuthResponse as Resp;
     let mut resp = handle
         .authenticate_keyboard_interactive_start(username.to_string(), None)
-        .await?;
+        .await
+        .map_err(auth_transport_error)?;
     let mut already_filled = false;
     loop {
         match resp {
@@ -579,7 +589,8 @@ where
                 if prompts.is_empty() {
                     resp = handle
                         .authenticate_keyboard_interactive_respond(Vec::new())
-                        .await?;
+                        .await
+                        .map_err(auth_transport_error)?;
                     continue;
                 }
                 let echoes: Vec<bool> = prompts.iter().map(|p| p.echo).collect();
@@ -593,25 +604,57 @@ where
                         instructions,
                         prompts: prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect(),
                     });
-                    match wait_kbd_answers(cmd_rx).await {
-                        Some(a) => a,
-                        None => return Ok(false),
+                    match wait_kbd_answers(cmd_rx, prelude).await {
+                        Ok(a) => a,
+                        Err(end) => return Err(kbd_aborted(end)),
                     }
                 };
                 resp = handle
                     .authenticate_keyboard_interactive_respond(answers)
-                    .await?;
+                    .await
+                    .map_err(auth_transport_error)?;
             }
         }
     }
 }
 
-async fn wait_kbd_answers(cmd_rx: &mut UnboundedReceiver<UiCommand>) -> Option<Vec<String>> {
+#[derive(Debug)]
+enum KbdWaitEnd {
+    /// 用户在提示框里点了断开。
+    Cancelled,
+    /// 命令通道关了（worker 正在退出）。
+    Closed,
+}
+
+fn kbd_aborted(end: KbdWaitEnd) -> anyhow::Error {
+    match end {
+        KbdWaitEnd::Cancelled => anyhow::anyhow!(
+            "{}",
+            crate::i18n::tr("已取消认证", "Authentication cancelled")
+        ),
+        KbdWaitEnd::Closed => anyhow::anyhow!(
+            "{}",
+            crate::i18n::tr(
+                "连接在认证过程中中断",
+                "Connection lost during authentication"
+            )
+        ),
+    }
+}
+
+/// 等键盘交互的回答。Resize / 转发 / 按键等非认证命令先存进 `prelude`，
+/// 认证结束后由开 PTY 的逻辑消化——首帧 Resize 若在这里被丢掉，会话会
+/// 以 80×24 打开并再空等一轮尺寸。
+async fn wait_kbd_answers(
+    cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    prelude: &mut VecDeque<UiCommand>,
+) -> Result<Vec<String>, KbdWaitEnd> {
     loop {
         match cmd_rx.recv().await {
-            Some(UiCommand::KbdResponse(a)) => return Some(a),
-            Some(UiCommand::Disconnect) | None => return None,
-            _ => {}
+            Some(UiCommand::KbdResponse(a)) => return Ok(a),
+            Some(UiCommand::Disconnect) => return Err(KbdWaitEnd::Cancelled),
+            None => return Err(KbdWaitEnd::Closed),
+            Some(other) => prelude.push_back(other),
         }
     }
 }
@@ -696,7 +739,17 @@ async fn bridge_local_agent(channel: Channel<client::Msg>) -> anyhow::Result<()>
 
 /// 解析本机 `DISPLAY` → `(screen, unix socket, 真 MIT cookie)`。
 /// 真 cookie 不离开本进程；发给远端的是一次性假 cookie。
-fn resolve_local_x11() -> Option<(u32, std::path::PathBuf, [u8; 16])> {
+///
+/// `xauth list` 是同步子进程。XAUTHORITY 落在卡住的 NFS 上时会一直不返回，
+/// 所以放到 `spawn_blocking`，不占着 SSH worker 的异步任务。
+async fn resolve_local_x11() -> Option<(u32, std::path::PathBuf, [u8; 16])> {
+    tokio::task::spawn_blocking(resolve_local_x11_blocking)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn resolve_local_x11_blocking() -> Option<(u32, std::path::PathBuf, [u8; 16])> {
     #[cfg(not(unix))]
     {
         return None;
@@ -781,18 +834,14 @@ fn x11_mit_cookie(display: &str) -> Option<[u8; 16]> {
 }
 
 /// 生成假 cookie 写入 `slot`。返回 `(screen, 假 cookie 的十六进制)`，后者才是 `request_x11` 的载荷。
-fn install_fake_x11(slot: &X11Slot) -> Option<(u32, String)> {
-    let (screen, sock, real) = resolve_local_x11()?;
+async fn install_fake_x11(slot: &X11Slot) -> Option<(u32, String)> {
+    let (screen, sock, real) = resolve_local_x11().await?;
     let mut fake = random_x11_cookie();
     if fake == real {
         fake[0] ^= 0xff;
     }
     let hex = cookie_hex(&fake);
-    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(X11Auth {
-        sock,
-        real,
-        fake,
-    });
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(X11Auth { sock, real, fake });
     Some((screen, hex))
 }
 
@@ -844,12 +893,33 @@ fn rewrite_x11_client_prefix(
     Ok(out)
 }
 
+/// 远端连上 X 转发口之后若一个字节都不发，两次 `read_exact` 会把这条通道和任务
+/// 永远挂住。握手本身只有十几字节，超时就拆掉。
+#[cfg(unix)]
+const X11_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
+async fn read_x11_exact(
+    remote: &mut (impl tokio::io::AsyncRead + Unpin),
+    buf: &mut [u8],
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    match tokio::time::timeout(X11_HANDSHAKE_TIMEOUT, remote.read_exact(buf)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => anyhow::bail!(
+            "{}",
+            crate::i18n::tr("X11 握手超时", "X11 handshake timed out")
+        ),
+    }
+}
+
 #[cfg(unix)]
 async fn bridge_local_x11(channel: Channel<client::Msg>, auth: X11Auth) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let mut remote = channel.into_stream();
     let mut hdr = [0u8; 12];
-    remote.read_exact(&mut hdr).await?;
+    read_x11_exact(&mut remote, &mut hdr).await?;
     let be = match hdr[0] {
         b'B' => true,
         b'l' => false,
@@ -877,7 +947,7 @@ async fn bridge_local_x11(channel: Channel<client::Msg>, auth: X11Auth) -> anyho
     let rest = name_len + x11_pad4(name_len) + data_len + x11_pad4(data_len);
     let mut prefix = vec![0u8; 12 + rest];
     prefix[..12].copy_from_slice(&hdr);
-    remote.read_exact(&mut prefix[12..]).await?;
+    read_x11_exact(&mut remote, &mut prefix[12..]).await?;
     let rewritten = rewrite_x11_client_prefix(&prefix, &auth.fake, &auth.real)
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut local = tokio::net::UnixStream::connect(&auth.sock).await?;
@@ -887,10 +957,7 @@ async fn bridge_local_x11(channel: Channel<client::Msg>, auth: X11Auth) -> anyho
 }
 
 #[cfg(not(unix))]
-async fn bridge_local_x11(
-    _channel: Channel<client::Msg>,
-    _auth: X11Auth,
-) -> anyhow::Result<()> {
+async fn bridge_local_x11(_channel: Channel<client::Msg>, _auth: X11Auth) -> anyhow::Result<()> {
     anyhow::bail!("X11 转发仅支持 Unix")
 }
 
@@ -915,11 +982,7 @@ async fn bridge_local_mcp(_channel: Channel<client::Msg>) -> anyhow::Result<()> 
 /// `-R` 路由：按远端报告的 connected_address:port 精确匹配。
 /// 同一端口只有一条登记时，才按端口兜底（sshd 常把 `0.0.0.0` 报成 `127.0.0.1`）。
 /// 同端口多条时不做地址别名，避免串到另一条本机目标。
-fn lookup_remote_fwd(
-    table: &RemoteFwdTable,
-    addr: &str,
-    port: u32,
-) -> Option<(String, u16)> {
+fn lookup_remote_fwd(table: &RemoteFwdTable, addr: &str, port: u32) -> Option<(String, u16)> {
     let map = table.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(v) = map.get(&(addr.to_string(), port)) {
         return Some(v.clone());
@@ -951,6 +1014,7 @@ async fn authenticate_interactive<H>(
     username: &str,
     sink: &UiSink,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    prelude: &mut VecDeque<UiCommand>,
 ) -> anyhow::Result<bool>
 where
     H: Handler,
@@ -981,9 +1045,10 @@ where
                     instructions,
                     prompts: prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect(),
                 });
-                // 等 UI 回答；连接前不会有其它指令，收到断开/通道关闭即视为取消
-                let Some(answers) = wait_kbd_answers(cmd_rx).await else {
-                    return Ok(false);
+                // 等 UI 回答。断开是用户取消，不能再报成凭据错误。
+                let answers = match wait_kbd_answers(cmd_rx, prelude).await {
+                    Ok(a) => a,
+                    Err(end) => return Err(kbd_aborted(end)),
                 };
                 resp = handle
                     .authenticate_keyboard_interactive_respond(answers)
@@ -1005,6 +1070,7 @@ pub(super) async fn connect(
     Option<Handle<JumpHandler>>,
     RemoteFwdTable,
     X11Slot,
+    VecDeque<UiCommand>,
 )> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(120)), // keepalive 30s × ~4；原 3600 时 TCP 黑洞最坏近 1h 才感知
@@ -1015,9 +1081,9 @@ pub(super) async fn connect(
     // 主机密钥确认通道：跳板机与目标主机共享（顺序询问，不并发）
     let decision_rx: HostKeyDecision = Arc::new(tokio::sync::Mutex::new(hostkey_rx));
     let remote_fwds: RemoteFwdTable = Arc::new(Mutex::new(HashMap::new()));
-
-    let remote_fwds: RemoteFwdTable = Arc::new(Mutex::new(HashMap::new()));
     let x11: X11Slot = Arc::new(Mutex::new(None));
+    // 键盘交互等待期间到达的 Resize 等命令。认证函数只往这里追加。
+    let mut cmd_prelude = VecDeque::new();
 
     let target_handler = ClientHandler {
         host: cfg.host.clone(),
@@ -1048,7 +1114,16 @@ pub(super) async fn connect(
             Ok(client::connect(config.clone(), (jump.host.as_str(), jump.port), jhandler).await?)
         })
         .await?;
-        if !authenticate(&mut jhandle, &jump.username, &jump.auth, sink, cmd_rx).await? {
+        if !authenticate(
+            &mut jhandle,
+            &jump.username,
+            &jump.auth,
+            sink,
+            cmd_rx,
+            &mut cmd_prelude,
+        )
+        .await?
+        {
             anyhow::bail!(
                 "{}",
                 crate::i18n::tr("跳板机认证被拒绝", "Jump host auth rejected")
@@ -1078,7 +1153,16 @@ pub(super) async fn connect(
     sink.send(WorkerEvent::Status(
         crate::i18n::tr("正在认证 …", "Authenticating …").into(),
     ));
-    if !authenticate(&mut handle, &cfg.username, &cfg.auth, sink, cmd_rx).await? {
+    if !authenticate(
+        &mut handle,
+        &cfg.username,
+        &cfg.auth,
+        sink,
+        cmd_rx,
+        &mut cmd_prelude,
+    )
+    .await?
+    {
         anyhow::bail!(
             "{}",
             crate::i18n::tr(
@@ -1087,7 +1171,7 @@ pub(super) async fn connect(
             )
         );
     }
-    Ok((handle, jump_keep, remote_fwds, x11))
+    Ok((handle, jump_keep, remote_fwds, x11, cmd_prelude))
 }
 
 /// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发；
@@ -1102,8 +1186,8 @@ pub(super) async fn open_shell(
     x11: &X11Slot,
     sink: &UiSink,
 ) -> anyhow::Result<russh::Channel<client::Msg>> {
-    // request_pty/request_shell 均为 &self，channel 之后按值返回，无需 mut
-    let channel = handle.channel_open_session().await?;
+    // request_pty/request_shell 均为 &self；等 X11 的 CHANNEL_SUCCESS/FAILURE 需要 wait()
+    let mut channel = handle.channel_open_session().await?;
     // 在该会话通道上请求 agent 转发；服务器随后回连的 auth-agent 通道由
     // ClientHandler::server_channel_open_agent_forward 桥接到本机 agent。
     if forward_agent {
@@ -1128,16 +1212,34 @@ pub(super) async fn open_shell(
     let _ = channel.set_env(false, "TERM", "xterm-256color").await;
     let _ = channel.set_env(false, "COLORTERM", "truecolor").await;
     if forward_x11 {
-        match install_fake_x11(x11) {
+        match install_fake_x11(x11).await {
             Some((screen, fake_hex)) => {
-                if let Err(e) = channel
-                    .request_x11(false, false, "MIT-MAGIC-COOKIE-1", fake_hex, screen)
+                // want_reply=false 时 sshd 不回 CHANNEL_FAILURE，拒绝路径永远走不到。
+                // 先等 Success/Failure，再开 shell，避免这条应答混进后面的终端数据。
+                let rejected = match channel
+                    .request_x11(true, false, "MIT-MAGIC-COOKIE-1", fake_hex, screen)
                     .await
                 {
+                    Err(e) => Some(e.to_string()),
+                    Ok(()) => {
+                        if x11_request_accepted(&mut channel).await {
+                            None
+                        } else {
+                            Some(
+                                crate::i18n::tr(
+                                    "远端拒绝了 X11 转发（X11Forwarding 未开，或未安装 xauth）",
+                                    "remote rejected X11 forwarding (X11Forwarding off, or xauth missing)",
+                                )
+                                .into(),
+                            )
+                        }
+                    }
+                };
+                if let Some(why) = rejected {
                     *x11.lock().unwrap_or_else(|err| err.into_inner()) = None;
                     sink.send(WorkerEvent::Status(match crate::i18n::current() {
-                        crate::i18n::Lang::Zh => format!("X11 转发请求被拒绝：{e}"),
-                        crate::i18n::Lang::En => format!("X11 forwarding request rejected: {e}"),
+                        crate::i18n::Lang::Zh => format!("X11 转发请求被拒绝：{why}"),
+                        crate::i18n::Lang::En => format!("X11 forwarding request rejected: {why}"),
                     }));
                 }
             }
@@ -1156,6 +1258,25 @@ pub(super) async fn open_shell(
     }
     channel.request_shell(false).await?;
     Ok(channel)
+}
+
+/// `request_x11(want_reply=true)` 只是把请求送出去。sshd 接受与否要看随后的
+/// CHANNEL_SUCCESS / CHANNEL_FAILURE。
+const X11_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn x11_request_accepted(channel: &mut Channel<client::Msg>) -> bool {
+    let deadline = tokio::time::Instant::now() + X11_REPLY_TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(left, channel.wait()).await {
+            Ok(Some(ChannelMsg::Success)) => return true,
+            Ok(Some(ChannelMsg::Failure)) | Ok(None) | Err(_) => return false,
+            Ok(Some(_)) => {}
+        }
+    }
 }
 
 /// 在独立通道上打开 SFTP 子系统。
@@ -1396,5 +1517,42 @@ mod tests {
         assert!(out.windows(16).any(|w| w == real));
         assert!(!out.windows(16).any(|w| w == fake));
         assert!(super::rewrite_x11_client_prefix(&buf, &[9u8; 16], &real).is_err());
+    }
+
+    #[tokio::test]
+    async fn kbd_wait_keeps_non_auth_commands() {
+        use crate::proto::UiCommand;
+        use tokio::sync::mpsc::unbounded_channel;
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(UiCommand::Resize {
+            cols: 100,
+            rows: 40,
+        })
+        .unwrap();
+        tx.send(UiCommand::TerminalInput(b"ls".to_vec())).unwrap();
+        tx.send(UiCommand::KbdResponse(vec!["otp".into()])).unwrap();
+        let mut prelude = std::collections::VecDeque::new();
+        let answers = super::wait_kbd_answers(&mut rx, &mut prelude)
+            .await
+            .expect("回答");
+        assert_eq!(answers, vec!["otp".to_string()]);
+        assert!(matches!(
+            prelude.pop_front(),
+            Some(UiCommand::Resize {
+                cols: 100,
+                rows: 40
+            })
+        ));
+        assert!(matches!(
+            prelude.pop_front(),
+            Some(UiCommand::TerminalInput(_))
+        ));
+
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(UiCommand::Disconnect).unwrap();
+        let err = super::wait_kbd_answers(&mut rx, &mut prelude)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::KbdWaitEnd::Cancelled));
     }
 }

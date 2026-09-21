@@ -120,12 +120,6 @@ impl Terminal {
         let hover_pos = ui
             .input(|i| i.pointer.hover_pos())
             .filter(|p| rect.contains(*p));
-        let hover_link = hover_pos.and_then(|p| {
-            link_rects
-                .iter()
-                .find(|(r, _)| r.contains(p))
-                .map(|(_, u)| u.clone())
-        });
 
         for row in 0..self.rows {
             let y = origin.y + row as f32 * char_h;
@@ -227,18 +221,14 @@ impl Terminal {
                 }
                 if c.strikethrough() {
                     let mid = y + char_h / 2.0;
-                    painter.hline(
-                        x..=(x + cell_w),
-                        mid,
-                        Stroke::new(1.0, color),
-                    );
+                    painter.hline(x..=(x + cell_w), mid, Stroke::new(1.0, color));
                 }
             }
         }
 
-        // 悬停链接：按住 Ctrl 才变成可点（手型 + 强调下划线），避免选词时误开浏览器。
-        let ctrl_click = ui.input(|i| i.modifiers.ctrl);
-        if ctrl_click {
+        // 悬停链接：按住 Ctrl（macOS 上是 Cmd，系统把 Ctrl+click 转成右键）才变成可点。
+        let mod_click = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        if mod_click {
             if let Some(p) = hover_pos {
                 if let Some((r, _)) = link_rects.iter().find(|(r, _)| r.contains(p)) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -253,9 +243,17 @@ impl Terminal {
                 }
             }
         }
-        if ctrl_click && resp.clicked() {
-            if let Some(url) = &hover_link {
-                open_url(url);
+        // 打开按下时指针下的那条链接。`clicked()` 报的是松开帧，用松开位置会在
+        // 从链接 A 拖到链接 B 时打开 B。
+        if mod_click && resp.clicked() {
+            let url = ui.input(|i| i.pointer.press_origin()).and_then(|p| {
+                link_rects
+                    .iter()
+                    .find(|(r, _)| r.contains(p))
+                    .map(|(_, u)| u.clone())
+            });
+            if let Some(url) = url {
+                open_url(&url);
             }
         }
 
@@ -272,18 +270,12 @@ impl Terminal {
                         let bg = vt_color(c.bgcolor(), tc.bg, &tc);
                         // 反色：背景用字色、字用底色；默认底上用强调色以免与屏同色看不见
                         if bg == tc.bg {
-                            (
-                                crate::theme::Palette::ACCENT.gamma_multiply(0.85),
-                                tc.bg,
-                            )
+                            (crate::theme::Palette::ACCENT.gamma_multiply(0.85), tc.bg)
                         } else {
                             (fg, bg)
                         }
                     }
-                    None => (
-                        crate::theme::Palette::ACCENT.gamma_multiply(0.85),
-                        tc.bg,
-                    ),
+                    None => (crate::theme::Palette::ACCENT.gamma_multiply(0.85), tc.bg),
                 };
                 painter.rect_filled(crect, 1.0, inv_bg);
                 if let Some(c) = screen.cell(cr, cc) {

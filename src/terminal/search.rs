@@ -76,18 +76,57 @@ impl Terminal {
                 hit_set.insert(base + i);
             }
         }
-        // 跨行：仅软折行做无分隔拼接。硬换行只按 `\n` 拼接，避免「s」+「h」误中「sh」。
+        // 跨行：软折行把一整条逻辑行拼起来（80 列里的长 URL 经常折成 3 行以上，
+        // 只拼相邻两行永远对不上）。硬换行只跟下一行用 `\n` 拼接，避免「s」+「h」误中「sh」。
+        // 止于分隔符的匹配（`foo\n`）也算跨行：`m.end()` 落到 `\n` 之后那个下标上，
+        // 用 `>` 会把它排除，而单行路径里又不可能出现 `\n`。
+        let mut i = 0;
+        while i < lines.len() {
+            if !lines[i].1 {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut joined = String::new();
+            let mut bounds = Vec::new();
+            loop {
+                joined.push_str(&lines[i].0);
+                bounds.push(joined.len());
+                let wrapped = lines[i].1;
+                i += 1;
+                if !wrapped || i >= lines.len() {
+                    break;
+                }
+            }
+            if bounds.len() < 2 {
+                continue;
+            }
+            for m in re.find_iter(&joined) {
+                let Some(start_line) = bounds.iter().position(|&end| m.start() < end) else {
+                    continue;
+                };
+                let line_lo = if start_line == 0 {
+                    0
+                } else {
+                    bounds[start_line - 1]
+                };
+                if m.start() >= line_lo && m.end() > bounds[start_line] {
+                    hit_set.insert(base + start + start_line);
+                }
+            }
+        }
         for i in 0..lines.len().saturating_sub(1) {
-            let (a, wrapped) = &lines[i];
+            if lines[i].1 {
+                continue;
+            }
+            let (a, _) = &lines[i];
             let (b, _) = &lines[i + 1];
-            let (joined, boundary) = if *wrapped {
-                (format!("{a}{b}"), a.len())
-            } else {
-                (format!("{a}\n{b}"), a.len() + 1)
-            };
-            if let Some(m) = re.find(&joined) {
-                if m.start() < a.len() && m.end() > boundary {
+            let joined = format!("{a}\n{b}");
+            let boundary = a.len() + 1;
+            for m in re.find_iter(&joined) {
+                if m.start() < a.len() && m.end() >= boundary {
                     hit_set.insert(base + i);
+                    break;
                 }
             }
         }

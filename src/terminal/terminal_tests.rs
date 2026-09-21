@@ -32,10 +32,7 @@ fn osc52_parsing() {
     // 查询不回读；非 c 选择器不认；空负载 = 清剪贴板
     assert!(osc::parse_osc52(b"\x1b]52;c;?\x07", 0).is_empty());
     assert!(osc::parse_osc52(b"\x1b]52;s;aGVsbG8=\x07", 0).is_empty());
-    assert_eq!(
-        osc::parse_osc52(b"\x1b]52;c;\x07", 0),
-        vec![String::new()]
-    );
+    assert_eq!(osc::parse_osc52(b"\x1b]52;c;\x07", 0), vec![String::new()]);
     // 负载空白剥掉再解；解不开的跳过不波及其它
     assert_eq!(
         osc::parse_osc52(b"\x1b]52;c;aGVs\r\n bG8=\x07", 0),
@@ -51,7 +48,10 @@ fn osc52_parsing() {
 #[test]
 fn osc133_parsing() {
     use osc::Osc133::*;
-    assert_eq!(osc::parse_osc133(b"\x1b]133;C\x07", 0), vec![(0, CommandStart)]);
+    assert_eq!(
+        osc::parse_osc133(b"\x1b]133;C\x07", 0),
+        vec![(0, CommandStart)]
+    );
     assert_eq!(
         osc::parse_osc133(b"\x1b]133;D;42\x07", 0),
         vec![(0, CommandEnd(Some(42)))]
@@ -154,13 +154,9 @@ fn partial_echo_match_stops_swallowing_newlines_after_cap() {
     t.feed(b"exp\r\n");
     t.feed(b"bash: exp: command not found\r\n");
     let screen = t.screen_text();
+    assert!(screen.contains("exp"), "巧合前缀不应永久吞掉：{screen:?}");
     assert!(
-        screen.contains("exp"),
-        "巧合前缀不应永久吞掉：{screen:?}"
-    );
-    assert!(
-        screen.contains("bash: exp: command not found")
-            || screen.contains("command not found"),
+        screen.contains("bash: exp: command not found") || screen.contains("command not found"),
         "真实换行后的输出行必须独立上屏：{screen:?}"
     );
     // 队列应已自愈：后续真回显仍可被吞（或至少不再卡死导致整段漏出——这里验证不 panic / 可继续喂）
@@ -328,7 +324,7 @@ fn ai_capture_detects_sentinel_and_exit_code() {
     assert_eq!(code, 7);
     assert!(!t.ai_capture_pending()); // 命中后自动清空
     assert!(t.take_ai_done().is_none()); // 取走即清空，第二次为 None
-    // 武装之后（"prompt$ echo hi\r\nhi\r\n" 之前的内容不算）才开始记录输出
+                                         // 武装之后（"prompt$ echo hi\r\nhi\r\n" 之前的内容不算）才开始记录输出
     assert!(!out.contains("prompt$"));
     assert!(out.contains("more output"));
 }
@@ -376,7 +372,10 @@ fn expect_echo_survives_unrelated_bytes_arriving_first() {
     t.feed(marker.as_bytes());
     t.feed(b"\r\n");
     let visible = t.screen_text();
-    assert!(visible.contains("hi"), "真实命令输出不应被误吞：{visible:?}");
+    assert!(
+        visible.contains("hi"),
+        "真实命令输出不应被误吞：{visible:?}"
+    );
     assert!(
         !visible.contains("printf"),
         "标记行回显应被吞掉，不应出现在可见终端里：{visible:?}"
@@ -434,7 +433,10 @@ fn ai_capture_end_to_end_matches_real_mcp_bridge_wire_format() {
     // 保留原始回显是符合预期的。
     assert_eq!(out, "echo hi\nhi\n");
     let visible = t.screen_text();
-    assert!(!visible.contains("printf"), "标记行不应出现在可见终端里：{visible:?}");
+    assert!(
+        !visible.contains("printf"),
+        "标记行不应出现在可见终端里：{visible:?}"
+    );
 }
 
 #[test]
@@ -544,12 +546,18 @@ fn clear_and_cpr_inside_dcs_are_ignored() {
     let replies = t.feed(b"\x1bPtmux;\x1b[2J\x1b[3J\x1b[6n\x1b\\");
     assert!(replies.is_empty(), "DCS 内查询不应应答：{replies:?}");
     let hist = t.history_text(50);
-    assert!(hist.contains("keep-me"), "DCS 内假 clear 清掉了历史：{hist:?}");
+    assert!(
+        hist.contains("keep-me"),
+        "DCS 内假 clear 清掉了历史：{hist:?}"
+    );
     // 真 clear 仍生效
     t.feed(b"\x1b[2J\x1b[3Jfresh\r\n");
     let hist = t.history_text(50);
     assert!(hist.contains("fresh"), "{hist:?}");
-    assert!(!hist.contains("keep-me"), "真 clear 后旧历史应消失：{hist:?}");
+    assert!(
+        !hist.contains("keep-me"),
+        "真 clear 后旧历史应消失：{hist:?}"
+    );
 }
 
 /// OSC 10/11 颜色查询按当前主题回 rgb:RRRR/GGGG/BBBB。
@@ -601,10 +609,7 @@ fn search_hits_survive_scrollback_trim() {
         hit + kept >= total,
         "绝对命中 {hit} 已漂出 retained 窗（total={total} kept={kept}）"
     );
-    assert!(
-        t.search_hl.is_some(),
-        "跳转到命中后应有高亮行"
-    );
+    assert!(t.search_hl.is_some(), "跳转到命中后应有高亮行");
 }
 
 /// 进出备用屏须清本地选区，否则在 less 上拖选、退出后复制会拿到主屏陈旧内容。
@@ -648,7 +653,12 @@ fn decawm_off_does_not_wrap_at_eol() {
     let (row, col) = t.parser.screen().cursor_position();
     assert_eq!(row, 0, "不应折到下一行：row={row} col={col}");
     // 末列应是最后写入的字符之一
-    let last = t.parser.screen().cell(0, 9).map(|c| c.contents()).unwrap_or_default();
+    let last = t
+        .parser
+        .screen()
+        .cell(0, 9)
+        .map(|c| c.contents())
+        .unwrap_or_default();
     assert!(!last.is_empty(), "末列应有覆盖写入的字符");
 }
 
@@ -659,10 +669,7 @@ fn search_matches_across_soft_wrap_only() {
     assert!(t.resize(8, 6));
     // 8 列软折：aaaHELLO | WORLD
     t.feed(b"aaaHELLOWORLD");
-    assert!(
-        t.parser.screen().row_wrapped(0),
-        "前提：第 0 行应是软折行"
-    );
+    assert!(t.parser.screen().row_wrapped(0), "前提：第 0 行应是软折行");
     t.find = Some(search::Find {
         query: "HELLOWORLD".into(),
         ..Default::default()
@@ -698,6 +705,42 @@ fn search_matches_across_soft_wrap_only() {
     assert!(
         sh.find.as_ref().unwrap().hits.is_empty(),
         "硬换行两侧的 s+h 不应命中 sh"
+    );
+}
+
+#[test]
+fn search_soft_wrap_spans_more_than_two_rows() {
+    let mut t = Terminal::new();
+    assert!(t.resize(4, 8));
+    // 4 列：HELL / OWOR / LDXY / Z —— HELLOWORLD 跨三行
+    t.feed(b"HELLOWORLDXYZ");
+    assert!(t.parser.screen().row_wrapped(0));
+    assert!(t.parser.screen().row_wrapped(1));
+    t.find = Some(search::Find {
+        query: "HELLOWORLD".into(),
+        ..Default::default()
+    });
+    t.run_search();
+    assert!(
+        !t.find.as_ref().unwrap().hits.is_empty(),
+        "三行软折应命中 HELLOWORLD"
+    );
+}
+
+#[test]
+fn search_hard_newline_regex_can_end_on_the_break() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 6));
+    t.feed(b"foo\r\nbar\r\n");
+    t.find = Some(search::Find {
+        query: "foo\n".into(),
+        regex: true,
+        ..Default::default()
+    });
+    t.run_search();
+    assert!(
+        !t.find.as_ref().unwrap().hits.is_empty(),
+        "正则 foo\\n 应命中硬换行"
     );
 }
 
@@ -793,7 +836,11 @@ fn alt_letter_encodes_meta_prefix() {
     assert_eq!(enc(egui::Key::B, ALT, false), b"\x1bb");
     assert_eq!(enc(egui::Key::F, ALT, false), b"\x1bf");
     // Alt+Shift+B -> 大写
-    let alt_shift = egui::Modifiers { alt: true, shift: true, ..Default::default() };
+    let alt_shift = egui::Modifiers {
+        alt: true,
+        shift: true,
+        ..Default::default()
+    };
     assert_eq!(enc(egui::Key::B, alt_shift, false), b"\x1bB");
     // Alt+Backspace = 删除前一个词
     assert_eq!(enc(egui::Key::Backspace, ALT, false), b"\x1b\x7f");
@@ -806,7 +853,11 @@ fn alt_punctuation_encodes_meta_prefix() {
     assert_eq!(enc(egui::Key::Comma, ALT, false), b"\x1b,");
     assert_eq!(enc(egui::Key::Slash, ALT, false), b"\x1b/");
     assert_eq!(enc(egui::Key::Minus, ALT, false), b"\x1b-");
-    let alt_shift = egui::Modifiers { alt: true, shift: true, ..Default::default() };
+    let alt_shift = egui::Modifiers {
+        alt: true,
+        shift: true,
+        ..Default::default()
+    };
     assert_eq!(enc(egui::Key::Period, alt_shift, false), b"\x1b>");
     assert_eq!(enc(egui::Key::Equals, alt_shift, false), b"\x1b+");
 }
@@ -817,21 +868,33 @@ fn ctrl_letter_and_symbols_encode_control_chars() {
     assert_eq!(enc(egui::Key::Space, CTRL, false), &[0x00]); // set-mark
     assert_eq!(enc(egui::Key::Slash, CTRL, false), &[0x1f]); // 撤销
     assert_eq!(enc(egui::Key::Backslash, CTRL, false), &[0x1c]); // SIGQUIT
-    // Ctrl+_ (=Ctrl+Shift+-) 发 US；而裸 Ctrl+- 必须不发——它被 egui 内建的
-    // zoom_with_keyboard 绑成界面缩小（COMMAND 在 Linux/Windows 上就是 Ctrl），
-    // 若这里也发 0x1f 就会「既缩放又发撤销」。
-    let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+                                                                 // Ctrl+_ (=Ctrl+Shift+-) 发 US；而裸 Ctrl+- 必须不发——它被 egui 内建的
+                                                                 // zoom_with_keyboard 绑成界面缩小（COMMAND 在 Linux/Windows 上就是 Ctrl），
+                                                                 // 若这里也发 0x1f 就会「既缩放又发撤销」。
+    let ctrl_shift = egui::Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Default::default()
+    };
     assert_eq!(enc(egui::Key::Minus, ctrl_shift, false), &[0x1f]);
     assert!(enc(egui::Key::Minus, CTRL, false).is_empty());
     // Alt+Ctrl+B -> ESC 前缀 + 控制字符
-    let alt_ctrl = egui::Modifiers { alt: true, ctrl: true, ..Default::default() };
+    let alt_ctrl = egui::Modifiers {
+        alt: true,
+        ctrl: true,
+        ..Default::default()
+    };
     assert_eq!(enc(egui::Key::B, alt_ctrl, false), b"\x1b\x02");
 }
 
 #[test]
 fn copy_paste_shortcuts_are_not_sent_to_terminal() {
     // Ctrl+Shift+C/V/F 保留给复制/粘贴/查找，不能当终端输入发下去。
-    let cs = egui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+    let cs = egui::Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Default::default()
+    };
     assert!(enc(egui::Key::C, cs, false).is_empty());
     assert!(enc(egui::Key::V, cs, false).is_empty());
 }
@@ -843,7 +906,7 @@ fn copy_paste_shortcuts_are_not_sent_to_terminal() {
 fn selection_does_not_insert_newline_across_soft_wrap() {
     let mut t = Terminal::new();
     assert!(t.resize(10, 4)); // 10 列，方便构造折行
-    // 24 个字符、中间没有任何 \n：终端会把它折成 3 个屏幕行，并给前两行置 wrapped
+                              // 24 个字符、中间没有任何 \n：终端会把它折成 3 个屏幕行，并给前两行置 wrapped
     t.feed(b"abcdefghijklmnopqrstuvwx");
     assert!(t.parser.screen().row_wrapped(0), "前提：第 0 行应是软换行");
     assert!(t.parser.screen().row_wrapped(1), "前提：第 1 行应是软换行");
@@ -861,7 +924,10 @@ fn selection_keeps_newline_for_real_line_break() {
     let mut t = Terminal::new();
     assert!(t.resize(20, 4));
     t.feed(b"line-one\r\nline-two");
-    assert!(!t.parser.screen().row_wrapped(0), "前提：第 0 行是真实换行、非软换行");
+    assert!(
+        !t.parser.screen().row_wrapped(0),
+        "前提：第 0 行是真实换行、非软换行"
+    );
 
     t.sel_anchor = Some((0, 0));
     t.sel_cursor = Some((1, 7));
@@ -1055,10 +1121,7 @@ fn bel_inside_a_dcs_string_is_not_a_bell() {
     let mut t = Terminal::new();
     run_ai_cli(&mut t, "claude");
     t.feed(b"\x1bPsome\x07payload\x1b\\");
-    assert!(
-        t.take_notices().is_empty(),
-        "DCS 内部的 0x07 被当成了响铃"
-    );
+    assert!(t.take_notices().is_empty(), "DCS 内部的 0x07 被当成了响铃");
 }
 
 /// 空闲的 zsh 提示符**不是**「忙」。
@@ -1106,8 +1169,16 @@ fn ishell_tagged_notices_are_classified_and_tag_is_hidden() {
     t.feed(b"\x1b]777;notify;ishell:need;needs your confirmation\x07");
     let ns = t.take_notices();
     assert_eq!(ns.len(), 2);
-    assert_eq!(ns[0].kind, NoticeKind::Done, "ishell:done 应判为「任务完成」");
-    assert_eq!(ns[1].kind, NoticeKind::Need, "ishell:need 应判为「需要人干涉」");
+    assert_eq!(
+        ns[0].kind,
+        NoticeKind::Done,
+        "ishell:done 应判为「任务完成」"
+    );
+    assert_eq!(
+        ns[1].kind,
+        NoticeKind::Need,
+        "ishell:need 应判为「需要人干涉」"
+    );
     // 标记是内部用的，不能漏进界面文字里
     for n in &ns {
         assert_eq!(n.title, None, "类别标记应被剥掉，不该当成标题显示");
@@ -1121,12 +1192,16 @@ fn ishell_tagged_notices_are_classified_and_tag_is_hidden() {
 fn unclassified_sources_keep_their_own_kind() {
     let mut t = Terminal::new();
     run_ai_cli(&mut t, "claude");
-    t.feed(b"continue? [y/N]\x07");           // 裸 BEL
-    t.feed(b"\x1b]9;codex done\x07");         // 第三方 OSC 9,无标记
+    t.feed(b"continue? [y/N]\x07"); // 裸 BEL
+    t.feed(b"\x1b]9;codex done\x07"); // 第三方 OSC 9,无标记
     t.feed(b"\x1b]777;notify;MyTool;hi\x07"); // 别人的 OSC 777,标题不是 iShell 标记
     let ns = t.take_notices();
     assert_eq!(ns.len(), 3);
-    assert_eq!(ns[0].kind, NoticeKind::Bell, "裸响铃必须能被单独认出来并滤掉");
+    assert_eq!(
+        ns[0].kind,
+        NoticeKind::Bell,
+        "裸响铃必须能被单独认出来并滤掉"
+    );
     assert_eq!(ns[1].kind, NoticeKind::Untagged);
     assert_eq!(ns[2].kind, NoticeKind::Untagged);
     // 别人的标题要原样保留（只有 iShell 自己的标记才剥）
@@ -1283,10 +1358,7 @@ fn feeding_the_same_bytes_split_anywhere_gives_the_same_result() {
                 got.0, want.0,
                 "语料 #{ci} 在第 {at} 字节切开后，屏幕内容不一致"
             );
-            assert_eq!(
-                got.1, want.1,
-                "语料 #{ci} 在第 {at} 字节切开后，通知不一致"
-            );
+            assert_eq!(got.1, want.1, "语料 #{ci} 在第 {at} 字节切开后，通知不一致");
             assert_eq!(
                 got.2, want.2,
                 "语料 #{ci} 在第 {at} 字节切开后，回给远端的应答不一致"
@@ -1316,22 +1388,22 @@ fn split_invariance_holds_across_the_whole_corpus() {
 #[test]
 fn feed_never_panics_on_arbitrary_bytes() {
     let nasty: &[&[u8]] = &[
-        b"\xff\xfe\xfd",                       // 非法 UTF-8
-        b"\xe4\xb8",                           // 半个 CJK 字符
-        b"\x1b",                               // 孤立 ESC
-        b"\x1b[",                              // 半截 CSI
-        b"\x1b]",                              // 半截 OSC
-        b"\x1bP",                              // 半截 DCS
-        b"\x1b[999999999999999999999m",        // 超大参数
-        b"\x1b]9;",                            // OSC 9 无正文无终止
-        b"\x1b]\x1b]\x1b]\x07",                // 嵌套/重复 OSC 引导
+        b"\xff\xfe\xfd",                         // 非法 UTF-8
+        b"\xe4\xb8",                             // 半个 CJK 字符
+        b"\x1b",                                 // 孤立 ESC
+        b"\x1b[",                                // 半截 CSI
+        b"\x1b]",                                // 半截 OSC
+        b"\x1bP",                                // 半截 DCS
+        b"\x1b[999999999999999999999m",          // 超大参数
+        b"\x1b]9;",                              // OSC 9 无正文无终止
+        b"\x1b]\x1b]\x1b]\x07",                  // 嵌套/重复 OSC 引导
         b"\x00\x01\x02\x07\x08\x0b\x0c\x0e\x0f", // 控制字符大杂烩
-        b"\x1b]7;file://\x07",                 // OSC 7 空路径
-        b"\x1b]7;file://h\x07",                // OSC 7 无 '/' 路径
-        b"\x1b]777;notify;\x07",               // 空标题空正文
-        b"\x1b[?2026h",                        // 未终止的同步帧（看门狗兜底）
-        b"\x1b[?2026l",                        // 落单的同步结束标记
-        b"\x1b[?2026h\x1b[?2026h\x1b[?2026l", // 连续嵌套的同步标记
+        b"\x1b]7;file://\x07",                   // OSC 7 空路径
+        b"\x1b]7;file://h\x07",                  // OSC 7 无 '/' 路径
+        b"\x1b]777;notify;\x07",                 // 空标题空正文
+        b"\x1b[?2026h",                          // 未终止的同步帧（看门狗兜底）
+        b"\x1b[?2026l",                          // 落单的同步结束标记
+        b"\x1b[?2026h\x1b[?2026h\x1b[?2026l",    // 连续嵌套的同步标记
     ];
     for (i, data) in nasty.iter().enumerate() {
         for at in 0..=data.len() {
@@ -1530,15 +1602,13 @@ fn recovery_does_not_depend_on_which_key_is_released_first() {
     let out = feed_events(
         &mut t,
         &ctx,
-        vec![
-            egui::Event::Key {
-                key: egui::Key::V,
-                physical_key: None,
-                pressed: false,
-                repeat: false,
-                modifiers: egui::Modifiers::default(), // ctrl 已经松掉了
-            },
-        ],
+        vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::default(), // ctrl 已经松掉了
+        }],
     );
     assert_eq!(out, vec![0x16], "先松 Ctrl 再松 V 时漏掉了这一下按键");
 }
@@ -1614,7 +1684,10 @@ fn terminal_ime_spot_is_constant_when_following_is_off() {
     let cell = egui::vec2(8.0, 16.0);
     let a = ime_rect(false, egui::pos2(100.0, 100.0), area, cell);
     let b = ime_rect(false, egui::pos2(500.0, 300.0), area, cell);
-    assert_eq!(a, b, "关掉跟随后坐标仍随光标变——那条会冻住界面的 XSetICValues 还是会发");
+    assert_eq!(
+        a, b,
+        "关掉跟随后坐标仍随光标变——那条会冻住界面的 XSetICValues 还是会发"
+    );
     assert!(area.contains_rect(a));
 
     // 开着的时候必须真的跟随
@@ -1707,7 +1780,6 @@ fn ai_capture_ignores_literal_escape_text_in_unswallowed_echo() {
     assert_eq!(code, 0, "退出码来自真实输出，不能是 -1");
 }
 
-
 /// 同步输出（DEC 私有模式 2026）专项测试。
 ///
 /// 背景：kimi/codex 这类「内联视口」TUI 每帧都是「整屏擦除 + 逐行重建」，帧体包在
@@ -1729,7 +1801,10 @@ fn sync_frame_is_buffered_until_sync_off() {
     // 帧的后半 + 结束标记：此刻整帧一次性上屏
     t.feed(b" continues\r\n\x1b[?2026l");
     let after = t.screen_text();
-    assert!(after.contains("new frame continues"), "结束后整帧应已上屏：{after:?}");
+    assert!(
+        after.contains("new frame continues"),
+        "结束后整帧应已上屏：{after:?}"
+    );
     assert!(!after.contains("old content"), "帧内清屏应随整帧生效");
     assert!(!t.sync_active, "结束后应退出帧内状态");
 }
@@ -1763,7 +1838,11 @@ fn sync_frame_answers_cursor_query_at_frame_end() {
     let frame: &[u8] = b"\x1b[?2026h\x1b[5;10H\x1b[6n\x1b[?2026l";
     let mut whole = Terminal::new();
     let want_replies = whole.feed(frame);
-    assert_eq!(want_replies, b"\x1b[5;10R".to_vec(), "应答应是查询点的光标位置");
+    assert_eq!(
+        want_replies,
+        b"\x1b[5;10R".to_vec(),
+        "应答应是查询点的光标位置"
+    );
     for at in 1..frame.len() {
         let mut t = Terminal::new();
         let mut r = t.feed(&frame[..at]);
@@ -1780,10 +1859,16 @@ fn sync_frame_containing_clear_still_clears_scrollback() {
     for i in 0..30 {
         t.feed(format!("line {i}\r\n").as_bytes());
     }
-    assert!(t.history_text(100).contains("line 0"), "清屏前应能回看到最早的历史行");
+    assert!(
+        t.history_text(100).contains("line 0"),
+        "清屏前应能回看到最早的历史行"
+    );
     t.feed(b"\x1b[?2026h\x1b[2J\x1b[3J\x1b[1;1Hcleared in frame\r\n\x1b[?2026l");
     let history = t.history_text(100);
-    assert!(!history.contains("line 0"), "帧内 clear 后旧历史应被清空：{history:?}");
+    assert!(
+        !history.contains("line 0"),
+        "帧内 clear 后旧历史应被清空：{history:?}"
+    );
     assert!(history.contains("cleared in frame"), "帧自己写的内容应留下");
 }
 
@@ -1894,7 +1979,9 @@ fn stray_sync_off_outside_frame_is_inert() {
 #[test]
 fn interleaved_plain_segments_and_frames_apply_in_order() {
     let mut t = Terminal::new();
-    t.feed(b"one\r\n\x1b[?2026htwo-frame\r\n\x1b[?2026lthree\r\n\x1b[?2026hfour-frame\r\n\x1b[?2026l");
+    t.feed(
+        b"one\r\n\x1b[?2026htwo-frame\r\n\x1b[?2026lthree\r\n\x1b[?2026hfour-frame\r\n\x1b[?2026l",
+    );
     let history = t.history_text(50);
     let pos_one = history.find("one").unwrap();
     let pos_two = history.find("two-frame").unwrap();
@@ -1915,6 +2002,41 @@ fn sgr_blink_strikethrough_double_underline() {
     assert!(s.cell(0, 1).unwrap().strikethrough());
     assert!(s.cell(0, 2).unwrap().double_underline());
     assert!(s.cell(0, 2).unwrap().underline());
+}
+
+#[test]
+fn resize_reflow_keeps_blink_strike_double_underline() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 10));
+    t.feed(b"\x1b[5mB\x1b[9mS\x1b[21mD\r\n");
+    assert!(t.resize(20, 6), "缩行才走序列化重排");
+    let screen = t.parser.screen();
+    let mut saw_b = false;
+    let mut saw_s = false;
+    let mut saw_d = false;
+    for row in 0..t.rows {
+        for col in 0..t.cols {
+            let Some(c) = screen.cell(row, col) else {
+                continue;
+            };
+            match c.contents() {
+                "B" => {
+                    assert!(c.blink(), "重排后闪烁丢了");
+                    saw_b = true;
+                }
+                "S" => {
+                    assert!(c.strikethrough(), "重排后删除线丢了");
+                    saw_s = true;
+                }
+                "D" => {
+                    assert!(c.double_underline(), "重排后双下划线丢了");
+                    saw_d = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_b && saw_s && saw_d, "重排后三个字形都应该还在");
 }
 
 #[test]
@@ -2016,4 +2138,48 @@ fn unterminated_osc8_does_not_swallow_following_output() {
         "query_tail 不应无界增长：{}",
         t.query_tail.len()
     );
+}
+
+#[test]
+fn malformed_osc8_does_not_swallow_following_output() {
+    let mut t = Terminal::new();
+    // 少一个分号的 OSC 8（BEL 收尾）+ 带分号的颜色序列 + 另一条用 BEL 收尾的标题。
+    let bytes = b"\x1b]8;http://x\x07\x1b[1;32m$\x1b[0m \x1b]0;title\x07ok";
+    t.feed(bytes);
+    let text = t.screen_text();
+    assert!(text.contains('$'), "颜色提示符被吞了：{text:?}");
+    assert!(text.contains("ok"), "标题后面的文本被吞了：{text:?}");
+    assert!(
+        t.osc8_spans.iter().all(|s| !s.3.contains("32m")),
+        "畸形 OSC 8 不应借后面的分号造出链接：{:?}",
+        t.osc8_spans
+    );
+    assert_eq!(t.window_title.as_deref(), Some("title"));
+}
+
+#[test]
+fn abandoned_osc8_keeps_trailing_query_prefix() {
+    let mut t = Terminal::new();
+    let mut buf = b"\x1b]8;".to_vec();
+    buf.extend(std::iter::repeat(b'A').take(2000));
+    buf.extend_from_slice(b"\x1b[6");
+    let r1 = t.feed(&buf);
+    assert!(!is_cpr(&r1), "半截查询不该在这一包就应答：{r1:?}");
+    let r2 = t.feed(b"nVISIBLE");
+    assert!(is_cpr(&r2), "超限 OSC 8 不应把尾部的 CPR 前缀清掉：{r2:?}");
+    assert!(t.screen_text().contains("VISIBLE"), "{}", t.screen_text());
+}
+
+#[test]
+fn osc8_prefix_inside_dcs_is_not_held() {
+    let mut t = Terminal::new();
+    // 包边界切在未终止 DCS 负载里的 ESC 之后。下一块以 [6n 开头时不能拼出 CPR。
+    let r1 = t.feed(b"\x1bPpayload\x1b");
+    assert!(!is_cpr(&r1));
+    let r2 = t.feed(b"[6n\x1b\\OK");
+    assert!(
+        !is_cpr(&r2),
+        "DCS 里的 ESC 不能和下一块的 [6n 拼成 CPR：{r2:?}"
+    );
+    assert!(t.screen_text().contains("OK"), "{}", t.screen_text());
 }

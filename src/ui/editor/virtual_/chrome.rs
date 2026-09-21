@@ -185,7 +185,6 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                 } else {
                     ed.replace.clone()
                 };
-                let at = a;
                 let rep_end = a + rep.len();
                 v_apply(ed, a, b - a, &rep);
                 // VSCode 行为：替换后立即选中**下一处**匹配——光标落回匹配范围内，

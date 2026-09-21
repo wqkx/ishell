@@ -28,6 +28,8 @@ pub(super) fn open_url(url: &str) {
 }
 
 /// 解析 OSC 7（`ESC ] 7 ; file://host/path BEL|ST`），返回最后一个上报的本地路径。
+/// 运行时走 `scan_osc_effects`；这个函数只给单测对照。
+#[cfg(test)]
 pub(super) fn parse_osc7(data: &[u8]) -> Option<String> {
     let pat = b"\x1b]7;";
     let mut result = None;
@@ -60,69 +62,13 @@ pub(super) fn parse_osc7(data: &[u8]) -> Option<String> {
     result
 }
 
-/// 解析 OSC 通知序列，返回 (标题, 正文) 列表：
-///
-/// - OSC 9  ：`ESC ] 9 ; <message> BEL|ST`（iTerm2/ConEmu 式，仅正文）
-/// - OSC 777：`ESC ] 777 ; notify ; <title> ; <body> BEL|ST`（urxvt 式，标题+正文）
-///
-/// Claude Code 等 AI CLI 的通知 hook、以及 `printf '\e]9;done\a'` 类脚本都走这两类。
-///
-/// `carried`：`data` 开头有多少字节是**上一次调用已经扫过**的（`feed()` 为了拼接被截断的
-/// 序列而留下的尾巴，见 `Terminal::notice_tail`）。终止符落在这段前缀里的 OSC 序列，上一轮
-/// 就已经完整、已经报过一次通知了，这一轮必须跳过。
-///
-/// 不跳会重复弹通知，而且是**只在特定切包位置**才出现的那种偶发：典型是 codex/Claude Code
-/// 在 tmux 下发的 DCS 透传 `ESC P tmux ; ESC ESC ] 9 ; <msg> BEL ESC \`——SSH 若恰好把包切在
-/// BEL 之后、结尾的 `ESC \` 之前（只差两个字节，很容易发生），那条内层 OSC 在第一包里就已经
-/// 终止并报过通知；而外层 DCS 还没终止，于是整段被留作 `notice_tail` 原样带到第二包重扫一遍，
-/// 同一条通知就弹了两次。`count_bel` 没这个问题（它对未终止的 OSC/DCS 一路吃到末尾且不计数），
-/// 所以 `feed()` 里那段「不会重复计数」的说明只对响铃成立，对通知不成立。
-pub(super) fn parse_osc_notify(data: &[u8], carried: usize) -> Vec<(Option<String>, String)> {
-    let mut out = Vec::new();
-    for (seq_start, body_start, end) in osc_sequences(data) {
-        // 终止符在已扫过的前缀里 = 上一轮已经报过这一条
-        if end < carried {
-            continue;
-        }
-        let payload = &data[body_start..end];
-        let _ = seq_start;
-        if let Some(rest) = payload.strip_prefix(b"9;") {
-            if let Ok(s) = std::str::from_utf8(rest) {
-                let s = s.trim();
-                if !s.is_empty() && !is_conemu_progress(s) {
-                    out.push((None, s.to_string()));
-                }
-            }
-        } else if let Some(rest) = payload.strip_prefix(b"777;notify;") {
-            if let Ok(s) = std::str::from_utf8(rest) {
-                let (title, body) = match s.split_once(';') {
-                    Some((t, b)) => (t.trim(), b.trim()),
-                    None => (s.trim(), ""),
-                };
-                if !title.is_empty() || !body.is_empty() {
-                    out.push((
-                        if title.is_empty() {
-                            None
-                        } else {
-                            Some(title.to_string())
-                        },
-                        body.to_string(),
-                    ));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// 解析 OSC 52 剪贴板序列（`ESC ] 52 ; <选择器> ; <base64> BEL|ST`），返回选择器为 `c`
 /// （系统剪贴板）的解码文本列表；空负载表示「清剪贴板」（返回空串）。
 ///
 /// 这是 TUI 程序（opencode/nvim/tmux 等）往**用户系统剪贴板**写东西的标准通道，也是
 /// 远端主机上的程序**唯一**可用的通道（本机程序能直接访问 OS 剪贴板，远端的只能经
 /// 终端转发）。iShell 此前不支持它——远端 TUI 里的「复制」因此全部失灵（实测 opencode
-/// 内复制无反应）。`carried` 语义同 `parse_osc_notify`：终止符落在已扫前缀里的序列
-/// 上一轮已处理过，跳过。
+/// 内复制无反应）。`carried`：终止符落在已扫前缀里的序列上一轮已处理过，跳过。
 ///
 /// 三个刻意的取舍：
 /// - **`?`（查询）不响应**：回读等于把剪贴板内容吐给远端——剪贴板常含密码/密钥，绝
@@ -130,6 +76,7 @@ pub(super) fn parse_osc_notify(data: &[u8], carried: usize) -> Vec<(Option<Strin
 /// - 选择器只认 `c`（clipboard）：`s`/`p`/`q`/`0`-`7`（primary/secondary/剪贴板池）在
 ///   现代桌面上大多无对应物，忽略。
 /// - base64 容错：先剥空白（tmux 透传常把负载折行）再解，单条解不开就跳过不波及其它。
+#[cfg(test)]
 pub(super) fn parse_osc52(data: &[u8], carried: usize) -> Vec<String> {
     use base64::Engine as _;
     let mut out = Vec::new();
@@ -140,9 +87,13 @@ pub(super) fn parse_osc52(data: &[u8], carried: usize) -> Vec<String> {
         }
         let payload = &data[body_start..end];
         let _ = seq_start;
-        let Some(rest) = payload.strip_prefix(b"52;") else { continue };
+        let Some(rest) = payload.strip_prefix(b"52;") else {
+            continue;
+        };
         // [u8]::split_once 至今未稳定（slice_split_once），手动切：第一段是选择器。
-        let Some(idx) = rest.iter().position(|&b| b == b';') else { continue };
+        let Some(idx) = rest.iter().position(|&b| b == b';') else {
+            continue;
+        };
         let (sel, data_b64) = (&rest[..idx], &rest[idx + 1..]);
         if sel != b"c" {
             continue;
@@ -161,7 +112,9 @@ pub(super) fn parse_osc52(data: &[u8], carried: usize) -> Vec<String> {
             let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(cleaned) else {
                 continue;
             };
-            let Ok(s) = String::from_utf8(bytes) else { continue };
+            let Ok(s) = String::from_utf8(bytes) else {
+                continue;
+            };
             s
         };
         out.push(text);
@@ -184,8 +137,9 @@ pub(super) enum Osc133 {
 
 /// 解析一块字节里的 OSC 133 事件，返回 `(序列在 data 中的起始下标, 事件)`，按出现顺序。
 ///
-/// `carried` 语义同 `parse_osc_notify`：终止符落在已扫前缀里的序列上一轮已处理过，跳过。
+/// `carried`：终止符落在已扫前缀里的序列上一轮已处理过，跳过。
 /// `A`（提示符开始）/`B`（提示符结束）我们用不到，直接忽略——只认 C 与 D，少一条依赖。
+#[cfg(test)]
 pub(super) fn parse_osc133(data: &[u8], carried: usize) -> Vec<(usize, Osc133)> {
     let mut out = Vec::new();
     for (seq_start, body_start, end) in osc_sequences(data) {
@@ -567,8 +521,7 @@ pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
                             .copied()
                             .filter(|b| !b.is_ascii_whitespace())
                             .collect();
-                        if let Ok(bytes) =
-                            base64::engine::general_purpose::STANDARD.decode(cleaned)
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(cleaned)
                         {
                             if let Ok(s) = String::from_utf8(bytes) {
                                 out.clipboards.push(s);
@@ -598,11 +551,13 @@ pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
 }
 
 /// OSC 0/2 窗口标题：返回本块里**最后一条**完整标题（空串表示远端清标题）。
+#[cfg(test)]
 pub(super) fn parse_osc_title(data: &[u8], carried: usize) -> Option<String> {
     scan_osc_effects(data, carried).title
 }
 
 /// OSC 10/11 颜色查询号列表（10=前景，11=背景）。
+#[cfg(test)]
 pub(super) fn parse_osc_color_queries(data: &[u8], carried: usize) -> Vec<u8> {
     scan_osc_effects(data, carried).color_queries
 }
@@ -646,6 +601,9 @@ mod string_escape_scan_tests {
             parse_osc_title(b"\x1b]0;hello\x07\x1b]2;world\x07", 0).as_deref(),
             Some("world")
         );
-        assert_eq!(parse_osc_color_queries(b"\x1b]10;?\x07\x1b]11;?\x1b\\", 0), vec![10, 11]);
+        assert_eq!(
+            parse_osc_color_queries(b"\x1b]10;?\x07\x1b]11;?\x1b\\", 0),
+            vec![10, 11]
+        );
     }
 }

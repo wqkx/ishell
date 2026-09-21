@@ -19,13 +19,18 @@ const WAIT_BUDGET: Duration = Duration::from_millis(1500);
 /// 供 worker 主循环在开 shell 之后优先消化（避免丢 AddForward / TerminalInput）。
 pub async fn resolve_initial_pty_size(
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    seeded: VecDeque<UiCommand>,
 ) -> (u16, u16, VecDeque<UiCommand>) {
     let mut prelude = VecDeque::new();
     let mut size = (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS);
     let mut got = false;
 
-    // 鉴权/连接期间 UI 可能已发过 Resize：先非阻塞排干。
-    while let Ok(cmd) = cmd_rx.try_recv() {
+    // 键盘交互认证等待期间缓存下来的命令（首帧 Resize 常在这里），再排干通道里
+    // 认证完成后新到的。任一处见过合法 Resize 就不必再空等 1.5s。
+    for cmd in seeded
+        .into_iter()
+        .chain(std::iter::from_fn(|| cmd_rx.try_recv().ok()))
+    {
         match cmd {
             UiCommand::Resize { cols, rows } if cols > 0 && rows > 0 => {
                 size = (cols, rows);
@@ -74,7 +79,7 @@ mod tests {
             rows: 40,
         })
         .unwrap();
-        let (c, r, prelude) = resolve_initial_pty_size(&mut rx).await;
+        let (c, r, prelude) = resolve_initial_pty_size(&mut rx, VecDeque::new()).await;
         assert_eq!((c, r), (120, 40));
         assert!(prelude.is_empty());
     }
@@ -89,7 +94,7 @@ mod tests {
             rows: 30,
         })
         .unwrap();
-        let (c, r, mut prelude) = resolve_initial_pty_size(&mut rx).await;
+        let (c, r, mut prelude) = resolve_initial_pty_size(&mut rx, VecDeque::new()).await;
         assert_eq!((c, r), (100, 30));
         assert!(matches!(
             prelude.pop_front(),
@@ -103,7 +108,25 @@ mod tests {
         // 用不阻塞的 try 路径：空通道 + 极短超时。把 WAIT 测到会慢，这里只验证 try_recv 空时
         // 仍返回默认——通过塞一个立即超时场景：先 drop sender 让 recv 立刻 None。
         drop(_tx);
-        let (c, r, _) = resolve_initial_pty_size(&mut rx).await;
+        let (c, r, _) = resolve_initial_pty_size(&mut rx, VecDeque::new()).await;
         assert_eq!((c, r), (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS));
+    }
+
+    #[tokio::test]
+    async fn seeded_resize_from_kbd_wait_skips_timeout() {
+        let (_tx, mut rx) = unbounded_channel::<UiCommand>();
+        drop(_tx);
+        let mut seed = VecDeque::new();
+        seed.push_back(UiCommand::TerminalInput(b"x".to_vec()));
+        seed.push_back(UiCommand::Resize {
+            cols: 110,
+            rows: 33,
+        });
+        let (c, r, mut prelude) = resolve_initial_pty_size(&mut rx, seed).await;
+        assert_eq!((c, r), (110, 33));
+        assert!(matches!(
+            prelude.pop_front(),
+            Some(UiCommand::TerminalInput(_))
+        ));
     }
 }

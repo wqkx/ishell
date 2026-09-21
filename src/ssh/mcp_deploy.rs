@@ -11,7 +11,7 @@
 
 use russh::client::Handle;
 
-use super::auth::{exec_capture, exec_status, open_sftp, ClientHandler};
+use super::auth::{exec_capture, exec_capture_bytes, exec_status, open_sftp, ClientHandler};
 use super::sftp::sftp_write_atomic;
 use super::UiSink;
 
@@ -27,19 +27,30 @@ pub(super) async fn deploy_mcp_agent(
         };
     }
 
-    // 1) 架构
-    let uname = match exec_capture(handle, "uname -m 2>/dev/null").await {
+    // 1) 架构。不用 `2>/dev/null`：csh/tcsh 把这写成语法错误，uname 根本没跑，
+    //    stdout 是空的，后面就报「这台服务器是 ，…」。stderr 本来也不进 exec_capture。
+    let uname = match exec_capture(handle, "uname -m").await {
         Ok(u) => u,
         Err(e) => fail!(
             format!("探测服务器架构失败：{e}"),
             format!("Could not detect the server architecture: {e}")
         ),
     };
-    let arch = uname.trim().to_string();
+    let arch = uname
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
+        .unwrap_or("")
+        .to_string();
     let Some(blob) = crate::mcp_embed::agent_for_uname(&arch) else {
         let have = crate::mcp_embed::embedded_arches().join(" / ");
         let have = if have.is_empty() {
-            if zh { "（本次构建没有内嵌任何代理）".to_string() } else { "(this build embeds none)".to_string() }
+            if zh {
+                "（本次构建没有内嵌任何代理）".to_string()
+            } else {
+                "(this build embeds none)".to_string()
+            }
         } else {
             have
         };
@@ -80,9 +91,13 @@ pub(super) async fn deploy_mcp_agent(
     // 用 `mkdir -p -m 700` 而不是 SFTP 的逐级 create_dir：`~/.ishell-mcp` 同时是反向转发
     // 落 socket 的目录，那边就是按 700 建的（见 ssh/mod.rs）。若这里先用默认 umask 把它
     // 建成 755，socket 目录就悄悄变松了。`-m` 只作用于**最后一级**，所以两级各建一次。
+    // `-m` 只作用于新建目录，已存在的 755 `~/.ishell-mcp` 不会被改。socket 落在这里，
+    // 补一次 chmod，把以前用默认 umask 建出来的目录收紧。
     match exec_status(
         handle,
-        &format!("mkdir -p -m 700 '{home}/.ishell-mcp' && mkdir -p -m 700 '{dir}'"),
+        &format!(
+            "mkdir -p -m 700 '{home}/.ishell-mcp' && mkdir -p -m 700 '{dir}' && chmod 700 '{home}/.ishell-mcp' '{dir}'"
+        ),
     )
     .await
     {
@@ -118,16 +133,29 @@ pub(super) async fn deploy_mcp_agent(
     }
 
     // 5) 真跑一次，确认架构没挑错、动态库也齐。
-    match exec_capture(handle, &format!("'{path}' --version 2>&1")).await {
-        Ok(v) if v.to_ascii_lowercase().contains("ishell-mcp") => (true, path),
-        Ok(v) => (
-            false,
-            if zh {
-                format!("已传到 {path}，但执行 --version 没有得到预期输出：{}", v.trim())
+    //
+    // 不能只在输出里找子串 "ishell-mcp"：执行失败的 shell 报错（cannot execute /
+    // Permission denied / not found）自己就带这条路径，路径里必然有这个名字，检查恒过。
+    // 要退出码 0，并且 stdout 是 `ishell-mcp <版本> proto <数字>` 这一行。
+    match exec_capture_bytes(handle, &format!("'{path}' --version")).await {
+        Ok((0, out, _)) if mcp_version_line_ok(&String::from_utf8_lossy(&out)) => (true, path),
+        Ok((code, out, err)) => {
+            let detail = format!("{}{}", String::from_utf8_lossy(&out), err);
+            let detail = detail.trim();
+            let detail = if detail.is_empty() {
+                format!("exit {code}")
             } else {
-                format!("Uploaded to {path}, but --version did not print what we expected: {}", v.trim())
-            },
-        ),
+                format!("exit {code}: {detail}")
+            };
+            (
+                false,
+                if zh {
+                    format!("已传到 {path}，但在服务器上执行 --version 失败：{detail}")
+                } else {
+                    format!("Uploaded to {path}, but --version failed on the server: {detail}")
+                },
+            )
+        }
         Err(e) => (
             false,
             if zh {
@@ -136,6 +164,41 @@ pub(super) async fn deploy_mcp_agent(
                 format!("Uploaded to {path}, but it does not run on the server: {e}")
             },
         ),
+    }
+}
+
+/// `--version` 的 stdout。大小写敏感：报错文本里的路径不该混进来。
+fn mcp_version_line_ok(stdout: &str) -> bool {
+    let mut parts = stdout.trim().split_whitespace();
+    let name = parts.next();
+    let ver = parts.next();
+    let proto_word = parts.next();
+    let proto = parts.next();
+    name == Some("ishell-mcp")
+        && ver.is_some_and(|v| {
+            !v.is_empty()
+                && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && v.chars().any(|c| c.is_ascii_digit())
+        })
+        && proto_word == Some("proto")
+        && proto.is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        && parts.next().is_none()
+}
+
+#[cfg(test)]
+mod version_line_tests {
+    use super::mcp_version_line_ok;
+
+    #[test]
+    fn accepts_real_version_line_only() {
+        assert!(mcp_version_line_ok("ishell-mcp 0.23.0 proto 7\n"));
+        assert!(!mcp_version_line_ok(
+            "bash: /home/u/.ishell-mcp/bin/ishell-mcp: cannot execute binary file"
+        ));
+        assert!(!mcp_version_line_ok(
+            "sh: /home/u/.ishell-mcp/bin/ishell-mcp: not found"
+        ));
+        assert!(!mcp_version_line_ok("ISHELL-MCP 1.0 proto 1"));
     }
 }
 
@@ -209,9 +272,10 @@ mod live_deploy_tests {
         }
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let (handle, _jump, _rf, _x11) = super::super::auth::connect(&cfg, &sink, hostkey_rx, &mut cmd_rx)
-            .await
-            .expect("连上测试服务器");
+        let (handle, _jump, _rf, _x11, _prelude) =
+            super::super::auth::connect(&cfg, &sink, hostkey_rx, &mut cmd_rx)
+                .await
+                .expect("连上测试服务器");
 
         let (ok, msg) = deploy_mcp_agent(&handle, &sink).await;
         assert!(ok, "部署失败：{msg}");
