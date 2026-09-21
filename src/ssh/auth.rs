@@ -387,11 +387,12 @@ fn password_looks_undecrypted(pw: &str) -> bool {
     pw.starts_with(UNDECRYPTED_SECRET_PREFIX)
 }
 
-/// 「密码」认证：先走 keyboard-interactive（多数发行版 sshd 把 PAM 密码挂在这上面，
-/// 并关掉了 SSH 协议里的 password 方法），不行再试 `authenticate_password`。
+/// 「密码」认证：先走 SSH 协议里的 `password` 方法（0.23 及更早就是这样），
+/// 不行再试 keyboard-interactive。
 ///
-/// 不这么做的话，用户选「密码」、服务器只开 kbd-int，就会显示「认证被拒绝」，
-/// 而 OpenSSH 命令行客户端在同一台机器上是能登进去的。
+/// 顺序不能反：不少 sshd 同时开两种方法，kbd-int 先失败会占掉 MaxAuthTries，
+/// 甚至直接拆掉连接，原来能用密码登上的机器就会变成「认证被拒绝」。
+/// kbd-int 回退只补「PasswordAuthentication no、只留 PAM 键盘交互」那一类。
 async fn authenticate_password_login<H>(
     handle: &mut Handle<H>,
     username: &str,
@@ -412,12 +413,18 @@ where
             )
         );
     }
-    match authenticate_password_via_kbd(handle, username, pw, sink, cmd_rx).await {
-        Ok(true) => return Ok(true),
-        Ok(false) => {}
-        Err(e) => log::debug!("keyboard-interactive 密码尝试未成功：{e}"),
+    match handle.authenticate_password(username, pw).await {
+        Ok(r) if r.success() => return Ok(true),
+        Ok(_) => {}
+        Err(e) => log::debug!("password 方法未成功：{e}"),
     }
-    Ok(handle.authenticate_password(username, pw).await?.success())
+    match authenticate_password_via_kbd(handle, username, pw, sink, cmd_rx).await {
+        Ok(ok) => Ok(ok),
+        Err(e) => {
+            log::debug!("keyboard-interactive 密码尝试未成功：{e}");
+            Ok(false)
+        }
+    }
 }
 
 /// 用已保存的密码应答 kbd-int 里不回显的提示（典型就是 PAM 的 Password:）。
