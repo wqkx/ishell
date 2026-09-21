@@ -69,12 +69,29 @@ impl Terminal {
         let total = self.parser.screen().scrollback_total();
         let kept = self.parser.screen().scrollback_rows();
         let base = total.saturating_sub(kept);
-        let hits: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| re.is_match(l))
-            .map(|(i, _)| base + i)
-            .collect();
+        let mut hit_set = std::collections::BTreeSet::new();
+        // 单行命中
+        for (i, l) in lines.iter().enumerate() {
+            if re.is_match(l) {
+                hit_set.insert(base + i);
+            }
+        }
+        // 跨行：相邻两行无分隔拼接（软折行常见）+ 带 `\n` 拼接（硬换行 / 正则 `\n`）
+        for i in 0..lines.len().saturating_sub(1) {
+            let a = &lines[i];
+            let b = &lines[i + 1];
+            for sep in ["", "\n"] {
+                let joined = format!("{a}{sep}{b}");
+                if let Some(m) = re.find(&joined) {
+                    let boundary = a.len() + if sep.is_empty() { 0 } else { sep.len() };
+                    // 匹配真正跨过边界才算跨行命中（避免与单行重复计数逻辑依赖 set）
+                    if m.start() < a.len() && m.end() > boundary {
+                        hit_set.insert(base + i);
+                    }
+                }
+            }
+        }
+        let hits: Vec<usize> = hit_set.into_iter().collect();
         if let Some(f) = &mut self.find {
             f.hits = hits;
             f.cur = 0;

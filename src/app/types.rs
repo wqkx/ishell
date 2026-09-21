@@ -296,7 +296,7 @@ pub(super) struct ForwardUi {
 
 /// "新增转发"表单状态。
 pub(super) struct ForwardForm {
-    /// 0 = 本地转发，1 = 动态 SOCKS5
+    /// 0 = 本地转发，1 = 动态 SOCKS5，2 = 远端转发 (-R)
     pub(super) kind: usize,
     pub(super) bind: String,
     pub(super) local_port: String,

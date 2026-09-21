@@ -637,6 +637,36 @@ fn dec_1047_and_1048_toggle_alt_and_cursor() {
     assert_eq!((r1, c1), (r0, c0), "1048 应恢复进备用屏前的光标");
 }
 
+/// DECAWM（`CSI ? 7`）：关闭后行末覆盖末列，不再折行。
+#[test]
+fn decawm_off_does_not_wrap_at_eol() {
+    let mut t = Terminal::new();
+    assert!(t.resize(10, 3));
+    t.feed(b"\x1b[?7l"); // 关自动折行
+    t.feed(b"\x1b[1;1H");
+    t.feed(b"ABCDEFGHIJKLMNOP"); // 超过 10 列
+    let (row, col) = t.parser.screen().cursor_position();
+    assert_eq!(row, 0, "不应折到下一行：row={row} col={col}");
+    // 末列应是最后写入的字符之一
+    let last = t.parser.screen().cell(0, 9).map(|c| c.contents()).unwrap_or_default();
+    assert!(!last.is_empty(), "末列应有覆盖写入的字符");
+}
+
+/// 跨行搜索：匹配跨相邻两行的字面量。
+#[test]
+fn search_matches_across_line_boundary() {
+    let mut t = Terminal::new();
+    assert!(t.resize(40, 10));
+    t.feed(b"aaaHELLO\r\nWORLDbbb\r\n");
+    t.find = Some(search::Find {
+        query: "HELLOWORLD".into(),
+        ..Default::default()
+    });
+    t.run_search();
+    let hits = &t.find.as_ref().unwrap().hits;
+    assert!(!hits.is_empty(), "应命中跨行 HELLOWORLD");
+}
+
 #[test]
 fn top_anchored_scroll_region_writes_to_scrollback() {
     let mut t = Terminal::new();

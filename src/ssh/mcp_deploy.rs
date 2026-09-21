@@ -208,7 +208,7 @@ mod live_deploy_tests {
         }
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let (handle, _jump) = super::super::auth::connect(&cfg, &sink, hostkey_rx, &mut cmd_rx)
+        let (handle, _jump, _rf) = super::super::auth::connect(&cfg, &sink, hostkey_rx, &mut cmd_rx)
             .await
             .expect("连上测试服务器");
 

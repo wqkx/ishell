@@ -1,6 +1,5 @@
-//! SSH 认证与通道建立：从 ssh God Object 拆出，行为不变。
-
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client::{self, Handle, Handler};
@@ -31,7 +30,14 @@ pub(crate) struct ClientHandler {
     /// 是否把本机 AI/MCP 控制 socket 反向转发到这台远端主机
     /// （远端能连到转发出来的 socket，等于能控制本机 iShell）
     mcp_forward: bool,
+    /// 用户级 `-R`：远端 (listen_addr, port) → 本机 (host, port)。
+    /// 远端有人连上监听口时，经 `server_channel_open_forwarded_tcpip` 查表桥接。
+    remote_fwds: RemoteFwdTable,
 }
+
+/// 用户 `-R` 转发路由表（与 `ClientHandler` / `run_forward` 共享）。
+pub(super) type RemoteFwdTable =
+    Arc<Mutex<HashMap<(String, u32), (String, u16)>>>;
 
 /// 用户主目录下的 known_hosts 路径（与 russh 内部一致）。
 fn known_hosts_file() -> anyhow::Result<std::path::PathBuf> {
@@ -237,6 +243,31 @@ impl Handler for ClientHandler {
                 }
             });
         }
+        Ok(())
+    }
+
+    /// 远端 `-R` 监听口有新连接时，服务器经此开通道；查表连到本机目标。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let target = lookup_remote_fwd(&self.remote_fwds, connected_address, connected_port);
+        let Some((host, port)) = target else {
+            log::debug!(
+                "收到未登记的 forwarded-tcpip {connected_address}:{connected_port}，忽略"
+            );
+            return Ok(());
+        };
+        tokio::spawn(async move {
+            if let Err(e) = bridge_local_tcp(channel, &host, port).await {
+                log::debug!("-R 桥接结束 {host}:{port}：{e}");
+            }
+        });
         Ok(())
     }
 
@@ -651,6 +682,40 @@ async fn bridge_local_mcp(_channel: Channel<client::Msg>) -> anyhow::Result<()> 
     anyhow::bail!("AI/MCP 控制目前仅支持 Unix（Linux/macOS）系统，暂不支持 Windows")
 }
 
+/// `-R` 路由：按远端报告的 connected_address:port 查本机目标；地址写法不一时做别名兜底。
+fn lookup_remote_fwd(
+    table: &RemoteFwdTable,
+    addr: &str,
+    port: u32,
+) -> Option<(String, u16)> {
+    let map = table.lock().unwrap_or_else(|e| e.into_inner());
+    let aliases = [addr, "127.0.0.1", "0.0.0.0", "::1", "localhost", ""];
+    for a in aliases {
+        if let Some(v) = map.get(&(a.to_string(), port)) {
+            return Some(v.clone());
+        }
+    }
+    // 仅一个同端口登记时按端口匹配（sshd 常把 0.0.0.0 报成 127.0.0.1）
+    let mut by_port = map.iter().filter(|((_, p), _)| *p == port);
+    let first = by_port.next()?;
+    if by_port.next().is_none() {
+        return Some(first.1.clone());
+    }
+    None
+}
+
+/// 把 forwarded-tcpip 通道桥到本机 TCP 目标。
+async fn bridge_local_tcp(
+    channel: Channel<client::Msg>,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<()> {
+    let mut remote = channel.into_stream();
+    let mut local = tokio::net::TcpStream::connect((host, port)).await?;
+    tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
+    Ok(())
+}
+
 /// 键盘交互（keyboard-interactive）认证：循环把服务器提示交给 UI、等回答再提交，
 /// 直至成功或失败。支持 OTP / 二次验证等多步提示。响应经 `cmd_rx` 收 `KbdResponse`。
 async fn authenticate_interactive<H>(
@@ -707,7 +772,7 @@ pub(super) async fn connect(
     sink: &UiSink,
     hostkey_rx: UnboundedReceiver<bool>,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
-) -> anyhow::Result<(Handle<ClientHandler>, Option<Handle<JumpHandler>>)> {
+) -> anyhow::Result<(Handle<ClientHandler>, Option<Handle<JumpHandler>>, RemoteFwdTable)> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(120)), // keepalive 30s × ~4；原 3600 时 TCP 黑洞最坏近 1h 才感知
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -716,6 +781,7 @@ pub(super) async fn connect(
 
     // 主机密钥确认通道：跳板机与目标主机共享（顺序询问，不并发）
     let decision_rx: HostKeyDecision = Arc::new(tokio::sync::Mutex::new(hostkey_rx));
+    let remote_fwds: RemoteFwdTable = Arc::new(Mutex::new(HashMap::new()));
 
     let target_handler = ClientHandler {
         host: cfg.host.clone(),
@@ -726,6 +792,7 @@ pub(super) async fn connect(
         // cfg!(unix)：与 ssh/mod.rs 里那个反向转发任务保持同一条件——Windows 上没有
         // 监听方，转发出去的 socket 后面空无一人。
         mcp_forward: cfg!(unix) && crate::store::load_mcp_consent(),
+        remote_fwds: remote_fwds.clone(),
     };
 
     let (mut handle, jump_keep) = if let Some(jump) = &cfg.jump {
@@ -783,7 +850,7 @@ pub(super) async fn connect(
             )
         );
     }
-    Ok((handle, jump_keep))
+    Ok((handle, jump_keep, remote_fwds))
 }
 
 /// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发。

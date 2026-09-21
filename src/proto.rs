@@ -324,13 +324,18 @@ pub struct DirectSpec {
 /// 端口转发类型。
 #[derive(Clone, Debug)]
 pub enum ForwardKind {
-    /// 本地转发：本地端口 -> 远端 host:port
+    /// 本地转发：本地端口 -> 远端 host:port（`ssh -L`）
     Local {
         remote_host: String,
         remote_port: u16,
     },
-    /// 动态转发：本地 SOCKS5 代理
+    /// 动态转发：本地 SOCKS5 代理（`ssh -D`）
     Dynamic,
+    /// 远端转发：远端监听 bind → 连回本机 local_host:local_port（`ssh -R`）
+    Remote {
+        local_host: String,
+        local_port: u16,
+    },
 }
 
 /// 一条端口转发配置。

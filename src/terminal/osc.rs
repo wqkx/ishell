@@ -479,48 +479,132 @@ pub(super) fn find_sub_outside_string_escapes(hay: &[u8], needle: &[u8]) -> Opti
     None
 }
 
-/// OSC 0/2 窗口标题：返回本块里**最后一条**完整标题（空串表示远端清标题）。
-/// `carried` 语义同 `parse_osc_notify`。
-pub(super) fn parse_osc_title(data: &[u8], carried: usize) -> Option<String> {
-    let mut last = None;
-    for (seq_start, body_start, end) in osc_sequences(data) {
-        let _ = seq_start;
-        if end < carried {
-            continue;
-        }
-        let payload = &data[body_start..end];
-        // `0;` 同时设 icon+title；`2;` 只设 title。icon-only（`1;`）忽略。
-        let Some(title) = payload
-            .strip_prefix(b"0;")
-            .or_else(|| payload.strip_prefix(b"2;"))
-        else {
-            continue;
-        };
-        let Ok(s) = std::str::from_utf8(title) else {
-            continue;
-        };
-        last = Some(s.to_string());
-    }
-    last
+/// 一次 `osc_sequences` 扫完 feed 关心的全部 OSC 副作用，避免热路径上对同一缓冲
+/// 反复全量 windows 扫描（通知 / 52 / 133 / 标题 / 颜色查询 / OSC 7 原先各自走一遍）。
+#[derive(Default)]
+pub(super) struct OscEffects {
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub color_queries: Vec<u8>,
+    pub notifies: Vec<(Option<String>, String)>,
+    pub clipboards: Vec<String>,
+    pub osc133: Vec<(usize, Osc133)>,
 }
 
-/// OSC 10/11 颜色查询（`ESC]10;?BEL` / `ESC]11;?BEL|ST`）：返回本块里按出现顺序的
-/// 查询号（10=前景，11=背景）。`carried` 语义同通知扫描。
-pub(super) fn parse_osc_color_queries(data: &[u8], carried: usize) -> Vec<u8> {
-    let mut out = Vec::new();
+pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
+    use base64::Engine as _;
+    let mut out = OscEffects::default();
     for (seq_start, body_start, end) in osc_sequences(data) {
-        let _ = seq_start;
         if end < carried {
             continue;
         }
         let payload = &data[body_start..end];
+
+        // OSC 7 cwd
+        if let Some(rest) = payload.strip_prefix(b"7;") {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                if let Some(rest) = s.strip_prefix("file://") {
+                    if let Some(slash) = rest.find('/') {
+                        out.cwd = Some(percent_decode(&rest[slash..]));
+                    }
+                }
+            }
+        }
+
+        // OSC 0/2 title（后者覆盖前者）
+        if let Some(title) = payload
+            .strip_prefix(b"0;")
+            .or_else(|| payload.strip_prefix(b"2;"))
+        {
+            if let Ok(s) = std::str::from_utf8(title) {
+                out.title = Some(s.to_string());
+            }
+        }
+
         match payload {
-            b"10;?" => out.push(10),
-            b"11;?" => out.push(11),
+            b"10;?" => out.color_queries.push(10),
+            b"11;?" => out.color_queries.push(11),
             _ => {}
+        }
+
+        // OSC 9 / 777 notify
+        if let Some(rest) = payload.strip_prefix(b"9;") {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                let s = s.trim();
+                if !s.is_empty() && !is_conemu_progress(s) {
+                    out.notifies.push((None, s.to_string()));
+                }
+            }
+        } else if let Some(rest) = payload.strip_prefix(b"777;notify;") {
+            if let Ok(s) = std::str::from_utf8(rest) {
+                let (title, body) = match s.split_once(';') {
+                    Some((t, b)) => (t.trim(), b.trim()),
+                    None => (s.trim(), ""),
+                };
+                if !title.is_empty() || !body.is_empty() {
+                    out.notifies.push((
+                        if title.is_empty() {
+                            None
+                        } else {
+                            Some(title.to_string())
+                        },
+                        body.to_string(),
+                    ));
+                }
+            }
+        }
+
+        // OSC 52 clipboard
+        if let Some(rest) = payload.strip_prefix(b"52;") {
+            if let Some(idx) = rest.iter().position(|&b| b == b';') {
+                let (sel, data_b64) = (&rest[..idx], &rest[idx + 1..]);
+                if sel == b"c" && data_b64 != b"?" {
+                    if data_b64.is_empty() {
+                        out.clipboards.push(String::new());
+                    } else {
+                        let cleaned: Vec<u8> = data_b64
+                            .iter()
+                            .copied()
+                            .filter(|b| !b.is_ascii_whitespace())
+                            .collect();
+                        if let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(cleaned)
+                        {
+                            if let Ok(s) = String::from_utf8(bytes) {
+                                out.clipboards.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // OSC 133
+        if let Some(rest) = payload.strip_prefix(b"133;") {
+            match rest.first() {
+                Some(b'C') => out.osc133.push((seq_start, Osc133::CommandStart)),
+                Some(b'D') => {
+                    let code = rest
+                        .strip_prefix(b"D;")
+                        .and_then(|c| std::str::from_utf8(c).ok())
+                        .and_then(|c| c.trim().parse::<i32>().ok());
+                    out.osc133.push((seq_start, Osc133::CommandEnd(code)));
+                }
+                _ => {}
+            }
         }
     }
     out
+}
+
+/// OSC 0/2 窗口标题：返回本块里**最后一条**完整标题（空串表示远端清标题）。
+pub(super) fn parse_osc_title(data: &[u8], carried: usize) -> Option<String> {
+    scan_osc_effects(data, carried).title
+}
+
+/// OSC 10/11 颜色查询号列表（10=前景，11=背景）。
+pub(super) fn parse_osc_color_queries(data: &[u8], carried: usize) -> Vec<u8> {
+    scan_osc_effects(data, carried).color_queries
 }
 
 /// 把 8-bit RGB 编成 xterm 常用的 `rgb:RRRR/GGGG/BBBB`（每分量 16-bit，字节复制到高低位）。

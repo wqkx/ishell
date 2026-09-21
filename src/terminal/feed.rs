@@ -4,8 +4,7 @@ use std::io::Write;
 
 use super::{
     osc::{
-        count_bel, find_sub_outside_string_escapes, osc_rgb_reply, parse_osc133,
-        parse_osc52, parse_osc7, parse_osc_color_queries, parse_osc_notify, parse_osc_title,
+        count_bel, find_sub_outside_string_escapes, osc_rgb_reply, scan_osc_effects,
         unterminated_string_tail, Osc133,
     },
     theme::TermColors,
@@ -413,20 +412,19 @@ impl Terminal {
             Some(at) if scan.len() - at <= NOTICE_TAIL_CAP => scan[at..].to_vec(),
             _ => Vec::new(),
         };
-        // OSC 7 上报的工作目录（shell 配置后会发；用于断线重连恢复 cwd）
-        if let Some(p) = parse_osc7(scan) {
+        // 一次扫完 OSC 副作用（cwd / 标题 / 颜色查询 / 通知 / 剪贴板 / 133），
+        // 避免热路径对同一缓冲反复全量扫描。
+        let osc = scan_osc_effects(scan, carried);
+        if let Some(p) = osc.cwd {
             self.osc7_cwd = Some(p);
         }
-        // OSC 0/2 窗口标题（vim/ssh 会话名等）；空串清掉动态标题，回落到连接名。
-        if let Some(t) = parse_osc_title(scan, carried) {
+        if let Some(t) = osc.title {
             self.window_title = if t.is_empty() { None } else { Some(t) };
         }
-        // OSC 10/11 颜色查询：WezTerm/kitty/现代 TUI 会问；按当前主题回 rgb:RRRR/GGGG/BBBB。
         let mut osc_color_replies = Vec::new();
-        let color_qs = parse_osc_color_queries(scan, carried);
-        if !color_qs.is_empty() {
+        if !osc.color_queries.is_empty() {
             let tc = TermColors::by_index(self.theme);
-            for n in color_qs {
+            for n in osc.color_queries {
                 let c = match n {
                     10 => tc.fg,
                     11 => tc.bg,
@@ -437,7 +435,7 @@ impl Terminal {
         }
         // OSC 9/777 桌面通知（codex 走这条、`printf '\e]9;done\a'` 类脚本也是）。
         // **不设门槛**：发这个序列本身就是程序在明确要求"提醒用户"，不像裸 BEL 那样含糊。
-        for (title, body) in parse_osc_notify(scan, carried) {
+        for (title, body) in osc.notifies {
             // 会主动发通知的程序，其后续的裸 BEL 也值得提醒（同一个程序在说同一件事）。
             self.ai_cli_seen = true;
             // iShell 自己装的 hook 会把类别写在标题位（见 NOTICE_TAG_*）；这类标题是内部
@@ -456,12 +454,12 @@ impl Terminal {
         }
         // OSC 52 剪贴板（opencode/nvim/tmux 等 TUI 的「复制」走这条；远端程序的唯一通道）。
         // 同一块里有多条时后者覆盖前者，与序列到达顺序一致。
-        for text in parse_osc52(scan, carried) {
+        for text in osc.clipboards {
             self.set_clipboard_from_osc52(text);
         }
         // shell 集成（OSC 133）：见过一条就说明片段生效了，AI 命令的完成检测据此改走集成
         // 判据（不再多打哨兵行）。事件同时驱动正在进行的捕获。
-        let osc133 = parse_osc133(scan, carried);
+        let osc133 = osc.osc133;
         if !osc133.is_empty() {
             self.shell_integration = true;
             // 见过一次 `C` 就说明这个 shell 发得出它（bash ≥ 4.4 的 PS0 / zsh 的 preexec）。

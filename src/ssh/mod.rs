@@ -111,7 +111,7 @@ pub async fn run(
     }));
 
     // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
-    let (handle, _jump_handle) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
+    let (handle, _jump_handle, remote_fwds) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
         Ok(h) => h,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
@@ -783,7 +783,8 @@ pub async fn run(
                         let id = spec.id;
                         let h = handle.clone();
                         let s = sink.clone();
-                        forwards.insert(id, tokio::spawn(forward::run_forward(h, spec, s)));
+                        let rf = remote_fwds.clone();
+                        forwards.insert(id, tokio::spawn(forward::run_forward(h, rf, spec, s)));
                     }
                     Some(UiCommand::RemoveForward(id)) => {
                         if let Some(task) = forwards.remove(&id) {

@@ -6,6 +6,8 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+/// DECAWM 关闭时置位：行末不再自动折行，改为覆盖末列（xterm `CSI ? 7 l`）。
+const MODE_NO_AUTOWRAP: u8 = 0b0010_0000;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -741,18 +743,23 @@ impl Screen {
         // cells, which i really don't want to do).
         let mut wrap = false;
         if pos.col > size.cols - width {
-            let last_cell = self
-                .grid()
-                .drawing_cell(crate::grid::Pos {
-                    row: pos.row,
-                    col: size.cols - 1,
-                })
-                // pos.row is valid, since it comes directly from
-                // self.grid().pos() which we assume to always have a valid
-                // row value. size.cols - 1 is also always a valid column.
-                .unwrap();
-            if last_cell.has_contents() || last_cell.is_wide_continuation() {
-                wrap = true;
+            if self.mode(MODE_NO_AUTOWRAP) {
+                // DECAWM off：挤在末列覆盖，不换行
+                self.grid_mut().col_set(size.cols - width);
+            } else {
+                let last_cell = self
+                    .grid()
+                    .drawing_cell(crate::grid::Pos {
+                        row: pos.row,
+                        col: size.cols - 1,
+                    })
+                    // pos.row is valid, since it comes directly from
+                    // self.grid().pos() which we assume to always have a valid
+                    // row value. size.cols - 1 is also always a valid column.
+                    .unwrap();
+                if last_cell.has_contents() || last_cell.is_wide_continuation() {
+                    wrap = true;
+                }
             }
         }
         self.grid_mut().col_wrap(width, wrap);
@@ -1158,6 +1165,7 @@ impl Screen {
             match param {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(true),
+                [7] => self.clear_mode(MODE_NO_AUTOWRAP), // DECAWM on（默认）
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.clear_mode(MODE_HIDE_CURSOR),
                 [47] => self.enter_alternate_grid(),
@@ -1200,6 +1208,7 @@ impl Screen {
             match param {
                 [1] => self.clear_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(false),
+                [7] => self.set_mode(MODE_NO_AUTOWRAP), // DECAWM off
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.set_mode(MODE_HIDE_CURSOR),
                 [47] => {

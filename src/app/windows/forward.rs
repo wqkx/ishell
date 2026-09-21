@@ -58,23 +58,38 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut f.kind, 0usize, crate::i18n::tr("本地转发", "Local"));
                     ui.selectable_value(&mut f.kind, 1usize, crate::i18n::tr("动态 SOCKS5", "Dynamic SOCKS5"));
+                    ui.selectable_value(&mut f.kind, 2usize, crate::i18n::tr("远端转发", "Remote (-R)"));
                 });
                 ui.horizontal(|ui| {
-                    ui.label(crate::i18n::tr("本地", "Local"));
+                    ui.label(if f.kind == 2 {
+                        crate::i18n::tr("远端", "Remote")
+                    } else {
+                        crate::i18n::tr("本地", "Local")
+                    });
                     ui.add(egui::TextEdit::singleline(&mut f.bind).desired_width(84.0).hint_text("127.0.0.1"));
                     ui.label(":");
                     ui.add(egui::TextEdit::singleline(&mut f.local_port).desired_width(48.0).hint_text(crate::i18n::tr("端口", "Port")));
                 });
-                if !is_loopback_bind(&f.bind) {
+                if f.kind != 2 && !is_loopback_bind(&f.bind) {
                     ui.label(RichText::new(crate::i18n::tr(
                         "⚠ 非回环地址：局域网内他人可使用此转发（SOCKS5 无认证）",
                         "⚠ Non-loopback: others on the LAN can use this forward (SOCKS5 has no auth)",
                     )).color(Palette::DANGER).size(11.0));
                 }
-                if f.kind == 0 {
+                if f.kind == 0 || f.kind == 2 {
                     ui.horizontal(|ui| {
-                        ui.label(crate::i18n::tr("目标", "Target"));
-                        ui.add(egui::TextEdit::singleline(&mut f.target_host).desired_width(120.0).hint_text(crate::i18n::tr("主机/IP", "Host/IP")));
+                        ui.label(if f.kind == 2 {
+                            crate::i18n::tr("本机目标", "Local target")
+                        } else {
+                            crate::i18n::tr("目标", "Target")
+                        });
+                        ui.add(egui::TextEdit::singleline(&mut f.target_host).desired_width(120.0).hint_text(
+                            if f.kind == 2 {
+                                "127.0.0.1"
+                            } else {
+                                crate::i18n::tr("主机/IP", "Host/IP")
+                            },
+                        ));
                         ui.label(":");
                         ui.add(egui::TextEdit::singleline(&mut f.target_port).desired_width(48.0).hint_text(crate::i18n::tr("端口", "Port")));
                     });
@@ -88,19 +103,45 @@ impl App {
                     };
                     if ui.add(egui::Button::new(RichText::new(format!("{}  {}", btn_icon, btn_label)).color(egui::Color32::WHITE)).fill(Palette::ACCENT)).clicked() {
                         if let Ok(lp) = f.local_port.trim().parse::<u16>() {
-                            let kind = if f.kind == 0 {
-                                match f.target_port.trim().parse::<u16>() {
+                            let kind = match f.kind {
+                                0 => match f.target_port.trim().parse::<u16>() {
                                     Ok(tp) if !f.target_host.trim().is_empty() => {
-                                        Some(ForwardKind::Local { remote_host: f.target_host.trim().to_string(), remote_port: tp })
+                                        Some(ForwardKind::Local {
+                                            remote_host: f.target_host.trim().to_string(),
+                                            remote_port: tp,
+                                        })
                                     }
                                     _ => None,
-                                }
-                            } else {
-                                Some(ForwardKind::Dynamic)
+                                },
+                                1 => Some(ForwardKind::Dynamic),
+                                2 => match f.target_port.trim().parse::<u16>() {
+                                    Ok(tp) => {
+                                        let host = if f.target_host.trim().is_empty() {
+                                            "127.0.0.1".into()
+                                        } else {
+                                            f.target_host.trim().to_string()
+                                        };
+                                        Some(ForwardKind::Remote {
+                                            local_host: host,
+                                            local_port: tp,
+                                        })
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
                             };
                             if let Some(kind) = kind {
-                                let bind = if f.bind.trim().is_empty() { "127.0.0.1".into() } else { f.bind.trim().to_string() };
-                                add_spec = Some(ForwardSpec { id: 0, bind_host: bind, bind_port: lp, kind });
+                                let bind = if f.bind.trim().is_empty() {
+                                    "127.0.0.1".into()
+                                } else {
+                                    f.bind.trim().to_string()
+                                };
+                                add_spec = Some(ForwardSpec {
+                                    id: 0,
+                                    bind_host: bind,
+                                    bind_port: lp,
+                                    kind,
+                                });
                             }
                         }
                     }
@@ -209,6 +250,14 @@ impl App {
                         form.target_host.clear();
                         form.target_port.clear();
                     }
+                    ForwardKind::Remote {
+                        local_host,
+                        local_port,
+                    } => {
+                        form.kind = 2;
+                        form.target_host = local_host;
+                        form.target_port = local_port.to_string();
+                    }
                 }
                 self.fwd.editing = Some(id);
                 self.fwd.error = None;
@@ -234,7 +283,13 @@ impl App {
                         .and_then(|s| s.forwards.iter().find(|f| f.id == id))
                 })
                 .is_some_and(|f| f.bind_port == spec.bind_port && f.bind_host == spec.bind_host);
-            if dup || (!same_as_editing && local_port_in_use(&spec.bind_host, spec.bind_port)) {
+            // `-R` 的 bind 在远端监听，不必查本机端口占用
+            let need_local_probe = !matches!(spec.kind, ForwardKind::Remote { .. });
+            if dup
+                || (need_local_probe
+                    && !same_as_editing
+                    && local_port_in_use(&spec.bind_host, spec.bind_port))
+            {
                 self.fwd.error = Some(match crate::i18n::current() {
                     crate::i18n::Lang::Zh => format!("本地端口 {} 已被占用", spec.bind_port),
                     crate::i18n::Lang::En => {
@@ -327,6 +382,13 @@ impl App {
                     )
                 }
                 ForwardKind::Dynamic => format!("SOCKS5 {}:{}", spec.bind_host, spec.bind_port),
+                ForwardKind::Remote {
+                    local_host,
+                    local_port,
+                } => format!(
+                    "{}:{} ← {}:{}",
+                    spec.bind_host, spec.bind_port, local_host, local_port
+                ),
             };
             s.forwards.push(ForwardEntry {
                 id,

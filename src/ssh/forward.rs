@@ -10,12 +10,107 @@ use russh::client::Handle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use super::auth::RemoteFwdTable;
 use super::ClientHandler;
 use super::UiSink;
 use crate::proto::{ForwardKind, ForwardSpec, WorkerEvent};
 
 /// 运行一条转发监听，直到任务被 abort。
-pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, sink: UiSink) {
+pub async fn run_forward(
+    handle: Arc<Handle<ClientHandler>>,
+    remote_fwds: RemoteFwdTable,
+    spec: ForwardSpec,
+    sink: UiSink,
+) {
+    match spec.kind.clone() {
+        ForwardKind::Remote {
+            local_host,
+            local_port,
+        } => {
+            run_remote_forward(handle, remote_fwds, spec, local_host, local_port, sink).await;
+        }
+        ForwardKind::Local { .. } | ForwardKind::Dynamic => {
+            run_local_or_dynamic(handle, spec, sink).await;
+        }
+    }
+}
+
+async fn run_remote_forward(
+    handle: Arc<Handle<ClientHandler>>,
+    remote_fwds: RemoteFwdTable,
+    spec: ForwardSpec,
+    local_host: String,
+    local_port: u16,
+    sink: UiSink,
+) {
+    let listen = if spec.bind_host.trim().is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        spec.bind_host.clone()
+    };
+    let want_port = spec.bind_port as u32;
+    let bound = match handle.tcpip_forward(listen.clone(), want_port).await {
+        Ok(p) => p,
+        Err(e) => {
+            sink.send(WorkerEvent::ForwardStatus {
+                id: spec.id,
+                ok: false,
+                message: match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("远端监听 {listen}:{want_port} 失败：{e}"),
+                    crate::i18n::Lang::En => {
+                        format!("Remote listen {listen}:{want_port} failed: {e}")
+                    }
+                },
+            });
+            return;
+        }
+    };
+    let key = (listen.clone(), bound);
+    {
+        let mut map = remote_fwds.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(key.clone(), (local_host.clone(), local_port));
+    }
+    let label = format!("{listen}:{bound} ← {local_host}:{local_port}");
+    sink.send(WorkerEvent::ForwardStatus {
+        id: spec.id,
+        ok: true,
+        message: match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("远端监听中  {label}"),
+            crate::i18n::Lang::En => format!("Remote listening  {label}"),
+        },
+    });
+    // 挂起直到 RemoveForward abort；Drop 时取消远端监听并从表里摘掉。
+    struct Guard {
+        handle: Arc<Handle<ClientHandler>>,
+        remote_fwds: RemoteFwdTable,
+        key: (String, u32),
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.remote_fwds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.key);
+            let h = self.handle.clone();
+            let (addr, port) = self.key.clone();
+            tokio::spawn(async move {
+                let _ = h.cancel_tcpip_forward(addr, port).await;
+            });
+        }
+    }
+    let _guard = Guard {
+        handle,
+        remote_fwds,
+        key,
+    };
+    std::future::pending::<()>().await;
+}
+
+async fn run_local_or_dynamic(
+    handle: Arc<Handle<ClientHandler>>,
+    spec: ForwardSpec,
+    sink: UiSink,
+) {
     // 稳健构造监听地址：bind_host 是 IP 字面量时走结构化 `SocketAddr`（IPv6 会自动加方括号，
     // 得到 `[::1]:8080` 而非手工拼接的 `::1:8080`）；否则按 `host:port` 交给解析器（支持主机名）。
     // `TcpListener::bind` 的字符串路径虽有「按末冒号拆分」的兜底、多能容忍裸 IPv6，但显示与
@@ -44,6 +139,7 @@ pub async fn run_forward(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, 
             remote_port,
         } => format!("{bind} → {remote_host}:{remote_port}"),
         ForwardKind::Dynamic => format!("SOCKS5 {bind}"),
+        ForwardKind::Remote { .. } => unreachable!("remote 走 run_remote_forward"),
     };
     // 绑定到非回环地址：同网段任何主机都能使用此转发（SOCKS5 无认证时即开放代理）——
     // 在状态里明确警示，让「对外开放」是一个知情决定
@@ -153,6 +249,9 @@ async fn handle_conn(
                     return Err(e.into());
                 }
             }
+        }
+        ForwardKind::Remote { .. } => {
+            anyhow::bail!("remote forward connections arrive via Handler, not local accept")
         }
     }
     Ok(())
