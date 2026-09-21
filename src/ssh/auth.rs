@@ -297,7 +297,22 @@ impl JumpHandler {
             fingerprint: fp,
             changed,
         });
-        matches!(self.decision_rx.lock().await.recv().await, Some(true))
+        // 与目标机同款 120s 超时：跳板确认若无限等，用户关弹窗后会话会永久挂死。
+        let mut rx = self.decision_rx.lock().await;
+        match tokio::time::timeout(HOSTKEY_DECISION_TIMEOUT, rx.recv()).await {
+            Ok(Some(true)) => true,
+            Ok(Some(false)) | Ok(None) => false,
+            Err(_) => {
+                self.sink
+                    .send(WorkerEvent::Status(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => "跳板机主机密钥确认超时，已拒绝连接".into(),
+                        crate::i18n::Lang::En => {
+                            "Jump host key confirmation timed out; connection rejected".into()
+                        }
+                    }));
+                false
+            }
+        }
     }
 }
 
@@ -787,9 +802,21 @@ pub(super) async fn open_shell(
         .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
         .await?;
     // 请求 UTF-8 locale：否则远端 ls 等会把中文文件名转义成 $'\345\277...'。
-    // 多数 sshd 默认 AcceptEnv LANG LC_*；不被接受时忽略即可。
-    let _ = channel.set_env(false, "LANG", "en_US.UTF-8").await;
-    let _ = channel.set_env(false, "LC_ALL", "en_US.UTF-8").await;
+    // 优先沿用本机已是 UTF-8 的 LANG（用户习惯的语言环境）；否则 C.UTF-8（比硬编码
+    // en_US.UTF-8 更常预装）。sshd 未 AcceptEnv 时 set_env 失败——记日志，不静默吞掉。
+    let lang = std::env::var("LANG")
+        .ok()
+        .filter(|l| {
+            let u = l.to_ascii_uppercase();
+            u.contains("UTF-8") || u.contains("UTF8")
+        })
+        .unwrap_or_else(|| "C.UTF-8".into());
+    if let Err(e) = channel.set_env(false, "LANG", &lang).await {
+        log::debug!("set_env LANG={lang} 被拒或失败：{e}");
+    }
+    if let Err(e) = channel.set_env(false, "LC_ALL", &lang).await {
+        log::debug!("set_env LC_ALL={lang} 被拒或失败：{e}");
+    }
     // 显式声明 TERM / 真彩色：许多工具（ls、bat、rg、nvim 等）靠 COLORTERM=truecolor
     // 才输出 SGR 38;2 / 48;2；仅 PTY 类型 xterm-256color 不足以开启 24 位色。
     let _ = channel.set_env(false, "TERM", "xterm-256color").await;

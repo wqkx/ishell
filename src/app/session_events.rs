@@ -11,6 +11,11 @@ impl Session {
     /// 超出预算的事件留在队列、下一帧继续（返回 true 表示还有积压需要重绘）——
     /// 远端持续大量输出时 UI 仍按帧渲染，不会被「全量排空循环」饿死。
     pub(crate) fn drain_events(&mut self) -> bool {
+        // 同步帧看门狗定时兜底：远端帧中静默挂起时不必等下一包。
+        let sync_replies = self.terminal.tick_sync_watchdog();
+        if !sync_replies.is_empty() {
+            let _ = self.cmd_tx.send(UiCommand::TerminalInput(sync_replies));
+        }
         // 系统信息走独立 watch 通道（只保留最新一份，不随 UI 排空节奏堆积），每帧单独取一次。
         if self.sysinfo_rx.has_changed().unwrap_or(false) {
             if let Some(info) = self.sysinfo_rx.borrow_and_update().clone() {

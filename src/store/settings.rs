@@ -620,6 +620,28 @@ pub fn save_editor_font(pt: f32) {
     }
 }
 
+fn term_font_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("term_font"))
+}
+
+/// 读取终端字号（pt）；未设置返回 None（沿用内建默认 14）。夹在 [8, 32]（与 Ctrl+滚轮一致）。
+pub fn load_term_font() -> Option<f32> {
+    term_font_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|z| z.clamp(8.0, 32.0))
+}
+
+/// 保存终端字号（pt）。Ctrl+滚轮调整后调用，重启后仍生效。
+pub fn save_term_font(pt: f32) {
+    if let Some(p) = term_font_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        write_setting(p, format!("{pt:.1}"));
+    }
+}
+
 fn file_cols_path() -> Option<PathBuf> {
     Some(config_dir()?.join("file_cols"))
 }

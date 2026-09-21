@@ -514,6 +514,33 @@ fn replies_to_cursor_position_query_split_across_feeds() {
     assert_eq!(t.feed(b"6n"), b"\x1b[1;4R");
 }
 
+/// DSR 5n（状态查询）与 DA（CSI c / CSI 0 c）现代 TUI 常用来探测终端能力；此前一律沉默。
+#[test]
+fn replies_to_dsr_status_and_device_attributes() {
+    let mut t = Terminal::new();
+    assert_eq!(t.feed(b"\x1b[5n"), b"\x1b[0n");
+    assert_eq!(t.feed(b"\x1b[c"), b"\x1b[?1;2c");
+    assert_eq!(t.feed(b"\x1b[0c"), b"\x1b[?1;2c");
+    // 分包：半截 DA
+    assert!(t.feed(b"\x1b[").is_empty());
+    assert_eq!(t.feed(b"c"), b"\x1b[?1;2c");
+}
+
+/// 进出备用屏须清本地选区，否则在 less 上拖选、退出后复制会拿到主屏陈旧内容。
+#[test]
+fn entering_or_leaving_alt_screen_clears_selection() {
+    let mut t = Terminal::new();
+    t.feed(b"main history\r\n");
+    t.sel_anchor = Some((0, 0));
+    t.sel_cursor = Some((0, 4));
+    t.feed(b"\x1b[?1049h"); // 进备用屏
+    assert!(t.sel_anchor.is_none() && t.sel_cursor.is_none());
+    t.sel_anchor = Some((0, 0));
+    t.sel_cursor = Some((0, 1));
+    t.feed(b"\x1b[?1049l"); // 出备用屏
+    assert!(t.sel_anchor.is_none() && t.sel_cursor.is_none());
+}
+
 #[test]
 fn top_anchored_scroll_region_writes_to_scrollback() {
     let mut t = Terminal::new();
@@ -610,6 +637,18 @@ fn alt_letter_encodes_meta_prefix() {
     assert_eq!(enc(egui::Key::B, alt_shift, false), b"\x1bB");
     // Alt+Backspace = 删除前一个词
     assert_eq!(enc(egui::Key::Backspace, ALT, false), b"\x1b\x7f");
+}
+
+/// Alt+标点此前落到空分支什么都不发；readline Meta（Alt+. 插上参等）依赖它。
+#[test]
+fn alt_punctuation_encodes_meta_prefix() {
+    assert_eq!(enc(egui::Key::Period, ALT, false), b"\x1b.");
+    assert_eq!(enc(egui::Key::Comma, ALT, false), b"\x1b,");
+    assert_eq!(enc(egui::Key::Slash, ALT, false), b"\x1b/");
+    assert_eq!(enc(egui::Key::Minus, ALT, false), b"\x1b-");
+    let alt_shift = egui::Modifiers { alt: true, shift: true, ..Default::default() };
+    assert_eq!(enc(egui::Key::Period, alt_shift, false), b"\x1b>");
+    assert_eq!(enc(egui::Key::Equals, alt_shift, false), b"\x1b+");
 }
 
 #[test]
@@ -1604,6 +1643,21 @@ fn unterminated_sync_frame_flushes_on_watchdog() {
     assert!(s.contains("half frame"), "看门狗应把半帧刷上去：{s:?}");
     assert!(s.contains('x'), "看门狗刷完后本次字节照常处理");
     assert!(!t.sync_active, "看门狗刷完后应复位帧内状态");
+}
+
+/// 定时路径：不必等下一包——`tick_sync_watchdog` 到期就刷。反向对照：只留 feed 入口
+/// 看门狗时，远端帧中静默挂起画面永久冻结。
+#[test]
+fn sync_watchdog_ticks_without_next_packet() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?2026hstuck half");
+    assert!(t.sync_active);
+    assert!(!t.screen_text().contains("stuck"));
+    t.sync_since = std::time::Instant::now() - std::time::Duration::from_millis(500);
+    let _ = t.tick_sync_watchdog();
+    assert!(t.screen_text().contains("stuck"));
+    assert!(!t.sync_active);
+    assert!(t.sync_watchdog_remaining().is_none());
 }
 
 /// 帧缓冲上限：超过 `SYNC_BUF_CAP` 强制刷掉，内存有界；刷掉后同步状态复位、

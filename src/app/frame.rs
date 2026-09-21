@@ -101,6 +101,15 @@ impl App {
         if self.sessions.iter().any(|s| s.connected) {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
+        // 同步帧看门狗：帧中远端静默时也要按时出帧，否则半帧滞留无上限。
+        if let Some(wait) = self
+            .sessions
+            .iter()
+            .filter_map(|s| s.terminal.sync_watchdog_remaining())
+            .min()
+        {
+            ctx.request_repaint_after(wait);
+        }
         // 「重连后恢复 cwd」意图挂着期间，同样得保证出帧。
         //
         // 它的注入判据（远端输出静止 2s、用户停笔 2s）全是每帧轮询的，而空闲窗口不转帧：

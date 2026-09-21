@@ -300,7 +300,7 @@ impl Terminal {
             cols: 80,
             rows: 24,
             scrollback: 0,
-            font_size: FONT_SIZE,
+            font_size: crate::store::load_term_font().unwrap_or(FONT_SIZE),
             sel_anchor: None,
             sel_cursor: None,
             clipboard: None,
@@ -803,6 +803,7 @@ impl Terminal {
             if zoom != 0.0 {
                 // 一次滚轮缺口 = 一级字号；不吃惯性尾巴（见上面 zoom_lines 的说明）
                 self.font_size = (self.font_size + zoom.signum() * 1.0).clamp(8.0, 32.0);
+                crate::store::save_term_font(self.font_size);
                 self.local_scroll_accum = 0.0; // 缩放不该顺带把余量带进回滚
             } else if report_mouse {
                 self.local_scroll_accum = 0.0; // 切换路径：旧余量不该带到鼠标上报语义里
@@ -888,6 +889,7 @@ impl Terminal {
             let on_top =
                 |pos: egui::Pos2| rect.contains(pos) && ctx.layer_id_at(pos) == Some(term_layer);
             let events = ui.input(|i| i.events.clone());
+            let cur_mods = ui.input(|i| i.modifiers);
             for ev in &events {
                 match ev {
                     egui::Event::PointerButton {
@@ -932,7 +934,15 @@ impl Terminal {
                                 && self.held_btn.is_some());
                         if motion {
                             let (r, c) = cell_at(*pos);
-                            let cb = 32 + self.held_btn.unwrap_or(3); // 32=移动标志位
+                            // 移动事件同样要带上当前 alt/ctrl（vim Ctrl+拖拽等）；此前只用
+                            // held_btn 基码，修饰位全丢。
+                            let mut cb = 32 + self.held_btn.unwrap_or(3);
+                            if cur_mods.alt {
+                                cb += 8;
+                            }
+                            if cur_mods.ctrl || cur_mods.command {
+                                cb += 16;
+                            }
                             encode_mouse(menc, cb, c, r, true, &mut mouse_out);
                         }
                     }
@@ -948,6 +958,11 @@ impl Terminal {
                     let press = crate::ui::drag_press_pos(ui, p);
                     if max_sb > 0 && press.x >= sb_track.left() {
                         self.sb_dragging = true;
+                    } else if self.parser.screen().alternate_screen() {
+                        // 备用屏选区与主屏历史共用绝对行坐标系——在 less 等上拖选、
+                        // 退出后再复制会拿到陈旧主屏内容。备用屏上禁用本地选区。
+                        self.sel_anchor = None;
+                        self.sel_cursor = None;
                     } else {
                         let (ar, ac) = cell_at(press);
                         let (cr, cc) = cell_at(p);

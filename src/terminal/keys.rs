@@ -111,8 +111,8 @@ pub(super) fn encode_key(key: Key, mods: Modifiers, app_cursor: bool, out: &mut 
         }
         Key::Escape => out.push(0x1b),
         _ => {
-            // Alt + 可打印键 -> `ESC <char>`（Meta 惯例：Alt+B/F 按词移动、Alt+D 删词等）。
-            // 无修饰的可打印字符不在这里处理——它们走 egui 的 Text 事件。
+            // Alt + 可打印键 -> `ESC <char>`（Meta 惯例：Alt+B/F 按词移动、Alt+D 删词、
+            // Alt+. 插入上条参数等）。无修饰的可打印字符不在这里处理——它们走 egui 的 Text。
             if mods.alt && !mods.ctrl {
                 if let Some(c) = key_to_ascii_letter(key) {
                     let ch = if mods.shift {
@@ -125,6 +125,9 @@ pub(super) fn encode_key(key: Key, mods: Modifiers, app_cursor: bool, out: &mut 
                 } else if let Some(d) = key_to_ascii_digit(key) {
                     out.push(0x1b);
                     out.push(d);
+                } else if let Some(p) = key_to_ascii_punct(key, mods.shift) {
+                    out.push(0x1b);
+                    out.push(p);
                 }
             }
         }
@@ -233,6 +236,91 @@ fn key_to_ascii_digit(key: Key) -> Option<u8> {
         Key::Num7 => b'7',
         Key::Num8 => b'8',
         Key::Num9 => b'9',
+        _ => return None,
+    })
+}
+
+/// Alt+标点：按 US 键盘未/已 Shift 的字形发 `ESC <char>`（readline Meta 惯例）。
+fn key_to_ascii_punct(key: Key, shift: bool) -> Option<u8> {
+    Some(match key {
+        Key::Minus => {
+            if shift {
+                b'_'
+            } else {
+                b'-'
+            }
+        }
+        Key::Equals => {
+            if shift {
+                b'+'
+            } else {
+                b'='
+            }
+        }
+        Key::OpenBracket => {
+            if shift {
+                b'{'
+            } else {
+                b'['
+            }
+        }
+        Key::CloseBracket => {
+            if shift {
+                b'}'
+            } else {
+                b']'
+            }
+        }
+        Key::Semicolon => {
+            if shift {
+                b':'
+            } else {
+                b';'
+            }
+        }
+        Key::Quote => {
+            if shift {
+                b'"'
+            } else {
+                b'\''
+            }
+        }
+        Key::Comma => {
+            if shift {
+                b'<'
+            } else {
+                b','
+            }
+        }
+        Key::Period => {
+            if shift {
+                b'>'
+            } else {
+                b'.'
+            }
+        }
+        Key::Slash => {
+            if shift {
+                b'?'
+            } else {
+                b'/'
+            }
+        }
+        Key::Backslash => {
+            if shift {
+                b'|'
+            } else {
+                b'\\'
+            }
+        }
+        Key::Backtick => {
+            if shift {
+                b'~'
+            } else {
+                b'`'
+            }
+        }
+        Key::Pipe => b'|',
         _ => return None,
     })
 }

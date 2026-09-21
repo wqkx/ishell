@@ -27,33 +27,81 @@ const SYNC_WATCHDOG: std::time::Duration = std::time::Duration::from_millis(100)
 /// 块（drain 预算 2 MiB，实测 SSH 块约 32 KB），仍有界。
 pub(super) const SYNC_BUF_CAP: usize = 1024 * 1024;
 
+#[derive(Clone, Copy)]
+enum ReplyKind {
+    Cpr,
+    DsrOk,
+    Da,
+}
+
+/// 在 `hay` 里找最早出现的查询；同起点取更长匹配（`ESC[0c` 优先于 `ESC[c`）。
+fn find_next_query(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<(usize, ReplyKind, usize)> {
+    let mut best: Option<(usize, ReplyKind, usize)> = None;
+    for &(pat, kind) in queries {
+        if let Some(at) = find_sub(hay, pat) {
+            let better = match best {
+                None => true,
+                Some((bat, _, blen)) => at < bat || (at == bat && pat.len() > blen),
+            };
+            if better {
+                best = Some((at, kind, pat.len()));
+            }
+        }
+    }
+    best
+}
+
+/// `rest` 末尾若是任一查询的真前缀，暂存起来等下一包拼完。
+fn incomplete_query_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize {
+    let mut keep = 0;
+    for &(pat, _) in queries {
+        for n in 1..pat.len() {
+            if rest.ends_with(&pat[..n]) {
+                keep = keep.max(n);
+            }
+        }
+    }
+    keep
+}
+
 impl Terminal {
     /// 处理终端输出，并为需要终端主动应答的查询生成回写字节。
     ///
-    /// Codex 的 inline viewport 启动时用 DSR `CSI 6 n` 查询光标位置；若终端不返回
-    /// CPR，它会超时后假定光标位于原点，后续 history insertion/resize 都会基于错误
-    /// viewport。查询必须与输出严格按序处理，不能整批 process 完后才读取光标。
+    /// - DSR `CSI 6 n` → CPR（Codex inline viewport 等依赖）
+    /// - DSR `CSI 5 n` → `CSI 0 n`（终端就绪）
+    /// - DA  `CSI c` / `CSI 0 c` → `CSI ? 1 ; 2 c`（VT100 + AVO；现代 TUI 探测用）
+    ///
+    /// 查询必须与输出严格按序处理，不能整批 process 完后才读光标。
     fn process_with_replies(&mut self, bytes: &[u8]) -> Vec<u8> {
-        const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+        /// 已知的「终端应主动应答」查询；按出现位置最早者优先，同位置取最长匹配。
+        const QUERIES: &[(&[u8], ReplyKind)] = &[
+            (b"\x1b[6n", ReplyKind::Cpr),
+            (b"\x1b[5n", ReplyKind::DsrOk),
+            (b"\x1b[0c", ReplyKind::Da),
+            (b"\x1b[c", ReplyKind::Da),
+        ];
 
         let mut data = std::mem::take(&mut self.query_tail);
         data.extend_from_slice(bytes);
         let mut replies = Vec::new();
         let mut pos = 0;
 
-        while let Some(rel) = find_sub(&data[pos..], CURSOR_QUERY) {
-            let query_at = pos + rel;
+        while let Some((at, kind, qlen)) = find_next_query(&data[pos..], QUERIES) {
+            let query_at = pos + at;
             self.parser.process(&data[pos..query_at]);
-            let (row, col) = self.parser.screen().cursor_position();
-            replies.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
-            pos = query_at + CURSOR_QUERY.len();
+            match kind {
+                ReplyKind::Cpr => {
+                    let (row, col) = self.parser.screen().cursor_position();
+                    replies.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+                }
+                ReplyKind::DsrOk => replies.extend_from_slice(b"\x1b[0n"),
+                ReplyKind::Da => replies.extend_from_slice(b"\x1b[?1;2c"),
+            }
+            pos = query_at + qlen;
         }
 
         let rest = &data[pos..];
-        let keep = (1..CURSOR_QUERY.len())
-            .rev()
-            .find(|&n| rest.ends_with(&CURSOR_QUERY[..n]))
-            .unwrap_or(0);
+        let keep = incomplete_query_keep(rest, QUERIES);
         self.parser.process(&rest[..rest.len() - keep]);
         self.query_tail.extend_from_slice(&rest[rest.len() - keep..]);
         replies
@@ -533,6 +581,28 @@ impl Terminal {
         }
     }
 
+    /// 定时兜底：远端帧中静默挂起时，不必等下一包到达才触发看门狗。
+    /// UI 每帧 / 心跳路径调用；到期则强刷半帧并返回可能的查询应答。
+    pub fn tick_sync_watchdog(&mut self) -> Vec<u8> {
+        if self.sync_active && self.sync_since.elapsed() >= SYNC_WATCHDOG {
+            log::debug!(
+                "同步帧看门狗（定时）触发：{}ms 未等到 2026l，强刷半帧",
+                self.sync_since.elapsed().as_millis()
+            );
+            self.flush_sync()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 若正在攒同步帧，返回距看门狗还剩多久（供 `request_repaint_after`）。
+    pub fn sync_watchdog_remaining(&self) -> Option<std::time::Duration> {
+        if !self.sync_active {
+            return None;
+        }
+        Some(SYNC_WATCHDOG.saturating_sub(self.sync_since.elapsed()))
+    }
+
     /// 丢弃未完成的同步帧（断线重连时调用）。半帧属于已死的会话：重连后看门狗会把
     /// 滞留的旧字节刷进新会话屏幕（新连接的第一包必然远超 100ms），与其画一帧死内容，
     /// 不如清掉——回滚历史保留不动，只清 `sync_buf`/`sync_active` 这两个瞬时状态。
@@ -579,8 +649,14 @@ impl Terminal {
 
     /// 离开备用屏（如退出 vim/less/htop）时，确保光标恢复可见——有些程序异常退出（被 Ctrl+C/
     /// 断线打断）会漏发「显示光标」(`ESC[?25h`)，导致回到 shell 后光标一直不显示（「光标丢失」）。
+    /// 进出备用屏时一并清掉本地选区：选区绝对行锚定主屏历史，在 alt 屏上拖选/退出后复制会
+    /// 拿到陈旧主屏内容。
     fn ensure_cursor_after_alt(&mut self) {
         let alt = self.parser.screen().alternate_screen();
+        if self.prev_alt != alt {
+            self.sel_anchor = None;
+            self.sel_cursor = None;
+        }
         if self.prev_alt && !alt && self.parser.screen().hide_cursor() {
             self.parser.process(b"\x1b[?25h");
         }
