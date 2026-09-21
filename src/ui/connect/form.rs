@@ -104,6 +104,7 @@ impl ConnectForm {
         self.passphrase.clear();
         self.auth = AuthKind::Password;
         self.forward_agent = false;
+        self.forward_x11 = false;
         self.group.clear();
         self.tags.clear();
         self.use_jump = false;
@@ -137,6 +138,7 @@ impl ConnectForm {
             _ => AuthKind::Password,
         };
         self.forward_agent = c.forward_agent;
+        self.forward_x11 = c.forward_x11;
         self.group = c.group;
         self.tags = c.tags;
         self.use_jump = c.use_jump;
@@ -181,6 +183,7 @@ impl ConnectForm {
                 AuthKind::Password => "password".into(),
             },
             forward_agent: self.forward_agent,
+            forward_x11: self.forward_x11,
             password: self.password.clone(),
             key_path: self.key_path.trim().to_string(),
             passphrase: self.passphrase.clone(),
@@ -375,6 +378,7 @@ impl ConnectForm {
             label: self.name.trim().to_string(),
             jump,
             forward_agent: self.forward_agent,
+            forward_x11: self.forward_x11,
             transport: crate::proto::Transport::Ssh,
         })
     }

@@ -167,10 +167,22 @@ pub(super) fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> Te
         color: fg,
         ..Default::default()
     };
-    if c.underline() {
-        f.underline = Stroke::new(1.0, fg);
+    if c.underline() || c.double_underline() {
+        let w = if c.double_underline() { 2.0 } else { 1.0 };
+        f.underline = Stroke::new(w, fg);
     }
     f
+}
+
+/// 闪烁相位：约 2Hz；用于 SGR 5/6。
+pub(super) fn blink_phase_visible() -> bool {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        / 500)
+        % 2
+        == 0
 }
 
 /// 按比例调整 RGB（用于 bold 提亮 / dim 变暗），保持 alpha。

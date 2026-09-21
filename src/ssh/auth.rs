@@ -27,6 +27,10 @@ pub(crate) struct ClientHandler {
     decision_rx: HostKeyDecision,
     /// 是否转发本机 ssh-agent：为真时桥接远端回连的 auth-agent 通道到本地 agent
     agent_forward: bool,
+    /// 是否转发本机 X11：为真时桥接远端回连的 x11 通道到本地 DISPLAY unix socket
+    x11_forward: bool,
+    /// 本机 X11 unix socket（如 `/tmp/.X11-unix/X0`）；`x11_forward` 为真且解析成功时有值
+    x11_sock: Option<std::path::PathBuf>,
     /// 是否把本机 AI/MCP 控制 socket 反向转发到这台远端主机
     /// （远端能连到转发出来的 socket，等于能控制本机 iShell）
     mcp_forward: bool,
@@ -224,6 +228,28 @@ impl Handler for ClientHandler {
                     log::debug!("agent 转发桥接结束：{e}");
                 }
             });
+        }
+        Ok(())
+    }
+
+    // 远端 X11 客户端连上时，服务器经此打开 x11 通道；桥到本机 DISPLAY 的 unix socket。
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if self.x11_forward {
+            if let Some(sock) = self.x11_sock.clone() {
+                tokio::spawn(async move {
+                    if let Err(e) = bridge_local_x11(channel, sock).await {
+                        log::debug!("X11 转发桥接结束：{e}");
+                    }
+                });
+            } else {
+                log::debug!("X11 转发已请求但本机 DISPLAY socket 不可用，忽略回连通道");
+            }
         }
         Ok(())
     }
@@ -664,6 +690,88 @@ async fn bridge_local_agent(channel: Channel<client::Msg>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// 解析 `DISPLAY` → `(协议, cookie, screen, unix socket 路径)`。
+/// 仅支持本机 unix domain（`:N` / `:N.M`）；TCP DISPLAY 暂不桥接。
+fn resolve_local_x11() -> Option<(String, String, u32, std::path::PathBuf)> {
+    #[cfg(not(unix))]
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let display = std::env::var("DISPLAY").ok()?;
+        let (disp_n, screen) = parse_x11_display(&display)?;
+        // 仅 unix socket：`DISPLAY` 以 `:` 开头，或含 `/unix`
+        let unix_ok = display.starts_with(':')
+            || display.contains("/unix:")
+            || display.starts_with("unix:");
+        if !unix_ok {
+            // `hostname:0` 也可能是本地；仍尝试 unix socket 路径
+            log::debug!("DISPLAY={display} 非纯 unix 形式，仍尝试 /tmp/.X11-unix/X{disp_n}");
+        }
+        let sock = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{disp_n}"));
+        if !sock.exists() {
+            return None;
+        }
+        let (proto, cookie) = x11_mit_cookie(&display)?;
+        Some((proto, cookie, screen, sock))
+    }
+}
+
+/// `DISPLAY` 形如 `:0` / `:0.1` / `host:10.0` → `(display_number, screen)`。
+fn parse_x11_display(display: &str) -> Option<(u32, u32)> {
+    let rest = display.rsplit_once(':').map(|(_, r)| r)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut parts = rest.split('.');
+    let n: u32 = parts.next()?.parse().ok()?;
+    let screen: u32 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((n, screen))
+}
+
+/// 从 `xauth list $DISPLAY` 取 MIT-MAGIC-COOKIE-1。
+fn x11_mit_cookie(display: &str) -> Option<(String, String)> {
+    let out = std::process::Command::new("xauth")
+        .args(["list", display])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 {
+            let proto = parts[parts.len() - 2];
+            let cookie = parts[parts.len() - 1];
+            if cookie.chars().all(|c| c.is_ascii_hexdigit()) && cookie.len() >= 16 {
+                return Some((proto.to_string(), cookie.to_string()));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+async fn bridge_local_x11(
+    channel: Channel<client::Msg>,
+    sock: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let mut remote = channel.into_stream();
+    let mut local = tokio::net::UnixStream::connect(&sock).await?;
+    tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn bridge_local_x11(
+    _channel: Channel<client::Msg>,
+    _sock: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    anyhow::bail!("X11 转发仅支持 Unix")
+}
+
 /// 把一条反向转发来的通道桥接到本机 AI/MCP 控制 socket（每进程一份
 /// `~/.config/ishell/mcp-<pid>.sock`）。MCP 本地 IPC 建立在 Unix domain socket 上，
 /// 目前只支持 unix 平台；Windows 上直接报错（不静默丢弃这条转发通道）。
@@ -783,12 +891,34 @@ pub(super) async fn connect(
     let decision_rx: HostKeyDecision = Arc::new(tokio::sync::Mutex::new(hostkey_rx));
     let remote_fwds: RemoteFwdTable = Arc::new(Mutex::new(HashMap::new()));
 
+    let (x11_forward, x11_sock) = if cfg.forward_x11 {
+        match resolve_local_x11() {
+            Some((_proto, _cookie, _screen, sock)) => (true, Some(sock)),
+            None => {
+                sink.send(WorkerEvent::Status(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => {
+                        "已开启 X11 转发，但本机 DISPLAY/xauth 不可用，将跳过".into()
+                    }
+                    crate::i18n::Lang::En => {
+                        "X11 forwarding enabled, but local DISPLAY/xauth unavailable; skipping"
+                            .into()
+                    }
+                }));
+                (false, None)
+            }
+        }
+    } else {
+        (false, None)
+    };
+
     let target_handler = ClientHandler {
         host: cfg.host.clone(),
         port: cfg.port,
         sink: sink.clone(),
         decision_rx: decision_rx.clone(),
         agent_forward: cfg.forward_agent,
+        x11_forward,
+        x11_sock,
         // cfg!(unix)：与 ssh/mod.rs 里那个反向转发任务保持同一条件——Windows 上没有
         // 监听方，转发出去的 socket 后面空无一人。
         mcp_forward: cfg!(unix) && crate::store::load_mcp_consent(),
@@ -853,11 +983,13 @@ pub(super) async fn connect(
     Ok((handle, jump_keep, remote_fwds))
 }
 
-/// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发。
+/// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发；
+/// `forward_x11` 为真时请求 X11 转发（本机 DISPLAY + xauth cookie）。
 /// `cols`/`rows` 用 UI 上报的真实窗口尺寸，避免先以 80×24 起 shell 再 resize 闪屏。
 pub(super) async fn open_shell(
     handle: &Handle<ClientHandler>,
     forward_agent: bool,
+    forward_x11: bool,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<russh::Channel<client::Msg>> {
@@ -893,6 +1025,16 @@ pub(super) async fn open_shell(
     // 才输出 SGR 38;2 / 48;2；仅 PTY 类型 xterm-256color 不足以开启 24 位色。
     let _ = channel.set_env(false, "TERM", "xterm-256color").await;
     let _ = channel.set_env(false, "COLORTERM", "truecolor").await;
+    if forward_x11 {
+        if let Some((proto, cookie, screen, _)) = resolve_local_x11() {
+            if let Err(e) = channel
+                .request_x11(false, false, proto, cookie, screen)
+                .await
+            {
+                log::debug!("request_x11 失败：{e}");
+            }
+        }
+    }
     channel.request_shell(false).await?;
     Ok(channel)
 }
@@ -1090,5 +1232,14 @@ mod tests {
         assert!(!should_autofill_kbd_password(false, &[true]));
         assert!(!should_autofill_kbd_password(false, &[]));
         assert!(!should_autofill_kbd_password(false, &[false, true]));
+    }
+
+    #[test]
+    fn parse_x11_display_variants() {
+        assert_eq!(super::parse_x11_display(":0"), Some((0, 0)));
+        assert_eq!(super::parse_x11_display(":0.1"), Some((0, 1)));
+        assert_eq!(super::parse_x11_display("localhost:10.0"), Some((10, 0)));
+        assert_eq!(super::parse_x11_display("unix:1"), Some((1, 0)));
+        assert_eq!(super::parse_x11_display("nodisplay"), None);
     }
 }

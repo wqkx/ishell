@@ -5,8 +5,8 @@ use egui::{Color32, FontId, Rect, Response, Stroke, Vec2};
 use super::{
     osc::open_url,
     paint::{
-        cell_format, find_row_urls, highlight_colors, paint_row_backgrounds, row_content_hash,
-        vt_color,
+        blink_phase_visible, cell_format, find_row_urls, highlight_colors, paint_row_backgrounds,
+        row_content_hash, vt_color,
     },
     theme::TermColors,
     Terminal,
@@ -105,6 +105,20 @@ impl Terminal {
                         url.clone(),
                     ));
                 }
+                // OSC 8 显式超链接（绝对行 → 当前视图行）
+                let abs = view_top + row as usize;
+                for (a, sc, ec, url) in &self.osc8_spans {
+                    if *a != abs {
+                        continue;
+                    }
+                    let x0 = origin.x + *sc as f32 * char_w;
+                    let x1 = origin.x + (*ec as f32 + 1.0) * char_w;
+                    let y = origin.y + row as f32 * char_h;
+                    link_rects.push((
+                        Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)),
+                        url.clone(),
+                    ));
+                }
             }
         }
         let hover_pos = ui
@@ -178,36 +192,50 @@ impl Terminal {
                 if s.is_empty() {
                     continue;
                 }
+                // SGR 5/6 闪烁：半周期不画字（下划线/删除线仍画，避免格子「空跳」难看）
+                let hide_glyph = c.blink() && !blink_phase_visible();
                 let fmt = cell_format(c, font, &tc);
                 let color = hl.get(col as usize).copied().flatten().unwrap_or(fmt.color);
                 let x = origin.x + col as f32 * char_w;
-                if c.is_wide() {
-                    // 全角字符（中文等）占 2 格：在两格内水平+纵向居中。
-                    // 用反向放大的字号抵消 CJK 后备字体的全局缩小（CJK_SCALE），
-                    // 让全角字以原始大小填满更多两格空间，减小字间距；行高 1.2× 留白足以容纳。
-                    let wfont = FontId::monospace(self.font_size / crate::theme::CJK_SCALE);
-                    painter.text(
-                        egui::pos2(x + char_w, y + char_h / 2.0),
-                        egui::Align2::CENTER_CENTER,
-                        s,
-                        wfont,
-                        color,
-                    );
-                } else {
-                    // 半角字符：纵向居中，使 1.2× 行高的额外留白上下均分
-                    painter.text(
-                        egui::pos2(x, y + char_h / 2.0),
-                        egui::Align2::LEFT_CENTER,
-                        s,
-                        font.clone(),
-                        color,
-                    );
+                let cell_w = if c.is_wide() { 2.0 * char_w } else { char_w };
+                if !hide_glyph {
+                    if c.is_wide() {
+                        let wfont = FontId::monospace(self.font_size / crate::theme::CJK_SCALE);
+                        painter.text(
+                            egui::pos2(x + char_w, y + char_h / 2.0),
+                            egui::Align2::CENTER_CENTER,
+                            s,
+                            wfont,
+                            color,
+                        );
+                    } else {
+                        painter.text(
+                            egui::pos2(x, y + char_h / 2.0),
+                            egui::Align2::LEFT_CENTER,
+                            s,
+                            font.clone(),
+                            color,
+                        );
+                    }
                 }
                 if fmt.underline.width > 0.0 {
-                    // 下划线落在居中字形的底部附近
                     let uy = y + (char_h + glyph_h) / 2.0 - 1.0;
-                    let w = if c.is_wide() { 2.0 * char_w } else { char_w };
-                    painter.hline(x..=(x + w), uy, fmt.underline);
+                    painter.hline(x..=(x + cell_w), uy, fmt.underline);
+                    if c.double_underline() {
+                        painter.hline(
+                            x..=(x + cell_w),
+                            uy + 2.0,
+                            Stroke::new(1.0, fmt.underline.color),
+                        );
+                    }
+                }
+                if c.strikethrough() {
+                    let mid = y + char_h / 2.0;
+                    painter.hline(
+                        x..=(x + cell_w),
+                        mid,
+                        Stroke::new(1.0, color),
+                    );
                 }
             }
         }
@@ -347,6 +375,21 @@ impl Terminal {
                 egui::Color32::from_rgb(179, 173, 159)
             };
             painter.rect_filled(handle, 3.0, col);
+        }
+
+        // SGR 闪烁：有任一可见闪烁格时按半周期重绘
+        let mut any_blink = false;
+        'blink: for row in 0..self.rows {
+            for col in 0..self.cols {
+                if screen.cell(row, col).is_some_and(|c| c.blink()) {
+                    any_blink = true;
+                    break 'blink;
+                }
+            }
+        }
+        if any_blink {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
 }

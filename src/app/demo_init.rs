@@ -40,6 +40,7 @@ impl App {
                             })
                         }),
                         forward_agent: false,
+                        forward_x11: false,
                         transport: crate::proto::Transport::Ssh,
                     });
                 }
@@ -260,6 +261,7 @@ impl App {
                     label: String::new(),
                     jump: None,
                     forward_agent: false,
+                    forward_x11: false,
                     transport: crate::proto::Transport::Ssh,
                 });
             }

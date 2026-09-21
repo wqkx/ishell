@@ -76,6 +76,7 @@ impl ConnectForm {
             });
 
         self.forward_agent_section(ui);
+        self.forward_x11_section(ui);
         self.jump_host_section(ui, w);
         if let Some(msg) = &self.notice {
             ui.add_space(6.0);
@@ -144,6 +145,28 @@ impl ConnectForm {
                 RichText::new(crate::i18n::tr(
                     "⚠ 风险：远端任意进程可使用本机 agent 中的全部私钥，等同于把本地身份交给该主机。",
                     "⚠ Risk: any remote process can use every key in your local agent — equivalent to handing your local identity to that host.",
+                ))
+                .color(Palette::DANGER)
+                .size(11.0),
+            );
+        }
+    }
+
+    fn forward_x11_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut self.forward_x11,
+            crate::i18n::tr("转发本机 X11（-Y）", "Forward X11 (-Y)"),
+        )
+        .on_hover_text(crate::i18n::tr(
+            "让远端图形程序画到本机 DISPLAY；使用本机 xauth cookie（信任式）。需本机有 DISPLAY 与 xauth。",
+            "Lets remote GUI apps draw on your local DISPLAY using your xauth cookie (trusted). Requires DISPLAY and xauth locally.",
+        ));
+        if self.forward_x11 {
+            ui.label(
+                RichText::new(crate::i18n::tr(
+                    "⚠ 风险：远端可连接本机 X 服务器（读键鼠/截屏等）；仅在信任的主机上开启。",
+                    "⚠ Risk: the remote host can connect to your local X server (keystrokes/screenshots); enable only on trusted hosts.",
                 ))
                 .color(Palette::DANGER)
                 .size(11.0),

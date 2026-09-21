@@ -1297,11 +1297,19 @@ impl Screen {
                 [2] => self.attrs.set_dim(),
                 [3] => self.attrs.set_italic(true),
                 [4] => self.attrs.set_underline(true),
+                [5] | [6] => self.attrs.set_blink(true), // 慢/快闪烁
                 [7] => self.attrs.set_inverse(true),
+                [9] => self.attrs.set_strikethrough(true),
+                [21] => self.attrs.set_double_underline(true),
                 [22] => self.attrs.set_normal_intensity(),
                 [23] => self.attrs.set_italic(false),
-                [24] => self.attrs.set_underline(false),
+                [24] => {
+                    self.attrs.set_underline(false);
+                    self.attrs.set_double_underline(false);
+                }
+                [25] => self.attrs.set_blink(false),
                 [27] => self.attrs.set_inverse(false),
+                [29] => self.attrs.set_strikethrough(false),
                 [n] if (30..=37).contains(n) => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }

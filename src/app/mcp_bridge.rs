@@ -433,6 +433,7 @@ fn connect_config_from_saved(c: &SavedConnection) -> Result<ConnectConfig, Strin
         label: c.name.clone(),
         jump,
         forward_agent: c.forward_agent,
+        forward_x11: c.forward_x11,
         transport: crate::proto::Transport::Ssh,
     })
 }

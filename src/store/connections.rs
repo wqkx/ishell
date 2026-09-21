@@ -19,6 +19,9 @@ pub struct SavedConnection {
     /// 转发本机 ssh-agent（-A）
     #[serde(default)]
     pub forward_agent: bool,
+    /// 转发本机 X11（-Y 信任 cookie）
+    #[serde(default)]
+    pub forward_x11: bool,
     #[serde(default)]
     pub password: String,
     #[serde(default)]
@@ -426,6 +429,7 @@ fn parse_ssh_config_text(text: &str, default_user: &str) -> Vec<SavedConnection>
             },
             auth_kind,
             forward_agent: false,
+            forward_x11: false,
             password: String::new(),
             key_path,
             passphrase: String::new(),

@@ -29,6 +29,8 @@ pub struct ConnectConfig {
     pub jump: Option<JumpHost>,
     /// 转发本机 ssh-agent（OpenSSH 的 `-A`）：远端进程可复用本机 agent 私钥
     pub forward_agent: bool,
+    /// 转发本机 X11（OpenSSH 的 `-Y` 信任式）：远端图形程序可画到本机 DISPLAY
+    pub forward_x11: bool,
     /// 传输类型（默认 SSH）。为 `Local` 时忽略上面所有 SSH 专有字段，改由本机 PTY worker 处理。
     pub transport: Transport,
 }
@@ -48,6 +50,7 @@ impl ConnectConfig {
             label: crate::i18n::tr("本机", "Local").into(),
             jump: None,
             forward_agent: false,
+            forward_x11: false,
             transport: Transport::Local,
         }
     }

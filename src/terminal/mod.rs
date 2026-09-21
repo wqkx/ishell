@@ -227,6 +227,12 @@ pub struct Terminal {
     hl_cache: std::collections::HashMap<u64, Vec<Option<egui::Color32>>>,
     /// 终端查询序列可能跨 SSH 数据块；暂存尚不能确定是否为完整查询的短尾。
     query_tail: Vec<u8>,
+    /// OSC 8 当前激活的超链接 URL（`ESC]8;;urlST` … `ESC]8;;ST` 之间）。
+    osc8_url: Option<String>,
+    /// 当前链接起点：`(历史绝对行, 列)`。结束或切换时与当前光标收成 `osc8_spans`。
+    osc8_anchor: Option<(usize, u16)>,
+    /// 已闭合的 OSC 8 区间：`(绝对行, 起始列, 结束列含, url)`，供点击打开。
+    osc8_spans: Vec<(usize, u16, u16, String)>,
     /// 结尾停在一条**未完成 CSI**（`ESC [` 还没等到终结字节）时暂存的那几个字节，下一块拼回前面。
     ///
     /// 与 `utf8_pending` 同类：这是**真的从字节流里扣下来**的，不是副本。vt100 自己能处理被切断的
@@ -344,6 +350,9 @@ impl Terminal {
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
             query_tail: Vec::new(),
+            osc8_url: None,
+            osc8_anchor: None,
+            osc8_spans: Vec::new(),
             csi_pending: Vec::new(),
             sync_buf: Vec::new(),
             sync_active: false,

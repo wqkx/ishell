@@ -176,4 +176,22 @@ impl Cell {
     pub fn inverse(&self) -> bool {
         self.attrs.inverse()
     }
+
+    /// Returns whether the cell should blink.
+    #[must_use]
+    pub fn blink(&self) -> bool {
+        self.attrs.blink()
+    }
+
+    /// Returns whether the cell should be rendered struck through.
+    #[must_use]
+    pub fn strikethrough(&self) -> bool {
+        self.attrs.strikethrough()
+    }
+
+    /// Returns whether the cell should use a double underline.
+    #[must_use]
+    pub fn double_underline(&self) -> bool {
+        self.attrs.double_underline()
+    }
 }

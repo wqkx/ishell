@@ -35,6 +35,88 @@ enum ReplyKind {
     Da,
 }
 
+/// 控制流切分事件：CSI 查询应答，或 OSC 8 超链接起止。
+enum StreamEvent {
+    Query { at: usize, kind: ReplyKind, len: usize },
+    Osc8 { at: usize, len: usize, url: Option<String> },
+}
+
+fn find_next_osc8(hay: &[u8]) -> Option<(usize, usize, Option<String>)> {
+    // `find_sub_outside_string_escapes` 在跳过 OSC 前会先匹配 needle，故能命中 `ESC]8;`。
+    let at = find_sub_outside_string_escapes(hay, b"\x1b]8;")?;
+    let body = at + 4; // 过 `ESC]8;`
+    // 参数段到下一个 `;`，其后是 URI（空 URI = 结束链接）
+    let semi_rel = hay[body..].iter().position(|&b| b == b';')?;
+    let uri_at = body + semi_rel + 1;
+    let mut end = uri_at;
+    while end < hay.len() {
+        if hay[end] == 0x07 {
+            let uri = &hay[uri_at..end];
+            let url = if uri.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(uri).into_owned())
+            };
+            return Some((at, end + 1 - at, url));
+        }
+        if hay[end] == 0x1b && hay.get(end + 1) == Some(&b'\\') {
+            let uri = &hay[uri_at..end];
+            let url = if uri.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(uri).into_owned())
+            };
+            return Some((at, end + 2 - at, url));
+        }
+        end += 1;
+    }
+    None // 未终止
+}
+
+fn find_next_stream_event(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<StreamEvent> {
+    let q = find_next_query(hay, queries);
+    let o = find_next_osc8(hay);
+    match (q, o) {
+        (None, None) => None,
+        (Some((at, kind, len)), None) => Some(StreamEvent::Query { at, kind, len }),
+        (None, Some((at, len, url))) => Some(StreamEvent::Osc8 { at, len, url }),
+        (Some((qa, kind, len)), Some((oa, olen, url))) => {
+            if qa <= oa {
+                Some(StreamEvent::Query {
+                    at: qa,
+                    kind,
+                    len,
+                })
+            } else {
+                Some(StreamEvent::Osc8 {
+                    at: oa,
+                    len: olen,
+                    url,
+                })
+            }
+        }
+    }
+}
+
+/// `rest` 末尾若是查询或 OSC 8 的真前缀 / 未终止序列，暂存起来等下一包拼完。
+fn incomplete_stream_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize {
+    let mut keep = incomplete_query_keep(rest, queries);
+    // 完整 OSC 8 已被消费；这里只处理「看得见开头但没收尾」或「半截前缀」。
+    if find_next_osc8(rest).is_none() {
+        if let Some(at) = find_sub_outside_string_escapes(rest, b"\x1b]8;") {
+            keep = keep.max(rest.len() - at);
+        } else {
+            const P: &[u8] = b"\x1b]8;";
+            for n in 1..P.len() {
+                if rest.ends_with(&P[..n]) {
+                    keep = keep.max(n);
+                }
+            }
+        }
+    }
+    keep
+}
+
 /// 在 `hay` 里找最早出现的查询；同起点取更长匹配（`ESC[0c` 优先于 `ESC[c`）。
 /// 在 OSC/DCS 负载内的同款字节不算——见 `find_sub_outside_string_escapes`。
 fn find_next_query(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<(usize, ReplyKind, usize)> {
@@ -72,6 +154,7 @@ impl Terminal {
     /// - DSR `CSI 6 n` → CPR（Codex inline viewport 等依赖）
     /// - DSR `CSI 5 n` → `CSI 0 n`（终端就绪）
     /// - DA  `CSI c` / `CSI 0 c` → `CSI ? 1 ; 2 c`（VT100 + AVO；现代 TUI 探测用）
+    /// - OSC 8 超链接：不喂给 vt100，按光标区间记入 `osc8_spans` 供点击
     ///
     /// 查询必须与输出严格按序处理，不能整批 process 完后才读光标。
     fn process_with_replies(&mut self, bytes: &[u8]) -> Vec<u8> {
@@ -88,25 +171,90 @@ impl Terminal {
         let mut replies = Vec::new();
         let mut pos = 0;
 
-        while let Some((at, kind, qlen)) = find_next_query(&data[pos..], QUERIES) {
-            let query_at = pos + at;
-            self.parser.process(&data[pos..query_at]);
-            match kind {
-                ReplyKind::Cpr => {
-                    let (row, col) = self.parser.screen().cursor_position();
-                    replies.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+        while let Some(ev) = find_next_stream_event(&data[pos..], QUERIES) {
+            match ev {
+                StreamEvent::Query { at, kind, len } => {
+                    let query_at = pos + at;
+                    self.parser.process(&data[pos..query_at]);
+                    match kind {
+                        ReplyKind::Cpr => {
+                            let (row, col) = self.parser.screen().cursor_position();
+                            replies.extend_from_slice(
+                                format!("\x1b[{};{}R", row + 1, col + 1).as_bytes(),
+                            );
+                        }
+                        ReplyKind::DsrOk => replies.extend_from_slice(b"\x1b[0n"),
+                        ReplyKind::Da => replies.extend_from_slice(b"\x1b[?1;2c"),
+                    }
+                    pos = query_at + len;
                 }
-                ReplyKind::DsrOk => replies.extend_from_slice(b"\x1b[0n"),
-                ReplyKind::Da => replies.extend_from_slice(b"\x1b[?1;2c"),
+                StreamEvent::Osc8 { at, len, url } => {
+                    let osc_at = pos + at;
+                    self.parser.process(&data[pos..osc_at]);
+                    self.apply_osc8(url);
+                    pos = osc_at + len;
+                }
             }
-            pos = query_at + qlen;
         }
 
         let rest = &data[pos..];
-        let keep = incomplete_query_keep(rest, QUERIES);
+        let keep = incomplete_stream_keep(rest, QUERIES);
         self.parser.process(&rest[..rest.len() - keep]);
         self.query_tail.extend_from_slice(&rest[rest.len() - keep..]);
         replies
+    }
+
+    /// OSC 8：开始/切换链接时记下光标锚点；结束（空 URI）或切换时把锚点→当前光标收成绝对行区间。
+    fn apply_osc8(&mut self, url: Option<String>) {
+        self.finish_osc8_span();
+        if let Some(u) = url {
+            if u.is_empty() {
+                self.osc8_url = None;
+                self.osc8_anchor = None;
+                return;
+            }
+            let (row, col) = self.parser.screen().cursor_position();
+            let abs = self.parser.screen().scrollback_total() + row as usize;
+            self.osc8_url = Some(u);
+            self.osc8_anchor = Some((abs, col));
+        } else {
+            self.osc8_url = None;
+            self.osc8_anchor = None;
+        }
+    }
+
+    fn finish_osc8_span(&mut self) {
+        let Some(url) = self.osc8_url.clone() else {
+            return;
+        };
+        let Some((start_abs, start_col)) = self.osc8_anchor else {
+            return;
+        };
+        let (er, ec) = self.parser.screen().cursor_position();
+        let end_abs = self.parser.screen().scrollback_total() + er as usize;
+        if end_abs < start_abs || (end_abs == start_abs && ec <= start_col) {
+            self.osc8_anchor = None;
+            return;
+        }
+        let cols = self.cols;
+        for abs in start_abs..=end_abs {
+            let sc = if abs == start_abs { start_col } else { 0 };
+            let ec = if abs == end_abs {
+                ec.saturating_sub(1) // 光标在下一格；区间含已写单元格
+            } else {
+                cols.saturating_sub(1)
+            };
+            if ec >= sc {
+                self.osc8_spans.push((abs, sc, ec, url.clone()));
+            }
+        }
+        // 容量封顶，丢掉最旧的
+        const CAP: usize = 256;
+        if self.osc8_spans.len() > CAP {
+            let drop = self.osc8_spans.len() - CAP;
+            self.osc8_spans.drain(..drop);
+        }
+        self.osc8_anchor = None;
     }
 
     /// 推进 AI 命令捕获：追加本块字节，再按模式判定「命令是否已结束」。
@@ -534,6 +682,9 @@ impl Terminal {
                 // 与 resize 重建同理：内容坐标体系已换，旧选区绝对行失效 → 复制会错位
                 self.sel_anchor = None;
                 self.sel_cursor = None;
+                self.osc8_spans.clear();
+                self.osc8_url = None;
+                self.osc8_anchor = None;
                 replies.extend(self.process_with_replies(after));
                 self.parser.process(&restore);
                 return replies;
@@ -761,6 +912,9 @@ impl Terminal {
             self.sel_anchor = None;
             self.sel_cursor = None;
             self.search_hl = None;
+            self.osc8_spans.clear();
+            self.osc8_url = None;
+            self.osc8_anchor = None;
         }
         true
     }

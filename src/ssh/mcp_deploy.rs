@@ -184,6 +184,7 @@ mod live_deploy_tests {
             label: "live-deploy-test".into(),
             jump: None,
             forward_agent: false,
+            forward_x11: false,
             transport: Transport::default(),
         })
     }

@@ -129,7 +129,7 @@ pub async fn run(
         crate::pty_size::resolve_initial_pty_size(&mut cmd_rx).await;
 
     // 1) 交互式 shell 通道
-    let mut shell = match open_shell(&handle, cfg.forward_agent, pty_cols, pty_rows).await {
+    let mut shell = match open_shell(&handle, cfg.forward_agent, cfg.forward_x11, pty_cols, pty_rows).await {
         Ok(c) => c,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {

@@ -1871,3 +1871,39 @@ fn interleaved_plain_segments_and_frames_apply_in_order() {
         "交错段落的生效顺序乱了：{history:?}"
     );
 }
+
+#[test]
+fn sgr_blink_strikethrough_double_underline() {
+    let mut p = vt100::Parser::new(5, 40, 0);
+    p.process(b"\x1b[5mB\x1b[0m\x1b[9mS\x1b[0m\x1b[21mD");
+    let s = p.screen();
+    assert!(s.cell(0, 0).unwrap().blink());
+    assert!(s.cell(0, 1).unwrap().strikethrough());
+    assert!(s.cell(0, 2).unwrap().double_underline());
+    assert!(s.cell(0, 2).unwrap().underline());
+}
+
+#[test]
+fn osc8_hyperlink_span_and_split_across_feeds() {
+    let mut t = Terminal::new();
+    // 标准 OSC 8：开始 → 文本 → 结束
+    t.feed(b"\x1b]8;;https://example.com\x07click\x1b]8;;\x07");
+    assert_eq!(t.osc8_spans.len(), 1);
+    let (abs, sc, ec, url) = &t.osc8_spans[0];
+    assert_eq!(url, "https://example.com");
+    assert_eq!(*abs, 0);
+    assert_eq!(*sc, 0);
+    assert_eq!(*ec, 4); // "click" 五列 0..=4
+    assert!(t.screen_text().contains("click"));
+    assert!(!t.screen_text().contains("example.com"));
+
+    // 跨包：半截 OSC 8 开头不应丢，拼完后生效
+    let mut t2 = Terminal::new();
+    t2.feed(b"\x1b]8;;https://a.co");
+    assert!(t2.osc8_spans.is_empty());
+    t2.feed(b"\x07hi\x1b]8;;\x07");
+    assert_eq!(t2.osc8_spans.len(), 1);
+    assert_eq!(t2.osc8_spans[0].3, "https://a.co");
+    assert_eq!(t2.osc8_spans[0].1, 0);
+    assert_eq!(t2.osc8_spans[0].2, 1); // "hi"
+}
