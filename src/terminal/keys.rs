@@ -386,6 +386,76 @@ pub(super) fn encode_mouse(
     }
 }
 
+/// 多键同持时的按钮状态：位图记哪些键还按着，`last` 记最近按下的基码（0/1/2），
+/// motion 用它——释放「正在上报」的那颗后改报仍按着的另一颗，而不是退回默认 3。
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct HeldButtons {
+    mask: u8,
+    last: u8,
+}
+
+impl HeldButtons {
+    pub(super) fn press(&mut self, base: u8) {
+        let base = base.min(2);
+        self.mask |= 1 << base;
+        self.last = base;
+    }
+
+    pub(super) fn release(&mut self, base: u8) {
+        let base = base.min(2);
+        self.mask &= !(1 << base);
+        if self.mask == 0 {
+            self.last = 3; // xterm：无键按住时 motion 用 3
+            return;
+        }
+        if self.last == base {
+            for b in 0u8..3 {
+                if self.mask & (1 << b) != 0 {
+                    self.last = b;
+                    break;
+                }
+            }
+        }
+    }
+
+    pub(super) fn any(&self) -> bool {
+        self.mask != 0
+    }
+
+    /// ButtonMotion / press-drag 用的基码；无键时 None。
+    pub(super) fn motion_base(&self) -> Option<u8> {
+        self.any().then_some(self.last.min(2))
+    }
+}
+
+#[cfg(test)]
+mod held_buttons_tests {
+    use super::HeldButtons;
+
+    #[test]
+    fn dual_hold_release_keeps_remaining_button() {
+        let mut h = HeldButtons::default();
+        h.press(0); // 左
+        h.press(2); // 右（后按，motion 跟右）
+        assert_eq!(h.motion_base(), Some(2));
+        h.release(2);
+        assert_eq!(h.motion_base(), Some(0), "松开后按的右键后应仍报左键");
+        h.release(0);
+        assert!(!h.any());
+        assert_eq!(h.motion_base(), None);
+    }
+
+    #[test]
+    fn release_non_last_keeps_last() {
+        let mut h = HeldButtons::default();
+        h.press(0);
+        h.press(1);
+        assert_eq!(h.motion_base(), Some(1));
+        h.release(0); // 松开较早的左键
+        assert_eq!(h.motion_base(), Some(1));
+    }
+}
+
 #[cfg(test)]
 mod encode_tests {
     use super::encode_key;

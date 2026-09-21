@@ -123,8 +123,13 @@ pub async fn run(
     };
     let handle = Arc::new(handle);
 
+    // 等 UI 上报真实窗口尺寸再开 PTY，避免 80×24 → 真尺寸的闪一下。
+    // 鉴权期间 layout 通常已把 Resize 打进通道；prelude 里其它命令主循环优先消化。
+    let (pty_cols, pty_rows, mut cmd_prelude) =
+        crate::pty_size::resolve_initial_pty_size(&mut cmd_rx).await;
+
     // 1) 交互式 shell 通道
-    let mut shell = match open_shell(&handle, cfg.forward_agent).await {
+    let mut shell = match open_shell(&handle, cfg.forward_agent, pty_cols, pty_rows).await {
         Ok(c) => c,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
@@ -370,7 +375,13 @@ pub async fn run(
                     _ => {}
                 }
             }
-            cmd = cmd_rx.recv() => {
+            cmd = async {
+                if let Some(c) = cmd_prelude.pop_front() {
+                    Some(c)
+                } else {
+                    cmd_rx.recv().await
+                }
+            } => {
                 match cmd {
                     Some(UiCommand::TerminalInput(bytes)) => {
                         if shell.data(&bytes[..]).await.is_err() {

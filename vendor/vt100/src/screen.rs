@@ -1174,6 +1174,11 @@ impl Screen {
                 [1006] => {
                     self.set_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
+                [1047] => {
+                    // 进备用屏（不清屏、不存光标）；老程序 / screen 用这条。
+                    self.enter_alternate_grid();
+                }
+                [1048] => self.decsc(),
                 [1049] => {
                     self.decsc();
                     self.alternate_grid.clear();
@@ -1215,6 +1220,12 @@ impl Screen {
                 [1006] => {
                     self.clear_mouse_encoding(MouseProtocolEncoding::Sgr);
                 }
+                [1047] => {
+                    // 退出备用屏并清空备用缓冲（xterm 行为）
+                    self.exit_alternate_grid();
+                    self.alternate_grid.clear();
+                }
+                [1048] => self.decrc(),
                 [1049] => {
                     self.exit_alternate_grid();
                     self.decrc();

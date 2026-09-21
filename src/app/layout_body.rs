@@ -221,7 +221,9 @@ impl App {
                     }
                 }
                 let size = s.terminal.size();
-                if size != s.last_size && s.connected {
+                // 未连上时也发一次 Resize（last_size 仍是 0×0）：worker 鉴权完就能按真
+                // 尺寸开 PTY，避免先 80×24 出提示符再撑开的闪一下。
+                if size != s.last_size && (s.connected || s.last_size == (0, 0)) {
                     s.last_size = size;
                     let _ = s.cmd_tx.send(UiCommand::Resize { cols: size.0, rows: size.1 });
                 }

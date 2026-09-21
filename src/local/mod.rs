@@ -18,11 +18,8 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize,
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::proto::{ConnectConfig, UiCommand, WorkerEvent};
+use crate::pty_size::{DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS};
 use crate::ssh::UiSink;
-
-/// 本机会话的初始 PTY 尺寸；UI 连接后会立即按真实窗口大小发一条 `Resize` 覆盖它。
-const INIT_COLS: u16 = 80;
-const INIT_ROWS: u16 = 24;
 
 /// worker 入口：起本地 PTY shell，桥接 UI 通道，直到 shell 退出或用户断开。
 pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, sink: UiSink) {
@@ -30,7 +27,10 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
         crate::i18n::tr("正在启动本机终端 …", "Starting local terminal …").into(),
     ));
 
-    let (master, mut child, out_rx, in_tx) = match spawn_pty() {
+    let (pty_cols, pty_rows, mut cmd_prelude) =
+        crate::pty_size::resolve_initial_pty_size(&mut cmd_rx).await;
+
+    let (master, mut child, out_rx, in_tx) = match spawn_pty(pty_cols, pty_rows) {
         Ok(v) => v,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
@@ -98,7 +98,13 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
                     Ok(None) | Err(_) => {}
                 }
             },
-            cmd = cmd_rx.recv() => match cmd {
+            cmd = async {
+                if let Some(c) = cmd_prelude.pop_front() {
+                    Some(c)
+                } else {
+                    cmd_rx.recv().await
+                }
+            } => match cmd {
                 Some(UiCommand::TerminalInput(bytes)) => {
                     // 写线程退出（PTY 关闭）时通道发送会失败——忽略即可，随后的 EOF 会收尾。
                     let _ = in_tx.send(bytes);
@@ -147,7 +153,10 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
 ///   下游 `recv()` 收到 `None`，据此判定 shell 已退出）。
 /// - 写线程：从 `in_rx` 收键盘字节，阻塞 `write_all`+`flush` 到 PTY；PTY 关闭即退出。
 #[allow(clippy::type_complexity)]
-fn spawn_pty() -> anyhow::Result<(
+fn spawn_pty(
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<(
     Box<dyn MasterPty + Send>,
     Box<dyn Child + Send + Sync>,
     UnboundedReceiver<Vec<u8>>,
@@ -155,10 +164,12 @@ fn spawn_pty() -> anyhow::Result<(
 )> {
     use std::io::{Read, Write};
 
+    let cols = if cols == 0 { DEFAULT_PTY_COLS } else { cols };
+    let rows = if rows == 0 { DEFAULT_PTY_ROWS } else { rows };
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
-        rows: INIT_ROWS,
-        cols: INIT_COLS,
+        rows,
+        cols,
         pixel_width: 0,
         pixel_height: 0,
     })?;
@@ -210,16 +221,59 @@ fn spawn_pty() -> anyhow::Result<(
     Ok((master, child, out_rx, in_tx))
 }
 
-/// 本机默认交互式 shell：unix 取 `$SHELL`（回退 `/bin/bash`），Windows 取 `%COMSPEC%`
-/// （回退 `powershell.exe`）。
+/// 本机默认交互式 shell：unix 取 `$SHELL`，不存在或不在白名单路径时依次试
+/// bash → zsh → sh；Windows 取 `%COMSPEC%`（回退 `powershell.exe`）。
 fn default_shell() -> String {
     #[cfg(unix)]
     {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
+        resolve_unix_shell()
     }
     #[cfg(windows)]
     {
         std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".into())
+    }
+}
+
+/// `$SHELL` 若指向存在的可执行文件就用它，否则沿 bash/zsh/sh 回退。
+#[cfg(unix)]
+fn resolve_unix_shell() -> String {
+    let candidates: Vec<String> = {
+        let mut v = Vec::new();
+        if let Ok(s) = std::env::var("SHELL") {
+            if !s.is_empty() {
+                v.push(s);
+            }
+        }
+        for p in ["/bin/bash", "/bin/zsh", "/bin/sh", "/usr/bin/bash", "/usr/bin/zsh", "/usr/bin/sh"]
+        {
+            v.push(p.into());
+        }
+        v
+    };
+    for c in &candidates {
+        if std::path::Path::new(c).is_file() {
+            return c.clone();
+        }
+    }
+    // 最后兜底：即使路径当前不可见（chroot/奇怪环境）也交给 spawn 报错。
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "/bin/sh".into())
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod shell_fallback_tests {
+    use super::resolve_unix_shell;
+
+    #[test]
+    fn resolves_to_an_existing_executable() {
+        let sh = resolve_unix_shell();
+        assert!(
+            std::path::Path::new(&sh).is_file(),
+            "应落到存在的 shell：{sh}"
+        );
     }
 }
 

@@ -14,6 +14,7 @@ mod local;
 mod mcp_embed;
 mod mcp_protocol;
 mod proto;
+mod pty_size;
 mod ssh;
 mod stall;
 mod store;

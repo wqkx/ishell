@@ -16,7 +16,7 @@ mod vt;
 mod default;
 
 use input::HistState;
-use keys::encode_mouse;
+use keys::{encode_mouse, HeldButtons};
 use search::{Find, FindAction};
 pub use theme::current_bg;
 use theme::{term_theme, TERM_THEMES};
@@ -144,8 +144,8 @@ pub struct Terminal {
     find: Option<Find>,
     /// 当前命中所在的屏幕行（高亮用）
     search_hl: Option<u16>,
-    /// 鼠标上报模式下当前按住的按钮基码（0=左 1=中 2=右），用于编码拖动事件
-    held_btn: Option<u8>,
+    /// 鼠标上报模式下当前按住的按钮（支持多键同持）
+    held_btns: HeldButtons,
     /// 跨数据块暂存的不完整 UTF-8 尾字节（避免多字节中文被拆分后乱码）
     utf8_pending: Vec<u8>,
     /// 跨数据块暂存的未终止字符串类转义序列（OSC/DCS…），供通知扫描拼接。
@@ -316,7 +316,7 @@ impl Terminal {
             paste_image: None,
             saw_text_paste: false,
             saw_v_press: false,
-            held_btn: None,
+            held_btns: HeldButtons::default(),
             utf8_pending: Vec::new(),
             notice_tail: Vec::new(),
             focus_req: false,
@@ -921,10 +921,10 @@ impl Terminal {
                             cb += 16;
                         }
                         if *pressed {
-                            self.held_btn = Some(base);
+                            self.held_btns.press(base);
                             encode_mouse(menc, cb, c, r, true, &mut mouse_out);
                         } else {
-                            self.held_btn = None;
+                            self.held_btns.release(base);
                             // X10(Press) 模式不上报释放；SGR 用原按钮码，传统编码用 3
                             if mmode != vt100::MouseProtocolMode::Press {
                                 let rel = if menc == vt100::MouseProtocolEncoding::Sgr {
@@ -939,12 +939,12 @@ impl Terminal {
                     egui::Event::PointerMoved(pos) if on_top(*pos) => {
                         let motion = mmode == vt100::MouseProtocolMode::AnyMotion
                             || (mmode == vt100::MouseProtocolMode::ButtonMotion
-                                && self.held_btn.is_some());
+                                && self.held_btns.any());
                         if motion {
                             let (r, c) = cell_at(*pos);
-                            // 移动事件同样要带上当前 alt/ctrl（vim Ctrl+拖拽等）；此前只用
-                            // held_btn 基码，修饰位全丢。
-                            let mut cb = 32 + self.held_btn.unwrap_or(3);
+                            // 移动事件同样要带上当前 alt/ctrl（vim Ctrl+拖拽等）；多键
+                            // 同持时用最近按下仍按住的基码，而不是单槽退回默认 3。
+                            let mut cb = 32 + self.held_btns.motion_base().unwrap_or(3);
                             if cur_mods.alt {
                                 cb += 8;
                             }

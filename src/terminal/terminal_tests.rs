@@ -622,6 +622,21 @@ fn entering_or_leaving_alt_screen_clears_selection() {
     assert!(t.sel_anchor.is_none() && t.sel_cursor.is_none());
 }
 
+/// DEC 1047/1048：老程序仍发这两条；此前 vendor 走 unhandled 空操作。
+#[test]
+fn dec_1047_and_1048_toggle_alt_and_cursor() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[10;20H"); // 主屏光标
+    let (r0, c0) = t.parser.screen().cursor_position();
+    t.feed(b"\x1b[?1048h\x1b[?1047h"); // 存光标 + 进备用屏
+    assert!(t.parser.screen().alternate_screen());
+    t.feed(b"\x1b[1;1H");
+    t.feed(b"\x1b[?1047l\x1b[?1048l"); // 出备用屏 + 恢复光标
+    assert!(!t.parser.screen().alternate_screen());
+    let (r1, c1) = t.parser.screen().cursor_position();
+    assert_eq!((r1, c1), (r0, c0), "1048 应恢复进备用屏前的光标");
+}
+
 #[test]
 fn top_anchored_scroll_region_writes_to_scrollback() {
     let mut t = Terminal::new();

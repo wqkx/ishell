@@ -787,9 +787,12 @@ pub(super) async fn connect(
 }
 
 /// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发。
+/// `cols`/`rows` 用 UI 上报的真实窗口尺寸，避免先以 80×24 起 shell 再 resize 闪屏。
 pub(super) async fn open_shell(
     handle: &Handle<ClientHandler>,
     forward_agent: bool,
+    cols: u16,
+    rows: u16,
 ) -> anyhow::Result<russh::Channel<client::Msg>> {
     // request_pty/request_shell 均为 &self，channel 之后按值返回，无需 mut
     let channel = handle.channel_open_session().await?;
@@ -798,8 +801,10 @@ pub(super) async fn open_shell(
     if forward_agent {
         let _ = channel.agent_forward(false).await;
     }
+    let cols = cols.max(1);
+    let rows = rows.max(1);
     channel
-        .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+        .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await?;
     // 请求 UTF-8 locale：否则远端 ls 等会把中文文件名转义成 $'\345\277...'。
     // 优先沿用本机已是 UTF-8 的 LANG（用户习惯的语言环境）；否则 C.UTF-8（比硬编码
