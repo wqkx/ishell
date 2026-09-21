@@ -63,7 +63,7 @@ impl Terminal {
             return;
         };
 
-        let lines = self.collect_lines();
+        let lines = self.collect_rows();
         // 命中用「历史绝对行」锚定（与选区同口径）：scrollback 满后修剪不减
         // scrollback_total，retained 下标会整体偏移，存 collect 下标会跳错行/高亮错位。
         let total = self.parser.screen().scrollback_total();
@@ -71,23 +71,23 @@ impl Terminal {
         let base = total.saturating_sub(kept);
         let mut hit_set = std::collections::BTreeSet::new();
         // 单行命中
-        for (i, l) in lines.iter().enumerate() {
+        for (i, (l, _)) in lines.iter().enumerate() {
             if re.is_match(l) {
                 hit_set.insert(base + i);
             }
         }
-        // 跨行：相邻两行无分隔拼接（软折行常见）+ 带 `\n` 拼接（硬换行 / 正则 `\n`）
+        // 跨行：仅软折行做无分隔拼接。硬换行只按 `\n` 拼接，避免「s」+「h」误中「sh」。
         for i in 0..lines.len().saturating_sub(1) {
-            let a = &lines[i];
-            let b = &lines[i + 1];
-            for sep in ["", "\n"] {
-                let joined = format!("{a}{sep}{b}");
-                if let Some(m) = re.find(&joined) {
-                    let boundary = a.len() + if sep.is_empty() { 0 } else { sep.len() };
-                    // 匹配真正跨过边界才算跨行命中（避免与单行重复计数逻辑依赖 set）
-                    if m.start() < a.len() && m.end() > boundary {
-                        hit_set.insert(base + i);
-                    }
+            let (a, wrapped) = &lines[i];
+            let (b, _) = &lines[i + 1];
+            let (joined, boundary) = if *wrapped {
+                (format!("{a}{b}"), a.len())
+            } else {
+                (format!("{a}\n{b}"), a.len() + 1)
+            };
+            if let Some(m) = re.find(&joined) {
+                if m.start() < a.len() && m.end() > boundary {
+                    hit_set.insert(base + i);
                 }
             }
         }

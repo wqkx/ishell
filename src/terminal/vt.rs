@@ -255,8 +255,44 @@ pub(super) fn incomplete_csi_tail(data: &[u8], cap: usize) -> Option<usize> {
                     return (data.len() - start <= cap).then_some(start);
                 }
             }
-            // 其余（OSC/DCS/ESC+单字节）不归这里管
-            _ => i += 2,
+            // OSC / DCS 负载里碰巧出现的 `ESC [` 不是 CSI。序列没结束就整段留给 vt100，
+            // 不能把负载尾部抠进 csi_pending，否则下一包会把它拼成真查询。
+            Some(b']') => {
+                i += 2;
+                let mut terminated = false;
+                while i < data.len() {
+                    if data[i] == 0x07 {
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if data[i] == 0x1b && data.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        terminated = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return None;
+                }
+            }
+            Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+                i += 2;
+                let mut terminated = false;
+                while i < data.len() {
+                    if data[i] == 0x1b && data.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        terminated = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return None;
+                }
+            }
+            Some(_) => i += 2,
         }
     }
     None
@@ -290,6 +326,8 @@ mod csi_tail_tests {
     fn osc_and_dcs_are_left_alone() {
         assert_eq!(incomplete_csi_tail(b"\x1b]9;hi", CAP), None);
         assert_eq!(incomplete_csi_tail(b"\x1bPtmux;", CAP), None);
+        // 负载内部的半截 CSI 也不能抠出来
+        assert_eq!(incomplete_csi_tail(b"\x1bPpayload\x1b[6", CAP), None);
     }
 
     /// 超过上限的长 CSI 不攒：识别 `ESC[2J`/`ESC[3J` 用不上，攒着只会无界增长。

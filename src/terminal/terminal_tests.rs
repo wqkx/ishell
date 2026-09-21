@@ -652,19 +652,53 @@ fn decawm_off_does_not_wrap_at_eol() {
     assert!(!last.is_empty(), "末列应有覆盖写入的字符");
 }
 
-/// 跨行搜索：匹配跨相邻两行的字面量。
+/// 跨行搜索：软折行无分隔拼接能命中；硬换行不能把行尾和行首粘成一个词。
 #[test]
-fn search_matches_across_line_boundary() {
+fn search_matches_across_soft_wrap_only() {
     let mut t = Terminal::new();
-    assert!(t.resize(40, 10));
-    t.feed(b"aaaHELLO\r\nWORLDbbb\r\n");
+    assert!(t.resize(8, 6));
+    // 8 列软折：aaaHELLO | WORLD
+    t.feed(b"aaaHELLOWORLD");
+    assert!(
+        t.parser.screen().row_wrapped(0),
+        "前提：第 0 行应是软折行"
+    );
     t.find = Some(search::Find {
         query: "HELLOWORLD".into(),
         ..Default::default()
     });
     t.run_search();
-    let hits = &t.find.as_ref().unwrap().hits;
-    assert!(!hits.is_empty(), "应命中跨行 HELLOWORLD");
+    assert!(
+        !t.find.as_ref().unwrap().hits.is_empty(),
+        "软折行应命中 HELLOWORLD"
+    );
+
+    let mut hard = Terminal::new();
+    assert!(hard.resize(40, 6));
+    hard.feed(b"aaaHELLO\r\nWORLDbbb\r\n");
+    assert!(!hard.parser.screen().row_wrapped(0));
+    hard.find = Some(search::Find {
+        query: "HELLOWORLD".into(),
+        ..Default::default()
+    });
+    hard.run_search();
+    assert!(
+        hard.find.as_ref().unwrap().hits.is_empty(),
+        "硬换行不应把两行粘成 HELLOWORLD"
+    );
+
+    let mut sh = Terminal::new();
+    assert!(sh.resize(40, 6));
+    sh.feed(b"ends\r\nhere\r\n");
+    sh.find = Some(search::Find {
+        query: "sh".into(),
+        ..Default::default()
+    });
+    sh.run_search();
+    assert!(
+        sh.find.as_ref().unwrap().hits.is_empty(),
+        "硬换行两侧的 s+h 不应命中 sh"
+    );
 }
 
 #[test]
@@ -1906,4 +1940,80 @@ fn osc8_hyperlink_span_and_split_across_feeds() {
     assert_eq!(t2.osc8_spans[0].3, "https://a.co");
     assert_eq!(t2.osc8_spans[0].1, 0);
     assert_eq!(t2.osc8_spans[0].2, 1); // "hi"
+}
+
+#[test]
+fn osc8_not_clickable_on_alternate_screen() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]8;;https://example.com\x07click\x1b]8;;\x07");
+    assert!(!t.osc8_links_for_row(0).is_empty());
+    t.feed(b"\x1b[?1049h");
+    assert!(
+        t.osc8_links_for_row(0).is_empty(),
+        "备用屏不应点到主屏 OSC 8"
+    );
+    t.feed(b"\x1b]8;;https://alt.example\x07vim\x1b]8;;\x07");
+    assert!(t.osc8_spans.iter().all(|s| s.3 != "https://alt.example"));
+    t.feed(b"\x1b[?1049l");
+    assert_eq!(t.osc8_links_for_row(0)[0].2, "https://example.com");
+}
+
+#[test]
+fn osc8_hard_newline_does_not_include_blanks_or_next_col0() {
+    let mut t = Terminal::new();
+    assert!(t.resize(20, 5));
+    t.feed(b"\x1b]8;;https://e.co\x07hi\r\n\x1b]8;;\x07");
+    assert_eq!(t.osc8_spans.len(), 1, "{:?}", t.osc8_spans);
+    let (abs, sc, ec, url) = &t.osc8_spans[0];
+    assert_eq!(url, "https://e.co");
+    assert_eq!(*abs, 0);
+    assert_eq!((*sc, *ec), (0, 1));
+}
+
+#[test]
+fn query_prefix_inside_dcs_is_not_a_cpr() {
+    let mut t = Terminal::new();
+    let r1 = t.feed(b"\x1bPpayload\x1b[6");
+    assert!(!is_cpr(&r1), "DCS 负载里的 ESC[6 不能进 query_tail：{r1:?}");
+    let r2 = t.feed(b"n\x1b\\OK\r\n");
+    assert!(!is_cpr(&r2), "拼上下一块的 n 也不能变成 CPR：{r2:?}");
+    assert!(t.screen_text().contains("OK"), "{}", t.screen_text());
+}
+
+fn is_cpr(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            if let Some(rel) = bytes[i + 2..].iter().position(|&b| b == b'R') {
+                let body = &bytes[i + 2..i + 2 + rel];
+                if !body.is_empty()
+                    && body.iter().all(|b| b.is_ascii_digit() || *b == b';')
+                    && body.contains(&b';')
+                {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[test]
+fn unterminated_osc8_does_not_swallow_following_output() {
+    let mut t = Terminal::new();
+    let mut buf = b"\x1b]8;".to_vec();
+    buf.extend(std::iter::repeat(b'A').take(2000));
+    buf.extend_from_slice(b"VISIBLE\r\n");
+    t.feed(&buf);
+    assert!(
+        t.screen_text().contains("VISIBLE"),
+        "缺分号的 OSC 8 不应扣住后续输出：{}",
+        t.screen_text()
+    );
+    assert!(
+        t.query_tail.len() <= 512,
+        "query_tail 不应无界增长：{}",
+        t.query_tail.len()
+    );
 }

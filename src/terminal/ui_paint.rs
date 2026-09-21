@@ -105,14 +105,10 @@ impl Terminal {
                         url.clone(),
                     ));
                 }
-                // OSC 8 显式超链接（绝对行 → 当前视图行）
-                let abs = view_top + row as usize;
-                for (a, sc, ec, url) in &self.osc8_spans {
-                    if *a != abs {
-                        continue;
-                    }
-                    let x0 = origin.x + *sc as f32 * char_w;
-                    let x1 = origin.x + (*ec as f32 + 1.0) * char_w;
+                // OSC 8 显式超链接（绝对行 → 当前视图行）。备用屏坐标对不上主屏，不画。
+                for (sc, ec, url) in self.osc8_links_for_row(row) {
+                    let x0 = origin.x + sc as f32 * char_w;
+                    let x1 = origin.x + (ec as f32 + 1.0) * char_w;
                     let y = origin.y + row as f32 * char_h;
                     link_rects.push((
                         Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + char_h)),

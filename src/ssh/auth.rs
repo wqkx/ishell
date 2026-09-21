@@ -27,10 +27,8 @@ pub(crate) struct ClientHandler {
     decision_rx: HostKeyDecision,
     /// 是否转发本机 ssh-agent：为真时桥接远端回连的 auth-agent 通道到本地 agent
     agent_forward: bool,
-    /// 是否转发本机 X11：为真时桥接远端回连的 x11 通道到本地 DISPLAY unix socket
-    x11_forward: bool,
-    /// 本机 X11 unix socket（如 `/tmp/.X11-unix/X0`）；`x11_forward` 为真且解析成功时有值
-    x11_sock: Option<std::path::PathBuf>,
+    /// X11 转发凭据。远端只拿到一次性假 cookie；回连时换成这里的真 cookie 再接本机 socket。
+    x11: X11Slot,
     /// 是否把本机 AI/MCP 控制 socket 反向转发到这台远端主机
     /// （远端能连到转发出来的 socket，等于能控制本机 iShell）
     mcp_forward: bool,
@@ -42,6 +40,16 @@ pub(crate) struct ClientHandler {
 /// 用户 `-R` 转发路由表（与 `ClientHandler` / `run_forward` 共享）。
 pub(super) type RemoteFwdTable =
     Arc<Mutex<HashMap<(String, u32), (String, u16)>>>;
+
+/// 本机 X11 转发材料。`fake` 发给远端，`real` 只留在本机，回连握手时替换。
+#[derive(Clone)]
+pub(super) struct X11Auth {
+    sock: std::path::PathBuf,
+    real: [u8; 16],
+    fake: [u8; 16],
+}
+
+pub(super) type X11Slot = Arc<Mutex<Option<X11Auth>>>;
 
 /// 用户主目录下的 known_hosts 路径（与 russh 内部一致）。
 fn known_hosts_file() -> anyhow::Result<std::path::PathBuf> {
@@ -240,16 +248,12 @@ impl Handler for ClientHandler {
         _originator_port: u32,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        if self.x11_forward {
-            if let Some(sock) = self.x11_sock.clone() {
-                tokio::spawn(async move {
-                    if let Err(e) = bridge_local_x11(channel, sock).await {
-                        log::debug!("X11 转发桥接结束：{e}");
-                    }
-                });
-            } else {
-                log::debug!("X11 转发已请求但本机 DISPLAY socket 不可用，忽略回连通道");
-            }
+        if let Some(auth) = self.x11.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            tokio::spawn(async move {
+                if let Err(e) = bridge_local_x11(channel, auth).await {
+                    log::debug!("X11 转发桥接结束：{e}");
+                }
+            });
         }
         Ok(())
     }
@@ -690,9 +694,9 @@ async fn bridge_local_agent(channel: Channel<client::Msg>) -> anyhow::Result<()>
     Ok(())
 }
 
-/// 解析 `DISPLAY` → `(协议, cookie, screen, unix socket 路径)`。
-/// 仅支持本机 unix domain（`:N` / `:N.M`）；TCP DISPLAY 暂不桥接。
-fn resolve_local_x11() -> Option<(String, String, u32, std::path::PathBuf)> {
+/// 解析本机 `DISPLAY` → `(screen, unix socket, 真 MIT cookie)`。
+/// 真 cookie 不离开本进程；发给远端的是一次性假 cookie。
+fn resolve_local_x11() -> Option<(u32, std::path::PathBuf, [u8; 16])> {
     #[cfg(not(unix))]
     {
         return None;
@@ -701,20 +705,12 @@ fn resolve_local_x11() -> Option<(String, String, u32, std::path::PathBuf)> {
     {
         let display = std::env::var("DISPLAY").ok()?;
         let (disp_n, screen) = parse_x11_display(&display)?;
-        // 仅 unix socket：`DISPLAY` 以 `:` 开头，或含 `/unix`
-        let unix_ok = display.starts_with(':')
-            || display.contains("/unix:")
-            || display.starts_with("unix:");
-        if !unix_ok {
-            // `hostname:0` 也可能是本地；仍尝试 unix socket 路径
-            log::debug!("DISPLAY={display} 非纯 unix 形式，仍尝试 /tmp/.X11-unix/X{disp_n}");
-        }
         let sock = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{disp_n}"));
         if !sock.exists() {
             return None;
         }
-        let (proto, cookie) = x11_mit_cookie(&display)?;
-        Some((proto, cookie, screen, sock))
+        let real = x11_mit_cookie(&display)?;
+        Some((screen, sock, real))
     }
 }
 
@@ -730,8 +726,41 @@ fn parse_x11_display(display: &str) -> Option<(u32, u32)> {
     Some((n, screen))
 }
 
-/// 从 `xauth list $DISPLAY` 取 MIT-MAGIC-COOKIE-1。
-fn x11_mit_cookie(display: &str) -> Option<(String, String)> {
+fn decode_hex_cookie(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn cookie_hex(c: &[u8; 16]) -> String {
+    c.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn random_x11_cookie() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if f.read_exact(&mut b).is_ok() {
+            return b;
+        }
+    }
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1);
+    for (i, slot) in b.iter_mut().enumerate() {
+        *slot = ((t >> (i * 5)) as u8).wrapping_add((i as u8).wrapping_mul(41));
+    }
+    b
+}
+
+/// 从 `xauth list $DISPLAY` 取 16 字节 MIT-MAGIC-COOKIE-1。
+fn x11_mit_cookie(display: &str) -> Option<[u8; 16]> {
     let out = std::process::Command::new("xauth")
         .args(["list", display])
         .output()
@@ -742,24 +771,117 @@ fn x11_mit_cookie(display: &str) -> Option<(String, String)> {
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let proto = parts[parts.len() - 2];
-            let cookie = parts[parts.len() - 1];
-            if cookie.chars().all(|c| c.is_ascii_hexdigit()) && cookie.len() >= 16 {
-                return Some((proto.to_string(), cookie.to_string()));
+        if parts.len() >= 3 && parts[parts.len() - 2] == "MIT-MAGIC-COOKIE-1" {
+            if let Some(cookie) = decode_hex_cookie(parts[parts.len() - 1]) {
+                return Some(cookie);
             }
         }
     }
     None
 }
 
+/// 生成假 cookie 写入 `slot`。返回 `(screen, 假 cookie 的十六进制)`，后者才是 `request_x11` 的载荷。
+fn install_fake_x11(slot: &X11Slot) -> Option<(u32, String)> {
+    let (screen, sock, real) = resolve_local_x11()?;
+    let mut fake = random_x11_cookie();
+    if fake == real {
+        fake[0] ^= 0xff;
+    }
+    let hex = cookie_hex(&fake);
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(X11Auth {
+        sock,
+        real,
+        fake,
+    });
+    Some((screen, hex))
+}
+
+fn x11_pad4(n: usize) -> usize {
+    (4 - (n % 4)) % 4
+}
+
+/// 把 X11 连接握手里的假 cookie 换成真 cookie。对不上假 cookie 就拒绝，不接到本机 X。
+fn rewrite_x11_client_prefix(
+    buf: &[u8],
+    fake: &[u8; 16],
+    real: &[u8; 16],
+) -> Result<Vec<u8>, &'static str> {
+    if buf.len() < 12 {
+        return Err("x11 prefix short");
+    }
+    let be = match buf[0] {
+        b'B' => true,
+        b'l' => false,
+        _ => return Err("x11 byte order"),
+    };
+    let u16_at = |off: usize| -> u16 {
+        let pair = [buf[off], buf[off + 1]];
+        if be {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        }
+    };
+    let name_len = u16_at(6) as usize;
+    let data_len = u16_at(8) as usize;
+    if name_len > 256 || data_len > 256 {
+        return Err("x11 auth too long");
+    }
+    let total = 12 + name_len + x11_pad4(name_len) + data_len + x11_pad4(data_len);
+    if buf.len() < total {
+        return Err("x11 prefix truncated");
+    }
+    let name = &buf[12..12 + name_len];
+    if name != b"MIT-MAGIC-COOKIE-1" {
+        return Err("x11 auth protocol");
+    }
+    let data_at = 12 + name_len + x11_pad4(name_len);
+    if &buf[data_at..data_at + data_len] != fake {
+        return Err("x11 cookie mismatch");
+    }
+    let mut out = buf[..total].to_vec();
+    out[data_at..data_at + data_len].copy_from_slice(real);
+    Ok(out)
+}
+
 #[cfg(unix)]
-async fn bridge_local_x11(
-    channel: Channel<client::Msg>,
-    sock: std::path::PathBuf,
-) -> anyhow::Result<()> {
+async fn bridge_local_x11(channel: Channel<client::Msg>, auth: X11Auth) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut remote = channel.into_stream();
-    let mut local = tokio::net::UnixStream::connect(&sock).await?;
+    let mut hdr = [0u8; 12];
+    remote.read_exact(&mut hdr).await?;
+    let be = match hdr[0] {
+        b'B' => true,
+        b'l' => false,
+        _ => anyhow::bail!("X11 字节序无效"),
+    };
+    let name_len = {
+        let pair = [hdr[6], hdr[7]];
+        if be {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        }
+    } as usize;
+    let data_len = {
+        let pair = [hdr[8], hdr[9]];
+        if be {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        }
+    } as usize;
+    if name_len > 256 || data_len > 256 {
+        anyhow::bail!("X11 认证字段过长");
+    }
+    let rest = name_len + x11_pad4(name_len) + data_len + x11_pad4(data_len);
+    let mut prefix = vec![0u8; 12 + rest];
+    prefix[..12].copy_from_slice(&hdr);
+    remote.read_exact(&mut prefix[12..]).await?;
+    let rewritten = rewrite_x11_client_prefix(&prefix, &auth.fake, &auth.real)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut local = tokio::net::UnixStream::connect(&auth.sock).await?;
+    local.write_all(&rewritten).await?;
     tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
     Ok(())
 }
@@ -767,7 +889,7 @@ async fn bridge_local_x11(
 #[cfg(not(unix))]
 async fn bridge_local_x11(
     _channel: Channel<client::Msg>,
-    _sock: std::path::PathBuf,
+    _auth: X11Auth,
 ) -> anyhow::Result<()> {
     anyhow::bail!("X11 转发仅支持 Unix")
 }
@@ -790,20 +912,18 @@ async fn bridge_local_mcp(_channel: Channel<client::Msg>) -> anyhow::Result<()> 
     anyhow::bail!("AI/MCP 控制目前仅支持 Unix（Linux/macOS）系统，暂不支持 Windows")
 }
 
-/// `-R` 路由：按远端报告的 connected_address:port 查本机目标；地址写法不一时做别名兜底。
+/// `-R` 路由：按远端报告的 connected_address:port 精确匹配。
+/// 同一端口只有一条登记时，才按端口兜底（sshd 常把 `0.0.0.0` 报成 `127.0.0.1`）。
+/// 同端口多条时不做地址别名，避免串到另一条本机目标。
 fn lookup_remote_fwd(
     table: &RemoteFwdTable,
     addr: &str,
     port: u32,
 ) -> Option<(String, u16)> {
     let map = table.lock().unwrap_or_else(|e| e.into_inner());
-    let aliases = [addr, "127.0.0.1", "0.0.0.0", "::1", "localhost", ""];
-    for a in aliases {
-        if let Some(v) = map.get(&(a.to_string(), port)) {
-            return Some(v.clone());
-        }
+    if let Some(v) = map.get(&(addr.to_string(), port)) {
+        return Some(v.clone());
     }
-    // 仅一个同端口登记时按端口匹配（sshd 常把 0.0.0.0 报成 127.0.0.1）
     let mut by_port = map.iter().filter(|((_, p), _)| *p == port);
     let first = by_port.next()?;
     if by_port.next().is_none() {
@@ -880,7 +1000,12 @@ pub(super) async fn connect(
     sink: &UiSink,
     hostkey_rx: UnboundedReceiver<bool>,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
-) -> anyhow::Result<(Handle<ClientHandler>, Option<Handle<JumpHandler>>, RemoteFwdTable)> {
+) -> anyhow::Result<(
+    Handle<ClientHandler>,
+    Option<Handle<JumpHandler>>,
+    RemoteFwdTable,
+    X11Slot,
+)> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(120)), // keepalive 30s × ~4；原 3600 时 TCP 黑洞最坏近 1h 才感知
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -891,25 +1016,8 @@ pub(super) async fn connect(
     let decision_rx: HostKeyDecision = Arc::new(tokio::sync::Mutex::new(hostkey_rx));
     let remote_fwds: RemoteFwdTable = Arc::new(Mutex::new(HashMap::new()));
 
-    let (x11_forward, x11_sock) = if cfg.forward_x11 {
-        match resolve_local_x11() {
-            Some((_proto, _cookie, _screen, sock)) => (true, Some(sock)),
-            None => {
-                sink.send(WorkerEvent::Status(match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => {
-                        "已开启 X11 转发，但本机 DISPLAY/xauth 不可用，将跳过".into()
-                    }
-                    crate::i18n::Lang::En => {
-                        "X11 forwarding enabled, but local DISPLAY/xauth unavailable; skipping"
-                            .into()
-                    }
-                }));
-                (false, None)
-            }
-        }
-    } else {
-        (false, None)
-    };
+    let remote_fwds: RemoteFwdTable = Arc::new(Mutex::new(HashMap::new()));
+    let x11: X11Slot = Arc::new(Mutex::new(None));
 
     let target_handler = ClientHandler {
         host: cfg.host.clone(),
@@ -917,8 +1025,7 @@ pub(super) async fn connect(
         sink: sink.clone(),
         decision_rx: decision_rx.clone(),
         agent_forward: cfg.forward_agent,
-        x11_forward,
-        x11_sock,
+        x11: x11.clone(),
         // cfg!(unix)：与 ssh/mod.rs 里那个反向转发任务保持同一条件——Windows 上没有
         // 监听方，转发出去的 socket 后面空无一人。
         mcp_forward: cfg!(unix) && crate::store::load_mcp_consent(),
@@ -980,7 +1087,7 @@ pub(super) async fn connect(
             )
         );
     }
-    Ok((handle, jump_keep, remote_fwds))
+    Ok((handle, jump_keep, remote_fwds, x11))
 }
 
 /// 打开带 PTY 的交互式 shell 通道。`forward_agent` 为真时请求 agent 转发；
@@ -992,6 +1099,8 @@ pub(super) async fn open_shell(
     forward_x11: bool,
     cols: u16,
     rows: u16,
+    x11: &X11Slot,
+    sink: &UiSink,
 ) -> anyhow::Result<russh::Channel<client::Msg>> {
     // request_pty/request_shell 均为 &self，channel 之后按值返回，无需 mut
     let channel = handle.channel_open_session().await?;
@@ -1005,20 +1114,13 @@ pub(super) async fn open_shell(
     channel
         .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await?;
-    // 请求 UTF-8 locale：否则远端 ls 等会把中文文件名转义成 $'\345\277...'。
-    // 优先沿用本机已是 UTF-8 的 LANG（用户习惯的语言环境）；否则 C.UTF-8（比硬编码
-    // en_US.UTF-8 更常预装）。sshd 未 AcceptEnv 时 set_env 失败——记日志，不静默吞掉。
-    let lang = std::env::var("LANG")
-        .ok()
-        .filter(|l| {
-            let u = l.to_ascii_uppercase();
-            u.contains("UTF-8") || u.contains("UTF8")
-        })
-        .unwrap_or_else(|| "C.UTF-8".into());
-    if let Err(e) = channel.set_env(false, "LANG", &lang).await {
+    // 固定 C.UTF-8，不用本机 LANG：远端没装 zh_CN.UTF-8 这类区域时每个会话都会报 locale 错误。
+    // C.UTF-8 在常见发行版里都有，足够让中文文件名不被转义。
+    let lang = "C.UTF-8";
+    if let Err(e) = channel.set_env(false, "LANG", lang).await {
         log::debug!("set_env LANG={lang} 被拒或失败：{e}");
     }
-    if let Err(e) = channel.set_env(false, "LC_ALL", &lang).await {
+    if let Err(e) = channel.set_env(false, "LC_ALL", lang).await {
         log::debug!("set_env LC_ALL={lang} 被拒或失败：{e}");
     }
     // 显式声明 TERM / 真彩色：许多工具（ls、bat、rg、nvim 等）靠 COLORTERM=truecolor
@@ -1026,12 +1128,29 @@ pub(super) async fn open_shell(
     let _ = channel.set_env(false, "TERM", "xterm-256color").await;
     let _ = channel.set_env(false, "COLORTERM", "truecolor").await;
     if forward_x11 {
-        if let Some((proto, cookie, screen, _)) = resolve_local_x11() {
-            if let Err(e) = channel
-                .request_x11(false, false, proto, cookie, screen)
-                .await
-            {
-                log::debug!("request_x11 失败：{e}");
+        match install_fake_x11(x11) {
+            Some((screen, fake_hex)) => {
+                if let Err(e) = channel
+                    .request_x11(false, false, "MIT-MAGIC-COOKIE-1", fake_hex, screen)
+                    .await
+                {
+                    *x11.lock().unwrap_or_else(|err| err.into_inner()) = None;
+                    sink.send(WorkerEvent::Status(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("X11 转发请求被拒绝：{e}"),
+                        crate::i18n::Lang::En => format!("X11 forwarding request rejected: {e}"),
+                    }));
+                }
+            }
+            None => {
+                sink.send(WorkerEvent::Status(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => {
+                        "已开启 X11 转发，但本机 DISPLAY/xauth 不可用，已跳过".into()
+                    }
+                    crate::i18n::Lang::En => {
+                        "X11 forwarding enabled, but local DISPLAY/xauth unavailable; skipped"
+                            .into()
+                    }
+                }));
             }
         }
     }
@@ -1241,5 +1360,41 @@ mod tests {
         assert_eq!(super::parse_x11_display("localhost:10.0"), Some((10, 0)));
         assert_eq!(super::parse_x11_display("unix:1"), Some((1, 0)));
         assert_eq!(super::parse_x11_display("nodisplay"), None);
+    }
+
+    #[test]
+    fn remote_fwd_same_port_does_not_alias() {
+        let table = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+            (("0.0.0.0".into(), 9000u32), ("127.0.0.1".into(), 1111u16)),
+            (("10.0.0.8".into(), 9000u32), ("127.0.0.1".into(), 2222u16)),
+        ])));
+        assert_eq!(
+            super::lookup_remote_fwd(&table, "10.0.0.8", 9000),
+            Some(("127.0.0.1".into(), 2222))
+        );
+        assert_eq!(super::lookup_remote_fwd(&table, "127.0.0.1", 9000), None);
+        let one = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([(
+            ("0.0.0.0".into(), 9000u32),
+            ("127.0.0.1".into(), 1111u16),
+        )])));
+        assert_eq!(
+            super::lookup_remote_fwd(&one, "127.0.0.1", 9000),
+            Some(("127.0.0.1".into(), 1111))
+        );
+    }
+
+    #[test]
+    fn x11_prefix_swaps_fake_cookie_only() {
+        let fake = [1u8; 16];
+        let real = [2u8; 16];
+        let name = b"MIT-MAGIC-COOKIE-1";
+        let mut buf = vec![b'B', 0, 0, 11, 0, 0, 0, name.len() as u8, 0, 16, 0, 0];
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(&fake);
+        let out = super::rewrite_x11_client_prefix(&buf, &fake, &real).unwrap();
+        assert!(out.windows(16).any(|w| w == real));
+        assert!(!out.windows(16).any(|w| w == fake));
+        assert!(super::rewrite_x11_client_prefix(&buf, &[9u8; 16], &real).is_err());
     }
 }

@@ -111,7 +111,7 @@ pub async fn run(
     }));
 
     // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
-    let (handle, _jump_handle, remote_fwds) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
+    let (handle, _jump_handle, remote_fwds, x11) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
         Ok(h) => h,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
@@ -129,7 +129,17 @@ pub async fn run(
         crate::pty_size::resolve_initial_pty_size(&mut cmd_rx).await;
 
     // 1) 交互式 shell 通道
-    let mut shell = match open_shell(&handle, cfg.forward_agent, cfg.forward_x11, pty_cols, pty_rows).await {
+    let mut shell = match open_shell(
+        &handle,
+        cfg.forward_agent,
+        cfg.forward_x11,
+        pty_cols,
+        pty_rows,
+        &x11,
+        &sink,
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {

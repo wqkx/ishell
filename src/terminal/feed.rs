@@ -98,13 +98,27 @@ fn find_next_stream_event(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<
     }
 }
 
+/// 第二个 `;` 还没出现时，OSC 8 参数段的暂存上限。缺分号就一直扣到缓冲区末尾会把后续输出整段冻住。
+const OSC8_PARAM_CAP: usize = 512;
+/// 已有 URI、还没等到 BEL/ST 时的暂存上限。超限放弃这条链接，字节照常进解析器。
+const OSC8_URI_CAP: usize = 8 * 1024;
+
 /// `rest` 末尾若是查询或 OSC 8 的真前缀 / 未终止序列，暂存起来等下一包拼完。
 fn incomplete_stream_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize {
     let mut keep = incomplete_query_keep(rest, queries);
     // 完整 OSC 8 已被消费；这里只处理「看得见开头但没收尾」或「半截前缀」。
     if find_next_osc8(rest).is_none() {
         if let Some(at) = find_sub_outside_string_escapes(rest, b"\x1b]8;") {
-            keep = keep.max(rest.len() - at);
+            let pending = rest.len() - at;
+            let body = &rest[at + 4..];
+            let cap = if body.contains(&b';') {
+                OSC8_URI_CAP
+            } else {
+                OSC8_PARAM_CAP
+            };
+            if pending <= cap {
+                keep = keep.max(pending);
+            }
         } else {
             const P: &[u8] = b"\x1b]8;";
             for n in 1..P.len() {
@@ -115,6 +129,22 @@ fn incomplete_stream_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize 
         }
     }
     keep
+}
+
+/// 未完成且已超过暂存上限的 OSC 8 起点。这种序列不能再扣着，也不能原样喂进 vt100。
+fn abandoned_osc8(rest: &[u8]) -> Option<usize> {
+    if find_next_osc8(rest).is_some() {
+        return None;
+    }
+    let at = find_sub_outside_string_escapes(rest, b"\x1b]8;")?;
+    let pending = rest.len() - at;
+    let body = &rest[at + 4..];
+    let cap = if body.contains(&b';') {
+        OSC8_URI_CAP
+    } else {
+        OSC8_PARAM_CAP
+    };
+    (pending > cap).then_some(at)
 }
 
 /// 在 `hay` 里找最早出现的查询；同起点取更长匹配（`ESC[0c` 优先于 `ESC[c`）。
@@ -136,11 +166,19 @@ fn find_next_query(hay: &[u8], queries: &[(&[u8], ReplyKind)]) -> Option<(usize,
 }
 
 /// `rest` 末尾若是任一查询的真前缀，暂存起来等下一包拼完。
+///
+/// 前缀落在未终止的 OSC/DCS 负载里时不算：包边界切在负载内部的 `\x1b[6` 上，
+/// 抽进 `query_tail` 会把下一块开头的 `n` 拼成假 CPR，同时把原序列撕开。
 fn incomplete_query_keep(rest: &[u8], queries: &[(&[u8], ReplyKind)]) -> usize {
+    let open = unterminated_string_tail(rest);
     let mut keep = 0;
     for &(pat, _) in queries {
         for n in 1..pat.len() {
-            if rest.ends_with(&pat[..n]) {
+            if rest.len() >= n && rest.ends_with(&pat[..n]) {
+                let at = rest.len() - n;
+                if open.is_some_and(|start| at >= start) {
+                    continue;
+                }
                 keep = keep.max(n);
             }
         }
@@ -198,14 +236,45 @@ impl Terminal {
         }
 
         let rest = &data[pos..];
-        let keep = incomplete_stream_keep(rest, QUERIES);
-        self.parser.process(&rest[..rest.len() - keep]);
-        self.query_tail.extend_from_slice(&rest[rest.len() - keep..]);
+        if let Some(at) = abandoned_osc8(rest) {
+            // 超限的未完成 OSC 8：引导字节丢掉，余下当普通输出。若整段喂给 vt100，
+            // 解析器会停在 OSC 里，把后面的输出一直吞到 BEL/ST。
+            self.parser.process(&rest[..at]);
+            let body = at + 4; // 过 `ESC]8;`
+            if body < rest.len() {
+                self.parser.process(&rest[body..]);
+            }
+            self.query_tail.clear();
+        } else {
+            let keep = incomplete_stream_keep(rest, QUERIES);
+            self.parser.process(&rest[..rest.len() - keep]);
+            self.query_tail.extend_from_slice(&rest[rest.len() - keep..]);
+        }
         replies
     }
 
+    /// 当前视图行上的 OSC 8 区间 `(start_col, end_col 含, url)`。备用屏不返回主屏链接。
+    pub(super) fn osc8_links_for_row(&self, row: u16) -> Vec<(u16, u16, String)> {
+        let screen = self.parser.screen();
+        if screen.alternate_screen() {
+            return Vec::new();
+        }
+        let abs = screen.scrollback_total() - screen.scrollback() + row as usize;
+        self.osc8_spans
+            .iter()
+            .filter(|s| s.0 == abs)
+            .map(|s| (s.1, s.2, s.3.clone()))
+            .collect()
+    }
+
     /// OSC 8：开始/切换链接时记下光标锚点；结束（空 URI）或切换时把锚点→当前光标收成绝对行区间。
+    /// 备用屏的绝对行与主屏不是同一套坐标，这里直接丢弃，避免 vim/less 第 n 行点到主屏旧链接。
     fn apply_osc8(&mut self, url: Option<String>) {
+        if self.parser.screen().alternate_screen() {
+            self.osc8_url = None;
+            self.osc8_anchor = None;
+            return;
+        }
         self.finish_osc8_span();
         if let Some(u) = url {
             if u.is_empty() {
@@ -231,21 +300,50 @@ impl Terminal {
             return;
         };
         let (er, ec) = self.parser.screen().cursor_position();
-        let end_abs = self.parser.screen().scrollback_total() + er as usize;
-        if end_abs < start_abs || (end_abs == start_abs && ec <= start_col) {
+        let mut end_abs = self.parser.screen().scrollback_total() + er as usize;
+        // 光标在下一行第 0 列：硬换行落点，这一格还没写入。不能 saturating_sub 成 0
+        // 把空列算进点击区；链接停在上一行，再裁掉行尾没写过的空格。
+        let mut end_excl = ec as usize;
+        if end_abs > start_abs && ec == 0 {
+            end_abs -= 1;
+            end_excl = self.cols as usize;
+        }
+        if end_abs < start_abs || (end_abs == start_abs && end_excl <= start_col as usize) {
             self.osc8_anchor = None;
             return;
         }
-        let cols = self.cols;
+        let total = self.parser.screen().scrollback_total();
+        let sb = self.parser.screen().scrollback();
         for abs in start_abs..=end_abs {
             let sc = if abs == start_abs { start_col } else { 0 };
-            let ec = if abs == end_abs {
-                ec.saturating_sub(1) // 光标在下一格；区间含已写单元格
+            let mut excl = if abs == end_abs {
+                end_excl
             } else {
-                cols.saturating_sub(1)
+                self.cols as usize
             };
-            if ec >= sc {
-                self.osc8_spans.push((abs, sc, ec, url.clone()));
+            let view = abs + sb;
+            if view >= total {
+                let view_row = (view - total) as u16;
+                if view_row < self.rows {
+                    let screen = self.parser.screen();
+                    while excl > sc as usize {
+                        let col = (excl - 1) as u16;
+                        let cell = screen.cell(view_row, col);
+                        if cell.is_some_and(|c| c.is_wide_continuation()) {
+                            break;
+                        }
+                        let empty = cell.map(|c| c.contents().is_empty()).unwrap_or(true);
+                        if empty {
+                            excl -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            if excl > sc as usize {
+                self.osc8_spans
+                    .push((abs, sc, (excl - 1) as u16, url.clone()));
             }
         }
         // 容量封顶，丢掉最旧的
@@ -436,23 +534,24 @@ impl Terminal {
         out
     }
 
-    /// 收集终端全部行文本（含回滚缓冲）。会临时改动 scrollback 并复原。
-    pub(super) fn collect_lines(&mut self) -> Vec<String> {
+    /// 收集终端全部行文本（含回滚缓冲）以及该行是否软折到下一行。会临时改动 scrollback 并复原。
+    pub(super) fn collect_rows(&mut self) -> Vec<(String, bool)> {
         let saved = self.parser.screen().scrollback();
-        // 设到最大以探测回滚总长度（内部会 clamp 到实际长度）
         self.parser.screen_mut().set_scrollback(usize::MAX);
         let sb = self.parser.screen().scrollback();
         let rows = self.rows as usize;
         let cols = self.cols;
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<(String, bool)> = Vec::new();
         let mut off = sb;
         loop {
             self.parser.screen_mut().set_scrollback(off);
             let start_idx = sb - off;
-            for (k, line) in self.parser.screen().rows(0, cols).enumerate() {
+            let texts: Vec<String> = self.parser.screen().rows(0, cols).collect();
+            for (k, line) in texts.into_iter().enumerate() {
                 let idx = start_idx + k;
                 if idx >= lines.len() {
-                    lines.push(line);
+                    let wrapped = self.parser.screen().row_wrapped(k as u16);
+                    lines.push((line, wrapped));
                 }
             }
             if off == 0 {
@@ -462,6 +561,11 @@ impl Terminal {
         }
         self.parser.screen_mut().set_scrollback(saved);
         lines
+    }
+
+    /// 收集终端全部行文本（含回滚缓冲）。会临时改动 scrollback 并复原。
+    pub(super) fn collect_lines(&mut self) -> Vec<String> {
+        self.collect_rows().into_iter().map(|(s, _)| s).collect()
     }
 
     /// 把整个缓冲（回滚 + 可见屏）连同颜色/属性序列化为带 SGR 的字节流（行间 `\r\n`）。
@@ -828,6 +932,11 @@ impl Terminal {
         if self.prev_alt != alt {
             self.sel_anchor = None;
             self.sel_cursor = None;
+            // 进行中的 OSC 8 锚在主屏坐标上；进备用屏后光标不再属于那段链接。
+            if alt {
+                self.osc8_url = None;
+                self.osc8_anchor = None;
+            }
         }
         if self.prev_alt && !alt && self.parser.screen().hide_cursor() {
             self.parser.process(b"\x1b[?25h");

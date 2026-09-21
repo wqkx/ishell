@@ -168,8 +168,8 @@ pub(super) fn cell_format(c: &vt100::Cell, font: &FontId, tc: &TermColors) -> Te
         ..Default::default()
     };
     if c.underline() || c.double_underline() {
-        let w = if c.double_underline() { 2.0 } else { 1.0 };
-        f.underline = Stroke::new(w, fg);
+        // 宽度保持 1；双下划线由 ui_paint 再画一条，避免又粗又双。
+        f.underline = Stroke::new(1.0, fg);
     }
     f
 }
