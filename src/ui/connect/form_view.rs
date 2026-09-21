@@ -74,6 +74,10 @@ impl ConnectForm {
 
         self.forward_agent_section(ui);
         self.jump_host_section(ui, w);
+        if let Some(msg) = &self.notice {
+            ui.add_space(6.0);
+            ui.label(RichText::new(msg).color(Palette::WARN).size(12.0));
+        }
         self.error_section(ui);
         self.credential_notice(ui);
         self.action_buttons(ui, result);
@@ -316,6 +320,7 @@ impl ConnectForm {
             }
             if ui.button(crate::i18n::tr("返回", "Back")).clicked() {
                 self.error = None;
+                self.notice = None;
                 self.mode = Mode::List;
             }
         });

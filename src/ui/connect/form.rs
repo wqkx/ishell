@@ -73,6 +73,7 @@ impl ConnectForm {
         self.j_passphrase.clear();
         self.j_auth = AuthKind::Password;
         self.error = None;
+        self.notice = None;
         self.editing = None;
     }
 
@@ -107,11 +108,12 @@ impl ConnectForm {
             "agent" => AuthKind::Agent,
             _ => AuthKind::Password,
         };
-        self.error = if c.secret_decrypt_failed {
+        self.error = None;
+        self.notice = if c.secret_decrypt_failed {
             Some(
                 crate::i18n::tr(
-                    "保存的密码无法解密：钥匙串里的主密钥已经对不上。请重新填写密码后再连接（不必删这条连接）。",
-                    "Saved password could not be decrypted: the master key in the keychain no longer matches. Re-enter the password, then connect (you can keep this saved connection).",
+                    "已存密码解不开（主密钥已更换）。请在密码栏重新输入，再点「连接」——会按现在的密钥重新保存。不必删这条连接。",
+                    "Saved password cannot be decrypted (master key changed). Type it again in the password field, then Connect — it will be re-saved with the current key. You can keep this connection.",
                 )
                 .into(),
             )
@@ -193,7 +195,12 @@ impl ConnectForm {
             return Err(crate::i18n::tr("请填写用户名", "Enter user").into());
         }
         let auth = match self.auth {
-            AuthKind::Password => AuthMethod::Password(self.password.clone()),
+            AuthKind::Password => {
+                if self.password.is_empty() {
+                    return Err(crate::i18n::tr("请填写密码", "Enter password").into());
+                }
+                AuthMethod::Password(self.password.clone())
+            }
             AuthKind::Agent => AuthMethod::Agent,
             AuthKind::Interactive => AuthMethod::Interactive,
             AuthKind::Key => {

@@ -121,6 +121,24 @@ pub fn load() -> Vec<SavedConnection> {
     list
 }
 
+/// 读盘但不解密。保存时若内存里某秘密字段是空的，用这里的旧密文补回去，
+/// 避免「解不开 → 内存留空 → 点连接/保存」把磁盘上唯一的密文写成空串。
+fn load_encrypted_file() -> Vec<SavedConnection> {
+    let Some(path) = config_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn keep_if_empty(new: &mut String, old: &str) {
+    if new.is_empty() && !old.is_empty() {
+        *new = old.to_string();
+    }
+}
+
 /// 写回连接列表（密码/口令加密后落盘）。
 /// 任一秘密字段加密失败则整次保存中止，避免静默写入明文密码。
 pub fn save(list: &[SavedConnection]) -> Result<(), String> {
@@ -133,6 +151,7 @@ pub fn save(list: &[SavedConnection]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    let previous = load_encrypted_file();
     let mut encrypted = Vec::with_capacity(list.len());
     for c in list {
         let mut e = c.clone();
@@ -140,6 +159,14 @@ pub fn save(list: &[SavedConnection]) -> Result<(), String> {
         e.passphrase = encrypt_secret(&c.passphrase)?;
         e.jump_password = encrypt_secret(&c.jump_password)?;
         e.jump_passphrase = encrypt_secret(&c.jump_passphrase)?;
+        if let Some(old) = previous.iter().find(|p| {
+            p.name == e.name && p.host == e.host && p.username == e.username
+        }) {
+            keep_if_empty(&mut e.password, &old.password);
+            keep_if_empty(&mut e.passphrase, &old.passphrase);
+            keep_if_empty(&mut e.jump_password, &old.jump_password);
+            keep_if_empty(&mut e.jump_passphrase, &old.jump_passphrase);
+        }
         encrypted.push(e);
     }
     let json = serde_json::to_string_pretty(&encrypted).map_err(|e| e.to_string())?;
@@ -414,5 +441,15 @@ Host pat-*
         let (_, h, p, _) = parse_proxyjump("gw:2200", &[], "me");
         assert_eq!(h, "gw");
         assert_eq!(p, 2200);
+    }
+
+    #[test]
+    fn empty_in_memory_secret_does_not_clobber_existing_ciphertext() {
+        let mut new = String::new();
+        keep_if_empty(&mut new, "enc:v1:abc");
+        assert_eq!(new, "enc:v1:abc");
+        let mut typed = "hunter2".to_string();
+        keep_if_empty(&mut typed, "enc:v1:abc");
+        assert_eq!(typed, "hunter2");
     }
 }
