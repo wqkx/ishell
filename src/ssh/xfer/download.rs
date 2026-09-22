@@ -368,8 +368,13 @@ pub(super) async fn download(
                 crate::i18n::tr("已取消", "Canceled").to_string()
             } else {
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("下载失败：{}", crate::ssh::dedup_status(&e.to_string())),
-                    crate::i18n::Lang::En => format!("Download failed: {}", crate::ssh::dedup_status(&e.to_string())),
+                    crate::i18n::Lang::Zh => {
+                        format!("下载失败：{}", crate::ssh::dedup_status(&e.to_string()))
+                    }
+                    crate::i18n::Lang::En => format!(
+                        "Download failed: {}",
+                        crate::ssh::dedup_status(&e.to_string())
+                    ),
                 }
             };
             sink.send(WorkerEvent::TransferDone {
@@ -557,7 +562,10 @@ pub(super) async fn relay_read_file(
             return;
         }
     };
-    sink.send(WorkerEvent::RelaySourceResult { id, result: Ok(size) });
+    sink.send(WorkerEvent::RelaySourceResult {
+        id,
+        result: Ok(size),
+    });
     sink.send(WorkerEvent::TransferStart {
         id,
         name: basename(&remote_path),
@@ -818,12 +826,15 @@ pub(super) async fn download_file(
         tokio::time::sleep(xfer_backoff(attempt)).await;
     }
     drop(out); // 关闭数据句柄后再 rename（Windows 需要）
-    // 换入前最后再校验一次实际长度：所有分段都标记"完成"不等于文件真的完整落盘
-    // （比如某个分段的 pwrite 系统调用层面部分失败但没有被上面的 short-read 检测捕捉到），
-    // 长度不对就直接报错、不换入，避免把损坏文件当成下载成功。
+               // 换入前最后再校验一次实际长度：所有分段都标记"完成"不等于文件真的完整落盘
+               // （比如某个分段的 pwrite 系统调用层面部分失败但没有被上面的 short-read 检测捕捉到），
+               // 长度不对就直接报错、不换入，避免把损坏文件当成下载成功。
     match std::fs::metadata(&data_part) {
         Ok(m) if m.len() == size => {}
-        Ok(m) => anyhow::bail!("下载文件长度不符（期望 {size}，实际 {}），未换入目标文件", m.len()),
+        Ok(m) => anyhow::bail!(
+            "下载文件长度不符（期望 {size}，实际 {}），未换入目标文件",
+            m.len()
+        ),
         Err(e) => anyhow::bail!("下载完成后无法校验临时文件：{e}"),
     }
     finish_download(&data_part, lpath)?;

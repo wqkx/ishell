@@ -53,81 +53,82 @@ pub(super) fn handle_input(
             v_cancel_preedit(ed);
             ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
         } else {
-        let ime_events: Vec<egui::ImeEvent> = ui.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| {
-                    if let egui::Event::Ime(ev) = e {
-                        Some(ev.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        });
-        // 本帧到底有没有输入法事件——下面的「组字状态自愈」要用。
-        let ime_seen = !ime_events.is_empty();
-        for ev in ime_events {
-            match ev {
-                egui::ImeEvent::Enabled => {}
-                egui::ImeEvent::Preedit(t) => {
-                    if t == "\n" || t == "\r" {
-                        continue;
-                    }
-                    // 组字是临时的：直接改 content、不入撤销栈
-                    let r = ed
-                        .vime_preedit
-                        .take()
-                        .or_else(|| v_sel_range(ed))
-                        .unwrap_or((ed.vcaret, ed.vcaret));
-                    // 必须走 replace_preedit 而不是裸 replace_range：撤销/重新加载会在两条
-                    // Preedit 之间换掉 content，旧区间可能落在多字节字符中间——那是 panic，
-                    // 不是越界，`.min(len)` 挡不住。
-                    let (s, end) = replace_preedit(&mut ed.content, r, &t);
-                    ed.vcaret = end;
-                    ed.vsel = None;
-                    ed.msel.clear();
-                    ed.dirty_flag = true; // 组字内容已上屏（取消时由 Disabled 分支重算）
-                    ed.vime_preedit = if t.is_empty() { None } else { Some((s, end)) };
-                    v_recompute(ed);
-                }
-                egui::ImeEvent::Commit(t) => {
-                    if t == "\n" || t == "\r" {
-                        continue;
-                    }
-                    if let Some(r) = ed.vime_preedit.take() {
-                        ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
+            let ime_events: Vec<egui::ImeEvent> = ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| {
+                        if let egui::Event::Ime(ev) = e {
+                            Some(ev.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+            // 本帧到底有没有输入法事件——下面的「组字状态自愈」要用。
+            let ime_seen = !ime_events.is_empty();
+            for ev in ime_events {
+                match ev {
+                    egui::ImeEvent::Enabled => {}
+                    egui::ImeEvent::Preedit(t) => {
+                        if t == "\n" || t == "\r" {
+                            continue;
+                        }
+                        // 组字是临时的：直接改 content、不入撤销栈
+                        let r = ed
+                            .vime_preedit
+                            .take()
+                            .or_else(|| v_sel_range(ed))
+                            .unwrap_or((ed.vcaret, ed.vcaret));
+                        // 必须走 replace_preedit 而不是裸 replace_range：撤销/重新加载会在两条
+                        // Preedit 之间换掉 content，旧区间可能落在多字节字符中间——那是 panic，
+                        // 不是越界，`.min(len)` 挡不住。
+                        let (s, end) = replace_preedit(&mut ed.content, r, &t);
+                        ed.vcaret = end;
                         ed.vsel = None;
+                        ed.msel.clear();
+                        ed.dirty_flag = true; // 组字内容已上屏（取消时由 Disabled 分支重算）
+                        ed.vime_preedit = if t.is_empty() { None } else { Some((s, end)) };
                         v_recompute(ed);
                     }
-                    // 多光标模式：英文/输入法提交也要作用到全部光标（系统输入法激活后字母走 Commit 而非 Text）
-                    if ed.msel.is_empty() {
-                        v_insert(ed, &t);
-                    } else {
-                        v_multi_replace(ed, &t);
+                    egui::ImeEvent::Commit(t) => {
+                        if t == "\n" || t == "\r" {
+                            continue;
+                        }
+                        if let Some(r) = ed.vime_preedit.take() {
+                            ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
+                            ed.vsel = None;
+                            v_recompute(ed);
+                        }
+                        // 多光标模式：英文/输入法提交也要作用到全部光标（系统输入法激活后字母走 Commit 而非 Text）
+                        if ed.msel.is_empty() {
+                            v_insert(ed, &t);
+                        } else {
+                            v_multi_replace(ed, &t);
+                        }
                     }
+                    egui::ImeEvent::Disabled => v_cancel_preedit(ed),
                 }
-                egui::ImeEvent::Disabled => v_cancel_preedit(ed),
             }
-        }
-        // 已自绘处理，移除 Ime 事件，避免主循环重复处理
-        ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
-        // 组字状态自愈（信号二）：本帧收到了普通文本输入，却一条 Ime 事件都没有。
-        // XIM 组字期间按键会被输入法过滤掉，能收到裸 `Text` 就说明组字已经不在了——
-        // 输入法多半是半路没了（fcitx 崩溃/重启、远程桌面会话切换），`Disabled` 永远不会来。
-        if !ime_seen && ed.vime_preedit.is_some() {
-            let typed_plain = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
-            if typed_plain {
-                v_cancel_preedit(ed);
+            // 已自绘处理，移除 Ime 事件，避免主循环重复处理
+            ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
+            // 组字状态自愈（信号二）：本帧收到了普通文本输入，却一条 Ime 事件都没有。
+            // XIM 组字期间按键会被输入法过滤掉，能收到裸 `Text` 就说明组字已经不在了——
+            // 输入法多半是半路没了（fcitx 崩溃/重启、远程桌面会话切换），`Disabled` 永远不会来。
+            if !ime_seen && ed.vime_preedit.is_some() {
+                let typed_plain =
+                    ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
+                if typed_plain {
+                    v_cancel_preedit(ed);
+                }
             }
-        }
         } // !readonly
     }
     if !focused {
         ed.complete = None; // 失焦关闭补全弹窗
-        // 组字状态自愈（信号一）：失焦时把没提交的组字撤掉。不撤的话，用户去重启了输入法
-        // 再点回来，屏幕上还留着上次那截没提交的拼音，而且 `vime_preedit` 里那个陈旧区间
-        // 会被下一次组字拿去替换——替到别的地方，看起来就是「输入法一抽风编辑器就乱」。
+                            // 组字状态自愈（信号一）：失焦时把没提交的组字撤掉。不撤的话，用户去重启了输入法
+                            // 再点回来，屏幕上还留着上次那截没提交的拼音，而且 `vime_preedit` 里那个陈旧区间
+                            // 会被下一次组字拿去替换——替到别的地方，看起来就是「输入法一抽风编辑器就乱」。
         v_cancel_preedit(ed);
     }
     let mut typed = false; // 本帧是否有字符输入（补全触发 + 光标闪烁重置）

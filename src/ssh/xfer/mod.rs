@@ -52,7 +52,8 @@ pub(super) enum PendingXfer {
     DownloadToMcp {
         id: u64,
         remote_path: String,
-        download_sink: tokio::sync::oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>,
+        download_sink:
+            tokio::sync::oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>,
     },
     /// 跨会话拷贝-中转模式（源会话侧）：读远端单文件灌进内存管道。
     RelayReadFile {
@@ -208,7 +209,13 @@ pub(super) fn start_xfer(
                             remote_path,
                         } => {
                             upload_from_mcp(
-                                sftp.as_ref(), id, source, size, remote_path, &s, cancel_work,
+                                sftp.as_ref(),
+                                id,
+                                source,
+                                size,
+                                remote_path,
+                                &s,
+                                cancel_work,
                             )
                             .await
                         }
@@ -217,12 +224,20 @@ pub(super) fn start_xfer(
                             remote_path,
                             download_sink,
                         } => {
-                            download_to_mcp(sftp, id, remote_path, download_sink, &s, cancel_work).await
+                            download_to_mcp(sftp, id, remote_path, download_sink, &s, cancel_work)
+                                .await
                         }
-                        PendingXfer::RelayReadFile { id, remote_path, writer } => {
-                            relay_read_file(sftp, id, remote_path, writer, &s, cancel_work).await
-                        }
-                        PendingXfer::RelayWriteFile { id, remote_path, size, reader } => {
+                        PendingXfer::RelayReadFile {
+                            id,
+                            remote_path,
+                            writer,
+                        } => relay_read_file(sftp, id, remote_path, writer, &s, cancel_work).await,
+                        PendingXfer::RelayWriteFile {
+                            id,
+                            remote_path,
+                            size,
+                            reader,
+                        } => {
                             upload_from_mcp(
                                 sftp.as_ref(),
                                 id,

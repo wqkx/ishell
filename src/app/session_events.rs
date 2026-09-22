@@ -306,9 +306,9 @@ impl Session {
                         // ——注册要在这台服务器上执行一次，用户看得见命令内容再决定按不按，
                         // 和「配置 AI 完成通知」那条菜单是同一个套路。
                         let cmd = super::session::mcp_register_cmd(&message);
-                        let _ = self
-                            .cmd_tx
-                            .send(crate::proto::UiCommand::TerminalInput(cmd.clone().into_bytes()));
+                        let _ = self.cmd_tx.send(crate::proto::UiCommand::TerminalInput(
+                            cmd.clone().into_bytes(),
+                        ));
                         self.terminal.push_input_line(&cmd);
                         self.status = match crate::i18n::current() {
                             crate::i18n::Lang::Zh => format!(
@@ -433,7 +433,10 @@ impl Session {
                     // 回填 MCP 响应本身不影响下面继续走 self.transfers 记账——
                     // AI 发起的这次复制也应该像普通传输一样，在传输窗口里对用户可见。
                     if self.file_copy_op_would_resolve(id) {
-                        self.try_resolve_file_copy(id, if ok { Ok(()) } else { Err(message.clone()) });
+                        self.try_resolve_file_copy(
+                            id,
+                            if ok { Ok(()) } else { Err(message.clone()) },
+                        );
                     }
                     // 跨会话拷贝（copy_between_sessions）状态机匹配自己关心的 op_id 用；
                     // 无关 id 由 App 层驱动函数直接忽略。

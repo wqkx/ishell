@@ -713,9 +713,8 @@ mod xfer_order_tests {
         from_a.sort_by(|&x, &y| xfer_order(x, y));
         from_b.sort_by(|&x, &y| xfer_order(x, y));
 
-        let names = |v: &Vec<(u64, &Transfer)>| {
-            v.iter().map(|(_, t)| t.name.clone()).collect::<Vec<_>>()
-        };
+        let names =
+            |v: &Vec<(u64, &Transfer)>| v.iter().map(|(_, t)| t.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(&from_a), names(&from_b), "两个标签的顺序必须一致");
         assert_eq!(
             names(&from_a),

@@ -242,26 +242,26 @@ impl App {
 /// **只用双引号，绝不含单引号**：整段要塞进外层的单引号里传给 python，而 sh 没有"在单引号
 /// 内转义单引号"的写法——出现一个就会把命令从那里截断。有测试守着这条约束。
 pub(super) const NOTIFY_HOOK: &str = concat!(
-        r#"p=$$; i=0; while [ $i -lt 6 ]; do p=$(ps -o ppid= -p $p 2>/dev/null | tr -d " "); "#,
-        r#"[ -z "$p" ] && break; t=$(ps -o tty= -p $p 2>/dev/null | tr -d " "); "#,
-        r#"case $t in ""|"?") ;; *) [ -w /dev/$t ] && "#,
-        r#"printf "\033]777;notify;%s;%s\007" "TAG" "MSG" > /dev/$t; break;; esac; "#,
-        r#"i=$((i+1)); done; exit 0 # ishell-osc9"#,
+    r#"p=$$; i=0; while [ $i -lt 6 ]; do p=$(ps -o ppid= -p $p 2>/dev/null | tr -d " "); "#,
+    r#"[ -z "$p" ] && break; t=$(ps -o tty= -p $p 2>/dev/null | tr -d " "); "#,
+    r#"case $t in ""|"?") ;; *) [ -w /dev/$t ] && "#,
+    r#"printf "\033]777;notify;%s;%s\007" "TAG" "MSG" > /dev/$t; break;; esac; "#,
+    r#"i=$((i+1)); done; exit 0 # ishell-osc9"#,
 );
 
 /// 合并脚本。同样只用双引号；hook 本体经环境变量 `ISHW` 传入，避免两层引号互相打架。
 pub(super) const NOTIFY_MERGE: &str = concat!(
-        r#"import json,os,shutil; p=os.path.expanduser("~/.claude/settings.json"); "#,
-        r#"os.makedirs(os.path.dirname(p),exist_ok=True); "#,
-        r#"d=json.load(open(p,encoding="utf-8")) if os.path.exists(p) else {}; "#,
-        r#"os.path.exists(p) and shutil.copy2(p,p+".bak"); w=os.environ["ISHW"]; "#,
-        r#"h=d.setdefault("hooks",{}); "#,
-        r#"h["Notification"]=[x for x in h.get("Notification",[]) if "ishell-osc9" not in json.dumps(x)]"#,
-        r#"+[{"hooks":[{"type":"command","command":w.replace("TAG","ishell:need").replace("MSG","Claude Code 需要你确认")}]}]; "#,
-        r#"h["Stop"]=[x for x in h.get("Stop",[]) if "ishell-osc9" not in json.dumps(x)]"#,
-        r#"+[{"hooks":[{"type":"command","command":w.replace("TAG","ishell:done").replace("MSG","Claude Code 任务完成")}]}]; "#,
-        r#"json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2); "#,
-        r#"print("iShell 通知 hook 已写入 "+p+"（原配置备份为 settings.json.bak）")"#,
+    r#"import json,os,shutil; p=os.path.expanduser("~/.claude/settings.json"); "#,
+    r#"os.makedirs(os.path.dirname(p),exist_ok=True); "#,
+    r#"d=json.load(open(p,encoding="utf-8")) if os.path.exists(p) else {}; "#,
+    r#"os.path.exists(p) and shutil.copy2(p,p+".bak"); w=os.environ["ISHW"]; "#,
+    r#"h=d.setdefault("hooks",{}); "#,
+    r#"h["Notification"]=[x for x in h.get("Notification",[]) if "ishell-osc9" not in json.dumps(x)]"#,
+    r#"+[{"hooks":[{"type":"command","command":w.replace("TAG","ishell:need").replace("MSG","Claude Code 需要你确认")}]}]; "#,
+    r#"h["Stop"]=[x for x in h.get("Stop",[]) if "ishell-osc9" not in json.dumps(x)]"#,
+    r#"+[{"hooks":[{"type":"command","command":w.replace("TAG","ishell:done").replace("MSG","Claude Code 任务完成")}]}]; "#,
+    r#"json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2); "#,
+    r#"print("iShell 通知 hook 已写入 "+p+"（原配置备份为 settings.json.bak）")"#,
 );
 
 /// 把「配置 AI 完成通知」的安装命令打进终端。
@@ -281,9 +281,7 @@ pub(super) const NOTIFY_MERGE: &str = concat!(
 /// Claude Code 起的子进程没有控制终端，那条路会静默失败。
 fn inject_notify_setup(s: &mut super::Session) {
     let cmd = format!("ISHW='{NOTIFY_HOOK}' python3 -c '{NOTIFY_MERGE}'");
-    let _ = s
-        .cmd_tx
-        .send(UiCommand::TerminalInput(cmd.into_bytes()));
+    let _ = s.cmd_tx.send(UiCommand::TerminalInput(cmd.into_bytes()));
     s.status = crate::i18n::tr(
         "安装命令已打进终端：看一眼没问题再按回车执行",
         "Install command typed into the terminal — review it, then press Enter",
@@ -300,10 +298,7 @@ mod notify_setup_tests {
     /// 转义单引号"的写法，所以这不是"注意点"，是硬约束。
     #[test]
     fn installer_segments_contain_no_single_quotes() {
-        for (name, seg) in [
-            ("HOOK", super::NOTIFY_HOOK),
-            ("MERGE", super::NOTIFY_MERGE),
-        ] {
+        for (name, seg) in [("HOOK", super::NOTIFY_HOOK), ("MERGE", super::NOTIFY_MERGE)] {
             assert!(
                 !seg.contains('\''),
                 "{name} 里出现了单引号，会把外层引号截断：{seg}"

@@ -50,13 +50,25 @@ const PROC_KEEP: usize = 40;
 /// 于是一个吃 100G 内存但几乎不用 CPU 的进程永远排不进来——按内存排序也看不见它。
 fn keep_top_by_cpu_and_mem(procs: &mut Vec<ProcInfo>, n: usize) {
     if procs.len() <= n {
-        procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+        procs.sort_by(|a, b| {
+            b.cpu
+                .partial_cmp(&a.cpu)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         return;
     }
     // 先按内存挑出前 n 的 pid，再按 CPU 排序并保留「CPU 前 n」或「内存前 n」的行。
-    procs.sort_by(|a, b| b.mem.partial_cmp(&a.mem).unwrap_or(std::cmp::Ordering::Equal));
+    procs.sort_by(|a, b| {
+        b.mem
+            .partial_cmp(&a.mem)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mem_top: std::collections::HashSet<u32> = procs.iter().take(n).map(|p| p.pid).collect();
-    procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+    procs.sort_by(|a, b| {
+        b.cpu
+            .partial_cmp(&a.cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     // `retain` 按原顺序访问，此时顺序即 CPU 排名，`rank` 就是这一行的 CPU 名次。
     let mut rank = 0usize;
     procs.retain(|p| {
@@ -508,7 +520,10 @@ mod tests {
         );
         // CPU 前 10 也必须一个不少
         for pid in 1..=10u32 {
-            assert!(procs.iter().any(|p| p.pid == pid), "CPU 前 10 里少了 pid {pid}");
+            assert!(
+                procs.iter().any(|p| p.pid == pid),
+                "CPU 前 10 里少了 pid {pid}"
+            );
         }
     }
 
@@ -516,8 +531,18 @@ mod tests {
     #[test]
     fn small_list_is_only_sorted_by_cpu() {
         let mut procs = vec![
-            ProcInfo { pid: 1, name: "a".into(), cpu: 1.0, mem: 9.0 },
-            ProcInfo { pid: 2, name: "b".into(), cpu: 5.0, mem: 1.0 },
+            ProcInfo {
+                pid: 1,
+                name: "a".into(),
+                cpu: 1.0,
+                mem: 9.0,
+            },
+            ProcInfo {
+                pid: 2,
+                name: "b".into(),
+                cpu: 5.0,
+                mem: 1.0,
+            },
         ];
         keep_top_by_cpu_and_mem(&mut procs, 10);
         assert_eq!(procs.len(), 2);

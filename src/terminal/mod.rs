@@ -3,6 +3,7 @@
 
 use egui::{FontId, Key, Rect, Sense, Vec2};
 
+mod default;
 mod feed;
 mod input;
 mod keys;
@@ -13,7 +14,6 @@ mod selection;
 mod theme;
 mod ui_paint;
 mod vt;
-mod default;
 
 use input::HistState;
 use keys::{encode_mouse, HeldButtons};
@@ -294,7 +294,10 @@ enum CaptureMode {
 
 /// 逐行裁掉行尾空白，再裁掉结尾的连续空行——`screen_text`/`history_text` 共用的收尾步骤。
 fn finalize_lines(lines: Vec<String>) -> Vec<String> {
-    let mut lines: Vec<String> = lines.into_iter().map(|l| l.trim_end().to_string()).collect();
+    let mut lines: Vec<String> = lines
+        .into_iter()
+        .map(|l| l.trim_end().to_string())
+        .collect();
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
@@ -491,7 +494,9 @@ impl Terminal {
 
     /// 捕获尚未完成时，看一眼「目前为止」已剥离 ANSI 的输出（不消费、不影响后续检测）。
     pub fn peek_ai_output(&self) -> Option<String> {
-        self.ai_capture.as_ref().map(|c| vt::strip_ansi_to_text(&c.buf))
+        self.ai_capture
+            .as_ref()
+            .map(|c| vt::strip_ansi_to_text(&c.buf))
     }
 
     /// 当前可见屏幕的纯文本（tmux capture-pane 风格），自动裁掉尾部空行。
@@ -842,7 +847,11 @@ impl Terminal {
                 self.local_scroll_accum = 0.0;
                 if raw != 0.0 {
                     let steps = (raw.abs().round() as i32).clamp(1, 3);
-                    let key = if raw > 0.0 { b"\x1b[A".as_slice() } else { b"\x1b[B".as_slice() };
+                    let key = if raw > 0.0 {
+                        b"\x1b[A".as_slice()
+                    } else {
+                        b"\x1b[B".as_slice()
+                    };
                     for _ in 0..steps {
                         mouse_out.extend_from_slice(key);
                     }
@@ -1297,7 +1306,6 @@ impl Terminal {
         out
     }
 }
-
 
 #[cfg(test)]
 #[path = "terminal_tests.rs"]

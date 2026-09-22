@@ -348,7 +348,10 @@ pub(super) fn local_basename(path: &str) -> String {
 /// **不先删旧目标再换新的**：那样一旦「删成功、换新失败」就两头皆空、旧数据不可恢复。改为
 /// 先把旧目标 rename 到同目录的备份名（原子、可回滚），换上新目录成功后才删备份，失败则把
 /// 备份换回——「成功前不破坏原目标」。备份与目标同目录、故同文件系统内 rename，不涉及跨盘拷贝。
-pub(super) fn place_extracted_dir(extracted: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+pub(super) fn place_extracted_dir(
+    extracted: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
     // 目标不存在：直接换上即可。
     if std::fs::symlink_metadata(target).is_err() {
         return std::fs::rename(extracted, target);
@@ -384,7 +387,10 @@ mod copy_move_script_tests {
     use super::{copy_move_script, CopyDest};
 
     fn plan(items: &[(&str, CopyDest)]) -> Vec<(String, CopyDest)> {
-        items.iter().map(|(s, d)| (s.to_string(), d.clone())).collect()
+        items
+            .iter()
+            .map(|(s, d)| (s.to_string(), d.clone()))
+            .collect()
     }
 
     /// **层级守门人**：不冲突/覆盖的那一项必须写成 `目标目录/`，**不能**写成显式的
@@ -395,14 +401,16 @@ mod copy_move_script_tests {
     /// 为了「顺手把目标写全」而改掉这里，就是一次静默的行为变化。
     #[test]
     fn non_conflicting_items_keep_the_trailing_slash_form() {
-        let cmd = copy_move_script(
-            &plan(&[("/a/proj", CopyDest::Into)]),
-            "/b",
-            false,
-        )
-        .expect("有活要干");
-        assert!(cmd.contains("cp -a -- '/a/proj' '/b'/"), "应当是「移入目录」形式：\n{cmd}");
-        assert!(!cmd.contains("'/b/proj'"), "不得写成显式的目标全路径：\n{cmd}");
+        let cmd =
+            copy_move_script(&plan(&[("/a/proj", CopyDest::Into)]), "/b", false).expect("有活要干");
+        assert!(
+            cmd.contains("cp -a -- '/a/proj' '/b'/"),
+            "应当是「移入目录」形式：\n{cmd}"
+        );
+        assert!(
+            !cmd.contains("'/b/proj'"),
+            "不得写成显式的目标全路径：\n{cmd}"
+        );
     }
 
     /// 重命名的那一项目标必然不存在，写显式全路径没有歧义。
@@ -414,7 +422,10 @@ mod copy_move_script_tests {
             false,
         )
         .expect("有活要干");
-        assert!(cmd.contains("'/b/r (1).pdf'"), "重命名应落到显式全路径：\n{cmd}");
+        assert!(
+            cmd.contains("'/b/r (1).pdf'"),
+            "重命名应落到显式全路径：\n{cmd}"
+        );
     }
 
     /// 一项失败不能让其余项不做（原来一条 `cp -a -- 全部源 目标/` 就是这个行为），
@@ -428,9 +439,16 @@ mod copy_move_script_tests {
         )
         .expect("有活要干");
         assert!(cmd.starts_with("rc=0"), "缺少 rc 初始化：\n{cmd}");
-        assert_eq!(cmd.matches("|| rc=1").count(), 2, "每一项都要记失败：\n{cmd}");
+        assert_eq!(
+            cmd.matches("|| rc=1").count(),
+            2,
+            "每一项都要记失败：\n{cmd}"
+        );
         assert!(cmd.ends_with("exit $rc"), "缺少整体退出码：\n{cmd}");
-        assert!(!cmd.contains("&&"), "不得用 && 串联（一项失败就不做后面的了）：\n{cmd}");
+        assert!(
+            !cmd.contains("&&"),
+            "不得用 && 串联（一项失败就不做后面的了）：\n{cmd}"
+        );
     }
 
     /// 跳过的项一条命令都不该出现；全部跳过时连脚本都不用发。

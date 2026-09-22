@@ -166,8 +166,18 @@ mod desktop_entry_tests {
     #[test]
     fn categories_declare_a_single_main_category() {
         const MAIN: [&str; 12] = [
-            "AudioVideo", "Audio", "Video", "Development", "Education", "Game", "Graphics",
-            "Network", "Office", "Science", "Settings", "System",
+            "AudioVideo",
+            "Audio",
+            "Video",
+            "Development",
+            "Education",
+            "Game",
+            "Graphics",
+            "Network",
+            "Office",
+            "Science",
+            "Settings",
+            "System",
         ];
         let cats = value_of("Categories").unwrap_or_default();
         let n = cats.split(';').filter(|c| MAIN.contains(c)).count();

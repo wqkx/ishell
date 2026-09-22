@@ -234,10 +234,7 @@ impl Terminal {
         }
         const END: &[u8] = b"\x1b[201~";
         let mut body = text.to_vec();
-        while let Some(i) = body
-            .windows(END.len())
-            .position(|w| w == END)
-        {
+        while let Some(i) = body.windows(END.len()).position(|w| w == END) {
             body.drain(i..i + END.len());
         }
         let mut out = Vec::with_capacity(body.len() + 12);

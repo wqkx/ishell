@@ -553,7 +553,11 @@ mod session_target_tests {
             McpReqKind::CloseSession { session_uid: 7 },
         ];
         for kind in cases {
-            assert_eq!(kind.session_target_uids(), vec![7], "漏报了目标会话：{kind:?}");
+            assert_eq!(
+                kind.session_target_uids(),
+                vec![7],
+                "漏报了目标会话：{kind:?}"
+            );
         }
     }
 
@@ -579,9 +583,7 @@ mod session_target_tests {
             McpReqKind::OpenSession { name: "s2".into() },
             // 连接级握手，不涉及任何会话。
             McpReqKind::Identify,
-            McpReqKind::IdentifyPair {
-                token: "x".into(),
-            },
+            McpReqKind::IdentifyPair { token: "x".into() },
             McpReqKind::PairHello {
                 nonce_c: "n".into(),
             },
@@ -742,7 +744,9 @@ mod framing_tests {
     /// 往返：写进去什么，读出来就该是什么，一个字节不差。
     async fn round_trip(payload: &[u8]) -> (u64, Vec<u8>) {
         let mut wire = Vec::new();
-        write_framed_stream(&mut &payload[..], &mut wire).await.expect("写不该失败");
+        write_framed_stream(&mut &payload[..], &mut wire)
+            .await
+            .expect("写不该失败");
         let mut got = Vec::new();
         let total = read_framed_stream(&mut std::io::Cursor::new(wire), &mut got)
             .await
@@ -753,15 +757,20 @@ mod framing_tests {
     #[tokio::test]
     async fn round_trips_payloads_of_every_shape() {
         for payload in [
-            Vec::new(),                                 // 空文件：只有一个 `0\n`
-            b"hello".to_vec(),                          // 单块
-            vec![0xAB; STREAM_CHUNK_BYTES],             // 恰好一块
-            vec![0xCD; STREAM_CHUNK_BYTES + 1],         // 跨块边界
-            vec![0x00; STREAM_CHUNK_BYTES * 2 + 7],     // 多块 + 零字节（不能被当成结束符）
-            b"12\n34\n0\n".to_vec(),                    // 内容长得像帧头：必须靠长度而非内容分帧
+            Vec::new(),                             // 空文件：只有一个 `0\n`
+            b"hello".to_vec(),                      // 单块
+            vec![0xAB; STREAM_CHUNK_BYTES],         // 恰好一块
+            vec![0xCD; STREAM_CHUNK_BYTES + 1],     // 跨块边界
+            vec![0x00; STREAM_CHUNK_BYTES * 2 + 7], // 多块 + 零字节（不能被当成结束符）
+            b"12\n34\n0\n".to_vec(),                // 内容长得像帧头：必须靠长度而非内容分帧
         ] {
             let (total, got) = round_trip(&payload).await;
-            assert_eq!(total, payload.len() as u64, "长度不符（payload {} 字节）", payload.len());
+            assert_eq!(
+                total,
+                payload.len() as u64,
+                "长度不符（payload {} 字节）",
+                payload.len()
+            );
             assert_eq!(got, payload, "内容不符（payload {} 字节）", payload.len());
         }
     }
@@ -771,7 +780,9 @@ mod framing_tests {
     async fn leaves_the_reader_exactly_at_the_verdict_line() {
         use tokio::io::AsyncBufReadExt;
         let mut wire = Vec::new();
-        write_framed_stream(&mut &b"body"[..], &mut wire).await.unwrap();
+        write_framed_stream(&mut &b"body"[..], &mut wire)
+            .await
+            .unwrap();
         wire.extend_from_slice(b"{\"id\":1,\"result\":{\"Ok\":\"Ok\"}}\n");
 
         let mut r = std::io::Cursor::new(wire);
@@ -781,7 +792,8 @@ mod framing_tests {
 
         let mut verdict = String::new();
         r.read_line(&mut verdict).await.unwrap();
-        let parsed: McpResponse = serde_json::from_str(verdict.trim()).expect("判定应能原样解析出来");
+        let parsed: McpResponse =
+            serde_json::from_str(verdict.trim()).expect("判定应能原样解析出来");
         assert!(parsed.result.is_ok());
     }
 
@@ -799,9 +811,12 @@ mod framing_tests {
     #[tokio::test]
     async fn refuses_a_garbled_chunk_header() {
         let mut got = Vec::new();
-        let err = read_framed_stream(&mut std::io::Cursor::new(b"not-a-number\n".to_vec()), &mut got)
-            .await
-            .expect_err("帧头无法解析时必须报错");
+        let err = read_framed_stream(
+            &mut std::io::Cursor::new(b"not-a-number\n".to_vec()),
+            &mut got,
+        )
+        .await
+        .expect_err("帧头无法解析时必须报错");
         assert!(err.contains("分块长度无法解析"), "{err}");
     }
 }
@@ -874,13 +889,7 @@ mod addressing_tests {
     #[test]
     fn identify_is_the_only_unaddressed_request_allowed() {
         assert!(req(None, McpReqKind::Identify).is_addressed_to("me"));
-        assert!(req(
-            None,
-            McpReqKind::IdentifyPair {
-                token: "t".into()
-            }
-        )
-        .is_addressed_to("me"));
+        assert!(req(None, McpReqKind::IdentifyPair { token: "t".into() }).is_addressed_to("me"));
         // 配对握手的两步同理：那时代理还没问出 id，填不了 instance。
         assert!(req(
             None,
@@ -983,19 +992,33 @@ pub enum McpReqResult {
     /// `ListSavedConnections` 的结果。
     SavedConnections(Vec<McpSavedConn>),
     /// `WriteFile` 成功后的新 mtime。
-    FileWritten { path: String, mtime: u32 },
+    FileWritten {
+        path: String,
+        mtime: u32,
+    },
     /// `ReadFile` 的结果。
-    FileContent { path: String, content: String },
+    FileContent {
+        path: String,
+        content: String,
+    },
     /// `CopyToRemote`/`CopyFromRemote` 成功后的目标路径。
-    Copied { path: String },
+    Copied {
+        path: String,
+    },
     /// `CopyFromRemoteToCaller` 的响应头：先以这一行 JSON 单独送达，代理进程解析出 `size`
     /// 后再从同一条 socket 连接上读取紧随其后的 `size` 字节原始文件内容（无额外分隔符/
     /// trailer）。GUI 侧提前判定失败（远端不存在/是目录等）时仍按普通 `Err` 响应，不会
     /// 发送这个变体，代理进程据此区分两种情况，不需要另外猜测。
-    CopyStreamHeader { path: String, size: u64 },
+    CopyStreamHeader {
+        path: String,
+        size: u64,
+    },
     /// `CopyBetweenSessions` 成功后的目标路径；`method` 目前恒为 `"relay"`（经 iShell 内存
     /// 中转，两端都不落盘）——为直连优先模式预留，届时会出现 `"direct"`。
-    CopiedBetweenSessions { path: String, method: String },
+    CopiedBetweenSessions {
+        path: String,
+        method: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1052,7 +1075,13 @@ mod tests {
     fn pair_proof_verifies_for_the_matching_token() {
         let p = pair_proof("tok", "NC", "NS", PairRole::Server);
         assert!(pair_proof_matches("tok", "NC", "NS", PairRole::Server, &p));
-        assert!(!pair_proof_matches("other", "NC", "NS", PairRole::Server, &p));
+        assert!(!pair_proof_matches(
+            "other",
+            "NC",
+            "NS",
+            PairRole::Server,
+            &p
+        ));
     }
 
     /// 换掉任何一个随机数，证明都必须失效——否则挑战-应答退化成可重放的静态口令，
@@ -1060,8 +1089,20 @@ mod tests {
     #[test]
     fn pair_proof_is_bound_to_both_nonces() {
         let p = pair_proof("tok", "NC", "NS", PairRole::Client);
-        assert!(!pair_proof_matches("tok", "NC2", "NS", PairRole::Client, &p));
-        assert!(!pair_proof_matches("tok", "NC", "NS2", PairRole::Client, &p));
+        assert!(!pair_proof_matches(
+            "tok",
+            "NC2",
+            "NS",
+            PairRole::Client,
+            &p
+        ));
+        assert!(!pair_proof_matches(
+            "tok",
+            "NC",
+            "NS2",
+            PairRole::Client,
+            &p
+        ));
     }
 
     /// 反射攻击：把服务器的证明原样当成客户端的证明送回去，必须不通过。
@@ -1079,7 +1120,10 @@ mod tests {
     /// 随机数每次都不一样，且长度固定（常量时间比对依赖这一点）。
     #[test]
     fn pair_nonce_is_fresh_and_fixed_width() {
-        let (a, b) = (pair_nonce().expect("熵源应可用"), pair_nonce().expect("熵源应可用"));
+        let (a, b) = (
+            pair_nonce().expect("熵源应可用"),
+            pair_nonce().expect("熵源应可用"),
+        );
         assert_eq!(a.len(), 64);
         assert_ne!(a, b, "两次生成的随机数相同——熵源有问题");
     }
@@ -1088,7 +1132,13 @@ mod tests {
     #[test]
     fn malformed_proofs_are_rejected_not_panicking() {
         for got in ["", "zz", &"a".repeat(63), &"a".repeat(65)] {
-            assert!(!pair_proof_matches("tok", "NC", "NS", PairRole::Server, got));
+            assert!(!pair_proof_matches(
+                "tok",
+                "NC",
+                "NS",
+                PairRole::Server,
+                got
+            ));
         }
     }
 

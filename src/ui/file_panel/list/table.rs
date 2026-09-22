@@ -3,12 +3,9 @@ use std::collections::HashSet;
 use egui::{RichText, Sense};
 
 use super::super::{
-    join_path, open_intent, Dialog, FileAction, FilePanelState, OpenIntent,
-    Renaming, SortKey,
+    join_path, open_intent, Dialog, FileAction, FilePanelState, OpenIntent, Renaming, SortKey,
 };
-use super::helpers::{
-    clip_targets, spring_navigate, toggle_favorite, Menu,
-};
+use super::helpers::{clip_targets, spring_navigate, toggle_favorite, Menu};
 use crate::theme::Palette;
 
 #[path = "table_rows.rs"]
@@ -25,7 +22,11 @@ mod table_tail;
 /// 抵消，只在切换升降序时露馅（0.17.0 就是这么错的）。别改这个取反。
 ///
 /// `sort_by_cached_key`：小写名每行只算一次（此前比较器内每对比较都算两次）。
-pub(in crate::ui::file_panel) fn sort_entries(entries: &mut [crate::proto::FileEntry], key: SortKey, desc: bool) {
+pub(in crate::ui::file_panel) fn sort_entries(
+    entries: &mut [crate::proto::FileEntry],
+    key: SortKey,
+    desc: bool,
+) {
     match key {
         SortKey::Name => entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase())),
         SortKey::Size => entries.sort_by_key(|e| (!e.is_dir, e.size)),

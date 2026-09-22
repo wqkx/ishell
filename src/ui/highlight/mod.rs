@@ -211,7 +211,10 @@ mod tests {
         // '维' 占 3 字节；构造一个 end 落在它中间的错误范围（真实 panic 里就是 bytes 25..28 的 27）
         let line = "x = [1, 2 3] # 这是多维数组";
         let mid = line.find('维').unwrap() + 1; // 汉字内部，非字符边界
-        assert!(!line.is_char_boundary(mid), "用例前提：该偏移确实在字符中间");
+        assert!(
+            !line.is_char_boundary(mid),
+            "用例前提：该偏移确实在字符中间"
+        );
         // 不 panic 即通过（此前会 `end byte index N is not a char boundary`）
         // from_ref：本意就是「只含这一个 Range 的切片」，写成 &[0..mid] 会被 clippy 误认为
         // 想要 0..mid 这个区间的所有值（single_range_in_vec_init）。
@@ -229,7 +232,6 @@ mod tests {
         let job2 = highlight_segment(line, 0..mid, "py", 12.0, &[], LineState::Normal);
         let _ = job2;
     }
-
 }
 
 /// 高亮/lint 的**绝不 panic**回归测试。
@@ -250,25 +252,27 @@ mod never_panic_tests {
         "\u{0}\u{1}\u{7f}",
         "中文注释 // 后面还有中文",
         "\"未闭合的字符串",
-        "'\\",                                  // 未闭合 + 结尾反斜杠
+        "'\\", // 未闭合 + 结尾反斜杠
         "r#\"raw 未闭合",
         "/* 未闭合块注释",
         "'''python 三引号未闭合",
         "\"\"\"另一种三引号",
         "a\"b'c`d/*e*/f//g",
-        "😀😀😀\"😀",                          // 4 字节字符 + 未闭合引号
-        "é\\\"é",                                // 2 字节 + 转义引号
-        "((((((((((((((((((((",                 // 大量未配平括号
+        "😀😀😀\"😀",           // 4 字节字符 + 未闭合引号
+        "é\\\"é",               // 2 字节 + 转义引号
+        "((((((((((((((((((((", // 大量未配平括号
         "))))))))))))))))))))",
         "{[(<>)]}{[(<>)]}",
-        "\\\\\\\\\"",                            // 连续反斜杠后跟引号（奇偶转义判定）
-        "0x1e-5 1e-5 1_000 .5 5.",              // 数字字面量各种形状
+        "\\\\\\\\\"",              // 连续反斜杠后跟引号（奇偶转义判定）
+        "0x1e-5 1e-5 1_000 .5 5.", // 数字字面量各种形状
         "let x = \"中\"; // 漢字",
         "\r\n\r\n\t\t   ",
         "#include <中文.h>",
     ];
 
-    const EXTS: &[&str] = &["rs", "py", "js", "c", "go", "json", "md", "txt", "sh", "unknown", ""];
+    const EXTS: &[&str] = &[
+        "rs", "py", "js", "c", "go", "json", "md", "txt", "sh", "unknown", "",
+    ];
 
     /// `line_states` 对任意内容 × 任意扩展名都不能 panic，且返回的状态数与行数一致
     /// （渲染按行索引取状态，长度对不上就会索引越界）。
@@ -303,7 +307,14 @@ mod never_panic_tests {
                 for a in 0..=n + 2 {
                     for b in 0..=n + 2 {
                         // 错误区间也故意用同样一对可能非法的下标
-                        let _ = highlight_segment(line, a..b, ext, 12.0, std::slice::from_ref(&(a..b)), state);
+                        let _ = highlight_segment(
+                            line,
+                            a..b,
+                            ext,
+                            12.0,
+                            std::slice::from_ref(&(a..b)),
+                            state,
+                        );
                     }
                 }
             }

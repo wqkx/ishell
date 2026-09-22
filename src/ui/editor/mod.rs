@@ -406,5 +406,4 @@ mod dirty_tests {
         ed.mark_saved();
         assert!(!ed.dirty());
     }
-
 }

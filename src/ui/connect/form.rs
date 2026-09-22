@@ -326,9 +326,11 @@ impl ConnectForm {
                             .editing_saved()
                             .is_some_and(|c| c.jump_password_decrypt_failed)
                     {
-                        return Err(
-                            crate::i18n::tr("请重新填写跳板密码", "Re-enter jump password").into(),
-                        );
+                        return Err(crate::i18n::tr(
+                            "请重新填写跳板密码",
+                            "Re-enter jump password",
+                        )
+                        .into());
                     }
                     AuthMethod::Password(self.j_password.clone())
                 }

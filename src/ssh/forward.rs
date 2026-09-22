@@ -106,11 +106,7 @@ async fn run_remote_forward(
     std::future::pending::<()>().await;
 }
 
-async fn run_local_or_dynamic(
-    handle: Arc<Handle<ClientHandler>>,
-    spec: ForwardSpec,
-    sink: UiSink,
-) {
+async fn run_local_or_dynamic(handle: Arc<Handle<ClientHandler>>, spec: ForwardSpec, sink: UiSink) {
     // 稳健构造监听地址：bind_host 是 IP 字面量时走结构化 `SocketAddr`（IPv6 会自动加方括号，
     // 得到 `[::1]:8080` 而非手工拼接的 `::1:8080`）；否则按 `host:port` 交给解析器（支持主机名）。
     // `TcpListener::bind` 的字符串路径虽有「按末冒号拆分」的兜底、多能容忍裸 IPv6，但显示与
@@ -187,7 +183,9 @@ async fn run_local_or_dynamic(
                 if transient > MAX_TRANSIENT {
                     let msg = match crate::i18n::current() {
                         crate::i18n::Lang::Zh => format!("监听已停止：accept 连续失败（{e}）"),
-                        crate::i18n::Lang::En => format!("Listener stopped: accept kept failing ({e})"),
+                        crate::i18n::Lang::En => {
+                            format!("Listener stopped: accept kept failing ({e})")
+                        }
                     };
                     sink.send(WorkerEvent::ForwardStatus {
                         id: spec.id,

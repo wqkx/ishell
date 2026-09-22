@@ -193,7 +193,11 @@ impl FilePanelState {
     pub fn expand_tilde(&self, p: &str) -> String {
         let t = p.trim();
         if t == "~" {
-            return if self.home.is_empty() { p.to_string() } else { self.home.clone() };
+            return if self.home.is_empty() {
+                p.to_string()
+            } else {
+                self.home.clone()
+            };
         }
         if let Some(rest) = t.strip_prefix("~/") {
             if !self.home.is_empty() {

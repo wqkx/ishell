@@ -179,7 +179,8 @@ pub(super) fn render_table_rows(
                             // 重命名中：显示输入框（默认选中后缀前的主名）
                             // 必须走 ime_singleline：与新建文件夹相同，绕开 egui 0.34 fcitx Commit 门
                             // （否则中文只能输一次 / 第二次无法组字）。
-                            let renaming_here = matches!(&state.renaming, Some(r) if r.full == full);
+                            let renaming_here =
+                                matches!(&state.renaming, Some(r) if r.full == full);
                             if renaming_here {
                                 if let Some(r) = &mut state.renaming {
                                     let te_id = "file_rename_inline";

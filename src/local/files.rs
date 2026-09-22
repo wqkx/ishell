@@ -25,7 +25,19 @@ pub(super) async fn handle(cmd: UiCommand, sink: &UiSink) {
             eol,
             expect_mtime,
             force,
-        } => write_file(id, &path, content, &encoding, eol, expect_mtime, force, sink).await,
+        } => {
+            write_file(
+                id,
+                &path,
+                content,
+                &encoding,
+                eol,
+                expect_mtime,
+                force,
+                sink,
+            )
+            .await
+        }
         UiCommand::ReadImage { path } => read_image(&path, sink).await,
         UiCommand::ReadDoc { id, path } => read_doc(id, &path, sink).await,
         UiCommand::TailFile { path, offset } => tail_file(&path, offset, sink).await,
@@ -213,7 +225,8 @@ async fn read_file(path: &str, force: bool, id: u64, sink: &UiSink) {
     // 分块读入内存并硬性限幅（不能只靠开始前那次 size 检查——文件可能在读取期间增长）。
     let res: std::io::Result<Result<Vec<u8>, ()>> = async {
         let mut f = tokio::fs::File::open(path).await?;
-        let mut data: Vec<u8> = Vec::with_capacity((total as usize).min(limit).min(16 * 1024 * 1024));
+        let mut data: Vec<u8> =
+            Vec::with_capacity((total as usize).min(limit).min(16 * 1024 * 1024));
         let mut buf = vec![0u8; 128 * 1024];
         let mut last = 0usize;
         loop {
@@ -434,7 +447,11 @@ async fn read_image(path: &str, sink: &UiSink) {
 
 async fn read_doc(id: u64, path: &str, sink: &UiSink) {
     const DOC_LIMIT: u64 = 20 * 1024 * 1024;
-    let total = tokio::fs::metadata(path).await.ok().map(|m| m.len()).unwrap_or(0);
+    let total = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0);
     sink.send(WorkerEvent::FileLoadProgress { id, done: 0, total });
     match read_capped(path, DOC_LIMIT as usize).await {
         Ok(data) => sink.send(WorkerEvent::DocOpened {
@@ -595,7 +612,10 @@ async fn create_file(path: &str, sink: &UiSink) {
             format!(
                 "{}{}",
                 crate::i18n::tr("操作失败：", "Operation failed: "),
-                crate::i18n::tr("同名文件已存在或无法创建", "File exists or cannot be created")
+                crate::i18n::tr(
+                    "同名文件已存在或无法创建",
+                    "File exists or cannot be created"
+                )
             ),
             Some(parent),
         ),
@@ -625,7 +645,11 @@ async fn chmod(path: &str, mode: u32, sink: &UiSink) {
         let _ = (path, mode);
         op_err(
             sink,
-            crate::i18n::tr("本平台不支持修改权限", "chmod not supported on this platform").into(),
+            crate::i18n::tr(
+                "本平台不支持修改权限",
+                "chmod not supported on this platform",
+            )
+            .into(),
         );
     }
 }
@@ -724,8 +748,11 @@ async fn copy_move(
     {
         op_err(
             sink,
-            crate::i18n::tr("目标不是已存在的目录", "Destination is not an existing directory")
-                .into(),
+            crate::i18n::tr(
+                "目标不是已存在的目录",
+                "Destination is not an existing directory",
+            )
+            .into(),
         );
         return;
     }
@@ -766,9 +793,9 @@ async fn copy_move(
                     skipped += 1;
                     continue;
                 }
-                ConflictPolicy::Rename => {
-                    std::path::PathBuf::from(crate::ssh::local_nonexistent(&target.to_string_lossy()))
-                }
+                ConflictPolicy::Rename => std::path::PathBuf::from(crate::ssh::local_nonexistent(
+                    &target.to_string_lossy(),
+                )),
                 ConflictPolicy::Overwrite => target,
             }
         } else {
@@ -804,7 +831,9 @@ async fn copy_move(
             (crate::i18n::Lang::Zh, 0) => format!("已{verb_zh} {done} 项"),
             (crate::i18n::Lang::Zh, k) => format!("已{verb_zh} {done} 项，跳过 {k} 项（已存在）"),
             (crate::i18n::Lang::En, 0) => format!("{verb_en} {done} item(s)"),
-            (crate::i18n::Lang::En, k) => format!("{verb_en} {done} item(s), skipped {k} (already exist)"),
+            (crate::i18n::Lang::En, k) => {
+                format!("{verb_en} {done} item(s), skipped {k} (already exist)")
+            }
         },
         Some(e) => match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!("{verb_zh}失败：{}", e.trim()),
@@ -1052,10 +1081,7 @@ mod tests {
             ConflictPolicy::Overwrite,
             &sink,
         ));
-        assert!(
-            !inner.join("proj").exists(),
-            "不该在自己的子目录里造出副本"
-        );
+        assert!(!inner.join("proj").exists(), "不该在自己的子目录里造出副本");
     }
 
     /// 冲突策略「跳过」：目标目录里已有同名项时不动它，源也留在原处。
@@ -1218,7 +1244,10 @@ mod tests {
             ConflictPolicy::Overwrite,
             &sink,
         ));
-        assert_eq!(std::fs::read(dstdir.join("a.txt")).expect("read dst"), b"NEW");
+        assert_eq!(
+            std::fs::read(dstdir.join("a.txt")).expect("read dst"),
+            b"NEW"
+        );
     }
 
     /// 同名前缀不能误伤：`/x/proj` 复制到 `/x/project` 是合法的。

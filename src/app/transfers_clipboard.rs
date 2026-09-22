@@ -3,7 +3,9 @@
 use crate::proto::{ConflictPolicy, TransferDir, UiCommand};
 
 use super::super::util::parent_dir;
-use super::super::{App, FileClip, LocalPeerXfer, PendingPaste, Relay, RelayPhase, Transfer, XferSpec};
+use super::super::{
+    App, FileClip, LocalPeerXfer, PendingPaste, Relay, RelayPhase, Transfer, XferSpec,
+};
 
 impl App {
     /// 复制 / 剪切选中项到 App 级剪贴板（跨 tab 共享）。

@@ -14,79 +14,80 @@ impl ConnectForm {
         egui::ScrollArea::vertical()
             .max_height(520.0)
             .show(ui, |ui| {
-        egui::Grid::new("conn_form")
-            .num_columns(2)
-            .spacing([12.0, 12.0])
-            .min_col_width(64.0)
-            .show(ui, |ui| {
-                text_row_hint(
-                    ui,
-                    crate::i18n::tr("名称", "Name"),
-                    &mut self.name,
-                    crate::i18n::tr("便于识别，可留空", "For display, optional"),
-                );
+                egui::Grid::new("conn_form")
+                    .num_columns(2)
+                    .spacing([12.0, 12.0])
+                    .min_col_width(64.0)
+                    .show(ui, |ui| {
+                        text_row_hint(
+                            ui,
+                            crate::i18n::tr("名称", "Name"),
+                            &mut self.name,
+                            crate::i18n::tr("便于识别，可留空", "For display, optional"),
+                        );
 
-                let host_resp = text_row(ui, crate::i18n::tr("主机", "Host"), &mut self.host);
-                if self.focus_host {
-                    host_resp.request_focus();
-                    self.focus_host = false;
+                        let host_resp =
+                            text_row(ui, crate::i18n::tr("主机", "Host"), &mut self.host);
+                        if self.focus_host {
+                            host_resp.request_focus();
+                            self.focus_host = false;
+                        }
+
+                        text_row(ui, crate::i18n::tr("端口", "Port"), &mut self.port);
+                        text_row(ui, crate::i18n::tr("用户名", "User"), &mut self.username);
+                        text_row_hint(
+                            ui,
+                            crate::i18n::tr("分组", "Group"),
+                            &mut self.group,
+                            crate::i18n::tr("可留空，用于归类", "Optional folder"),
+                        );
+                        text_row_hint(
+                            ui,
+                            crate::i18n::tr("标签", "Tags"),
+                            &mut self.tags,
+                            crate::i18n::tr("逗号分隔，参与搜索", "Comma-separated, searchable"),
+                        );
+
+                        ui.label(crate::i18n::tr("认证方式", "Auth"));
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.auth,
+                                AuthKind::Password,
+                                crate::i18n::tr("密码", "Password"),
+                            );
+                            ui.selectable_value(
+                                &mut self.auth,
+                                AuthKind::Key,
+                                crate::i18n::tr("私钥", "Key"),
+                            );
+                            ui.selectable_value(
+                                &mut self.auth,
+                                AuthKind::Agent,
+                                crate::i18n::tr("Agent", "Agent"),
+                            );
+                            ui.selectable_value(
+                                &mut self.auth,
+                                AuthKind::Interactive,
+                                crate::i18n::tr("交互/2FA", "2FA"),
+                            );
+                        });
+                        ui.end_row();
+
+                        self.auth_fields(ui, w);
+                    });
+
+                self.forward_agent_section(ui);
+                self.forward_x11_section(ui);
+                self.jump_host_section(ui, w);
+                if let Some(msg) = &self.notice {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(msg).color(Palette::WARN).size(12.0)).wrap(),
+                    );
                 }
-
-                text_row(ui, crate::i18n::tr("端口", "Port"), &mut self.port);
-                text_row(ui, crate::i18n::tr("用户名", "User"), &mut self.username);
-                text_row_hint(
-                    ui,
-                    crate::i18n::tr("分组", "Group"),
-                    &mut self.group,
-                    crate::i18n::tr("可留空，用于归类", "Optional folder"),
-                );
-                text_row_hint(
-                    ui,
-                    crate::i18n::tr("标签", "Tags"),
-                    &mut self.tags,
-                    crate::i18n::tr("逗号分隔，参与搜索", "Comma-separated, searchable"),
-                );
-
-                ui.label(crate::i18n::tr("认证方式", "Auth"));
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.auth,
-                        AuthKind::Password,
-                        crate::i18n::tr("密码", "Password"),
-                    );
-                    ui.selectable_value(
-                        &mut self.auth,
-                        AuthKind::Key,
-                        crate::i18n::tr("私钥", "Key"),
-                    );
-                    ui.selectable_value(
-                        &mut self.auth,
-                        AuthKind::Agent,
-                        crate::i18n::tr("Agent", "Agent"),
-                    );
-                    ui.selectable_value(
-                        &mut self.auth,
-                        AuthKind::Interactive,
-                        crate::i18n::tr("交互/2FA", "2FA"),
-                    );
-                });
-                ui.end_row();
-
-                self.auth_fields(ui, w);
-            });
-
-        self.forward_agent_section(ui);
-        self.forward_x11_section(ui);
-        self.jump_host_section(ui, w);
-        if let Some(msg) = &self.notice {
-            ui.add_space(6.0);
-            ui.add(
-                egui::Label::new(RichText::new(msg).color(Palette::WARN).size(12.0)).wrap(),
-            );
-        }
-        self.error_section(ui);
-        self.credential_notice(ui);
-        self.action_buttons(ui, result);
+                self.error_section(ui);
+                self.credential_notice(ui);
+                self.action_buttons(ui, result);
             });
     }
 

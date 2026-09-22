@@ -156,7 +156,8 @@ pub(super) fn toolbar(
                 let mut fav_remove: Option<String> = None;
                 // 收藏数量决定弹窗高度，最多五行；再多就滚动。
                 let fav_rows = state.favorites.len().clamp(1, MAX_FAV_ROWS);
-                let fav_row_h = ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
+                let fav_row_h =
+                    ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
                 let fav_max_h = fav_row_h * fav_rows as f32;
                 // 用 `Popup` 而不是 `popup_below_widget`：后者内部写死 `AboveOrBelow::Below`，
                 // 不会翻转。文件区工具栏本就靠近窗口下沿，弹窗被屏幕底边裁掉后无论收藏多少
@@ -179,68 +180,67 @@ pub(super) fn toolbar(
                                 false,
                             );
                         } else {
-                            fav_scroll_area(fav_max_h)
-                                .show(ui, |ui| {
-                                    for p in state.favorites.iter() {
-                                        ui.horizontal(|ui| {
-                                            ui.set_min_width(266.0);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new(icon::TRASH)
-                                                                    .size(12.0)
-                                                                    .color(Palette::TEXT_DIM),
-                                                            )
-                                                            .frame(false),
+                            fav_scroll_area(fav_max_h).show(ui, |ui| {
+                                for p in state.favorites.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_width(266.0);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new(icon::TRASH)
+                                                                .size(12.0)
+                                                                .color(Palette::TEXT_DIM),
                                                         )
-                                                        .on_hover_text(crate::i18n::tr(
-                                                            "删除收藏",
-                                                            "Remove",
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        fav_remove = Some(p.clone());
-                                                    }
-                                                    ui.with_layout(
-                                                        egui::Layout::left_to_right(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            let disp = trailing_path(p, 40);
-                                                            // `show_tooltip_when_elided(false)`：
-                                                            // 否则 egui 自带的「省略即提示完整文字」
-                                                            // 会和下面这条 tooltip 叠成两个（同
-                                                            // table_rows.rs 里文件名那处的老毛病）。
-                                                            if ui
-                                                                .add(
-                                                                    egui::Label::new(
-                                                                        RichText::new(format!(
-                                                                            "{} {}",
-                                                                            icon::FOLDER,
-                                                                            disp
-                                                                        ))
-                                                                        .size(12.0)
-                                                                        .color(Palette::TEXT),
-                                                                    )
-                                                                    .selectable(false)
-                                                                    .show_tooltip_when_elided(false)
-                                                                    .sense(Sense::click()),
+                                                        .frame(false),
+                                                    )
+                                                    .on_hover_text(crate::i18n::tr(
+                                                        "删除收藏",
+                                                        "Remove",
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    fav_remove = Some(p.clone());
+                                                }
+                                                ui.with_layout(
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        let disp = trailing_path(p, 40);
+                                                        // `show_tooltip_when_elided(false)`：
+                                                        // 否则 egui 自带的「省略即提示完整文字」
+                                                        // 会和下面这条 tooltip 叠成两个（同
+                                                        // table_rows.rs 里文件名那处的老毛病）。
+                                                        if ui
+                                                            .add(
+                                                                egui::Label::new(
+                                                                    RichText::new(format!(
+                                                                        "{} {}",
+                                                                        icon::FOLDER,
+                                                                        disp
+                                                                    ))
+                                                                    .size(12.0)
+                                                                    .color(Palette::TEXT),
                                                                 )
-                                                                .on_hover_text(p.as_str())
-                                                                .clicked()
-                                                            {
-                                                                fav_nav = Some(p.clone());
-                                                            }
-                                                        },
-                                                    );
-                                                },
-                                            );
-                                        });
-                                    }
-                                });
+                                                                .selectable(false)
+                                                                .show_tooltip_when_elided(false)
+                                                                .sense(Sense::click()),
+                                                            )
+                                                            .on_hover_text(p.as_str())
+                                                            .clicked()
+                                                        {
+                                                            fav_nav = Some(p.clone());
+                                                        }
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    });
+                                }
+                            });
                         }
                     });
                 if let Some(p) = fav_remove {
@@ -720,8 +720,7 @@ mod fav_popup_tests {
             };
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    estimate =
-                        ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
+                    estimate = ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
                     let r = ui
                         .horizontal(|ui| {
                             ui.set_min_width(266.0);

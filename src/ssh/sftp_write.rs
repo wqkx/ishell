@@ -108,9 +108,7 @@ pub(in crate::ssh) async fn sftp_write_atomic(
     // 下面的「设完权限复验 tmp、被截断就重写内容放弃权限」保留不动：根因虽已消除，但这一步
     // 便宜，且真遇到行为古怪的服务端时它仍是最后一道「数据优先」的兜底。
     if let Some(mode) = orig_perm {
-        let _ = sftp
-            .set_metadata(&tmp, super::perm_only_attrs(mode))
-            .await;
+        let _ = sftp.set_metadata(&tmp, super::perm_only_attrs(mode)).await;
         if !sftp_verify_size(sftp, &tmp, data.len()).await {
             // 该服务器 SETSTAT 会截断文件：重写内容、放弃权限保留（数据优先）。
             if let Err(e) = sftp_overwrite_progress_to(sftp, &tmp, path, data, sink).await {
@@ -433,8 +431,13 @@ pub(in crate::ssh) async fn handle_fs_op(
         }),
         Err(e) => {
             let message = match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("操作失败：{}", crate::ssh::dedup_status(&e.to_string())),
-                crate::i18n::Lang::En => format!("Operation failed: {}", crate::ssh::dedup_status(&e.to_string())),
+                crate::i18n::Lang::Zh => {
+                    format!("操作失败：{}", crate::ssh::dedup_status(&e.to_string()))
+                }
+                crate::i18n::Lang::En => format!(
+                    "Operation failed: {}",
+                    crate::ssh::dedup_status(&e.to_string())
+                ),
             };
             match op_path {
                 // 失败也可能改变了目录内容（部分创建/目标状态未知），刷新父目录一致化

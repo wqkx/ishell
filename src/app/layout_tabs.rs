@@ -171,9 +171,9 @@ impl App {
                                     let ctx = ui.ctx().clone();
                                     let body_font = egui::TextStyle::Body.resolve(ui.style());
                                     let mut acc = 0.0f32; // 目标布局累计左边界
-                                    // 同名会话消歧（规则见 `tab_labels`）：标签上只在同名会话
-                                    // 分属不同主机时追加「· 主机」；#uid 不上标签，只在 hover
-                                    // 提示里跟在 user@host 后面。
+                                                          // 同名会话消歧（规则见 `tab_labels`）：标签上只在同名会话
+                                                          // 分属不同主机时追加「· 主机」；#uid 不上标签，只在 hover
+                                                          // 提示里跟在 user@host 后面。
                                     let labels = tab_labels(self.sessions.iter().map(|s| {
                                         // OSC 0/2 动态标题优先（vim/ssh 会话名）；否则用连接名。
                                         let title = s
@@ -473,7 +473,10 @@ fn tab_hover_text(base: &str, dup_uid: Option<u64>, ai_owner_label: Option<&str>
         tip.push_str(&format!(" · #{uid}"));
     }
     if let Some(label) = ai_owner_label {
-        tip.push_str(&format!(" · {} {label}", crate::i18n::tr("AI 开启，来源", "AI-opened by")));
+        tip.push_str(&format!(
+            " · {} {label}",
+            crate::i18n::tr("AI 开启，来源", "AI-opened by")
+        ));
     }
     tip
 }
@@ -506,7 +509,11 @@ mod tab_label_tests {
     #[test]
     fn host_suffix_only_when_hosts_differ() {
         assert_eq!(
-            labels(&[("web", Some("10.0.0.1")), ("web", Some("10.0.0.2")), ("db", Some("10.0.0.1"))]),
+            labels(&[
+                ("web", Some("10.0.0.1")),
+                ("web", Some("10.0.0.2")),
+                ("db", Some("10.0.0.1"))
+            ]),
             vec![
                 ("web · 10.0.0.1".to_string(), true),
                 ("web · 10.0.0.2".to_string(), true),
@@ -522,8 +529,14 @@ mod tab_label_tests {
 
     #[test]
     fn hover_puts_uid_right_after_user_at_host() {
-        assert_eq!(tab_hover_text("root@10.0.0.1:22", Some(3), None), "root@10.0.0.1:22 · #3");
-        assert_eq!(tab_hover_text("root@10.0.0.1:22", None, None), "root@10.0.0.1:22");
+        assert_eq!(
+            tab_hover_text("root@10.0.0.1:22", Some(3), None),
+            "root@10.0.0.1:22 · #3"
+        );
+        assert_eq!(
+            tab_hover_text("root@10.0.0.1:22", None, None),
+            "root@10.0.0.1:22"
+        );
         assert!(tab_hover_text("root@10.0.0.1:22", Some(3), Some("e5-1"))
             .starts_with("root@10.0.0.1:22 · #3 · "));
     }

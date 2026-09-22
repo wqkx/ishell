@@ -6,9 +6,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -38,17 +38,19 @@ impl Session {
     /// 匹配"而白白 clone 一份内容。
     pub(super) fn file_write_op_would_resolve(&self, id: u64) -> bool {
         self.file_op_tombstones.contains(&id)
-            || self.pending_file_ops.iter().any(
-                |op| matches!(op.kind, FileOpKind::Write { op_id } if op_id == id),
-            )
+            || self
+                .pending_file_ops
+                .iter()
+                .any(|op| matches!(op.kind, FileOpKind::Write { op_id } if op_id == id))
     }
 
     /// 同上，读操作版本。
     pub(super) fn file_read_op_would_resolve(&self, id: u64) -> bool {
         self.file_op_tombstones.contains(&id)
-            || self.pending_file_ops.iter().any(
-                |op| matches!(op.kind, FileOpKind::Read { op_id } if op_id == id),
-            )
+            || self
+                .pending_file_ops
+                .iter()
+                .any(|op| matches!(op.kind, FileOpKind::Read { op_id } if op_id == id))
     }
 
     /// 放弃当前挂起的 AI 命令运行：给还在等待的 `poll_run` 一个明确的"未完成"响应
@@ -160,9 +162,11 @@ impl Session {
         if self.file_op_tombstones.contains(&id) {
             return true;
         }
-        let Some(pos) = self.pending_file_ops.iter().position(
-            |op| matches!(op.kind, FileOpKind::Write { op_id } if op_id == id),
-        ) else {
+        let Some(pos) = self
+            .pending_file_ops
+            .iter()
+            .position(|op| matches!(op.kind, FileOpKind::Write { op_id } if op_id == id))
+        else {
             return false;
         };
         let mut op = self.pending_file_ops.remove(pos);
@@ -171,7 +175,10 @@ impl Session {
             let resp = match result {
                 Ok(mtime) => McpResponse {
                     id: req_id,
-                    result: Ok(McpReqResult::FileWritten { path: op.path, mtime }),
+                    result: Ok(McpReqResult::FileWritten {
+                        path: op.path,
+                        mtime,
+                    }),
                 },
                 Err(msg) => McpResponse {
                     id: req_id,
@@ -185,13 +192,19 @@ impl Session {
 
     /// `ReadFile` 对应的 worker 事件（`FileOpened`/`FileLoadFailed`/`FileTooLarge`）到达时调用：
     /// 按 `id` 匹配当前挂起的读操作，命中则回填响应并返回 true（同上，跳过转发给编辑器 UI）。
-    pub(super) fn try_resolve_file_read(&mut self, id: u64, result: Result<String, String>) -> bool {
+    pub(super) fn try_resolve_file_read(
+        &mut self,
+        id: u64,
+        result: Result<String, String>,
+    ) -> bool {
         if self.file_op_tombstones.contains(&id) {
             return true;
         }
-        let Some(pos) = self.pending_file_ops.iter().position(
-            |op| matches!(op.kind, FileOpKind::Read { op_id } if op_id == id),
-        ) else {
+        let Some(pos) = self
+            .pending_file_ops
+            .iter()
+            .position(|op| matches!(op.kind, FileOpKind::Read { op_id } if op_id == id))
+        else {
             return false;
         };
         let mut op = self.pending_file_ops.remove(pos);
@@ -226,18 +239,21 @@ impl Session {
     /// MCP 响应，不影响事件其余部分的处理。
     pub(super) fn file_copy_op_would_resolve(&self, id: u64) -> bool {
         self.file_op_tombstones.contains(&id)
-            || self.pending_file_ops.iter().any(
-                |op| matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id),
-            )
+            || self
+                .pending_file_ops
+                .iter()
+                .any(|op| matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id))
     }
 
     pub(super) fn try_resolve_file_copy(&mut self, id: u64, result: Result<(), String>) -> bool {
         if self.file_op_tombstones.contains(&id) {
             return true;
         }
-        let Some(pos) = self.pending_file_ops.iter().position(
-            |op| matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id),
-        ) else {
+        let Some(pos) = self
+            .pending_file_ops
+            .iter()
+            .position(|op| matches!(op.kind, FileOpKind::Copy { op_id } if op_id == id))
+        else {
             return false;
         };
         let mut op = self.pending_file_ops.remove(pos);
@@ -264,12 +280,18 @@ impl Session {
 /// `WriteFile`/这三个事件都加了 id 字段），各自的 `op_id` 语义不同（Write 侧是这次
 /// write_file 生成的临时 id；Read 侧同理），用各自的变量名区分。
 pub(super) enum FileOpKind {
-    Write { op_id: u64 },
-    Read { op_id: u64 },
+    Write {
+        op_id: u64,
+    },
+    Read {
+        op_id: u64,
+    },
     /// `CopyToRemote`/`CopyFromRemote`：`op_id` 匹配 `WorkerEvent::TransferDone`（同一 id
     /// 空间，见 mcp_bridge.rs 里 nanosecond 时间戳生成 op_id 的既有写法，避免跟 GUI 自己
     /// 发起的传输、走 `Session::next_xfer` 的小整数 id 撞车）。
-    Copy { op_id: u64 },
+    Copy {
+        op_id: u64,
+    },
 }
 
 /// AI 的 `write_file`/`read_file`/`copy_*` 请求，正等待 worker 侧 SFTP 操作完成的事件。
@@ -488,15 +510,19 @@ pub(super) struct McpCall {
 /// 从一个形状古怪的结果里反推发生了什么便宜得多。
 fn validate_run_command(command: &str) -> Result<(), String> {
     if command.trim().is_empty() {
-        return Err("command 为空：空命令只会让 shell 打一个新提示符，不会执行任何东西（\
+        return Err(
+            "command 为空：空命令只会让 shell 打一个新提示符，不会执行任何东西（\
                     shell 集成下还会误报成上一条命令的退出码）。要单纯看屏幕请用 read_screen"
-            .into());
+                .into(),
+        );
     }
     if command.contains('\n') || command.contains('\r') {
-        return Err("command 含换行：命令是当作按键打进真实终端的，换行会被 shell 当成回车、\
+        return Err(
+            "command 含换行：命令是当作按键打进真实终端的，换行会被 shell 当成回车、\
                     拆成多条命令依次执行，完成检测只认得第一条——请改写成单行（用 `;` 或 \
                     `&&` 连接），或先用 write_file 写一个脚本再执行它"
-            .into());
+                .into(),
+        );
     }
     // 整条命令、或命令链里单独成段的一环是 `logout`：它的本意是「关掉这个会话」，那是
     // close_session 的事。不能照 `exit` 的办法包进子 shell——子 shell 永远不是登录 shell，
@@ -505,10 +531,12 @@ fn validate_run_command(command: &str) -> Result<(), String> {
     // 两条路都不对，拒绝。（分段扫描与改写 exit 共用同一份判据，两处不会漂移。）
     for (s, e) in top_level_command_segments(command) {
         if normalized_session_ender(&command[s..e]).is_some_and(|(head, _)| head == "logout") {
-            return Err("command 里含有 logout：run_command 用来执行命令，不用来关会话——关掉你\
+            return Err(
+                "command 里含有 logout：run_command 用来执行命令，不用来关会话——关掉你\
                         自己开的会话请用 close_session；只是想拿一个退出码请用 `exit N`（会在\
                         子 shell 里执行，会话不受影响）"
-                .into());
+                    .into(),
+            );
         }
     }
     // `exit` 后面还接着命令：原语义里 exit 一执行 shell 就终止，后面的命令**一条都不会跑**
@@ -517,11 +545,13 @@ fn validate_run_command(command: &str) -> Result<(), String> {
     // （实测 bash：`test -f /nonexistent || (exit 1); echo DANGER` 打印 DANGER）。改写保不住
     // 这个语义，原样发出去又会杀掉登录 shell——拒绝，让调用方把后续命令改成条件分支。
     if exit_followed_by_command(command) {
-        return Err("command 里的 exit 后面还有命令：在 run_command 里 exit 会被改写进子 shell \
+        return Err(
+            "command 里的 exit 后面还有命令：在 run_command 里 exit 会被改写进子 shell \
                     执行（为了不杀掉会话），它**无法终止**后面的命令——`cond || exit 1; rm …` \
                     这类守卫会失效、rm 照跑。请把后续命令改成条件分支（`cond && rm …`），或把 \
                     exit 放到命令最后"
-            .into());
+                .into(),
+        );
     }
     Ok(())
 }
@@ -620,7 +650,7 @@ fn top_level_command_segments(command: &str) -> Vec<(usize, usize)> {
                 }
                 b'&' if depth == 0 => match bytes.get(i + 1) {
                     _ if prev == b'>' || prev == b'<' => {} // >&、<&：重定向操作符的一部分
-                    Some(b'>') => {}                         // &>
+                    Some(b'>') => {}                        // &>
                     Some(b'&') => {
                         segs.push((start, i));
                         start = i + 2;
@@ -794,7 +824,11 @@ const MAX_RUN_OUTPUT_BYTES: usize = 200_000;
 /// 只应该在 `remote_path` 已经过 `validate_remote_path` 校验之后调用：对相对路径，
 /// `rfind('/')` 找不到分隔符会退化成 `"/"`，把上传目标悄悄改到文件系统根目录。
 fn remote_basename(path: &str) -> String {
-    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string()
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn remote_parent(path: &str) -> String {
@@ -814,7 +848,9 @@ fn validate_remote_path(path: &str) -> Result<(), String> {
         return Err(format!("remote_path 必须是绝对路径：{path}"));
     }
     if path.split('/').any(|seg| seg == "." || seg == "..") {
-        return Err(format!("remote_path 不能包含 \".\" 或 \"..\" 路径段：{path}"));
+        return Err(format!(
+            "remote_path 不能包含 \".\" 或 \"..\" 路径段：{path}"
+        ));
     }
     if remote_basename(path).is_empty() {
         return Err(format!("remote_path 缺少有效的文件名：{path}"));
@@ -833,7 +869,9 @@ fn validate_local_path(path: &str) -> Result<(), String> {
     // 规整掉（只有开头的 "." 才会被保留成 `Component::CurDir`），导致
     // "/tmp/./notes.txt" 这类路径检测不到，字符串层面直接拆分才可靠。
     if path.split('/').any(|seg| seg == "." || seg == "..") {
-        return Err(format!("local_path 不能包含 \".\" 或 \"..\" 路径段：{path}"));
+        return Err(format!(
+            "local_path 不能包含 \".\" 或 \"..\" 路径段：{path}"
+        ));
     }
     if p.file_name().is_none() {
         return Err(format!("local_path 缺少有效的文件名：{path}"));
@@ -902,7 +940,8 @@ impl russh::keys::ssh_key::rand_core::TryCryptoRng for SysRandom {}
 fn generate_temp_keypair(marker: &str) -> Result<(Vec<u8>, String), String> {
     use russh::keys::ssh_key;
     let mut rng = SysRandom;
-    let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519).map_err(|e| e.to_string())?;
+    let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
+        .map_err(|e| e.to_string())?;
     key.set_comment(marker.to_string());
     let priv_pem = key
         .to_openssh(ssh_key::LineEnding::LF)
@@ -1169,7 +1208,13 @@ mod tickets {
                 map.remove(&oldest);
             }
         }
-        map.insert(ticket.clone(), Entry { actor, last_used: now });
+        map.insert(
+            ticket.clone(),
+            Entry {
+                actor,
+                last_used: now,
+            },
+        );
         Some(ticket)
     }
 
@@ -1259,10 +1304,12 @@ async fn handle_conn(
         reply(
             &mut w,
             id,
-            Err("这条请求点名的是另一个 iShell 实例（或没有点名）。请重新发起 MCP 连接：\
+            Err(
+                "这条请求点名的是另一个 iShell 实例（或没有点名）。请重新发起 MCP 连接：\
                  绑定的那个 iShell 可能已经退出或重启；代理会在只剩一个匹配实例时改绑，\
                  多开时仍不会静默换到别的窗口——命令落到你没预期的机器上更糟"
-                .to_string()),
+                    .to_string(),
+            ),
         )
         .await;
         return;
@@ -1285,12 +1332,7 @@ async fn handle_conn(
     //   v5 收紧）。配对握手（PairHello/PairProve）不受影响。
     match &req.kind {
         McpReqKind::Identify => {
-            reply(
-                &mut w,
-                id,
-                Ok(instance_hello(String::new())),
-            )
-            .await;
+            reply(&mut w, id, Ok(instance_hello(String::new()))).await;
             return;
         }
         // v3 的旧代理才会发这个。v5 起**校验 token 才答话**（见上面块注释）：token 正确，
@@ -1300,12 +1342,7 @@ async fn handle_conn(
             if *token != crate::store::mcp_pairing_token() {
                 return; // 静默丢弃：probe 分类为 Dead，实例从候选集里消失
             }
-            reply(
-                &mut w,
-                id,
-                Ok(instance_hello(String::new())),
-            )
-            .await;
+            reply(&mut w, id, Ok(instance_hello(String::new()))).await;
             return;
         }
         // 配对握手（v4）：本进程先出示 `Server` 证明，对端验过再送 `Client` 证明上来。
@@ -1366,19 +1403,19 @@ async fn handle_conn(
                     // 验过了才签发凭据。没声明 actor 的握手不签：凭据要绑一个身份，否则 iShell
                     // 没法把「窗口归开它的那个 AI」落到实处。
                     let Some(actor) = hello_actor else {
-                        reply(&mut w, id2, Err("配对握手缺少 actor（代理进程标识），不签发连接凭据".into())).await;
+                        reply(
+                            &mut w,
+                            id2,
+                            Err("配对握手缺少 actor（代理进程标识），不签发连接凭据".into()),
+                        )
+                        .await;
                         return;
                     };
                     let Some(ticket) = tickets::issue(actor) else {
                         reply(&mut w, id2, Err("本机熵源不可用，无法签发连接凭据".into())).await;
                         return;
                     };
-                    reply(
-                        &mut w,
-                        id2,
-                        Ok(instance_hello(ticket)),
-                    )
-                    .await;
+                    reply(&mut w, id2, Ok(instance_hello(ticket))).await;
                 }
                 Some((id2, false)) => {
                     reply(&mut w, id2, Err("配对证明不符".into())).await;
@@ -1484,7 +1521,15 @@ async fn handle_conn(
         };
         let upload_source = Some(Box::new(source) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
         let (resp_tx, resp_rx) = oneshot::channel();
-        if tx.send(McpCall { req, resp_tx, upload_source, download_sink: None }).is_err() {
+        if tx
+            .send(McpCall {
+                req,
+                resp_tx,
+                upload_source,
+                download_sink: None,
+            })
+            .is_err()
+        {
             return;
         }
         ctx.request_repaint();
@@ -1525,14 +1570,23 @@ async fn handle_conn(
     // 处理，不复用下面的通用一问一答路径。
     let is_caller_download = matches!(&req.kind, McpReqKind::CopyFromRemoteToCaller { .. });
     if is_caller_download {
-        let McpReqKind::CopyFromRemoteToCaller { ref remote_path, .. } = req.kind else {
+        let McpReqKind::CopyFromRemoteToCaller {
+            ref remote_path, ..
+        } = req.kind
+        else {
             unreachable!()
         };
         let stream_path = remote_path.clone();
         let (resp_tx, resp_rx) = oneshot::channel();
-        let (dl_tx, dl_rx) = oneshot::channel::<Result<crate::proto::DownloadStreamSource, String>>();
+        let (dl_tx, dl_rx) =
+            oneshot::channel::<Result<crate::proto::DownloadStreamSource, String>>();
         if tx
-            .send(McpCall { req, resp_tx, upload_source: None, download_sink: Some(dl_tx) })
+            .send(McpCall {
+                req,
+                resp_tx,
+                upload_source: None,
+                download_sink: Some(dl_tx),
+            })
             .is_err()
         {
             return;
@@ -1544,7 +1598,9 @@ async fn handle_conn(
         let outcome: Result<crate::proto::DownloadStreamSource, String> = match dl_rx.await {
             Ok(o) => o,
             Err(_) => match resp_rx.await {
-                Ok(McpResponse { result: Err(msg), .. }) => Err(msg),
+                Ok(McpResponse {
+                    result: Err(msg), ..
+                }) => Err(msg),
                 Ok(McpResponse { result: Ok(_), .. }) => Err("iShell 返回了意料之外的响应".into()),
                 Err(_) => Err("iShell 未能处理该请求（可能已关闭）".into()),
             },
@@ -1553,7 +1609,10 @@ async fn handle_conn(
             Ok(source) => {
                 let header = McpResponse {
                     id,
-                    result: Ok(McpReqResult::CopyStreamHeader { path: stream_path, size: source.size }),
+                    result: Ok(McpReqResult::CopyStreamHeader {
+                        path: stream_path,
+                        size: source.size,
+                    }),
                 };
                 if let Ok(mut json) = serde_json::to_string(&header) {
                     json.push('\n');
@@ -1580,13 +1639,21 @@ async fn handle_conn(
                     Ok(Ok(Err(msg))) => Err(msg),
                     // worker 没吭声就没了（panic/被 drop）：只能按失败算。宁可让调用方重试，
                     // 也不能让它把一个来路不明的字节流换入原文件。
-                    Ok(Err(_)) => Err("iShell 未能给出这次传输的最终判定（worker 已退出）".to_string()),
-                    Err(_) => Err("iShell 未能在字节流发完后及时给出传输判定（worker 可能已卡死）".to_string()),
+                    Ok(Err(_)) => {
+                        Err("iShell 未能给出这次传输的最终判定（worker 已退出）".to_string())
+                    }
+                    Err(_) => Err(
+                        "iShell 未能在字节流发完后及时给出传输判定（worker 可能已卡死）"
+                            .to_string(),
+                    ),
                 };
                 reply(&mut w, id, verdict).await;
             }
             Err(msg) => {
-                let resp = McpResponse { id, result: Err(msg) };
+                let resp = McpResponse {
+                    id,
+                    result: Err(msg),
+                };
                 if let Ok(mut json) = serde_json::to_string(&resp) {
                     json.push('\n');
                     let _ = w.write_all(json.as_bytes()).await;
@@ -1596,16 +1663,24 @@ async fn handle_conn(
         return;
     }
     let (resp_tx, mut resp_rx) = oneshot::channel();
-    if tx.send(McpCall { req, resp_tx, upload_source: None, download_sink: None }).is_err() {
+    if tx
+        .send(McpCall {
+            req,
+            resp_tx,
+            upload_source: None,
+            download_sink: None,
+        })
+        .is_err()
+    {
         return;
     }
     ctx.request_repaint(); // 唤醒 UI 线程尽快排空这条请求
-    // 对端（ishell-mcp）自己可能有更短的超时（比如 MCP 客户端的空闲中止），在我们等到
-    // App 处理完之前就提前断开连接——这种情况下这一行不再读到任何东西，`next_line()`
-    // 会返回 Ok(None)（EOF）。如果只是死等 resp_rx，那么即使对端早就走了，
-    // 这个 resp_tx 依旧会一直挂在 PendingAiRun 上，把后续 poll_run 卡死在
-    // "已有一个 poll_run 在等待"——release 掉 resp_rx（丢弃它，触发发送端的
-    // is_closed()），让 App 那边能识别出这个等待者其实已经没人要结果了。
+                           // 对端（ishell-mcp）自己可能有更短的超时（比如 MCP 客户端的空闲中止），在我们等到
+                           // App 处理完之前就提前断开连接——这种情况下这一行不再读到任何东西，`next_line()`
+                           // 会返回 Ok(None)（EOF）。如果只是死等 resp_rx，那么即使对端早就走了，
+                           // 这个 resp_tx 依旧会一直挂在 PendingAiRun 上，把后续 poll_run 卡死在
+                           // "已有一个 poll_run 在等待"——release 掉 resp_rx（丢弃它，触发发送端的
+                           // is_closed()），让 App 那边能识别出这个等待者其实已经没人要结果了。
     let resp = tokio::select! {
         biased;
         r = &mut resp_rx => r.unwrap_or(McpResponse {
@@ -1726,13 +1801,17 @@ impl App {
         // 写法与下面的 use consent 对齐（`as_ref` + `take`），两处收尾方式一致，便于对读。
         if let Some(pending) = self.pending_open_consent.as_ref() {
             if Instant::now() >= pending.deadline {
-                let pending = self.pending_open_consent.take().expect("上一行刚确认是 Some");
+                let pending = self
+                    .pending_open_consent
+                    .take()
+                    .expect("上一行刚确认是 Some");
                 if let Some(tx) = pending.resp_tx {
                     let _ = tx.send(McpResponse {
                         id: pending.req_id,
                         result: Err(
                             "等待用户确认超时（5 分钟），已自动拒绝：请让用户切回 iShell 点击\
-                             确认弹窗，或直接重新调用 open_session 再次发起确认请求".into(),
+                             确认弹窗，或直接重新调用 open_session 再次发起确认请求"
+                                .into(),
                         ),
                     });
                 }
@@ -1745,13 +1824,17 @@ impl App {
             if pending.resp_tx.is_closed() {
                 self.pending_bind_consent = None;
             } else if Instant::now() >= pending.deadline {
-                let pending = self.pending_bind_consent.take().expect("上一行刚确认是 Some");
+                let pending = self
+                    .pending_bind_consent
+                    .take()
+                    .expect("上一行刚确认是 Some");
                 let _ = pending.resp_tx.send(McpResponse {
                     id: pending.req_id,
                     result: Err(
                         "等待用户选择 iShell 窗口超时（5 分钟）：用户同时开着多个 iShell，\
                          需要他在想让你操作的那个窗口上点「允许」。请让用户切回 iShell 处理\
-                         后重试".into(),
+                         后重试"
+                            .into(),
                     ),
                 });
             }
@@ -1795,7 +1878,12 @@ impl App {
             .cross_copy_jobs
             .iter()
             .flat_map(|j| [j.deadline, j.phase_deadline]);
-        let next = consents.into_iter().flatten().chain(sessions).chain(jobs).min();
+        let next = consents
+            .into_iter()
+            .flatten()
+            .chain(sessions)
+            .chain(jobs)
+            .min();
         if let Some(deadline) = next {
             self.ctx
                 .request_repaint_after(deadline.saturating_duration_since(Instant::now()));
@@ -1888,7 +1976,8 @@ impl App {
             let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
                 continue;
             };
-            if let CrossCopyPhase::DirectCopying { started } = &mut self.cross_copy_jobs[idx].phase {
+            if let CrossCopyPhase::DirectCopying { started } = &mut self.cross_copy_jobs[idx].phase
+            {
                 *started = true;
             }
         }
@@ -1896,7 +1985,10 @@ impl App {
             let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
                 continue;
             };
-            if !matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::DirectCopying { .. }) {
+            if !matches!(
+                self.cross_copy_jobs[idx].phase,
+                CrossCopyPhase::DirectCopying { .. }
+            ) {
                 continue; // 迟到事件（比如已经因超时转过一次中转）：直接忽略
             }
             self.finish_direct_attempt(idx, if ok { Ok(()) } else { Err(message) });
@@ -1919,7 +2011,10 @@ impl App {
             if ok {
                 self.cross_copy_jobs[idx].trust_established = false;
             }
-            if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
+            if matches!(
+                self.cross_copy_jobs[idx].phase,
+                CrossCopyPhase::UntrustingAfterDirect
+            ) {
                 self.finish_after_untrust(idx, true);
             }
         }
@@ -1927,7 +2022,10 @@ impl App {
             let Some(idx) = self.cross_copy_jobs.iter().position(|j| j.op_id == op_id) else {
                 continue;
             };
-            if !matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::RelayReading) {
+            if !matches!(
+                self.cross_copy_jobs[idx].phase,
+                CrossCopyPhase::RelayReading
+            ) {
                 continue;
             }
             match result {
@@ -1948,7 +2046,12 @@ impl App {
                     }
                     let sent = self.sessions[dest_idx]
                         .cmd_tx
-                        .send(UiCommand::RelayWriteFile { id: op_id, remote_path: dest_path, size, reader: pipe_reader })
+                        .send(UiCommand::RelayWriteFile {
+                            id: op_id,
+                            remote_path: dest_path,
+                            size,
+                            reader: pipe_reader,
+                        })
                         .is_ok();
                     if !sent {
                         self.fail_cross_copy_job(idx, "目标会话的后台连接似乎已经断开".into());
@@ -1990,13 +2093,17 @@ impl App {
             // 撤销是断线前发的，旧 worker 未必处理到——等 phase_deadline 收尾时一声不吭，
             // 公钥就可能静默残留。这里当场告警，并把 trust_established 清掉（已告警、也已
             // 无通道可补发），避免快败/总超时分支之后再对同一把 key 重复告警。
-            if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::UntrustingAfterDirect) {
+            if matches!(
+                self.cross_copy_jobs[idx].phase,
+                CrossCopyPhase::UntrustingAfterDirect
+            ) {
                 let (dest_uid, marker, trusted) = {
                     let job = &self.cross_copy_jobs[idx];
                     (job.dest_uid, job.marker.clone(), job.trust_established)
                 };
-                let dest_connected =
-                    self.session_idx_by_uid(dest_uid).map(|i| self.sessions[i].connected);
+                let dest_connected = self
+                    .session_idx_by_uid(dest_uid)
+                    .map(|i| self.sessions[i].connected);
                 if trusted && untrust_route(dest_connected).is_err() {
                     self.warn_temp_key_residue(dest_uid, marker, "撤销回执未到，目标会话已断线");
                     self.cross_copy_jobs[idx].trust_established = false;
@@ -2009,9 +2116,9 @@ impl App {
                     .into_iter()
                     .find_map(|(role, uid)| match self.session_idx_by_uid(uid) {
                         None => Some(format!("{role}会话已不存在（uid={uid}），跨会话拷贝中止")),
-                        Some(i) if !self.sessions[i].connected => {
-                            Some(format!("{role}会话已断线（uid={uid}），跨会话拷贝中止——重连后请重试"))
-                        }
+                        Some(i) if !self.sessions[i].connected => Some(format!(
+                            "{role}会话已断线（uid={uid}），跨会话拷贝中止——重连后请重试"
+                        )),
                         Some(_) => None,
                     })
             };
@@ -2029,7 +2136,10 @@ impl App {
                 // 直连传输已在进行：先置取消标志——直连循环只看这个 Arc<AtomicBool>，
                 // CancelTransfer 管不到它；不置位的话源 worker 的 scp/rsync 会照跑完，
                 // AI 据失败重试就是两个进程并发写同一目标文件。
-                if matches!(self.cross_copy_jobs[idx].phase, CrossCopyPhase::DirectCopying { .. }) {
+                if matches!(
+                    self.cross_copy_jobs[idx].phase,
+                    CrossCopyPhase::DirectCopying { .. }
+                ) {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // TrustingB 在途窗口（信任已发给 worker、回执未到）里判败必须先补发撤销——
@@ -2082,14 +2192,20 @@ impl App {
                         };
                         self.best_effort_untrust(dest_uid, op_id, marker);
                     }
-                    self.fail_cross_copy_job(idx, "跨会话拷贝超时（源或目标 worker 未在超时前返回结果）".into());
+                    self.fail_cross_copy_job(
+                        idx,
+                        "跨会话拷贝超时（源或目标 worker 未在超时前返回结果）".into(),
+                    );
                 }
                 continue;
             }
             match job.phase {
                 CrossCopyPhase::DirectCopying { started: false } if now >= job.phase_deadline => {
                     job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.finish_direct_attempt(idx, Err("直连尝试超时（20s 内未建立连接），已转中转".into()));
+                    self.finish_direct_attempt(
+                        idx,
+                        Err("直连尝试超时（20s 内未建立连接），已转中转".into()),
+                    );
                 }
                 CrossCopyPhase::UntrustingAfterDirect if now >= job.phase_deadline => {
                     // 只是撤销回执迟到，总超时还没到——时间预算还在，照常可以转中转。
@@ -2183,7 +2299,11 @@ impl App {
         };
         let sent = self.sessions[src_idx]
             .cmd_tx
-            .send(UiCommand::RelayReadFile { id: op_id, remote_path: src_path, writer: pipe_writer })
+            .send(UiCommand::RelayReadFile {
+                id: op_id,
+                remote_path: src_path,
+                writer: pipe_writer,
+            })
             .is_ok();
         if !sent {
             self.fail_cross_copy_job(idx, "源会话的后台连接似乎已经断开".into());
@@ -2246,10 +2366,17 @@ impl App {
         };
         let sent = self.sessions[dest_idx]
             .cmd_tx
-            .send(UiCommand::UntrustTempKey { op_id, marker: marker.clone() })
+            .send(UiCommand::UntrustTempKey {
+                op_id,
+                marker: marker.clone(),
+            })
             .is_ok();
         if !sent {
-            self.warn_temp_key_residue(dest_uid, marker, "撤销消息发送失败（目标会话后台连接已断开）");
+            self.warn_temp_key_residue(
+                dest_uid,
+                marker,
+                "撤销消息发送失败（目标会话后台连接已断开）",
+            );
         }
     }
 
@@ -2295,10 +2422,12 @@ impl App {
                 job.marker
             );
             if let Some(dest_idx) = self.session_idx_by_uid(job.dest_uid) {
-                let _ = self.sessions[dest_idx].cmd_tx.send(UiCommand::UntrustTempKey {
-                    op_id: job.op_id,
-                    marker: job.marker.clone(),
-                });
+                let _ = self.sessions[dest_idx]
+                    .cmd_tx
+                    .send(UiCommand::UntrustTempKey {
+                        op_id: job.op_id,
+                        marker: job.marker.clone(),
+                    });
             }
         }
     }
@@ -2334,9 +2463,9 @@ impl App {
                 // TransferDone 已经通过 try_resolve_file_copy 自然移除了；这里只处理
                 // "某一侧因为提前失败/超时而从没走到那一步"的情况，避免占位项永久占着
                 // 并发名额。
-                self.sessions[sidx]
-                    .pending_file_ops
-                    .retain(|op| !matches!(op.kind, FileOpKind::Copy { op_id } if op_id == job.op_id));
+                self.sessions[sidx].pending_file_ops.retain(
+                    |op| !matches!(op.kind, FileOpKind::Copy { op_id } if op_id == job.op_id),
+                );
             }
         }
         if let Some(tx) = job.resp_tx {
@@ -2348,7 +2477,10 @@ impl App {
                         method: method.to_string(),
                     }),
                 },
-                Err(msg) => McpResponse { id: job.req_id, result: Err(msg) },
+                Err(msg) => McpResponse {
+                    id: job.req_id,
+                    result: Err(msg),
+                },
             };
             let _ = tx.send(resp);
         }
@@ -2378,11 +2510,14 @@ impl App {
         let prev_active = self.active;
         self.spawn_session(cfg);
         self.active = prev_active;
-        let s = self.sessions.last_mut().expect("spawn_session 刚 push 了一个会话");
+        let s = self
+            .sessions
+            .last_mut()
+            .expect("spawn_session 刚 push 了一个会话");
         s.ai_owned = true; // AI 新开的会话：只读，用户键盘输入不转发（见 layout_body.rs）
         s.ai_owner = owner; // 归属：只归开它的那个 AI 进程使用（见 session_owned_by）
-        // 标签 hover 上展示「谁开的」：渲染时由 layout_tabs::tab_hover_text 拼接（#uid 要插在
-        // user@host 与来源之间，所以不再把来源预先拼进 tip）。
+                            // 标签 hover 上展示「谁开的」：渲染时由 layout_tabs::tab_hover_text 拼接（#uid 要插在
+                            // user@host 与来源之间，所以不再把来源预先拼进 tip）。
         s.ai_owner_label = owner_label.clone();
         let info = McpSessionInfo {
             uid: s.uid,
@@ -2522,7 +2657,12 @@ impl App {
         let Some(call) = self.gate_foreign_sessions(call) else {
             return;
         };
-        let McpCall { req, resp_tx, upload_source, download_sink } = call;
+        let McpCall {
+            req,
+            resp_tx,
+            upload_source,
+            download_sink,
+        } = call;
         // 发起方代理的进程标识：归属判定（CloseSession）与 list_sessions 的 mine 标记都要
         // 用，先在这里快照——match req.kind 之后 req 就被部分移动了。
         let caller_actor = req.actor.clone();
@@ -2549,7 +2689,10 @@ impl App {
                 // 整次绑定还会以「没有任何一个窗口批准」告终，而用户一个框都没见过。
                 // 两个框不同时显示是**渲染**层的事，交给 handle_ai_bind_consent 去排队。
                 if self.pending_bind_consent.is_some() {
-                    send_err(resp_tx, "已有另一个 AI 客户端正在等待用户选择窗口，请稍候重试".into());
+                    send_err(
+                        resp_tx,
+                        "已有另一个 AI 客户端正在等待用户选择窗口，请稍候重试".into(),
+                    );
                     return;
                 }
                 self.pending_bind_consent = Some(PendingBindConsent {
@@ -2596,7 +2739,10 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 let s = &mut self.sessions[idx];
@@ -2604,7 +2750,10 @@ impl App {
                     // 未连上（还在连接/认证中）或已断线时，输入会被 worker 静默丢弃——
                     // 哨兵永远等不到，会话会被 pending_ai_run 占死。直接拒绝，让 AI 明确
                     // 知道要等连上了再试（可用 list_sessions 的 connected 字段确认）。
-                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if s.pending_ai_run.is_some() {
@@ -2657,10 +2806,15 @@ impl App {
                 // 这个半成功窗口自然也就不存在了。）
                 let command_sent = s
                     .cmd_tx
-                    .send(UiCommand::TerminalInput(format!("{sent_command}\r").into_bytes()))
+                    .send(UiCommand::TerminalInput(
+                        format!("{sent_command}\r").into_bytes(),
+                    ))
                     .is_ok();
                 if !command_sent {
-                    send_err(resp_tx, "会话的后台连接似乎已经断开，命令未发送，请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话的后台连接似乎已经断开，命令未发送，请稍后重试".into(),
+                    );
                     return;
                 }
                 match &marker {
@@ -2679,7 +2833,8 @@ impl App {
                             return;
                         }
                         s.terminal.expect_echo(typed);
-                        s.terminal.arm_ai_capture(capture_prefix.clone().into_bytes());
+                        s.terminal
+                            .arm_ai_capture(capture_prefix.clone().into_bytes());
                     }
                     // 集成模式：命令已经发出去了，此外什么都不用打。
                     None => s.terminal.arm_ai_capture_integration(),
@@ -2704,7 +2859,10 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 match self.sessions[idx].pending_ai_run.as_mut() {
@@ -2749,7 +2907,10 @@ impl App {
             }
             McpReqKind::ReadScreen { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 let text = self.sessions[idx].terminal.screen_text();
@@ -2760,7 +2921,10 @@ impl App {
             }
             McpReqKind::Interrupt { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 // Ctrl-C 没送出去就**绝不能**丢掉这条运行的跟踪状态：远端命令多半还在跑，
@@ -2771,7 +2935,8 @@ impl App {
                     send_err(
                         resp_tx,
                         "会话尚未连接（可能在连接/认证中，或已断线），Ctrl-C 没有发出；\
-                         远端命令可能仍在运行，这条运行的状态已保留，可用 poll_run 继续查".into(),
+                         远端命令可能仍在运行，这条运行的状态已保留，可用 poll_run 继续查"
+                            .into(),
                     );
                     return;
                 }
@@ -2780,7 +2945,8 @@ impl App {
                     send_err(
                         resp_tx,
                         "这个会话的后台连接似乎已经断开，Ctrl-C 没有送达；远端命令可能仍在\
-                         运行，这条运行的状态已保留，可用 poll_run 继续查".into(),
+                         运行，这条运行的状态已保留，可用 poll_run 继续查"
+                            .into(),
                     );
                     return;
                 }
@@ -2828,7 +2994,10 @@ impl App {
             }
             McpReqKind::CloseSession { session_uid } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 // 只允许关「自己（这个 AI 进程）」开的会话：不能关用户的，也不能关另一个
@@ -2846,9 +3015,9 @@ impl App {
                         "这不是 AI 自己开的会话，不能通过这个工具关闭".to_string()
                     } else {
                         match &s.ai_owner_label {
-                            Some(label) => format!(
-                                "这是另一个 AI（{label}）开的会话，只能由它自己关闭"
-                            ),
+                            Some(label) => {
+                                format!("这是另一个 AI（{label}）开的会话，只能由它自己关闭")
+                            }
                             None => "这不是你这个 AI 开的会话，不能关闭".to_string(),
                         }
                     };
@@ -2866,12 +3035,13 @@ impl App {
                 max_lines,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
-                let text = self.sessions[idx]
-                    .terminal
-                    .history_text(max_lines as usize);
+                let text = self.sessions[idx].terminal.history_text(max_lines as usize);
                 let _ = resp_tx.send(McpResponse {
                     id,
                     result: Ok(McpReqResult::History(text)),
@@ -2894,14 +3064,20 @@ impl App {
             }
             McpReqKind::SendInput { session_uid, text } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 // 和 run_command 同样的前置检查。此前这里既不看 connected、也不看 send 的
                 // 结果，一律回 Ok——断线时按键根本没送到远端，调用方却以为发出去了，接着
                 // 按「已经输入过了」往下走（比如以为 sudo 密码已提交，继续等提示符）。
                 if !self.sessions[idx].connected {
-                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if self.sessions[idx]
@@ -2909,7 +3085,10 @@ impl App {
                     .send(UiCommand::TerminalInput(text.into_bytes()))
                     .is_err()
                 {
-                    send_err(resp_tx, "这个会话的后台连接似乎已经断开，输入没有送达".into());
+                    send_err(
+                        resp_tx,
+                        "这个会话的后台连接似乎已经断开，输入没有送达".into(),
+                    );
                     return;
                 }
                 let _ = resp_tx.send(McpResponse {
@@ -2932,12 +3111,18 @@ impl App {
                     return;
                 }
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 let s = &mut self.sessions[idx];
                 if !s.connected {
-                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
@@ -2963,7 +3148,10 @@ impl App {
                     })
                     .is_ok();
                 if !sent {
-                    send_err(resp_tx, "会话的后台连接似乎已经断开，写入未发送，请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话的后台连接似乎已经断开，写入未发送，请稍后重试".into(),
+                    );
                     return;
                 }
                 s.pending_file_ops.push(PendingAiFileOp {
@@ -2987,12 +3175,18 @@ impl App {
                     return;
                 }
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 let s = &mut self.sessions[idx];
                 if !s.connected {
-                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
@@ -3015,7 +3209,10 @@ impl App {
                     })
                     .is_ok();
                 if !sent {
-                    send_err(resp_tx, "会话的后台连接似乎已经断开，读取未发送，请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话的后台连接似乎已经断开，读取未发送，请稍后重试".into(),
+                    );
                     return;
                 }
                 s.pending_file_ops.push(PendingAiFileOp {
@@ -3033,12 +3230,18 @@ impl App {
                 timeout_ms,
             } => {
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 let s = &mut self.sessions[idx];
                 if !s.connected {
-                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
@@ -3078,7 +3281,10 @@ impl App {
                     })
                     .is_ok();
                 if !sent {
-                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into(),
+                    );
                     return;
                 }
                 s.pending_file_ops.push(PendingAiFileOp {
@@ -3100,12 +3306,18 @@ impl App {
                     return;
                 };
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 let s = &mut self.sessions[idx];
                 if !s.connected {
-                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
@@ -3130,7 +3342,10 @@ impl App {
                     })
                     .is_ok();
                 if !sent {
-                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into(),
+                    );
                     return;
                 }
                 s.pending_file_ops.push(PendingAiFileOp {
@@ -3154,12 +3369,18 @@ impl App {
                     return;
                 };
                 let Some(idx) = self.session_idx_by_uid(session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 let s = &mut self.sessions[idx];
                 if !s.connected {
-                    send_err(resp_tx, "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if s.pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
@@ -3183,7 +3404,10 @@ impl App {
                     })
                     .is_ok();
                 if !sent {
-                    send_err(resp_tx, "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "会话的后台连接似乎已经断开，复制未发送，请稍后重试".into(),
+                    );
                     return;
                 }
                 // resp_tx 就此不再使用（响应已经交给 download_sink 那条路），直接丢弃；
@@ -3205,15 +3429,24 @@ impl App {
                 timeout_ms,
             } => {
                 if src_session_uid == dest_session_uid {
-                    send_err(resp_tx, "源和目标不能是同一个会话；同会话内复制请用 run_command 执行 cp".into());
+                    send_err(
+                        resp_tx,
+                        "源和目标不能是同一个会话；同会话内复制请用 run_command 执行 cp".into(),
+                    );
                     return;
                 }
                 let Some(src_idx) = self.session_idx_by_uid(src_session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(src_session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(src_session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 if !self.sessions[src_idx].connected {
-                    send_err(resp_tx, "源会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "源会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if self.sessions[src_idx].pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
@@ -3221,11 +3454,17 @@ impl App {
                     return;
                 }
                 let Some(dest_idx) = self.session_idx_by_uid(dest_session_uid) else {
-                    send_err(resp_tx, self.session_not_found_msg(dest_session_uid, caller_actor.as_deref()));
+                    send_err(
+                        resp_tx,
+                        self.session_not_found_msg(dest_session_uid, caller_actor.as_deref()),
+                    );
                     return;
                 };
                 if !self.sessions[dest_idx].connected {
-                    send_err(resp_tx, "目标会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "目标会话尚未连接（可能在连接/认证中，或已断线），请稍后重试".into(),
+                    );
                     return;
                 }
                 if self.sessions[dest_idx].pending_file_ops.len() >= MAX_CONCURRENT_FILE_OPS {
@@ -3245,10 +3484,7 @@ impl App {
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
                 let deadline = Instant::now() + clamp_timeout(timeout_ms);
-                let marker = format!(
-                    "ishell-ai-relay-{op_id}-{}",
-                    rand_marker_suffix()
-                );
+                let marker = format!("ishell-ai-relay-{op_id}-{}", rand_marker_suffix());
                 // 一次性 ed25519 密钥对：只用于这一次直连尝试，成功与否都会在
                 // UntrustingAfterDirect 阶段撤销公钥、源会话侧的私钥文件也会被清理，
                 // 不留长期可用的免密信任。
@@ -3264,26 +3500,36 @@ impl App {
                 let (pipe_writer, pipe_reader) = tokio::io::duplex(128 * 1024);
                 let sent = self.sessions[dest_idx]
                     .cmd_tx
-                    .send(UiCommand::TrustTempKey { op_id, pub_key_line })
+                    .send(UiCommand::TrustTempKey {
+                        op_id,
+                        pub_key_line,
+                    })
                     .is_ok();
                 if !sent {
-                    send_err(resp_tx, "目标会话的后台连接似乎已经断开，复制未发送，请稍后重试".into());
+                    send_err(
+                        resp_tx,
+                        "目标会话的后台连接似乎已经断开，复制未发送，请稍后重试".into(),
+                    );
                     return;
                 }
-                self.sessions[src_idx].pending_file_ops.push(PendingAiFileOp {
-                    kind: FileOpKind::Copy { op_id },
-                    path: src_remote_path.clone(),
-                    resp_tx: None,
-                    req_id: id,
-                    deadline,
-                });
-                self.sessions[dest_idx].pending_file_ops.push(PendingAiFileOp {
-                    kind: FileOpKind::Copy { op_id },
-                    path: dest_remote_path.clone(),
-                    resp_tx: None,
-                    req_id: id,
-                    deadline,
-                });
+                self.sessions[src_idx]
+                    .pending_file_ops
+                    .push(PendingAiFileOp {
+                        kind: FileOpKind::Copy { op_id },
+                        path: src_remote_path.clone(),
+                        resp_tx: None,
+                        req_id: id,
+                        deadline,
+                    });
+                self.sessions[dest_idx]
+                    .pending_file_ops
+                    .push(PendingAiFileOp {
+                        kind: FileOpKind::Copy { op_id },
+                        path: dest_remote_path.clone(),
+                        resp_tx: None,
+                        req_id: id,
+                        deadline,
+                    });
                 self.cross_copy_jobs.push(CrossCopyJob {
                     op_id,
                     req_id: id,
@@ -3383,12 +3629,24 @@ mod run_command_validation_tests {
     #[test]
     fn only_a_single_non_empty_line_is_accepted() {
         assert!(validate_run_command("ls -l").is_ok());
-        assert!(validate_run_command("cd /tmp && ls; echo done").is_ok(), "单行里的 ; && 照常");
+        assert!(
+            validate_run_command("cd /tmp && ls; echo done").is_ok(),
+            "单行里的 ; && 照常"
+        );
         assert!(validate_run_command("echo one\necho two").is_err());
-        assert!(validate_run_command("cat <<EOF\nbody\nEOF").is_err(), "heredoc 也是多行");
-        assert!(validate_run_command("ls\r").is_err(), "裸回车同样是「按下 Enter」");
+        assert!(
+            validate_run_command("cat <<EOF\nbody\nEOF").is_err(),
+            "heredoc 也是多行"
+        );
+        assert!(
+            validate_run_command("ls\r").is_err(),
+            "裸回车同样是「按下 Enter」"
+        );
         assert!(validate_run_command("").is_err());
-        assert!(validate_run_command("   \t ").is_err(), "只有空白等于空命令");
+        assert!(
+            validate_run_command("   \t ").is_err(),
+            "只有空白等于空命令"
+        );
     }
 }
 
@@ -3403,7 +3661,10 @@ mod reclaim_tests {
     #[test]
     fn only_an_abandoned_run_is_reclaimed() {
         let long = RECLAIM_IDLE + Duration::from_secs(1);
-        assert!(run_is_abandoned(long, true, false), "没人等、无输出、久未轮询：该回收");
+        assert!(
+            run_is_abandoned(long, true, false),
+            "没人等、无输出、久未轮询：该回收"
+        );
         assert!(
             !run_is_abandoned(long, false, false),
             "终端还在输出（构建/测试在跑）：命令活着，不能回收"
@@ -3428,7 +3689,10 @@ mod untrust_route_tests {
     /// 第一条断言当场挂——那正是公钥静默残留的路径。
     #[test]
     fn disconnected_destination_is_never_treated_as_deliverable() {
-        assert!(untrust_route(Some(false)).is_err(), "断线会话的 send 可能 Ok 却永不执行");
+        assert!(
+            untrust_route(Some(false)).is_err(),
+            "断线会话的 send 可能 Ok 却永不执行"
+        );
         assert!(untrust_route(None).is_err(), "会话已不存在");
         assert!(untrust_route(Some(true)).is_ok(), "连着的会话照常发撤销");
     }
@@ -3444,11 +3708,23 @@ mod session_ownership_tests {
     /// 反向对照：把 `session_owned_by` 改回「用户窗口放行」（`!ai_owned ||`），第一条挂。
     #[test]
     fn only_the_opener_owns_a_session() {
-        assert!(!session_owned_by(false, None, Some("me")), "用户自己打开的窗口：不是任何 AI 的");
+        assert!(
+            !session_owned_by(false, None, Some("me")),
+            "用户自己打开的窗口：不是任何 AI 的"
+        );
         assert!(session_owned_by(true, Some("me"), Some("me")));
-        assert!(!session_owned_by(true, Some("other"), Some("me")), "另一个 AI 的窗口");
-        assert!(!session_owned_by(true, None, Some("me")), "旧版代理的共享池窗口");
-        assert!(!session_owned_by(true, None, None), "不带 actor 的请求不拥有任何窗口");
+        assert!(
+            !session_owned_by(true, Some("other"), Some("me")),
+            "另一个 AI 的窗口"
+        );
+        assert!(
+            !session_owned_by(true, None, Some("me")),
+            "旧版代理的共享池窗口"
+        );
+        assert!(
+            !session_owned_by(true, None, None),
+            "不带 actor 的请求不拥有任何窗口"
+        );
         assert!(!session_owned_by(true, Some("me"), None));
     }
 
@@ -3459,14 +3735,18 @@ mod session_ownership_tests {
     fn any_foreign_session_in_the_request_refuses_it() {
         let table = |uid: u64| match uid {
             1 => Some((true, Some("me"))),
-            2 => Some((false, None)),             // 用户的窗口
-            3 => Some((true, Some("other"))),     // 别的 AI 的窗口
-            _ => None,                            // 不存在
+            2 => Some((false, None)),         // 用户的窗口
+            3 => Some((true, Some("other"))), // 别的 AI 的窗口
+            _ => None,                        // 不存在
         };
         assert_eq!(first_foreign_session(&[1], table, Some("me")), None);
         assert_eq!(first_foreign_session(&[1, 2], table, Some("me")), Some(2));
         assert_eq!(first_foreign_session(&[3], table, Some("me")), Some(3));
-        assert_eq!(first_foreign_session(&[99], table, Some("me")), None, "不存在的 uid 放过去");
+        assert_eq!(
+            first_foreign_session(&[99], table, Some("me")),
+            None,
+            "不存在的 uid 放过去"
+        );
         assert_eq!(first_foreign_session(&[], table, Some("me")), None);
     }
 }
@@ -3512,19 +3792,35 @@ mod tests {
         assert_eq!(wrap_session_ender("cd /x; exit 7"), "cd /x; (exit 7)");
         assert_eq!(wrap_session_ender("make && exit 1"), "make && (exit 1)");
         assert_eq!(wrap_session_ender("make || exit 1"), "make || (exit 1)");
-        assert_eq!(wrap_session_ender("cmd; exit 3 # done"), "cmd; (exit 3) # done");
-        assert_eq!(wrap_session_ender("cmd; exit 3;"), "cmd; (exit 3);", "末尾空段不算后续命令");
+        assert_eq!(
+            wrap_session_ender("cmd; exit 3 # done"),
+            "cmd; (exit 3) # done"
+        );
+        assert_eq!(
+            wrap_session_ender("cmd; exit 3;"),
+            "cmd; (exit 3);",
+            "末尾空段不算后续命令"
+        );
         assert_eq!(wrap_session_ender("cmd & exit 3"), "cmd & (exit 3)");
         assert_eq!(wrap_session_ender("cmd | exit 3"), "cmd | (exit 3)");
         // 重定向双字符操作符不能被当成段分隔符。
-        assert_eq!(wrap_session_ender("echo hi >&2; exit 1"), "echo hi >&2; (exit 1)");
-        assert_eq!(wrap_session_ender("echo hi 2>&1; exit 1"), "echo hi 2>&1; (exit 1)");
+        assert_eq!(
+            wrap_session_ender("echo hi >&2; exit 1"),
+            "echo hi >&2; (exit 1)"
+        );
+        assert_eq!(
+            wrap_session_ender("echo hi 2>&1; exit 1"),
+            "echo hi 2>&1; (exit 1)"
+        );
         // 引号里的分隔符不成段。
         assert_eq!(
             wrap_session_ender("echo \"a; exit\"; exit 3"),
             "echo \"a; exit\"; (exit 3)"
         );
-        assert_eq!(wrap_session_ender("echo '; exit'; exit 3"), "echo '; exit'; (exit 3)");
+        assert_eq!(
+            wrap_session_ender("echo '; exit'; exit 3"),
+            "echo '; exit'; (exit 3)"
+        );
     }
 
     #[test]
@@ -3573,17 +3869,32 @@ mod tests {
         let err = validate_run_command("logout").expect_err("logout 应被拒绝");
         assert!(err.contains("close_session"), "报错要指明替代做法：{err}");
         assert!(validate_run_command("  logout ; ").is_err());
-        assert!(validate_run_command("cmd; logout").is_err(), "命令链里的 logout 也要拒绝");
+        assert!(
+            validate_run_command("cmd; logout").is_err(),
+            "命令链里的 logout 也要拒绝"
+        );
         assert!(validate_run_command("cmd && logout 2").is_err());
         assert!(validate_run_command("logout # 注释").is_err());
-        assert!(validate_run_command("exit 3").is_ok(), "exit 走子 shell 包裹，不拒绝");
-        assert!(validate_run_command("cd /x; exit 7").is_ok(), "复合命令里的 exit 同样不拒绝");
+        assert!(
+            validate_run_command("exit 3").is_ok(),
+            "exit 走子 shell 包裹，不拒绝"
+        );
+        assert!(
+            validate_run_command("cd /x; exit 7").is_ok(),
+            "复合命令里的 exit 同样不拒绝"
+        );
         assert!(validate_run_command("echo logout").is_ok());
         assert!(validate_run_command("echo \"logout\"").is_ok());
-        assert!(validate_run_command("echo hi # ; logout").is_ok(), "注释里的 logout 不是命令");
+        assert!(
+            validate_run_command("echo hi # ; logout").is_ok(),
+            "注释里的 logout 不是命令"
+        );
         // `${#x}` 是取长度不是注释：扫描不能在 `{#` 处截断，否则其后的 logout 漏检。
         // 反向对照：把 `{`/`}` 加回 is_shell_word_start，这条当场挂。
-        assert!(validate_run_command("echo ${#x}; logout").is_err(), "${{#…}} 后面的 logout 必须检出");
+        assert!(
+            validate_run_command("echo ${#x}; logout").is_err(),
+            "${{#…}} 后面的 logout 必须检出"
+        );
     }
 
     /// **exit 后面还有命令必须拒绝。** 原语义里 exit 一执行 shell 就终止、后面一条都不跑，
@@ -3601,10 +3912,16 @@ mod tests {
         // exit 是最后一段：语义可以保住，放行（由 wrap_session_ender 改写）。
         assert!(validate_run_command("cd /x; exit 7").is_ok());
         assert!(validate_run_command("make || exit 1").is_ok());
-        assert!(validate_run_command("cmd; exit 3; # 注释").is_ok(), "末尾空段与注释不算后续命令");
+        assert!(
+            validate_run_command("cmd; exit 3; # 注释").is_ok(),
+            "末尾空段与注释不算后续命令"
+        );
         // 不是顶层 exit 段：与这条规则无关。
         assert!(validate_run_command("echo exit; ls").is_ok());
-        assert!(validate_run_command("(exit 3); ls").is_ok(), "子 shell 里的 exit 本来就不终止");
+        assert!(
+            validate_run_command("(exit 3); ls").is_ok(),
+            "子 shell 里的 exit 本来就不终止"
+        );
     }
 
     #[test]
@@ -3875,7 +4192,10 @@ mod pair_handshake_tests {
     const TEST_ACTOR: &str = "test-actor";
 
     /// 发一条点名本实例的业务请求（`ListSessions`），带上给定凭据与自报 actor，返回原始响应。
-    async fn business_request(ticket: Option<String>, claimed_actor: &str) -> Result<McpReqResult, String> {
+    async fn business_request(
+        ticket: Option<String>,
+        claimed_actor: &str,
+    ) -> Result<McpReqResult, String> {
         let (r, mut w) = serve_one().await.into_split();
         let mut r = BufReader::new(r);
         let mut line = serde_json::to_string(&McpRequest {
@@ -3905,12 +4225,20 @@ mod pair_handshake_tests {
     /// 反向对照：删掉 `handle_conn` 里凭据核对那一段，前两条断言当场挂。
     #[tokio::test]
     async fn a_request_without_a_valid_ticket_is_refused_even_with_the_right_instance() {
-        let err = business_request(None, TEST_ACTOR).await.expect_err("没带凭据必须拒绝");
-        assert!(err.starts_with(crate::mcp_protocol::TICKET_REJECTED), "{err}");
+        let err = business_request(None, TEST_ACTOR)
+            .await
+            .expect_err("没带凭据必须拒绝");
+        assert!(
+            err.starts_with(crate::mcp_protocol::TICKET_REJECTED),
+            "{err}"
+        );
         let err = business_request(Some("f".repeat(128)), TEST_ACTOR)
             .await
             .expect_err("伪造的凭据必须拒绝");
-        assert!(err.starts_with(crate::mcp_protocol::TICKET_REJECTED), "{err}");
+        assert!(
+            err.starts_with(crate::mcp_protocol::TICKET_REJECTED),
+            "{err}"
+        );
         // 握手拿到的凭据：放行。
         let ticket = match handshake_with(&crate::store::mcp_pairing_token()).await {
             Ok(McpReqResult::Instance { ticket, .. }) => ticket,
@@ -3942,7 +4270,11 @@ mod pair_handshake_tests {
         line.push('\n');
         w.write_all(line.as_bytes()).await.expect("写请求");
         let call = rx.recv().await.expect("带有效凭据的请求应递进 App");
-        assert_eq!(call.req.actor.as_deref(), Some(TEST_ACTOR), "应以凭据绑定的 actor 为准");
+        assert_eq!(
+            call.req.actor.as_deref(),
+            Some(TEST_ACTOR),
+            "应以凭据绑定的 actor 为准"
+        );
         drop(r);
     }
 
@@ -4003,10 +4335,7 @@ mod pair_handshake_tests {
                 id, proto_version, ..
             }) => {
                 assert_eq!(id, crate::store::mcp_instance_id());
-                assert_eq!(
-                    proto_version,
-                    crate::mcp_protocol::MCP_PROTOCOL_VERSION
-                );
+                assert_eq!(proto_version, crate::mcp_protocol::MCP_PROTOCOL_VERSION);
             }
             other => panic!("匿名 Identify 应当照答（版本信标），实际：{other:?}"),
         }
@@ -4113,7 +4442,10 @@ mod upload_stream_tests {
         let call = rx.recv().await.expect("handle_conn 应把请求转进来");
         let mut src = call.upload_source.expect("上传请求必须带字节流");
         if err_while_reading {
-            let _ = call.resp_tx.send(McpResponse { id: 1, result: Err("文件操作超时".into()) });
+            let _ = call.resp_tx.send(McpResponse {
+                id: 1,
+                result: Err("文件操作超时".into()),
+            });
             // 给「报错即排干」的错误实现留足抢数据的时间
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }

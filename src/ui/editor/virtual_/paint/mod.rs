@@ -756,7 +756,10 @@ mod ime_report_tests {
             egui::Rect::from_min_size(egui::pos2(0.0, -9999.0), egui::vec2(1.0, 16.0)),
             bounds,
         );
-        assert_eq!(far1, far2, "越滚越远时钳位结果还在变，等于每帧一次 XSetICValues");
+        assert_eq!(
+            far1, far2,
+            "越滚越远时钳位结果还在变，等于每帧一次 XSetICValues"
+        );
     }
 
     /// 关掉「候选框跟随光标」之后，上报的坐标必须与光标位置**完全无关**。
@@ -771,7 +774,10 @@ mod ime_report_tests {
         let a = ime_rect(false, Some(egui::pos2(50.0, 80.0)), clip, 16.0);
         let b = ime_rect(false, Some(egui::pos2(300.0, 250.0)), clip, 16.0);
         let c = ime_rect(false, None, clip, 16.0);
-        assert_eq!(a, b, "关掉跟随后坐标仍随光标变——XSetICValues 还是会发，卡死路径没封住");
+        assert_eq!(
+            a, b,
+            "关掉跟随后坐标仍随光标变——XSetICValues 还是会发，卡死路径没封住"
+        );
         assert_eq!(b, c, "有没有光标都该是同一个恒定值");
         assert!(clip.contains_rect(a));
     }

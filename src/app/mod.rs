@@ -7,9 +7,9 @@ mod util;
 pub(crate) mod view_state;
 mod widgets;
 pub(in crate::app) use types::{
-    DirectFallback, DirectJob, DocKind, EditorState, EditorTab, FileClip, ForwardEntry, ForwardUi,
-    ImageTab, ImageView, KbdPrompt, LocalPeerXfer, PendingPaste, Popups, ProcPopup, Relay,
-    xfer_order, RelayPhase, SaveState, Shot, Snippets, TabBar, Transfer, Transfers, XferFilter,
+    xfer_order, DirectFallback, DirectJob, DocKind, EditorState, EditorTab, FileClip, ForwardEntry,
+    ForwardUi, ImageTab, ImageView, KbdPrompt, LocalPeerXfer, PendingPaste, Popups, ProcPopup,
+    Relay, RelayPhase, SaveState, Shot, Snippets, TabBar, Transfer, Transfers, XferFilter,
     SAVE_TIMEOUT,
 };
 #[allow(unused_imports)]
@@ -22,15 +22,15 @@ mod demo_init;
 mod dialogs;
 mod doc_parse;
 mod doc_view;
-mod editor_win;
 mod editor_close;
+mod editor_win;
 mod editor_window_view;
 mod file_actions;
 mod frame;
 mod frame_editor;
 mod layout;
-mod layout_tabs;
 mod layout_body;
+mod layout_tabs;
 mod mcp_bridge;
 mod pending;
 mod screenshot;

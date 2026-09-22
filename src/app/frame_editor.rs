@@ -305,10 +305,10 @@ impl App {
                 }
             }
             let mut close_after_save: Vec<(u64, u64)> = Vec::new(); // (uid, tid)
-            // 实际匹配标签靠 (uid, id)，其中 id = 本次保存的 save_op（每次 begin_save 唯一分配）。
-            // 用 save_op 而非 tid 匹配，是为了让「超时判定后姗姗来迟」的旧事件天然匹配不到任何
-            // 标签（超时时已把 save_op 清零、重试又分配了新的 save_op）而被安全丢弃。
-            // save_tombstones 是显式识别：命中即「已超时判定过」，直接跳过，不做任何状态更新。
+                                                                    // 实际匹配标签靠 (uid, id)，其中 id = 本次保存的 save_op（每次 begin_save 唯一分配）。
+                                                                    // 用 save_op 而非 tid 匹配，是为了让「超时判定后姗姗来迟」的旧事件天然匹配不到任何
+                                                                    // 标签（超时时已把 save_op 清零、重试又分配了新的 save_op）而被安全丢弃。
+                                                                    // save_tombstones 是显式识别：命中即「已超时判定过」，直接跳过，不做任何状态更新。
             for (uid, id, _path, mtime) in saved {
                 if ed.save_tombstones.contains(&id) {
                     continue; // 超时后姗姗来迟的成功事件：已判超时，丢弃（标签或已关闭 / 已重试）
@@ -440,7 +440,9 @@ impl App {
         self.toast = Some((
             match crate::i18n::current() {
                 crate::i18n::Lang::Zh => "保存超时，请检查网络连接".to_string(),
-                crate::i18n::Lang::En => "Save timed out; check your network connection".to_string(),
+                crate::i18n::Lang::En => {
+                    "Save timed out; check your network connection".to_string()
+                }
             },
             ui.input(|i| i.time),
         ));

@@ -43,7 +43,9 @@ fn main() {
     );
     for (var, arch) in TARGETS {
         println!("cargo:rerun-if-env-changed={var}");
-        let Ok(path) = std::env::var(var) else { continue };
+        let Ok(path) = std::env::var(var) else {
+            continue;
+        };
         if path.trim().is_empty() {
             continue;
         }
@@ -51,9 +53,7 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
         match std::fs::metadata(&path) {
             Ok(m) if m.is_file() => {
-                src.push_str(&format!(
-                    "    ({arch:?}, include_bytes!({path:?})),\n"
-                ));
+                src.push_str(&format!("    ({arch:?}, include_bytes!({path:?})),\n"));
             }
             _ => panic!(
                 "{var}={path} 指向的文件不存在或不是普通文件。\

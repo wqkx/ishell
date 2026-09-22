@@ -90,7 +90,9 @@ fn candidate_paths() -> Vec<std::path::PathBuf> {
         return Vec::new();
     };
     let dirs = [
-        std::path::PathBuf::from(&home).join(".config").join("ishell"),
+        std::path::PathBuf::from(&home)
+            .join(".config")
+            .join("ishell"),
         std::path::PathBuf::from(&home).join(".ishell-mcp"),
     ];
     let mut out = Vec::new();
@@ -127,7 +129,12 @@ enum Probe {
     /// 答话了，但没通过配对（token 不符），或压根没配 token 时的普通发现。
     Answered { id: String, ver: u32 },
     /// 答话了，且双向配对握手通过；`ticket` 是对端签发的连接凭据。
-    Paired { id: String, ver: u32, ticket: String, host: String },
+    Paired {
+        id: String,
+        ver: u32,
+        ticket: String,
+        host: String,
+    },
 }
 
 #[cfg(unix)]
@@ -164,7 +171,12 @@ async fn probe(path: &std::path::Path, prove_token: Option<&str>) -> Probe {
         return Probe::Answered { id, ver };
     }
     match pair_handshake(path, token).await {
-        Some((id, ver, ticket, host)) => Probe::Paired { id, ver, ticket, host },
+        Some((id, ver, ticket, host)) => Probe::Paired {
+            id,
+            ver,
+            ticket,
+            host,
+        },
         None => Probe::Answered { id, ver },
     }
 }
@@ -173,7 +185,10 @@ async fn probe(path: &std::path::Path, prove_token: Option<&str>) -> Probe {
 ///
 /// 两问两答共用同一条连接：两个方向的证明必须绑定同一对随机数，拆连接就绑不住了。
 #[cfg(unix)]
-async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, u32, String, String)> {
+async fn pair_handshake(
+    path: &std::path::Path,
+    token: &str,
+) -> Option<(String, u32, String, String)> {
     let nonce_c = mcp_protocol::pair_nonce()?; // 熵源不可用：中止，绝不用可预测值凑合
     let stream = connect_timeout(path).await.ok()?.ok()?;
     let (r, mut w) = stream.into_split();
@@ -261,8 +276,7 @@ async fn pair_handshake(path: &std::path::Path, token: &str) -> Option<(String, 
 /// 本机 `~/.config/ishell/mcp-*.sock` 属于仍可能活着的 iShell 进程，误删会让本机 MCP 失联。
 #[cfg(unix)]
 fn is_reverse_forward_sock(path: &std::path::Path) -> bool {
-    path.components()
-        .any(|c| c.as_os_str() == ".ishell-mcp")
+    path.components().any(|c| c.as_os_str() == ".ishell-mcp")
         && path
             .file_name()
             .and_then(|n| n.to_str())
@@ -295,8 +309,20 @@ async fn identify(path: &std::path::Path) -> Option<(String, u32)> {
         }
         _ => return None,
     };
-    match exchange(stream, None, None, None, None, McpReqKind::Identify, CONNECT_WRITE_TIMEOUT).await {
-        Ok(McpReqResult::Instance { id, proto_version, .. }) => Some((id, proto_version)),
+    match exchange(
+        stream,
+        None,
+        None,
+        None,
+        None,
+        McpReqKind::Identify,
+        CONNECT_WRITE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(McpReqResult::Instance {
+            id, proto_version, ..
+        }) => Some((id, proto_version)),
         _ => None,
     }
 }
@@ -464,10 +490,7 @@ fn keep_instances_for_launch_host(
     if found.is_empty() {
         return Ok(found);
     }
-    let seen: Vec<String> = found
-        .iter()
-        .map(|(_, _, _, _, h)| h.clone())
-        .collect();
+    let seen: Vec<String> = found.iter().map(|(_, _, _, _, h)| h.clone()).collect();
     let kept: Vec<_> = found
         .into_iter()
         .filter(|(_, _, _, _, h)| {
@@ -551,7 +574,12 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String, String),
             ));
         };
         return match probe(&path, Some(token)).await {
-            Probe::Paired { id, ver, ticket, host } => {
+            Probe::Paired {
+                id,
+                ver,
+                ticket,
+                host,
+            } => {
                 check_proto_version(ver)?;
                 reject_if_host_mismatch(&host)?;
                 Ok((id, path, ticket, host))
@@ -620,7 +648,13 @@ async fn bind_instance() -> Result<(String, std::path::PathBuf, String, String),
     // 只收握手通过的实例（连同它签发的凭据）。
     let mut found: Vec<(String, u32, std::path::PathBuf, String, String)> = Vec::new();
     for (p, path) in all {
-        let Probe::Paired { id, ver, ticket, host } = p else {
+        let Probe::Paired {
+            id,
+            ver,
+            ticket,
+            host,
+        } = p
+        else {
             continue;
         };
         // 按实例去重：多条路径可能通向同一个 iShell（见 candidate_paths 的说明）。
@@ -773,11 +807,7 @@ async fn connect_bound() -> Result<(UnixStream, String, String), String> {
     // 找不到且恰好只剩一个 token 匹配实例时才改绑（iShell 重启）。必须重新握手（id
     // 不是秘密，只认 id 的话，同账号的人摆一个冒充该 id 的 socket 就能接管后续请求）。
     let (path, ticket) = rediscover_bound(&id).await?;
-    let id = BOUND_INSTANCE
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or(id);
+    let id = BOUND_INSTANCE.lock().unwrap().clone().unwrap_or(id);
     let stream = connect_timeout(&path)
         .await
         .map_err(|_| "连接 iShell socket 超时".to_string())?
@@ -790,9 +820,20 @@ async fn connect_bound() -> Result<(UnixStream, String, String), String> {
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum RediscoverOutcome {
-    Same { path: std::path::PathBuf, ticket: String },
-    Rebound { new_id: String, path: std::path::PathBuf, ticket: String, host: String },
-    Lost { paired: Vec<(String, String)>, answered: usize },
+    Same {
+        path: std::path::PathBuf,
+        ticket: String,
+    },
+    Rebound {
+        new_id: String,
+        path: std::path::PathBuf,
+        ticket: String,
+        host: String,
+    },
+    Lost {
+        paired: Vec<(String, String)>,
+        answered: usize,
+    },
 }
 
 #[cfg(unix)]
@@ -801,7 +842,9 @@ fn classify_rediscover(want_id: &str, probes: &[(Probe, std::path::PathBuf)]) ->
     let mut answered = 0usize;
     for (p, path) in probes {
         match p {
-            Probe::Paired { id, ticket, host, .. } => {
+            Probe::Paired {
+                id, ticket, host, ..
+            } => {
                 if !paired.iter().any(|(known, ..)| known == id) {
                     paired.push((id.clone(), path.clone(), ticket.clone(), host.clone()));
                 }
@@ -1065,7 +1108,9 @@ where
 fn validate_caller_path(path_str: &str, field: &str) -> Result<(), String> {
     let path = std::path::Path::new(path_str);
     if !path.is_absolute() {
-        return Err(format!("{field} 必须是运行 ishell-mcp 的调用方机器上的绝对路径"));
+        return Err(format!(
+            "{field} 必须是运行 ishell-mcp 的调用方机器上的绝对路径"
+        ));
     }
     if path_str.split('/').any(|seg| seg == "." || seg == "..") {
         return Err(format!("{field} 不能包含 \".\" 或 \"..\" 路径段"));
@@ -1092,7 +1137,9 @@ async fn copy_to_remote_from_caller(
         .await
         .map_err(|error| format!("无法读取调用方文件 {local_path}: {error}"))?;
     if !metadata.is_file() {
-        return Err("调用方流式上传当前只支持单个普通文件；目录请使用 git/rsync，或逐文件上传".into());
+        return Err(
+            "调用方流式上传当前只支持单个普通文件；目录请使用 git/rsync，或逐文件上传".into(),
+        );
     }
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -1113,10 +1160,13 @@ async fn copy_to_remote_from_caller(
     };
     let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;
     header.push('\n');
-    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, write_half.write_all(header.as_bytes()))
-        .await
-        .map_err(|_| "发送上传请求给 iShell 超时".to_string())?
-        .map_err(|error| error.to_string())?;
+    tokio::time::timeout(
+        CONNECT_WRITE_TIMEOUT,
+        write_half.write_all(header.as_bytes()),
+    )
+    .await
+    .map_err(|_| "发送上传请求给 iShell 超时".to_string())?
+    .map_err(|error| error.to_string())?;
 
     let mut source = tokio::fs::File::open(&path)
         .await
@@ -1216,14 +1266,21 @@ async fn copy_from_remote_to_caller(
         origin: Some(caller_origin()),
         actor: Some(current_actor()),
         ticket: Some(ticket),
-        kind: McpReqKind::CopyFromRemoteToCaller { session_uid, remote_path, timeout_ms },
+        kind: McpReqKind::CopyFromRemoteToCaller {
+            session_uid,
+            remote_path,
+            timeout_ms,
+        },
     };
     let mut header = serde_json::to_string(&request).map_err(|error| error.to_string())?;
     header.push('\n');
-    tokio::time::timeout(CONNECT_WRITE_TIMEOUT, write_half.write_all(header.as_bytes()))
-        .await
-        .map_err(|_| "发送下载请求给 iShell 超时".to_string())?
-        .map_err(|error| error.to_string())?;
+    tokio::time::timeout(
+        CONNECT_WRITE_TIMEOUT,
+        write_half.write_all(header.as_bytes()),
+    )
+    .await
+    .map_err(|_| "发送下载请求给 iShell 超时".to_string())?
+    .map_err(|error| error.to_string())?;
 
     let mut reader = BufReader::new(read_half);
     let mut header_line = String::new();
@@ -1234,7 +1291,8 @@ async fn copy_from_remote_to_caller(
     if read == 0 {
         return Err("iShell 未返回下载结果就关闭了连接".into());
     }
-    let resp: McpResponse = serde_json::from_str(header_line.trim()).map_err(|error| error.to_string())?;
+    let resp: McpResponse =
+        serde_json::from_str(header_line.trim()).map_err(|error| error.to_string())?;
     let size = match resp.result? {
         McpReqResult::CopyStreamHeader { size, .. } => size,
         _ => return Err("iShell 返回了意料之外的下载响应".into()),
@@ -1284,7 +1342,9 @@ async fn copy_from_remote_to_caller(
                 "iShell 判定传输成功，但字节数与它自己声明的不符：应为 {size}，实收 {received}"
             ));
         }
-        dest.flush().await.map_err(|error| format!("落盘调用方文件失败: {error}"))?;
+        dest.flush()
+            .await
+            .map_err(|error| format!("落盘调用方文件失败: {error}"))?;
         let _ = dest.sync_all().await; // 尽力 fsync，换入前确保字节真正落盘
         drop(dest);
         // 原子换入：同目录改名，替换调用方已有的同名文件（Unix rename 原子且直接覆盖）
@@ -1325,7 +1385,7 @@ async fn wait_connected(session_uid: u64, max: std::time::Duration) {
         match call(McpReqKind::ListSessions).await {
             Ok(McpReqResult::Sessions(list)) => match list.iter().find(|s| s.uid == session_uid) {
                 Some(s) if s.connected => return,
-                Some(_) => {} // 还在连接/认证中，继续等
+                Some(_) => {}   // 还在连接/认证中，继续等
                 None => return, // 没这个会话：留给后续调用报错
             },
             _ => return, // 查询本身失败（GUI 未运行等）：同样留给后续调用
@@ -1526,8 +1586,7 @@ impl IshellMcp {
                 let had_filter = filter.as_ref().is_some_and(|f| !f.trim().is_empty());
                 if let Some(f) = filter.map(|f| f.to_lowercase()).filter(|f| !f.is_empty()) {
                     list.retain(|s| {
-                        s.title.to_lowercase().contains(&f)
-                            || s.host.to_lowercase().contains(&f)
+                        s.title.to_lowercase().contains(&f) || s.host.to_lowercase().contains(&f)
                     });
                 }
                 if list.is_empty() {
@@ -1630,7 +1689,10 @@ impl IshellMcp {
     )]
     async fn start_command(
         &self,
-        Parameters(StartCommandArgs { session_uid, command }): Parameters<StartCommandArgs>,
+        Parameters(StartCommandArgs {
+            session_uid,
+            command,
+        }): Parameters<StartCommandArgs>,
     ) -> Result<CallToolResult, McpError> {
         wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
@@ -1776,7 +1838,11 @@ impl IshellMcp {
     )]
     async fn send_input(
         &self,
-        Parameters(SendInputArgs { session_uid, text, escapes }): Parameters<SendInputArgs>,
+        Parameters(SendInputArgs {
+            session_uid,
+            text,
+            escapes,
+        }): Parameters<SendInputArgs>,
     ) -> Result<CallToolResult, McpError> {
         // 转义在代理侧解析、线协议不变：GUI 永远原样发送收到的 text，新旧版本任意组合行为一致。
         let text = if escapes {
@@ -1866,7 +1932,12 @@ impl IshellMcp {
         wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
             with_ticket_retry(|| {
-                copy_to_remote_from_caller(session_uid, local_path.clone(), remote_path.clone(), timeout_ms)
+                copy_to_remote_from_caller(
+                    session_uid,
+                    local_path.clone(),
+                    remote_path.clone(),
+                    timeout_ms,
+                )
             })
             .await,
         )
@@ -1895,7 +1966,12 @@ impl IshellMcp {
         wait_connected(session_uid, std::time::Duration::from_secs(20)).await;
         text_result(
             with_ticket_retry(|| {
-                copy_from_remote_to_caller(session_uid, remote_path.clone(), local_path.clone(), timeout_ms)
+                copy_from_remote_to_caller(
+                    session_uid,
+                    remote_path.clone(),
+                    local_path.clone(),
+                    timeout_ms,
+                )
             })
             .await,
         )
@@ -2015,7 +2091,10 @@ impl ServerHandler for IshellMcp {}
 async fn main() -> anyhow::Result<()> {
     // `--version`：打印 crate 版本与 MCP 线协议版本。安装脚本与（后续）GUI 自动部署都靠它
     // 比对「已部署的代理」与「当前 iShell」是否配套——协议版本才是决定线格式兼容性的关键。
-    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
         println!(
             "ishell-mcp {} proto {}",
             env!("CARGO_PKG_VERSION"),
@@ -2079,7 +2158,11 @@ fn client_actor() -> Option<String> {
 /// 拼出 actor。开机标识去掉连字符取前 16 位十六进制（64 位，足以区分不同机器/不同次开机）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn actor_from_parts(boot_id: &str, ppid: u32, start_ticks: u64) -> Option<String> {
-    let boot: String = boot_id.chars().filter(|c| c.is_ascii_hexdigit()).take(16).collect();
+    let boot: String = boot_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(16)
+        .collect();
     (boot.len() == 16).then(|| format!("{boot}-{ppid}-{start_ticks}"))
 }
 
@@ -2185,7 +2268,10 @@ mod tests {
             (s("mine"), false, false)
         );
         // 终端没注入（AI 在 IDE 里启动等）：只能用配置。第三位 true = 配置兜底，必须告警。
-        assert_eq!(resolve_pairing_token(None, s("cfg")), (s("cfg"), false, true));
+        assert_eq!(
+            resolve_pairing_token(None, s("cfg")),
+            (s("cfg"), false, true)
+        );
         // 空白等于没设。
         assert_eq!(
             resolve_pairing_token(s("  "), s("cfg")),
@@ -2202,16 +2288,32 @@ mod tests {
         use super::actor_from_parts;
         let boot = "3f2a9c1e-7b4d-4e11-9a0b-5c6d7e8f9012\n";
         let a = actor_from_parts(boot, 4242, 987654).expect("完整输入应能派生");
-        assert_eq!(Some(a.clone()), actor_from_parts(boot, 4242, 987654), "同一个客户端 → 同一个 actor");
+        assert_eq!(
+            Some(a.clone()),
+            actor_from_parts(boot, 4242, 987654),
+            "同一个客户端 → 同一个 actor"
+        );
         assert_eq!(a, "3f2a9c1e7b4d4e11-4242-987654");
-        assert_ne!(Some(a.clone()), actor_from_parts(boot, 4243, 987654), "不同父进程");
-        assert_ne!(Some(a.clone()), actor_from_parts(boot, 4242, 987655), "pid 被复用给了新进程");
+        assert_ne!(
+            Some(a.clone()),
+            actor_from_parts(boot, 4243, 987654),
+            "不同父进程"
+        );
+        assert_ne!(
+            Some(a.clone()),
+            actor_from_parts(boot, 4242, 987655),
+            "pid 被复用给了新进程"
+        );
         assert_ne!(
             Some(a),
             actor_from_parts("0000000000000000", 4242, 987654),
             "另一台机器/另一次开机"
         );
-        assert_eq!(actor_from_parts("short", 1, 1), None, "开机标识不完整就不派生");
+        assert_eq!(
+            actor_from_parts("short", 1, 1),
+            None,
+            "开机标识不完整就不派生"
+        );
     }
 
     /// `/proc/<pid>/stat` 的进程名在括号里、可以含空格和括号——必须从最后一个 `)` 往后数。
@@ -2219,8 +2321,14 @@ mod tests {
     fn proc_start_time_survives_hostile_process_names() {
         use super::proc_start_time;
         let tail = "S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 555000 19 20";
-        assert_eq!(proc_start_time(&format!("123 (claude) {tail}")), Some(555000));
-        assert_eq!(proc_start_time(&format!("123 (a) b (c d) {tail}")), Some(555000));
+        assert_eq!(
+            proc_start_time(&format!("123 (claude) {tail}")),
+            Some(555000)
+        );
+        assert_eq!(
+            proc_start_time(&format!("123 (a) b (c d) {tail}")),
+            Some(555000)
+        );
         assert_eq!(proc_start_time("garbage"), None);
     }
 
@@ -2256,7 +2364,10 @@ mod tests {
     #[test]
     fn rediscover_keeps_the_original_instance_when_it_is_still_there() {
         use super::{classify_rediscover, RediscoverOutcome};
-        let probes = vec![paired("old", "box", "/tmp/a.sock"), paired("other", "box", "/tmp/b.sock")];
+        let probes = vec![
+            paired("old", "box", "/tmp/a.sock"),
+            paired("other", "box", "/tmp/b.sock"),
+        ];
         match classify_rediscover("old", &probes) {
             RediscoverOutcome::Same { path, .. } => {
                 assert_eq!(path, std::path::PathBuf::from("/tmp/a.sock"))
@@ -2413,13 +2524,22 @@ mod tests {
     fn rebind_refuses_a_unique_match_on_another_host() {
         use super::rebind_host_ok;
         assert!(rebind_host_ok(Some("box"), "box").is_ok());
-        assert!(rebind_host_ok(Some("box"), "box.lan").is_ok(), "短名 vs FQDN 算同一台");
+        assert!(
+            rebind_host_ok(Some("box"), "box.lan").is_ok(),
+            "短名 vs FQDN 算同一台"
+        );
         assert!(
             rebind_host_ok(Some("box"), "other").is_err(),
             "原实例下线后唯一匹配者在另一台机器，不能静默改绑"
         );
-        assert!(rebind_host_ok(None, "other").is_ok(), "没记下旧主机时无法对照");
-        assert!(rebind_host_ok(Some("unknown-host"), "other").is_ok(), "旧 GUI 无法对照");
+        assert!(
+            rebind_host_ok(None, "other").is_ok(),
+            "没记下旧主机时无法对照"
+        );
+        assert!(
+            rebind_host_ok(Some("unknown-host"), "other").is_ok(),
+            "旧 GUI 无法对照"
+        );
         assert!(rebind_host_ok(Some("box"), "unknown-host").is_ok());
         assert!(rebind_host_ok(Some(""), "other").is_ok());
     }
@@ -2556,7 +2676,11 @@ mod fake_farm_tests {
         EnvGuard { saved }
     }
 
-    async fn reply(w: &mut tokio::net::unix::OwnedWriteHalf, id: u64, result: Result<McpReqResult, String>) {
+    async fn reply(
+        w: &mut tokio::net::unix::OwnedWriteHalf,
+        id: u64,
+        result: Result<McpReqResult, String>,
+    ) {
         let mut line = serde_json::to_string(&McpResponse { id, result }).expect("resp json");
         line.push('\n');
         let _ = w.write_all(line.as_bytes()).await;
@@ -2604,7 +2728,12 @@ mod fake_farm_tests {
                         id: peer.spec.id.into(),
                         proto_version: peer.spec.proto,
                         nonce_s: nonce_s.clone(),
-                        server_proof: pair_proof(&peer.spec.token, &nonce_c, &nonce_s, PairRole::Server),
+                        server_proof: pair_proof(
+                            &peer.spec.token,
+                            &nonce_c,
+                            &nonce_s,
+                            PairRole::Server,
+                        ),
                     }),
                 )
                 .await;
@@ -2659,7 +2788,12 @@ mod fake_farm_tests {
         }
     }
 
-    async fn start_farm(specs: Vec<Spec>, pair: Option<&str>, config: Option<&str>, host: Option<&str>) -> Farm {
+    async fn start_farm(
+        specs: Vec<Spec>,
+        pair: Option<&str>,
+        config: Option<&str>,
+        host: Option<&str>,
+    ) -> Farm {
         let lock = FARM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!(
             "ishell-mcp-farm-{}-{}",
@@ -2693,7 +2827,8 @@ mod fake_farm_tests {
                     bind: AtomicU32::new(0),
                 },
             });
-            let listener = UnixListener::bind(&path).unwrap_or_else(|e| panic!("bind {}: {e}", path.display()));
+            let listener = UnixListener::bind(&path)
+                .unwrap_or_else(|e| panic!("bind {}: {e}", path.display()));
             let p = peer.clone();
             let handle = tokio::spawn(async move {
                 loop {
@@ -2776,7 +2911,9 @@ mod fake_farm_tests {
             Some("alice-pc"),
         )
         .await;
-        let (id, _, _, _) = bind_instance().await.expect("应按终端注入的 token 绑 Alice");
+        let (id, _, _, _) = bind_instance()
+            .await
+            .expect("应按终端注入的 token 绑 Alice");
         assert_eq!(id, "alice");
         assert_eq!(peer(&farm, "bob").binds(), 0);
         assert_eq!(peer(&farm, "bob").pair_ok(), 0);
@@ -2798,12 +2935,20 @@ mod fake_farm_tests {
         let (id, _, _, host) = bind_instance().await.expect("应绑 Alice");
         assert_eq!(id, "alice");
         assert_eq!(host, "alice-pc");
-        assert_eq!(peer(&farm, "bob").binds(), 0, "主机过滤必须发生在 Bind 之前");
+        assert_eq!(
+            peer(&farm, "bob").binds(),
+            0,
+            "主机过滤必须发生在 Bind 之前"
+        );
         assert!(
             peer(&farm, "bob").pair_ok() >= 1,
             "握手仍会发生（才能读到 host），但不得弹窗"
         );
-        assert_eq!(peer(&farm, "alice").binds(), 0, "过滤后只剩 Alice，唯一绑定不弹窗");
+        assert_eq!(
+            peer(&farm, "alice").binds(),
+            0,
+            "过滤后只剩 Alice，唯一绑定不弹窗"
+        );
     }
 
     /// 共用 token 且 ISHELL_HOST 指向一台根本不在的机器 → 拒绝，不绑到别人电脑。
@@ -2863,7 +3008,10 @@ mod fake_farm_tests {
         )
         .await;
         let err = bind_instance().await.expect_err("无 token 必须拒绝");
-        assert!(err.contains("ISHELL_PAIR_TOKEN") || err.contains("配对 token"), "{err}");
+        assert!(
+            err.contains("ISHELL_PAIR_TOKEN") || err.contains("配对 token"),
+            "{err}"
+        );
         assert_eq!(peer(&farm, "alice").binds(), 0);
         assert_eq!(peer(&farm, "bob").binds(), 0);
     }
@@ -2883,7 +3031,10 @@ mod fake_farm_tests {
         .await;
         let err = bind_instance().await.expect_err("token 全不对");
         assert!(err.contains("token") || err.contains("握手"), "{err}");
-        assert!(!err.contains("未检测到 iShell"), "有人应答就不要报没客户端：{err}");
+        assert!(
+            !err.contains("未检测到 iShell"),
+            "有人应答就不要报没客户端：{err}"
+        );
         assert_eq!(peer(&farm, "alice").binds(), 0);
     }
 
@@ -2894,7 +3045,10 @@ mod fake_farm_tests {
         spec.proto = 5;
         let _farm = start_farm(vec![spec], Some("token-alice"), None, Some("alice-pc")).await;
         let err = bind_instance().await.expect_err("版本不符");
-        assert!(err.contains("重新部署") || err.contains("版本不一致"), "{err}");
+        assert!(
+            err.contains("重新部署") || err.contains("版本不一致"),
+            "{err}"
+        );
     }
 
     /// 同一实例出现在本机目录和反向转发目录：按 id 去重，唯一绑定。
@@ -2910,7 +3064,13 @@ mod fake_farm_tests {
         };
         let fwd = Spec::user("alice", "token-alice", "alice-pc");
         // 两个 spec 同 id 会绑两个 socket 文件、两个 listener，Identify 都报 id=alice。
-        let farm = start_farm(vec![local, fwd], Some("token-alice"), None, Some("alice-pc")).await;
+        let farm = start_farm(
+            vec![local, fwd],
+            Some("token-alice"),
+            None,
+            Some("alice-pc"),
+        )
+        .await;
         let (id, _, _, _) = bind_instance().await.expect("去重后唯一");
         assert_eq!(id, "alice");
         let binds: u32 = farm.peers.iter().map(|p| p.binds()).sum();
@@ -2932,7 +3092,9 @@ mod fake_farm_tests {
         .await;
         let bob_path = peer(&farm, "bob").path.clone();
         std::env::set_var("ISHELL_MCP_SOCKET", &bob_path);
-        let err = bind_instance().await.expect_err("点名了别人的 socket 也不能越过 token");
+        let err = bind_instance()
+            .await
+            .expect_err("点名了别人的 socket 也不能越过 token");
         assert!(
             err.contains("握手") || err.contains("token") || err.contains("配对"),
             "{err}"
@@ -3057,10 +3219,15 @@ mod fake_farm_tests {
         w.write_all(line.as_bytes()).await.unwrap();
         let mut resp = String::new();
         BufReader::new(r).read_line(&mut resp).await.unwrap();
-        assert!(!resp.contains("super-secret-token"), "Identify 把 token 漏出来了：{resp}");
+        assert!(
+            !resp.contains("super-secret-token"),
+            "Identify 把 token 漏出来了：{resp}"
+        );
         let decoded: McpResponse = serde_json::from_str(resp.trim()).unwrap();
         match decoded.result.unwrap() {
-            McpReqResult::Instance { token, host, id, .. } => {
+            McpReqResult::Instance {
+                token, host, id, ..
+            } => {
                 assert!(token.is_empty(), "v3+ token 字段必须恒空");
                 assert_eq!(id, "alice");
                 assert_eq!(host, "alice-pc");

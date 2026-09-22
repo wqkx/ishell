@@ -90,7 +90,10 @@ pub(super) fn tree(ui: &mut egui::Ui, state: &mut FilePanelState, actions: &mut 
         //
         // 乐观移除照做不误：重命名下项目确实离开了源目录；只有跳过时留在原处，worker 那边
         // 检测到有跳过就会补刷一次源目录，把它们放回列表（见 ssh/mod.rs 的 CopyMove 分支）。
-        if matches!(state.conflict_policy, crate::proto::ConflictPolicy::Overwrite) {
+        if matches!(
+            state.conflict_policy,
+            crate::proto::ConflictPolicy::Overwrite
+        ) {
             state.record_move(srcs.clone(), dest_dir.clone());
         }
         actions.push(FileAction::Move { srcs, dest_dir });

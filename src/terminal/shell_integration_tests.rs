@@ -35,7 +35,12 @@ impl ShellHarness {
     /// 起一个交互式 bash（`--norc --noprofile`：不受本机 rc 影响，结果可复现）。
     fn start() -> Self {
         let pair = native_pty_system()
-            .openpty(PtySize { rows: 24, cols: 100, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("openpty");
         let mut cmd = CommandBuilder::new("bash");
         cmd.args(["--norc", "--noprofile", "-i"]);
@@ -91,7 +96,9 @@ impl ShellHarness {
     }
 
     fn type_line(&mut self, line: &str) {
-        self.writer.write_all(format!("{line}\r").as_bytes()).expect("write");
+        self.writer
+            .write_all(format!("{line}\r").as_bytes())
+            .expect("write");
         self.writer.flush().expect("flush");
     }
 
@@ -134,9 +141,14 @@ fn a_plain_command_reports_its_exit_code_and_output() {
     let mut h = ShellHarness::start();
     h.inject();
     h.run("echo hello-ishell");
-    let (code, out) = h.wait_done(Duration::from_secs(5)).expect("命令该在 5 秒内完成");
+    let (code, out) = h
+        .wait_done(Duration::from_secs(5))
+        .expect("命令该在 5 秒内完成");
     assert_eq!(code, 0);
-    assert!(out.contains("hello-ishell"), "输出里应有命令结果，实际：{out:?}");
+    assert!(
+        out.contains("hello-ishell"),
+        "输出里应有命令结果，实际：{out:?}"
+    );
     assert!(
         !h.term.screen_text().contains("AI_DONE"),
         "集成模式不该往终端里打哨兵行"
@@ -166,9 +178,14 @@ fn an_interactive_command_still_completes() {
     h.send_raw(b"typed-into-cat\r");
     h.pump(Duration::from_millis(300));
     h.send_raw(&[0x04]); // Ctrl-D：cat 收到 EOF 退出
-    let (code, out) = h.wait_done(Duration::from_secs(5)).expect("cat 退出后运行必须收束");
+    let (code, out) = h
+        .wait_done(Duration::from_secs(5))
+        .expect("cat 退出后运行必须收束");
     assert_eq!(code, 0);
-    assert!(out.contains("typed-into-cat"), "cat 的回显应在输出里，实际：{out:?}");
+    assert!(
+        out.contains("typed-into-cat"),
+        "cat 的回显应在输出里，实际：{out:?}"
+    );
 }
 
 /// 中断也要有结论：Ctrl-C 之后 shell 打印新提示符时会发 `D;130`，运行就地收束，
@@ -180,7 +197,9 @@ fn interrupting_a_command_yields_a_result_instead_of_a_stuck_run() {
     h.run("sleep 30");
     h.pump(Duration::from_millis(300));
     h.send_raw(&[0x03]); // Ctrl-C
-    let (code, _) = h.wait_done(Duration::from_secs(5)).expect("中断后必须有结论");
+    let (code, _) = h
+        .wait_done(Duration::from_secs(5))
+        .expect("中断后必须有结论");
     assert_eq!(code, 130, "SIGINT 结束的命令退出码是 128+2");
 }
 
@@ -219,6 +238,12 @@ fn back_to_back_commands_do_not_bleed_into_each_other() {
     h.run("echo second; (exit 7)");
     let (c2, o2) = h.wait_done(Duration::from_secs(5)).expect("第二条该完成");
     assert_eq!((c1, c2), (0, 7));
-    assert!(o1.contains("first") && !o1.contains("second"), "第一条输出串了：{o1:?}");
-    assert!(o2.contains("second") && !o2.contains("first"), "第二条输出串了：{o2:?}");
+    assert!(
+        o1.contains("first") && !o1.contains("second"),
+        "第一条输出串了：{o1:?}"
+    );
+    assert!(
+        o2.contains("second") && !o2.contains("first"),
+        "第二条输出串了：{o2:?}"
+    );
 }

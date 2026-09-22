@@ -272,7 +272,10 @@ pub(super) fn last_rsync_bytes(s: &str) -> Option<u64> {
 /// authorized_keys，建立"源主机可以免密连过来"的单向信任。带 `restrict`（OpenSSH 7.2+
 /// 组合开关：禁端口/agent/X11 转发 + 禁 PTY/login shell）收紧这把临时密钥的能力——
 /// 即便撤销失败遗留，能做的事也严格限定在文件传输，不会变成一把可以任意登录的钥匙。
-pub(crate) async fn trust_temp_key(handle: &Handle<ClientHandler>, pub_key_line: &str) -> anyhow::Result<()> {
+pub(crate) async fn trust_temp_key(
+    handle: &Handle<ClientHandler>,
+    pub_key_line: &str,
+) -> anyhow::Result<()> {
     let home = exec_capture(handle, "echo -n $HOME").await?;
     let home = home.trim();
     if home.is_empty() {
@@ -304,7 +307,10 @@ pub(crate) async fn trust_temp_key(handle: &Handle<ClientHandler>, pub_key_line:
 /// 撤销 `trust_temp_key` 追加的那一行：按 marker 注释精确匹配删除（不按整行文本匹配，
 /// 避免公钥内容里出现 shell 特殊字符时 `grep -v` 出问题）。尽力而为——失败只在调用方
 /// 记日志，不向上抛，因为清理失败不应该掩盖"传输本身成功/失败"这个对用户更重要的结果。
-pub(crate) async fn untrust_temp_key(handle: &Handle<ClientHandler>, marker: &str) -> anyhow::Result<()> {
+pub(crate) async fn untrust_temp_key(
+    handle: &Handle<ClientHandler>,
+    marker: &str,
+) -> anyhow::Result<()> {
     let home = exec_capture(handle, "echo -n $HOME").await?;
     let home = home.trim();
     if home.is_empty() {
@@ -429,7 +435,10 @@ pub(crate) async fn direct_relay_copy(
         });
         return;
     }
-    let _key_guard = TmpKeyGuard { handle: handle.clone(), dir: tmp_dir.clone() };
+    let _key_guard = TmpKeyGuard {
+        handle: handle.clone(),
+        dir: tmp_dir.clone(),
+    };
     let tmp_key = format!("{tmp_dir}/key");
     if let Err(e) = sftp_overwrite(&sftp, &tmp_key, &priv_key_pem).await {
         sink.send(WorkerEvent::DirectRelayDone {
@@ -465,7 +474,10 @@ pub(crate) async fn direct_relay_copy(
         Ok((0, _))
     );
     let xfer = if has_rsync {
-        format!("rsync -a --info=progress2 -e {} -- {src} {dest_spec}", sh_quote(&ssh_opt))
+        format!(
+            "rsync -a --info=progress2 -e {} -- {src} {dest_spec}",
+            sh_quote(&ssh_opt)
+        )
     } else {
         format!(
             "scp -P {dest_port} -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -- {src} {dest_spec}",
@@ -501,10 +513,14 @@ pub(crate) async fn direct_relay_copy(
     // 两条路径行为一致。`mkdir -p` 对已存在目录 / 根目录 "/" 都是幂等的无害操作。
     let mkpath = format!(
         "{ssh_opt} -- {host_spec} {}",
-        sh_quote(&format!("mkdir -p {}", sh_quote(&remote_parent(&dest_path)))),
+        sh_quote(&format!(
+            "mkdir -p {}",
+            sh_quote(&remote_parent(&dest_path))
+        )),
     );
-    let cmd =
-        format!("{{ {mkpath} && {xfer} && {commit}; }} || {{ {discard} >/dev/null 2>&1; exit 1; }}");
+    let cmd = format!(
+        "{{ {mkpath} && {xfer} && {commit}; }} || {{ {discard} >/dev/null 2>&1; exit 1; }}"
+    );
 
     // 临时私钥的清理交由 _key_guard 在作用域结束（含超时取消时的 future drop）异步完成。
     // `DirectRelayStarted` 必须在 exec_direct_progress 内部真正 `channel_open_session`+
@@ -539,7 +555,11 @@ pub(crate) async fn direct_relay_copy(
                 ok: false,
                 message: format!(
                     "直连失败（码 {code}）：{}",
-                    if reason.is_empty() { "源主机无法连到目标主机" } else { reason }
+                    if reason.is_empty() {
+                        "源主机无法连到目标主机"
+                    } else {
+                        reason
+                    }
                 ),
             });
         }
@@ -622,7 +642,13 @@ mod untrust_cmd_tests {
             "/home/a b/.ssh/tmp",
             "/home/a b/.ssh/lock",
         );
-        assert!(c.contains(r#"'it'\''s a marker'"#), "marker 未正确转义：\n{c}");
-        assert!(c.contains("'/home/a b/.ssh/authorized_keys'"), "路径未加引号：\n{c}");
+        assert!(
+            c.contains(r#"'it'\''s a marker'"#),
+            "marker 未正确转义：\n{c}"
+        );
+        assert!(
+            c.contains("'/home/a b/.ssh/authorized_keys'"),
+            "路径未加引号：\n{c}"
+        );
     }
 }

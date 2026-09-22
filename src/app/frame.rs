@@ -170,11 +170,9 @@ impl App {
             match super::session::cwd_restore_decision(never_typed, idle, expired) {
                 super::session::CwdRestore::Inject => {
                     let cmd = format!("cd '{}'", s.last_cwd.replace('\'', "'\\''"));
-                    let _ = s
-                        .cmd_tx
-                        .send(crate::proto::UiCommand::TerminalInput(
-                            format!("{cmd}\r").into_bytes(),
-                        ));
+                    let _ = s.cmd_tx.send(crate::proto::UiCommand::TerminalInput(
+                        format!("{cmd}\r").into_bytes(),
+                    ));
                     // 吞掉回显，否则 `cd '…'` 会原样留在屏幕上
                     s.terminal.expect_auto_inject_echo(&cmd);
                     s.restore_cwd = false;
@@ -308,8 +306,10 @@ impl App {
         let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
         let mut pdf_searches: Vec<FramePdfSearch> = Vec::new();
         let mut new_docs: Vec<(u64, u64, Vec<u8>)> = Vec::new(); // uid, 占位 id, docx 字节
-        // 终端通知的判据：都要在借用 sessions 之前算好。
-        let active_uid = self.active.and_then(|i| self.sessions.get(i).map(|s| s.uid));
+                                                                 // 终端通知的判据：都要在借用 sessions 之前算好。
+        let active_uid = self
+            .active
+            .and_then(|i| self.sessions.get(i).map(|s| s.uid));
         let window_focused = self.ctx.input(|i| i.focused);
         let notify_mode = crate::store::load_ai_notify_mode();
         for s in &mut self.sessions {
@@ -777,12 +777,12 @@ fn gdbus_notify_args(summary: &str, body: &str, replaces_id: u32) -> Vec<String>
     .iter()
     .map(|s| (*s).to_string())
     .chain([
-        gvariant_str("iShell"),          // app_name
-        replaces_id.to_string(),         // replaces_id：0=新建，否则替换那一条
-        gvariant_str(""),                // app_icon：留空，图标由 desktop-entry 决定
+        gvariant_str("iShell"),  // app_name
+        replaces_id.to_string(), // replaces_id：0=新建，否则替换那一条
+        gvariant_str(""),        // app_icon：留空，图标由 desktop-entry 决定
         gvariant_str(summary),
         gvariant_str(body),
-        "[]".to_string(),                // actions：无按钮
+        "[]".to_string(), // actions：无按钮
         // desktop-entry 告诉 GNOME 这条通知属于哪个 .desktop，点击才谈得上「激活已有窗口」
         // 而不是另开一个（要和窗口 app_id 对上，见 main.rs 的 APP_ID）。
         "{'desktop-entry': <'ishell'>}".to_string(),
@@ -798,7 +798,11 @@ fn gdbus_notify_args(summary: &str, body: &str, replaces_id: u32) -> Vec<String>
 #[cfg(any(target_os = "linux", test))]
 fn parse_gdbus_uint32(out: &str) -> Option<u32> {
     let rest = out.split_once("uint32")?.1;
-    let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     digits.parse().ok()
 }
 
@@ -827,8 +831,14 @@ fn notice_should_alert(
 /// 系统通知的操作，串行交给唯一一条通知线程处理。
 #[cfg(target_os = "linux")]
 enum NotifyOp {
-    Show { uid: u64, summary: String, body: String },
-    Close { uid: u64 },
+    Show {
+        uid: u64,
+        summary: String,
+        body: String,
+    },
+    Close {
+        uid: u64,
+    },
 }
 
 /// 通往通知线程的队列。
@@ -992,10 +1002,20 @@ mod os_notify_tests {
     /// 一条通知都不发。替换/关闭那套能力走 gdbus，不要往这里塞。
     #[test]
     fn notify_send_sticks_to_options_that_exist_in_0_7() {
-        const SINCE_0_8: [&str; 6] = ["-p", "--print-id", "-r", "--replace-id", "-e", "--transient"];
+        const SINCE_0_8: [&str; 6] = [
+            "-p",
+            "--print-id",
+            "-r",
+            "--replace-id",
+            "-e",
+            "--transient",
+        ];
         let args = super::notify_send_args("s", "b");
         for opt in SINCE_0_8 {
-            assert!(!args.contains(&opt), "{opt} 在 libnotify 0.7.x 上会让整条通知发不出去");
+            assert!(
+                !args.contains(&opt),
+                "{opt} 在 libnotify 0.7.x 上会让整条通知发不出去"
+            );
         }
     }
 
@@ -1032,7 +1052,10 @@ mod os_notify_tests {
         let a = super::gdbus_notify_args("- 摘要", "- 正文", 0);
         let m = a.iter().position(|x| x == "--method").unwrap();
         for (i, arg) in a.iter().enumerate().skip(m + 2) {
-            assert!(!arg.starts_with('-'), "第 {i} 个位置参数 {arg:?} 会被当成选项");
+            assert!(
+                !arg.starts_with('-'),
+                "第 {i} 个位置参数 {arg:?} 会被当成选项"
+            );
         }
     }
 
@@ -1136,7 +1159,10 @@ mod pair_inject_tests {
     /// 显式勾选之后才注入，且只注入一次、只注入用户自己的会话。
     #[test]
     fn opted_in_injects_once_into_user_sessions_only() {
-        assert!(pair_inject_allowed(true, true, false, false), "勾选后应当注入");
+        assert!(
+            pair_inject_allowed(true, true, false, false),
+            "勾选后应当注入"
+        );
         assert!(
             !pair_inject_allowed(true, true, true, false),
             "AI 专用会话不该注入：那里的 AI 是我们自己开的，本来就知道该回哪台电脑"

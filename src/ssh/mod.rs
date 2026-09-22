@@ -111,16 +111,17 @@ pub async fn run(
     }));
 
     // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
-    let (handle, _jump_handle, remote_fwds, x11, kbd_prelude) = match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
-        Ok(h) => h,
-        Err(e) => {
-            sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("连接失败：{e}"),
-                crate::i18n::Lang::En => format!("Connect failed: {e}"),
-            }));
-            return;
-        }
-    };
+    let (handle, _jump_handle, remote_fwds, x11, kbd_prelude) =
+        match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
+            Ok(h) => h,
+            Err(e) => {
+                sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("连接失败：{e}"),
+                    crate::i18n::Lang::En => format!("Connect failed: {e}"),
+                }));
+                return;
+            }
+        };
     let handle = Arc::new(handle);
 
     // 等 UI 上报真实窗口尺寸再开 PTY，避免 80×24 → 真尺寸的闪一下。
@@ -181,7 +182,8 @@ pub async fn run(
             let h = handle.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                let fresh = match tokio::time::timeout(Duration::from_secs(15), open_sftp(&h)).await {
+                let fresh = match tokio::time::timeout(Duration::from_secs(15), open_sftp(&h)).await
+                {
                     Ok(Ok(s)) => Some(s),
                     _ => None, // 超时或失败：回送 None，主循环解锁重连位，下个操作会再次触发
                 };
@@ -206,7 +208,8 @@ pub async fn run(
     // 这个闭包。同时在注册前顺手清理这个子目录里 mtime 超过 24 小时的旧 socket 文件——不做
     // 连通性探测（不依赖远端装了 nc/socat），单纯用时间兜底崩溃/异常退出导致的遗留，避免
     // 无限堆积。
-    let mcp_forward_path: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let mcp_forward_path: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
     // 注册在独立任务里异步完成。收尾时要先等它把 remote_path 落进槽位再清理，否则「连接先
     // 结束、注册后完成」会把已注册的 socket 遗留在远端（槽位被 take 时还是 None）。注册任务
     // 成功后会转入 keepalive 心跳循环、永不自行结束，所以收尾不能死等它完成——改用一个
@@ -215,8 +218,9 @@ pub async fn run(
     // `cfg!(unix)`：Windows 上 `spawn_mcp_listener` 是个空实现（整套 IPC 建在 Unix domain
     // socket 上），没有任何东西在监听。0.19 起这个开关默认是开的，不加这个条件的话每次连接
     // 都会往远端注册一个后面空无一人的反向转发 socket，纯粹是垃圾。
-    let mcp_forward_task: Option<tokio::task::JoinHandle<()>> =
-        if cfg!(unix) && crate::store::load_mcp_consent() {
+    let mcp_forward_task: Option<tokio::task::JoinHandle<()>> = if cfg!(unix)
+        && crate::store::load_mcp_consent()
+    {
         let fwd_handle = handle.clone();
         let path_slot = mcp_forward_path.clone();
         Some(tokio::spawn(async move {
@@ -268,8 +272,9 @@ pub async fn run(
                 tick.tick().await; // 首个 tick 立即返回，消费掉（注册刚完成，mtime 尚新）
                 loop {
                     tick.tick().await;
-                    let _ = exec_status(&fwd_handle, &format!("touch -c {}", sh_quote(&remote_path)))
-                        .await;
+                    let _ =
+                        exec_status(&fwd_handle, &format!("touch -c {}", sh_quote(&remote_path)))
+                            .await;
                 }
             }
         }))

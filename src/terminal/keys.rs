@@ -470,13 +470,22 @@ mod encode_tests {
         String::from_utf8_lossy(&enc(key, mods, app_cursor)).into_owned()
     }
     fn ctrl() -> Modifiers {
-        Modifiers { ctrl: true, ..Default::default() }
+        Modifiers {
+            ctrl: true,
+            ..Default::default()
+        }
     }
     fn shift() -> Modifiers {
-        Modifiers { shift: true, ..Default::default() }
+        Modifiers {
+            shift: true,
+            ..Default::default()
+        }
     }
     fn alt() -> Modifiers {
-        Modifiers { alt: true, ..Default::default() }
+        Modifiers {
+            alt: true,
+            ..Default::default()
+        }
     }
 
     /// DECCKM（应用光标键模式）：htop/vim/less 这类 ncurses 程序初始化时会开它，之后期望
@@ -510,9 +519,22 @@ mod encode_tests {
     /// 一旦算错，对端收到的是另一个键，且不会报错、只会"行为不对"。
     #[test]
     fn modifier_parameter_follows_the_xterm_bitmask() {
-        let cs = Modifiers { ctrl: true, shift: true, ..Default::default() };
-        let ca = Modifiers { ctrl: true, alt: true, ..Default::default() };
-        let all = Modifiers { ctrl: true, alt: true, shift: true, ..Default::default() };
+        let cs = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let ca = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        let all = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
         assert_eq!(s(Key::ArrowUp, cs, false), "\x1b[1;6A"); // 1|4 +1 = 6
         assert_eq!(s(Key::ArrowUp, ca, false), "\x1b[1;7A"); // 2|4 +1 = 7
         assert_eq!(s(Key::ArrowUp, all, false), "\x1b[1;8A"); // 1|2|4 +1 = 8
@@ -538,7 +560,11 @@ mod encode_tests {
         assert_eq!(enc(Key::Z, ctrl(), false), vec![0x1a]);
         assert_eq!(enc(Key::D, ctrl(), false), vec![0x04]);
         // Alt+Ctrl+B：ESC 前缀 + 0x02
-        let ca = Modifiers { ctrl: true, alt: true, ..Default::default() };
+        let ca = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
         assert_eq!(enc(Key::B, ca, false), vec![0x1b, 0x02]);
     }
 
@@ -548,7 +574,11 @@ mod encode_tests {
         assert_eq!(enc(Key::Num0, ctrl(), false), vec![0x10]);
         assert_eq!(enc(Key::Num1, ctrl(), false), vec![0x11]);
         assert_eq!(enc(Key::Num9, ctrl(), false), vec![0x19]);
-        let ca = Modifiers { ctrl: true, alt: true, ..Default::default() };
+        let ca = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
         assert_eq!(enc(Key::Num2, ca, false), vec![0x1b, 0x12]);
     }
 
@@ -556,7 +586,11 @@ mod encode_tests {
     /// 发出去的后果是：想复制却给远端发了 Ctrl+C，把正在跑的命令打断。
     #[test]
     fn ctrl_shift_cvf_are_reserved_for_the_ui() {
-        let cs = Modifiers { ctrl: true, shift: true, ..Default::default() };
+        let cs = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
         for k in [Key::C, Key::V, Key::F] {
             assert!(
                 enc(k, cs, false).is_empty(),
@@ -597,20 +631,52 @@ mod encode_tests {
     #[test]
     fn no_key_ever_emits_a_truncated_escape_sequence() {
         let all_keys = [
-            Key::ArrowUp, Key::ArrowDown, Key::ArrowLeft, Key::ArrowRight,
-            Key::Home, Key::End, Key::Insert, Key::Delete, Key::PageUp, Key::PageDown,
-            Key::Enter, Key::Tab, Key::Escape, Key::Backspace, Key::Space,
-            Key::A, Key::C, Key::Z, Key::Num0, Key::Num9,
-            Key::F1, Key::F4, Key::F5, Key::F12,
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::Home,
+            Key::End,
+            Key::Insert,
+            Key::Delete,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Enter,
+            Key::Tab,
+            Key::Escape,
+            Key::Backspace,
+            Key::Space,
+            Key::A,
+            Key::C,
+            Key::Z,
+            Key::Num0,
+            Key::Num9,
+            Key::F1,
+            Key::F4,
+            Key::F5,
+            Key::F12,
         ];
         let mod_sets = [
             Modifiers::default(),
             ctrl(),
             shift(),
             alt(),
-            Modifiers { ctrl: true, shift: true, ..Default::default() },
-            Modifiers { ctrl: true, alt: true, ..Default::default() },
-            Modifiers { ctrl: true, alt: true, shift: true, ..Default::default() },
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+            Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+            Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
         ];
         for k in all_keys {
             for m in mod_sets {

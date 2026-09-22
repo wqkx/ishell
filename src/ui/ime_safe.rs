@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn stale_range_inside_a_multibyte_char_is_snapped() {
         let s = String::from("中文abc"); // "中"=0..3, "文"=3..6
-        // 4、5 都在「文」的中间——直接拿去切片就是 panic
+                                         // 4、5 都在「文」的中间——直接拿去切片就是 panic
         assert!(!s.is_char_boundary(4) && !s.is_char_boundary(5));
         let (a, b) = clamp_range(&s, (4, 5));
         assert!(s.is_char_boundary(a) && s.is_char_boundary(b));
@@ -112,7 +112,11 @@ mod tests {
         assert_eq!(char_of_byte(s, 0), 0);
         assert_eq!(char_of_byte(s, 3), 1);
         assert_eq!(char_of_byte(s, 4), 2);
-        assert_eq!(char_of_byte(s, 5), 2, "落在「文」中间应向下取整到 4→字符位 2");
+        assert_eq!(
+            char_of_byte(s, 5),
+            2,
+            "落在「文」中间应向下取整到 4→字符位 2"
+        );
         assert_eq!(char_of_byte(s, 999), 3);
         assert_eq!(byte_of_char(s, 0), 0);
         assert_eq!(byte_of_char(s, 2), 4);
@@ -189,7 +193,10 @@ mod boundary_sweep_tests {
             assert!(got <= n, "floor_boundary({b}) = {got} 越界（len={n}）");
             assert!(got <= b || b > n, "floor_boundary({b}) = {got} 比入参还大");
             // 必须是「≤ b 的最大合法边界」，不能保守地退太多
-            let want = (0..=b.min(n)).rev().find(|&i| MIXED.is_char_boundary(i)).unwrap();
+            let want = (0..=b.min(n))
+                .rev()
+                .find(|&i| MIXED.is_char_boundary(i))
+                .unwrap();
             assert_eq!(got, want, "floor_boundary({b}) 应当退到 {want}");
         }
     }
@@ -223,7 +230,11 @@ mod boundary_sweep_tests {
         for b in 0..=n {
             let ch = char_of_byte(MIXED, b); // 非边界也不能崩
             if MIXED.is_char_boundary(b) {
-                assert_eq!(byte_of_char(MIXED, ch), b, "字节 {b} → 字符 {ch} → 字节 往返不一致");
+                assert_eq!(
+                    byte_of_char(MIXED, ch),
+                    b,
+                    "字节 {b} → 字符 {ch} → 字节 往返不一致"
+                );
             }
         }
         // 字符下标越界也要有个合理答案（钳到末尾），不能 panic

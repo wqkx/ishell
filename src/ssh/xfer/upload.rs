@@ -46,22 +46,26 @@ pub(super) async fn upload(
                 });
                 return;
             }
-            ConflictPolicy::Rename => match remote_nonexistent(sftp, &remote_dir, &name, is_dir).await {
-                Ok(n) => n,
-                Err(e) => {
-                    sink.send(WorkerEvent::TransferDone {
-                        id,
-                        ok: false,
-                        message: match crate::i18n::current() {
-                            crate::i18n::Lang::Zh => format!("寻找可用文件名失败：{e}"),
-                            crate::i18n::Lang::En => format!("Failed to find an available name: {e}"),
-                        },
-                        // 目录状态未知（可能已不存在），刷新一致化
-                        refresh_dir: Some(remote_dir.clone()),
-                    });
-                    return;
+            ConflictPolicy::Rename => {
+                match remote_nonexistent(sftp, &remote_dir, &name, is_dir).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        sink.send(WorkerEvent::TransferDone {
+                            id,
+                            ok: false,
+                            message: match crate::i18n::current() {
+                                crate::i18n::Lang::Zh => format!("寻找可用文件名失败：{e}"),
+                                crate::i18n::Lang::En => {
+                                    format!("Failed to find an available name: {e}")
+                                }
+                            },
+                            // 目录状态未知（可能已不存在），刷新一致化
+                            refresh_dir: Some(remote_dir.clone()),
+                        });
+                        return;
+                    }
                 }
-            },
+            }
             ConflictPolicy::Overwrite => name,
         },
         Err(e) if is_sftp_not_found(&e) => name, // 确实不存在：直接用原名
@@ -211,8 +215,13 @@ pub(super) async fn upload(
                 crate::i18n::tr("已取消", "Canceled").to_string()
             } else {
                 match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("上传失败：{}", crate::ssh::dedup_status(&e.to_string())),
-                    crate::i18n::Lang::En => format!("Upload failed: {}", crate::ssh::dedup_status(&e.to_string())),
+                    crate::i18n::Lang::Zh => {
+                        format!("上传失败：{}", crate::ssh::dedup_status(&e.to_string()))
+                    }
+                    crate::i18n::Lang::En => format!(
+                        "Upload failed: {}",
+                        crate::ssh::dedup_status(&e.to_string())
+                    ),
                 }
             };
             sink.send(WorkerEvent::TransferDone {
@@ -316,12 +325,12 @@ pub(super) async fn upload_from_mcp(
             }
             let wanted = (size - written).min(buffer.len() as u64) as usize;
             // 源读取挂死（FUSE/网络盘）不能把 MCP 连接占满 24h：单次读超过此时限即失败。
-            let read = tokio::time::timeout(
-                MCP_SOURCE_READ_IDLE,
-                source.read(&mut buffer[..wanted]),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("调用方文件流读取超时（{MCP_SOURCE_IDLE_SECS}s 无数据）"))??;
+            let read =
+                tokio::time::timeout(MCP_SOURCE_READ_IDLE, source.read(&mut buffer[..wanted]))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("调用方文件流读取超时（{MCP_SOURCE_IDLE_SECS}s 无数据）")
+                    })??;
             if read == 0 {
                 anyhow::bail!("调用方文件流提前结束：期望 {size} 字节，实际收到 {written} 字节");
             }
@@ -336,7 +345,9 @@ pub(super) async fn upload_from_mcp(
         let mut trailing = [0_u8; 1];
         let extra = tokio::time::timeout(MCP_SOURCE_READ_IDLE, source.read(&mut trailing))
             .await
-            .map_err(|_| anyhow::anyhow!("调用方文件流读取超时（{MCP_SOURCE_IDLE_SECS}s 无数据）"))??;
+            .map_err(|_| {
+                anyhow::anyhow!("调用方文件流读取超时（{MCP_SOURCE_IDLE_SECS}s 无数据）")
+            })??;
         if extra != 0 {
             anyhow::bail!("调用方文件流超过声明的 {size} 字节");
         }
@@ -779,11 +790,7 @@ mod live_sftp_tests {
             .expect("sftp 会话");
         let dir = format!("/tmp/ishell-upload-it-{}", super::super::rand_hex(8));
         sftp.create_dir(dir.clone()).await.expect("建测试目录");
-        Some(Env {
-            sftp,
-            dir,
-            handle,
-        })
+        Some(Env { sftp, dir, handle })
     }
 
     fn sink() -> (crate::ssh::UiSink, std::sync::mpsc::Receiver<WorkerEvent>) {
@@ -815,7 +822,12 @@ mod live_sftp_tests {
         let flag = Arc::new(AtomicBool::new(cancel));
         let last = AtomicU64::new(0);
         let sz = std::fs::metadata(lpath).map(|m| m.len()).unwrap_or(0);
-        let perm = env.sftp.metadata(target).await.ok().and_then(|m| m.permissions);
+        let perm = env
+            .sftp
+            .metadata(target)
+            .await
+            .ok()
+            .and_then(|m| m.permissions);
         upload_file_once(
             &env.sftp, lpath, target, perm, &flag, 0, 1, &s, &last, false, sz, None,
         )
@@ -875,7 +887,10 @@ mod live_sftp_tests {
         let src = local_file("swap", b"brand new content");
         upload_one(&env, &src, &target, false).await.expect("上传");
 
-        assert_eq!(env.read(&target).await.as_deref(), Some(&b"brand new content"[..]));
+        assert_eq!(
+            env.read(&target).await.as_deref(),
+            Some(&b"brand new content"[..])
+        );
         assert!(
             !env.exists(&upload_part_path(&target)).await,
             "换入后不该留下 .ishell-part"
@@ -984,7 +999,11 @@ mod live_sftp_tests {
             .expect("读回权限")
             .permissions
             .expect("服务器应回报权限");
-        assert_eq!(before & 0o777, 0o755, "测试前置没设上，后面的断言就没意义了");
+        assert_eq!(
+            before & 0o777,
+            0o755,
+            "测试前置没设上，后面的断言就没意义了"
+        );
 
         let src = local_file("mode", b"#!/bin/sh\necho new\n");
         upload_one(&env, &src, &target, false).await.expect("上传");
@@ -1148,7 +1167,10 @@ mod live_sftp_tests {
         // 1) 内容：marker 那行没了，用户自己那行还在
         let after = String::from_utf8_lossy(&env.read(&ak).await.expect("读回")).into_owned();
         assert!(!after.contains(marker), "临时公钥那行没删掉：{after:?}");
-        assert!(after.contains("userkey"), "把用户自己的公钥也删了：{after:?}");
+        assert!(
+            after.contains("userkey"),
+            "把用户自己的公钥也删了：{after:?}"
+        );
 
         // 2) 权限：必须还是 0600
         let (_, mode) = env.exec(&format!("stat -c %a {ak}")).await;

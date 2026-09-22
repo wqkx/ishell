@@ -87,7 +87,10 @@ mod tests {
                 "aarch64" => 0xb7,
                 other => panic!("未知架构标签 {other}"),
             };
-            assert_eq!(machine, want, "{arch}：ELF 机器类型是 {machine:#x}，架构填错了");
+            assert_eq!(
+                machine, want,
+                "{arch}：ELF 机器类型是 {machine:#x}，架构填错了"
+            );
         }
     }
 

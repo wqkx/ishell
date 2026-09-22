@@ -48,7 +48,9 @@ impl App {
                 } else {
                     match crate::i18n::current() {
                         crate::i18n::Lang::Zh => format!("「{title}」仍在连接中，确定关闭吗？"),
-                        crate::i18n::Lang::En => format!("\"{title}\" is still connected. Close it?"),
+                        crate::i18n::Lang::En => {
+                            format!("\"{title}\" is still connected. Close it?")
+                        }
                     }
                 });
             });
@@ -79,5 +81,4 @@ impl App {
             None => {}
         }
     }
-
 }

@@ -77,10 +77,7 @@ pub(super) fn remote_parent(path: &str) -> String {
 /// 分段、从根往下逐级 `create_dir`。已存在的层会让 `create_dir` 报错，这里一律忽略——真正
 /// 的权限/占位（同名文件挡路）等问题会在随后打开/写入文件那步以清晰的错误暴露，不必在这里
 /// 抢先判定。best-effort 语义：本函数只负责"尽量把目录建出来"，成败由后续写操作定夺。
-pub(super) async fn create_remote_dir_all(
-    sftp: &russh_sftp::client::SftpSession,
-    dir: &str,
-) {
+pub(super) async fn create_remote_dir_all(sftp: &russh_sftp::client::SftpSession, dir: &str) {
     let dir = dir.trim_end_matches('/');
     if dir.is_empty() {
         return; // 根目录 "/"：无需创建
@@ -154,7 +151,10 @@ mod path_tests {
             let joined = join_remote(dir, "x.txt");
             let back = remote_parent(&joined);
             let expect = if dir == "/" { "/" } else { dir };
-            assert_eq!(back, expect, "join_remote({dir:?}, x.txt) = {joined:?} 的父级算错了");
+            assert_eq!(
+                back, expect,
+                "join_remote({dir:?}, x.txt) = {joined:?} 的父级算错了"
+            );
         }
     }
 }

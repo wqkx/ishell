@@ -76,7 +76,11 @@ fn snapshot(root: &Path) -> Snapshot {
 /// **A 类断言**：除了 `changed` 点名的相对路径，其余条目必须逐字节不变，
 /// 也不许凭空多出或少掉。
 fn assert_only_changed(before: &Snapshot, after: &Snapshot, changed: &[&str]) {
-    let allowed = |k: &str| changed.iter().any(|c| k == *c || k.starts_with(&format!("{c}/")));
+    let allowed = |k: &str| {
+        changed
+            .iter()
+            .any(|c| k == *c || k.starts_with(&format!("{c}/")))
+    };
     for (k, v) in before {
         if allowed(k) {
             continue;
@@ -227,7 +231,12 @@ fn copying_into_a_file_is_refused_without_damaging_it() {
     std::fs::write(&dest_file, b"I AM A FILE").expect("w");
     let before = snapshot(&tmp.0);
 
-    run_copy_move(&[src.join("a.txt")], &dest_file, false, ConflictPolicy::Overwrite);
+    run_copy_move(
+        &[src.join("a.txt")],
+        &dest_file,
+        false,
+        ConflictPolicy::Overwrite,
+    );
 
     assert_identical(&before, &snapshot(&tmp.0));
 }
@@ -355,7 +364,12 @@ fn pasting_into_its_own_directory_never_truncates_the_source() {
     make_tree(&tmp.0);
     let before = snapshot(&tmp.0);
 
-    run_copy_move(&[tmp.0.join("a.txt")], &tmp.0, false, ConflictPolicy::Overwrite);
+    run_copy_move(
+        &[tmp.0.join("a.txt")],
+        &tmp.0,
+        false,
+        ConflictPolicy::Overwrite,
+    );
 
     assert_identical(&before, &snapshot(&tmp.0));
 }
@@ -368,7 +382,12 @@ fn copying_a_directory_into_itself_leaves_no_debris() {
     make_tree(&proj);
     let before = snapshot(&tmp.0);
 
-    run_copy_move(&[proj.clone()], &proj.join("sub"), false, ConflictPolicy::Overwrite);
+    run_copy_move(
+        &[proj.clone()],
+        &proj.join("sub"),
+        false,
+        ConflictPolicy::Overwrite,
+    );
 
     assert_identical(&before, &snapshot(&tmp.0));
 }

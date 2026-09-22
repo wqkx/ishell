@@ -34,17 +34,31 @@ pub(super) fn spawn_pdf_info(
                 } else {
                     sink.send(WorkerEvent::FileLoadFailed {
                         id,
-                        message: crate::i18n::tr("无法解析 PDF 页数", "Cannot parse PDF page count").into(),
+                        message: crate::i18n::tr(
+                            "无法解析 PDF 页数",
+                            "Cannot parse PDF page count",
+                        )
+                        .into(),
                     });
                 }
             }
-            Ok((127, _, _)) => sink.send(WorkerEvent::FileLoadFailed { id, message: hint.into() }),
+            Ok((127, _, _)) => sink.send(WorkerEvent::FileLoadFailed {
+                id,
+                message: hint.into(),
+            }),
             Ok((code, _, err)) => {
                 let e = err.trim().to_string();
-                let msg = if e.is_empty() { format!("pdfinfo exit {code}") } else { e };
+                let msg = if e.is_empty() {
+                    format!("pdfinfo exit {code}")
+                } else {
+                    e
+                };
                 sink.send(WorkerEvent::FileLoadFailed { id, message: msg });
             }
-            Err(e) => sink.send(WorkerEvent::FileLoadFailed { id, message: e.to_string() }),
+            Err(e) => sink.send(WorkerEvent::FileLoadFailed {
+                id,
+                message: e.to_string(),
+            }),
         }
     });
 }
@@ -91,10 +105,13 @@ pub(super) fn spawn_pdf_search(
                         path,
                         query,
                         hits: Vec::new(),
-                        message: Some(crate::i18n::tr(
-                            "该 PDF 无文本层（可能是扫描件），无法搜索",
-                            "PDF has no text layer (scanned?), cannot search",
-                        ).into()),
+                        message: Some(
+                            crate::i18n::tr(
+                                "该 PDF 无文本层（可能是扫描件），无法搜索",
+                                "PDF has no text layer (scanned?), cannot search",
+                            )
+                            .into(),
+                        ),
                     });
                     return;
                 }
@@ -125,16 +142,24 @@ pub(super) fn spawn_pdf_search(
                         hits.push((pi as u32 + 1, snippet));
                     }
                 }
-                sink.send(WorkerEvent::PdfSearch { path, query, hits, message: None });
+                sink.send(WorkerEvent::PdfSearch {
+                    path,
+                    query,
+                    hits,
+                    message: None,
+                });
             }
             Ok((127, _, _)) => sink.send(WorkerEvent::PdfSearch {
                 path,
                 query,
                 hits: Vec::new(),
-                message: Some(crate::i18n::tr(
-                    "远端缺少 pdftotext（poppler-utils）",
-                    "Remote missing pdftotext (poppler-utils)",
-                ).into()),
+                message: Some(
+                    crate::i18n::tr(
+                        "远端缺少 pdftotext（poppler-utils）",
+                        "Remote missing pdftotext (poppler-utils)",
+                    )
+                    .into(),
+                ),
             }),
             Ok((code, _, err)) => {
                 let e = err.trim().to_string();
@@ -142,7 +167,11 @@ pub(super) fn spawn_pdf_search(
                     path,
                     query,
                     hits: Vec::new(),
-                    message: Some(if e.is_empty() { format!("pdftotext exit {code}") } else { e }),
+                    message: Some(if e.is_empty() {
+                        format!("pdftotext exit {code}")
+                    } else {
+                        e
+                    }),
                 });
             }
             Err(e) => sink.send(WorkerEvent::PdfSearch {

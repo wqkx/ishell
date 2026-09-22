@@ -459,11 +459,9 @@ impl Session {
         // 引号风格按**会话类型**而不是本机平台选：远端会话一律是 POSIX shell（哪怕 iShell
         // 跑在 Windows 上），只有「本机」会话在 Windows 上才是 cmd/PowerShell。
         let quoted = quote_shell_arg(path, self.cfg.is_local() && cfg!(windows));
-        let _ = self
-            .cmd_tx
-            .send(crate::proto::UiCommand::TerminalInput(
-                format!("{quoted} ").into_bytes(),
-            ));
+        let _ = self.cmd_tx.send(crate::proto::UiCommand::TerminalInput(
+            format!("{quoted} ").into_bytes(),
+        ));
         self.terminal.push_input_line(&quoted);
         self.status = match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!("已粘贴图片：{path}"),
@@ -555,7 +553,11 @@ impl App {
             // 本机会话的 host/port 只是占位（见 ConnectConfig::local），不拿去拼 user@host:port
             // 这种毫无意义的悬停提示；给一个明确的「本机」标识。
             tip: if cfg.is_local() {
-                format!("{} · {}", crate::i18n::tr("本机", "Local machine"), cfg.username)
+                format!(
+                    "{} · {}",
+                    crate::i18n::tr("本机", "Local machine"),
+                    cfg.username
+                )
             } else {
                 format!("{}@{}:{}", cfg.username, cfg.host, cfg.port)
             },
@@ -643,7 +645,7 @@ impl App {
         s.monitor_ok = None;
         s.pending_ai_run = None; // worker 已重启：旧的 AI 命令等待作废（对端 oneshot 断线会收到错误）
         s.pending_file_ops.clear(); // 同上：旧的 write_file/read_file/copy 等待也一并作废
-        // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建
+                                    // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建
         for f in &mut s.forwards {
             f.ok = true;
             f.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
@@ -653,9 +655,9 @@ impl App {
         s.reconnect_at = None;
         s.shell_exited = false;
         s.restore_cwd = true; // 重连成功后尝试 cd 回 last_cwd（保留不清空）
-        // 截止时刻属于**上一轮**连接，必须一并清掉：连接抖动（刚连上又断）时它可能已经
-        // 过期，留着会让这一轮新置下的意图被 `expire_cwd_restore_intents` 当场清掉。
-        // 新的 15s 由下一次 `WorkerEvent::Connected` 武装。
+                              // 截止时刻属于**上一轮**连接，必须一并清掉：连接抖动（刚连上又断）时它可能已经
+                              // 过期，留着会让这一轮新置下的意图被 `expire_cwd_restore_intents` 当场清掉。
+                              // 新的 15s 由下一次 `WorkerEvent::Connected` 武装。
         s.restore_cwd_until = None;
         s.status = crate::i18n::tr("重连中 …", "Reconnecting …").into();
         // M1：刷新该会话已打开编辑器标签的 cmd_tx——旧句柄随 worker 失效，否则重连后保存静默丢失。
@@ -827,7 +829,10 @@ mod reconnect_gate_tests {
             "用户敲 exit 后不应自动重连"
         );
         assert!(!should_auto_reconnect(true, true, false, 0), "本机不重连");
-        assert!(!should_auto_reconnect(false, false, false, 0), "从未连上不重连");
+        assert!(
+            !should_auto_reconnect(false, false, false, 0),
+            "从未连上不重连"
+        );
         assert!(!should_auto_reconnect(true, false, false, 5), "满 5 次停");
     }
 }
@@ -849,7 +854,10 @@ mod cwd_restore_tests {
     #[test]
     fn gives_up_as_soon_as_the_user_starts_typing() {
         assert_eq!(cwd_restore_decision(false, true, false), CwdRestore::GiveUp);
-        assert_eq!(cwd_restore_decision(false, false, false), CwdRestore::GiveUp);
+        assert_eq!(
+            cwd_restore_decision(false, false, false),
+            CwdRestore::GiveUp
+        );
     }
 
     /// 等太久也放弃：意图不能无限期挂着，否则几分钟后突然往用户的 shell 里敲一行 `cd`。
@@ -873,7 +881,10 @@ mod cwd_restore_tests {
             Some(now + std::time::Duration::from_secs(15)),
             now
         ));
-        assert!(cwd_restore_expired(now.checked_sub(std::time::Duration::from_secs(1)), now));
+        assert!(cwd_restore_expired(
+            now.checked_sub(std::time::Duration::from_secs(1)),
+            now
+        ));
         // 恰好到点也算过期（`>=`）
         assert!(cwd_restore_expired(Some(now), now));
     }

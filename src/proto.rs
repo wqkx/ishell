@@ -335,10 +335,7 @@ pub enum ForwardKind {
     /// 动态转发：本地 SOCKS5 代理（`ssh -D`）
     Dynamic,
     /// 远端转发：远端监听 bind → 连回本机 local_host:local_port（`ssh -R`）
-    Remote {
-        local_host: String,
-        local_port: u16,
-    },
+    Remote { local_host: String, local_port: u16 },
 }
 
 /// 一条端口转发配置。
@@ -412,7 +409,11 @@ pub enum WorkerEvent {
     /// 保存时检测到文件已被外部修改（未写入）；UI 提示用户是否覆盖
     FileSaveConflict { id: u64, path: String },
     /// 保存失败（网络/权限/磁盘等）：标签保持未保存状态并提示
-    FileSaveFailed { id: u64, path: String, message: String },
+    FileSaveFailed {
+        id: u64,
+        path: String,
+        message: String,
+    },
     /// `DeployMcpAgent` 的结果。成功时 `message` 是远端可执行文件的绝对路径
     /// （UI 据此把注册命令打进终端）；失败时是给用户看的原因。
     McpAgentDeployed { ok: bool, message: String },
@@ -490,9 +491,16 @@ pub enum WorkerEvent {
     /// `size` 转告目标会话、下发 `RelayWriteFile`（目标会话在此之前不知道文件大小）；
     /// `Err(message)`（目录/远端不可访问）此时还没有 `TransferStart` 过，App 层直接据此
     /// 判定整个跨会话拷贝失败，不需要等任何 `TransferDone`。
-    RelaySourceResult { id: u64, result: Result<u64, String> },
+    RelaySourceResult {
+        id: u64,
+        result: Result<u64, String>,
+    },
     /// `TrustTempKey` 的执行结果。
-    TempKeyTrusted { op_id: u64, ok: bool, message: String },
+    TempKeyTrusted {
+        op_id: u64,
+        ok: bool,
+        message: String,
+    },
     /// `UntrustTempKey` 已执行完（结果不影响主流程成败判定，仅供日志）。
     /// 临时公钥撤销的结果。`ok=false` 时 `message` 是原因——**必须让用户看见**：
     /// 撤销失败意味着一把带 `restrict` 的临时公钥留在了目标机的 `~/.ssh/authorized_keys` 里。
@@ -506,7 +514,11 @@ pub enum WorkerEvent {
     /// 一半被误杀。
     DirectRelayStarted { op_id: u64 },
     /// `DirectRelayCopy` 的最终结果。
-    DirectRelayDone { op_id: u64, ok: bool, message: String },
+    DirectRelayDone {
+        op_id: u64,
+        ok: bool,
+        message: String,
+    },
     /// 进程详情返回
     ProcDetail {
         pid: u32,
@@ -644,13 +656,20 @@ mod conflict_policy_tests {
     #[test]
     fn unknown_values_fall_back_to_the_default() {
         for s in ["", "OVERWRITE", "skip ", "什么", "0"] {
-            assert_eq!(ConflictPolicy::from_str(s), ConflictPolicy::Overwrite, "输入 {s:?}");
+            assert_eq!(
+                ConflictPolicy::from_str(s),
+                ConflictPolicy::Overwrite,
+                "输入 {s:?}"
+            );
         }
     }
 
     /// `Default` 必须和 `from_str` 的兜底一致——两处各写各的，迟早会分叉。
     #[test]
     fn default_matches_the_from_str_fallback() {
-        assert_eq!(ConflictPolicy::default(), ConflictPolicy::from_str("说不出的东西"));
+        assert_eq!(
+            ConflictPolicy::default(),
+            ConflictPolicy::from_str("说不出的东西")
+        );
     }
 }
