@@ -1060,12 +1060,20 @@ mod keychain_slot_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("key");
 
-        // 没有任何现成密钥：may_create=false 必须拒绝，不能去写钥匙串。
+        // 没有任何本地密钥：may_create=false 不得新建本地文件，也不得 set_password。
+        // 若本机钥匙串里已有条目，允许只读 adopt（返回 Some），但磁盘上仍不能出现 key。
+        let adopted = mint_new_key(&path, false);
         assert!(
-            mint_new_key(&path, false).is_none(),
-            "无锁且无现成密钥时应放弃，而不是 set_password"
+            read_local_key(&path).is_none(),
+            "无锁时不得新建本地 key 文件"
         );
-        assert!(read_local_key(&path).is_none());
+        if adopted.is_none() {
+            // 钥匙串也空：必须彻底放弃
+        } else {
+            // 来自已有钥匙串——再次调用仍应得到同一把，且仍不落盘
+            assert_eq!(mint_new_key(&path, false), adopted);
+            assert!(read_local_key(&path).is_none());
+        }
 
         let existing = [0xABu8; 32];
         write_key_file(&path, &existing).unwrap();
