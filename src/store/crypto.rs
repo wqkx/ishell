@@ -400,6 +400,16 @@ fn persist_local_backup(path: &std::path::Path, k: &[u8; 32]) {
     }
 }
 
+/// 拿不到跨进程初始化锁时，禁止一切会改写共享密钥材料的动作。
+/// 只读已有钥匙串/本地密钥仍可；MintNew 与向钥匙串迁移必须等锁。
+fn demote_plan_without_init_lock(plan: MasterKeyPlan) -> MasterKeyPlan {
+    match plan {
+        MasterKeyPlan::MintNew => MasterKeyPlan::None,
+        MasterKeyPlan::UseLocal { migrate: true } => MasterKeyPlan::UseLocal { migrate: false },
+        other => other,
+    }
+}
+
 /// 跨进程互斥：多实例同时首次初始化时串行化 mint / 写本地 key / 写钥匙串。
 /// 锁文件本身不是密钥；进程退出或 drop 后自动释放。
 struct MasterKeyDirLock {
@@ -423,7 +433,7 @@ fn lock_master_key_dir(dir: &std::path::Path) -> Option<MasterKeyDirLock> {
 }
 
 /// 本地 key：已有则采用，否则写入候选并**读回**磁盘上的最终内容。
-/// 调用方须已持有 `lock_master_key_dir`。
+/// 调用方须已持有 `lock_master_key_dir`（或明确知道不会并发创建）。
 fn install_or_adopt_local_key(path: &std::path::Path, candidate: &[u8; 32]) -> Option<[u8; 32]> {
     if let Some(existing) = read_local_key(path) {
         return Some(existing);
@@ -439,16 +449,28 @@ fn install_or_adopt_local_key(path: &std::path::Path, candidate: &[u8; 32]) -> O
     read_local_key(path)
 }
 
-fn mint_new_key(path: &std::path::Path) -> Option<[u8; 32]> {
+/// `may_create`：仅在已持有目录锁时为 true。否则只采用已有本地/钥匙串密钥，
+/// 绝不 `set_password` / 新建本地 key——配置目录只读但钥匙串可写时，无锁并发
+/// mint 会互相覆盖钥匙串条目。
+fn mint_new_key(path: &std::path::Path, may_create: bool) -> Option<[u8; 32]> {
     // 等锁期间其它进程可能已经完成初始化——先采用现成的，不要再掷一次骰子。
     if let Some(existing) = read_local_key(path) {
         let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
         return Some(existing);
     }
     if let KeychainRead::Found(k) = keychain_read() {
-        persist_local_backup(path, &k);
+        if may_create {
+            persist_local_backup(path, &k);
+        }
         let _ = KEY_STORAGE.set(KeyStorage::Keychain);
         return Some(k);
+    }
+
+    if !may_create {
+        log::error!(
+            "无法取得主密钥目录锁，又没有现成的本地/钥匙串密钥；拒绝新建以免并发覆盖"
+        );
+        return None;
     }
 
     let mut k = [0u8; 32];
@@ -480,8 +502,14 @@ fn compute_master_key() -> Option<[u8; 32]> {
         }
     };
     let path = dir.join("key");
-    // 拿不到锁也继续（极端只读目录）：仍走下面的逻辑，只是没有跨进程串行化。
-    let _dir_lock = lock_master_key_dir(&dir);
+    let dir_lock = lock_master_key_dir(&dir);
+    let have_init_lock = dir_lock.is_some();
+    if !have_init_lock {
+        log::warn!(
+            "无法锁定主密钥目录（{}）：只使用已有密钥，不会新建或写入钥匙串",
+            dir.display()
+        );
+    }
     let local = read_local_key(&path);
     let has_ciphertext = saved_secrets_need_existing_key();
     let read = keychain_read();
@@ -489,7 +517,15 @@ fn compute_master_key() -> Option<[u8; 32]> {
         KeychainRead::Found(k) => Some(k),
         _ => None,
     };
-    match plan_master_key(read, local.is_some(), has_ciphertext) {
+    let plan = {
+        let p = plan_master_key(read, local.is_some(), has_ciphertext);
+        if have_init_lock {
+            p
+        } else {
+            demote_plan_without_init_lock(p)
+        }
+    };
+    match plan {
         MasterKeyPlan::UseKeychain => {
             let k = keychain_key.expect("Found 才走 UseKeychain");
             if has_ciphertext && !key_opens_saved_secrets(&k) {
@@ -506,12 +542,16 @@ fn compute_master_key() -> Option<[u8; 32]> {
                 let _ = KEY_STORAGE.set(KeyStorage::Keychain);
                 return Some(k);
             }
-            persist_local_backup(&path, &k);
+            // 无锁时不写本地备份：写备份本身也需要跨进程协调。
+            if have_init_lock {
+                persist_local_backup(&path, &k);
+            }
             let _ = KEY_STORAGE.set(KeyStorage::Keychain);
             Some(k)
         }
         MasterKeyPlan::UseLocal { migrate } => {
             let k = local.expect("has_local 才走 UseLocal");
+            // migrate 仅在 have_init_lock 时仍为 true（见 demote_plan_without_init_lock）。
             if migrate && keychain_set_key(&k) {
                 match keychain_read() {
                     KeychainRead::Found(got) if got == k => {
@@ -524,10 +564,10 @@ fn compute_master_key() -> Option<[u8; 32]> {
             let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
             Some(k)
         }
-        MasterKeyPlan::MintNew => mint_new_key(&path),
+        MasterKeyPlan::MintNew => mint_new_key(&path, have_init_lock),
         MasterKeyPlan::None => {
             log::error!(
-                "主密钥不可用（钥匙串暂时读不到，又没有本地备份）。已存密码不会被一把新密钥毁掉。"
+                "主密钥不可用（钥匙串暂时读不到，又没有本地备份，或无法取得初始化锁）。已存密码不会被一把新密钥毁掉。"
             );
             // 不写入 KEY_STORAGE：超时这次失败，钥匙串恢复后这次进程里还应该能再读。
             None
@@ -974,6 +1014,167 @@ mod keychain_slot_tests {
         let b = handles.pop().unwrap().join().unwrap().expect("b");
         assert_eq!(a, b, "两进程/线程应收敛到同一把最终密钥");
         assert_eq!(read_local_key(&path), Some(a));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_init_lock_mint_and_migrate_are_refused() {
+        use super::{demote_plan_without_init_lock, MasterKeyPlan};
+        assert_eq!(
+            demote_plan_without_init_lock(MasterKeyPlan::MintNew),
+            MasterKeyPlan::None,
+            "无锁时绝不能新建钥匙串/本地主密钥"
+        );
+        assert_eq!(
+            demote_plan_without_init_lock(MasterKeyPlan::UseLocal { migrate: true }),
+            MasterKeyPlan::UseLocal { migrate: false },
+            "无锁时不能往钥匙串迁移（写入）"
+        );
+        assert_eq!(
+            demote_plan_without_init_lock(MasterKeyPlan::UseKeychain),
+            MasterKeyPlan::UseKeychain
+        );
+        assert_eq!(
+            demote_plan_without_init_lock(MasterKeyPlan::UseLocal { migrate: false }),
+            MasterKeyPlan::UseLocal { migrate: false }
+        );
+        assert_eq!(
+            demote_plan_without_init_lock(MasterKeyPlan::None),
+            MasterKeyPlan::None
+        );
+    }
+
+    #[test]
+    fn mint_without_create_permission_only_adopts_existing() {
+        use super::{mint_new_key, read_local_key, write_key_file};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-mint-nocreate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+
+        // 没有任何现成密钥：may_create=false 必须拒绝，不能去写钥匙串。
+        assert!(
+            mint_new_key(&path, false).is_none(),
+            "无锁且无现成密钥时应放弃，而不是 set_password"
+        );
+        assert!(read_local_key(&path).is_none());
+
+        let existing = [0xABu8; 32];
+        write_key_file(&path, &existing).unwrap();
+        assert_eq!(mint_new_key(&path, false), Some(existing));
+        assert_eq!(read_local_key(&path), Some(existing));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_fails_when_config_dir_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::lock_master_key_dir;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-ro-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        assert!(
+            lock_master_key_dir(&dir).is_none(),
+            "只读配置目录应拿不到 key.lock，调用方须 demote MintNew"
+        );
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(&dir, perms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个**独立进程**在目录锁下安装本地 key，应收敛到同一把（不是同进程线程）。
+    #[test]
+    fn two_os_processes_converge_on_one_local_key() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-proc-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("key");
+        let marker = dir.join("ready");
+
+        // 子进程用与 `lock_master_key_dir` + `install_or_adopt_local_key` 相同的
+        // flock→若无则写入→读回 协议（Python 便于起两个真 OS 进程，不依赖测试 bin hook）。
+        let py = format!(
+            r#"
+import fcntl, os, pathlib, sys, time
+d = pathlib.Path({dir:?})
+key, lockp, ready = d / "key", d / "key.lock", d / "ready"
+while not ready.exists():
+    time.sleep(0.005)
+fd = os.open(lockp, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+if key.exists():
+    data = key.read_bytes()
+else:
+    data = os.urandom(32)
+    tmp = d / f"tmp.{{os.getpid()}}"
+    tmp.write_bytes(data)
+    os.chmod(tmp, 0o600)
+    tmp.replace(key)
+    data = key.read_bytes()
+sys.stdout.buffer.write(data)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+"#,
+            dir = dir
+        );
+        let mut children = Vec::new();
+        for _ in 0..2 {
+            children.push(
+                Command::new("python3")
+                    .arg("-c")
+                    .arg(&py)
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn python child"),
+            );
+        }
+        std::fs::write(&marker, b"1").unwrap();
+        let mut outs = Vec::new();
+        for c in children {
+            let out = c.wait_with_output().expect("child");
+            assert!(out.status.success(), "child failed: {:?}", out.status);
+            assert_eq!(out.stdout.len(), 32, "child must print 32-byte key");
+            outs.push(out.stdout);
+        }
+        assert_eq!(outs[0], outs[1], "两独立进程应收敛到同一本地密钥");
+        assert_eq!(
+            super::read_local_key(&key_path).as_ref().map(|k| k.as_slice()),
+            Some(outs[0].as_slice())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
