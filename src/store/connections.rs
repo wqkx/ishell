@@ -127,6 +127,17 @@ fn default_port() -> u16 {
 
 // ---------- 读写 ----------
 
+/// 解析失败时把原文件内容备份为 `connections.json.bak`。
+/// 损坏文件里可能仍有旧明文密码：必须与主文件一样走限制权限的原子写。
+fn persist_corrupt_config_backup(config_path: &std::path::Path, text: &str) {
+    let bak = config_path.with_extension("json.bak");
+    if let Err(e) = write_atomic(&bak, text) {
+        log::warn!("备份损坏的 connections.json 失败：{e}");
+    } else {
+        restrict_perms(&bak);
+    }
+}
+
 /// 读取已保存连接列表（内存中为明文密码）。
 ///
 /// - 文件不存在 → 空列表
@@ -143,7 +154,7 @@ pub fn load() -> Vec<SavedConnection> {
         Ok(l) => l,
         Err(e) => {
             log::warn!("connections.json 解析失败：{e}，已备份为 .bak");
-            let _ = std::fs::write(path.with_extension("json.bak"), &text);
+            persist_corrupt_config_backup(&path, &text);
             return Vec::new();
         }
     };
@@ -568,5 +579,32 @@ Host pat-*
         c.use_jump = true;
         c.jump_auth_kind = "password".into();
         assert_eq!(c.blocked_secrets(), vec![BlockedSecret::JumpPassword]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_config_backup_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-conn-bak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connections.json");
+        // 故意用宽松 umask 风格先写一份，确认备份路径不会继承成 0644。
+        let plain = r#"[{"password":"legacy-plaintext-secret"}] NOT_JSON"#;
+        persist_corrupt_config_backup(&path, plain);
+        let bak = path.with_extension("json.bak");
+        let meta = std::fs::metadata(&bak).expect("bak exists");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "损坏配置备份须为 0600，实际 {mode:#o}");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), plain);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -575,27 +575,11 @@ fn compute_master_key() -> Option<[u8; 32]> {
     }
 }
 
-/// 以 0600 原子写入主密钥文件：写 0600 临时文件后 rename 覆盖到位（rename 保留临时文件权限）。
-#[cfg(unix)]
+/// 以属主可读的方式原子写入主密钥文件：写临时文件 → fsync → 换入目标。
+/// Unix 上临时文件 mode=0600（rename 保留）；Windows 上同样先写完整临时文件再替换，
+/// 避免 `fs::write` 中途崩溃把本地备份截断。
 fn write_key_file(path: &std::path::Path, k: &[u8; 32]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp); // 清理可能的同名残留，确保 create_new 成功
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true) // 全新创建：mode 在此刻生效，无 0644 窗口
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(k)?;
-        let _ = f.sync_all();
-    }
-    std::fs::rename(&tmp, path)
-}
-#[cfg(not(unix))]
-fn write_key_file(path: &std::path::Path, k: &[u8; 32]) -> std::io::Result<()> {
-    std::fs::write(path, k)
+    super::paths::write_atomic_bytes(path, k)
 }
 
 /// 校验本地 key 文件权限：若 group/other 有任何位（过宽），记录并收紧为 0600。
@@ -1130,6 +1114,8 @@ mod keychain_slot_tests {
     }
 
     /// 两个**独立进程**在目录锁下安装本地 key，应收敛到同一把（不是同进程线程）。
+    /// 仅 Unix：依赖 `python3` + `fcntl`；Windows 发布目标上跳过，避免 `cargo test` 失败。
+    #[cfg(unix)]
     #[test]
     fn two_os_processes_converge_on_one_local_key() {
         use std::process::Command;
@@ -1197,6 +1183,29 @@ os.close(fd)
             super::read_local_key(&key_path).as_ref().map(|k| k.as_slice()),
             Some(outs[0].as_slice())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_key_file_replaces_existing_without_truncating_in_place() {
+        use super::{read_local_key, write_key_file};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-key-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+        write_key_file(&path, &[0x11; 32]).unwrap();
+        assert_eq!(read_local_key(&path), Some([0x11; 32]));
+        // 第二次写入必须能覆盖（Windows 上裸 rename 会失败）；读回完整 32 字节。
+        write_key_file(&path, &[0x22; 32]).unwrap();
+        assert_eq!(read_local_key(&path), Some([0x22; 32]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
