@@ -4,7 +4,7 @@
 
 **A modern, AI-native SSH terminal written in Rust**
 
-Let Claude Code, Codex CLI, or any MCP-compatible agent drive a real, persistent terminal session — plus system monitor · SFTP file manager · port forwarding · jump hosts, all in one window
+Let Claude Code, Codex CLI, Kimi Code, OpenCode, or another MCP-compatible agent drive a real, persistent terminal session — plus system monitor · SFTP file manager · port forwarding · jump hosts, all in one window
 
 **English** · [中文](README.zh-CN.md)
 
@@ -20,7 +20,7 @@ Let Claude Code, Codex CLI, or any MCP-compatible agent drive a real, persistent
 
 Everything you need for daily SSH work in **one window** — and it stays out of your way.
 
-- 🤖 **Let AI drive the terminal (MCP)** — Claude Code / Codex operate a real persistent session (cwd/env/history intact); commands appear live in the tab. On by default (Settings turns it off); the matching proxy binary ships inside iShell and installs onto a server in one click. When several computers share one AI server, enable pairing. See "AI / MCP integration".
+- 🤖 **Let AI drive the terminal (MCP)** — Claude Code, Codex CLI, Kimi Code, and OpenCode operate a real persistent session (cwd/env/history intact); commands appear live in the tab. On by default (Settings turns it off); the matching proxy binary ships inside iShell and installs onto a server in one click. When several computers share one AI server, enable pairing. See "AI / MCP integration".
 - ⚡ **Fast & lightweight** — pure Rust + GPU immediate-mode UI. A single binary (~8–12 MB), instant startup, **~0% idle CPU**, **~80 MB RAM**. No Electron / JVM / Python, no daemon, no runtime deps.
 - 🎯 **Refined user experience** — a clean, warm light theme; smooth drag-to-reorder tabs; no toolbar clutter; English / 中文 switchable on the fly; sensible defaults so it just works.
 - 📁 **Effortless file operations** — multi-select rubber-band, batch delete/download, server-side copy/move, **resumable** transfers that **auto-resume after reconnect**, and folder **compress-download** (tar.gz) for thousands of small files.
@@ -41,7 +41,7 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 ## 🚀 Features
 
 **AI / MCP integration** (on by default — see "AI / MCP integration" below)
-- Let Claude Code / Codex CLI drive a **real terminal session** (cwd/env/history intact), with live commands and output
+- Let Claude Code, Codex CLI, Kimi Code, and OpenCode drive a **real terminal session** (cwd/env/history intact), with live commands and output
 - Full tool set: run commands, read screen/history, interactive input, interrupt, open/close sessions, read/write/transfer remote files
 - SSH reverse-forward lets the AI on a remote server reach back to this iShell; **enable pairing when several computers share one AI server** (see below)
 
@@ -200,7 +200,7 @@ See [BUILD.md](BUILD.md) for per-platform details, dependencies, and cross build
 
 ## 🤖 AI / MCP integration
 
-Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal session — cwd / env / history intact — instead of a throwaway `ssh host cmd`. It can take over a tab you already have open, or open a read-only AI-only session from a saved connection (a human can't type into it).
+Let an AI (Claude Code, Codex CLI, Kimi Code, or OpenCode) drive a **real, persistent** terminal session — cwd / env / history intact — instead of a throwaway `ssh host cmd`. These four MCP clients have been tested with iShell. It can take over a tab you already have open, or open a read-only AI-only session from a saved connection (a human can't type into it).
 
 ### Enable & setup
 
@@ -211,9 +211,15 @@ Let an AI (Claude Code, Codex CLI, …) drive a **real, persistent** terminal se
      ```bash
      scripts/install-mcp.sh ./ishell-mcp                  # → ~/.ishell-mcp/bin/ishell-mcp
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
-     # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
+     # Claude Code, Kimi Code, and OpenCode: register the stdio server using the client’s MCP settings.
      ```
-     Other clients just point `command` at the same path. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
+     **Codex CLI:** add the server to `~/.codex/config.toml` (or the applicable Codex config) and allow the pairing variables to reach the MCP subprocess:
+     ```toml
+     [mcp_servers.ishell]
+     command = "/home/you/.ishell-mcp/bin/ishell-mcp"
+     env_vars = ["ISHELL_PAIR_TOKEN", "ISHELL_HOST"]
+     ```
+     `env_vars` forwards these values from Codex’s local environment; it does not create them. Start Codex from an iShell terminal where the variables have been injected, or otherwise ensure they are present in the environment that launches Codex. Do not hard-code a pairing token in a shared MCP config. For Claude Code, Kimi Code, and OpenCode, register the stdio server with the same `ishell-mcp` command; other MCP clients can do the same. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
 
 ### Tools
 

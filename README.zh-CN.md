@@ -4,7 +4,7 @@
 
 **一个面向 AI 工作流的现代化终端，用 Rust 编写**
 
-让 Claude Code、Codex CLI 等任意 MCP 兼容的 AI 助手直接驱动一个真实、持久的终端会话——外加系统监控 · SFTP 文件管理 · 端口转发 · 跳板机，一屏搞定
+让 Claude Code、Codex CLI、Kimi Code、OpenCode 等 MCP 兼容的 AI 助手直接驱动一个真实、持久的终端会话——外加系统监控 · SFTP 文件管理 · 端口转发 · 跳板机，一屏搞定
 
 [English](README.md) · **中文**
 
@@ -20,7 +20,7 @@
 
 日常 SSH 运维需要的一切都在**同一个窗口**里——而且不打扰你。
 
-- 🤖 **让 AI 直接驱动终端（MCP）** —— Claude Code / Codex 等可操作真实持久会话（cwd/环境/历史保留），命令实时出现在标签里；默认开启（设置里可关），配套代理二进制内置在 iShell 里、一次点击即可装到服务器上。多机共用一台 AI 服务器时请启用配对。详见「AI / MCP 集成」。
+- 🤖 **让 AI 直接驱动终端（MCP）** —— Claude Code、Codex CLI、Kimi Code、OpenCode 均可操作真实持久会话（cwd/环境/历史保留），命令实时出现在标签里；默认开启（设置里可关），配套代理二进制内置在 iShell 里、一次点击即可装到服务器上。多机共用一台 AI 服务器时请启用配对。详见「AI / MCP 集成」。
 - ⚡ **快、占用低** —— 纯 Rust + GPU 即时模式 UI。单文件（约 8–12 MB）、秒开、**空闲 CPU ≈ 0%**、**内存约 80 MB**。无 Electron / JVM / Python，无守护进程，无运行时依赖。
 - 🎯 **用心打磨的体验** —— 干净的暖色浅色主题、标签平滑拖拽排序、不堆砌工具栏、中文 / English 随时切换、默认值合理，开箱即用。
 - 📁 **便捷的文件操作** —— 框选多选、批量删除/下载、远端服务器侧复制/移动、**下载断点续传**且**断线后自动续传**、文件夹 **压缩下载**（tar.gz）应对成千上万小文件。
@@ -41,7 +41,7 @@
 ## 🚀 功能
 
 **AI / MCP 集成**（默认开启，详见下文「AI / MCP 集成」一节）
-- 让 Claude Code / Codex CLI 等 AI **驱动真实终端会话**（保留 cwd/环境/历史），命令与输出实时可见
+- 让 Claude Code、Codex CLI、Kimi Code、OpenCode **驱动真实终端会话**（保留 cwd/环境/历史），命令与输出实时可见
 - 完整工具集：跑命令、读屏幕/历史、交互输入、中断、开关会话、读写/传输远端文件
 - SSH 反向转发到远端后，AI 在服务器上也能回控本机 iShell；**多机共用一台 AI 服务器时务必启用配对**（见下文）
 
@@ -201,7 +201,7 @@ cargo run --release
 
 ## 🤖 AI / MCP 集成
 
-让 AI（Claude Code、Codex CLI 等）驱动**真实、持久**的终端会话——保留 cwd / 环境 / 历史，而不是每次另开一条丢光上下文的 `ssh host cmd`。可接管你已打开的标签，也可按已保存连接新开只读 AI 会话（人不能往里打字）。
+让 AI（Claude Code、Codex CLI、Kimi Code 或 OpenCode）驱动**真实、持久**的终端会话——保留 cwd / 环境 / 历史，而不是每次另开一条丢光上下文的 `ssh host cmd`。这四种 MCP 客户端均已通过 iShell 实测。可接管你已打开的标签，也可按已保存连接新开只读 AI 会话（人不能往里打字）。
 
 ### 开启与接入
 
@@ -212,9 +212,15 @@ cargo run --release
      ```bash
      scripts/install-mcp.sh ./ishell-mcp                  # → ~/.ishell-mcp/bin/ishell-mcp
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
-     # codex mcp add ishell -- ~/.ishell-mcp/bin/ishell-mcp          # Codex
+     # Claude Code、Kimi Code、OpenCode：在各自的 MCP 设置中注册 stdio server。
      ```
-     其它客户端把 `command` 指到同一路径即可。GUI 与 `ishell-mcp` **必须同版本**；升级后重跑安装脚本。
+     **Codex CLI：**在 `~/.codex/config.toml`（或适用的 Codex 配置文件）中添加 server，并允许配对环境变量传给 MCP 子进程：
+     ```toml
+     [mcp_servers.ishell]
+     command = "/home/you/.ishell-mcp/bin/ishell-mcp"
+     env_vars = ["ISHELL_PAIR_TOKEN", "ISHELL_HOST"]
+     ```
+     `env_vars` 会从 Codex 的本地运行环境转发变量，**不会自动生成变量值**。请从已注入这两个变量的 iShell 终端启动 Codex，或确保启动 Codex 的环境中已有它们。不要把配对 token 明文固定写入多人共用的 MCP 配置。Claude Code、Kimi Code、OpenCode 在各自 MCP 设置中将 stdio server 的命令指向同一个 `ishell-mcp` 即可；其它 MCP 客户端也可用相同方式配置。GUI 与 `ishell-mcp` **必须同版本**；升级后重跑安装脚本。
 
 ### 工具一览
 
