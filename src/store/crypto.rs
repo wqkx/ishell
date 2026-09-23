@@ -259,28 +259,82 @@ fn read_local_key(path: &std::path::Path) -> Option<[u8; 32]> {
     })
 }
 
-fn saved_secrets_need_existing_key() -> bool {
+/// 磁盘上已存密文的盘点结果。区分「确认没有」「确认有且可读」「说不清」——
+/// 说不清时绝不能当成「空样本 → 任意密钥都验证通过」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CiphertextInventory {
+    /// 没有配置文件，或合法 JSON 里没有任何 `enc:v1:` 字段。
+    Empty,
+    /// 已解析出的密文字符串（至少一条）。
+    Samples(Vec<String>),
+    /// 文件在但读不到 / JSON 坏了却仍能看见 `enc:v1:`：验证结果未知。
+    Unknown,
+}
+
+impl CiphertextInventory {
+    fn needs_existing_key(&self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+}
+
+/// 从已读到的配置文本归类。供单测直接喂损坏内容，不依赖真实路径。
+fn inventory_from_text(text: &str) -> CiphertextInventory {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Array(arr)) => {
+            let mut out = Vec::new();
+            for item in &arr {
+                for key in ["password", "passphrase", "jump_password", "jump_passphrase"] {
+                    if let Some(s) = item.get(key).and_then(|x| x.as_str()) {
+                        if s.starts_with(ENC_PREFIX) {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+            }
+            if out.is_empty() {
+                CiphertextInventory::Empty
+            } else {
+                CiphertextInventory::Samples(out)
+            }
+        }
+        Ok(_) => {
+            // 合法 JSON 但不是连接数组：若正文里仍有密文前缀，按未知处理，免得漏保护。
+            if text.contains(ENC_PREFIX) {
+                CiphertextInventory::Unknown
+            } else {
+                CiphertextInventory::Empty
+            }
+        }
+        Err(_) => {
+            if text.contains(ENC_PREFIX) {
+                CiphertextInventory::Unknown
+            } else {
+                CiphertextInventory::Empty
+            }
+        }
+    }
+}
+
+fn inventory_saved_ciphertexts() -> CiphertextInventory {
     let Some(path) = super::paths::config_path() else {
-        return false;
+        return CiphertextInventory::Empty;
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return text.contains(ENC_PREFIX);
-    };
-    let Some(arr) = v.as_array() else {
-        return false;
-    };
-    arr.iter().any(|item| {
-        ["password", "passphrase", "jump_password", "jump_passphrase"]
-            .iter()
-            .any(|key| {
-                item.get(*key)
-                    .and_then(|x| x.as_str())
-                    .is_some_and(|s| s.starts_with(ENC_PREFIX))
-            })
-    })
+    match std::fs::read_to_string(&path) {
+        Ok(text) => inventory_from_text(&text),
+        Err(_) => {
+            // 读都读不到：无法确认有没有密文。文件存在时按未知处理，避免把钥匙串密钥
+            // 当成「已验证」去盖掉本地备份。
+            if path.exists() {
+                CiphertextInventory::Unknown
+            } else {
+                CiphertextInventory::Empty
+            }
+        }
+    }
+}
+
+fn saved_secrets_need_existing_key() -> bool {
+    inventory_saved_ciphertexts().needs_existing_key()
 }
 
 fn decrypt_with_key(k: &[u8; 32], s: &str) -> Option<String> {
@@ -296,40 +350,24 @@ fn decrypt_with_key(k: &[u8; 32], s: &str) -> Option<String> {
         .and_then(|b| String::from_utf8(b).ok())
 }
 
-fn ciphertext_samples() -> Vec<String> {
-    let Some(path) = super::paths::config_path() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    let Some(arr) = v.as_array() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for item in arr {
-        for key in ["password", "passphrase", "jump_password", "jump_passphrase"] {
-            if let Some(s) = item.get(key).and_then(|x| x.as_str()) {
-                if s.starts_with(ENC_PREFIX) {
-                    out.push(s.to_string());
-                }
-            }
-        }
-    }
-    out
+/// 能解开**全部**已存密文才算可用。只抽第一条会漏掉「新旧密钥混存」。
+fn key_opens_all_samples(k: &[u8; 32], samples: &[String]) -> bool {
+    !samples.is_empty() && samples.iter().all(|s| decrypt_with_key(k, s).is_some())
 }
 
-/// 能解开**全部**已存密文才算可用。只抽第一条会漏掉「新旧密钥混存」：
-/// 第一条碰巧是新钥写的，就会误认钥匙串旧钥已废、或反过来。
-fn key_opens_all_samples(k: &[u8; 32], samples: &[String]) -> bool {
-    samples.is_empty() || samples.iter().all(|s| decrypt_with_key(k, s).is_some())
+fn key_opens_inventory(k: &[u8; 32], inv: &CiphertextInventory) -> bool {
+    match inv {
+        // 确认没有密文：任意密钥都「兼容」（首次安装）。
+        CiphertextInventory::Empty => true,
+        // 读不清时不能当验证成功——否则 persist_local_backup 会用未验证的钥匙串密钥
+        // 覆盖仍能解开旧密文的本地备份。
+        CiphertextInventory::Unknown => false,
+        CiphertextInventory::Samples(samples) => key_opens_all_samples(k, samples),
+    }
 }
 
 fn key_opens_saved_secrets(k: &[u8; 32]) -> bool {
-    key_opens_all_samples(k, &ciphertext_samples())
+    key_opens_inventory(k, &inventory_saved_ciphertexts())
 }
 
 /// 解不开已存密文的钥匙串密钥不能写成本地备份：以后钥匙串一超时就会稳定地用这把废钥匙。
@@ -338,9 +376,10 @@ fn may_persist_as_local_backup(key_opens_secrets: bool, has_ciphertext: bool) ->
 }
 
 fn persist_local_backup(path: &std::path::Path, k: &[u8; 32]) {
-    let key_opens = key_opens_saved_secrets(k);
-    if !may_persist_as_local_backup(key_opens, saved_secrets_need_existing_key()) {
-        log::warn!("钥匙串密钥解不开已存密码，不把它写成本地备份");
+    let inv = inventory_saved_ciphertexts();
+    let key_opens = key_opens_inventory(k, &inv);
+    if !may_persist_as_local_backup(key_opens, inv.needs_existing_key()) {
+        log::warn!("钥匙串密钥解不开已存密码（或配置无法验证），不把它写成本地备份");
         return;
     }
     if let Some(existing) = read_local_key(path) {
@@ -348,7 +387,7 @@ fn persist_local_backup(path: &std::path::Path, k: &[u8; 32]) {
             return;
         }
         // 本地还是旧密钥、且它能解开已存密码：绝不覆盖，那是唯一的找回手段。
-        if key_opens_saved_secrets(&existing) && !key_opens {
+        if key_opens_inventory(&existing, &inv) && !key_opens {
             log::warn!("本地 key 文件仍能解开已存密码，钥匙串里的密钥对不上；保留本地文件不覆盖");
             return;
         }
@@ -361,33 +400,88 @@ fn persist_local_backup(path: &std::path::Path, k: &[u8; 32]) {
     }
 }
 
-fn mint_new_key(path: &std::path::Path) -> Option<[u8; 32]> {
-    let mut k = [0u8; 32];
-    getrandom::getrandom(&mut k).ok()?;
-    if keychain_set_key(&k) {
-        persist_local_backup(path, &k);
-        let _ = KEY_STORAGE.set(KeyStorage::Keychain);
-        return Some(k);
+/// 跨进程互斥：多实例同时首次初始化时串行化 mint / 写本地 key / 写钥匙串。
+/// 锁文件本身不是密钥；进程退出或 drop 后自动释放。
+struct MasterKeyDirLock {
+    /// 持有打开的锁文件句柄；关闭即解锁。字段本身不被读。
+    _file: std::fs::File,
+}
+
+fn lock_master_key_dir(dir: &std::path::Path) -> Option<MasterKeyDirLock> {
+    let _ = std::fs::create_dir_all(dir);
+    let path = dir.join("key.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    // std::fs::File::lock：阻塞直到拿到独占锁（跨进程）。
+    file.lock().ok()?;
+    Some(MasterKeyDirLock { _file: file })
+}
+
+/// 本地 key：已有则采用，否则写入候选并**读回**磁盘上的最终内容。
+/// 调用方须已持有 `lock_master_key_dir`。
+fn install_or_adopt_local_key(path: &std::path::Path, candidate: &[u8; 32]) -> Option<[u8; 32]> {
+    if let Some(existing) = read_local_key(path) {
+        return Some(existing);
     }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if write_key_file(path, &k).is_err() {
-        let _ = KEY_STORAGE.set(KeyStorage::None);
-        return None;
+    // 锁下再看一次：等锁期间别人可能已经写好了。
+    if let Some(existing) = read_local_key(path) {
+        return Some(existing);
     }
+    write_key_file(path, candidate).ok()?;
+    read_local_key(path)
+}
+
+fn mint_new_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    // 等锁期间其它进程可能已经完成初始化——先采用现成的，不要再掷一次骰子。
+    if let Some(existing) = read_local_key(path) {
+        let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
+        return Some(existing);
+    }
+    if let KeychainRead::Found(k) = keychain_read() {
+        persist_local_backup(path, &k);
+        let _ = KEY_STORAGE.set(KeyStorage::Keychain);
+        return Some(k);
+    }
+
+    let mut k = [0u8; 32];
+    getrandom::getrandom(&mut k).ok()?;
+    if keychain_set_key(&k) {
+        // set 成功不等于我们赢了：并发写入时以读回为准。
+        match keychain_read() {
+            KeychainRead::Found(got) => {
+                persist_local_backup(path, &got);
+                let _ = KEY_STORAGE.set(KeyStorage::Keychain);
+                return Some(got);
+            }
+            _ => {
+                log::warn!("钥匙串写入后读不回，改走本地主密钥文件");
+            }
+        }
+    }
+    let adopted = install_or_adopt_local_key(path, &k)?;
     let _ = KEY_STORAGE.set(KeyStorage::LocalFile);
-    Some(k)
+    Some(adopted)
 }
 
 fn compute_master_key() -> Option<[u8; 32]> {
-    let path = match config_dir() {
-        Some(dir) => dir.join("key"),
+    let dir = match config_dir() {
+        Some(dir) => dir,
         None => {
             let _ = KEY_STORAGE.set(KeyStorage::None);
             return None;
         }
     };
+    let path = dir.join("key");
+    // 拿不到锁也继续（极端只读目录）：仍走下面的逻辑，只是没有跨进程串行化。
+    let _dir_lock = lock_master_key_dir(&dir);
     let local = read_local_key(&path);
     let has_ciphertext = saved_secrets_need_existing_key();
     let read = keychain_read();
@@ -753,6 +847,133 @@ mod keychain_slot_tests {
         );
         assert!(!super::key_opens_all_samples(&k_new, &samples));
         assert!(super::key_opens_all_samples(&k_old, &samples[..1]));
-        assert!(super::key_opens_all_samples(&k_old, &[]));
+        assert!(
+            !super::key_opens_all_samples(&k_old, &[]),
+            "空切片不是 Empty 盘点：Samples 路径下没有可验证条目应失败"
+        );
+        assert!(super::key_opens_inventory(
+            &k_old,
+            &super::CiphertextInventory::Empty
+        ));
+        assert!(!super::key_opens_inventory(
+            &k_old,
+            &super::CiphertextInventory::Unknown
+        ));
+    }
+
+    #[test]
+    fn corrupt_config_with_ciphertext_is_unknown_not_verified_empty() {
+        use super::{
+            inventory_from_text, key_opens_inventory, may_persist_as_local_backup,
+            CiphertextInventory,
+        };
+
+        let corrupt = format!(
+            "{{ not json but has {}abc...",
+            super::ENC_PREFIX
+        );
+        let inv = inventory_from_text(&corrupt);
+        assert_eq!(inv, CiphertextInventory::Unknown);
+        assert!(inv.needs_existing_key());
+        assert!(
+            !key_opens_inventory(&[9u8; 32], &inv),
+            "配置损坏时不能把任意密钥当成验证通过"
+        );
+        assert!(
+            !may_persist_as_local_backup(false, true),
+            "未验证的钥匙串密钥不得覆盖本地备份"
+        );
+
+        assert_eq!(inventory_from_text("[]"), CiphertextInventory::Empty);
+        assert_eq!(
+            inventory_from_text(r#"[{"host":"x","password":"plain"}]"#),
+            CiphertextInventory::Empty
+        );
+        let sealed = format!(
+            r#"[{{"password":"{}AAAA"}}]"#,
+            super::ENC_PREFIX
+        );
+        assert!(matches!(
+            inventory_from_text(&sealed),
+            CiphertextInventory::Samples(s) if s.len() == 1
+        ));
+    }
+
+    #[test]
+    fn corrupt_config_must_not_let_unverified_key_overwrite_local_backup() {
+        use super::{
+            install_or_adopt_local_key, inventory_from_text, key_opens_inventory,
+            may_persist_as_local_backup, read_local_key, write_key_file, CiphertextInventory,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-corrupt-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("key");
+        let good = [0x11u8; 32];
+        write_key_file(&key_path, &good).unwrap();
+
+        // 模拟「损坏配置里有密文」：盘点 Unknown → 钥匙串候选不得落盘覆盖。
+        let inv = inventory_from_text(&format!("broken {}", super::ENC_PREFIX));
+        assert_eq!(inv, CiphertextInventory::Unknown);
+        let keychain_candidate = [0x22u8; 32];
+        let opens = key_opens_inventory(&keychain_candidate, &inv);
+        assert!(!opens);
+        assert!(!may_persist_as_local_backup(opens, inv.needs_existing_key()));
+        // 调用方若遵守 may_persist，就不会 write；这里直接确认本地仍是 good。
+        assert_eq!(read_local_key(&key_path), Some(good));
+
+        // adopt 已有文件时也不会改掉它
+        assert_eq!(
+            install_or_adopt_local_key(&key_path, &keychain_candidate),
+            Some(good)
+        );
+        assert_eq!(read_local_key(&key_path), Some(good));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_local_key_install_converges_under_dir_lock() {
+        use std::sync::{Arc, Barrier};
+
+        use super::{install_or_adopt_local_key, lock_master_key_dir, read_local_key};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-key-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for i in 0..2u8 {
+            let dir = dir.clone();
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let _lock = lock_master_key_dir(&dir).expect("拿目录锁");
+                let candidate = [i.wrapping_add(1); 32];
+                install_or_adopt_local_key(&path, &candidate)
+            }));
+        }
+        let a = handles.pop().unwrap().join().unwrap().expect("a");
+        let b = handles.pop().unwrap().join().unwrap().expect("b");
+        assert_eq!(a, b, "两进程/线程应收敛到同一把最终密钥");
+        assert_eq!(read_local_key(&path), Some(a));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
