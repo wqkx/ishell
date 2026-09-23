@@ -36,7 +36,8 @@ use xfer::{
 /// 发往 UI 的事件通道（std mpsc），附带 egui 上下文用于主动请求重绘。
 /// worker → UI 主事件通道容量。有界是为了在窗口最小化 / UI 卡顿时给生产端背压，
 /// 避免 `yes` / `cat` 大文件把无界队列撑到 OOM（sysinfo 早因此改成了 watch）。
-/// 512 × 典型 8KiB chunk ≈ 4MiB 量级上限；控制类事件远小于此。
+/// 满时 `UiSink::send` 会阻塞等到有空位（含终端数据），内存上限约
+/// 512 × 典型 8KiB chunk ≈ 4MiB；控制类事件同样走这条通道。
 pub const WORKER_EVT_CAP: usize = 512;
 
 #[derive(Clone)]
@@ -67,16 +68,11 @@ impl UiSink {
                 self.ctx.request_repaint();
             }
             Err(std::sync::mpsc::TrySendError::Full(ev)) => {
-                // 背压：终端数据可丢（UI 已落后，再攒只会 OOM）；生命周期/控制事件必须送达。
-                match ev {
-                    WorkerEvent::TerminalData(_) => {
-                        self.ctx.request_repaint();
-                    }
-                    other => {
-                        let _ = self.tx.send(other);
-                        self.ctx.request_repaint();
-                    }
-                }
+                // 有界通道已满：先催 UI 排空，再阻塞等到有空位。终端字节不能丢——丢掉后
+                // 解析器看到的是断层数据，屏幕和终端状态都会错。阻塞会让 shell 读端停住，
+                // TCP 窗口自然给远端背压；内存仍被 WORKER_EVT_CAP 封顶，不会无界堆积。
+                self.ctx.request_repaint();
+                let _ = self.tx.send(ev);
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
         }
@@ -977,5 +973,36 @@ Encrypted: no
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(0);
         assert_eq!(pages, 12);
+    }
+
+    #[test]
+    fn full_event_queue_keeps_terminal_data() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::proto::WorkerEvent;
+        use super::UiSink;
+
+        let (tx, rx) = mpsc::sync_channel::<WorkerEvent>(1);
+        let (sys_tx, _sys_rx) = tokio::sync::watch::channel(None);
+        let sink = UiSink::new(tx, egui::Context::default(), std::sync::Arc::new(sys_tx));
+
+        sink.send(WorkerEvent::TerminalData(b"keep-me".to_vec()));
+        // 队列已满：再发一条必须阻塞到有人取走，不能静默丢掉。
+        let producer = std::thread::spawn(move || {
+            sink.send(WorkerEvent::TerminalData(b"also-kept".to_vec()));
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !producer.is_finished(),
+            "队列满时应阻塞等待空位，而不是把终端数据丢掉后立刻返回"
+        );
+
+        let first = rx.recv_timeout(Duration::from_secs(1)).expect("第一条");
+        assert!(matches!(first, WorkerEvent::TerminalData(b) if b == b"keep-me"));
+        let second = rx.recv_timeout(Duration::from_secs(1)).expect("第二条应被保留");
+        assert!(matches!(second, WorkerEvent::TerminalData(b) if b == b"also-kept"));
+        producer.join().expect("producer");
     }
 }

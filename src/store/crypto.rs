@@ -212,7 +212,8 @@ enum MasterKeyPlan {
 }
 
 /// 纯决策：超时/锁定绝不能当成「没有密钥」去生成一把新的（那会覆盖钥匙串里还能用的密钥）。
-/// 钥匙串根本不存在时仍在本地新建，哪怕磁盘上已有旧密文——否则卸掉钥匙串后重新填写也无法落盘。
+/// 钥匙串暂时读不到（含无 D-Bus）且磁盘上已有密文时同样拒绝新建——新旧密钥混存比暂时
+/// 存不了密码更糟。真正的全新安装（无密文）才在本地 MintNew。
 fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) -> MasterKeyPlan {
     match read {
         KeychainRead::Found(_) => MasterKeyPlan::UseKeychain,
@@ -228,10 +229,13 @@ fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) ->
         KeychainRead::Unavailable => {
             if has_local {
                 MasterKeyPlan::UseLocal { migrate: false }
+            } else if has_ciphertext {
+                // 无 D-Bus / 会话总线暂时不在，与「钥匙串永久卸掉」分不清。磁盘上已有
+                // 密文时绝不能 MintNew：新密码会用本地新钥加密，总线恢复后优先选回
+                // 钥匙串旧钥，新旧密文就解不开同一把。先拒绝保存，等钥匙串恢复，
+                // 或用户清掉 connections.json 后再当全新安装。
+                MasterKeyPlan::None
             } else {
-                // 钥匙串根本不在（不是超时）。旧版本迁到钥匙串后会删掉本地 key，
-                // 这时若拒绝新建，用户重新填写也落不了盘，除非手工清掉 connections.json。
-                // 新密钥只写本地文件（钥匙串不可用时 set 直接失败），旧密文仍由保存路径留在磁盘上。
                 MasterKeyPlan::MintNew
             }
         }
@@ -292,26 +296,40 @@ fn decrypt_with_key(k: &[u8; 32], s: &str) -> Option<String> {
         .and_then(|b| String::from_utf8(b).ok())
 }
 
-fn first_ciphertext_sample() -> Option<String> {
-    let path = super::paths::config_path()?;
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    for item in v.as_array()? {
+fn ciphertext_samples() -> Vec<String> {
+    let Some(path) = super::paths::config_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
         for key in ["password", "passphrase", "jump_password", "jump_passphrase"] {
             if let Some(s) = item.get(key).and_then(|x| x.as_str()) {
                 if s.starts_with(ENC_PREFIX) {
-                    return Some(s.to_string());
+                    out.push(s.to_string());
                 }
             }
         }
     }
-    None
+    out
+}
+
+/// 能解开**全部**已存密文才算可用。只抽第一条会漏掉「新旧密钥混存」：
+/// 第一条碰巧是新钥写的，就会误认钥匙串旧钥已废、或反过来。
+fn key_opens_all_samples(k: &[u8; 32], samples: &[String]) -> bool {
+    samples.is_empty() || samples.iter().all(|s| decrypt_with_key(k, s).is_some())
 }
 
 fn key_opens_saved_secrets(k: &[u8; 32]) -> bool {
-    match first_ciphertext_sample() {
-        Some(sample) => decrypt_with_key(k, &sample).is_some(),
-        None => true,
-    }
+    key_opens_all_samples(k, &ciphertext_samples())
 }
 
 /// 解不开已存密文的钥匙串密钥不能写成本地备份：以后钥匙串一超时就会稳定地用这把废钥匙。
@@ -688,8 +706,8 @@ mod keychain_slot_tests {
         );
         assert_eq!(
             plan_master_key(KeychainRead::Unavailable, false, true),
-            MasterKeyPlan::MintNew,
-            "钥匙串已卸掉、只剩旧密文时仍应在本地新建，否则重新填写也无法落盘"
+            MasterKeyPlan::None,
+            "无 D-Bus 且磁盘上已有密文时不能 MintNew，否则新旧密文会分属两把钥"
         );
         assert_eq!(
             plan_master_key(KeychainRead::Transient, false, false),
@@ -706,5 +724,35 @@ mod keychain_slot_tests {
             !super::may_persist_as_local_backup(false, true),
             "对不上已存密文的钥匙串密钥不能写成本地备份"
         );
+    }
+
+    #[test]
+    fn key_must_open_every_saved_ciphertext_not_just_the_first() {
+        use chacha20poly1305::aead::Aead;
+        use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
+
+        fn seal(k: &[u8; 32], plain: &str) -> String {
+            let c = ChaCha20Poly1305::new(Key::from_slice(k));
+            let nonce = [7u8; 12];
+            let ct = c.encrypt(Nonce::from_slice(&nonce), plain.as_bytes()).unwrap();
+            let mut blob = nonce.to_vec();
+            blob.extend_from_slice(&ct);
+            format!(
+                "{}{}",
+                super::ENC_PREFIX,
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, blob)
+            )
+        }
+
+        let k_old = [1u8; 32];
+        let k_new = [2u8; 32];
+        let samples = vec![seal(&k_old, "old-pw"), seal(&k_new, "new-pw")];
+        assert!(
+            !super::key_opens_all_samples(&k_old, &samples),
+            "只能解开第一条时不能算可用"
+        );
+        assert!(!super::key_opens_all_samples(&k_new, &samples));
+        assert!(super::key_opens_all_samples(&k_old, &samples[..1]));
+        assert!(super::key_opens_all_samples(&k_old, &[]));
     }
 }
