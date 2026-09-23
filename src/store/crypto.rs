@@ -768,6 +768,10 @@ mod tests {
 mod keychain_slot_tests {
     use super::{with_timeout, KEYCHAIN_MAX_INFLIGHT};
 
+    /// `KEYCHAIN_INFLIGHT` 是进程级计数；本模块里凡走 `with_timeout` / `keychain_read`
+    /// 的用例必须互斥，否则并行跑会把名额打爆，误报「panic 后名额没还」。
+    static KEYCHAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// **回归门禁**：钥匙串调用 panic 之后，并发名额必须归还。
     ///
     /// `with_timeout` 原先把 `KEYCHAIN_INFLIGHT.fetch_sub` 写在工作线程末尾。keyring 是第三方
@@ -780,6 +784,9 @@ mod keychain_slot_tests {
     /// 能感知的那件事**：连续 panic 若干次之后，下一次正常调用还能不能拿到结果。
     #[test]
     fn a_panicking_call_still_returns_its_slot() {
+        let _guard = KEYCHAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // panic 的默认 hook 会往 stderr 打一堆栈，这里是**故意**制造 panic，静音掉免得
         // 测试输出看起来像是出了事。
         let prev_hook = std::panic::take_hook();
@@ -802,6 +809,9 @@ mod keychain_slot_tests {
     /// 正常路径：超时封装本身不改变返回值。
     #[test]
     fn normal_calls_pass_the_value_through() {
+        let _guard = KEYCHAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             with_timeout(|| "ok".to_string()),
             super::KeychainWait::Ok("ok".to_string())
@@ -1047,6 +1057,10 @@ mod keychain_slot_tests {
     #[test]
     fn mint_without_create_permission_only_adopts_existing() {
         use super::{mint_new_key, read_local_key, write_key_file};
+
+        let _guard = KEYCHAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir().join(format!(
             "ishell-mint-nocreate-{}-{}",
