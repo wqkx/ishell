@@ -1,0 +1,12 @@
+---
+description: Use the system global Rust toolchain; never a /tmp sandbox cargo target
+alwaysApply: true
+---
+
+# Global Rust only
+
+- Build and test with the **system/global** toolchain (`rustc`/`cargo` on `PATH`, e.g. `/mnt/sda1/Applications/rust/cargo`).
+- **Do not** set or rely on `CARGO_TARGET_DIR` under `/tmp` (e.g. `/tmp/cursor-sandbox-cache/.../cargo-target`).
+- Prefer `env -u CARGO_TARGET_DIR cargo …` so artifacts land in the project `target/` directory.
+- Do not create a separate Rust/cargo environment for this repo. If a sandbox injects `CARGO_TARGET_DIR` into `/tmp`, unset it before compiling or testing.
+- Clean up leftover `/tmp/cursor-sandbox-cache` (and similar temp cargo targets) when found; do not leave multi-GB test trees there.
