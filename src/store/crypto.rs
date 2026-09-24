@@ -250,6 +250,15 @@ fn plan_master_key(read: KeychainRead, has_local: bool, has_ciphertext: bool) ->
 }
 
 fn read_local_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    if let Some(k) = read_key_bytes(path) {
+        return Some(k);
+    }
+    // 旧版 Windows「两次 rename」或写临时文件后崩溃时，完整密钥可能落在旁路名上而
+    // 目标 `key` 缺失。启动时把合法的 32 字节旁路文件收回来，否则钥匙串不可用时会丢备份。
+    recover_local_key_from_sidecars(path)
+}
+
+fn read_key_bytes(path: &std::path::Path) -> Option<[u8; 32]> {
     let bytes = std::fs::read(path).ok()?;
     (bytes.len() == 32).then(|| {
         check_key_perms(path);
@@ -257,6 +266,59 @@ fn read_local_key(path: &std::path::Path) -> Option<[u8; 32]> {
         k.copy_from_slice(&bytes);
         k
     })
+}
+
+/// 旁路名形如 `key.ishell-stale.*` / `key.ishell-tmp.*`（见 `paths::write_atomic_bytes`）。
+fn recover_local_key_from_sidecars(path: &std::path::Path) -> Option<[u8; 32]> {
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_str()?;
+    let stale_prefix = format!("{name}.ishell-stale.");
+    let tmp_prefix = format!("{name}.ishell-tmp.");
+    let mut best: Option<(std::path::PathBuf, [u8; 32], std::time::SystemTime)> = None;
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        if !(fname.starts_with(&stale_prefix) || fname.starts_with(&tmp_prefix)) {
+            continue;
+        }
+        let Some(k) = read_key_bytes(&entry.path()) else {
+            continue;
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let better = match &best {
+            None => true,
+            Some((_, _, t)) => mtime >= *t,
+        };
+        if better {
+            best = Some((entry.path(), k, mtime));
+        }
+    }
+    let (sidecar, k, _) = best?;
+    if !path.exists() {
+        match std::fs::rename(&sidecar, path) {
+            Ok(()) => {
+                log::warn!(
+                    "从中断写入的旁路文件恢复本地主密钥：{}",
+                    sidecar.display()
+                );
+                check_key_perms(path);
+            }
+            Err(e) => {
+                log::warn!(
+                    "发现旁路主密钥 {} 但移回 {} 失败（{e}）；本次仍用其内容",
+                    sidecar.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+    Some(k)
 }
 
 /// 磁盘上已存密文的盘点结果。区分「确认没有」「确认有且可读」「说不清」——
@@ -1114,11 +1176,21 @@ mod keychain_slot_tests {
     }
 
     /// 两个**独立进程**在目录锁下安装本地 key，应收敛到同一把（不是同进程线程）。
-    /// 仅 Unix：依赖 `python3` + `fcntl`；Windows 发布目标上跳过，避免 `cargo test` 失败。
+    /// 仅 Unix：依赖 `python3` + `fcntl`；缺 python3 时跳过，避免 CI/精简环境误红。
     #[cfg(unix)]
     #[test]
     fn two_os_processes_converge_on_one_local_key() {
         use std::process::Command;
+
+        let py_ok = Command::new("python3")
+            .args(["-c", "import fcntl"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !py_ok {
+            eprintln!("skip two_os_processes_converge_on_one_local_key: need python3 with fcntl");
+            return;
+        }
 
         let dir = std::env::temp_dir().join(format!(
             "ishell-proc-race-{}-{}",
@@ -1183,6 +1255,42 @@ os.close(fd)
             super::read_local_key(&key_path).as_ref().map(|k| k.as_slice()),
             Some(outs[0].as_slice())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovers_local_key_from_interrupted_replace_sidecar() {
+        use super::{read_local_key, write_key_file};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ishell-key-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+        let sidecar = dir.join("key.ishell-stale.crash.1");
+        let k = [0x5Au8; 32];
+        std::fs::write(&sidecar, k).unwrap();
+        assert!(
+            !path.exists(),
+            "模拟崩溃窗口：目标缺失，密钥只在旁路名"
+        );
+        assert_eq!(read_local_key(&path), Some(k));
+        assert!(
+            path.exists(),
+            "恢复后应把旁路文件移回规范的 key 路径"
+        );
+        assert_eq!(read_local_key(&path), Some(k));
+        // 规范路径已在时，旁路不应盖掉更新的内容
+        write_key_file(&path, &[0xA5; 32]).unwrap();
+        let leftover = dir.join("key.ishell-tmp.orphan.1");
+        std::fs::write(&leftover, [0x11u8; 32]).unwrap();
+        assert_eq!(read_local_key(&path), Some([0xA5; 32]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

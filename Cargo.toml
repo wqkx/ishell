@@ -94,6 +94,10 @@ rfd = "0.17"
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+# Windows：MoveFileEx 原子替换本地主密钥 / connections.json（避免两次 rename 的崩溃窗口）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 # 本地补丁：修复 glutin 在 macOS 最小化窗口时 make_current 的 .expect panic
 #（编辑器为独立 OS 窗口后，多窗口最小化到 Stage Manager 偶发闪退）。vendor/glutin 为
 # crates.io 0.32.3 原样副本，仅改 is_view_current 一行（无视图时返回 false），跨平台安全。

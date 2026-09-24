@@ -44,41 +44,66 @@ pub(super) fn expand_tilde(p: &str) -> String {
     p.to_string()
 }
 
-/// 把已完整写好的临时文件换到目标路径。Unix 上 `rename` 可覆盖；Windows 上不行，
-/// 先把旧目标挪到旁路名再换入，失败则尽量恢复，避免目标被截断或长期消失。
+/// 把已完整写好的临时文件换到目标路径。
+///
+/// - Unix：`rename(2)` 可覆盖，进程崩溃时目标要么旧要么新。
+/// - Windows：`MoveFileExW(MOVEFILE_REPLACE_EXISTING)` 同 inode 级替换，避免
+///   「先挪走旧文件再移入新文件」两次改名之间目标路径缺失、密钥卡在旁路名的窗口。
 pub(super) fn replace_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::rename(tmp, path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let stale = path.with_extension(format!(
-            "ishell-stale.{}.{}",
-            std::process::id(),
-            nonce
-        ));
-        let _ = std::fs::remove_file(&stale);
-        let had_old = path.exists();
-        if had_old {
-            std::fs::rename(path, &stale)?;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        fn wide(p: &std::path::Path) -> Vec<u16> {
+            p.as_os_str().encode_wide().chain(Some(0)).collect()
         }
+        let from = wide(tmp);
+        let to = wide(path);
+        // SAFETY: 两个 NUL 结尾的宽路径，API 只读不持有指针。
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        // 其它平台尽力而为：能覆盖最好，否则旁路换入。
         match std::fs::rename(tmp, path) {
-            Ok(()) => {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let stale = path.with_extension(format!(
+                    "ishell-stale.{}",
+                    std::process::id()
+                ));
                 let _ = std::fs::remove_file(&stale);
-                Ok(())
-            }
-            Err(e) => {
-                if had_old {
-                    let _ = std::fs::rename(&stale, path);
+                if path.exists() {
+                    std::fs::rename(path, &stale)?;
                 }
-                let _ = std::fs::remove_file(tmp);
-                Err(e)
+                match std::fs::rename(tmp, path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&stale);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = std::fs::rename(&stale, path);
+                        let _ = std::fs::remove_file(tmp);
+                        Err(e)
+                    }
+                }
             }
         }
     }

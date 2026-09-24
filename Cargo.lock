@@ -2450,6 +2450,7 @@ dependencies = [
  "tokio",
  "ttf-parser",
  "vt100",
+ "windows-sys 0.59.0",
  "winresource",
  "zip",
 ]
