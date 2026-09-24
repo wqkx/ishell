@@ -162,7 +162,7 @@ poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
 winit only sends that request when the coordinate actually *changes*, so reporting a constant one means it is never sent at all. You keep full CJK input; the candidate window just stops following the caret. iShell also detects a frozen UI thread on its own and appends an explanation to `~/.config/ishell/crash.log` — it only reports, it never changes settings behind your back.
 
 **Whole UI looks suspended after minimizing the window — and the AI can't drive it either?**
-Fixed in 0.24.x: Wayland disables vsync by default, and a local eframe patch keeps the event loop alive for hidden surfaces (no waiting on compositor frame callbacks; skip `swap_buffers` when minimize is detectable). You usually don't need an env var.
+Fixed in 0.24.x: Wayland disables vsync by default, and a local eframe patch keeps the event loop alive for hidden surfaces (prefer compositor `request_redraw`, fall back to direct paint after ~100 ms if `RedrawRequested` never arrives; skip `swap_buffers` when minimize is detectable). You usually don't need an env var.
 
 If it still happens: make sure `ISHELL_VSYNC=1` is not set; on X11 try `ISHELL_NO_VSYNC=1`.
 

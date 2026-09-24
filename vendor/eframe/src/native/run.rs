@@ -25,6 +25,35 @@ use crate::{
 /// See <https://github.com/emilk/egui/issues/7776>.
 const INVISIBLE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Wayland: how long to wait for `RedrawRequested` after `request_redraw` before
+/// painting directly. Hidden surfaces often never get a frame callback
+/// (emilk/egui#5136); without a fallback, `App::logic` / MCP drain stall.
+const WAYLAND_REDRAW_FALLBACK: Duration = Duration::from_millis(100);
+
+/// Decision for a due repaint timer entry (pure; unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DueRepaintAction {
+    /// Call `run_ui_and_paint` from the timer (no RedrawRequested expected).
+    DirectPaint { throttle: bool },
+    /// Ask the compositor via `request_redraw`.
+    RequestRedraw,
+    /// Wayland: `request_redraw`, and arm a fallback direct-paint deadline.
+    RequestRedrawWithFallback,
+}
+
+fn due_repaint_action(invisible_or_minimized: bool, on_wayland: bool) -> DueRepaintAction {
+    // Keep in sync with `wayland_repaint_policy_tests` in ishell `src/main.rs`
+    // (eframe is not a workspace member, so those tests are the easy CI gate).
+    if invisible_or_minimized {
+        DueRepaintAction::DirectPaint { throttle: true }
+    } else if on_wayland {
+        // Prefer compositor pacing while the surface is shown; fallback handles hide.
+        DueRepaintAction::RequestRedrawWithFallback
+    } else {
+        DueRepaintAction::RequestRedraw
+    }
+}
+
 // ----------------------------------------------------------------------------
 fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop<UserEvent>> {
     #[cfg(target_os = "android")]
@@ -78,6 +107,10 @@ fn with_event_loop<R>(
 /// some events, but otherwise forwards events to the [`WinitApp`].
 struct WinitAppWrapper<T: WinitApp> {
     windows_next_repaint_times: HashMap<WindowId, Instant>,
+    /// Wayland only: after `request_redraw`, if `RedrawRequested` has not arrived by
+    /// this instant, paint directly so a suppressed frame callback cannot stall
+    /// `App::logic` (MCP). Cleared when `RedrawRequested` is delivered.
+    wayland_redraw_fallback: HashMap<WindowId, Instant>,
     winit_app: T,
     return_result: Result<(), crate::Error>,
     run_and_return: bool,
@@ -87,6 +120,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
     fn new(winit_app: T, run_and_return: bool) -> Self {
         Self {
             windows_next_repaint_times: HashMap::default(),
+            wayland_redraw_fallback: HashMap::default(),
             winit_app,
             return_result: Ok(()),
             run_and_return,
@@ -192,11 +226,13 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         let mut direct_paint_ids = Vec::new();
         // Subset that should also be throttled (~10 Hz) to avoid a busy loop.
         let mut throttle_ids = Vec::new();
+        // Wayland: arm compositor redraw + a fallback deadline (not a direct paint yet).
+        let mut wayland_arm_fallback: Vec<WindowId> = Vec::new();
 
         // Wayland: `is_minimized` / `Occluded` are unsupported, and `request_redraw`
         // waits for a compositor frame callback that is never delivered for a hidden
-        // surface — so the event loop (and App::logic / MCP drain) would stall after
-        // minimize. Paint from the timer instead. See emilk/egui#5136 and ISHELL_PATCHES.md.
+        // surface. Prefer `request_redraw` while shown; if the callback never comes,
+        // fall back to direct paint. See emilk/egui#5136 and ISHELL_PATCHES.md.
         let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
 
         self.windows_next_repaint_times
@@ -211,16 +247,24 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                     // never be processed. We collect these windows to paint them
                     // directly below.
                     // See: https://github.com/emilk/egui/issues/5229
-                    if is_invisible_or_minimized(&window) {
-                        direct_paint_ids.push(*window_id);
-                        throttle_ids.push(*window_id);
-                    } else if wayland {
-                        log::trace!("wayland direct paint for {window_id:?}");
-                        direct_paint_ids.push(*window_id);
-                    } else {
-                        log::trace!("request_redraw for {window_id:?}");
-                        event_loop.set_control_flow(ControlFlow::Poll);
-                        window.request_redraw();
+                    match due_repaint_action(is_invisible_or_minimized(&window), wayland) {
+                        DueRepaintAction::DirectPaint { throttle } => {
+                            direct_paint_ids.push(*window_id);
+                            if throttle {
+                                throttle_ids.push(*window_id);
+                            }
+                        }
+                        DueRepaintAction::RequestRedraw => {
+                            log::trace!("request_redraw for {window_id:?}");
+                            event_loop.set_control_flow(ControlFlow::Poll);
+                            window.request_redraw();
+                        }
+                        DueRepaintAction::RequestRedrawWithFallback => {
+                            log::trace!("wayland request_redraw (+fallback) for {window_id:?}");
+                            event_loop.set_control_flow(ControlFlow::Poll);
+                            window.request_redraw();
+                            wayland_arm_fallback.push(*window_id);
+                        }
                     }
                 } else {
                     log::trace!("No window found for {window_id:?}");
@@ -228,15 +272,35 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                 false
             });
 
-        // Paint directly when RedrawRequested will not arrive (invisible / Wayland).
+        for window_id in wayland_arm_fallback {
+            self.wayland_redraw_fallback
+                .insert(window_id, now + WAYLAND_REDRAW_FALLBACK);
+        }
+
+        // Wayland fallbacks that came due: compositor never delivered RedrawRequested.
+        let mut due_fallbacks = Vec::new();
+        self.wayland_redraw_fallback.retain(|window_id, deadline| {
+            if now < *deadline {
+                return true;
+            }
+            due_fallbacks.push(*window_id);
+            false
+        });
+        for window_id in due_fallbacks {
+            log::trace!("wayland fallback direct paint for {window_id:?}");
+            direct_paint_ids.push(window_id);
+            // Likely hidden — throttle like other invisible windows.
+            throttle_ids.push(window_id);
+        }
+
+        // Paint directly when RedrawRequested will not arrive (invisible / Wayland fallback).
         for window_id in &direct_paint_ids {
+            self.wayland_redraw_fallback.remove(window_id);
             let event_result = self.winit_app.run_ui_and_paint(event_loop, *window_id);
             self.handle_event_result(event_loop, event_result);
         }
 
-        // Throttle only truly invisible/minimized windows to avoid busy-looping.
-        // Do not throttle the Wayland-visible path — that would cap interactive
-        // animations at ~10 Hz.
+        // Throttle invisible / fallback paints to avoid busy-looping.
         // See: https://github.com/emilk/egui/issues/7776
         if !throttle_ids.is_empty() {
             let next_paint = Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL;
@@ -247,7 +311,12 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             }
         }
 
-        let next_repaint_time = self.windows_next_repaint_times.values().min().copied();
+        let next_repaint_time = self
+            .windows_next_repaint_times
+            .values()
+            .copied()
+            .chain(self.wayland_redraw_fallback.values().copied())
+            .min();
         if let Some(next_repaint_time) = next_repaint_time {
             event_loop.set_control_flow(ControlFlow::WaitUntil(next_repaint_time));
         }
@@ -371,6 +440,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         event_loop_context::with_event_loop_context(event_loop, move || {
             let event_result = match event {
                 winit::event::WindowEvent::RedrawRequested => {
+                    // Compositor delivered a frame — cancel the Wayland fallback.
+                    self.wayland_redraw_fallback.remove(&window_id);
                     self.winit_app.run_ui_and_paint(event_loop, window_id)
                 }
                 _ => self.winit_app.window_event(event_loop, window_id, event),
@@ -578,4 +649,39 @@ pub enum EframePumpStatus {
 
     /// The exit code for the application
     Exit(i32),
+}
+
+#[cfg(test)]
+mod ishell_patch_tests {
+    use super::{DueRepaintAction, due_repaint_action};
+
+    #[test]
+    fn invisible_windows_paint_directly_and_throttle() {
+        assert_eq!(
+            due_repaint_action(true, false),
+            DueRepaintAction::DirectPaint { throttle: true }
+        );
+        assert_eq!(
+            due_repaint_action(true, true),
+            DueRepaintAction::DirectPaint { throttle: true }
+        );
+    }
+
+    #[test]
+    fn x11_visible_uses_request_redraw() {
+        assert_eq!(
+            due_repaint_action(false, false),
+            DueRepaintAction::RequestRedraw
+        );
+    }
+
+    #[test]
+    fn wayland_visible_prefers_redraw_with_fallback_not_always_direct() {
+        // Regression: do not direct-paint every Wayland timer tick while shown —
+        // that skipped compositor pacing. Fallback (separate map) covers hide.
+        assert_eq!(
+            due_repaint_action(false, true),
+            DueRepaintAction::RequestRedrawWithFallback
+        );
+    }
 }

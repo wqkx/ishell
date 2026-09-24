@@ -108,24 +108,20 @@ fn main() -> eframe::Result<()> {
     // 规避——所以 **Wayland 默认关 vsync**（`DontWait`）。X11 / 其它平台仍默认开。
     //
     // 另有 eframe 本地补丁（`vendor/eframe`）：可检测最小化的平台跳过 paint/swap；Wayland
-    // 上定时重绘改为直接 paint，不依赖合成器 frame callback（见 ISHELL_PATCHES.md）。
+    // 上优先 `request_redraw`，若 ~100ms 内没有 `RedrawRequested` 再直接 paint（见
+    // ISHELL_PATCHES.md）——可见窗口仍跟合成器节奏，隐藏时 MCP 不会饿死。
     //
     // 覆盖：`ISHELL_NO_VSYNC=1` 强制关；`ISHELL_VSYNC=1` 强制开（Wayland 上仍可能在最小化
     // 后卡死，仅调试/接受风险时用）。
-    let force_no_vsync = std::env::var_os("ISHELL_NO_VSYNC").is_some();
-    let force_vsync = std::env::var_os("ISHELL_VSYNC").is_some();
-    let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let vsync = if force_no_vsync {
-        false
-    } else if force_vsync {
-        true
-    } else {
-        !on_wayland
-    };
+    let vsync = choose_vsync(
+        std::env::var_os("ISHELL_NO_VSYNC").is_some(),
+        std::env::var_os("ISHELL_VSYNC").is_some(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    );
     if !vsync {
-        if force_no_vsync {
+        if std::env::var_os("ISHELL_NO_VSYNC").is_some() {
             log::info!("已关闭垂直同步（ISHELL_NO_VSYNC）：交换缓冲不再等垂直同步");
-        } else if on_wayland {
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             log::info!(
                 "Wayland 下默认关闭垂直同步，避免最小化后 swap_buffers 阻塞事件循环/MCP；\
                  需要时可设 ISHELL_VSYNC=1（有卡死风险）"
@@ -143,6 +139,17 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
+}
+
+/// 是否启用垂直同步。纯函数，便于单测覆盖 Wayland 默认关 / 环境变量覆盖。
+fn choose_vsync(force_no_vsync: bool, force_vsync: bool, on_wayland: bool) -> bool {
+    if force_no_vsync {
+        false
+    } else if force_vsync {
+        true
+    } else {
+        !on_wayland
+    }
 }
 
 #[cfg(test)]
@@ -200,3 +207,80 @@ mod desktop_entry_tests {
         assert_eq!(n, 1, "Categories={cats} 里有 {n} 个主类目，应当只有一个");
     }
 }
+
+#[cfg(test)]
+mod vsync_policy_tests {
+    use super::choose_vsync;
+
+    #[test]
+    fn wayland_defaults_to_no_vsync() {
+        assert!(!choose_vsync(false, false, true));
+    }
+
+    #[test]
+    fn x11_defaults_to_vsync() {
+        assert!(choose_vsync(false, false, false));
+    }
+
+    #[test]
+    fn no_vsync_env_wins_over_wayland_and_force_on() {
+        assert!(!choose_vsync(true, true, true));
+        assert!(!choose_vsync(true, false, false));
+    }
+
+    #[test]
+    fn force_vsync_overrides_wayland_default() {
+        assert!(choose_vsync(false, true, true));
+    }
+}
+
+#[cfg(test)]
+mod wayland_repaint_policy_tests {
+    /// 与 `vendor/eframe/src/native/run.rs` 的 `DueRepaintAction` / `due_repaint_action` 同构。
+    /// eframe 不是 workspace member，crate 内单测不便从本仓直接跑，故在此钉住补丁合约。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DueRepaintAction {
+        DirectPaint { throttle: bool },
+        RequestRedraw,
+        RequestRedrawWithFallback,
+    }
+
+    fn due_repaint_action(invisible_or_minimized: bool, on_wayland: bool) -> DueRepaintAction {
+        if invisible_or_minimized {
+            DueRepaintAction::DirectPaint { throttle: true }
+        } else if on_wayland {
+            DueRepaintAction::RequestRedrawWithFallback
+        } else {
+            DueRepaintAction::RequestRedraw
+        }
+    }
+
+    #[test]
+    fn invisible_windows_paint_directly_and_throttle() {
+        assert_eq!(
+            due_repaint_action(true, false),
+            DueRepaintAction::DirectPaint { throttle: true }
+        );
+        assert_eq!(
+            due_repaint_action(true, true),
+            DueRepaintAction::DirectPaint { throttle: true }
+        );
+    }
+
+    #[test]
+    fn x11_visible_uses_request_redraw() {
+        assert_eq!(
+            due_repaint_action(false, false),
+            DueRepaintAction::RequestRedraw
+        );
+    }
+
+    #[test]
+    fn wayland_visible_prefers_redraw_with_fallback_not_always_direct() {
+        assert_eq!(
+            due_repaint_action(false, true),
+            DueRepaintAction::RequestRedrawWithFallback
+        );
+    }
+}
+

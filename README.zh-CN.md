@@ -163,7 +163,9 @@ winit 只在坐标**真的变了**时才发这条请求，所以恒定上报同�
 
 
 **最小化窗口之后整个界面像被挂起、AI 也操作不了？**
-0.24.x 起已从根上处理：Wayland 默认关垂直同步；并对 eframe 打了本地补丁（隐藏表面不再等合成器 frame callback，可检测最小化的平台跳过 `swap_buffers`）。一般无需再设环境变量。
+0.24.x 起已从根上处理：Wayland 默认关垂直同步；并对 eframe 打了本地补丁（可见时仍走合成器
+`request_redraw`，约 100ms 收不到 `RedrawRequested` 再直接 paint；可检测最小化的平台跳过
+`swap_buffers`）。一般无需再设环境变量。
 
 若仍复现：确认没有设 `ISHELL_VSYNC=1`；在 X11 上可试 `ISHELL_NO_VSYNC=1`。
 
