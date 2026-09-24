@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.24.4] - 2026-09-24
+
 ### Fixed
 
 - **近期版本启动后没有界面**：eframe 补丁曾把 `is_invisible_or_minimized` 并进绘制用的

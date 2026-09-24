@@ -12,7 +12,7 @@ Let Claude Code, Codex CLI, Kimi Code, OpenCode, or another MCP-compatible agent
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-> **Latest release:** [v0.24.3](https://github.com/wqkx/ishell/releases/tag/v0.24.3)
+> **Latest release:** [v0.24.4](https://github.com/wqkx/ishell/releases/tag/v0.24.4)
 
 </div>
 
