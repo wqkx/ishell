@@ -175,15 +175,11 @@ impl App {
                                                           // 分属不同主机时追加「· 主机」；#uid 不上标签，只在 hover
                                                           // 提示里跟在 user@host 后面。
                                     let labels = tab_labels(self.sessions.iter().map(|s| {
-                                        // OSC 0/2 动态标题优先（vim/ssh 会话名）；否则用连接名。
-                                        let title = s
-                                            .terminal
-                                            .window_title()
-                                            .filter(|t| !t.is_empty())
-                                            .unwrap_or(s.title.as_str());
+                                        // 标签固定用连接名（`s.title`），不用 OSC 0/2 动态标题。
+                                        // vim/shell 改窗口标题不应搅乱会话标签——那是用户认连接的锚点。
                                         let host = (!s.cfg.is_local() && !s.cfg.host.is_empty())
                                             .then_some(s.cfg.host.as_str());
-                                        (title, host)
+                                        (s.title.as_str(), host)
                                     }));
                                     for (i, s) in self.sessions.iter().enumerate() {
                                         let selected = active == Some(i);
