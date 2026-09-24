@@ -290,12 +290,12 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         // let sub-interval repaints push the deadline forever while the compositor
         // suppresses RedrawRequested — MCP would stall. See wayland_fallback_deadline.
         for window_id in wayland_arm_fallback {
-            self.wayland_redraw_fallback
-                .entry(window_id)
-                .and_modify(|deadline| {
-                    *deadline = (*deadline).min(now + WAYLAND_REDRAW_FALLBACK);
-                })
-                .or_insert_with(|| now + WAYLAND_REDRAW_FALLBACK);
+            let deadline = wayland_fallback_deadline(
+                self.wayland_redraw_fallback.get(&window_id).copied(),
+                now,
+                WAYLAND_REDRAW_FALLBACK,
+            );
+            self.wayland_redraw_fallback.insert(window_id, deadline);
         }
 
         // Wayland fallbacks that came due: compositor never delivered RedrawRequested.
