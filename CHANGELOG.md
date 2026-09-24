@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **近期版本启动后没有界面**：eframe 补丁曾把 `is_invisible_or_minimized` 并进绘制用的
+  `is_visible`；部分桌面在窗口尚未完全映射时会报不可见/最小化，于是跳过 `App::ui` 与
+  绘制，看起来像起不来。已撤回该判定，保留 Wayland 定时回退直接绘制与默认关 vsync
+  （MCP 最小化修复仍在）。
+
 ## [0.24.3] - 2026-09-24
 
 ### Fixed

@@ -557,14 +557,7 @@ impl GlowWinitRunning<'_> {
             };
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
-            // Native platforms never assign `viewport.info.visible` (Occluded writes
-            // `info.occluded` instead), so unwrap_or(true) alone always paints — and
-            // with vsync Wait, swap_buffers can block forever on a minimized surface.
-            // Skip paint/swap when we can detect invisible/minimized; App::logic still
-            // runs (see epi_integration). Wayland cannot report minimize — that case is
-            // handled by DontWait (iShell) + direct paint in run.rs.
-            let is_visible = viewport.info.visible().unwrap_or(true)
-                && !is_invisible_or_minimized(window);
+            let is_visible = viewport.info.visible().unwrap_or(true);
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
