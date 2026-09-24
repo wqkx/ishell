@@ -158,8 +158,8 @@ pub struct App {
     /// 终端内容区在本帧的矩形（由 layout_body 记录）：通知浮层据此贴着终端摆，
     /// 而不是贴窗口边。None = 本帧没画终端（欢迎页等）。
     term_rect: Option<egui::Rect>,
-    /// 上一帧主窗口上报的 IME 矩形。控件失焦导致本帧 `o.ime` 为空时沿用它，
-    /// 避免 X11 上 XDestroyIC/XCreateIC 把部分输入法的中文模式打回英文
+    /// 上一帧主窗口上报的 IME 矩形。本帧 `o.ime` 为空时（控件失焦或整窗失焦催出的重绘）
+    /// 沿用它，避免 X11 上 XDestroyIC/XCreateIC 把部分输入法的中文模式打回英文
     /// （见 `ui::ime_keepalive`）。
     ime_sticky: Option<egui::output::IMEOutput>,
 }
@@ -633,8 +633,8 @@ impl App {
         // 自检截图驱动
         self.drive_screenshot(&ctx);
 
-        // 所有控件画完之后：窗口仍在前台且本帧无人上报 o.ime 时，沿用上一帧矩形，
-        // 避免 X11 控件间切焦点销毁/重建输入上下文、把部分输入法打回英文。
+        // 所有控件画完之后：本帧无人上报 o.ime 时沿用上一帧矩形（含整窗失焦催出的那一帧），
+        // 避免 X11 销毁/重建输入上下文、把部分输入法打回英文。
         crate::ui::ime_keepalive::keep_ime_alive(ui.ctx(), &mut self.ime_sticky);
     }
 }

@@ -513,7 +513,7 @@ impl App {
 
             super::editor_close::handle_editor_viewport_close(vctx, &mut ed);
 
-            // 编辑器是独立 OS 窗口，有自己的 egui-winit IME 状态；同样防止控件间切焦点拆 IC。
+            // 编辑器是独立 OS 窗口，有自己的 egui-winit IME 状态；控件切焦点与整窗失焦同路径。
             crate::ui::ime_keepalive::keep_ime_alive(vctx, &mut ed.ime_sticky);
         });
     }
