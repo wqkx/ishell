@@ -162,15 +162,13 @@ poll(timeout=-1) → _XReadEvents → XIfEvent → _XimRead → XSetICValues
 winit only sends that request when the coordinate actually *changes*, so reporting a constant one means it is never sent at all. You keep full CJK input; the candidate window just stops following the caret. iShell also detects a frozen UI thread on its own and appends an explanation to `~/.config/ishell/crash.log` — it only reports, it never changes settings behind your back.
 
 **Whole UI looks suspended after minimizing the window — and the AI can't drive it either?**
-Try starting with `ISHELL_NO_VSYNC=1 ./iShell/ishell`. If minimizing behaves after that, it's the following.
+Fixed in 0.24.x: Wayland disables vsync by default, and a local eframe patch keeps the event loop alive for hidden surfaces (no waiting on compositor frame callbacks; skip `swap_buffers` when minimize is detectable). You usually don't need an env var.
 
-What the framework source says: eframe **keeps drawing and swapping buffers for a minimized window**. Its visibility check reads `viewport.info.visible()`, and **nothing on native ever assigns that field** (the `Occluded` event writes `info.occluded` instead), so it is always true — neither the paint nor `gl_surface.swap_buffers()` is skipped. With the default `vsync: true`, glutin uses `SwapInterval::Wait(1)`, so that swap waits for a vblank — which an iconified window the compositor no longer presents may never get, parking the thread that draws the UI. It is the only blocking call on that path.
+If it still happens: make sure `ISHELL_VSYNC=1` is not set; on X11 try `ISHELL_NO_VSYNC=1`.
 
 A zero-cost way to tell (no gdb needed): **type something → minimize → wait 15s → restore → read `~/.config/ishell/crash.log`**.
-- There's an entry (saying the window was minimized/occluded) → only the UI thread was blocked, the process is alive: that's the case above.
+- There's an entry (saying the window was minimized/occluded) → only the UI thread was blocked, the process is alive.
 - Nothing logged, yet the AI really couldn't drive it → even the watchdog thread was frozen, so something outside iShell is suspending the whole process.
-
-Turning vsync off can cause tearing while scrolling, so it is not the default.
 
 
 ## 🔧 Build from source

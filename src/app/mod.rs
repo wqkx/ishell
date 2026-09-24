@@ -281,15 +281,11 @@ impl eframe::App for App {
     /// （`epi_integration.rs`）——凡是不需要 `Ui`、且不能因为窗口看不见就停摆的事情，
     /// 都该放在这里。见 [`App::pump_background`]。
     ///
-    /// **别把它当成「最小化之后 AI 操作不了 iShell」的修复**：那条 `is_visible` 取自
-    /// `viewport.info.visible()`，而原生平台上 eframe/egui-winit **没有任何一处给这个字段
-    /// 赋值**（`Occluded` 事件写的是 `info.occluded`），恒为 `None → unwrap_or(true)`，
-    /// 所以 Linux 上最小化时 `ui` 照样被调用（已用无头实测双向确认）。那个 bug 的真因另有
-    /// 其人，目前最像的是 `swap_buffers` 等一个图标化窗口永远等不到的垂直同步——见 `main.rs`
-    /// 里 `ISHELL_NO_VSYNC` 那段。真是它的话，`logic` 和 `ui` 在同一个线程上，挪过来也救不了。
-    ///
-    /// 这里成立的理由要弱一些、但仍然成立：Windows 上 `is_visible` 确实会变假，而且这些活
-    /// 本来就不该挂在「窗口可见」这个条件上。
+    /// 「最小化之后 AI 操作不了 iShell」的真因是事件循环线程卡住（Wayland 上 frame
+    /// callback / vsync `swap_buffers`），不是这条 `is_visible` 门——原生平台上
+    /// `viewport.info.visible` 往往恒为真。修复在 `vendor/eframe` + Wayland 默认关 vsync
+    /// （见 `main.rs`）。把 MCP 排空放在 `logic` 仍然正确：Windows 上 `is_visible` 会变假，
+    /// 这些活本来就不该挂在「窗口可见」上。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 卡死看门狗：记「事件循环还活着」。必须记在 logic 而不是 ui——最小化时 ui 不再被
         // 调用，记在那边会把「窗口最小化」误判成「UI 线程卡死」。

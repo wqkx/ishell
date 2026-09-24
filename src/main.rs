@@ -99,26 +99,42 @@ fn main() -> eframe::Result<()> {
             .with_app_id(APP_ID)
             .with_icon(load_icon())
     };
-    // 垂直同步。默认开（不开会撕裂），但留一个关掉它的口子——**这是「最小化之后整个界面
-    // 像被挂起」的排查/应急开关**。
+    // 垂直同步。
     //
-    // 起因：eframe 会给**最小化的窗口照样画帧并交换缓冲**。它内部那个 `is_visible` 取自
-    // `viewport.info.visible()`，而原生平台上没有任何一处给这个字段赋值（`Occluded` 事件写
-    // 的是 `info.occluded`），于是恒为真——绘制与 `gl_surface.swap_buffers()` 都不会被跳过。
-    // 而 `vsync: true` 让 glutin 用 `SwapInterval::Wait(1)`，那次交换要等一个垂直同步；一个
-    // 已经被图标化、合成器不再呈现的窗口很可能永远等不到，事件循环线程就停在那儿——从外面
-    // 看就是「进程挂起了」，AI 经 MCP 也操作不了（排空请求要在事件循环里跑）。
+    // Wayland 上 Mesa EGL 在 `SwapInterval::Wait` 时会在 `eglSwapBuffers` 里等 frame
+    // callback；窗口一旦被合成器藏起（最小化/其它工作区），那次回调可能永远不来，事件循环
+    // 线程（连带 MCP 排空）就停死。glutin 文档也写了这一点。而且 Wayland 上
+    // `Window::is_minimized` / `Occluded` 都不可用，应用侧无法靠「检测到最小化就跳过绘制」
+    // 规避——所以 **Wayland 默认关 vsync**（`DontWait`）。X11 / 其它平台仍默认开。
     //
-    // 这条链路里**只有这一个会阻塞的调用**，所以先给它一个开关：`ISHELL_NO_VSYNC=1` 启动，
-    // 交换缓冲改成 `DontWait`，立即返回、不可能卡住。若这样最小化之后一切正常，就坐实了。
-    // 代价是连续滚动时可能撕裂，所以不设为默认。
-    let no_vsync = std::env::var_os("ISHELL_NO_VSYNC").is_some();
-    if no_vsync {
-        log::info!("已关闭垂直同步（ISHELL_NO_VSYNC）：交换缓冲不再等垂直同步");
+    // 另有 eframe 本地补丁（`vendor/eframe`）：可检测最小化的平台跳过 paint/swap；Wayland
+    // 上定时重绘改为直接 paint，不依赖合成器 frame callback（见 ISHELL_PATCHES.md）。
+    //
+    // 覆盖：`ISHELL_NO_VSYNC=1` 强制关；`ISHELL_VSYNC=1` 强制开（Wayland 上仍可能在最小化
+    // 后卡死，仅调试/接受风险时用）。
+    let force_no_vsync = std::env::var_os("ISHELL_NO_VSYNC").is_some();
+    let force_vsync = std::env::var_os("ISHELL_VSYNC").is_some();
+    let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let vsync = if force_no_vsync {
+        false
+    } else if force_vsync {
+        true
+    } else {
+        !on_wayland
+    };
+    if !vsync {
+        if force_no_vsync {
+            log::info!("已关闭垂直同步（ISHELL_NO_VSYNC）：交换缓冲不再等垂直同步");
+        } else if on_wayland {
+            log::info!(
+                "Wayland 下默认关闭垂直同步，避免最小化后 swap_buffers 阻塞事件循环/MCP；\
+                 需要时可设 ISHELL_VSYNC=1（有卡死风险）"
+            );
+        }
     }
     let native_options = eframe::NativeOptions {
         viewport,
-        vsync: !no_vsync,
+        vsync,
         ..Default::default()
     };
 

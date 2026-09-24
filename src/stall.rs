@@ -244,7 +244,7 @@ pub fn spawn(ctx: egui::Context) {
 /// 早先这里会自动把「输入法候选框跟随光标」关掉。撤掉了，两个理由：① 判定再怎么加护栏也
 /// 只是「一段时间没出帧」，静默改用户设置的代价配不上这个确定性（真出过一次误报就知道了）；
 /// ② 那条归因本身也没被证实——最小化时更像卡在绘制/缓冲交换上（见 `main.rs` 的
-/// `ISHELL_NO_VSYNC`），关输入法跟随既没用又冤枉。日志里把两条候选都写清楚，由用户定夺。
+/// Wayland 默认关 vsync / eframe 补丁），关输入法跟随既没用又冤枉。日志里把两条候选都写清楚，由用户定夺。
 fn on_stall(kind: StallKind) {
     let follow = crate::store::load_ime_follow_caret();
     log::error!(
@@ -295,9 +295,9 @@ fn write_stall_log(kind: StallKind, follow_was_on: bool) {
         ),
         StallKind::Hidden => (
             "窗口当时是最小化/被遮挡的，更可能卡在窗口与绘制路径上：合成器不再给一个图标化的\n\
-             \x20         窗口调度垂直同步，而 eframe 仍会给它画帧并交换缓冲（原生平台上 is_visible\n\
-             \x20         恒为真），缓冲交换就会一直等一个不来的帧回调。",
-            "用 ISHELL_NO_VSYNC=1 启动再试一次（交换缓冲改成不等垂直同步）。与输入法无关。",
+             \x20         窗口调度垂直同步 / frame callback，而交换缓冲若仍在等，事件循环就会停住。\n\
+             \x20         Wayland 上 iShell 已默认关 vsync，并给 eframe 打了补丁；若仍卡住请抓栈。",
+            "确认未设置 ISHELL_VSYNC=1。若在 X11 上，可试 ISHELL_NO_VSYNC=1。与输入法无关。",
         ),
         StallKind::Visible if follow_was_on => (
             XIM_LIKELY,

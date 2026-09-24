@@ -2,6 +2,17 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [Unreleased]
+
+### Fixed
+
+- **最小化（尤其 Wayland）后 MCP / 界面像被挂起**：根因是事件循环线程卡住——Wayland 上
+  `request_redraw` 等合成器 frame callback（隐藏表面可能永远不来），且 vsync
+  `swap_buffers` 也会在同一回调上永久阻塞；`is_minimized` / `Occluded` 在 Wayland 上不可用，
+  无法靠检测后跳过绘制。处理：Wayland 默认关垂直同步（`ISHELL_VSYNC=1` 可强制开）；
+  vendor eframe 补丁在 Wayland 上由定时器直接 paint，并在可检测最小化的平台跳过 paint/swap。
+  详见 `vendor/eframe/ISHELL_PATCHES.md`。
+
 ## [0.24.1] - 2026-09-21
 
 ### Fixed
