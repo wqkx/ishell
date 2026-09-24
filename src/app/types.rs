@@ -496,6 +496,8 @@ pub(super) struct EditorState {
     /// FileSaved/FileSaveFailed/FileSaveConflict 若命中此表即识别为「超时后的迟到事件」直接丢弃，
     /// 不再据其更新标签状态（标签可能已被用户关闭 / 已重试保存）。仿 mcp_bridge::file_op_tombstones。
     pub(super) save_tombstones: std::collections::VecDeque<u64>,
+    /// 编辑器窗口 IME sticky（独立 OS 窗口有自己的 egui-winit allow_ime 状态）。
+    pub(super) ime_sticky: Option<egui::output::IMEOutput>,
 }
 
 impl EditorState {

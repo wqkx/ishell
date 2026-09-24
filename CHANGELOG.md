@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **部分输入法在控件间切焦点后变回英文**：终端/编辑器只在自身聚焦时上报 `o.ime`，失焦帧
+  egui-winit 会 `set_ime_allowed(false)`，X11 上即 `XDestroyIC`，再聚焦是 `XCreateIC`——
+  有的输入法重建上下文后回到英文默认态。窗口仍在前台时沿用上一帧 IME 矩形（主窗口与
+  编辑器窗口各自 sticky），保持输入上下文不被拆掉；窗口失焦仍正常关闭 IME。
+
 ## [0.24.2] - 2026-09-24
 
 ### Fixed
