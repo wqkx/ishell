@@ -11,6 +11,8 @@ hidden window cannot freeze the event-loop thread (and with it MCP request handl
    - Prefer `request_redraw` so **visible** windows stay compositor-paced.
    - Arm a ~100 ms fallback; if `RedrawRequested` never arrives, paint directly
      (and throttle) so `App::logic` / MCP keep running.
+   - Keep the **earliest** pending fallback deadline — rapid sub-interval repaints
+     must not keep pushing it out, or direct paint never fires while hidden.
    - Clear the fallback when `RedrawRequested` is delivered.
 
 2. **`src/native/glow_integration.rs`** (and wgpu twin) — Treat

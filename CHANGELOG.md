@@ -11,7 +11,8 @@
   `swap_buffers` 也会在同一回调上永久阻塞；`is_minimized` / `Occluded` 在 Wayland 上不可用，
   无法靠检测后跳过绘制。处理：Wayland 默认关垂直同步（`ISHELL_VSYNC=1` 可强制开）；
   vendor eframe 补丁在 Wayland 上优先 `request_redraw`、约 100ms 无 `RedrawRequested` 再
-  回退直接 paint（可见窗口仍跟合成器节奏），并在可检测最小化的平台跳过 paint/swap。
+  回退直接 paint（可见窗口仍跟合成器节奏；连续短间隔重绘保留最早回退截止时间，避免被
+  反复延后），并在可检测最小化的平台跳过 paint/swap。
   详见 `vendor/eframe/ISHELL_PATCHES.md`。
 
 ## [0.24.1] - 2026-09-21

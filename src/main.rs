@@ -236,6 +236,8 @@ mod vsync_policy_tests {
 
 #[cfg(test)]
 mod wayland_repaint_policy_tests {
+    use std::time::{Duration, Instant};
+
     /// 与 `vendor/eframe/src/native/run.rs` 的 `DueRepaintAction` / `due_repaint_action` 同构。
     /// eframe 不是 workspace member，crate 内单测不便从本仓直接跑，故在此钉住补丁合约。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +254,19 @@ mod wayland_repaint_policy_tests {
             DueRepaintAction::RequestRedrawWithFallback
         } else {
             DueRepaintAction::RequestRedraw
+        }
+    }
+
+    /// 与 eframe `wayland_fallback_deadline` 同构：保留最早截止时间。
+    fn wayland_fallback_deadline(
+        existing: Option<Instant>,
+        now: Instant,
+        delay: Duration,
+    ) -> Instant {
+        let candidate = now + delay;
+        match existing {
+            Some(prev) => prev.min(candidate),
+            None => candidate,
         }
     }
 
@@ -281,6 +296,21 @@ mod wayland_repaint_policy_tests {
             due_repaint_action(false, true),
             DueRepaintAction::RequestRedrawWithFallback
         );
+    }
+
+    #[test]
+    fn wayland_fallback_keeps_earliest_deadline_across_rapid_repaints() {
+        let delay = Duration::from_millis(100);
+        let t0 = Instant::now();
+        let first = wayland_fallback_deadline(None, t0, delay);
+        assert_eq!(first, t0 + delay);
+
+        // <100ms 连续到期重绘不能把回退截止时间往后推，否则合成器一直不发
+        // RedrawRequested 时直接绘制永远触发不了，MCP 会卡住。
+        let t1 = t0 + Duration::from_millis(40);
+        assert_eq!(wayland_fallback_deadline(Some(first), t1, delay), first);
+        let t2 = t0 + Duration::from_millis(80);
+        assert_eq!(wayland_fallback_deadline(Some(first), t2, delay), first);
     }
 }
 

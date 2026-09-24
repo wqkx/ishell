@@ -54,6 +54,20 @@ fn due_repaint_action(invisible_or_minimized: bool, on_wayland: bool) -> DueRepa
     }
 }
 
+/// Next Wayland fallback deadline. Keeps the **earliest** pending deadline so a burst of
+/// sub-interval repaint requests cannot push the fallback forever (MCP would stall).
+fn wayland_fallback_deadline(
+    existing: Option<Instant>,
+    now: Instant,
+    delay: Duration,
+) -> Instant {
+    let candidate = now + delay;
+    match existing {
+        Some(prev) => prev.min(candidate),
+        None => candidate,
+    }
+}
+
 // ----------------------------------------------------------------------------
 fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop<UserEvent>> {
     #[cfg(target_os = "android")]
@@ -273,8 +287,12 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             });
 
         for window_id in wayland_arm_fallback {
-            self.wayland_redraw_fallback
-                .insert(window_id, now + WAYLAND_REDRAW_FALLBACK);
+            let deadline = wayland_fallback_deadline(
+                self.wayland_redraw_fallback.get(&window_id).copied(),
+                now,
+                WAYLAND_REDRAW_FALLBACK,
+            );
+            self.wayland_redraw_fallback.insert(window_id, deadline);
         }
 
         // Wayland fallbacks that came due: compositor never delivered RedrawRequested.
@@ -653,7 +671,10 @@ pub enum EframePumpStatus {
 
 #[cfg(test)]
 mod ishell_patch_tests {
-    use super::{DueRepaintAction, due_repaint_action};
+    use super::{
+        DueRepaintAction, WAYLAND_REDRAW_FALLBACK, due_repaint_action, wayland_fallback_deadline,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn invisible_windows_paint_directly_and_throttle() {
@@ -682,6 +703,25 @@ mod ishell_patch_tests {
         assert_eq!(
             due_repaint_action(false, true),
             DueRepaintAction::RequestRedrawWithFallback
+        );
+    }
+
+    #[test]
+    fn wayland_fallback_keeps_earliest_deadline_across_rapid_repaints() {
+        let t0 = Instant::now();
+        let first = wayland_fallback_deadline(None, t0, WAYLAND_REDRAW_FALLBACK);
+        assert_eq!(first, t0 + WAYLAND_REDRAW_FALLBACK);
+
+        // Another due repaint 40ms later must not push the fallback out.
+        let t1 = t0 + Duration::from_millis(40);
+        let kept = wayland_fallback_deadline(Some(first), t1, WAYLAND_REDRAW_FALLBACK);
+        assert_eq!(kept, first);
+
+        // And again at 80ms — still the original deadline.
+        let t2 = t0 + Duration::from_millis(80);
+        assert_eq!(
+            wayland_fallback_deadline(Some(kept), t2, WAYLAND_REDRAW_FALLBACK),
+            first
         );
     }
 }
