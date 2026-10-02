@@ -4,6 +4,9 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use super::{Block, Kind, Marker, Span};
 
+#[path = "markdown_html.rs"]
+mod html;
+
 #[derive(Default)]
 struct TableBuild {
     head: Vec<Vec<Span>>,
@@ -22,8 +25,12 @@ struct Builder {
     links: Vec<String>,
     /// 正在收集的图片的 alt 文字（v1 只显示占位，不取图，地址不留）
     image: Option<String>,
-    /// 正在收集的 HTML 块原文（按行到达，攒齐了再整块去标签）
+    /// 正在收集的 HTML 块原文（按行到达，攒齐了再整块处理）
     html: Option<String>,
+    /// 已打开、尚未闭合的 HTML 元素（跨事件保持，见 `markdown_html`）
+    html_open: Vec<html::Open>,
+    /// 处于 `<code>` / `<kbd>` 之类 HTML 行内代码元素内的层数
+    html_code: u32,
     heading: u8,
     /// 列表栈：Some(n)=有序列表的下一个编号，None=无序
     lists: Vec<Option<u64>>,
@@ -46,50 +53,16 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
-/// 去掉 HTML 标签，只留标签之间的文字（`<br>` 记为换行；注释与 `<style>` / `<script>`
-/// 的内容整体丢弃）。传入的应是**完整**的一段 HTML——逐行调用会把跨行结构拆坏。
-fn strip_tags(html: &str) -> String {
-    let mut out = String::new();
-    let mut rest = html;
-    while let Some(lt) = rest.find('<') {
-        out.push_str(&rest[..lt]);
-        let tail = &rest[lt..];
-        if tail.starts_with("<!--") {
-            // 没收尾的注释一直延续到末尾（CommonMark 的 HTML 块也是这么算的）
-            match tail.find("-->") {
-                Some(e) => rest = &tail[e + 3..],
-                None => return out,
-            }
-            continue;
-        }
-        let Some(end) = tail.find('>').map(|e| e + 1) else {
-            // 没有收尾：不是标签，原样保留
-            out.push_str(tail);
-            return out;
-        };
-        let tag = tail[..end].to_ascii_lowercase();
-        rest = &tail[end..];
-        if tag.starts_with("<br") {
-            out.push('\n');
-        }
-        // 这两种元素的内容不是给人读的：连同收尾标签一起跳过
-        for raw in ["style", "script"] {
-            if tag[1..].starts_with(raw) {
-                // ASCII 小写化不改变字节偏移，可以直接拿来切原串
-                let lower = rest.to_ascii_lowercase();
-                rest = match lower.find(&format!("</{raw}")) {
-                    Some(c) => rest[c..].find('>').map_or("", |e| &rest[c + e + 1..]),
-                    None => "",
-                };
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 impl Builder {
     fn push(&mut self, kind: Kind) {
+        // 表格单元格里出现的块（HTML 表格的单元格里可以写 Markdown）：模型里单元格只装
+        // 行内片段，所以代码块降级成行内代码，其余（分割线等）放弃——总比跑到表格外面强。
+        if self.table.is_some() {
+            if let Kind::Code { text, .. } = &kind {
+                self.text(text, true);
+            }
+            return;
+        }
         self.blocks.push(Block {
             kind,
             indent: self.lists.len().min(u8::MAX as usize) as u8,
@@ -99,6 +72,9 @@ impl Builder {
 
     /// 结束当前段落：有文字才出块（顺带带走待用的列表标记）。
     fn flush_text(&mut self) {
+        if self.in_cell() {
+            return;
+        }
         self.soft = false;
         if self.spans.is_empty() {
             return;
@@ -111,12 +87,40 @@ impl Builder {
             heading,
             marker,
         });
+        self.html_end_of_para();
+    }
+
+    /// 正在表格里：单元格内的分段不出块，只当作一次换行，文字继续攒在单元格里。
+    /// （Markdown 表格的单元格只有行内内容，走不到这里；这是给 HTML 表格的单元格里
+    /// 空行夹着写 Markdown 的情形准备的。）
+    fn in_cell(&mut self) -> bool {
+        if self.table.is_none() {
+            return false;
+        }
+        self.marker = None;
+        if self.spans.last().is_some_and(|s| !s.text.ends_with('\n')) {
+            self.text("\n", false);
+        }
+        self.soft = false;
+        true
+    }
+
+    /// 当前列表的下一个项标记。
+    fn next_marker(&mut self) -> Marker {
+        match self.lists.last_mut() {
+            Some(Some(n)) => {
+                let m = Marker::Number(*n);
+                *n = n.saturating_add(1);
+                m
+            }
+            _ => Marker::Bullet,
+        }
     }
 
     /// 同 `flush_text`，但列表标记还没用掉时即使没有文字也出一个空段落——
     /// 空列表项、或列表项的首个子块是代码块/嵌套列表时，标记不能丢。
     fn flush_force(&mut self) {
-        if self.spans.is_empty() && self.marker.is_some() {
+        if self.table.is_none() && self.spans.is_empty() && self.marker.is_some() {
             let marker = self.marker.take();
             self.soft = false;
             self.push(Kind::Para {
@@ -222,14 +226,7 @@ impl Builder {
             Tag::Item => {
                 // 父项的标记还没用掉（如 `- - a`）：先出掉，免得被子项覆盖
                 self.flush_force();
-                self.marker = Some(match self.lists.last_mut() {
-                    Some(Some(n)) => {
-                        let m = Marker::Number(*n);
-                        *n = n.saturating_add(1);
-                        m
-                    }
-                    _ => Marker::Bullet,
-                });
+                self.marker = Some(self.next_marker());
             }
             Tag::Table(..) => {
                 self.flush_force();
@@ -273,14 +270,7 @@ impl Builder {
             }
             TagEnd::HtmlBlock => {
                 if let Some(raw) = self.html.take() {
-                    // 去标签后每个非空行当作同一段里的一行（行间按软换行衔接）
-                    for line in strip_tags(&raw).lines() {
-                        let line = line.trim();
-                        if !line.is_empty() {
-                            self.text(line, false);
-                            self.soft = true;
-                        }
-                    }
+                    self.html(&raw);
                 }
                 self.flush_text();
             }
@@ -342,19 +332,15 @@ impl Builder {
             Event::End(tag) => self.end(tag),
             Event::Text(t) => match &mut self.code {
                 Some((_, body)) => body.push_str(&t),
-                None => self.text(&t, false),
+                // 行内 HTML 的 <code>/<kbd> 之间的文字是作为普通 Text 事件送来的
+                None => self.text(&t, self.html_code > 0),
             },
             Event::Code(t) => self.text(&t, true),
-            Event::InlineHtml(t) => {
-                let plain = strip_tags(&t);
-                if !plain.is_empty() {
-                    self.text(&plain, false);
-                }
-            }
+            Event::InlineHtml(t) => self.html(&t),
             // HTML 块按行到达：先攒着，块结束时整块处理（见 TagEnd::HtmlBlock）
             Event::Html(t) => match &mut self.html {
                 Some(raw) => raw.push_str(&t),
-                None => self.text(&strip_tags(&t), false),
+                None => self.html(&t),
             },
             Event::SoftBreak => self.soft = true,
             Event::HardBreak => self.text("\n", false),
@@ -368,7 +354,8 @@ impl Builder {
     }
 }
 
-/// 解析 Markdown 源码。对任意输入都不 panic、不失败（Markdown 没有「语法错误」）。
+/// 解析 Markdown 源码。对任意输入都不 panic、不失败：Markdown 没有「语法错误」（写错的
+/// 标记按 CommonMark 规定退化成普通文字），内嵌 HTML 写错了也有兜底（见 `markdown_html`）。
 pub fn parse(src: &str) -> Vec<Block> {
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -378,6 +365,8 @@ pub fn parse(src: &str) -> Vec<Block> {
     for ev in Parser::new_ext(src, opts) {
         b.event(ev);
     }
+    // 文末统一收尾没闭合的 HTML 结构（列表、引用、表格……）
+    b.html_unwind(0);
     b.flush_force();
     b.blocks
 }
@@ -553,11 +542,157 @@ mod tests {
     }
 
     #[test]
-    fn html_keeps_text_drops_tags() {
-        assert_eq!(strip_tags("<b>粗</b> 与 <!-- 注释 > --> 尾"), "粗 与  尾");
-        assert_eq!(strip_tags("a<br/>b"), "a\nb");
-        assert_eq!(strip_tags("1 < 2"), "1 < 2");
-        assert_eq!(para(&parse("按 <kbd>Ctrl</kbd> 键\n"), 0).0, "按 Ctrl 键");
+    fn inline_html_tags_become_styles() {
+        let b = parse("按 <kbd>Ctrl</kbd> 键，<b>粗</b><i>斜</i><del>删</del> <a href=\"https://a.b\">链</a>\n");
+        let Kind::Para { spans, .. } = &b[0].kind else {
+            panic!("应为段落")
+        };
+        assert_eq!(plain(spans), "按 Ctrl 键，粗斜删 链");
+        let find = |t: &str| spans.iter().find(|s| s.text == t).expect(t);
+        assert!(find("Ctrl").code);
+        assert!(find("粗").bold);
+        assert!(find("斜").italic);
+        assert!(find("删").strike);
+        assert_eq!(find("链").link.as_deref(), Some("https://a.b"));
+    }
+
+    #[test]
+    fn html_entities_are_decoded() {
+        use super::html::decode_entities as d;
+        assert_eq!(d("a &amp; b &lt;c&gt; &#20013;&#x6587; &quot;q&quot;"), "a & b <c> 中文 \"q\"");
+        // 不认识的、没写完的原样保留
+        assert_eq!(d("AT&T &bogus; &amp &#xZZ; &"), "AT&T &bogus; &amp &#xZZ; &");
+        assert_eq!(para(&parse("<p>1 &lt; 2 &amp;&amp; 3 &gt; 2</p>\n"), 0).0, "1 < 2 && 3 > 2");
+    }
+
+    #[test]
+    fn html_block_structures() {
+        let b = parse("<h2 align=\"center\">标题</h2>\n<p>段一</p>\n<p>段二<br>第二行</p>\n<hr>\n<blockquote>引用</blockquote>\n");
+        assert_eq!(para(&b, 0), ("标题".into(), 2, None));
+        assert_eq!(para(&b, 1), ("段一".into(), 0, None));
+        assert_eq!(para(&b, 2).0, "段二\n第二行");
+        assert_eq!(b[3].kind, Kind::Rule);
+        assert_eq!((para(&b, 4).0, b[4].quote), ("引用".into(), 1));
+        assert_eq!(b.len(), 5);
+    }
+
+    #[test]
+    fn html_lists() {
+        let b = parse("<ul>\n<li>甲\n  <ol start=\"3\">\n  <li>乙</li>\n  <li>丙</li>\n  </ol>\n</li>\n<li>丁</li>\n</ul>\n");
+        let got: Vec<_> = (0..b.len())
+            .map(|i| (para(&b, i).0, b[i].indent, para(&b, i).2))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("甲".into(), 1, Some(Marker::Bullet)),
+                ("乙".into(), 2, Some(Marker::Number(3))),
+                ("丙".into(), 2, Some(Marker::Number(4))),
+                ("丁".into(), 1, Some(Marker::Bullet)),
+            ]
+        );
+    }
+
+    #[test]
+    fn html_pre_is_a_code_block() {
+        let b = parse("<pre><code class=\"hljs language-Rust\">\nif a &lt; b {\n    <span class=\"k\">return</span>;\n}\n</code></pre>\n");
+        assert_eq!(
+            b[0].kind,
+            Kind::Code {
+                lang: "rust".into(),
+                text: "if a < b {\n    return;\n}".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn html_table() {
+        let b = parse("<table>\n<tr><th>名称</th><th>值</th></tr>\n<tr><td><b>a</b></td><td>1</td></tr>\n</table>\n\n后文\n");
+        let Kind::Table { head, rows } = &b[0].kind else {
+            panic!("应为表格：{:?}", b[0].kind)
+        };
+        assert_eq!(head.iter().map(|c| plain(c)).collect::<Vec<_>>(), ["名称", "值"]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0][0][0].bold);
+        assert_eq!(plain(&rows[0][1]), "1");
+        assert_eq!(para(&b, 1).0, "后文");
+    }
+
+    /// HTML 与 Markdown 交错：`<details>` 里空一行写 Markdown、表格单元格里空一行写
+    /// Markdown。HTML 元素的状态必须跨事件保持，单元格里的段落也不能跑到表格外面去。
+    #[test]
+    fn markdown_inside_html_containers() {
+        let b = parse("<details>\n<summary>展开</summary>\n\n- **项**\n\n</details>\n");
+        assert_eq!(para(&b, 0).0, "展开");
+        let Kind::Para { spans, .. } = &b[0].kind else { panic!() };
+        assert!(spans[0].bold, "summary 应加粗");
+        assert_eq!(para(&b, 1), ("项".into(), 0, Some(Marker::Bullet)));
+        assert_eq!(b.len(), 2);
+
+        let b = parse("<table>\n<tr>\n<td>\n\n**粗** 文字\n\n```sh\nls\n```\n\n</td>\n<td>二</td>\n</tr>\n</table>\n");
+        assert_eq!(b.len(), 1, "单元格里的内容跑到表格外面了：{b:?}");
+        let Kind::Table { head, .. } = &b[0].kind else { panic!() };
+        assert_eq!(head.len(), 2);
+        assert!(head[0][0].bold);
+        assert!(plain(&head[0]).contains("文字"));
+        assert!(head[0].iter().any(|s| s.code && s.text == "ls"));
+        assert_eq!(plain(&head[1]), "二");
+    }
+
+    /// 写错的 HTML 逐类兜底（规则见 `markdown_html` 模块文档）。
+    #[test]
+    fn malformed_html_degrades_gracefully() {
+        // 没闭合的行内样式只管到本段结束
+        let b = parse("前 <b>粗\n\n下一段\n");
+        let Kind::Para { spans, .. } = &b[1].kind else { panic!() };
+        assert!(!spans[0].bold, "没闭合的 <b> 漏到了下一段");
+        // 没闭合的标题同理
+        let b = parse("<h1>标题\n\n正文\n");
+        assert_eq!(para(&b, 0).1, 1);
+        assert_eq!(para(&b, 1), ("正文".into(), 0, None));
+        // 没闭合的链接同理
+        let b = parse("<a href=\"https://a.b\">链\n\n正文\n");
+        let Kind::Para { spans, .. } = &b[1].kind else { panic!() };
+        assert_eq!(spans[0].link, None);
+
+        // 多余的闭合标签忽略；嵌套错位自然收拢
+        assert_eq!(para(&parse("甲</b></div></table>乙\n"), 0).0, "甲乙");
+        let b = parse("<b>粗<i>粗斜</b>常</i>规\n");
+        let Kind::Para { spans, .. } = &b[0].kind else { panic!() };
+        assert_eq!(plain(spans), "粗粗斜常规");
+        assert!(spans.iter().all(|s| s.text != "常规" || (!s.bold && !s.italic)));
+
+        // 不构成标签的 `<` 原样显示
+        assert_eq!(para(&parse("<p>1 < 2，a <- b，x <y</p>\n"), 0).0, "1 < 2，a <- b，x <y");
+        // 引号没配对的属性不吞后面的内容
+        assert_eq!(para(&parse("<p align=\"center>文字</p>\n\n后文\n"), 0).0, "文字");
+
+        // 省略的闭合标签：<li> / <tr> / <td> / <p>
+        let b = parse("<ul>\n<li>一\n<li>二\n</ul>\n");
+        assert_eq!(b.len(), 2);
+        assert_eq!((para(&b, 1).0, b[1].indent), ("二".into(), 1));
+        let b = parse("<table><tr><td>a<td>b<tr><td>c<td>d</table>\n");
+        let Kind::Table { head, rows } = &b[0].kind else { panic!("{b:?}") };
+        assert_eq!((head.len(), rows.len(), rows[0].len()), (2, 1, 2));
+        assert_eq!(parse("<p>一<p>二\n").len(), 2);
+
+        // 缺父元素：<li> 外面没有列表、<td> 外面没有 <tr>
+        let b = parse("<li>孤项</li>\n\n后文\n");
+        assert_eq!((para(&b, 0).2, b[0].indent), (Some(Marker::Bullet), 1));
+        let b = parse("<table><td>a</td><td>b</td></table>\n");
+        assert!(matches!(&b[0].kind, Kind::Table { head, .. } if head.len() == 2));
+        // 表格外的 <td> 不是表格：只留文字
+        assert_eq!(para(&parse("<td>散</td>\n"), 0).0, "散");
+
+        // 文末没闭合的块级结构：内容不能丢
+        let b = parse("<table>\n<tr><td>a</td>\n");
+        assert!(matches!(&b[0].kind, Kind::Table { head, .. } if plain(&head[0]) == "a"));
+        let b = parse("<pre>\nlet x = 1;\n");
+        assert!(matches!(&b[0].kind, Kind::Code { text, .. } if text == "let x = 1;"));
+        let b = parse("<blockquote>\n引\n");
+        assert_eq!((para(&b, 0).0, b[0].quote), ("引".into(), 1));
+        // 没收尾的注释吞到块末，不显示
+        assert!(parse("<!-- 半截注释\n还在注释里\n").is_empty());
     }
 
     /// HTML 块是**按行**送来的：逐行去标签会把跨行结构拆坏——多行注释整段漏成正文、
@@ -569,11 +704,11 @@ mod tests {
 
         let b = parse("<p align=\"center\">\n  <img src=x\n  width=200>\n  居中文字\n</p>\n");
         assert_eq!(b.len(), 1);
-        assert_eq!(para(&b, 0).0, "居中文字");
+        assert_eq!(para(&b, 0).0, "x 居中文字"); // 图片占位（alt 缺省取文件名）+ 文字
 
         let b = parse("<style>\n.a { color: red }\n</style>\n\n<div>\n甲<br>乙\n</div>\n");
         assert_eq!(b.len(), 1, "{b:?}");
-        assert_eq!(para(&b, 0).0, "甲乙"); // 行间按软换行衔接（中文不补空格）
+        assert_eq!(para(&b, 0).0, "甲\n乙");
     }
 
     /// README 的标准徽章写法：链接里套图片。占位文字必须带着**外层链接**，否则点不开。
@@ -598,7 +733,11 @@ mod tests {
             > 引用\n> - 列表\n>   1. 有序\n>      ```rs\n>      let s = \"😀\";\n>      ```\n\n\
             - [ ] 任务\n- [x] 完成\n\t- 制表符缩进\n\n\
             | a | b |\n|:--|--:|\n| 1 | `2` |\n| 仅一列\n\n\
-            <div align=\"center\">\n<img src=x>\n</div>\n\n***\n\n    缩进代码\n\n```\n未闭合";
+            <div align=\"center\">\n<img src=x>\n</div>\n\n***\n\n    缩进代码\n\n\
+            <details><summary>折叠 &amp; 展开</summary>\n\n**内** <kbd>键</kbd>\n\n</details>\n\n\
+            <table>\n<tr><th>头<td>格 <a href='u>链</a>\n\n- 项\n\n<tr><td><pre>码 &lt;</pre>\n</table>\n\n\
+            <ul><li>一<ol start=\"x\"><li>二</ul></b></i> 1 < 2 &#x4e2d; &#99999999; <!-- 注 -->\n\n\
+            <style>\n.a{}\n</style>\n\n<h3>题<b>粗\n\n```\n未闭合";
         let mut cuts: Vec<usize> = CORPUS.char_indices().map(|(i, _)| i).collect();
         cuts.push(CORPUS.len());
         for cut in cuts {
