@@ -416,26 +416,25 @@ fn read_only_operations_never_modify_anything() {
     assert_identical(&before, &snapshot(&tmp.0));
 }
 
-/// 保存失败（父目录只读）时，原文件必须原封不动——绝不能先截断再发现写不进去。
-/// root 会无视权限位，那种环境下跳过。
-#[test]
-fn a_failed_save_leaves_the_original_file_intact() {
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("跳过：以 root 运行时权限位不起作用");
-        return;
-    }
+/// 在只读目录 `locked/` 里放（或不放）一个文件，保存 `REPLACEMENT` 进去，返回
+/// (保存后的文件内容, 收到的保存结果事件, 目录里的文件名)。
+fn save_into_read_only_dir(
+    tag: &str,
+    existing: Option<u32>,
+) -> (Option<Vec<u8>>, Option<WorkerEvent>, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
-
-    let tmp = TmpDir::new("ds-rosave");
+    let tmp = TmpDir::new(tag);
     let dir = tmp.0.join("locked");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let target = dir.join("config.yaml");
-    std::fs::write(&target, b"ORIGINAL CONTENT").expect("w");
-
-    // 目录只读：临时文件建不出来 → 保存必须失败
+    if let Some(mode) = existing {
+        std::fs::write(&target, b"ORIGINAL CONTENT, LONGER THAN THE NEW ONE").expect("w");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    // 目录只读：临时文件建不出来
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
 
-    let (sink, _rx) = test_sink();
+    let (sink, rx) = test_sink();
     block_on(write_file(
         1,
         &target.to_string_lossy(),
@@ -449,10 +448,68 @@ fn a_failed_save_leaves_the_original_file_intact() {
 
     // 先恢复权限，免得 TmpDir 清理不掉
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+    let result = rx.try_iter().find(|e| {
+        matches!(
+            e,
+            WorkerEvent::FileSaved { .. } | WorkerEvent::FileSaveFailed { .. }
+        )
+    });
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("ls")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    (std::fs::read(&target).ok(), result, names)
+}
 
+fn running_as_root() -> bool {
+    // root 会无视权限位，那种环境下这几条测不了
+    let root = unsafe { libc::geteuid() } == 0;
+    if root {
+        eprintln!("跳过：以 root 运行时权限位不起作用");
+    }
+    root
+}
+
+/// 目录只读但文件本身可写：事务写做不了，退化成直接覆盖写，并带上「非原子」标记让 UI
+/// 提示。新内容比旧的短——尾巴必须截掉。
+#[test]
+fn a_read_only_directory_falls_back_to_writing_in_place() {
+    if running_as_root() {
+        return;
+    }
+    let (content, result, names) = save_into_read_only_dir("ds-inplace", Some(0o644));
+    assert_eq!(content.as_deref(), Some(&b"REPLACEMENT"[..]));
+    assert!(
+        matches!(result, Some(WorkerEvent::FileSaved { in_place: true, size: 11, .. })),
+        "应当报「已保存（原地覆盖）」"
+    );
+    assert_eq!(names, ["config.yaml"], "不该留下临时文件");
+}
+
+/// 目录只读、文件也只读：保存必须失败，原文件原封不动——绝不能先截断再发现写不进去。
+#[test]
+fn a_failed_save_leaves_the_original_file_intact() {
+    if running_as_root() {
+        return;
+    }
+    let (content, result, _) = save_into_read_only_dir("ds-rosave", Some(0o444));
     assert_eq!(
-        std::fs::read(&target).expect("原文件必须还在"),
-        b"ORIGINAL CONTENT",
+        content.as_deref(),
+        Some(&b"ORIGINAL CONTENT, LONGER THAN THE NEW ONE"[..]),
         "保存失败却把原文件改了/清空了"
     );
+    assert!(matches!(result, Some(WorkerEvent::FileSaveFailed { .. })));
+}
+
+/// 目录只读、目标不存在（新建）：不退化，保存失败，什么都不留下。
+#[test]
+fn a_new_file_in_a_read_only_directory_is_not_created() {
+    if running_as_root() {
+        return;
+    }
+    let (content, result, names) = save_into_read_only_dir("ds-ronew", None);
+    assert_eq!(content, None);
+    assert!(matches!(result, Some(WorkerEvent::FileSaveFailed { .. })));
+    assert!(names.is_empty(), "留下了文件：{names:?}");
 }

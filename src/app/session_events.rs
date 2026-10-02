@@ -258,9 +258,10 @@ impl Session {
                     path,
                     mtime,
                     size,
+                    in_place,
                 } => {
                     if !self.file_write_op_would_resolve(id) {
-                        self.pending.saved.push((id, path, mtime, size));
+                        self.pending.saved.push((id, path, mtime, size, in_place));
                     } else {
                         self.try_resolve_file_write(id, Ok(mtime));
                     }

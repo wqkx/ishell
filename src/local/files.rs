@@ -354,8 +354,27 @@ async fn write_file(
             let _ = tokio::fs::create_dir_all(parent).await;
         }
     }
-    match atomic_write(path, &bytes).await {
-        Ok(()) => {
+    // 目录不可写（临时文件建不出来）而文件本身可写：退化成原地覆盖写并提示。
+    let outcome = match atomic_write(path, &bytes).await {
+        Ok(()) => Ok(false),
+        Err(SaveError::TmpDenied(denied)) => match write_in_place(path, &bytes).await {
+            Ok(()) => Ok(true),
+            Err((false, _)) => Err(denied.to_string()),
+            Err((true, e)) => Err(match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!(
+                    "目录不可写，改为直接覆盖写入时失败：{e}。文件可能只写了一部分；\
+                     编辑器里的内容是完整的，请重新保存"
+                ),
+                crate::i18n::Lang::En => format!(
+                    "directory not writable; writing in place failed: {e}. The file may be \
+                     incomplete; the editor still has the full content — save again"
+                ),
+            }),
+        },
+        Err(SaveError::Other(e)) => Err(e.to_string()),
+    };
+    match outcome {
+        Ok(in_place) => {
             sink.send(WorkerEvent::FileSaveProgress {
                 path: path.to_string(),
                 done: total,
@@ -371,6 +390,7 @@ async fn write_file(
                 path: path.to_string(),
                 mtime: nm,
                 size: total,
+                in_place,
             });
         }
         Err(e) => sink.send(WorkerEvent::FileSaveFailed {
@@ -387,7 +407,7 @@ async fn write_file(
 /// 本地事务性保存：写同目录临时文件 → 继承原文件权限 → `rename` 原子换入。本地 `rename`
 /// 在同一文件系统上原子，无需 SFTP 那套换入前后复验（那是防个别服务器 SETSTAT 截断的）。
 /// 目标是符号链接时解析到真实目标后替换（链接语义保留）。
-async fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
+async fn atomic_write(path: &str, data: &[u8]) -> Result<(), SaveError> {
     // 符号链接 → 写到真实目标上（链接不变）；断链/普通文件就地写。
     let target: PathBuf = match tokio::fs::symlink_metadata(path).await {
         Ok(m) if m.file_type().is_symlink() => tokio::fs::canonicalize(path)
@@ -413,24 +433,58 @@ async fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
     // 先写后 chmod 会让一个 0600 文件的明文有一段时间是全局可读的。目标文件不存在时
     // 没有可继承的权限，保持默认。
     if let Err(e) = create_with_perm(&tmp, orig_perm.clone()).await {
-        return Err(e);
+        return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
+            SaveError::TmpDenied(e)
+        } else {
+            SaveError::Other(e)
+        });
     }
     if let Err(e) = tokio::fs::write(&tmp, data).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e);
+        return Err(SaveError::Other(e));
     }
     // 覆盖已有文件时权限必须**确实**设上了才能换入：设不上就 rename 过去，等于把
     // `~/.ssh/config` 这类文件从 0600 静默降成 0644。设失败宁可整个保存失败。
     if let Some(perm) = orig_perm {
         if let Err(e) = tokio::fs::set_permissions(&tmp, perm).await {
             let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e);
+            return Err(SaveError::Other(e));
         }
     }
     if let Err(e) = tokio::fs::rename(&tmp, &target).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e);
+        return Err(SaveError::Other(e));
     }
+    Ok(())
+}
+
+enum SaveError {
+    /// 临时文件在创建这一步就被拒绝（所在目录不可写）。原文件分毫未动。
+    TmpDenied(std::io::Error),
+    Other(std::io::Error),
+}
+
+/// 目录不可写、事务写做不了时的退化：直接覆盖写**已存在**的普通文件。不是原子的。
+/// 失败时返回 `(是否已经动过原文件, 错误)`。
+///
+/// 不带 truncate 打开，写完再 `set_len`：中途失败时文件里是新内容的前半段接旧内容的尾巴，
+/// 而不是一个空文件。权限、属主、硬链接天然保留。
+async fn write_in_place(path: &str, data: &[u8]) -> Result<(), (bool, std::io::Error)> {
+    use tokio::io::AsyncWriteExt;
+    // 跟随符号链接；目标不存在（新建）或不是普通文件时不退化
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err((false, std::io::ErrorKind::InvalidInput.into())),
+        Err(e) => return Err((false, e)),
+    }
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|e| (false, e))?;
+    f.write_all(data).await.map_err(|e| (true, e))?;
+    f.set_len(data.len() as u64).await.map_err(|e| (true, e))?;
+    f.sync_all().await.map_err(|e| (true, e))?;
     Ok(())
 }
 

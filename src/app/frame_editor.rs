@@ -309,7 +309,7 @@ impl App {
     pub(super) fn process_editor_save_events(
         &mut self,
         ctx: &egui::Context,
-        saved: Vec<(u64, u64, String, u32, u64)>,
+        saved: Vec<(u64, u64, String, u32, u64, bool)>,
         conflicts: Vec<(u64, u64, String)>,
         save_progress: Vec<(u64, String, u64, u64)>,
         save_failed: Vec<(u64, u64, String, String)>,
@@ -343,7 +343,7 @@ impl App {
                                                                     // 用 save_op 而非 tid 匹配，是为了让「超时判定后姗姗来迟」的旧事件天然匹配不到任何
                                                                     // 标签（超时时已把 save_op 清零、重试又分配了新的 save_op）而被安全丢弃。
                                                                     // save_tombstones 是显式识别：命中即「已超时判定过」，直接跳过，不做任何状态更新。
-            for (uid, id, _path, mtime, size) in saved {
+            for (uid, id, _path, mtime, size, in_place) in saved {
                 if ed.save_tombstones.contains(&id) {
                     // 超时后姗姗来迟的成功事件：已判超时，保存状态不再动（标签或已关闭 / 已重试）。
                     // 但那次写入**确实落盘了**，远端 mtime 已是它的——不回填的话，下一次保存
@@ -373,6 +373,12 @@ impl App {
                         t.save_op = 0; // 结束在途保存：清 save_op / deadline（避免被误判超时）
                         t.save_deadline = None;
                         t.editor.mark_saved();
+                        if in_place {
+                            t.editor.set_status(crate::i18n::tr(
+                                "已保存：目录不可写，这次是直接覆盖写入的（非原子）",
+                                "Saved in place: directory not writable (not atomic)",
+                            ));
+                        }
                         if close_after {
                             close_after_save.push((uid, t.tid));
                         }

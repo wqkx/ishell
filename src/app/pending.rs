@@ -23,7 +23,7 @@ pub(super) struct SessionPending {
     /// 已读取待填充到占位编辑器标签的文件
     pub open: Vec<OpenedFile>,
     /// 保存成功回报（请求 id, path, 新 mtime, 写入的字节数）
-    pub saved: Vec<(u64, String, u32, u64)>,
+    pub saved: Vec<(u64, String, u32, u64, bool)>,
     /// 保存写入进度（path, done, total）——驱动编辑器标签「珊瑚→绿」保存动画
     pub save_progress: Vec<(String, u64, u64)>,
     /// 跟随读取返回：(路径, 新增字节, 新 offset, 是否截断/轮转)

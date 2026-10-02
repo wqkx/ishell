@@ -419,6 +419,8 @@ pub enum WorkerEvent {
         path: String,
         mtime: u32,
         size: u64,
+        /// 所在目录不可写、建不了临时文件，这次是直接覆盖写原文件的（非原子）：UI 要提示
+        in_place: bool,
     },
     /// 保存写入进度（驱动编辑器标签的「珊瑚→绿」保存动画，跟随实际上传速度）
     FileSaveProgress { path: String, done: u64, total: u64 },

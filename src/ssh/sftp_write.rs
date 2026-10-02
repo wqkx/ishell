@@ -84,7 +84,20 @@ pub(in crate::ssh) async fn sftp_write_atomic(
         .and_then(|m| m.permissions);
 
     let tmp = format!("{target}.ishell-tmp-{}", rand_hex(6));
-    if let Err(e) = sftp_overwrite_progress_to(sftp, &tmp, path, data, sink).await {
+    // 打开与写入分开：「临时文件建不出来（目录不可写）」要能和「写到一半失败」区分开，
+    // 前者由编辑器保存退化成原地覆盖写（见 `sftp_write_in_place`），后者不行。
+    let tmp_file = {
+        use russh_sftp::protocol::OpenFlags;
+        let flags = OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE;
+        match sftp.open_with_flags(&tmp, flags).await {
+            Ok(f) => f,
+            Err(e) if super::is_sftp_permission_denied(&e) => {
+                return Err(anyhow::Error::new(TmpDenied(e.to_string())));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    if let Err(e) = sftp_write_chunks(tmp_file, path, data, sink).await {
         let _ = sftp.remove_file(&tmp).await; // 写失败：清理临时文件，原文件未动
         return Err(e);
     }
@@ -200,6 +213,61 @@ pub(in crate::ssh) async fn sftp_write_atomic(
     Ok(())
 }
 
+/// 事务写在「建临时文件」这一步就被拒绝了（所在目录不可写）。此时原文件分毫未动。
+#[derive(Debug)]
+pub(in crate::ssh) struct TmpDenied(String);
+
+impl std::fmt::Display for TmpDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TmpDenied {}
+
+/// 原地覆盖写失败。`touched` = 已经往原文件里写过东西了（它现在可能不完整）。
+pub(in crate::ssh) struct InPlaceError {
+    pub touched: bool,
+    pub err: anyhow::Error,
+}
+
+/// 目录不可写、事务写做不了时的退化：直接覆盖写**已存在**的目标文件。只给编辑器保存用——
+/// 不是原子的，写到一半失败会留下不完整的文件。
+///
+/// 顺序是「不带 TRUNCATE 打开 → 从头写完 → 再截断到新长度 → 校验」：中途断掉时文件里是
+/// 新内容的前半段接旧内容的尾巴，而不是一个空文件。权限、属主、硬链接天然保留。
+pub(in crate::ssh) async fn sftp_write_in_place(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    data: &[u8],
+    sink: &UiSink,
+) -> Result<(), InPlaceError> {
+    use russh_sftp::protocol::OpenFlags;
+    let untouched = |err: anyhow::Error| InPlaceError {
+        touched: false,
+        err,
+    };
+    // `metadata` 跟随符号链接；目标不存在（新建）或是目录时不退化——目录不可写本来也建不出来。
+    match sftp.metadata(path).await {
+        Ok(m) if !m.is_dir() => {}
+        Ok(_) => return Err(untouched(anyhow::anyhow!("is a directory"))),
+        Err(e) => return Err(untouched(e.into())),
+    }
+    let f = sftp
+        .open_with_flags(path, OpenFlags::WRITE)
+        .await
+        .map_err(|e| untouched(e.into()))?;
+    let touched = |err: anyhow::Error| InPlaceError { touched: true, err };
+    sftp_write_chunks(f, path, data, sink).await.map_err(touched)?;
+    sftp.set_metadata(path, super::size_only_attrs(data.len() as u64))
+        .await
+        .map_err(|e| touched(e.into()))?;
+    if !sftp_verify_size(sftp, path, data.len()).await {
+        return Err(touched(anyhow::anyhow!("size mismatch after write")));
+    }
+    Ok(())
+}
+
 /// 分块写 `write_path` 并以 `report_path` 上报保存进度。
 pub(in crate::ssh) async fn sftp_overwrite_progress_to(
     sftp: &russh_sftp::client::SftpSession,
@@ -209,6 +277,22 @@ pub(in crate::ssh) async fn sftp_overwrite_progress_to(
     sink: &UiSink,
 ) -> anyhow::Result<()> {
     use russh_sftp::protocol::OpenFlags;
+    let f = sftp
+        .open_with_flags(
+            write_path,
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+        )
+        .await?;
+    sftp_write_chunks(f, report_path, data, sink).await
+}
+
+/// 把 `data` 分块写进已打开的 `f`、收尾关闭，并以 `report_path` 上报保存进度。
+async fn sftp_write_chunks(
+    mut f: russh_sftp::client::fs::File,
+    report_path: &str,
+    data: &[u8],
+    sink: &UiSink,
+) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     const CHUNK: usize = 256 * 1024;
     let total = data.len() as u64;
@@ -217,12 +301,6 @@ pub(in crate::ssh) async fn sftp_overwrite_progress_to(
         done: 0,
         total,
     });
-    let mut f = sftp
-        .open_with_flags(
-            write_path,
-            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
-        )
-        .await?;
     let mut off = 0usize;
     while off < data.len() {
         let end = (off + CHUNK).min(data.len());
@@ -242,6 +320,25 @@ pub(in crate::ssh) async fn sftp_overwrite_progress_to(
         total,
     });
     Ok(())
+}
+
+/// 退化的原地覆盖写也失败时给用户的说明。没碰过原文件就报最初那个「目录不可写」的错。
+fn in_place_failure(denied: &str, ip: &InPlaceError) -> String {
+    if !ip.touched {
+        return denied.to_string();
+    }
+    match crate::i18n::current() {
+        crate::i18n::Lang::Zh => format!(
+            "目录不可写，改为直接覆盖写入时失败：{}。远端文件可能只写了一部分；\
+             编辑器里的内容是完整的，请重新保存",
+            ip.err
+        ),
+        crate::i18n::Lang::En => format!(
+            "directory not writable; writing in place failed: {}. The remote file may be \
+             incomplete; the editor still has the full content — save again",
+            ip.err
+        ),
+    }
 }
 
 pub(in crate::ssh) async fn handle_fs_op(
@@ -380,8 +477,19 @@ pub(in crate::ssh) async fn handle_fs_op(
                 if sftp.metadata(&parent).await.is_err() {
                     super::create_remote_dir_all(sftp, &parent).await;
                 }
-                match sftp_write_atomic(sftp, &path, &bytes, sink).await {
-                    Ok(_) => {
+                // 目录不可写（临时文件建不出来）而文件本身可写：退化成原地覆盖写并提示。
+                let outcome = match sftp_write_atomic(sftp, &path, &bytes, sink).await {
+                    Ok(()) => Ok(false),
+                    Err(e) if e.downcast_ref::<TmpDenied>().is_some() => {
+                        match sftp_write_in_place(sftp, &path, &bytes, sink).await {
+                            Ok(()) => Ok(true),
+                            Err(ip) => Err(in_place_failure(&e.to_string(), &ip)),
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                match outcome {
+                    Ok(in_place) => {
                         let nm = sftp
                             .metadata(&path)
                             .await
@@ -393,20 +501,24 @@ pub(in crate::ssh) async fn handle_fs_op(
                             path: path.clone(),
                             mtime: nm,
                             size: bytes.len() as u64,
+                            in_place,
                         });
                         Ok((
-                            match crate::i18n::current() {
-                                crate::i18n::Lang::Zh => format!("已保存：{path}"),
-                                crate::i18n::Lang::En => format!("Saved: {path}"),
+                            match (crate::i18n::current(), in_place) {
+                                (crate::i18n::Lang::Zh, false) => format!("已保存：{path}"),
+                                (crate::i18n::Lang::En, false) => format!("Saved: {path}"),
+                                (crate::i18n::Lang::Zh, true) =>
+                                    format!("已保存（目录不可写，直接覆盖写入）：{path}"),
+                                (crate::i18n::Lang::En, true) =>
+                                    format!("Saved in place (directory not writable): {path}"),
                             },
                             None,
                         ))
                     }
-                    Err(e) => {
+                    Err(raw) => {
                         // 专用失败事件（带路径）：UI 据此复位 saving、保留 dirty，不再只有匿名 Error。
                         // russh-sftp Status 的 Display 会整串重复（「No such file: No such file」），
                         // 经 dedup_status 折叠后再上报（与读取路径一致）。
-                        let raw = e.to_string();
                         sink.send(WorkerEvent::FileSaveFailed {
                             id,
                             path: path.clone(),

@@ -49,6 +49,28 @@ pub(super) fn perm_only_attrs(mode: u32) -> russh_sftp::protocol::FileAttributes
     }
 }
 
+/// 只设置 size 的属性（截断用）。同 [`perm_only_attrs`]：不能用 `..Default::default()`。
+pub(super) fn size_only_attrs(size: u64) -> russh_sftp::protocol::FileAttributes {
+    russh_sftp::protocol::FileAttributes {
+        size: Some(size),
+        uid: None,
+        user: None,
+        gid: None,
+        group: None,
+        permissions: None,
+        atime: None,
+        mtime: None,
+    }
+}
+
+pub(super) fn is_sftp_permission_denied(e: &russh_sftp::client::error::Error) -> bool {
+    matches!(
+        e,
+        russh_sftp::client::error::Error::Status(s)
+            if s.status_code == russh_sftp::protocol::StatusCode::PermissionDenied
+    )
+}
+
 pub(super) fn is_sftp_not_found(e: &russh_sftp::client::error::Error) -> bool {
     matches!(
         e,
