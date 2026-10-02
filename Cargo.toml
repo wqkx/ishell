@@ -112,6 +112,8 @@ glutin = { path = "vendor/glutin" }
 eframe = { path = "vendor/eframe" }
 # vt100 0.16.2 在任何 DECSTBM 滚动区域启用时都丢弃被推出顶部的行；Codex 等
 # inline TUI 使用从第 1 行开始的滚动区域写入原生历史，因此需要保留这些行。
+# 另一处补丁：宽字符因行尾只剩一格被推到下一行时，把该行标记为软换行（`screen.rs` 里
+# `pushed_wide`）——否则复制 / 查找 / 缩放重排会把一条中文长行当成两行。升级 vendor 时别丢。
 vt100 = { path = "vendor/vt100" }
 
 [profile.release]

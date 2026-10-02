@@ -1878,11 +1878,18 @@ impl App {
             .cross_copy_jobs
             .iter()
             .flat_map(|j| [j.deadline, j.phase_deadline]);
+        // 编辑器的保存超时：编辑器是独立窗口，主窗口可能正空闲 / 最小化着
+        let saves: Vec<Instant> = super::util::lock_mutex(&self.editor_state)
+            .tabs
+            .iter()
+            .filter_map(|t| t.save_deadline)
+            .collect();
         let next = consents
             .into_iter()
             .flatten()
             .chain(sessions)
             .chain(jobs)
+            .chain(saves)
             .min();
         if let Some(deadline) = next {
             self.ctx

@@ -2885,3 +2885,51 @@ fn the_find_highlight_follows_its_line_as_output_scrolls() {
         }
     }
 }
+
+/// 宽字符折行留下的那格空白，不能在别的消费方那里变成一个真空格：缩放重排后文字要连着，
+/// 跨折行处的查找也要搜得到。
+#[test]
+fn the_gap_left_by_a_pushed_wide_char_never_becomes_a_space() {
+    let mut t = Terminal::new();
+    t.resize(10, 5);
+    t.feed("abcdefghi中文\r\n".as_bytes());
+    find_in(&mut t, "i中");
+    assert_eq!(t.find.as_ref().unwrap().hits.len(), 1, "跨折行处搜不到");
+    // 先缩小（走重排路径）再看：一行放得下了，文字必须连着
+    t.resize(30, 4);
+    assert!(
+        t.screen_text().contains("abcdefghi中文"),
+        "重排后内容变了：{:?}",
+        t.screen_text()
+    );
+}
+
+/// 拖窗口的角：同时变高又变窄。宽度变了就得回流——原先只要变高就走「直接改尺寸」，
+/// 每一行超出新宽度的部分被直接截掉，既不显示也不进历史。同时回滚缓冲不能因此被吸回
+/// 可见区（那是变高时不回流的本意）。
+#[test]
+fn growing_taller_while_changing_width_still_reflows() {
+    let mut t = Terminal::new();
+    t.resize(20, 6);
+    for i in 0..30 {
+        t.feed(format!("row{i:02} 0123456789abcd\r\n").as_bytes());
+    }
+    let sb_before = {
+        t.parser.screen_mut().set_scrollback(usize::MAX);
+        let m = t.parser.screen().scrollback();
+        t.parser.screen_mut().set_scrollback(0);
+        m
+    };
+    t.resize(12, 9); // 更高、更窄
+    let all = t.collect_lines().join("");
+    for i in 0..30 {
+        assert!(
+            all.contains(&format!("row{i:02} 0123456789abcd")),
+            "第 {i} 行被截断了：变窄后超出的部分丢了"
+        );
+    }
+    t.parser.screen_mut().set_scrollback(usize::MAX);
+    let sb_after = t.parser.screen().scrollback();
+    t.parser.screen_mut().set_scrollback(0);
+    assert!(sb_after >= sb_before, "回滚缓冲被吸回可见区：{sb_before} → {sb_after}");
+}

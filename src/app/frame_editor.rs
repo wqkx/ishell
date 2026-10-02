@@ -283,7 +283,7 @@ impl App {
 
     pub(super) fn process_editor_save_events(
         &mut self,
-        ui: &mut egui::Ui,
+        ctx: &egui::Context,
         saved: Vec<(u64, u64, String, u32)>,
         conflicts: Vec<(u64, u64, String)>,
         save_progress: Vec<(u64, String, u64, u64)>,
@@ -403,17 +403,16 @@ impl App {
                         crate::i18n::Lang::Zh => format!("保存失败：{message}"),
                         crate::i18n::Lang::En => format!("Save failed: {message}"),
                     },
-                    ui.input(|i| i.time),
+                    ctx.input(|i| i.time),
                 ));
             }
             // 「保存并关闭」：确认成功后移除标签
             for (uid, tid) in close_after_save {
                 if let Some(i) = ed.tabs.iter().position(|t| t.uid == uid && t.tid == tid) {
-                    ed.remove_tab_at(ui.ctx(), i);
+                    ed.remove_tab_at(ctx, i);
                 }
             }
-            ui.ctx()
-                .request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+            ctx.request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
         }
     }
 
@@ -427,7 +426,7 @@ impl App {
     /// 收尾「珊瑚→绿」保存动画（复用失败分支的 save_at/save_done_at 清理），并把该 save_op
     /// 记入 save_tombstones——这样即便底层 SFTP 操作最终返回，那条迟到事件也会被识别、丢弃，
     /// 不会误更新一个可能已被用户关闭 / 已重试保存的标签。
-    pub(super) fn check_editor_save_timeouts(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn check_editor_save_timeouts(&mut self, ctx: &egui::Context) {
         const MAX_TOMBSTONES: usize = 32;
         let now_i = std::time::Instant::now();
         let mut ed = lock_mutex(&self.editor_state);
@@ -467,9 +466,8 @@ impl App {
                     "Save timed out; check your network connection".to_string()
                 }
             },
-            ui.input(|i| i.time),
+            ctx.input(|i| i.time),
         ));
-        ui.ctx()
-            .request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
+        ctx.request_repaint_of(egui::ViewportId::from_hash_of("ishell_editor"));
     }
 }

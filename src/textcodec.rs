@@ -35,7 +35,9 @@ pub(crate) fn encode_for_save(
     encoding: &str,
 ) -> Result<Vec<u8>, String> {
     let text = match eol {
-        crate::proto::Eol::Crlf => content.replace('\n', "\r\n"),
+        // 先归一再展开：混合行尾的文件是按 LF 打开的、内容里还留着 `\r`，直接把 `\n` 换成
+        // `\r\n` 会把原本就是 CRLF 的行写成 `\r\r\n`。
+        crate::proto::Eol::Crlf => content.replace("\r\n", "\n").replace('\n', "\r\n"),
         crate::proto::Eol::Lf => content,
     };
     if encoding == UTF8_BOM {
@@ -152,6 +154,16 @@ mod tests {
         assert_eq!(split_eol("a\nb\n".into()), ("a\nb\n".into(), Eol::Lf));
         assert_eq!(split_eol("a\r\nb\n".into()), ("a\r\nb\n".into(), Eol::Lf));
         assert_eq!(split_eol("no newline".into()), ("no newline".into(), Eol::Lf));
+    }
+
+    /// 混合行尾的文件按 LF 打开、内容里留着 `\r`。用户在状态栏切到 CRLF 再保存，是要把
+    /// 整个文件统一成 CRLF——原本就是 CRLF 的行不能变成 `\r\r\n`。
+    #[test]
+    fn switching_a_mixed_file_to_crlf_does_not_double_the_cr() {
+        let (content, eol) = split_eol("a\r\nb\nc\r\n".into());
+        assert_eq!(eol, Eol::Lf);
+        let out = encode_for_save(content, Eol::Crlf, "UTF-8").unwrap();
+        assert_eq!(out, b"a\r\nb\r\nc\r\n");
     }
 
     /// 目标编码表示不了的字符：拒绝保存，而不是写成 `&#20013;` 再报「已保存」。

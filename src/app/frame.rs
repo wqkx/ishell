@@ -45,8 +45,27 @@ impl App {
         let mut temp_key_untrusted: Vec<(u64, bool, String)> = Vec::new();
         let mut direct_relay_started: Vec<u64> = Vec::new();
         let mut direct_relay_done: Vec<(u64, bool, String)> = Vec::new();
+        // 编辑器的保存结果也在这里收：编辑器是**独立的 OS 窗口**，主窗口最小化时用户照样
+        // 能在里面按保存。放在 `ui` 那条路径上的话，保存既等不到确认、也等不到超时——
+        // 标签一直卡在「保存中」，「保存并关闭」永远不关。
+        let mut saved: Vec<(u64, u64, String, u32)> = Vec::new(); // uid, id, path, mtime
+        let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
+        let mut conflicts: Vec<(u64, u64, String)> = Vec::new(); // uid, id, path
+        let mut save_failed: Vec<(u64, u64, String, String)> = Vec::new(); // uid, id, path, message
         for s in &mut self.sessions {
             backlog |= s.drain_events();
+            for (id, path, mtime) in s.pending.saved.drain(..) {
+                saved.push((s.uid, id, path, mtime));
+            }
+            for (path, done, total) in s.pending.save_progress.drain(..) {
+                save_progress.push((s.uid, path, done, total));
+            }
+            for (id, path) in s.pending.conflict.drain(..) {
+                conflicts.push((s.uid, id, path));
+            }
+            for (id, path, msg) in s.pending.save_failed.drain(..) {
+                save_failed.push((s.uid, id, path, msg));
+            }
             for x in s.pending.relay_source.drain(..) {
                 relay_source.push(x);
             }
@@ -69,6 +88,11 @@ impl App {
         // 必须在上面那轮 drain_events **之后**：文件读写的超时判定要晚于「本帧事件是否已经
         // 带来真正结果」，否则会跟刚好本帧到达的完成事件打时序竞争（见该方法注释）。
         self.check_file_op_timeouts();
+        self.process_editor_save_events(ctx, saved, conflicts, save_progress, save_failed);
+        // 必须在 process_editor_save_events 之后：保存超时判定要晚于「本帧是否已带来真正的
+        // 保存结果」的处理，否则会与刚好本帧到达的 FileSaved/Failed/Conflict 打时序竞争
+        //（明明已成功却先被判超时）。理由同 check_file_op_timeouts。
+        self.check_editor_save_timeouts(ctx);
         self.advance_cross_copy_jobs(
             temp_key_trusted,
             temp_key_untrusted,
@@ -296,10 +320,6 @@ impl App {
         let mut load_progress: Vec<(u64, u64, u64, u64)> = Vec::new(); // uid, id, done, total
         let mut load_fail: Vec<(u64, u64)> = Vec::new(); // uid, id
         let mut new_images: Vec<(String, Vec<u8>, String, u64)> = Vec::new(); // path, data, title, uid
-        let mut saved: Vec<(u64, u64, String, u32)> = Vec::new(); // uid, id, path, mtime
-        let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
-        let mut conflicts: Vec<(u64, u64, String)> = Vec::new(); // uid, id, path
-        let mut save_failed: Vec<(u64, u64, String, String)> = Vec::new(); // uid, id, path, message
         let mut warns: Vec<String> = Vec::new(); // 需弹 toast 的警告
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
         let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
@@ -330,23 +350,11 @@ impl App {
             for (id, path, content, encoding, eol, mtime) in s.pending.open.drain(..) {
                 filled.push((s.uid, id, path, content, encoding, eol, mtime));
             }
-            for (id, path, mtime) in s.pending.saved.drain(..) {
-                saved.push((s.uid, id, path, mtime));
-            }
-            for (path, done, total) in s.pending.save_progress.drain(..) {
-                save_progress.push((s.uid, path, done, total));
-            }
             for (path, data, offset, truncated) in s.pending.tail.drain(..) {
                 tails.push((s.uid, path, data, offset, truncated));
             }
-            for (id, path) in s.pending.conflict.drain(..) {
-                conflicts.push((s.uid, id, path));
-            }
             for w in s.pending.warn.drain(..) {
                 warns.push(w);
-            }
-            for (id, path, msg) in s.pending.save_failed.drain(..) {
-                save_failed.push((s.uid, id, path, msg));
             }
             for (id, path, size) in s.pending.too_large.drain(..) {
                 too_large.push((s.uid, id, path, size));
@@ -470,9 +478,11 @@ impl App {
                     }
                     if truncated {
                         t.tail_carry.clear(); // 旧文件残留的半个字符不能拼到新内容前面
-                        t.editor.append_tail(crate::i18n::tr(
-                            "\n--- 文件被截断/轮转，以下为新内容 ---\n",
-                            "\n--- file truncated/rotated, new content follows ---\n",
+                        // 只在状态栏提示，不往缓冲里写字：写进去的话，退出跟随后再保存，
+                        // 这行提示就成了文件内容。
+                        t.editor.set_status(crate::i18n::tr(
+                            "文件被截断/轮转，其后为新文件的内容",
+                            "File was truncated/rotated; what follows is the new file",
                         ));
                     }
                     if !data.is_empty() {
@@ -573,11 +583,7 @@ impl App {
             new_docs,
             pdf_searches,
         );
-        self.process_editor_save_events(ui, saved, conflicts, save_progress, save_failed);
-        // 必须在 process_editor_save_events 之后：保存超时判定要晚于「本帧是否已带来真正的
-        // 保存结果」的处理，否则会与刚好本帧到达的 FileSaved/Failed/Conflict 打时序竞争
-        //（明明已成功却先被判超时）。理由同 check_file_op_timeouts。
-        self.check_editor_save_timeouts(ui);
+        // 编辑器的保存结果与保存超时不在这里处理：见 `pump_background`。
 
         // 断线自动重连：到点的执行重连，并安排下次唤醒（即使无交互也能触发）
         let now = std::time::Instant::now();

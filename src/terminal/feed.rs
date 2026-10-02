@@ -671,7 +671,8 @@ impl Terminal {
         let rows = self.rows as usize;
         let cols = self.cols;
         // 按「全局行索引」去重收集每行的序列化字节（与 collect_lines 同样的遍历方式）
-        let mut lines: Vec<Vec<u8>> = Vec::new();
+        // 每行连同它的软换行标志：软换行的行与下一行本是同一条逻辑行
+        let mut lines: Vec<(Vec<u8>, bool)> = Vec::new();
         let mut off = sb;
         loop {
             self.parser.screen_mut().set_scrollback(off);
@@ -683,7 +684,10 @@ impl Terminal {
                     if idx < lines.len() {
                         continue;
                     }
-                    lines.push(serialize_row(screen, r as u16, cols));
+                    lines.push((
+                        serialize_row(screen, r as u16, cols),
+                        screen.row_wrapped(r as u16),
+                    ));
                 }
             }
             if off == 0 {
@@ -693,15 +697,20 @@ impl Terminal {
         }
         self.parser.screen_mut().set_scrollback(saved);
         // 去掉末尾空行（多为放大补出的空白/未用行），重放后内容自然贴底
-        while lines.last().is_some_and(|l| l.is_empty()) {
+        while lines.last().is_some_and(|(l, _)| l.is_empty()) {
             lines.pop();
         }
         let mut out = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if i > 0 {
+        let mut joined = false; // 上一行是软换行：这一行接在它后面，不补换行
+        for (i, (line, wrapped)) in lines.iter().enumerate() {
+            // 软换行处不写换行，重放时由新宽度重新折行——这才是真正的回流。一律写换行的话，
+            // 变宽后折开的长命令 / 链接接不回去；宽字符折行（行尾留一格空）的行更是会在
+            // 中间多出一个硬换行。
+            if i > 0 && !joined {
                 out.extend_from_slice(b"\r\n");
             }
             out.extend_from_slice(line);
+            joined = *wrapped;
         }
         out
     }
@@ -1115,7 +1124,8 @@ impl Terminal {
         if cols == self.cols && rows == self.rows {
             return false;
         }
-        if self.parser.screen().alternate_screen() || rows > self.rows {
+        let alt = self.parser.screen().alternate_screen();
+        if alt || (rows > self.rows && cols == self.cols) {
             // 备用屏由应用收到 SIGWINCH 后自行重绘。普通屏放高时也必须直接扩容：如果把
             // scrollback 序列化后按更高的视口重放，历史行会被吸回可见区；Codex 等 TUI
             // 随后的清屏重绘会覆盖这些行，表现为 max scrollback 在缩小再放大后归零。
@@ -1127,9 +1137,36 @@ impl Terminal {
             let prev_sb = self.scrollback;
             let data = self.serialize_buffer();
             let restore = Self::mode_restore_bytes(self.parser.screen());
-            let mut np = vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK);
+            // 同时变高又改了宽度：宽度变了必须回流（直接 set_size 会把每行右侧截掉、不进历史），
+            // 但不能按更高的视口重放（见上面的说明：历史行会被吸回可见区）。所以按**原来的
+            // 行数**和新宽度回流，再原地加高——加出来的是底部空白，回滚缓冲原样保留。
+            let reflow_rows = rows.min(self.rows);
+            // 序列化会裁掉末尾的空行（缩小时让内容贴底）。加高时不该贴底：光标若停在最后
+            // 一行内容下面的空行上（刚输出完、提示符还没来），裁掉它就等于少了一行，
+            // 回滚行数跟着变。把光标到最后一行内容之间的空行补回去。
+            let blank_tail = if rows > self.rows {
+                self.parser.screen_mut().set_scrollback(0);
+                let screen = self.parser.screen();
+                let last_text = screen
+                    .rows(0, self.cols)
+                    .enumerate()
+                    .filter(|(_, l)| !l.is_empty())
+                    .map(|(i, _)| i)
+                    .last();
+                let cursor_row = screen.cursor_position().0 as usize;
+                last_text.map_or(0, |l| cursor_row.saturating_sub(l))
+            } else {
+                0
+            };
+            let mut np = vt100::Parser::new(reflow_rows, cols, DEFAULT_SCROLLBACK);
             np.process(&data);
+            for _ in 0..blank_tail {
+                np.process(b"\r\n");
+            }
             np.process(&restore);
+            if rows > reflow_rows {
+                np.screen_mut().set_size(rows, cols);
+            }
             self.parser = np;
             self.cols = cols;
             self.rows = rows;
