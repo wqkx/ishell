@@ -139,7 +139,7 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
                 last.inserted.push_str(inserted);
                 last.caret_after = ed.vcaret;
                 ed.vredo.clear();
-                ed.dirty_flag = true;
+                mark_edited(ed);
                 v_recompute(ed);
                 return;
             }
@@ -156,8 +156,21 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
         ed.vundo.remove(0);
     }
     ed.vredo.clear();
-    ed.dirty_flag = true; // 任何编辑必然离开保存点（回到保存点只能靠 undo，由 v_undo 重算）
+    mark_edited(ed);
     v_recompute(ed);
+}
+
+/// 一次编辑之后更新「有改动」标记。
+///
+/// 绝大多数编辑都离开了保存点，直接置位即可（O(1)，不比较全文）。但编辑也可能恰好**回到**
+/// 保存点——敲一个字再退格删掉——那时不该还显示「已修改」、关标签时还提示保存一个其实
+/// 没动过的文件。长度不同就一定不同；只有长度碰巧相等时才值得比一次内容。
+fn mark_edited(ed: &mut Editor) {
+    if ed.content.len() == ed.orig.len() {
+        ed.recompute_dirty();
+    } else {
+        ed.dirty_flag = true;
+    }
 }
 /// 粘贴文本归一成 LF（内部统一用 LF，保存时按文件行尾还原）。
 pub(super) fn normalize_paste(t: &str) -> String {
@@ -751,6 +764,23 @@ mod tests {
         ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
         v_recompute(&mut ed);
         ed
+    }
+
+    /// 编辑恰好回到保存时的内容（敲一个字又删掉）：不该还算「已修改」。
+    #[test]
+    fn editing_back_to_the_saved_content_is_clean() {
+        let mut ed = ed_rs("abc");
+        v_insert(&mut ed, "x");
+        assert!(ed.dirty());
+        v_backspace(&mut ed);
+        assert_eq!(ed.content, "abc");
+        assert!(!ed.dirty(), "内容已回到保存点，仍显示已修改");
+        // 长度相等但内容不同：仍是已修改
+        ed.vcaret = 0;
+        ed.vsel = Some(1);
+        v_insert(&mut ed, "z");
+        assert_eq!(ed.content, "zbc");
+        assert!(ed.dirty());
     }
 
     /// 什么都没改的「编辑」不是编辑：不该置 dirty、不该占一条撤销记录、不该清空重做栈。
