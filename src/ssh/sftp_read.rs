@@ -40,10 +40,12 @@ pub(in crate::ssh) async fn tail_file(
         return;
     }
     if size < offset {
+        // 截断/轮转：下一次从新文件的**开头**读。回报 size 的话，轮转后已经写进去的那些
+        // 内容会被整段跳过——而提示文案说的是「以下为新内容」。
         sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
             data: Vec::new(),
-            offset: size,
+            offset: 0,
             truncated: true,
         });
         return;
@@ -191,11 +193,7 @@ pub(in crate::ssh) async fn read_file_chunked(
             }
             // 探测编码并解码（UTF-8 优先，非 UTF-8 用 chardetng 猜 GBK/GB18030 等），再把行尾统一成 LF
             let (decoded, encoding) = decode_text(&data);
-            let (content, eol) = if decoded.contains("\r\n") {
-                (decoded.replace("\r\n", "\n"), crate::proto::Eol::Crlf)
-            } else {
-                (decoded, crate::proto::Eol::Lf)
-            };
+            let (content, eol) = crate::textcodec::split_eol(decoded);
             sink.send(WorkerEvent::FileOpened {
                 id,
                 path: path.to_string(),

@@ -10,7 +10,11 @@ use super::App;
 impl App {
     /// 关闭活动标签前的二次确认（会话仍连接时）。
     pub(super) fn close_tab_dialog(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.pending_close_tab else {
+        let Some(uid) = self.pending_close_tab else {
+            return;
+        };
+        let Some(idx) = self.session_idx_by_uid(uid) else {
+            self.pending_close_tab = None; // 会话已不在
             return;
         };
         // 若该会话已不在，或已断开、不是 AI 会话、名下也没有未保存的编辑器标签，则无需确认

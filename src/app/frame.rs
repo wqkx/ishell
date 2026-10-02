@@ -469,31 +469,22 @@ impl App {
                         continue; // 已关闭跟随：丢弃迟到的数据
                     }
                     if truncated {
+                        t.tail_carry.clear(); // 旧文件残留的半个字符不能拼到新内容前面
                         t.editor.append_tail(crate::i18n::tr(
                             "\n--- 文件被截断/轮转，以下为新内容 ---\n",
                             "\n--- file truncated/rotated, new content follows ---\n",
                         ));
                     }
                     if !data.is_empty() {
-                        // 跨块解码：与上一块留下的不完整尾字节拼接；UTF-8 时把本块末尾
-                        // 不完整的多字节序列留到下一块（跨块字符不再变 �）
+                        // 跨块解码：与上一块留下的尾字节拼接，再把本块末尾「还没读完」的部分
+                        //（被切开的多字节字符、可能是 CRLF 前一半的 \r）留到下一块。
                         let mut bytes = std::mem::take(&mut t.tail_carry);
                         bytes.extend_from_slice(&data);
-                        let enc = encoding_rs::Encoding::for_label(t.editor.encoding().as_bytes())
-                            .unwrap_or(encoding_rs::UTF_8);
-                        if enc == encoding_rs::UTF_8 {
-                            let valid = match std::str::from_utf8(&bytes) {
-                                Ok(_) => bytes.len(),
-                                Err(e) => e.valid_up_to(),
-                            };
-                            // 仅当截断发生在末尾 ≤3 字节内才视为「不完整序列」暂存；
-                            // 中间的真实坏字节照常替换输出，避免 carry 死循环
-                            if bytes.len() - valid <= 3 && valid < bytes.len() {
-                                t.tail_carry = bytes.split_off(valid);
-                            }
-                        }
+                        let enc = crate::textcodec::encoding_for(t.editor.encoding());
+                        let keep = crate::textcodec::tail_carry_len(enc, &bytes);
+                        t.tail_carry = bytes.split_off(bytes.len() - keep);
                         if !bytes.is_empty() {
-                            let (cow, _, _) = enc.decode(&bytes);
+                            let (cow, _) = enc.decode_without_bom_handling(&bytes);
                             let txt = cow.replace("\r\n", "\n");
                             t.editor.append_tail(&txt);
                         }
@@ -503,7 +494,7 @@ impl App {
             for t in edst.tabs.iter_mut() {
                 if t.editor.follow {
                     any_follow = true;
-                    if !t.tail_pending && t.tail_offset != u64::MAX && now - t.tail_last > 1.0 {
+                    if super::session::tail_poll_due(t.tail_pending, now - t.tail_last) {
                         t.tail_pending = true;
                         t.tail_last = now;
                         let _ = t.cmd_tx.send(UiCommand::TailFile {

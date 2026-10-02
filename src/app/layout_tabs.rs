@@ -432,7 +432,7 @@ impl App {
                             })
                             .unwrap_or(false);
                         if need_confirm {
-                            self.pending_close_tab = Some(i);
+                            self.pending_close_tab = self.sessions.get(i).map(|s| s.uid);
                         } else {
                             self.close_session(i);
                         }

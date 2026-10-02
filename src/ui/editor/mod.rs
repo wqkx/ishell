@@ -377,6 +377,14 @@ impl Editor {
             self.pending_scroll = Some(self.vlines.len().saturating_sub(1));
         }
     }
+    /// 内容里有解码失败留下的替换字符（�）。
+    pub fn has_undecodable(&self) -> bool {
+        self.content.contains('\u{FFFD}')
+    }
+    /// 状态栏提示文字。
+    pub fn set_status(&mut self, s: &str) {
+        self.status = s.to_string();
+    }
     pub fn set_loading(&mut self, v: bool) {
         self.loading = v;
     }

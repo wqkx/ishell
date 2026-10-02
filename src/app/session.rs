@@ -769,6 +769,15 @@ pub(super) fn session_close_needs_confirm(
     connected || ai_owned || dirty_tabs > 0
 }
 
+/// 跟随（tail -f）该不该发下一次读取请求。`since` = 距上次发请求的秒数。
+///
+/// 正常节奏是「上一个请求回来了、且过了 1 秒」。但回包可能永远不来——断线重连时旧 worker
+/// 连同在途请求一起没了、或 SFTP 还没就绪时请求被直接丢弃——所以等待中的请求过了 10 秒
+/// 就当它丢了、重新发。不设这个兜底的话，状态栏一直显示「跟随」，内容却再也不动。
+pub(super) fn tail_poll_due(pending: bool, since: f64) -> bool {
+    since > if pending { 10.0 } else { 1.0 }
+}
+
 /// 重连后恢复目录要替用户敲的命令。目录里有控制字符就不恢复（返回 None）。
 ///
 /// 单引号转义挡得住 shell 元字符，挡不住**行编辑器**：`^U` 清行、回车提交，都在引号
@@ -783,7 +792,15 @@ pub(super) fn cwd_restore_command(cwd: &str) -> Option<String> {
 
 #[cfg(test)]
 mod close_and_restore_tests {
-    use super::{cwd_restore_command, session_close_needs_confirm as need};
+    use super::{cwd_restore_command, session_close_needs_confirm as need, tail_poll_due};
+
+    #[test]
+    fn a_lost_tail_reply_does_not_stall_follow_forever() {
+        assert!(!tail_poll_due(false, 0.5));
+        assert!(tail_poll_due(false, 1.5));
+        assert!(!tail_poll_due(true, 5.0), "请求还在途，不重复发");
+        assert!(tail_poll_due(true, 11.0), "等了 10 秒没回音：当它丢了");
+    }
 
     /// 断开的普通会话原先直接关、不问——连同它名下没保存的编辑器标签一起。
     #[test]

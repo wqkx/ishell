@@ -115,6 +115,15 @@ impl App {
                     if large {
                         editor.readonly = true;
                     }
+                    // 解码时有字节认不出来（已显示成 �）：原字节在内存里已经没了，一保存就把
+                    // 替换字符写回文件。先只读打开，由用户看过之后自己决定要不要解除。
+                    if editor.has_undecodable() {
+                        editor.readonly = true;
+                        editor.set_status(crate::i18n::tr(
+                            "含无法按当前编码解码的字节（显示为 �），已只读打开——保存会改坏这些字节",
+                            "Contains bytes that could not be decoded (shown as �); opened read-only",
+                        ));
+                    }
                     if let Some(line) = crate::store::load_cursor_line(&key) {
                         editor.restore_line(line);
                     }
@@ -311,7 +320,17 @@ impl App {
                                                                     // save_tombstones 是显式识别：命中即「已超时判定过」，直接跳过，不做任何状态更新。
             for (uid, id, _path, mtime) in saved {
                 if ed.save_tombstones.contains(&id) {
-                    continue; // 超时后姗姗来迟的成功事件：已判超时，丢弃（标签或已关闭 / 已重试）
+                    // 超时后姗姗来迟的成功事件：已判超时，保存状态不再动（标签或已关闭 / 已重试）。
+                    // 但那次写入**确实落盘了**，远端 mtime 已是它的——不回填的话，下一次保存
+                    // 必然被判成「文件已被外部修改」。
+                    if let Some(t) = ed
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.uid == uid && t.editor.path == _path && !t.is_saving())
+                    {
+                        t.editor.set_mtime(mtime);
+                    }
+                    continue;
                 }
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.save_op == id) {
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动

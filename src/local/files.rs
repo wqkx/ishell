@@ -262,11 +262,7 @@ async fn read_file(path: &str, force: bool, id: u64, sink: &UiSink) {
                 return;
             }
             let (decoded, encoding) = decode_text(&data);
-            let (content, eol) = if decoded.contains("\r\n") {
-                (decoded.replace("\r\n", "\n"), Eol::Crlf)
-            } else {
-                (decoded, Eol::Lf)
-            };
+            let (content, eol) = crate::textcodec::split_eol(decoded);
             sink.send(WorkerEvent::FileOpened {
                 id,
                 path: path.to_string(),
@@ -320,22 +316,18 @@ async fn write_file(
     }
 
     // 内部统一 LF → 按原文件行尾还原；再按原编码编码，避免破坏非 UTF-8 文件 / 改动行尾。
-    let text = match eol {
-        Eol::Crlf => content.replace('\n', "\r\n"),
-        Eol::Lf => content,
+    // 目标编码表示不了的字符：不写（见 encode_for_save）。
+    let bytes = match crate::textcodec::encode_for_save(content, eol, encoding) {
+        Ok(b) => b,
+        Err(message) => {
+            sink.send(WorkerEvent::FileSaveFailed {
+                id,
+                path: path.to_string(),
+                message,
+            });
+            return;
+        }
     };
-    let enc = encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
-    let (bytes, _, had_unmappable) = enc.encode(&text);
-    if had_unmappable {
-        sink.send(WorkerEvent::Status(match crate::i18n::current() {
-            crate::i18n::Lang::Zh => {
-                format!("⚠ 部分字符无法用 {encoding} 编码，已按替代形式写入：{path}")
-            }
-            crate::i18n::Lang::En => {
-                format!("⚠ Some chars aren't representable in {encoding}; written as substitutions: {path}")
-            }
-        }));
-    }
 
     let total = bytes.len() as u64;
     sink.send(WorkerEvent::FileSaveProgress {
@@ -351,7 +343,7 @@ async fn write_file(
             let _ = tokio::fs::create_dir_all(parent).await;
         }
     }
-    match atomic_write(path, bytes.as_ref()).await {
+    match atomic_write(path, &bytes).await {
         Ok(()) => {
             sink.send(WorkerEvent::FileSaveProgress {
                 path: path.to_string(),

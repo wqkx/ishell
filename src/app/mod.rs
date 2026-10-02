@@ -87,7 +87,9 @@ pub struct App {
     /// 显示"确认退出"对话框
     show_close_confirm: bool,
     /// 待确认关闭的标签（仅当该会话仍连接中时弹确认）
-    pending_close_tab: Option<usize>,
+    /// 待确认关闭的会话（记 uid 而不是下标：确认框开着时别的会话可能被关掉——比如 AI
+    /// 关了它自己的会话——下标会指到另一个会话上，点「关闭」就关错了）
+    pending_close_tab: Option<u64>,
     /// 已确认可以关闭
     allow_close: bool,
     /// 编辑器状态：放在 Arc<Mutex> 里，供 deferred viewport 回调（'static + Send + Sync，

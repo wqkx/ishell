@@ -406,6 +406,7 @@ impl App {
                     } else if !t.editor.dirty() && t.load_id.is_none() {
                         t.editor.follow = true;
                         t.tail_offset = u64::MAX;
+                        t.tail_carry.clear();
                         t.tail_pending = true;
                         t.tail_last = now;
                         // 初始化：只取当前文件大小（相当于 tail -f -n 0），此后每 ~1s 增量拉取

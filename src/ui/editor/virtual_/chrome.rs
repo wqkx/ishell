@@ -152,7 +152,7 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                     // 编码：点击从菜单选择（保存时按所选编码写回）
                     ui.menu_button(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0), |ui| {
                         ui.set_min_width(120.0);
-                        for enc in ["UTF-8", "GBK", "GB18030", "Big5", "Shift_JIS", "EUC-KR", "windows-1252", "ISO-8859-1"] {
+                        for enc in ["UTF-8", crate::textcodec::UTF8_BOM, "GBK", "GB18030", "Big5", "Shift_JIS", "EUC-KR", "windows-1252", "ISO-8859-1"] {
                             if ui.selectable_label(ed.encoding() == enc, enc).clicked() {
                                 ed.set_encoding(enc.to_string());
                                 ui.close();

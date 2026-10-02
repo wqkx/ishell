@@ -355,26 +355,21 @@ pub(in crate::ssh) async fn handle_fs_op(
             } else {
                 false
             };
+            // 内部统一 LF → 按原文件行尾还原；再按原编码编码后写回，避免破坏非 UTF-8 文件 / 改动行尾。
+            // 目标编码表示不了的字符：不写（见 encode_for_save）。
+            let encoded = if conflict {
+                None
+            } else {
+                Some(crate::textcodec::encode_for_save(content, eol, &encoding))
+            };
             if conflict {
                 sink.send(WorkerEvent::FileSaveConflict { id, path });
                 Ok((String::new(), None))
+            } else if let Some(Err(message)) = encoded {
+                sink.send(WorkerEvent::FileSaveFailed { id, path, message });
+                Ok((String::new(), None))
             } else {
-                // 内部统一 LF → 按原文件行尾还原；再按原编码编码后写回，避免破坏非 UTF-8 文件 / 改动行尾。
-                let text = match eol {
-                    crate::proto::Eol::Crlf => content.replace('\n', "\r\n"),
-                    crate::proto::Eol::Lf => content,
-                };
-                let enc = encoding_rs::Encoding::for_label(encoding.as_bytes())
-                    .unwrap_or(encoding_rs::UTF_8);
-                // 第三个返回值 had_unmappable=true 表示有字符无法用目标编码表示（被替换为
-                // 数字字符引用等），保存不再静默——提示用户该编码丢失了字符。
-                let (bytes, _, had_unmappable) = enc.encode(&text);
-                if had_unmappable {
-                    sink.send(WorkerEvent::Status(match crate::i18n::current() {
-                        crate::i18n::Lang::Zh => format!("⚠ 部分字符无法用 {encoding} 编码，已按替代形式写入：{path}"),
-                        crate::i18n::Lang::En => format!("⚠ Some chars aren't representable in {encoding}; written as substitutions: {path}"),
-                    }));
-                }
+                let bytes = encoded.and_then(Result::ok).unwrap_or_default();
                 // 与 copy_to_remote 对齐：父目录不存在时自动逐级创建——copy 家族的工具描述
                 // 承诺过「所在目录不存在会自动创建」，write_file 此前照 SFTP 默认直写，目录
                 // 缺失就裸抛一个 Status 错误，同一套 MCP 接口里两个工具行为不一致。先探一次
@@ -385,7 +380,7 @@ pub(in crate::ssh) async fn handle_fs_op(
                 if sftp.metadata(&parent).await.is_err() {
                     super::create_remote_dir_all(sftp, &parent).await;
                 }
-                match sftp_write_atomic(sftp, &path, bytes.as_ref(), sink).await {
+                match sftp_write_atomic(sftp, &path, &bytes, sink).await {
                     Ok(_) => {
                         let nm = sftp
                             .metadata(&path)
