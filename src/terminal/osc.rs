@@ -1,6 +1,6 @@
 //! OSC 7 解析与 URL 打开。
 
-pub(super) fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
     // 终端输出内容不可信：先做 scheme 白名单（避免 file:// 打开本地任意文件、
     // 或恶意注册协议触发任意处理器）；裸 www. 补 https。
     let normalized = if url.to_ascii_lowercase().starts_with("www.") {

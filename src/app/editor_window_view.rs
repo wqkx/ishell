@@ -62,6 +62,7 @@ impl App {
             if vctx.egui_wants_keyboard_input() {
                 vctx.request_repaint();
             }
+            super::screenshot::save_editor_shot(vctx);
             // Ctrl+Tab / Ctrl+Shift+Tab 切换编辑器标签（先 consume，免被文本框当作 Tab 字符）
             let n = ed.tabs.len();
             if n > 1 {
@@ -81,6 +82,14 @@ impl App {
             let mut do_save = false;
             let mut toggle_find = false;
             let mut toggle_follow = false;
+            // Markdown 预览切换（Ctrl+Shift+M 或顶栏按钮；只对 Markdown 文本标签有效）。
+            // 先 consume，免得落到编辑区被当作普通按键。
+            let mut toggle_preview = vctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::M,
+                )
+            });
             // 标签栏：左侧可拖动重排的标签（仿主窗口，带跟手+缓动），右侧「保存 / 查找」
             egui::Panel::top("editor_tabs")
                 .frame(
@@ -130,6 +139,29 @@ impl App {
                                 crate::i18n::tr("查找 / 替换", "Find / replace"),
                             ) {
                                 toggle_find = true;
+                            }
+                            // Markdown 标签：源码 ⇄ 渲染预览
+                            let md_preview = ed
+                                .tabs
+                                .get(ed.active)
+                                .filter(|t| t.doc.is_none() && t.editor.is_markdown())
+                                .map(|t| t.editor.previewing());
+                            if let Some(on) = md_preview {
+                                let (ic, label) = if on {
+                                    (icon::PENCIL_SIMPLE, crate::i18n::tr("源码", "Source"))
+                                } else {
+                                    (icon::EYE, crate::i18n::tr("预览", "Preview"))
+                                };
+                                if flat_button(
+                                    ui,
+                                    &RichText::new(format!("{ic} {label}")),
+                                    crate::i18n::tr(
+                                        "切换 Markdown 源码 / 渲染预览（Ctrl+Shift+M）",
+                                        "Toggle Markdown source / preview (Ctrl+Shift+M)",
+                                    ),
+                                ) {
+                                    toggle_preview = true;
+                                }
                             }
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
@@ -252,6 +284,14 @@ impl App {
                     });
                     ed.shown = ed.active;
                 });
+            if toggle_preview {
+                let active = ed.active;
+                if let Some(t) = ed.tabs.get_mut(active) {
+                    if t.doc.is_none() {
+                        t.editor.toggle_preview();
+                    }
+                }
+            }
             if toggle_find {
                 let active = ed.active;
                 if let Some(t) = ed.tabs.get_mut(active) {

@@ -69,6 +69,10 @@ flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
 
+# 编辑器 Markdown 预览：CommonMark/GFM 拉流解析（纯 Rust）。关掉默认特性——
+# 只要事件流，不要 HTML 输出（pulldown-cmark-escape）与命令行（getopts）。
+pulldown-cmark = { version = "0.13", default-features = false }
+
 # 工具
 anyhow = "1"
 log = "0.4"

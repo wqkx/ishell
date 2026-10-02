@@ -23,7 +23,7 @@ use crate::ui::ime_safe::replace_preedit;
 /// 「内容被改到不该改的位置」。）
 ///
 /// 没有组字在进行时是无操作，可以随便调。
-pub(super) fn v_cancel_preedit(ed: &mut Editor) {
+pub(in crate::ui::editor) fn v_cancel_preedit(ed: &mut Editor) {
     let Some(r) = ed.vime_preedit.take() else {
         return;
     };

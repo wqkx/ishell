@@ -5,11 +5,12 @@ use egui::RichText;
 
 use crate::theme::Palette;
 use crate::ui::highlight::{self, Indent};
+use crate::ui::markdown;
 
 mod find;
 mod virtual_;
 
-use virtual_::{editable_virtual, v_line_of, v_recompute, v_sel_range};
+use virtual_::{editable_virtual, v_cancel_preedit, v_line_of, v_recompute, v_sel_range};
 
 pub struct Editor {
     pub path: String,
@@ -141,6 +142,12 @@ pub struct Editor {
     pub unlock_req: bool,
     /// 占位（loading）状态下的自定义文案（None = 「下载中 …」）。
     pub loading_note: Option<String>,
+    /// Markdown 预览：开启时以渲染视图替代源码编辑区（仅 Markdown 文件可开）。
+    preview: bool,
+    /// 预览的解析结果与渲染缓存（按内容版本 vver 失效）。
+    md: crate::ui::markdown::Preview,
+    /// 一次性：从预览切回源码后把键盘焦点还给编辑区。
+    refocus: bool,
 }
 
 /// 一次编辑操作：把 content[at..at+removed.len()] 由 removed 换成 inserted。
@@ -235,6 +242,32 @@ impl Editor {
             readonly: false,
             unlock_req: false,
             loading_note: None,
+            preview: false,
+            md: Default::default(),
+            refocus: false,
+        }
+    }
+
+    /// 是否 Markdown 文件（才提供渲染预览）。
+    pub fn is_markdown(&self) -> bool {
+        matches!(self.language.as_str(), "md" | "markdown" | "mdown" | "mkd")
+    }
+    /// 当前是否显示渲染预览。
+    pub fn previewing(&self) -> bool {
+        self.preview && self.is_markdown()
+    }
+    /// 源码 ⇄ 渲染预览切换（非 Markdown 文件无操作）。
+    pub fn toggle_preview(&mut self) {
+        if !self.is_markdown() {
+            return;
+        }
+        self.preview = !self.preview;
+        if self.preview {
+            // 预览期间编辑区不绘制、也不处理输入：没提交的输入法组字先撤掉，
+            // 否则那截拼音会留在正文里被渲染出来，Ctrl+S 还会把它存进文件。
+            v_cancel_preedit(self);
+        } else {
+            self.refocus = true;
         }
     }
 
@@ -254,6 +287,8 @@ impl Editor {
         }
         self.show_find = true;
         self.find_focus = true;
+        // 查找栏属于源码视图：预览中发起查找即切回源码
+        self.preview = false;
     }
     /// 兼容旧名：与 [`Self::open_find`] 相同（不再切换关闭）。
     pub fn toggle_find(&mut self) {
@@ -383,7 +418,43 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
         return false;
     }
 
+    if ed.previewing() {
+        return preview(ui, ed, text_id);
+    }
+    if ed.refocus {
+        ed.refocus = false;
+        ui.memory_mut(|m| m.request_focus(text_id));
+    }
     editable_virtual(ui, ed, text_id)
+}
+
+/// Markdown 渲染预览（替代源码编辑区）。返回 true 表示请求保存。
+fn preview(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
+    // 编辑区此时不绘制，egui 会自行收回它的焦点（聚焦控件当帧没出现即失焦），无需手动让出。
+    // 保存与查找快捷键原本由编辑区的输入处理负责，预览里要自己接
+    let save = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+        ed.open_find(); // 顺带切回源码
+        ui.ctx().request_repaint();
+        return save;
+    }
+    if ed.content.len() > markdown::PREVIEW_LIMIT {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.4);
+            ui.label(
+                RichText::new(crate::i18n::tr(
+                    "文件过大，不提供渲染预览",
+                    "File too large to preview",
+                ))
+                .size(12.0)
+                .color(Palette::TEXT_DIM),
+            );
+        });
+        return save;
+    }
+    ed.md.sync(&ed.content, ed.vver);
+    markdown::show(ui, &mut ed.md, text_id.with("md_preview"));
+    save
 }
 
 #[cfg(test)]
@@ -405,5 +476,137 @@ mod dirty_tests {
         assert!(ed.dirty());
         ed.mark_saved();
         assert!(!ed.dirty());
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    const CTRL: egui::Modifiers = egui::Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: false,
+        mac_cmd: false,
+        command: true,
+    };
+
+    fn md_editor() -> Editor {
+        let mut ed = Editor::new("/tmp/a.md".into(), "# 标题\n\n正文 **粗**\n".into());
+        v_recompute(&mut ed);
+        ed
+    }
+
+    /// 跑一帧真实的 `content()`，返回它的「请求保存」结果。
+    #[allow(deprecated)]
+    fn frame(ctx: &egui::Context, ed: &mut Editor, id: egui::Id, keys: &[egui::Key]) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 400.0),
+            )),
+            modifiers: if keys.is_empty() { Default::default() } else { CTRL },
+            events: keys
+                .iter()
+                .map(|&key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: CTRL,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut save = false;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                save = content(ui, ed, id);
+            });
+        });
+        save
+    }
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        ctx
+    }
+
+    #[test]
+    fn only_markdown_files_can_preview() {
+        let mut ed = Editor::new("/tmp/a.rs".into(), "fn main() {}\n".into());
+        ed.toggle_preview();
+        assert!(!ed.previewing());
+        let mut ed = md_editor();
+        ed.toggle_preview();
+        assert!(ed.previewing());
+        ed.toggle_preview();
+        assert!(!ed.previewing());
+    }
+
+    /// 保存快捷键原本由编辑区的输入处理负责；预览路径不经过它，必须自己接住，
+    /// 否则「预览着按 Ctrl+S 没反应」。
+    #[test]
+    fn ctrl_s_in_preview_requests_save() {
+        let (ctx, id) = (ctx(), egui::Id::new("md_probe"));
+        let mut ed = md_editor();
+        ed.toggle_preview();
+        frame(&ctx, &mut ed, id, &[]); // 首帧：字体/样式生效
+        assert!(!frame(&ctx, &mut ed, id, &[]), "没按键不该请求保存");
+        assert!(frame(&ctx, &mut ed, id, &[egui::Key::S]));
+        assert!(ed.previewing(), "保存不该退出预览");
+    }
+
+    /// 查找栏属于源码视图：预览中按 Ctrl+F 要切回源码并打开查找，而不是毫无反应。
+    #[test]
+    fn ctrl_f_in_preview_returns_to_source_with_find_open() {
+        let (ctx, id) = (ctx(), egui::Id::new("md_probe"));
+        let mut ed = md_editor();
+        ed.toggle_preview();
+        frame(&ctx, &mut ed, id, &[]);
+        frame(&ctx, &mut ed, id, &[egui::Key::F]);
+        assert!(!ed.previewing());
+        assert!(ed.show_find);
+    }
+
+    /// 切回源码后要把焦点还给编辑区，否则得先点一下才能继续打字——这是门禁（去掉
+    /// `refocus` 实测会挂）。
+    ///
+    /// 中间那条「预览中焦点不在编辑区」是**钉子不是门禁**：这靠的是 egui 自己的行为
+    /// （聚焦控件当帧没出现就失焦），我们没有为它写代码，所以它恒绿。留着是防将来
+    /// egui 升级改了这个行为——那时按键/输入法会路由到看不见的编辑器。
+    #[test]
+    fn focus_leaves_the_hidden_editor_and_returns_with_it() {
+        let (ctx, id) = (ctx(), egui::Id::new("md_probe"));
+        let mut ed = md_editor();
+        frame(&ctx, &mut ed, id, &[]);
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut ed, id, &[]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(id), "前提：编辑区已聚焦");
+
+        ed.toggle_preview();
+        frame(&ctx, &mut ed, id, &[]);
+        assert_ne!(ctx.memory(|m| m.focused()), Some(id), "预览中焦点仍在编辑区");
+
+        ed.toggle_preview();
+        frame(&ctx, &mut ed, id, &[]);
+        frame(&ctx, &mut ed, id, &[]);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(id), "切回源码后焦点没还给编辑区");
+    }
+
+    /// 进预览时没提交的输入法组字必须撤掉：预览里没有输入处理去收尾它，
+    /// 那截拼音会被渲染出来，Ctrl+S 还会把它写进文件。
+    #[test]
+    fn entering_preview_cancels_an_unfinished_composition() {
+        let mut ed = md_editor();
+        let orig = ed.content.clone();
+        let (s, e) = crate::ui::ime_safe::replace_preedit(&mut ed.content, (0, 0), "zhong");
+        ed.vime_preedit = Some((s, e));
+        ed.vcaret = e;
+        assert_ne!(ed.content, orig);
+        ed.toggle_preview();
+        assert_eq!(ed.content, orig);
+        assert!(ed.vime_preedit.is_none());
     }
 }

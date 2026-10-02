@@ -11,5 +11,6 @@ mod view;
 mod wrap;
 
 pub(super) use geom::{v_line_of, v_sel_range};
+pub(super) use input::v_cancel_preedit;
 pub(super) use view::editable_virtual;
 pub(super) use wrap::v_recompute;

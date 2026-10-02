@@ -16,6 +16,7 @@ mod ui_paint;
 mod vt;
 
 use input::HistState;
+pub(crate) use osc::open_url;
 use keys::{encode_mouse, HeldButtons};
 use search::{Find, FindAction};
 pub use theme::current_bg;

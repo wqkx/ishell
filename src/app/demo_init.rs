@@ -164,6 +164,48 @@ impl App {
             }
         }
 
+        // 自检：Markdown 标签（截图核对渲染预览）。ISHELL_DEMO_MD=src 时停在源码视图，
+        // 否则直接进预览。
+        if let Ok(mode) = std::env::var("ISHELL_DEMO_MD") {
+            if let Some((server, uid, tx)) = self
+                .sessions
+                .first()
+                .map(|s| (s.title.clone(), s.uid, s.cmd_tx.clone()))
+            {
+                let md = "# iShell Markdown 预览\n\n这是一段**加粗**、*斜体*、~~删除线~~ 与 `行内代码` 的正文，\n源码里折行的中文不该多出空格。See [the docs](https://example.com/docs) for more.\n\n| 名称 | 说明 | 数值 |\n|---|---|---:|\n| **alpha** | 第一行 | 1 |\n| beta | 含 `code` 的单元格 | 22 |\n\n---\n\n![架构图](img/arch.png) 图片只显示占位。\n\n## 列表\n\n- 无序项\n  - 嵌套项，带 `code`\n- [x] 已完成的任务\n- [ ] 待办的任务\n\n1. 第一步\n2. 第二步\n\n   续段：松散列表项的第二段。\n\n> 引用块第一段。\n>\n> > 嵌套引用。\n\n## 代码\n\n```rust\n// 示例：读取并打印\nfn main() {\n    let s = String::from(\"你好\");\n    println!(\"{s}\");\n}\n```\n".to_string();
+                let text_id = self.alloc_editor_id();
+                let mut editor = crate::ui::editor::Editor::new("/home/e5-1/README.md".into(), md);
+                if mode != "src" {
+                    editor.toggle_preview();
+                }
+                let mut ed = lock_mutex(&self.editor_state);
+                ed.tabs.push(EditorTab {
+                    editor,
+                    server,
+                    uid,
+                    cmd_tx: tx,
+                    text_id,
+                    tid: 9,
+                    load_id: None,
+                    load_done: 0,
+                    load_total: 0,
+                    save: SaveState::Idle,
+                    save_at: None,
+                    save_done: 0,
+                    save_total: 0,
+                    save_done_at: None,
+                    save_op: 0,
+                    save_deadline: None,
+                    tail_offset: u64::MAX,
+                    tail_pending: false,
+                    tail_last: 0.0,
+                    doc: None,
+                    tail_carry: Vec::new(),
+                });
+                ed.active = ed.tabs.len() - 1;
+            }
+        }
+
         // 自检：看图工具——合成一张彩色渐变图打开
         if std::env::var("ISHELL_DEMO_IMG").is_ok() {
             if let Some((server, uid)) = self.sessions.first().map(|s| (s.title.clone(), s.uid)) {
