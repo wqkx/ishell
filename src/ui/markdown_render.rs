@@ -72,10 +72,10 @@ fn spans_job(
         } else {
             &s.text
         };
-        let color = if s.image {
-            Palette::TEXT_DIM
-        } else if s.link.is_some() {
+        let color = if s.link.is_some() {
             LINK
+        } else if s.image {
+            Palette::TEXT_DIM
         } else if strong || s.bold {
             STRONG
         } else {
@@ -92,11 +92,11 @@ fn spans_job(
         if s.strike {
             fmt.strikethrough = Stroke::new(1.0, Palette::TEXT_DIM);
         }
-        if s.link.is_some() && !s.image {
+        if s.link.is_some() {
             fmt.underline = Stroke::new(1.0, LINK);
         }
         let n = text.chars().count();
-        if let Some(url) = s.link.as_ref().filter(|_| !s.image) {
+        if let Some(url) = &s.link {
             links.push((nchars..nchars + n, url.clone()));
         }
         nchars += n;
@@ -151,13 +151,21 @@ fn paragraph(ui: &mut egui::Ui, spans: &[Span], size: f32, strong: bool) {
         return;
     };
     let local = pos - resp.rect.min;
+    // cursor_from_pos 给的是「最近的字符间隙」，不是指针下的字符：指针在间隙右侧时压着的是
+    // 间隙后面那个字符，在左侧时是前面那个。直接拿间隙下标去比区间，会把链接两侧相邻
+    // 字符的半个身位也算进来（紧挨的两个链接还会点到另一个）。
     let cur = galley.cursor_from_pos(local);
-    // cursor_from_pos 取的是「最近的字符间隙」：行尾右侧的空白处也会落到行末字符上，
-    // 所以再要求指针确实贴着那个间隙，免得点空白处也算点中了行末的链接。
-    let near = (galley.pos_from_cursor(cur).center().x - local.x).abs() <= size;
+    let gap_x = galley.pos_from_cursor(cur).center().x;
+    let under = if local.x >= gap_x {
+        Some(cur.index)
+    } else {
+        cur.index.checked_sub(1)
+    };
+    // 行尾右侧的空白处也会落到行末那个间隙上：要求指针确实贴着它，免得点空白也算点中
+    let near = (gap_x - local.x).abs() <= size;
     let hit = links
         .iter()
-        .find(|(r, _)| near && r.start <= cur.index && cur.index <= r.end);
+        .find(|(r, _)| near && under.is_some_and(|c| r.contains(&c)));
     if let Some((_, url)) = hit {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         if resp.clicked() {
@@ -197,7 +205,10 @@ fn table(ui: &mut egui::Ui, bi: usize, head: &[Vec<Span>], rows: &[Vec<Vec<Span>
                                     // 折行限宽：长文本不把表格撑出显示边界
                                     let cell = row.get(c).map(|c| &c[..]).unwrap_or(&[]);
                                     let (job, _) = spans_job(cell, 12.5, ri == 0, 320.0);
-                                    ui.label(job);
+                                    // 交给 Label 的必须是排好版的 galley：传 LayoutJob 的话
+                                    // Label 会按自己的折行模式覆盖掉这里的限宽
+                                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                                    ui.label(galley);
                                 }
                                 ui.end_row();
                             }

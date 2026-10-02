@@ -20,8 +20,10 @@ struct Builder {
     italic: u32,
     strike: u32,
     links: Vec<String>,
-    /// 正在收集的图片：(alt, 地址)
-    image: Option<(String, String)>,
+    /// 正在收集的图片的 alt 文字（v1 只显示占位，不取图，地址不留）
+    image: Option<String>,
+    /// 正在收集的 HTML 块原文（按行到达，攒齐了再整块去标签）
+    html: Option<String>,
     heading: u8,
     /// 列表栈：Some(n)=有序列表的下一个编号，None=无序
     lists: Vec<Option<u64>>,
@@ -44,28 +46,43 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
-/// 去掉 HTML 标签，只留标签之间的文字（`<br>` 记为换行；注释整体丢弃）。
+/// 去掉 HTML 标签，只留标签之间的文字（`<br>` 记为换行；注释与 `<style>` / `<script>`
+/// 的内容整体丢弃）。传入的应是**完整**的一段 HTML——逐行调用会把跨行结构拆坏。
 fn strip_tags(html: &str) -> String {
     let mut out = String::new();
     let mut rest = html;
     while let Some(lt) = rest.find('<') {
         out.push_str(&rest[..lt]);
         let tail = &rest[lt..];
-        let end = if tail.starts_with("<!--") {
-            tail.find("-->").map(|e| e + 3)
-        } else {
-            tail.find('>').map(|e| e + 1)
-        };
-        let Some(end) = end else {
+        if tail.starts_with("<!--") {
+            // 没收尾的注释一直延续到末尾（CommonMark 的 HTML 块也是这么算的）
+            match tail.find("-->") {
+                Some(e) => rest = &tail[e + 3..],
+                None => return out,
+            }
+            continue;
+        }
+        let Some(end) = tail.find('>').map(|e| e + 1) else {
             // 没有收尾：不是标签，原样保留
             out.push_str(tail);
             return out;
         };
         let tag = tail[..end].to_ascii_lowercase();
+        rest = &tail[end..];
         if tag.starts_with("<br") {
             out.push('\n');
         }
-        rest = &tail[end..];
+        // 这两种元素的内容不是给人读的：连同收尾标签一起跳过
+        for raw in ["style", "script"] {
+            if tag[1..].starts_with(raw) {
+                // ASCII 小写化不改变字节偏移，可以直接拿来切原串
+                let lower = rest.to_ascii_lowercase();
+                rest = match lower.find(&format!("</{raw}")) {
+                    Some(c) => rest[c..].find('>').map_or("", |e| &rest[c + e + 1..]),
+                    None => "",
+                };
+            }
+        }
     }
     out.push_str(rest);
     out
@@ -145,7 +162,7 @@ impl Builder {
     }
 
     fn text(&mut self, t: &str, code: bool) {
-        if let Some((alt, _)) = &mut self.image {
+        if let Some(alt) = &mut self.image {
             alt.push_str(t);
             return;
         }
@@ -193,7 +210,10 @@ impl Builder {
                 self.flush_force();
                 self.code = Some(("yaml".into(), String::new()));
             }
-            Tag::HtmlBlock => self.flush_force(),
+            Tag::HtmlBlock => {
+                self.flush_force();
+                self.html = Some(String::new());
+            }
             Tag::List(first) => {
                 // 紧凑列表项的文字没有 Paragraph 包着：嵌套列表开始前先收掉
                 self.flush_text();
@@ -224,10 +244,9 @@ impl Builder {
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
             Tag::Link { dest_url, .. } => self.links.push(dest_url.to_string()),
-            Tag::Image { dest_url, .. } => {
+            Tag::Image { .. } => {
                 // 嵌套图片（alt 里再放图片）极少见：只认最外层
-                self.image
-                    .get_or_insert_with(|| (String::new(), dest_url.to_string()));
+                self.image.get_or_insert_with(String::new);
             }
             _ => {}
         }
@@ -252,7 +271,19 @@ impl Builder {
                     self.push(Kind::Code { lang, text });
                 }
             }
-            TagEnd::HtmlBlock => self.flush_text(),
+            TagEnd::HtmlBlock => {
+                if let Some(raw) = self.html.take() {
+                    // 去标签后每个非空行当作同一段里的一行（行间按软换行衔接）
+                    for line in strip_tags(&raw).lines() {
+                        let line = line.trim();
+                        if !line.is_empty() {
+                            self.text(line, false);
+                            self.soft = true;
+                        }
+                    }
+                }
+                self.flush_text();
+            }
             TagEnd::List(..) => {
                 self.flush_text();
                 self.lists.pop();
@@ -291,11 +322,12 @@ impl Builder {
                 self.links.pop();
             }
             TagEnd::Image => {
-                if let Some((alt, url)) = self.image.take() {
+                if let Some(alt) = self.image.take() {
+                    // 带上外层链接：`[![徽章](b.svg)](url)` 的占位文字要能点开 url
                     self.spans.push(Span {
                         text: alt,
                         image: true,
-                        link: Some(url),
+                        link: self.links.last().cloned(),
                         ..Span::default()
                     });
                 }
@@ -319,15 +351,11 @@ impl Builder {
                     self.text(&plain, false);
                 }
             }
-            // HTML 块按行到达：每行去标签后当作同一段里的一行（行间按软换行衔接）
-            Event::Html(t) => {
-                let plain = strip_tags(&t);
-                let plain = plain.trim();
-                if !plain.is_empty() {
-                    self.text(plain, false);
-                    self.soft = true;
-                }
-            }
+            // HTML 块按行到达：先攒着，块结束时整块处理（见 TagEnd::HtmlBlock）
+            Event::Html(t) => match &mut self.html {
+                Some(raw) => raw.push_str(&t),
+                None => self.text(&strip_tags(&t), false),
+            },
             Event::SoftBreak => self.soft = true,
             Event::HardBreak => self.text("\n", false),
             Event::Rule => {
@@ -508,7 +536,7 @@ mod tests {
         };
         let img = spans.iter().find(|s| s.image).expect("应有图片片段");
         assert_eq!(img.text, "架构图");
-        assert_eq!(img.link.as_deref(), Some("img/a.png"));
+        assert_eq!(img.link, None, "不在链接里的图片不该变成可点的");
     }
 
     #[test]
@@ -530,6 +558,34 @@ mod tests {
         assert_eq!(strip_tags("a<br/>b"), "a\nb");
         assert_eq!(strip_tags("1 < 2"), "1 < 2");
         assert_eq!(para(&parse("按 <kbd>Ctrl</kbd> 键\n"), 0).0, "按 Ctrl 键");
+    }
+
+    /// HTML 块是**按行**送来的：逐行去标签会把跨行结构拆坏——多行注释整段漏成正文、
+    /// 跨行标签的属性漏成正文、`<style>` 的内容被当成段落。必须整块处理。
+    #[test]
+    fn multi_line_html_blocks_do_not_leak_markup() {
+        assert_eq!(parse("<!--\nTODO: 别显示\n-->\n\n正文\n").len(), 1);
+        assert_eq!(para(&parse("<!--\nTODO: 别显示\n-->\n\n正文\n"), 0).0, "正文");
+
+        let b = parse("<p align=\"center\">\n  <img src=x\n  width=200>\n  居中文字\n</p>\n");
+        assert_eq!(b.len(), 1);
+        assert_eq!(para(&b, 0).0, "居中文字");
+
+        let b = parse("<style>\n.a { color: red }\n</style>\n\n<div>\n甲<br>乙\n</div>\n");
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!(para(&b, 0).0, "甲乙"); // 行间按软换行衔接（中文不补空格）
+    }
+
+    /// README 的标准徽章写法：链接里套图片。占位文字必须带着**外层链接**，否则点不开。
+    #[test]
+    fn image_inside_link_keeps_the_outer_link() {
+        let b = parse("[![构建](badge.svg)](https://ci.example/run)\n");
+        let Kind::Para { spans, .. } = &b[0].kind else {
+            panic!("应为段落")
+        };
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "构建");
+        assert_eq!(spans[0].link.as_deref(), Some("https://ci.example/run"));
     }
 
     /// 预览跑在 UI 线程：解析 panic = 整个应用闪退、连带丢掉未保存的改动。

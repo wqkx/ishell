@@ -19,7 +19,7 @@ pub struct Span {
     pub strike: bool,
     /// 行内代码
     pub code: bool,
-    /// 图片占位：`text` 为 alt 文字，`link` 为图片地址
+    /// 图片占位：`text` 为 alt 文字（图片地址不保留；`link` 是外层链接，如徽章）
     pub image: bool,
     /// 链接目标
     pub link: Option<String>,

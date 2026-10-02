@@ -432,8 +432,14 @@ pub fn content(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
 fn preview(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -> bool {
     // 编辑区此时不绘制，egui 会自行收回它的焦点（聚焦控件当帧没出现即失焦），无需手动让出。
     // 保存与查找快捷键原本由编辑区的输入处理负责，预览里要自己接
-    let save = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
-    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+    //（与源码视图一致，Cmd 和 Ctrl 都认——macOS 上它们是两个键）
+    let hotkey = |key| {
+        ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, key) || i.consume_key(egui::Modifiers::CTRL, key)
+        })
+    };
+    let save = hotkey(egui::Key::S);
+    if hotkey(egui::Key::F) {
         ed.open_find(); // 顺带切回源码
         ui.ctx().request_repaint();
         return save;
@@ -500,12 +506,23 @@ mod preview_tests {
     /// 跑一帧真实的 `content()`，返回它的「请求保存」结果。
     #[allow(deprecated)]
     fn frame(ctx: &egui::Context, ed: &mut Editor, id: egui::Id, keys: &[egui::Key]) -> bool {
+        frame_with(ctx, ed, id, keys, CTRL)
+    }
+
+    #[allow(deprecated)]
+    fn frame_with(
+        ctx: &egui::Context,
+        ed: &mut Editor,
+        id: egui::Id,
+        keys: &[egui::Key],
+        mods: egui::Modifiers,
+    ) -> bool {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(900.0, 400.0),
             )),
-            modifiers: if keys.is_empty() { Default::default() } else { CTRL },
+            modifiers: if keys.is_empty() { Default::default() } else { mods },
             events: keys
                 .iter()
                 .map(|&key| egui::Event::Key {
@@ -513,7 +530,7 @@ mod preview_tests {
                     physical_key: None,
                     pressed: true,
                     repeat: false,
-                    modifiers: CTRL,
+                    modifiers: mods,
                 })
                 .collect(),
             ..Default::default()
@@ -556,6 +573,23 @@ mod preview_tests {
         assert!(!frame(&ctx, &mut ed, id, &[]), "没按键不该请求保存");
         assert!(frame(&ctx, &mut ed, id, &[egui::Key::S]));
         assert!(ed.previewing(), "保存不该退出预览");
+    }
+
+    /// 源码视图的快捷键认的是 `command || ctrl`，预览必须一致：macOS 上 Ctrl 与 Cmd 是
+    /// 两个键（`command` 只跟 Cmd），只认 COMMAND 的话那里 Ctrl+S / Ctrl+F 在预览里没反应。
+    #[test]
+    fn plain_ctrl_without_command_works_in_preview_too() {
+        let ctrl_only = egui::Modifiers {
+            command: false,
+            ..CTRL
+        };
+        let (ctx, id) = (ctx(), egui::Id::new("md_probe"));
+        let mut ed = md_editor();
+        ed.toggle_preview();
+        frame(&ctx, &mut ed, id, &[]);
+        assert!(frame_with(&ctx, &mut ed, id, &[egui::Key::S], ctrl_only));
+        frame_with(&ctx, &mut ed, id, &[egui::Key::F], ctrl_only);
+        assert!(!ed.previewing());
     }
 
     /// 查找栏属于源码视图：预览中按 Ctrl+F 要切回源码并打开查找，而不是毫无反应。
