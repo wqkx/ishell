@@ -142,8 +142,8 @@ impl Terminal {
                     self.saw_v_press = false;
                 }
                 egui::Event::Copy => {
-                    let copy_selection = cfg!(target_os = "macos") || shift;
-                    if copy_selection {
+                    let insert = physical_key_down(VK_INSERT);
+                    if copy_event_copies(cfg!(target_os = "macos"), shift, insert) {
                         if let Some(t) = self.selected_text() {
                             ui.ctx().copy_text(t);
                         }
@@ -155,12 +155,13 @@ impl Terminal {
                         }
                     }
                 }
-                egui::Event::Cut =>
-                {
-                    #[cfg(not(target_os = "macos"))]
-                    if !shift {
-                        out.push(0x18);
-                    }
+                egui::Event::Cut => {
+                    let delete = physical_key_down(VK_DELETE);
+                    out.extend_from_slice(cut_event_bytes(
+                        cfg!(target_os = "macos"),
+                        shift,
+                        delete,
+                    ));
                 }
                 egui::Event::Key {
                     key,
@@ -476,5 +477,71 @@ mod ai_cli_tests {
         ] {
             assert!(!is_ai_cli_command(line), "不该识别为 AI CLI:{line:?}");
         }
+    }
+}
+
+// ——— 「复制 / 剪切」事件到底是哪个键触发的 ———
+//
+// egui-winit 把快捷键归并成 `Event::Copy` / `Event::Cut` 再交给我们，原始按键不再下发。
+// 多数平台上它们只对应 Ctrl+C / Ctrl+X；但在 **Windows** 上，Ctrl+Insert 也算复制、
+// Shift+Delete 也算剪切（`egui-winit` 的 `is_copy_command` / `is_cut_command`）。终端里
+// Ctrl+C 是中断：不分辨的话，用户按 Ctrl+Insert 想复制，实际打断了正在跑的命令。
+// 事件里没有按键信息，只能问系统这个键此刻是不是按着的。
+
+const VK_INSERT: u16 = 45;
+const VK_DELETE: u16 = 46;
+
+#[cfg(windows)]
+fn physical_key_down(vk: u16) -> bool {
+    // 最高位 = 此刻按着。只读查询，没有任何前置条件。
+    let state =
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk as i32) };
+    (state as u16) & 0x8000 != 0
+}
+
+#[cfg(not(windows))]
+fn physical_key_down(_vk: u16) -> bool {
+    false
+}
+
+/// 收到 `Event::Copy`：是复制选区（true），还是把 Ctrl+C 当中断发给远端（false）。
+/// macOS 上复制是 Cmd+C，与 Ctrl+C 无关；其它平台 Ctrl+Shift+C 是复制；
+/// Windows 上 Ctrl+Insert 也是复制。
+fn copy_event_copies(macos: bool, shift: bool, insert_down: bool) -> bool {
+    macos || shift || insert_down
+}
+
+/// 收到 `Event::Cut` 时要发给远端的字节。终端里没有「剪切」：Ctrl+X 照发 0x18；
+/// Windows 上由 Shift+Delete 触发的那次按原样发 Shift+Delete（`CSI 3;2~`）；
+/// Ctrl+Shift+X 和 macOS 的 Cmd+X 不发。
+fn cut_event_bytes(macos: bool, shift: bool, delete_down: bool) -> &'static [u8] {
+    if delete_down {
+        b"\x1b[3;2~"
+    } else if macos || shift {
+        b""
+    } else {
+        b"\x18"
+    }
+}
+
+#[cfg(test)]
+mod copy_cut_tests {
+    use super::{copy_event_copies, cut_event_bytes};
+
+    /// Windows 上 Ctrl+Insert 触发的「复制」必须是复制，不能当成 Ctrl+C 去打断远端的命令。
+    #[test]
+    fn ctrl_insert_copies_instead_of_interrupting() {
+        assert!(copy_event_copies(false, false, true), "Ctrl+Insert");
+        assert!(!copy_event_copies(false, false, false), "Ctrl+C 仍是中断");
+        assert!(copy_event_copies(false, true, false), "Ctrl+Shift+C");
+        assert!(copy_event_copies(true, false, false), "macOS Cmd+C");
+    }
+
+    #[test]
+    fn shift_delete_is_sent_as_itself() {
+        assert_eq!(cut_event_bytes(false, true, true), b"\x1b[3;2~", "Shift+Delete");
+        assert_eq!(cut_event_bytes(false, false, false), b"\x18", "Ctrl+X");
+        assert_eq!(cut_event_bytes(false, true, false), b"", "Ctrl+Shift+X");
+        assert_eq!(cut_event_bytes(true, false, false), b"", "macOS Cmd+X");
     }
 }
