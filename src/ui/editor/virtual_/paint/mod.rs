@@ -174,8 +174,10 @@ pub(super) fn paint_visible_rows(
             // 键盘移动：只在越界时「一行」地滚（不要整屏跳）
             let top = ed.vtop;
             let vis = ed.vlast_vis.max(3);
-            let tt = if caret_row < top {
-                caret_row // 光标在视口上方 → 滚到刚好露出该行（一行）
+            // 顶部的粘性作用域行盖在正文最上面几行上：光标行要露在它们下面
+            let covered = ed.vlast_sticky;
+            let tt = if caret_row < top + covered {
+                caret_row.saturating_sub(covered) // 光标在视口上方（或被粘性行盖住）→ 滚到刚好露出该行
             } else if caret_row + 2 >= top + vis {
                 (caret_row + 3).saturating_sub(vis) // 光标在视口下方 → 滚到该行刚好在底部附近（一行）
             } else {
@@ -388,7 +390,8 @@ pub(super) fn paint_visible_rows(
                         .get(last_line.min(total))
                         .copied()
                         .unwrap_or(ed.content.len());
-                    let mlo = ed.find_matches.partition_point(|&(s, _)| s < vis_a);
+                    // 按**终点**取下界：起点在视口上方、延伸进视口的跨行命中也要高亮
+                    let mlo = ed.find_matches.partition_point(|&(_, e)| e <= vis_a);
                     let mhi = ed.find_matches.partition_point(|&(s, _)| s < vis_b);
                     ed.find_matches[mlo..mhi].to_vec()
                 } else {

@@ -155,7 +155,11 @@ pub(super) fn paint_sticky_scope(
     // 顶部固定显示首个可见行的外层作用域链（按缩进推导，至多 3 行），点击跳转
     let sticky: Vec<usize> = if show_code_aids && top_row > 0 && first_line > 0 {
         let mut chain: Vec<usize> = Vec::new();
-        let mut min_lead = v_lead(ed, first_line, unit_cols).unwrap_or(usize::MAX);
+        // 首个可见行是空白行时没有缩进可比：用它下面最近的非空行（否则紧邻的上一条普通
+        // 语句的缩进必然「更小」，会被误当成外层作用域）
+        let mut min_lead = (first_line..(first_line + 200).min(ed.vlines.len()))
+            .find_map(|l| v_lead(ed, l, unit_cols))
+            .unwrap_or(usize::MAX);
         let lo = first_line.saturating_sub(3000);
         let mut l = first_line;
         while l > lo && min_lead > 0 && chain.len() < 3 {
@@ -172,6 +176,7 @@ pub(super) fn paint_sticky_scope(
     } else {
         Vec::new()
     };
+    ed.vlast_sticky = sticky.len();
     for (si, &l) in sticky.iter().enumerate() {
         let y = clip.top() + si as f32 * row_h;
         let row_rect = egui::Rect::from_min_max(

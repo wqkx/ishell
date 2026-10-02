@@ -60,6 +60,24 @@ fn scan_pair(text: &str, start: usize, open: &str, close: &str) -> usize {
         .unwrap_or(text.len())
 }
 
+/// `rest` 以 `'` 开头：若是一个字符字面量，返回它的字节长度（含两端引号）。
+fn char_literal_len(rest: &str) -> Option<usize> {
+    let mut it = rest.char_indices().skip(1);
+    let (_, first) = it.next()?;
+    if first == '\\' {
+        // 转义：`\n`、`\'`、`\x41`、`\u{1F600}`——往后找收尾引号，限个长度免得吞掉半行
+        let (_, esc) = it.next()?;
+        if esc == '\'' || esc == '\\' {
+            return it.next().filter(|&(_, c)| c == '\'').map(|(i, _)| i + 1);
+        }
+        return it.take(10).find(|&(_, c)| c == '\'').map(|(i, _)| i + 1);
+    }
+    if first == '\'' || first == '\n' {
+        return None;
+    }
+    it.next().filter(|&(_, c)| c == '\'').map(|(i, _)| i + 1)
+}
+
 /// 单遍分词，返回 (字节范围, 类别) 列表（连续 Plain 已合并）。
 pub(super) fn tokenize(text: &str, lang: &Lang) -> Vec<(usize, usize, Tok)> {
     let mut segs: Vec<(usize, usize, Tok)> = Vec::new();
@@ -93,6 +111,16 @@ pub(super) fn tokenize(text: &str, lang: &Lang) -> Vec<(usize, usize, Tok)> {
             segs.push((i, end, Tok::Comment));
             i = end;
             continue;
+        }
+        // 字符字面量（Rust）：`'x'` / `'\n'` / `'\u{1F600}'`。必须整体认出来，否则里面的
+        // 引号（`'"'`）会开出一个假字符串、括号（`'('`）会被算进括号配对。
+        // 认不出来的 `'` 是生命周期（`'a`），按普通字符处理。
+        if lang.char_lit && c == '\'' {
+            if let Some(len) = char_literal_len(rest) {
+                segs.push((i, i + len, Tok::Str));
+                i += len;
+                continue;
+            }
         }
         // 字符串
         if lang.strings.contains(&c) {
@@ -213,6 +241,10 @@ pub(super) fn tokenize(text: &str, lang: &Lang) -> Vec<(usize, usize, Tok)> {
                 break;
             }
             if lang.deco && c == '@' {
+                break;
+            }
+            // 字符字面量要整体成段：让位给外层循环的字符字面量分支
+            if lang.char_lit && c == '\'' && char_literal_len(rest).is_some() {
                 break;
             }
             if lang.strings.contains(&c) || c.is_ascii_digit() || c == '_' || c.is_alphabetic() {

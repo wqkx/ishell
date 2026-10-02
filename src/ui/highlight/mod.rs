@@ -154,6 +154,40 @@ mod tests {
         assert_eq!(tok_at(src, "lua", "x = 1"), Tok::Plain);
     }
 
+    /// 语法检查是给「明显写错了」提个醒的，不能在正常代码上成片报错——那样状态栏永远挂着
+    /// 「⚠ N 处语法问题」、行号一片红，真问题反而看不见了。
+    #[test]
+    fn ordinary_code_raises_no_lint_errors() {
+        for (ext, src) in [
+            ("rs", "fn main() {\n    let x = 1;\n    for i in 0..n { f(i) }\n    if a { b(c) } else { d }\n}\n"),
+            // Rust 字符字面量：`'\"'` 不是一个没闭合的字符串，`'('` 不是一个括号
+            ("rs", "fn f() {\n    let q = '\"';\n    let p = '(';\n    let e = '\\'';\n    let l: &'static str = \"x\";\n}\n"),
+            ("py", "xs = [x for x in y]\nv = f(a if b else c)\nok = (a and b)\nd = {k: v for k in m}\n"),
+            // docstring 里的文字不是代码：`Usage:` 后面不需要缩进块
+            ("py", "\"\"\"Doc.\n\nUsage:\nrun it\n\tand a tab\n\"\"\"\nx = 1\n"),
+            ("js", "function f(a) { return a + 1; }\nconst g = async (b) => { await b; };\n"),
+            ("ts", "function f(a: number): void { let b = a; }\n"),
+            ("c", "int f(int a) { unsigned long b = a; return b; }\n"),
+            ("go", "func f(a int, b string) { var c int = a; return }\n"),
+            ("java", "class A { void f(String s) { final int n = 1; return; } }\n"),
+        ] {
+            let (lines, _, msg) = lint_syntax(src, ext);
+            assert!(msg.is_none(), "{ext} 正常代码被报错（行 {lines:?}）：\n{src}");
+        }
+        // 真缺逗号照旧能检出
+        assert!(lint_syntax("x = [1, 2 3]\n", "py").2.is_some());
+        assert!(lint_syntax("f(1 2);\n", "js").2.is_some());
+        assert!(lint_syntax("let v = [1 \"a\"];\n", "rs").2.is_some());
+    }
+
+    /// 纯文本里的撇号不是字符串定界符：`don't` 之后不该整行染成字符串色。
+    #[test]
+    fn apostrophes_in_prose_are_not_strings() {
+        for ext in ["txt", "log", "md"] {
+            assert_eq!(tok_at("I don't know why\n", ext, "know"), Tok::Plain, "{ext}");
+        }
+    }
+
     #[test]
     fn lint_py_missing_comma() {
         let (lines, ranges, msg) = lint_syntax("x = [1, 2 3]\n", "py");

@@ -12,6 +12,8 @@ pub(super) struct Lang {
     pub(super) str_prefix: bool,
     /// 是否高亮装饰器（Python 的 @xxx.yyy）
     pub(super) deco: bool,
+    /// `'x'` 是字符字面量、但 `'` 本身不是字符串定界符（Rust：还有 `'a` 生命周期）
+    pub(super) char_lit: bool,
 }
 
 /// 语言规格缺省值：各分支用 `..BASE` 只填差异字段。
@@ -23,6 +25,7 @@ const BASE: Lang = Lang {
     multi: &[],
     str_prefix: false,
     deco: false,
+    char_lit: false,
 };
 
 /// Python / TOML 共用的三引号定界符。
@@ -62,6 +65,7 @@ pub(super) fn lang_for(ext: &str) -> Lang {
             strings: &['"'],
             keywords: KW_RUST,
             multi: &[("r#\"", "\"#")],
+            char_lit: true,
             ..BASE
         },
         "py" | "pyw" => Lang {
@@ -162,6 +166,16 @@ pub(super) fn lang_for(ext: &str) -> Lang {
         },
         "json" => Lang {
             strings: &['"'],
+            ..BASE
+        },
+        // 纯文本：撇号是文字的一部分（don't / it's），不是字符串定界符；`//` 多半是网址
+        "txt" | "text" | "log" => Lang {
+            strings: &['"'],
+            ..BASE
+        },
+        "md" | "markdown" => Lang {
+            line: &["#"],
+            strings: &['`'],
             ..BASE
         },
         // 未知：C 风格注释 + 常见字符串，无关键字（仍高亮注释/字符串/数字）

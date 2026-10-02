@@ -59,6 +59,8 @@ pub struct Editor {
     /// 上一帧滚动度量（横向仍用 egui；vlast_top/vlast_vis 供跟随光标判断）
     vlast_top: usize,
     vlast_vis: usize,
+    /// 上一帧顶部「粘性作用域行」占掉的行数（它们盖在正文最上面几行上）
+    vlast_sticky: usize,
     vlast_hoff: f32,
     vlast_vieww: f32,
     vlast_viewh: f32,
@@ -202,6 +204,7 @@ impl Editor {
             vscroll_accum: 0.0,
             vlast_top: 0,
             vlast_vis: 1,
+            vlast_sticky: 0,
             vlast_hoff: 0.0,
             vlast_vieww: 0.0,
             vlast_viewh: 0.0,
@@ -596,6 +599,67 @@ mod reveal_tests {
             ed.vtop,
             ed.vtop + ed.vlast_vis
         );
+    }
+
+    /// 顶部的「粘性作用域行」盖在正文最上面几行上。键盘上移把光标带到视口顶端时，
+    /// 光标所在行不能落在它们下面——那样光标和正在编辑的那行都看不见。
+    #[test]
+    fn the_caret_row_is_never_hidden_under_the_sticky_scope_rows() {
+        let body: String = (0..300)
+            .map(|i| format!("        if c{i} {{ work{i}(); }}\n"))
+            .collect();
+        let mut ed = Editor::new(
+            "/tmp/a.rs".into(),
+            format!("mod m {{\n    fn f() {{\n{body}    }}\n}}\n"),
+        );
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let id = egui::Id::new("sticky_probe");
+        let frame = |ed: &mut Editor, up: bool| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 300.0),
+                )),
+                events: if up {
+                    vec![egui::Event::Key {
+                        key: egui::Key::ArrowUp,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            #[allow(deprecated)]
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    content(ui, ed, id);
+                });
+            });
+        };
+        frame(&mut ed, false);
+        virtual_::test_goto_line(&mut ed, 150);
+        frame(&mut ed, false);
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&mut ed, false);
+        let mut seen_sticky = false;
+        for _ in 0..40 {
+            frame(&mut ed, true);
+            frame(&mut ed, false); // 让粘性行数按新的滚动位置结算
+            let row = virtual_::test_caret_vrow(&ed);
+            seen_sticky |= ed.vlast_sticky > 0;
+            assert!(
+                row >= ed.vtop + ed.vlast_sticky,
+                "光标在视觉行 {row}，视口从 {} 开始，最上面 {} 行被粘性作用域行盖住",
+                ed.vtop,
+                ed.vlast_sticky
+            );
+        }
+        assert!(seen_sticky, "前提：这段代码里确实出现了粘性作用域行");
     }
 
     /// 跳转目标落在折叠区里：必须先展开再定位，否则居中的是折叠着的那一行。

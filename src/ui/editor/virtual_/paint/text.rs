@@ -295,7 +295,9 @@ pub(super) fn paint_text_row(
     let folded_end = ctx.ed.folds.iter().find(|&&(h, _)| h == i).map(|&(_, e)| e);
     let mut fold_click = None;
     // 折叠 header：行尾画「⋯ N」胶囊提示（点击展开）
-    if let Some(fe) = folded_end {
+    // 换行模式下 header 行可能折成几段：胶囊只画在最后一段的行尾
+    let last_seg = !ctx.wrap || col0 + ncols >= byte_to_char(line_full, line_full.len());
+    if let Some(fe) = folded_end.filter(|_| last_seg) {
         let bx = seg_x + galley.size().x + 10.0;
         let label = format!("⋯ {}", fe - i);
         let tr = ctx.painter.text(

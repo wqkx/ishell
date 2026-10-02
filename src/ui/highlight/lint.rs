@@ -123,15 +123,16 @@ pub fn lint_syntax(text: &str, ext: &str) -> (Vec<usize>, Vec<Range<usize>>, Opt
             b..end
         })
         .collect();
-    let lines: Vec<usize> = bad
-        .iter()
-        .map(|&b| {
-            text[..b.min(text.len())]
-                .bytes()
-                .filter(|x| *x == b'\n')
-                .count()
-        })
-        .collect();
+    // bad 已升序：接着上一个位置往后数换行即可（每个错误点都从文首数一遍是平方级的，
+    // 而这段在 256KB 以内的文件上每次按键都会跑）
+    let mut lines: Vec<usize> = Vec::with_capacity(bad.len());
+    let (mut pos, mut line) = (0usize, 0usize);
+    for &b in &bad {
+        let b = b.min(text.len());
+        line += text.as_bytes()[pos..b].iter().filter(|x| **x == b'\n').count();
+        pos = b;
+        lines.push(line);
+    }
     let msg = if bad.is_empty() {
         None
     } else {
@@ -216,8 +217,8 @@ fn str_segment_unclosed(text: &str, s: usize, e: usize, lang: &Lang) -> bool {
     false
 }
 
-/// 在 () [] {} 内的相邻「值」之间缺逗号时标出（跳过注释/字符串）。
-/// 启发式：值结束后仅空白再接另一值，且无逗号 → 缺逗号（如 `[1, 2 3]`）。
+/// 在 () [] {} 内两个相邻字面量之间缺逗号时标出（跳过注释）。
+/// 启发式：字面量结束后仅空白再接另一个字面量，且无逗号 → 缺逗号（如 `[1, 2 3]`）。
 fn lint_comma_in_brackets(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Vec<usize>) {
     let mut depth = 0i32;
     // 上一「值」token（跳过纯空白 Plain，避免 `2` 与 `3` 被空格段隔开）
@@ -255,8 +256,14 @@ fn lint_comma_in_brackets(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Ve
             continue;
         }
         // Plain 里可能混有标点+标识；按「值起点/终点」判断
-        if let Some((ps, pe, ptok)) = prev_val {
-            if looks_like_value_end(text, ps, pe, ptok) && looks_like_value_start(text, s, e, tok) {
+        if let Some((_, pe, ptok)) = prev_val {
+            // 只认**两个字面量**挨在一起（数字/字符串，且不是两个字符串——相邻字符串在
+            // C、Python 等语言里是合法的拼接）。原先连「关键字 + 标识符」「标识符 + 标识符」
+            // 也算，而代码里到处都是这种相邻：`let x`、`int a`、`x for x in y`、`a if b`……
+            // 函数体本身就在 `{}` 里，于是正常代码成片报错。
+            let literal = |t: Tok| matches!(t, Tok::Num | Tok::Str);
+            let both_str = ptok == Tok::Str && tok == Tok::Str;
+            if literal(ptok) && literal(tok) && !both_str {
                 let between = &text[pe..s];
                 if !between.contains(',') && between.chars().all(|c| c.is_whitespace()) {
                     bad.push(s);
@@ -291,36 +298,24 @@ fn looks_like_value_end(text: &str, s: usize, e: usize, tok: Tok) -> bool {
     }
 }
 
-fn looks_like_value_start(text: &str, s: usize, e: usize, tok: Tok) -> bool {
-    match tok {
-        Tok::Num | Tok::Str => true,
-        Tok::Keyword => {
-            // True/False/None/null 等可作值；控制关键字不当值起点
-            matches!(
-                &text[s..e],
-                "True" | "False" | "None" | "true" | "false" | "null" | "undefined" | "nil"
-            )
-        }
-        Tok::Plain => {
-            let t = text[s..e].trim_start();
-            t.starts_with('(')
-                || t.starts_with('[')
-                || t.starts_with('{')
-                || t.chars().next().is_some_and(|c| {
-                    c == '_' || c.is_alphanumeric() || c == '"' || c == '\'' || c == '`'
-                })
-        }
-        Tok::Comment => false,
-    }
-}
-
 fn lint_python(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Vec<usize>) {
     lint_comma_in_brackets(text, segs, bad);
 
     // 混用 Tab / 空格缩进
+    // 落在字符串内部的位置（多行字符串 / docstring 的正文不是代码，不受缩进规则约束）
+    let in_str = |pos: usize| {
+        let i = segs.partition_point(|&(s, _, _)| s < pos);
+        i > 0 && segs[i - 1].2 == Tok::Str && pos < segs[i - 1].1
+    };
     let mut saw_space = false;
     let mut saw_tab = false;
-    for (i, line) in text.split('\n').enumerate() {
+    let mut line_off = 0usize;
+    for line in text.split('\n') {
+        let this_off = line_off;
+        line_off += line.len() + 1;
+        if in_str(this_off) {
+            continue;
+        }
         let mut sp = false;
         let mut tb = false;
         for b in line.bytes() {
@@ -338,15 +333,14 @@ fn lint_python(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Vec<usize>) {
         }
         if sp && tb {
             // 同行混用：标在行首
-            let off = text.split('\n').take(i).map(|l| l.len() + 1).sum::<usize>();
-            bad.push(off);
+            bad.push(this_off);
         }
     }
     if saw_space && saw_tab {
         // 文件级混用：标在第一个 Tab 缩进行
         let mut off = 0usize;
         for line in text.split('\n') {
-            if line.starts_with('\t') {
+            if line.starts_with('\t') && !in_str(off) {
                 bad.push(off);
                 break;
             }
@@ -361,7 +355,8 @@ fn lint_python(text: &str, segs: &[(usize, usize, Tok)], bad: &mut Vec<usize>) {
         let line = lines[i];
         let trimmed = line.trim_end();
         let code = strip_py_line_comment(trimmed);
-        if code.ends_with(':') && !code.ends_with("::") {
+        // 行尾落在字符串内部（docstring 里的 `Usage:`）不是语句头
+        if code.ends_with(':') && !code.ends_with("::") && !in_str(off + trimmed.len()) {
             let lead = line
                 .bytes()
                 .take_while(|b| *b == b' ' || *b == b'\t')
