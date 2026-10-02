@@ -139,7 +139,8 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                     // 光标位置 Ln:Col（主光标，1 基；列按字符计）
                     let cl = v_line_of(ed, ed.vcaret);
                     let (lsx, _) = v_line_range(ed, cl);
-                    let col = ed.content[lsx..ed.vcaret.min(ed.content.len())].chars().count() + 1;
+                    let caret = crate::ui::ime_safe::floor_boundary(&ed.content, ed.vcaret).max(lsx);
+                    let col = ed.content[lsx..caret].chars().count() + 1;
                     ui.label(RichText::new(format!("Ln {}, Col {}", cl + 1, col)).color(Palette::TEXT_DIM).size(11.0));
                     ui.add_space(10.0);
                     // 行尾：点击切换 LF/CRLF

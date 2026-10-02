@@ -14,6 +14,8 @@ pub(super) struct Lang {
     pub(super) deco: bool,
     /// `'x'` 是字符字面量、但 `'` 本身不是字符串定界符（Rust：还有 `'a` 生命周期）
     pub(super) char_lit: bool,
+    /// 有正则字面量 `/…/flags`（JS / TS）：要整体成段，里面的引号、括号不是代码
+    pub(super) regex_lit: bool,
 }
 
 /// 语言规格缺省值：各分支用 `..BASE` 只填差异字段。
@@ -26,6 +28,7 @@ const BASE: Lang = Lang {
     str_prefix: false,
     deco: false,
     char_lit: false,
+    regex_lit: false,
 };
 
 /// Python / TOML 共用的三引号定界符。
@@ -83,6 +86,7 @@ pub(super) fn lang_for(ext: &str) -> Lang {
             strings: cl,
             keywords: KW_JS,
             deco: true,
+            regex_lit: true,
             ..BASE
         },
         "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "cu" => Lang {

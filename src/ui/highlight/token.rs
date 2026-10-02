@@ -78,6 +78,62 @@ fn char_literal_len(rest: &str) -> Option<usize> {
     it.next().filter(|&(_, c)| c == '\'').map(|(i, _)| i + 1)
 }
 
+/// `text[at]` 是 `/`：若它开出一个正则字面量，返回字面量的字节长度（含两端斜杠与标志）。
+///
+/// `/` 是正则还是除号要看前文：前面是「值」（标识符、数字、`)`、`]`）就是除号；前面是
+/// 运算符 / 分隔符 / 行首，或 `return`、`typeof` 这类后面跟表达式的关键字，才是正则。
+/// 正则不跨行；字符类 `[...]` 里的 `/` 不收尾。
+fn regex_literal_len(text: &str, at: usize) -> Option<usize> {
+    let before = text[..at].trim_end_matches([' ', '\t']);
+    let starts_expression = match before.chars().next_back() {
+        None | Some('\n') => true,
+        Some(c) if "(,=:[!&|?{};+-*%<>~^".contains(c) => true,
+        Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => {
+            let word_at = before
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .last()
+                .map_or(before.len(), |(i, _)| i);
+            matches!(
+                &before[word_at..],
+                "return" | "typeof" | "case" | "in" | "of" | "delete" | "void" | "throw" | "new"
+                    | "else" | "do" | "yield" | "await"
+            )
+        }
+        _ => false,
+    };
+    if !starts_expression {
+        return None;
+    }
+    let body = &text[at + 1..];
+    // `//`、`/*` 是注释（调用方已先处理）；`/ ` 多半是写了一半的除法
+    if body.starts_with(['/', '*', ' ', '\n']) || body.is_empty() {
+        return None;
+    }
+    let mut in_class = false;
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\n' => return None,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => {
+                let flags = body[i + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .count();
+                return Some(1 + i + 1 + flags);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// 单遍分词，返回 (字节范围, 类别) 列表（连续 Plain 已合并）。
 pub(super) fn tokenize(text: &str, lang: &Lang) -> Vec<(usize, usize, Tok)> {
     let mut segs: Vec<(usize, usize, Tok)> = Vec::new();
@@ -117,6 +173,14 @@ pub(super) fn tokenize(text: &str, lang: &Lang) -> Vec<(usize, usize, Tok)> {
         // 认不出来的 `'` 是生命周期（`'a`），按普通字符处理。
         if lang.char_lit && c == '\'' {
             if let Some(len) = char_literal_len(rest) {
+                segs.push((i, i + len, Tok::Str));
+                i += len;
+                continue;
+            }
+        }
+        // 正则字面量（JS / TS）
+        if lang.regex_lit && c == '/' {
+            if let Some(len) = regex_literal_len(text, i) {
                 segs.push((i, i + len, Tok::Str));
                 i += len;
                 continue;
@@ -245,6 +309,10 @@ pub(super) fn tokenize(text: &str, lang: &Lang) -> Vec<(usize, usize, Tok)> {
             }
             // 字符字面量要整体成段：让位给外层循环的字符字面量分支
             if lang.char_lit && c == '\'' && char_literal_len(rest).is_some() {
+                break;
+            }
+            // 正则字面量同理（已经在本段里走过至少一个字符才让位，避免原地打转）
+            if lang.regex_lit && c == '/' && i > start && regex_literal_len(text, i).is_some() {
                 break;
             }
             if lang.strings.contains(&c) || c.is_ascii_digit() || c == '_' || c.is_alphabetic() {

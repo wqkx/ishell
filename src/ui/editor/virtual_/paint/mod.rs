@@ -191,7 +191,8 @@ pub(super) fn paint_visible_rows(
         if (moved || jumped) && !wrap {
             let (ls2, _) = v_line_range(ed, v_line_of(ed, ed.vcaret));
             // 光标在内容坐标里的 x：按真实字宽算（中文、Tab 都不是一列宽）
-            let cx = gutter_w + str_cols(&ed.content[ls2..ed.vcaret]) * char_w;
+            let caret = crate::ui::ime_safe::floor_boundary(&ed.content, ed.vcaret).max(ls2);
+            let cx = gutter_w + str_cols(&ed.content[ls2..caret]) * char_w;
             if cx < ed.vlast_hoff + gutter_w + char_w {
                 force_h = Some((cx - gutter_w - char_w * 2.0).max(0.0));
             } else if cx > ed.vlast_hoff + view_w - char_w * 2.0 {

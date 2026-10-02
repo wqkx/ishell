@@ -180,6 +180,28 @@ mod tests {
         assert!(lint_syntax("let v = [1 \"a\"];\n", "rs").2.is_some());
     }
 
+    /// JS / TS 的正则字面量要整体认出来：里面的引号不是字符串、括号不参与配对。
+    /// 除法不能被误认成正则。
+    #[test]
+    fn js_regex_literals_are_not_linted_as_code() {
+        for src in [
+            "s.replace(/\"/g, '');\n",
+            "const r = /[(]/.test(x);\n",
+            "if (/^\\s*\\{/.test(line)) { ok(); }\n",
+            "return /[/\\]]+'/i;\n",
+            "const a = b / c / d;\n",
+            "x = (a + b) / 2; y = n / 3; // half\n",
+            "let k = arr[0] / arr[1];\n",
+        ] {
+            let (lines, _, msg) = lint_syntax(src, "js");
+            assert!(msg.is_none(), "被误报（行 {lines:?}）：{src}");
+        }
+        assert_eq!(tok_at("x = /ab+c/gi;\n", "js", "ab+c"), Tok::Str);
+        assert_eq!(tok_at("x = a / b;\n", "js", "b;"), Tok::Plain);
+        // 真的不配平仍然报
+        assert!(lint_syntax("f(/x/, [1, 2);\n", "js").2.is_some());
+    }
+
     /// 纯文本里的撇号不是字符串定界符：`don't` 之后不该整行染成字符串色。
     #[test]
     fn apostrophes_in_prose_are_not_strings() {

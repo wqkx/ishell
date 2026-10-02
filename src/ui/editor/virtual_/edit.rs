@@ -395,6 +395,9 @@ pub(super) fn v_move_v(ed: &mut Editor, delta: isize, shift: bool) {
     // 按「视觉行」上下移动（保持视觉列）：换行/非换行都维护该映射，且自动跳过折叠行
     if ed.vrow_cols > 0 && !ed.vrow_pre.is_empty() {
         let cols = ed.vrow_cols;
+        // 行数表平时在绘制时同步；同一帧里先有编辑再有移动的话它还是旧的。这里先同步
+        //（没变化时是空操作）。
+        super::wrap::v_wrap_sync(ed, cols);
         let (vrow, vcol) = v_vpos_of_byte(ed, ed.vcaret, cols);
         let goal = ed.vgoal_col.unwrap_or(vcol);
         ed.vgoal_col = Some(goal);
@@ -781,6 +784,19 @@ mod tests {
         v_insert(&mut ed, "z");
         assert_eq!(ed.content, "zbc");
         assert!(ed.dirty());
+    }
+
+    /// 同一帧里「先编辑、再上下移动」：移动用的折行行数表必须是编辑之后的。表只在绘制时
+    /// 同步的话，这一帧里它还是旧的——行数变了，上移就落到错误的那一段上。
+    #[test]
+    fn vertical_moves_after_an_edit_in_the_same_frame_use_fresh_rows() {
+        let mut ed = ed_rs("abcdefgh\nxy");
+        super::super::wrap::v_wrap_sync(&mut ed, 4); // 第 0 行 2 段
+        ed.vcaret = 8;
+        v_insert(&mut ed, "ijkl"); // 第 0 行变成 3 段；这一帧还没绘制
+        ed.vcaret = 13; // 第 1 行行首
+        v_move_v(&mut ed, -1, false);
+        assert_eq!(ed.vcaret, 8, "应落在第 0 行最后一段（ijkl）的行首");
     }
 
     /// 什么都没改的「编辑」不是编辑：不该置 dirty、不该占一条撤销记录、不该清空重做栈。
