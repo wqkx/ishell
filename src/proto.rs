@@ -242,8 +242,14 @@ pub enum UiCommand {
     DirectTransfer(Box<DirectSpec>),
     /// 键盘交互认证：用户对服务器提示的逐项回答（顺序与 prompts 一致）
     KbdResponse(Vec<String>),
-    /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制。id 关联占位标签的下载进度
-    ReadFile { id: u64, path: String, force: bool },
+    /// 读取文本文件内容（用于编辑器打开）；force=true 时放宽大小限制。id 关联占位标签的下载进度。
+    /// encoding：Some = 不探测、按指定编码解码（编辑器「按编码重新打开」）；None = 自动探测。
+    ReadFile {
+        id: u64,
+        path: String,
+        force: bool,
+        encoding: Option<String>,
+    },
     /// 跟随读取（tail -f）：从 offset 读到文件末尾（单次上限 512KB）。
     /// offset = u64::MAX 表示初始化——只返回当前文件大小、不读数据。
     TailFile { path: String, offset: u64 },
@@ -400,10 +406,20 @@ pub enum WorkerEvent {
         encoding: String,
         eol: Eol,
         mtime: u32,
+        /// 文件的原始字节数（跟随模式从这里接着读）
+        size: u64,
+        /// 解码时有字节认不出来（已替换成 U+FFFD）：内存里的内容编不回原文件
+        lossy: bool,
     },
     /// 保存成功（携带新的 mtime，编辑器据此更新，避免下次保存误判为外部改动）。
     /// id 与发起的 WriteFile 一致，按 id 匹配发起方（不止 path，避免同路径多个发起方串档）。
-    FileSaved { id: u64, path: String, mtime: u32 },
+    /// size = 写入的字节数。
+    FileSaved {
+        id: u64,
+        path: String,
+        mtime: u32,
+        size: u64,
+    },
     /// 保存写入进度（驱动编辑器标签的「珊瑚→绿」保存动画，跟随实际上传速度）
     FileSaveProgress { path: String, done: u64, total: u64 },
     /// 保存时检测到文件已被外部修改（未写入）；UI 提示用户是否覆盖

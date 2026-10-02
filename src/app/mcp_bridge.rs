@@ -3226,6 +3226,7 @@ impl App {
                         id: op_id,
                         path: path.clone(),
                         force,
+                        encoding: None,
                     })
                     .is_ok();
                 if !sent {

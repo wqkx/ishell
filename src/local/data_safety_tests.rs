@@ -409,7 +409,7 @@ fn read_only_operations_never_modify_anything() {
         list_dir_event(&tmp.0.to_string_lossy(), 1, &sink).await;
         for f in ["a.txt", "crlf.txt", "bin.dat", "sub/inner.txt"] {
             let p = tmp.0.join(f);
-            read_file(&p.to_string_lossy(), false, 1, &sink).await;
+            read_file(&p.to_string_lossy(), false, None, 1, &sink).await;
         }
     });
 

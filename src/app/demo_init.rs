@@ -108,6 +108,8 @@ impl App {
                     tail_last: 0.0,
                     doc: None,
                     tail_carry: Vec::new(),
+                    file_size: None,
+                    reopening: false,
                 });
                 let mut big_ed = crate::ui::editor::Editor::new("/var/log/huge.log".into(), big);
                 big_ed.readonly = true; // 演示大文件默认只读
@@ -133,6 +135,8 @@ impl App {
                     tail_last: 0.0,
                     doc: None,
                     tail_carry: Vec::new(),
+                    file_size: None,
+                    reopening: false,
                 });
                 ed.tabs.push(EditorTab {
                     editor: crate::ui::editor::Editor::new(
@@ -159,6 +163,8 @@ impl App {
                     tail_last: 0.0,
                     doc: None,
                     tail_carry: Vec::new(),
+                    file_size: None,
+                    reopening: false,
                 });
                 ed.active = 1; // 默认显示大文件标签
             }
@@ -201,6 +207,8 @@ impl App {
                     tail_last: 0.0,
                     doc: None,
                     tail_carry: Vec::new(),
+                    file_size: None,
+                    reopening: false,
                 });
                 ed.active = ed.tabs.len() - 1;
             }

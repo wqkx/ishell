@@ -146,6 +146,8 @@ pub struct Editor {
     pub readonly: bool,
     /// 状态栏「改为可编辑」被点击（一次性，app/editor 层消费后清零）。
     pub unlock_req: bool,
+    /// 状态栏「按编码重新打开」选了某个编码（一次性，app 层消费：重新读取文件）。
+    pub reopen_req: Option<String>,
     /// 占位（loading）状态下的自定义文案（None = 「下载中 …」）。
     pub loading_note: Option<String>,
     /// Markdown 预览：开启时以渲染视图替代源码编辑区（仅 Markdown 文件可开）。
@@ -250,6 +252,7 @@ impl Editor {
             follow_req: false,
             readonly: false,
             unlock_req: false,
+            reopen_req: None,
             loading_note: None,
             preview: false,
             md: Default::default(),
@@ -376,10 +379,6 @@ impl Editor {
             self.vcaret = self.content.len();
             self.pending_scroll = Some(self.vlines.len().saturating_sub(1));
         }
-    }
-    /// 内容里有解码失败留下的替换字符（�）。
-    pub fn has_undecodable(&self) -> bool {
-        self.content.contains('\u{FFFD}')
     }
     /// 状态栏提示文字。
     pub fn set_status(&mut self, s: &str) {

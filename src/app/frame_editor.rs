@@ -2,14 +2,14 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::proto::{Eol, UiCommand};
+use crate::proto::UiCommand;
 
 use super::util::lock_mutex;
 use super::{App, DocKind, EditorTab, SaveState};
 
 type FramePlaceholder = (u64, String, String, u64, UnboundedSender<UiCommand>);
 /// (uid, id, path, content, encoding, eol, mtime) —— uid 不可省，见 frame.rs 同名类型注释。
-type FrameFilled = (u64, u64, String, String, String, Eol, u32);
+type FrameFilled = (u64, super::pending::OpenedFile);
 type FramePdfSearch = (u64, String, Vec<(u32, String)>, Option<String>);
 
 impl App {
@@ -81,6 +81,8 @@ impl App {
                         tail_last: 0.0,
                         doc: None,
                         tail_carry: Vec::new(),
+                    file_size: None,
+                    reopening: false,
                     });
                     ed.active = ed.tabs.len() - 1;
                 }
@@ -101,7 +103,17 @@ impl App {
                 }
             }
             // 3) 内容就位：占位标签变为可编辑、填入内容；恢复上次光标位置
-            for (uid, id, path, content, encoding, eol, mtime) in filled {
+            for (uid, f) in filled {
+                let super::pending::OpenedFile {
+                    id,
+                    path,
+                    content,
+                    encoding,
+                    eol,
+                    mtime,
+                    size,
+                    lossy,
+                } = f;
                 if let Some(t) = ed
                     .tabs
                     .iter_mut()
@@ -116,12 +128,13 @@ impl App {
                         editor.readonly = true;
                     }
                     // 解码时有字节认不出来（已显示成 �）：原字节在内存里已经没了，一保存就把
-                    // 替换字符写回文件。先只读打开，由用户看过之后自己决定要不要解除。
-                    if editor.has_undecodable() {
+                    // 替换字符写回文件。先只读打开，由用户看过之后自己决定要不要解除——多半是
+                    // 编码认错了，状态栏「按编码重新打开」可以换一个试。
+                    if lossy {
                         editor.readonly = true;
                         editor.set_status(crate::i18n::tr(
-                            "含无法按当前编码解码的字节（显示为 �），已只读打开——保存会改坏这些字节",
-                            "Contains bytes that could not be decoded (shown as �); opened read-only",
+                            "有字节无法按当前编码解码（显示为 �），已只读打开；可在状态栏按其它编码重新打开",
+                            "Some bytes could not be decoded (shown as �); opened read-only. Try reopening with another encoding",
                         ));
                     }
                     if let Some(line) = crate::store::load_cursor_line(&key) {
@@ -129,6 +142,8 @@ impl App {
                     }
                     t.editor = editor;
                     t.load_id = None;
+                    t.reopening = false;
+                    t.file_size = Some(size);
                 }
             }
             // 3.5) 文档就位：占位标签变为 PDF / Word 查看器
@@ -272,7 +287,12 @@ impl App {
                     .iter()
                     .position(|t| t.uid == uid && t.load_id == Some(id))
                 {
-                    ed.remove_tab_at(ui.ctx(), i);
+                    if ed.tabs[i].reopening {
+                        // 「按编码重新打开」失败：标签里原来的内容还在，放回来就是
+                        ed.tabs[i].cancel_reopen();
+                    } else {
+                        ed.remove_tab_at(ui.ctx(), i);
+                    }
                 }
             }
             // 编辑器是独立 deferred 子窗口：变化后必须显式唤醒它重绘（含进度条动画）。
@@ -284,7 +304,7 @@ impl App {
     pub(super) fn process_editor_save_events(
         &mut self,
         ctx: &egui::Context,
-        saved: Vec<(u64, u64, String, u32)>,
+        saved: Vec<(u64, u64, String, u32, u64)>,
         conflicts: Vec<(u64, u64, String)>,
         save_progress: Vec<(u64, String, u64, u64)>,
         save_failed: Vec<(u64, u64, String, String)>,
@@ -318,7 +338,7 @@ impl App {
                                                                     // 用 save_op 而非 tid 匹配，是为了让「超时判定后姗姗来迟」的旧事件天然匹配不到任何
                                                                     // 标签（超时时已把 save_op 清零、重试又分配了新的 save_op）而被安全丢弃。
                                                                     // save_tombstones 是显式识别：命中即「已超时判定过」，直接跳过，不做任何状态更新。
-            for (uid, id, _path, mtime) in saved {
+            for (uid, id, _path, mtime, size) in saved {
                 if ed.save_tombstones.contains(&id) {
                     // 超时后姗姗来迟的成功事件：已判超时，保存状态不再动（标签或已关闭 / 已重试）。
                     // 但那次写入**确实落盘了**，远端 mtime 已是它的——不回填的话，下一次保存
@@ -329,10 +349,12 @@ impl App {
                         .find(|t| t.uid == uid && t.editor.path == _path && !t.is_saving())
                     {
                         t.editor.set_mtime(mtime);
+                        t.file_size = Some(size);
                     }
                     continue;
                 }
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.save_op == id) {
+                    t.file_size = Some(size); // 文件现在这么大：跟随模式从这里接着读
                     t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
                                                // 取出本次保存发出时的签名与关闭意图（Saving 状态里）；非 Saving 则忽略这条确认。
                     let (sent_rev, close_after) = match &t.save {

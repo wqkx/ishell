@@ -579,12 +579,12 @@ pub async fn run(
                             });
                         }
                     }
-                    Some(UiCommand::ReadFile { id, path, force }) => {
+                    Some(UiCommand::ReadFile { id, path, force, encoding }) => {
                         if let Some(sftp) = &sftp {
                             let sftp = sftp.clone();
                             let s = sink.clone();
                             tokio::spawn(async move {
-                                read_file_chunked(&sftp, &path, force, id, &s).await;
+                                read_file_chunked(&sftp, &path, force, encoding.as_deref(), id, &s).await;
                             });
                         } else {
                             // SFTP 未就绪：移除占位标签并提示（否则永久「下载中」）

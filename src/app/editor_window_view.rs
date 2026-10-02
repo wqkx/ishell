@@ -390,6 +390,15 @@ impl App {
                         t.editor.follow_req = false;
                         toggle_follow = true;
                     }
+                    // 状态栏「按编码重新打开」：条件不满足（有未保存修改等）时不做，状态栏给提示
+                    if let Some(enc) = t.editor.reopen_req.take() {
+                        if !t.begin_reopen(enc) {
+                            t.editor.set_status(crate::i18n::tr(
+                                "有未保存的修改或正在跟随 / 加载：先保存或撤销，再按编码重新打开",
+                                "Unsaved changes, following or loading: save or undo first",
+                            ));
+                        }
+                    }
                     if t.editor.unlock_req {
                         t.editor.unlock_req = false;
                         t.editor.readonly = false;
@@ -404,48 +413,7 @@ impl App {
                     if t.editor.follow {
                         t.editor.follow = false;
                     } else if !t.editor.dirty() && t.load_id.is_none() {
-                        t.editor.follow = true;
-                        t.tail_offset = u64::MAX;
-                        t.tail_carry.clear();
-                        t.tail_pending = true;
-                        t.tail_last = now;
-                        // 初始化：只取当前文件大小（相当于 tail -f -n 0），此后每 ~1s 增量拉取
-                        let _ = t.cmd_tx.send(UiCommand::TailFile {
-                            path: t.editor.path.clone(),
-                            offset: u64::MAX,
-                        });
-                    }
-                }
-            }
-            if do_save {
-                let active = ed.active;
-                // 仅在「有改动」且「上次保存已完成」时才真正保存：无改动不触发也不放动画；
-                // 保存进行中（大文件耗时）屏蔽再次保存，避免用旧 mtime 重复写入被误判为外部改动；
-                // 跟随模式（tail -f）期间禁止保存——外部持续写入，本地内容无权威性。
-                let should = ed
-                    .tabs
-                    .get(active)
-                    .is_some_and(|t| t.editor.dirty() && !t.is_saving() && !t.editor.is_readonly());
-                if should {
-                    if let Some(tab) = ed.tabs.get_mut(active) {
-                        // 先进入「保存中」（分配本次 save_op / 超时截止），再据此发送 WriteFile。
-                        // 不在此处 mark_saved：只有收到服务器 FileSaved 确认（且签名一致）
-                        // 才清 dirty——发送失败/远端写失败时标签必须仍是「未保存」。
-                        tab.begin_save(false); // 保存进行中，收到 FileSaved/Conflict/Failed 或超时前屏蔽再次保存
-                        let _ = tab.cmd_tx.send(UiCommand::WriteFile {
-                            id: tab.save_op,
-                            path: tab.editor.path.clone(),
-                            content: tab.editor.content.clone(),
-                            encoding: tab.editor.encoding().to_string(),
-                            eol: tab.editor.eol(),
-                            expect_mtime: tab.editor.mtime(),
-                            force: false,
-                        });
-                        // 触发标签底部珊瑚线的「绿扫→珊瑚扫」保存动画（重置进度，跟随本次写入）
-                        tab.save_at = Some(vctx.input(|i| i.time));
-                        tab.save_done_at = None;
-                        tab.save_done = 0;
-                        tab.save_total = 0;
+                        t.start_follow(now);
                     }
                 }
             }

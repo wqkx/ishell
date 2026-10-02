@@ -99,6 +99,7 @@ pub(in crate::ssh) async fn read_file_chunked(
     sftp: &russh_sftp::client::SftpSession,
     path: &str,
     force: bool,
+    encoding: Option<&str>,
     id: u64,
     sink: &UiSink,
 ) {
@@ -192,7 +193,11 @@ pub(in crate::ssh) async fn read_file_chunked(
                 return;
             }
             // 探测编码并解码（UTF-8 优先，非 UTF-8 用 chardetng 猜 GBK/GB18030 等），再把行尾统一成 LF
-            let (decoded, encoding) = decode_text(&data);
+            let size = data.len() as u64;
+            let (decoded, encoding, lossy) = match encoding {
+                Some(enc) => crate::textcodec::decode_as(&data, enc),
+                None => decode_text(&data),
+            };
             let (content, eol) = crate::textcodec::split_eol(decoded);
             sink.send(WorkerEvent::FileOpened {
                 id,
@@ -201,6 +206,8 @@ pub(in crate::ssh) async fn read_file_chunked(
                 encoding,
                 eol,
                 mtime: file_mtime,
+                size,
+                lossy,
             });
         }
         Err(e) => {

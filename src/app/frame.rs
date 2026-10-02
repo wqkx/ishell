@@ -3,7 +3,7 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::proto::{Eol, UiCommand};
+use crate::proto::UiCommand;
 use crate::ui::file_panel;
 
 use super::util::{lock_mutex, trim_memory};
@@ -14,7 +14,7 @@ type FramePlaceholder = (u64, String, String, u64, UnboundedSender<UiCommand>);
 /// 本帧待填入编辑器的文件内容：(uid, id, path, content, encoding, eol, mtime)。
 /// **必须带 uid**：id 来自各会话**独立**的 `next_xfer` 计数器（见 file_actions.rs），
 /// 跨会话必然重号，而编辑器标签是全局一张表——只按 id 找标签会填进别的会话的标签里。
-type FrameFilled = (u64, u64, String, String, String, Eol, u32);
+type FrameFilled = (u64, super::pending::OpenedFile);
 /// PDF 查找命中：(uid, path, hits, message)
 type FramePdfSearch = (u64, String, Vec<(u32, String)>, Option<String>);
 
@@ -48,14 +48,14 @@ impl App {
         // 编辑器的保存结果也在这里收：编辑器是**独立的 OS 窗口**，主窗口最小化时用户照样
         // 能在里面按保存。放在 `ui` 那条路径上的话，保存既等不到确认、也等不到超时——
         // 标签一直卡在「保存中」，「保存并关闭」永远不关。
-        let mut saved: Vec<(u64, u64, String, u32)> = Vec::new(); // uid, id, path, mtime
+        let mut saved: Vec<(u64, u64, String, u32, u64)> = Vec::new(); // uid, id, path, mtime, size
         let mut save_progress: Vec<(u64, String, u64, u64)> = Vec::new(); // uid, path, done, total
         let mut conflicts: Vec<(u64, u64, String)> = Vec::new(); // uid, id, path
         let mut save_failed: Vec<(u64, u64, String, String)> = Vec::new(); // uid, id, path, message
         for s in &mut self.sessions {
             backlog |= s.drain_events();
-            for (id, path, mtime) in s.pending.saved.drain(..) {
-                saved.push((s.uid, id, path, mtime));
+            for (id, path, mtime, size) in s.pending.saved.drain(..) {
+                saved.push((s.uid, id, path, mtime, size));
             }
             for (path, done, total) in s.pending.save_progress.drain(..) {
                 save_progress.push((s.uid, path, done, total));
@@ -347,8 +347,8 @@ impl App {
             for (id, path) in s.pending.placeholder.drain(..) {
                 new_placeholders.push((id, path, s.title.clone(), s.uid, s.cmd_tx.clone()));
             }
-            for (id, path, content, encoding, eol, mtime) in s.pending.open.drain(..) {
-                filled.push((s.uid, id, path, content, encoding, eol, mtime));
+            for f in s.pending.open.drain(..) {
+                filled.push((s.uid, f));
             }
             for (path, data, offset, truncated) in s.pending.tail.drain(..) {
                 tails.push((s.uid, path, data, offset, truncated));

@@ -392,6 +392,7 @@ pub(in crate::ssh) async fn handle_fs_op(
                             id,
                             path: path.clone(),
                             mtime: nm,
+                            size: bytes.len() as u64,
                         });
                         Ok((
                             match crate::i18n::current() {

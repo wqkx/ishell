@@ -3,13 +3,27 @@
 
 use crate::proto::Eol;
 
+/// 一次读文件的结果（`WorkerEvent::FileOpened` 的内容）。
+pub(super) struct OpenedFile {
+    pub id: u64,
+    pub path: String,
+    pub content: String,
+    pub encoding: String,
+    pub eol: Eol,
+    pub mtime: u32,
+    /// 文件原始字节数
+    pub size: u64,
+    /// 解码有损（内容里的 U+FFFD 是替换出来的）
+    pub lossy: bool,
+}
+
 /// 单会话内、尚未被 App 帧循环取走的异步结果。
 #[derive(Default)]
 pub(super) struct SessionPending {
-    /// 已读取待填充到占位编辑器标签的文件（id, path, content, encoding, eol, mtime）
-    pub open: Vec<(u64, String, String, String, Eol, u32)>,
-    /// 保存成功回报的新 mtime（请求 id, path, mtime）
-    pub saved: Vec<(u64, String, u32)>,
+    /// 已读取待填充到占位编辑器标签的文件
+    pub open: Vec<OpenedFile>,
+    /// 保存成功回报（请求 id, path, 新 mtime, 写入的字节数）
+    pub saved: Vec<(u64, String, u32, u64)>,
     /// 保存写入进度（path, done, total）——驱动编辑器标签「珊瑚→绿」保存动画
     pub save_progress: Vec<(String, u64, u64)>,
     /// 跟随读取返回：(路径, 新增字节, 新 offset, 是否截断/轮转)

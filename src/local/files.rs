@@ -16,7 +16,12 @@ use crate::textcodec::decode_text;
 pub(super) async fn handle(cmd: UiCommand, sink: &UiSink) {
     match cmd {
         UiCommand::ListDir { path, gen } => list_dir_event(&path, gen, sink).await,
-        UiCommand::ReadFile { id, path, force } => read_file(&path, force, id, sink).await,
+        UiCommand::ReadFile {
+            id,
+            path,
+            force,
+            encoding,
+        } => read_file(&path, force, encoding.as_deref(), id, sink).await,
         UiCommand::WriteFile {
             id,
             path,
@@ -170,7 +175,7 @@ async fn resolve_symlinks(dir: &str, entries: &mut [FileEntry]) {
 
 // ————————————————————————— 读文件（编辑器打开） —————————————————————————
 
-async fn read_file(path: &str, force: bool, id: u64, sink: &UiSink) {
+async fn read_file(path: &str, force: bool, encoding: Option<&str>, id: u64, sink: &UiSink) {
     use tokio::io::AsyncReadExt;
     let limit = if force {
         crate::limits::FILE_HARD_LIMIT as usize
@@ -261,7 +266,11 @@ async fn read_file(path: &str, force: bool, id: u64, sink: &UiSink) {
                 });
                 return;
             }
-            let (decoded, encoding) = decode_text(&data);
+            let size = data.len() as u64;
+            let (decoded, encoding, lossy) = match encoding {
+                Some(enc) => crate::textcodec::decode_as(&data, enc),
+                None => decode_text(&data),
+            };
             let (content, eol) = crate::textcodec::split_eol(decoded);
             sink.send(WorkerEvent::FileOpened {
                 id,
@@ -270,6 +279,8 @@ async fn read_file(path: &str, force: bool, id: u64, sink: &UiSink) {
                 encoding,
                 eol,
                 mtime: file_mtime,
+                size,
+                lossy,
             });
         }
         Ok(Err(())) => sink.send(WorkerEvent::FileLoadFailed {
@@ -359,6 +370,7 @@ async fn write_file(
                 id,
                 path: path.to_string(),
                 mtime: nm,
+                size: total,
             });
         }
         Err(e) => sink.send(WorkerEvent::FileSaveFailed {

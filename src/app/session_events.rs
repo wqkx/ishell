@@ -231,6 +231,8 @@ impl Session {
                     encoding,
                     eol,
                     mtime,
+                    size,
+                    lossy,
                 } => {
                     // 先看是不是 MCP read_file 在等这次读取（或者是个该丢弃的迟到墓碑）——
                     // 是的话直接把内容 move 给它，不转发给编辑器 UI（这种读取没有对应的
@@ -238,15 +240,27 @@ impl Session {
                     if self.file_read_op_would_resolve(id) {
                         self.try_resolve_file_read(id, Ok(content));
                     } else {
-                        self.pending
-                            .open
-                            .push((id, path, content, encoding, eol, mtime));
+                        self.pending.open.push(super::pending::OpenedFile {
+                            id,
+                            path,
+                            content,
+                            encoding,
+                            eol,
+                            mtime,
+                            size,
+                            lossy,
+                        });
                         self.status = crate::i18n::tr("已打开文件", "File opened").into();
                     }
                 }
-                WorkerEvent::FileSaved { id, path, mtime } => {
+                WorkerEvent::FileSaved {
+                    id,
+                    path,
+                    mtime,
+                    size,
+                } => {
                     if !self.file_write_op_would_resolve(id) {
-                        self.pending.saved.push((id, path, mtime));
+                        self.pending.saved.push((id, path, mtime, size));
                     } else {
                         self.try_resolve_file_write(id, Ok(mtime));
                     }

@@ -149,18 +149,45 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                         ed.set_eol(n);
                     }
                     ui.add_space(10.0);
-                    // 编码：点击从菜单选择（保存时按所选编码写回）
+                    // 编码菜单：两个不同的动作，必须分开——
+                    //   · 按编码重新打开：文件字节不变，换一种编码去**读**（自动识别错了、显示乱码时用）；
+                    //   · 保存为编码：内容不变，下次保存时换一种编码去**写**（转换文件编码）。
+                    // 原先只有后者：文件被认错编码时，用户选了正确的编码，显示纹丝不动，
+                    // 一保存反而把乱码按新编码写了回去。
+                    const ENCODINGS: [&str; 9] = ["UTF-8", crate::textcodec::UTF8_BOM, "GBK", "GB18030", "Big5", "Shift_JIS", "EUC-KR", "windows-1252", "ISO-8859-1"];
                     ui.menu_button(RichText::new(ed.encoding()).color(Palette::TEXT_DIM).size(11.0), |ui| {
-                        ui.set_min_width(120.0);
-                        for enc in ["UTF-8", crate::textcodec::UTF8_BOM, "GBK", "GB18030", "Big5", "Shift_JIS", "EUC-KR", "windows-1252", "ISO-8859-1"] {
-                            if ui.selectable_label(ed.encoding() == enc, enc).clicked() {
-                                ed.set_encoding(enc.to_string());
-                                ui.close();
+                        ui.set_min_width(170.0);
+                        ui.menu_button(crate::i18n::tr("按编码重新打开", "Reopen with encoding"), |ui| {
+                            ui.set_min_width(120.0);
+                            for enc in ENCODINGS {
+                                if ui.button(enc).clicked() {
+                                    ed.reopen_req = Some(enc.to_string());
+                                    ui.close();
+                                }
                             }
-                        }
+                        })
+                        .response
+                        .on_hover_text(crate::i18n::tr(
+                            "显示乱码时用：按所选编码重新读取文件（文件本身不变）。\n需要先保存或撤销未保存的修改。",
+                            "For garbled text: re-read the file using this encoding (the file is not changed).\nRequires no unsaved changes.",
+                        ));
+                        ui.menu_button(crate::i18n::tr("保存为编码", "Save with encoding"), |ui| {
+                            ui.set_min_width(120.0);
+                            for enc in ENCODINGS {
+                                if ui.selectable_label(ed.encoding() == enc, enc).clicked() {
+                                    ed.set_encoding(enc.to_string());
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(crate::i18n::tr(
+                            "转换文件编码：内容不变，下次保存时按所选编码写入。",
+                            "Convert the file: content is kept and written in this encoding on next save.",
+                        ));
                     })
                     .response
-                    .on_hover_text(crate::i18n::tr("点击选择保存编码", "Click to choose save encoding"));
+                    .on_hover_text(crate::i18n::tr("编码：重新打开 / 保存为", "Encoding: reopen / save as"));
                 });
             });
         });

@@ -94,26 +94,40 @@ pub(crate) fn tail_carry_len(enc: &'static encoding_rs::Encoding, bytes: &[u8]) 
         .unwrap_or(0)
 }
 
-/// 探测字节的字符编码并解码为 String，返回 (文本, 编码名)。
+/// 探测字节的字符编码并解码，返回 (文本, 编码名, 是否有损)。
 /// UTF-8(含 BOM) 优先；非 UTF-8 用 chardetng 猜测（中文环境多为 GBK/GB18030）。
-pub(crate) fn decode_text(data: &[u8]) -> (String, String) {
+/// 「有损」= 有字节在该编码下不合法、已被替换成 U+FFFD：内存里的文本编不回原字节。
+pub(crate) fn decode_text(data: &[u8]) -> (String, String, bool) {
     // UTF-8 BOM：记成单独的编码名，保存时才知道要把 BOM 写回去
-    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return (
-            String::from_utf8_lossy(&data[3..]).into_owned(),
-            UTF8_BOM.into(),
-        );
+    if let Some(body) = data.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        let text = String::from_utf8_lossy(body);
+        let lossy = matches!(text, std::borrow::Cow::Owned(_));
+        return (text.into_owned(), UTF8_BOM.into(), lossy);
     }
     // 无损 UTF-8 直接用
     if let Ok(s) = std::str::from_utf8(data) {
-        return (s.to_string(), "UTF-8".into());
+        return (s.to_string(), "UTF-8".into(), false);
     }
     // 非 UTF-8：探测后解码
     let mut det = chardetng::EncodingDetector::new();
     det.feed(data, true);
     let enc = det.guess(None, true);
-    let (cow, actual, _) = enc.decode(data);
-    (cow.into_owned(), actual.name().to_string())
+    let (cow, actual, lossy) = enc.decode(data);
+    (cow.into_owned(), actual.name().to_string(), lossy)
+}
+
+/// 不探测、按指定编码解码（「按编码重新打开」：自动探测猜错时由用户指定）。
+/// 返回 (文本, 编码名, 是否有损)；编码名原样返回，保存时沿用。
+pub(crate) fn decode_as(data: &[u8], encoding: &str) -> (String, String, bool) {
+    if encoding == UTF8_BOM {
+        let body = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
+        let text = String::from_utf8_lossy(body);
+        let lossy = matches!(text, std::borrow::Cow::Owned(_));
+        return (text.into_owned(), UTF8_BOM.into(), lossy);
+    }
+    // 去掉与该编码对应的 BOM（UTF-16 靠它，UTF-8 文件带了也不该显示成 U+FEFF）
+    let (cow, lossy) = encoding_for(encoding).decode_with_bom_removal(data);
+    (cow.into_owned(), encoding.to_string(), lossy)
 }
 
 #[cfg(test)]
@@ -123,7 +137,8 @@ mod tests {
 
     /// 打开再保存、一个字没改：写回去的必须和原文件逐字节相同。
     fn roundtrip(data: &[u8]) -> Vec<u8> {
-        let (decoded, encoding) = decode_text(data);
+        let (decoded, encoding, lossy) = decode_text(data);
+        assert!(!lossy);
         let (content, eol) = split_eol(decoded);
         encode_for_save(content, eol, &encoding).expect("应可无损写回")
     }
@@ -164,6 +179,36 @@ mod tests {
         assert_eq!(eol, Eol::Lf);
         let out = encode_for_save(content, Eol::Crlf, "UTF-8").unwrap();
         assert_eq!(out, b"a\r\nb\r\nc\r\n");
+    }
+
+    /// 有损解码要如实报告：这些文件一保存就会把替换字符写回去。
+    #[test]
+    fn lossy_decoding_is_reported() {
+        assert!(!decode_text("纯 UTF-8".as_bytes()).2);
+        assert!(decode_text(b"\xEF\xBB\xBFok \xFF bad").2, "BOM 之后的非法字节");
+        let gbk = encoding_rs::GBK.encode("中文").0.into_owned();
+        assert!(!decode_text(&gbk).2);
+        // 文件里本来就有合法的 U+FFFD：不算有损
+        assert!(!decode_text("a\u{FFFD}b".as_bytes()).2);
+    }
+
+    /// 探测猜错时由用户指定编码重新解码：结果按指定的来，编码名沿用到保存。
+    #[test]
+    fn decoding_with_an_explicit_encoding() {
+        let gbk = encoding_rs::GBK.encode("中文内容").0.into_owned();
+        assert_eq!(decode_as(&gbk, "GBK"), ("中文内容".into(), "GBK".into(), false));
+        // 同样的字节按 UTF-8 读是有损的
+        assert!(decode_as(&gbk, "UTF-8").2);
+        // UTF-8 BOM / UTF-16：BOM 不进正文
+        assert_eq!(decode_as(b"\xEF\xBB\xBFhi", UTF8_BOM).0, "hi");
+        assert_eq!(decode_as(b"\xEF\xBB\xBFhi", "UTF-8").0, "hi");
+        let mut u16le = vec![0xFF, 0xFE];
+        u16le.extend("hi".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        assert_eq!(decode_as(&u16le, "UTF-16LE").0, "hi");
+        // 指定编码重新打开、原样保存：字节不变
+        let (text, enc, _) = decode_as(&gbk, "GBK");
+        let (content, eol) = split_eol(text);
+        assert_eq!(encode_for_save(content, eol, &enc).unwrap(), gbk);
     }
 
     /// 目标编码表示不了的字符：拒绝保存，而不是写成 `&#20013;` 再报「已保存」。

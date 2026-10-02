@@ -213,7 +213,12 @@ impl App {
                 s.next_xfer += 1;
                 // 立即建占位标签（显示文件名 + 进度条），下载完成后由 FileOpened 填充内容
                 s.pending.placeholder.push((id, path.clone()));
-                let _ = s.cmd_tx.send(UiCommand::ReadFile { id, path, force });
+                let _ = s.cmd_tx.send(UiCommand::ReadFile {
+                    id,
+                    path,
+                    force,
+                    encoding: None,
+                });
             }
             FileAction::OpenImage { path } => {
                 s.status = match crate::i18n::current() {

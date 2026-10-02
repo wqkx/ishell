@@ -411,6 +411,12 @@ pub(super) struct EditorTab {
     /// 跟随模式跨块解码缓冲：上一块末尾不完整的多字节字符原始字节，与下一块拼接
     ///（否则 UTF-8/GBK 字符跨 512KB 分块边界会变替换字符并永久丢失原始字节）
     pub(super) tail_carry: Vec<u8>,
+    /// 文件在磁盘上的字节数（打开时 / 上次保存后）；None = 还不知道。跟随模式从这里接着读，
+    /// 这样「打开文件」到「开启跟随」之间新增的内容不会缺一段。
+    pub(super) file_size: Option<u64>,
+    /// 正在「按编码重新打开」（重新读取中）：失败时保留标签与原内容，而不是像首次加载
+    /// 失败那样把占位标签移除。
+    pub(super) reopening: bool,
     /// 绿扫完成、进入「珊瑚扫回」阶段的起始时刻（ctx 时间）；None=仍在绿扫阶段
     pub(super) save_done_at: Option<f64>,
     /// 本次在途保存的唯一操作 id（每次 begin_save 递增分配，作为 WriteFile.id 下发；
@@ -421,6 +427,58 @@ pub(super) struct EditorTab {
     /// 在途保存的截止时刻（stall 超时：每收到一次写入进度就顺延，见 process_editor_save_events）。
     /// None = 无在途保存。到点仍未收到结果 → 判定保存超时，转空闲失败态并收尾动画。
     pub(super) save_deadline: Option<std::time::Instant>,
+}
+
+/// 「按编码重新打开」用的请求 id：取自高位区间，与各会话的 `next_xfer`（从 1 递增）和
+/// MCP 文件操作的 id（纳秒时间戳，< 2^63）都不会相撞。
+static NEXT_REOPEN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 63);
+
+impl EditorTab {
+    /// 开启跟随（tail -f）：从文件「打开时 / 上次保存后」的大小接着读。
+    ///
+    /// 原先从开启那一刻的文件末尾读起（相当于 `tail -f -n 0`），于是打开文件之后、开启
+    /// 跟随之前写入的内容不在缓冲里，中间无声无息地缺了一段。大小未知时退回旧做法。
+    /// 调用方保证：无未保存修改、不在加载中。
+    pub(super) fn start_follow(&mut self, now: f64) {
+        self.editor.follow = true;
+        self.tail_offset = self.file_size.unwrap_or(u64::MAX);
+        self.tail_carry.clear();
+        self.tail_pending = true;
+        self.tail_last = now;
+        let _ = self.cmd_tx.send(UiCommand::TailFile {
+            path: self.editor.path.clone(),
+            offset: self.tail_offset,
+        });
+    }
+
+    /// 按指定编码重新读取文件（自动探测猜错了编码时用）。只在「没有未保存的修改、不在
+    /// 跟随、不在加载」时进行——重新读取会换掉整个缓冲。返回是否已发起。
+    pub(super) fn begin_reopen(&mut self, encoding: String) -> bool {
+        if self.doc.is_some() || self.load_id.is_some() || self.editor.follow || self.editor.dirty()
+        {
+            return false;
+        }
+        let id = NEXT_REOPEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.load_id = Some(id);
+        self.load_done = 0;
+        self.load_total = 0;
+        self.reopening = true;
+        self.editor.set_loading(true);
+        let _ = self.cmd_tx.send(UiCommand::ReadFile {
+            id,
+            path: self.editor.path.clone(),
+            force: true, // 已经打开过的文件：不再受软上限 / 二进制检测约束
+            encoding: Some(encoding),
+        });
+        true
+    }
+
+    /// 重新读取失败：把原来的内容放回来。
+    pub(super) fn cancel_reopen(&mut self) {
+        self.load_id = None;
+        self.reopening = false;
+        self.editor.set_loading(false);
+    }
 }
 
 /// 保存超时阈值（stall 超时：自最后一次写入进度起算）。略高于底层 SFTP 单请求 20s 超时
@@ -677,6 +735,8 @@ mod save_fsm_tests {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
+                    file_size: None,
+                    reopening: false,
             save_done_at: None,
             save_op: 0,
             save_deadline: None,
@@ -711,6 +771,64 @@ mod save_fsm_tests {
         ed.tabs.retain(|t| t.text_id != egui::Id::new(2u8)); // B 自己没了
         assert_eq!(ed.confirm_tab_index(), None);
         assert_eq!(ed.close_tab_confirm, None);
+    }
+
+    fn tab_on_channel() -> (EditorTab, tokio::sync::mpsc::UnboundedReceiver<UiCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut t = tab();
+        t.cmd_tx = tx;
+        (t, rx)
+    }
+
+    /// 开启跟随要从「打开时的文件大小」接着读，而不是从此刻的文件末尾——
+    /// 否则打开之后、开启之前写入的内容不在缓冲里。
+    #[test]
+    fn follow_resumes_from_the_size_the_file_had_when_opened() {
+        let (mut t, mut rx) = tab_on_channel();
+        t.file_size = Some(1234);
+        t.tail_carry = vec![0xE4]; // 上一次跟随留下的残余
+        t.start_follow(1.0);
+        assert!(t.editor.follow && t.tail_pending && t.tail_carry.is_empty());
+        match rx.try_recv().expect("应发出读取请求") {
+            UiCommand::TailFile { offset, .. } => assert_eq!(offset, 1234),
+            _ => panic!("应是 TailFile"),
+        }
+        // 大小未知：退回「只取当前大小」的初始化
+        let (mut t, mut rx) = tab_on_channel();
+        t.start_follow(1.0);
+        match rx.try_recv().expect("应发出读取请求") {
+            UiCommand::TailFile { offset, .. } => assert_eq!(offset, u64::MAX),
+            _ => panic!("应是 TailFile"),
+        }
+    }
+
+    /// 「按编码重新打开」会换掉整个缓冲：有未保存修改 / 正在跟随 / 正在加载时不许做。
+    /// 失败时标签和原内容都得还在。
+    #[test]
+    fn reopening_with_an_encoding_never_discards_unsaved_work() {
+        let (mut t, mut rx) = tab_on_channel();
+        t.editor.set_encoding("GBK".into()); // 有改动
+        assert!(!t.begin_reopen("Big5".into()));
+        assert!(rx.try_recv().is_err());
+
+        let (mut t, _rx) = tab_on_channel();
+        t.editor.follow = true;
+        assert!(!t.begin_reopen("GBK".into()));
+
+        let (mut t, mut rx) = tab_on_channel();
+        assert!(t.begin_reopen("GBK".into()));
+        assert!(t.reopening && t.load_id.is_some());
+        assert!(!t.begin_reopen("Big5".into()), "读取中不重复发起");
+        match rx.try_recv().expect("应发出读取请求") {
+            UiCommand::ReadFile { id, encoding, .. } => {
+                assert_eq!(Some(id), t.load_id);
+                assert_eq!(encoding.as_deref(), Some("GBK"));
+            }
+            _ => panic!("应是 ReadFile"),
+        }
+        t.cancel_reopen();
+        assert!(t.load_id.is_none() && !t.reopening);
+        assert_eq!(t.editor.content, "hi\n", "失败后原内容还在");
     }
 
     #[test]
