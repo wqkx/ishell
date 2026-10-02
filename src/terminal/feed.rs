@@ -5,6 +5,7 @@ use std::io::Write;
 use super::{
     osc::{
         count_bel, find_sub_outside_string_escapes, osc_rgb_reply, scan_osc_effects,
+        string_payload_prefix,
         unterminated_string_tail, Osc133,
     },
     theme::TermColors,
@@ -794,9 +795,19 @@ impl Terminal {
             joined = [tail.as_slice(), bytes].concat();
             &joined
         };
+        // 上一包结束时还开着的字符串类序列（留在 tail 里的那条）：记下它的类型，下面要用
+        let open_kind = (tail.len() >= 2 && tail[0] == 0x1b).then(|| tail[1]);
+        let prev_ended_with_esc = tail.last() == Some(&0x1b);
+        let mut abandon_osc = false;
         self.notice_tail = match unterminated_string_tail(scan) {
             Some(at) if scan.len() - at <= NOTICE_TAIL_CAP => scan[at..].to_vec(),
-            _ => Vec::new(),
+            // 超过上限仍没收尾：我们这边放弃这条序列。解析器那边也要放弃——vte 会把一条
+            // OSC 整条攒在内存里、没有上限，而且只要它还陷在里面，后面的输出就全被吞掉。
+            Some(at) => {
+                abandon_osc = scan.get(at + 1) == Some(&b']');
+                Vec::new()
+            }
+            None => Vec::new(),
         };
         // 一次扫完 OSC 副作用（cwd / 标题 / 颜色查询 / 通知 / 剪贴板 / 133），
         // 避免热路径对同一缓冲反复全量扫描。
@@ -871,6 +882,16 @@ impl Terminal {
             merged.extend_from_slice(&data);
             data = merged;
         }
+        // 上一包留下一条没收尾的 DCS / SOS / PM / APC：这一包开头那截仍是它的负载。负载里
+        // 碰巧出现的 `ESC[2J ESC[3J`、`ESC[6n` 不能当真（单包内早就不当真了）——这截直接交给
+        // 解析器，不经过下面那些按字节找清屏 / 查询序列的逻辑。OSC 不在此列：它一遇到 ESC
+        // 就被打断，负载里藏不了这些序列，而且 OSC 8 有自己的跨包处理。
+        let payload_lead = match open_kind {
+            Some(b'P' | b'X' | b'^' | b'_') if !self.sync_active => {
+                data.len() + string_payload_prefix(bytes, prev_ended_with_esc)
+            }
+            _ => 0,
+        };
         data.extend_from_slice(bytes);
         let hold = incomplete_utf8_tail(&data);
         let split = data.len() - hold;
@@ -890,13 +911,20 @@ impl Terminal {
             self.csi_pending = data[at..].to_vec();
             data.truncate(at);
         }
-        let bytes = &data[..];
-        if bytes.is_empty() {
+        let lead = payload_lead.min(data.len());
+        if lead > 0 {
+            self.parser.process(&data[..lead]);
+        }
+        let bytes = &data[lead..];
+        if bytes.is_empty() && !abandon_osc {
             return Vec::new();
         }
 
         let mut replies = osc_color_replies;
         replies.extend(self.process_with_sync(bytes));
+        if abandon_osc {
+            self.parser.process(b"\x18"); // CAN：让解析器丢掉那条攒了一半的 OSC
+        }
         // 回看历史时 vt100 会随新输出自增偏移，把视口钉在用户正在看的内容上。我们自己记的
         // 偏移要跟上：不同步的话，下一帧绘制前「探测最大回滚再还原」会用旧值把它拨回去，
         // 画面就随着新输出一行行滑走了。
@@ -924,7 +952,12 @@ impl Terminal {
         // 中间时就是「上一块以 [2J 结尾、这一块以 [3J 开头」）：记住上一块的结尾。
         let after_2j = std::mem::take(&mut self.ended_with_2j) && bytes.starts_with(b"\x1b[3J");
         self.ended_with_2j = bytes.ends_with(b"\x1b[2J");
-        if after_2j || find_sub_outside_string_escapes(bytes, b"\x1b[2J").is_some() {
+        // 备用屏（全屏程序）里的清屏只是它在清自己的画面，交给 vt100 正常处理：重建的话新
+        // 解析器在主屏，程序被踢出备用屏，主屏原来的内容也一并没了。
+        let on_main = !self.parser.screen().alternate_screen();
+        if on_main
+            && (after_2j || find_sub_outside_string_escapes(bytes, b"\x1b[2J").is_some())
+        {
             if let Some(pos) = find_sub_outside_string_escapes(bytes, b"\x1b[3J") {
                 let (before, after) = bytes.split_at(pos + 4);
                 let mut replies = self.process_with_replies(before);
@@ -1112,7 +1145,9 @@ impl Terminal {
     /// 这里把旧解析器当前生效的模式换算成等价的开启转义序列，喂给新解析器，效果等同于远端
     /// 重新发了一遍——不改变新解析器"从头历史重放"这个既有设计，只是把旁路状态一并接上。
     fn mode_restore_bytes(old: &vt100::Screen) -> Vec<u8> {
-        let mut out = Vec::new();
+        // 当前的文字属性（颜色、粗体……）也是要带过去的状态：程序设了红色之后窗口缩了一下
+        // 或清了一次屏，接下来的输出仍应是红色。
+        let mut out = super::vt::pen_sgr(old);
         if old.application_keypad() {
             out.extend_from_slice(b"\x1b=");
         }

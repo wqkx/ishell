@@ -220,6 +220,12 @@ fn osc_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
         while end < data.len() {
             match data[end] {
                 0x07 => break,
+                // CAN / SUB 在解析器里无条件打断当前序列：这条 OSC 作废，后面的是普通输出
+                0x18 | 0x1a => {
+                    aborted = true;
+                    end += 1;
+                    break;
+                }
                 0x1b => match data.get(end + 1) {
                     Some(b'\\') => break,
                     // OSC 里出现别的转义序列 = 这条 OSC 被打断了（vte 也是这么处理的）。
@@ -236,7 +242,7 @@ fn osc_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
             }
         }
         if aborted {
-            i = end;
+            i = end; // ESC 打断：从那个 ESC 重新扫；CAN/SUB 打断：从它后面继续
             continue;
         }
         if end >= data.len() {
@@ -340,6 +346,12 @@ pub(super) fn unterminated_string_tail(data: &[u8]) -> Option<usize> {
                         terminated = true;
                         break;
                     }
+                    // CAN / SUB 打断任何字符串类序列（与解析器一致）
+                    if matches!(data[i], 0x18 | 0x1a) {
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
                     if data[i] == 0x1b {
                         match data.get(i + 1) {
                             Some(b'\\') => {
@@ -436,7 +448,7 @@ pub(super) fn find_sub_outside_string_escapes(hay: &[u8], needle: &[u8]) -> Opti
             Some(b']') => {
                 i += 2;
                 while i < hay.len() {
-                    if hay[i] == 0x07 {
+                    if matches!(hay[i], 0x07 | 0x18 | 0x1a) {
                         i += 1;
                         break;
                     }
@@ -467,11 +479,31 @@ pub(super) fn find_sub_outside_string_escapes(hay: &[u8], needle: &[u8]) -> Opti
                     }
                 }
             }
+            // `ESC ESC …`：前一个 ESC 被后一个打断，后一个才是序列的开头——只跳过一个字节
+            Some(0x1b) => i += 1,
             Some(_) => i += 2,
             None => break,
         }
     }
     None
+}
+
+/// 上一包结束时还开着一条 DCS / SOS / PM / APC（负载没收尾）：这一包开头有多少字节仍是
+/// 它的负载（含终止符）。`prev_ended_with_esc`：上一包最后一个字节是 ESC（ST 的前一半）。
+/// 整包都没收尾则返回整包长度。
+pub(super) fn string_payload_prefix(bytes: &[u8], prev_ended_with_esc: bool) -> usize {
+    if prev_ended_with_esc && bytes.first() == Some(&b'\\') {
+        return 1;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x18 | 0x1a => return i + 1,
+            0x1b if bytes.get(i + 1) == Some(&b'\\') => return i + 2,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// 一次 `osc_sequences` 扫完 feed 关心的全部 OSC 副作用，避免热路径上对同一缓冲

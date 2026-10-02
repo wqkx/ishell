@@ -1529,8 +1529,9 @@ fn byte_by_byte_feeding_still_renders_the_same_text() {
 #[test]
 fn paste_is_bracketed_only_when_the_far_side_asked_for_it() {
     let mut t = Terminal::new();
-    // 远端没开：原样发出，不加任何东西
-    assert_eq!(t.wrap_paste(b"a\nb"), b"a\nb".to_vec());
+    // 远端没开：不加括号（换行按回车键发，见
+    // `unbracketed_paste_sends_newlines_as_carriage_returns`）
+    assert_eq!(t.wrap_paste(b"a\nb"), b"a\rb".to_vec());
 
     // 远端开启 bracketed paste
     let _ = t.feed(b"\x1b[?2004h");
@@ -1540,9 +1541,9 @@ fn paste_is_bracketed_only_when_the_far_side_asked_for_it() {
         "开了 bracketed paste 却没套括号：多行粘贴会被逐行当成回车敲进去"
     );
 
-    // 关掉之后又回到原样
+    // 关掉之后又回到不加括号
     let _ = t.feed(b"\x1b[?2004l");
-    assert_eq!(t.wrap_paste(b"a\nb"), b"a\nb".to_vec());
+    assert_eq!(t.wrap_paste(b"a\nb"), b"a\rb".to_vec());
 }
 
 /// 粘贴内容里自带的结束标记必须剔除。
@@ -3048,4 +3049,159 @@ fn osc52_writes_respect_the_switch_and_the_size_cap() {
     assert!(osc52_accept(true, OSC52_MAX));
     assert!(!osc52_accept(true, OSC52_MAX + 1));
     assert!(!osc52_accept(false, 10));
+}
+
+/// 全屏程序（备用屏）里发 `ESC[2J ESC[3J` 只是它在清自己的画面。原先照样重建解析器：
+/// 新解析器在主屏，程序被踢出备用屏，主屏原来的内容也一并没了。
+#[test]
+fn clearing_inside_the_alternate_screen_stays_on_it() {
+    let mut t = Terminal::new();
+    t.feed(b"main content\r\n\x1b[?1049h");
+    t.feed(b"tui\x1b[2J\x1b[3Jredrawn");
+    assert!(t.parser.screen().alternate_screen(), "清屏把程序踢回了主屏");
+    assert!(t.screen_text().contains("redrawn"));
+    t.feed(b"\x1b[?1049l");
+    assert!(t.screen_text().contains("main content"), "退出全屏程序后主屏内容没了");
+}
+
+/// 我们自己扫转义序列的那套规则要和解析器一致，否则同一段字节两边理解不同：
+/// - `ESC ESC [6n`：前一个 ESC 被后一个打断，后面是一条正常的查询，要应答；
+/// - OSC 被 CAN / SUB 打断：到此为止，后面的是普通输出，不是这条 OSC 的内容。
+#[test]
+fn escape_scanning_agrees_with_the_parser() {
+    assert_eq!(Terminal::new().feed(b"\x1b\x1b[6n"), Terminal::new().feed(b"\x1b[6n"));
+    for abort in [0x18u8, 0x1a] {
+        let mut t = Terminal::new();
+        let mut bytes = b"\x1b]0;title".to_vec();
+        bytes.push(abort);
+        bytes.extend_from_slice(b"visible\x07");
+        t.feed(&bytes);
+        assert_eq!(t.window_title, None, "被打断的 OSC 仍被当成了标题");
+        assert!(t.screen_text().contains("visible"));
+    }
+}
+
+/// 光标写满一行后「悬」在行尾，解析器报的列等于列数。画光标、报输入法位置都要钳回
+/// 最后一列，不然光标画到了终端区域外面。
+#[test]
+fn a_cursor_hanging_at_the_right_margin_is_reported_inside_the_grid() {
+    let mut t = Terminal::new();
+    t.resize(10, 3);
+    t.feed(b"0123456789");
+    assert_eq!(t.cursor_cell(), (0, 9));
+}
+
+/// 未开 bracketed paste 时，粘贴内容里的换行要按「回车键」发（`\r`），与 xterm 一致。
+/// 发 `\n` 的话，raw 模式的程序收到的是 Ctrl+J 而不是回车（nano 里那是「对齐段落」）。
+#[test]
+fn unbracketed_paste_sends_newlines_as_carriage_returns() {
+    let t = Terminal::new();
+    assert_eq!(t.wrap_paste(b"a\nb\r\nc\rd"), b"a\rb\rc\rd");
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?2004h");
+    assert_eq!(t.wrap_paste(b"a\nb"), b"\x1b[200~a\nb\x1b[201~", "括号粘贴原样发");
+}
+
+/// 缩放回流会换一个新的解析器。当前的文字属性（颜色、粗体……）也是状态的一部分：
+/// 程序设了红色之后窗口缩了一下，接下来的输出仍应是红色。
+#[test]
+fn the_current_text_attributes_survive_a_reflow() {
+    let mut t = Terminal::new();
+    t.resize(40, 10);
+    t.feed(b"\x1b[31;1mred ");
+    t.resize(30, 9);
+    t.feed(b"X");
+    let sc = t.parser.screen();
+    let (r, c) = sc.cursor_position();
+    let cell = sc.cell(r, c - 1).unwrap();
+    assert_eq!(cell.contents(), "X");
+    assert_eq!(cell.fgcolor(), vt100::Color::Idx(1), "回流后颜色丢了");
+    assert!(cell.bold(), "回流后粗体丢了");
+}
+
+/// 一条没完没了、始终不终止的 OSC：解析器会把它整条攒在内存里（没有上限）。超过我们
+/// 自己的上限后要让解析器放弃这条序列——之后的输出才会重新显示，内存也不再涨。
+#[test]
+fn an_endless_osc_is_abandoned_instead_of_swallowing_everything() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]0;");
+    for _ in 0..40 {
+        t.feed(&vec![b'A'; 32 * 1024]);
+    }
+    // 后面是**纯文本**（没有 ESC / BEL 来顺带终止那条 OSC）：只有解析器真的放弃了它，
+    // 这些字才会显示出来
+    t.feed(b"\r\nvisible again\r\n");
+    assert!(
+        t.screen_text().contains("visible again"),
+        "解析器还陷在那条 OSC 里，后面的输出全被吞了"
+    );
+}
+
+/// DCS / OSC 的负载被分成两包时，第二包开头那截仍是负载：里面碰巧出现的清屏、查询序列
+/// 不能当真（单包内早就不当真了，见 `clear_and_cpr_inside_dcs_are_ignored`）。
+#[test]
+fn a_string_payload_continued_in_the_next_packet_is_still_payload() {
+    let mut t = Terminal::new();
+    for i in 0..30 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.feed(b"\x1bPq#0;2;0;0;0");
+    let replies = t.feed(b"payload\x1b[2J\x1b[3J\x1b[6nmore\x1b\\after\r\n");
+    assert!(replies.is_empty(), "负载里的查询被应答了：{replies:?}");
+    let history = t.history_text(100);
+    assert!(history.contains("line 0"), "负载里的清屏序列真的清了回滚");
+    assert!(history.contains("after"));
+}
+
+/// 右键属于本地菜单（复制 / 粘贴是这个应用最常用的入口）：不再同时转发给远端——
+/// 否则 tmux 弹它自己的菜单、vim 扩展选区，和本地菜单叠在一起。
+#[test]
+fn right_click_is_not_forwarded_to_the_remote() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1000h\x1b[?1006h");
+    ui_frame(&mut t, &ctx, vec![]);
+    let pos = egui::pos2(200.0, 200.0);
+    ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    let mut out = Vec::new();
+    for pressed in [true, false] {
+        out.extend(ui_frame(
+            &mut t,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            }],
+        ));
+    }
+    assert!(out.is_empty(), "右键被上报给了远端：{out:?}");
+}
+
+/// 传统（非 SGR）鼠标编码下，释放事件的按钮码是 3，但修饰键位要照带（xterm 如此）。
+#[test]
+fn legacy_mouse_release_keeps_modifier_bits() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1000h");
+    ui_frame(&mut t, &ctx, vec![]);
+    let pos = egui::pos2(200.0, 200.0);
+    ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    let alt = egui::Modifiers {
+        alt: true,
+        ..Default::default()
+    };
+    let ev = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: alt,
+    };
+    let press = ui_frame(&mut t, &ctx, vec![ev(true)]);
+    let release = ui_frame(&mut t, &ctx, vec![ev(false)]);
+    assert_eq!(press[3], 32 + 8, "按下：左键 + Alt");
+    assert_eq!(release[3], 32 + 3 + 8, "释放：3 + Alt");
 }

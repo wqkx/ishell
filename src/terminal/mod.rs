@@ -634,6 +634,15 @@ impl Terminal {
         (steps as i32).clamp(-3, 3)
     }
 
+    /// 光标所在的格子（行, 列）。
+    ///
+    /// 光标写满一行后「悬」在行尾等着折行时，解析器报的列等于列数（越过最后一格）。
+    /// 画光标、给输入法报位置都要用格子里的坐标，所以钳回最后一列。
+    pub(super) fn cursor_cell(&self) -> (u16, u16) {
+        let (r, c) = self.parser.screen().cursor_position();
+        (r, c.min(self.cols.saturating_sub(1)))
+    }
+
     /// （重）连时复位输入时钟：新 shell 是全新的一轮，`never_typed` 该重新计。
     pub fn reset_input_clock(&mut self) {
         self.last_input_at = None;
@@ -755,6 +764,10 @@ impl Terminal {
             if !focused {
                 self.ime_preedit.clear();
             }
+            // 「被吞掉的 Ctrl+V」的判定靠一对跨事件的标记（见 collect_input）；按键按到一半
+            // 焦点换了，这对标记就不成对了，留着会让下一次粘贴判断出错。
+            self.saw_v_press = false;
+            self.saw_text_paste = false;
         }
 
         // 关键：终端聚焦时锁定 Tab / 方向键 / Esc，使其传给 shell（修复 Tab 补全），
@@ -984,10 +997,14 @@ impl Terminal {
                         pressed,
                         modifiers,
                     } => {
+                        // 右键属于本地菜单（复制 / 粘贴 / 查找都在那里），不转发给远端：两边都
+                        // 响应的话，tmux 弹它自己的菜单、vim 扩展选区，和本地菜单叠在一起。
+                        if *button == egui::PointerButton::Secondary {
+                            continue;
+                        }
                         let base = match button {
                             egui::PointerButton::Primary => 0u8,
                             egui::PointerButton::Middle => 1,
-                            egui::PointerButton::Secondary => 2,
                             _ => 0,
                         };
                         // 按下必须落在终端上；释放不管落在哪都要上报——只要这个键是在终端里
@@ -1010,11 +1027,12 @@ impl Terminal {
                         } else {
                             self.held_btns.release(base);
                             // X10(Press) 模式不上报释放；SGR 用原按钮码，传统编码用 3
+                            //（修饰键位照带，与 xterm 一致）
                             if mmode != vt100::MouseProtocolMode::Press {
                                 let rel = if menc == vt100::MouseProtocolEncoding::Sgr {
                                     cb
                                 } else {
-                                    3
+                                    3 + (cb - base)
                                 };
                                 encode_mouse(menc, rel, c, r, false, &mut mouse_out);
                             }
@@ -1350,7 +1368,14 @@ impl Terminal {
         }
         if do_paste {
             match self.read_clipboard() {
-                Some(t) => out.extend_from_slice(&self.wrap_paste(t.as_bytes())),
+                Some(t) => {
+                    // 与键盘粘贴一致：贴进去的内容也记进输入行影子
+                    if !self.parser.screen().alternate_screen() && !self.input_untracked {
+                        self.input_line.push_str(&t);
+                        self.hist = None;
+                    }
+                    out.extend_from_slice(&self.wrap_paste(t.as_bytes()))
+                }
                 // 剪贴板里没有文本：可能是一张图（截图工具刚截的），走「落地成文件再贴路径」。
                 None => self.grab_clipboard_image(),
             }

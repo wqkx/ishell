@@ -79,6 +79,7 @@ impl Terminal {
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
                     log::debug!("IME Commit: {t:?}");
                     self.ime_preedit.clear();
+                    self.clear_selection(); // 与 Text 分支一致：输入字符即取消选择
                     if !alt {
                         if !self.input_untracked {
                             self.input_line.push_str(&t);

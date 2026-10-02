@@ -276,7 +276,8 @@ impl Terminal {
         // 光标：聚焦时反色绘制其下字符（终端惯例，实心填充会盖住字符）。
         // 失焦时珊瑚色描边，避免点到文件栏/侧栏后光标看似「消失」。
         if !screen.hide_cursor() && self.scrollback == 0 {
-            let (cr, cc) = screen.cursor_position();
+            // 悬在行尾的光标报的列会越过最后一格：钳回格子里（见 `cursor_cell`）
+            let (cr, cc) = self.cursor_cell();
             // 光标在宽字符上：盖住整个字（两格）；落在续格上则从这个字的起始格算
             let cc = if cc > 0
                 && screen
@@ -341,7 +342,7 @@ impl Terminal {
         // 等 fcitx 回复且**没有超时**。钳住之后光标一出视口这个值就恒定，滚动期间不再产生
         // 任何 XIM 往返，也就少了一批「正卡在往返里而 fcitx 恰好没了」的机会窗口。
         if focused {
-            let (cr, cc) = screen.cursor_position();
+            let (cr, cc) = self.cursor_cell();
             // 「候选框跟随光标」关掉时上报一个**恒定**坐标（输入区左上角）。
             // winit 只在坐标真的变了时才发 `XSetICValues`（`ime/context.rs::set_spot` 自带
             // 去重），恒定上报 = 一条都不发 = 那条「Xlib 无超时地等 fcitx 回复」的卡死路径

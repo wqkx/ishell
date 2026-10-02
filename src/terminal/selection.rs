@@ -259,7 +259,22 @@ impl Terminal {
     /// 变成键入——这是 bracketed paste 众所周知的注入面。
     pub(super) fn wrap_paste(&self, text: &[u8]) -> Vec<u8> {
         if !self.parser.screen().bracketed_paste() {
-            return text.to_vec();
+            // 没有括号可依：换行按「回车键」发（`\r`），与 xterm 一致。原样发 `\n` 的话，
+            // raw 模式的程序收到的是 Ctrl+J 而不是回车；`\r\n` 则会被当成两次回车。
+            let mut out = Vec::with_capacity(text.len());
+            let mut i = 0;
+            while i < text.len() {
+                match text[i] {
+                    b'\r' if text.get(i + 1) == Some(&b'\n') => {
+                        out.push(b'\r');
+                        i += 1;
+                    }
+                    b'\n' => out.push(b'\r'),
+                    b => out.push(b),
+                }
+                i += 1;
+            }
+            return out;
         }
         const END: &[u8] = b"\x1b[201~";
         let mut body = text.to_vec();

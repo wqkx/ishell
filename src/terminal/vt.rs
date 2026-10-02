@@ -173,6 +173,25 @@ fn push_sgr_color(p: &mut Vec<String>, c: vt100::Color, fg: bool) {
     }
 }
 
+/// 解析器当前「画笔」的 SGR（之后写入的字符会带的属性）。全是默认值时返回空。
+pub(super) fn pen_sgr(screen: &vt100::Screen) -> Vec<u8> {
+    let pen = CellAttrs {
+        fg: screen.fgcolor(),
+        bg: screen.bgcolor(),
+        bold: screen.bold(),
+        dim: screen.dim(),
+        italic: screen.italic(),
+        underline: screen.underline(),
+        inverse: screen.inverse(),
+        ..CellAttrs::DEFAULT
+    };
+    if pen == CellAttrs::DEFAULT {
+        Vec::new()
+    } else {
+        pen.sgr()
+    }
+}
+
 /// 把可见屏第 `row` 行序列化为带 SGR 的字节（裁掉行尾空白；空行返回空 Vec）。
 /// 行内属性变化时插入自包含 SGR，行尾补 `\x1b[0m`，使各行互不影响。
 pub(super) fn serialize_row(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<u8> {
