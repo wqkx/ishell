@@ -421,7 +421,7 @@ fn read_only_operations_never_modify_anything() {
 fn save_into_read_only_dir(
     tag: &str,
     existing: Option<u32>,
-) -> (Option<Vec<u8>>, Option<WorkerEvent>, Vec<String>) {
+) -> (Option<Vec<u8>>, Option<WorkerEvent>, Vec<String>, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     let tmp = TmpDir::new(tag);
     let dir = tmp.0.join("locked");
@@ -448,18 +448,21 @@ fn save_into_read_only_dir(
 
     // 先恢复权限，免得 TmpDir 清理不掉
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
-    let result = rx.try_iter().find(|e| {
-        matches!(
-            e,
-            WorkerEvent::FileSaved { .. } | WorkerEvent::FileSaveFailed { .. }
-        )
-    });
+    let mut result = None;
+    let mut notices = Vec::new();
+    for e in rx.try_iter() {
+        match e {
+            WorkerEvent::Status(s) => notices.push(s),
+            WorkerEvent::FileSaved { .. } | WorkerEvent::FileSaveFailed { .. } => result = Some(e),
+            _ => {}
+        }
+    }
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("ls")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    (std::fs::read(&target).ok(), result, names)
+    (std::fs::read(&target).ok(), result, names, notices)
 }
 
 fn running_as_root() -> bool {
@@ -478,22 +481,25 @@ fn a_read_only_directory_falls_back_to_writing_in_place() {
     if running_as_root() {
         return;
     }
-    let (content, result, names) = save_into_read_only_dir("ds-inplace", Some(0o644));
+    let (content, result, names, notices) = save_into_read_only_dir("ds-inplace", Some(0o644));
     assert_eq!(content.as_deref(), Some(&b"REPLACEMENT"[..]));
     assert!(
         matches!(result, Some(WorkerEvent::FileSaved { in_place: true, size: 11, .. })),
         "应当报「已保存（原地覆盖）」"
     );
     assert_eq!(names, ["config.yaml"], "不该留下临时文件");
+    // 提示要走主窗口的 toast（⚠ 前缀），「保存并关闭」时编辑器状态栏看不到
+    assert!(notices.iter().any(|s| s.starts_with('⚠')), "没有提示：{notices:?}");
 }
 
+/// 钉子不是门禁：只读文件带不带 truncate 都打不开，「先截断再写」的回归在这里测不出来。
 /// 目录只读、文件也只读：保存必须失败，原文件原封不动——绝不能先截断再发现写不进去。
 #[test]
 fn a_failed_save_leaves_the_original_file_intact() {
     if running_as_root() {
         return;
     }
-    let (content, result, _) = save_into_read_only_dir("ds-rosave", Some(0o444));
+    let (content, result, _, _) = save_into_read_only_dir("ds-rosave", Some(0o444));
     assert_eq!(
         content.as_deref(),
         Some(&b"ORIGINAL CONTENT, LONGER THAN THE NEW ONE"[..]),
@@ -502,13 +508,14 @@ fn a_failed_save_leaves_the_original_file_intact() {
     assert!(matches!(result, Some(WorkerEvent::FileSaveFailed { .. })));
 }
 
+/// 钉子不是门禁：不带 create 的 open 本来也建不出文件。
 /// 目录只读、目标不存在（新建）：不退化，保存失败，什么都不留下。
 #[test]
 fn a_new_file_in_a_read_only_directory_is_not_created() {
     if running_as_root() {
         return;
     }
-    let (content, result, names) = save_into_read_only_dir("ds-ronew", None);
+    let (content, result, names, _) = save_into_read_only_dir("ds-ronew", None);
     assert_eq!(content, None);
     assert!(matches!(result, Some(WorkerEvent::FileSaveFailed { .. })));
     assert!(names.is_empty(), "留下了文件：{names:?}");

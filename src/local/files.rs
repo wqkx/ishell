@@ -375,6 +375,9 @@ async fn write_file(
     };
     match outcome {
         Ok(in_place) => {
+            if in_place {
+                sink.send(WorkerEvent::Status(crate::ssh::in_place_notice(path)));
+            }
             sink.send(WorkerEvent::FileSaveProgress {
                 path: path.to_string(),
                 done: total,

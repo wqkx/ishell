@@ -1006,3 +1006,14 @@ Encrypted: no
         producer.join().expect("producer");
     }
 }
+
+/// 退化成原地覆盖写成功后的提示。`⚠` 前缀让主窗口弹 toast——「保存并关闭」时标签马上关掉，
+/// 编辑器状态栏上的那条提示用户看不到。
+pub(crate) fn in_place_notice(path: &str) -> String {
+    match crate::i18n::current() {
+        crate::i18n::Lang::Zh => format!("⚠ 目录不可写，已直接覆盖写入（非原子）：{path}"),
+        crate::i18n::Lang::En => {
+            format!("⚠ Directory not writable — saved by overwriting in place (not atomic): {path}")
+        }
+    }
+}

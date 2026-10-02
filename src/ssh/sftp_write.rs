@@ -247,10 +247,11 @@ pub(in crate::ssh) async fn sftp_write_in_place(
         touched: false,
         err,
     };
-    // `metadata` 跟随符号链接；目标不存在（新建）或是目录时不退化——目录不可写本来也建不出来。
+    // `metadata` 跟随符号链接；只对已存在的普通文件退化。新建文件在不可写目录里本来也建
+    // 不出来；FIFO / 设备文件原地写会卡住或写到别处。
     match sftp.metadata(path).await {
-        Ok(m) if !m.is_dir() => {}
-        Ok(_) => return Err(untouched(anyhow::anyhow!("is a directory"))),
+        Ok(m) if matches!(m.file_type(), russh_sftp::protocol::FileType::File) => {}
+        Ok(_) => return Err(untouched(anyhow::anyhow!("not a regular file"))),
         Err(e) => return Err(untouched(e.into())),
     }
     let f = sftp
@@ -490,6 +491,9 @@ pub(in crate::ssh) async fn handle_fs_op(
                 };
                 match outcome {
                     Ok(in_place) => {
+                        if in_place {
+                            sink.send(WorkerEvent::Status(crate::ssh::in_place_notice(&path)));
+                        }
                         let nm = sftp
                             .metadata(&path)
                             .await
