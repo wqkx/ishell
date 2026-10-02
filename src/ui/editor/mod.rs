@@ -49,6 +49,8 @@ pub struct Editor {
     msel: Vec<(usize, usize)>,
     /// 虚拟编辑器自绘 IME：当前组字(预编辑)文本在 content 中的字节范围；无则 None
     vime_preedit: Option<(usize, usize)>,
+    /// 组字开始时收起的多光标区间（组字期间它们对不上内容），提交/取消时放回 msel。
+    ime_msel: Vec<(usize, usize)>,
     /// 自绘竖向滚动：当前首个可见「视觉行」号（我们自己维护，不经 egui 像素滚动条）。
     /// 这样竖向定位按行号，与内容像素高度彻底解耦——大文件拖到底不再有 egui 边界结算卡顿。
     vtop: usize,
@@ -195,6 +197,7 @@ impl Editor {
             pending_scroll: None,
             msel: Vec::new(),
             vime_preedit: None,
+            ime_msel: Vec::new(),
             vtop: 0,
             vscroll_accum: 0.0,
             vlast_top: 0,

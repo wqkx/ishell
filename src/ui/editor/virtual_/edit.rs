@@ -115,6 +115,13 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
     }
     let (at, end) = crate::ui::ime_safe::clamp_range(&ed.content, (at, at + removed_len));
     let removed_len = end - at;
+    // 什么都没改的不算编辑：不置 dirty、不占撤销记录、不清重做栈
+    if removed_len == 0 && inserted.is_empty() {
+        return;
+    }
+    // 多光标区间是字节偏移，内容一变就陈旧了。多光标自己的编辑（v_multi_replace）会在
+    // 这之后重新设好；其它任何编辑（右键菜单、查找替换、补全……）都意味着退出多选。
+    ed.msel.clear();
     v_remap_folds(ed, at, removed_len, inserted);
     let caret_before = ed.vcaret;
     let removed = ed.content[at..end].to_string();
@@ -151,6 +158,14 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
     ed.vredo.clear();
     ed.dirty_flag = true; // 任何编辑必然离开保存点（回到保存点只能靠 undo，由 v_undo 重算）
     v_recompute(ed);
+}
+/// 粘贴文本归一成 LF（内部统一用 LF，保存时按文件行尾还原）。
+pub(super) fn normalize_paste(t: &str) -> String {
+    if t.contains('\r') {
+        t.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        t.to_string()
+    }
 }
 pub(super) fn v_delete_selection(ed: &mut Editor) -> bool {
     if let Some((a, b)) = v_sel_range(ed) {
@@ -234,10 +249,20 @@ pub(super) fn v_block_indent(ed: &mut Editor, add: bool) {
         }
     }
     if out != ed.content[start..end] {
+        let had_sel = b > a;
+        let old_caret = ed.vcaret;
+        let grew = out.len() as isize - (end - start) as isize;
         v_apply(ed, start, end - start, &out);
-        // 选中整块，支持连续 Tab/Shift+Tab
-        ed.vsel = Some(start);
-        ed.vcaret = start + out.len();
+        if had_sel {
+            // 选中整块，支持连续 Tab/Shift+Tab
+            ed.vsel = Some(start);
+            ed.vcaret = start + out.len();
+        } else {
+            // 无选区：只是调整当前行的缩进，光标跟着文字走，不留选区
+            //（留下整行选区的话，接着敲的字会把整行替换掉）
+            let moved = (old_caret as isize + grew).max(start as isize) as usize;
+            ed.vcaret = crate::ui::ime_safe::floor_boundary(&ed.content, moved);
+        }
     }
     ed.vgoal_col = None;
 }
@@ -292,6 +317,7 @@ pub(super) fn v_undo(ed: &mut Editor) {
         if !history_matches(ed, op.at, &op.inserted) {
             return;
         }
+        ed.msel.clear();
         let end = op.at + op.inserted.len();
         v_remap_folds(ed, op.at, op.inserted.len(), &op.removed);
         ed.content.replace_range(op.at..end, &op.removed);
@@ -316,6 +342,7 @@ pub(super) fn v_redo(ed: &mut Editor) {
         if !history_matches(ed, op.at, &op.removed) {
             return;
         }
+        ed.msel.clear();
         let end = op.at + op.removed.len();
         v_remap_folds(ed, op.at, op.removed.len(), &op.inserted);
         ed.content.replace_range(op.at..end, &op.inserted);
@@ -454,7 +481,17 @@ pub(super) fn v_word_range(s: &str, pos: usize) -> Option<(usize, usize)> {
 }
 // ——— 多光标（Ctrl+D 累加选区）———
 /// 把最后一个选区的文本的「下一处」加入 msel（向后找、到尾环绕；跳过已在集合中的）。
+/// 把多光标区间收敛到当前内容的合法字符边界上。正常情况下它们本来就合法（`v_apply`
+/// 会让非多光标的编辑退出多选）；这是给漏网的陈旧区间兜底——下面几处是裸切片，
+/// 一个落在汉字中间的偏移就是 panic。
+fn v_multi_sanitize(ed: &mut Editor) {
+    let content = &ed.content;
+    for r in ed.msel.iter_mut() {
+        *r = crate::ui::ime_safe::clamp_range(content, *r);
+    }
+}
 pub(super) fn v_multi_add_next(ed: &mut Editor) {
+    v_multi_sanitize(ed);
     let &(ls, le) = match ed.msel.last() {
         Some(r) => r,
         None => return,
@@ -503,6 +540,10 @@ pub(super) fn v_ctrl_d(ed: &mut Editor) {
 }
 /// 把全部选区替换为 text（一次撤销记录），并把 msel 收为各插入点后的裸光标。
 pub(super) fn v_multi_replace(ed: &mut Editor, text: &str) {
+    if ed.is_readonly() {
+        return;
+    }
+    v_multi_sanitize(ed);
     let mut ranges = ed.msel.clone();
     ranges.sort_by_key(|r| r.0);
     let mut clean: Vec<(usize, usize)> = Vec::new();
@@ -533,6 +574,7 @@ pub(super) fn v_multi_replace(ed: &mut Editor, text: &str) {
     ed.vgoal_col = None;
 }
 pub(super) fn v_multi_backspace(ed: &mut Editor) {
+    v_multi_sanitize(ed);
     let del: Vec<(usize, usize)> = ed
         .msel
         .iter()
@@ -548,6 +590,7 @@ pub(super) fn v_multi_backspace(ed: &mut Editor) {
     v_multi_replace(ed, "");
 }
 pub(super) fn v_multi_delete(ed: &mut Editor) {
+    v_multi_sanitize(ed);
     let del: Vec<(usize, usize)> = ed
         .msel
         .iter()
@@ -701,5 +744,125 @@ mod tests {
             ed.vcaret
         );
         v_backspace(&mut ed); // 修复前在这里 panic
+    }
+
+    fn ed_rs(text: &str) -> Editor {
+        let mut ed = Editor::new("/tmp/a.rs".into(), text.into());
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        v_recompute(&mut ed);
+        ed
+    }
+
+    /// 什么都没改的「编辑」不是编辑：不该置 dirty、不该占一条撤销记录、不该清空重做栈。
+    /// 空文件删行、光标在文首的多光标退格、空的输入法提交都会走到这里。
+    #[test]
+    fn a_no_op_edit_leaves_no_trace() {
+        let mut ed = ed_rs("");
+        super::super::commands::v_delete_line(&mut ed);
+        v_apply(&mut ed, 0, 0, "");
+        ed.msel = vec![(0, 0)];
+        v_multi_backspace(&mut ed);
+        assert!(!ed.dirty(), "没改任何内容却显示已修改");
+        assert!(ed.vundo.is_empty());
+        // 重做栈不被空操作清掉
+        let mut ed = ed_rs("a");
+        v_insert(&mut ed, "b");
+        v_undo(&mut ed);
+        v_apply(&mut ed, 0, 0, "");
+        assert_eq!(ed.vredo.len(), 1);
+    }
+
+    /// 无选区按 Shift+Tab 只是反缩进当前行，不该留下一个整行选区——
+    /// 留下的话，接着敲的那个字会把整行替换掉。
+    #[test]
+    fn outdent_without_a_selection_does_not_select_the_line() {
+        let mut ed = ed_rs("    let x = 1;\n");
+        ed.vcaret = 8; // 在 `let` 之后
+        v_block_indent(&mut ed, false);
+        assert_eq!(ed.content, "let x = 1;\n");
+        assert_eq!(v_sel_range(&ed), None);
+        assert_eq!(ed.vcaret, 4, "光标应跟着文字左移");
+        // 有选区时照旧选中整块，便于连续调整
+        let mut ed = ed_rs("    a\n    b\n");
+        ed.vsel = Some(0);
+        ed.vcaret = 11;
+        v_block_indent(&mut ed, false);
+        assert_eq!(ed.content, "a\nb\n");
+        assert!(v_sel_range(&ed).is_some());
+    }
+
+    /// 注释切换是一次操作：一次撤销就该还原，而不是选了几行就要按几次 Ctrl+Z。
+    #[test]
+    fn toggling_comments_is_a_single_undo_step() {
+        let src = "fn a() {\n    x();\n\n    y();\n}\n";
+        let mut ed = ed_rs(src);
+        ed.vsel = Some(0);
+        ed.vcaret = src.len() - 1;
+        super::super::commands::v_toggle_comment(&mut ed, "//");
+        assert_eq!(ed.content, "// fn a() {\n    // x();\n\n    // y();\n// }\n");
+        v_undo(&mut ed);
+        assert_eq!(ed.content, src);
+        // 切换后整块保持选中，紧接着再按一次就是反注释
+        ed.vsel = Some(0);
+        ed.vcaret = src.len() - 1;
+        super::super::commands::v_toggle_comment(&mut ed, "//");
+        super::super::commands::v_toggle_comment(&mut ed, "//");
+        assert_eq!(ed.content, src);
+    }
+
+    /// 多光标区间是字节偏移，内容被别的路径改过之后就是陈旧的。普通编辑必须退出多选；
+    /// 即便真有陈旧区间漏进来（落在汉字中间、越界），多光标替换也不能 panic。
+    #[test]
+    fn stale_multi_cursor_ranges_never_panic() {
+        let mut ed = ed_rs("中文 中文 中文");
+        ed.msel = vec![(0, 6), (7, 13), (14, 20)];
+        v_apply(&mut ed, 0, 6, ""); // 右键剪切 / 查找替换走的就是这条
+        assert!(ed.msel.is_empty(), "普通编辑后仍留着旧的多选区间");
+        ed.msel = vec![(1, 2), (5, 99), (200, 300)]; // 人为塞进陈旧区间
+        v_multi_replace(&mut ed, "x");
+        v_multi_backspace(&mut ed);
+        v_multi_add_next(&mut ed);
+    }
+
+    /// 多光标下用输入法：组字期间只在主光标显示，提交时要作用到全部光标。
+    #[test]
+    fn ime_commit_applies_to_every_cursor() {
+        use super::super::input::{v_ime_commit, v_preedit};
+        let mut ed = ed_rs("foo foo");
+        ed.msel = vec![(0, 3), (4, 7)];
+        ed.vsel = Some(4);
+        ed.vcaret = 7;
+        v_preedit(&mut ed, "ni");
+        v_preedit(&mut ed, "nihao");
+        v_ime_commit(&mut ed, "你好");
+        assert_eq!(ed.content, "你好 你好");
+        // 取消组字：多选原样回来
+        let mut ed = ed_rs("foo foo");
+        ed.msel = vec![(0, 3), (4, 7)];
+        ed.vsel = Some(4);
+        ed.vcaret = 7;
+        v_preedit(&mut ed, "ni");
+        super::super::input::v_cancel_preedit(&mut ed);
+        assert_eq!(ed.content, "foo foo");
+        assert_eq!(ed.msel, vec![(0, 3), (4, 7)]);
+    }
+
+    /// 组字被退格删空（`Preedit("")`）后内容已回到原样，不该留着脏标记。
+    #[test]
+    fn emptied_composition_restores_clean_state() {
+        use super::super::input::v_preedit;
+        let mut ed = ed_rs("abc");
+        v_preedit(&mut ed, "n");
+        assert!(ed.dirty());
+        v_preedit(&mut ed, "");
+        assert_eq!(ed.content, "abc");
+        assert!(!ed.dirty());
+    }
+
+    /// 粘贴源（Windows 记事本 / 浏览器）几乎总是 CRLF；编辑器内部统一 LF。
+    #[test]
+    fn pasted_text_is_normalized_to_lf() {
+        assert_eq!(normalize_paste("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        assert_eq!(normalize_paste("plain"), "plain");
     }
 }

@@ -7,7 +7,7 @@ use super::edit::{
     v_apply, v_backspace, v_block_indent, v_complete_accept, v_complete_refresh, v_ctrl_d,
     v_delete_fwd, v_delete_selection, v_delete_word, v_insert, v_move_doc, v_move_edge, v_move_h,
     v_move_v, v_move_word, v_multi_backspace, v_multi_copy, v_multi_delete, v_multi_move,
-    v_multi_replace, v_newline_indent, v_redo, v_undo,
+    v_multi_replace, v_newline_indent, v_redo, v_undo, normalize_paste,
 };
 use super::geom::{next_char_boundary, v_sel_range};
 use super::wrap::v_recompute;
@@ -29,6 +29,7 @@ pub(in crate::ui::editor) fn v_cancel_preedit(ed: &mut Editor) {
     };
     ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
     ed.vsel = None;
+    ed.msel = std::mem::take(&mut ed.ime_msel); // 组字开始时收起的多选原样放回
     // 内容恢复到组字前，可能恰好回到保存点上——全量重算 dirty
     ed.recompute_dirty();
     v_recompute(ed);
@@ -46,6 +47,12 @@ pub(super) fn v_preedit(ed: &mut Editor, t: &str) {
     // 取消组字后那段原文再也找不回来。
     let r = match ed.vime_preedit.take() {
         Some(r) => r,
+        // 多光标：组字只在主光标处显示，各选区原样留到提交时一并替换。区间先收起来——
+        // 组字文本会让它们暂时对不上内容，不能留在 msel 里被绘制/编辑拿去用。
+        None if !ed.msel.is_empty() => {
+            ed.ime_msel = std::mem::take(&mut ed.msel);
+            (ed.vcaret, ed.vcaret)
+        }
         None => {
             if let Some((a, b)) = v_sel_range(ed).filter(|(a, b)| b > a) {
                 v_apply(ed, a, b - a, "");
@@ -60,8 +67,15 @@ pub(super) fn v_preedit(ed: &mut Editor, t: &str) {
     ed.vcaret = end;
     ed.vsel = None;
     ed.msel.clear();
-    ed.dirty_flag = true; // 组字内容已上屏（取消时由 Disabled 分支重算）
-    ed.vime_preedit = if t.is_empty() { None } else { Some((s, end)) };
+    if t.is_empty() {
+        // 组字被删空：内容已回到组字前，可能正好在保存点上；收起的多选也原样放回
+        ed.vime_preedit = None;
+        ed.msel = std::mem::take(&mut ed.ime_msel);
+        ed.recompute_dirty();
+    } else {
+        ed.vime_preedit = Some((s, end));
+        ed.dirty_flag = true; // 组字内容已上屏
+    }
     v_recompute(ed);
 }
 
@@ -71,6 +85,10 @@ pub(super) fn v_ime_commit(ed: &mut Editor, t: &str) {
         ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
         ed.vsel = None;
         v_recompute(ed);
+    }
+    // 组字开始时收起的多选：组字文本已撤掉，区间重新对得上内容了
+    if !ed.ime_msel.is_empty() {
+        ed.msel = std::mem::take(&mut ed.ime_msel);
     }
     // 多光标模式：英文/输入法提交也要作用到全部光标（系统输入法激活后字母走 Commit 而非 Text）
     if ed.msel.is_empty() {
@@ -223,7 +241,9 @@ pub(super) fn handle_input(
                 let mut handled = true;
                 match &ev {
                     egui::Event::Text(t) if !t.is_empty() => v_multi_replace(ed, t),
-                    egui::Event::Paste(t) if !t.is_empty() => v_multi_replace(ed, t),
+                    egui::Event::Paste(t) if !t.is_empty() => {
+                        v_multi_replace(ed, &normalize_paste(t))
+                    }
                     egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => {
                         v_multi_replace(ed, t)
                     }
@@ -252,6 +272,8 @@ pub(super) fn handle_input(
                             egui::Key::Backspace => v_multi_backspace(ed),
                             egui::Key::Delete => v_multi_delete(ed),
                             egui::Key::Enter => v_multi_replace(ed, "\n"),
+                            // Shift+Tab 是反缩进，不是「插入一个缩进」；多光标下没有对应操作
+                            egui::Key::Tab if modifiers.shift => {}
                             egui::Key::Tab => {
                                 let u = ed.indent.unit();
                                 v_multi_replace(ed, &u);
@@ -312,12 +334,7 @@ pub(super) fn handle_input(
                     // ssh/sftp_write.rs）；粘贴源（尤其 Windows 上的记事本/Office/浏览器）
                     // 几乎总是 CRLF，不归一化会让裸 \r 混进 content，读起来正常但保存后
                     // 文件里带杂散 \r，且后续每次比对内容是否变化都会被这些字符干扰。
-                    let t = if t.contains('\r') {
-                        t.replace("\r\n", "\n").replace('\r', "\n")
-                    } else {
-                        t
-                    };
-                    v_insert(ed, &t);
+                    v_insert(ed, &normalize_paste(&t));
                 }
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => v_insert(ed, &t),
                 egui::Event::Copy => {
@@ -406,7 +423,10 @@ pub(super) fn handle_input(
         ed.vcaret = ed.vcaret.min(ed.content.len());
         // 补全触发/维护：有字符输入 →（重新）打开；其它编辑（如退格）→ 按新前缀刷新；
         // 纯光标移动 → 关闭（避免弹窗脱离输入上下文）
-        if typed || (ed.complete.is_some() && ed.vver != vver0) {
+        if !ed.msel.is_empty() {
+            // 多光标下不弹补全：接受补全走的是单光标插入，只会补一处、其余光标错位
+            ed.complete = None;
+        } else if typed || (ed.complete.is_some() && ed.vver != vver0) {
             v_complete_refresh(ed);
         } else if ed.complete.is_some() && ed.vcaret != caret0 {
             ed.complete = None;

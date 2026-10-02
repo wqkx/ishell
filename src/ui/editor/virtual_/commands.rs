@@ -34,25 +34,44 @@ pub(super) fn v_toggle_comment(ed: &mut Editor, prefix: &str) {
         }
     }
     let pfx = format!("{prefix} ");
-    // 从后往前改，前面行的偏移不受影响
-    for li in (first..=last).rev() {
-        let (ls, le) = v_line_range(ed, li);
-        let line = &ed.content[ls..le];
+    // 整块重写后**一次** `v_apply`：逐行调用的话选了几行就是几条撤销记录（要按几次 Ctrl+Z
+    // 才能还原），每行还各触发一次全文行索引重算。
+    let start = v_line_range(ed, first).0;
+    let end = v_line_range(ed, last).1;
+    let mut out = String::with_capacity(end - start + (last - first + 1) * pfx.len());
+    for (i, line) in ed.content[start..end].split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
         let indent = line.len() - line.trim_start().len();
+        let (lead, body) = line.split_at(indent);
+        out.push_str(lead);
         if all {
-            let after = &line[indent..];
-            if let Some(rest) = after.strip_prefix(prefix) {
-                let mut rm = prefix.len();
-                if rest.starts_with(' ') {
-                    rm += 1;
-                }
-                v_apply(ed, ls + indent, rm, "");
+            match body.strip_prefix(prefix) {
+                Some(rest) => out.push_str(rest.strip_prefix(' ').unwrap_or(rest)),
+                None => out.push_str(body),
             }
-        } else if !line[indent..].is_empty() {
-            v_apply(ed, ls + indent, 0, &pfx);
+        } else {
+            if !body.is_empty() {
+                out.push_str(&pfx);
+            }
+            out.push_str(body);
         }
     }
-    ed.vsel = None;
+    if out != ed.content[start..end] {
+        let had_sel = sb > sa;
+        let old_caret = ed.vcaret;
+        let grew = out.len() as isize - (end - start) as isize;
+        v_apply(ed, start, end - start, &out);
+        if had_sel {
+            // 保持选中整块，便于再按一次切回去
+            ed.vsel = Some(start);
+            ed.vcaret = start + out.len();
+        } else {
+            let moved = (old_caret as isize + grew).max(start as isize) as usize;
+            ed.vcaret = crate::ui::ime_safe::floor_boundary(&ed.content, moved);
+        }
+    }
     ed.vgoal_col = None;
 }
 pub(super) fn v_duplicate_line(ed: &mut Editor, down: bool) {

@@ -4,7 +4,7 @@ use super::super::find::{
     build_find_regex, find_widget, goto_widget, nav_match, rebuild_matches, FindOut,
 };
 use super::super::Editor;
-use super::edit::{v_apply, v_insert};
+use super::edit::{normalize_paste, v_apply, v_insert};
 use super::geom::{v_line_of, v_line_range};
 use crate::theme::Palette;
 use crate::ui::highlight::Indent;
@@ -240,7 +240,8 @@ pub(super) fn apply_context_menu_actions(
     // 复制/剪切用「冻结的右键选区」(menu_sel)，避免右键折叠选区后复制不到
     if do_copy || do_cut {
         if let Some((a, b)) = ed.menu_sel {
-            let (a, b) = (a.min(ed.content.len()), b.min(ed.content.len()));
+            // 冻结选区是菜单打开那一刻的偏移，菜单开着时内容可能已变：收敛到合法边界再切
+            let (a, b) = crate::ui::ime_safe::clamp_range(&ed.content, (a, b));
             if b > a {
                 ui.ctx().copy_text(ed.content[a..b].to_string());
                 if do_cut {
@@ -256,9 +257,10 @@ pub(super) fn apply_context_menu_actions(
             .and_then(|mut c| c.get_text().ok())
         {
             if !t.is_empty() {
+                let t = normalize_paste(&t); // 与 Ctrl+V 一致：CRLF 归一成 LF
                 // 有冻结选区则替换它，否则插入到光标
                 if let Some((a, b)) = ed.menu_sel.filter(|&(a, b)| b > a) {
-                    let (a, b) = (a.min(ed.content.len()), b.min(ed.content.len()));
+                    let (a, b) = crate::ui::ime_safe::clamp_range(&ed.content, (a, b));
                     v_apply(ed, a, b - a, &t);
                 } else {
                     v_insert(ed, &t);
