@@ -137,7 +137,12 @@ impl App {
                             "Some bytes could not be decoded (shown as �); opened read-only. Try reopening with another encoding",
                         ));
                     }
-                    if let Some(line) = crate::store::load_cursor_line(&key) {
+                    if t.reopening {
+                        // 「按编码重新打开」换的是同一个文件的读法：视图状态（换行开关、
+                        // 光标所在行）沿用，不要像新开文件那样退回存档里的旧位置
+                        editor.set_wrap(t.editor.wrap());
+                        editor.restore_line(t.editor.caret_line());
+                    } else if let Some(line) = crate::store::load_cursor_line(&key) {
                         editor.restore_line(line);
                     }
                     t.editor = editor;

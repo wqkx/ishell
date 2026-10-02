@@ -390,6 +390,9 @@ impl Editor {
     pub fn set_status(&mut self, s: &str) {
         self.status = s.to_string();
     }
+    pub fn wrap(&self) -> bool {
+        self.wrap
+    }
     /// 自动换行开关。
     pub fn set_wrap(&mut self, on: bool) {
         self.wrap = on;
@@ -628,6 +631,60 @@ mod reveal_tests {
             ed.vlast_hoff,
             ed.vlast_hoff + ed.vlast_vieww
         );
+    }
+
+    /// 在含中文的行之间用方向键上下移动：这条路径在**处理输入时**第一次去问字体要字宽
+    ///（ASCII 不用问），所以要用真实的帧 + 真实的按键跑一遍——既验证不会卡死在字体锁上，
+    /// 也验证按小数列宽算出来的目标列落在视觉上对应的那个字符上。
+    #[test]
+    fn arrow_keys_move_by_visual_column_through_cjk_text() {
+        for wrap in [false, true] {
+            let line = "ab中文字xyz";
+            let mut ed = Editor::new("/tmp/a.txt".into(), format!("{line}\n{line}\nabcdefghijkl\n"));
+            ed.wrap = wrap;
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let id = egui::Id::new("cjk_arrows");
+            let frame = |ed: &mut Editor, key: Option<egui::Key>| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 300.0),
+                    )),
+                    events: key
+                        .map(|key| egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                };
+                #[allow(deprecated)]
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        content(ui, ed, id);
+                    });
+                });
+            };
+            frame(&mut ed, None);
+            ctx.memory_mut(|m| m.request_focus(id));
+            frame(&mut ed, None);
+            let after_third = "ab中文字".len(); // 第 3 个汉字之后
+            ed.vcaret = after_third;
+            frame(&mut ed, Some(egui::Key::ArrowDown));
+            assert_eq!(ed.vcaret, line.len() + 1 + after_third, "wrap={wrap}：↓ 应落在下一行同一个字符后");
+            frame(&mut ed, Some(egui::Key::ArrowDown));
+            // 第三行是纯 ASCII：三个汉字约占 4.7 列，加上 ab 两列 ≈ 第 7 列附近
+            let col = ed.vcaret - 2 * (line.len() + 1);
+            assert!((6..=7).contains(&col), "wrap={wrap}：落在 ASCII 行第 {col} 列，视觉上应在第 6–7 列");
+            frame(&mut ed, Some(egui::Key::ArrowUp));
+            frame(&mut ed, Some(egui::Key::ArrowUp));
+            assert_eq!(ed.vcaret, after_third, "wrap={wrap}：↑↑ 应回到原位");
+        }
     }
 
     /// 换行模式下，用**字体实测的字宽**折出来的每一段都得放得进视口——这是用户看到的
