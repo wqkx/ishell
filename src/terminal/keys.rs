@@ -131,7 +131,12 @@ pub(super) fn encode_key(key: Key, mods: Modifiers, app_cursor: bool, out: &mut 
                     out.push(ch as u8);
                 } else if let Some(d) = key_to_ascii_digit(key) {
                     out.push(0x1b);
-                    out.push(d);
+                    // Alt+Shift+数字是上档符号（Alt+# 等；US 布局）
+                    out.push(if mods.shift {
+                        b")!@#$%^&*("[(d - b'0') as usize]
+                    } else {
+                        d
+                    });
                 } else if let Some(p) = key_to_ascii_punct(key, mods.shift) {
                     out.push(0x1b);
                     out.push(p);
@@ -328,6 +333,14 @@ fn key_to_ascii_punct(key: Key, shift: bool) -> Option<u8> {
             }
         }
         Key::Pipe => b'|',
+        // egui 对带 Shift 的标点有独立的逻辑键（Shift+/ 报成 Questionmark，不是 Slash+shift）
+        Key::Questionmark => b'?',
+        Key::Colon => b':',
+        Key::Plus => b'+',
+        Key::Exclamationmark => b'!',
+        Key::OpenCurlyBracket => b'{',
+        Key::CloseCurlyBracket => b'}',
+        Key::Space => b' ',
         _ => return None,
     })
 }
@@ -427,6 +440,10 @@ impl HeldButtons {
 
     pub(super) fn any(&self) -> bool {
         self.mask != 0
+    }
+
+    pub(super) fn held(&self, base: u8) -> bool {
+        self.mask & (1 << base.min(2)) != 0
     }
 
     /// ButtonMotion / press-drag 用的基码；无键时 None。
@@ -597,6 +614,32 @@ mod encode_tests {
             ..Default::default()
         };
         assert_eq!(enc(Key::Num2, ca, false), vec![0x1b, 0x00]);
+    }
+
+    /// 按住 Alt 时文本事件被丢弃，字符全靠这里编码成 `ESC <char>`。egui 对带 Shift 的标点
+    /// 有**独立的逻辑键**（Shift+/ 报成 `Questionmark` 而不是 `Slash`+shift），漏掉它们的话
+    /// Alt+? / Alt+: / Alt+{ 等既不发 ESC 序列也不发文本，整键失效。
+    #[test]
+    fn alt_with_shifted_punctuation_and_space_is_encoded() {
+        let alt_shift = Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        for (key, ch) in [
+            (Key::Questionmark, b'?'),
+            (Key::Colon, b':'),
+            (Key::Plus, b'+'),
+            (Key::Exclamationmark, b'!'),
+            (Key::OpenCurlyBracket, b'{'),
+            (Key::CloseCurlyBracket, b'}'),
+        ] {
+            assert_eq!(enc(key, alt_shift, false), vec![0x1b, ch], "{key:?}");
+        }
+        assert_eq!(enc(Key::Space, alt(), false), vec![0x1b, b' ']);
+        // Alt+Shift+数字是上档符号（Alt+# 等），不是数字
+        assert_eq!(enc(Key::Num3, alt_shift, false), vec![0x1b, b'#']);
+        assert_eq!(enc(Key::Num3, alt(), false), vec![0x1b, b'3']);
     }
 
     /// Ctrl+Shift+C/V/F 留给复制/粘贴/查找，**不能**当终端输入发出去。

@@ -2476,3 +2476,153 @@ fn mouse_reports_and_swallowed_paste_count_as_user_input() {
     assert_eq!(out, vec![0x16], "前提：补发了 0x16");
     assert!(!t.never_typed());
 }
+
+fn key_ev(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+/// 本地前缀历史靠一份「输入行影子」猜远端命令行上现在是什么。只要按过它跟踪不了的键
+/// （Ctrl+W 删词、←/→ 移动光标、Tab 补全……），影子就不再可信：此后按 ↑ 必须原样交给
+/// 远端 shell，而不是拿过期的前缀去搜历史、再用 `^E^U` 把用户当前的命令行覆盖掉。
+#[test]
+fn history_search_stands_down_once_the_line_can_no_longer_be_tracked() {
+    let ctx = egui::Context::default();
+    let ctrl = egui::Modifiers {
+        ctrl: true,
+        command: true,
+        ..Default::default()
+    };
+    for untrackable in [
+        key_ev(egui::Key::W, ctrl),
+        key_ev(egui::Key::ArrowLeft, Default::default()),
+        key_ev(egui::Key::Tab, Default::default()),
+        key_ev(egui::Key::Delete, Default::default()),
+        key_ev(egui::Key::Home, Default::default()),
+    ] {
+        let mut t = Terminal::new();
+        t.history = vec!["ls foo bar".into()];
+        feed_events(&mut t, &ctx, vec![egui::Event::Text("ls foo".into())]);
+        feed_events(&mut t, &ctx, vec![untrackable.clone()]);
+        let out = feed_events(&mut t, &ctx, vec![key_ev(egui::Key::ArrowUp, Default::default())]);
+        assert_eq!(out, b"\x1b[A", "按过 {untrackable:?} 之后 ↑ 仍被本地历史拦下并改写了命令行");
+    }
+    // 对照：一直可跟踪时照常做前缀搜索
+    let mut t = Terminal::new();
+    t.history = vec!["ls foo bar".into()];
+    feed_events(&mut t, &ctx, vec![egui::Event::Text("ls foo".into())]);
+    let out = feed_events(&mut t, &ctx, vec![key_ev(egui::Key::ArrowUp, Default::default())]);
+    assert_eq!(out, b"\x05\x15ls foo bar");
+    // 回车提交后重新开始跟踪
+    let mut t = Terminal::new();
+    t.history = vec!["ls foo bar".into()];
+    feed_events(&mut t, &ctx, vec![egui::Event::Text("x".into())]);
+    feed_events(&mut t, &ctx, vec![key_ev(egui::Key::ArrowLeft, Default::default())]);
+    feed_events(&mut t, &ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
+    feed_events(&mut t, &ctx, vec![egui::Event::Text("ls foo".into())]);
+    let out = feed_events(&mut t, &ctx, vec![key_ev(egui::Key::ArrowUp, Default::default())]);
+    assert_eq!(out, b"\x05\x15ls foo bar");
+}
+
+fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+/// 在终端里按下、拖到终端外面松开：远端必须收到这次释放。收不到的话 vim/tmux 里的拖选
+/// 就卡住了，而且我们这边也一直以为键还按着——之后光标只要划过终端，就持续上报
+/// 「按住左键拖动」。
+#[test]
+fn a_button_released_outside_the_terminal_is_still_reported() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1002h\x1b[?1006h"); // 按键+拖动上报，SGR 编码
+    ui_frame(&mut t, &ctx, vec![]);
+    let inside = egui::pos2(200.0, 200.0);
+    ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(inside)]);
+    let out = ui_frame(&mut t, &ctx, vec![button(inside, true)]);
+    assert!(out.ends_with(b"M"), "前提：按下已上报 {out:?}");
+    let outside = egui::pos2(5000.0, 5000.0);
+    let out = ui_frame(
+        &mut t,
+        &ctx,
+        vec![egui::Event::PointerMoved(outside), button(outside, false)],
+    );
+    assert!(out.ends_with(b"m"), "在终端外松开，远端没收到释放：{out:?}");
+    // 之后在终端里移动：没有键按着，ButtonMotion 模式下不该再上报拖动
+    let out = ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(egui::pos2(220.0, 220.0))]);
+    assert!(out.is_empty(), "键早松开了，却还在上报拖动：{out:?}");
+}
+
+/// 触控板 / 高分辨率滚轮每个事件只有一两个像素。离散路径（鼠标上报、备用屏转方向键）
+/// 必须攒够一行才发一步；原先 `clamp(1, 3)` 让每个非零事件都至少发一步，轻扫一行的
+/// 距离变成十几行。
+#[test]
+fn tiny_wheel_deltas_accumulate_instead_of_each_becoming_a_step() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1000h\x1b[?1006h");
+    ui_frame(&mut t, &ctx, vec![]);
+    let pos = egui::pos2(200.0, 200.0);
+    ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    let mut steps = 0;
+    for _ in 0..12 {
+        let out = ui_frame(
+            &mut t,
+            &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 2.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        steps += out.iter().filter(|b| **b == b'M').count();
+    }
+    // 12 个 2px 的事件共 24px：一两行的距离
+    assert!((1..=3).contains(&steps), "24px 的滚动发出了 {steps} 步滚轮");
+    // 普通滚轮一格（Line 单位）照旧一步
+    let out = ui_frame(
+        &mut t,
+        &ctx,
+        vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        }],
+    );
+    assert_eq!(out.iter().filter(|b| **b == b'M').count(), 1);
+}
+
+/// 鼠标上报的移动事件按**单元格**去重：光标在同一格里挪几十个像素，不该给远端发几十条
+/// 一模一样的坐标（xterm 只在跨格时上报）。
+#[test]
+fn pointer_motion_inside_one_cell_is_reported_once() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1003h\x1b[?1006h"); // 任意移动都上报
+    ui_frame(&mut t, &ctx, vec![]);
+    let mut reports = 0;
+    for dx in 0..6 {
+        let out = ui_frame(
+            &mut t,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(200.0 + dx as f32 * 0.5, 200.0))],
+        );
+        reports += out.iter().filter(|b| **b == b'M').count();
+    }
+    assert_eq!(reports, 1, "同一格内的移动被重复上报");
+}

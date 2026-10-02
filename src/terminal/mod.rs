@@ -147,6 +147,12 @@ pub struct Terminal {
     search_hl: Option<u16>,
     /// 鼠标上报模式下当前按住的按钮（支持多键同持）
     held_btns: HeldButtons,
+    /// 上一次上报的鼠标移动：(行, 列, 按钮码)。同一格内的移动不重复上报。
+    last_motion: Option<(u16, u16, u8)>,
+    /// 离散滚轮路径（鼠标上报 / 备用屏转方向键）的亚行余量，攒够一行才发一步。
+    wheel_accum: f32,
+    /// 输入行影子已不可信（按过跟踪不了的键）：到下一次回车 / Ctrl+C 为止停用本地前缀历史。
+    input_untracked: bool,
     /// 跨数据块暂存的不完整 UTF-8 尾字节（避免多字节中文被拆分后乱码）
     utf8_pending: Vec<u8>,
     /// 跨数据块暂存的未终止字符串类转义序列（OSC/DCS…），供通知扫描拼接。
@@ -327,6 +333,9 @@ impl Terminal {
             saw_text_paste: false,
             saw_v_press: false,
             held_btns: HeldButtons::default(),
+            last_motion: None,
+            wheel_accum: 0.0,
+            input_untracked: false,
             utf8_pending: Vec::new(),
             notice_tail: Vec::new(),
             focus_req: false,
@@ -585,6 +594,23 @@ impl Terminal {
         self.last_input_at = Some(std::time::Instant::now());
     }
 
+    /// 离散滚轮：把本帧的滚动量（单位：行）并入余量，返回该发几步（正=上，负=下）。
+    /// 攒够一行才发一步——触控板/高分辨率滚轮每个事件只有零点几行，逐个取整会把每个事件
+    /// 都放大成整步。每帧最多 3 步，多出来的丢掉（不让一次猛滚在之后几帧里慢慢放出来）。
+    fn wheel_steps(&mut self, raw_lines: f32) -> i32 {
+        if raw_lines == 0.0 {
+            return 0;
+        }
+        // 换方向：之前同向攒下的零头作废，不然反向的第一格会被它抵掉
+        if self.wheel_accum * raw_lines < 0.0 {
+            self.wheel_accum = 0.0;
+        }
+        self.wheel_accum += raw_lines;
+        let steps = self.wheel_accum.trunc();
+        self.wheel_accum -= steps;
+        (steps as i32).clamp(-3, 3)
+    }
+
     /// （重）连时复位输入时钟：新 shell 是全新的一轮，`never_typed` 该重新计。
     pub fn reset_input_clock(&mut self) {
         self.last_input_at = None;
@@ -834,14 +860,15 @@ impl Terminal {
                 self.font_size = (self.font_size + zoom.signum() * 1.0).clamp(8.0, 32.0);
                 crate::store::save_term_font(self.font_size);
                 self.local_scroll_accum = 0.0; // 缩放不该顺带把余量带进回滚
+                self.wheel_accum = 0.0;
             } else if report_mouse {
                 self.local_scroll_accum = 0.0; // 切换路径：旧余量不该带到鼠标上报语义里
-                if raw != 0.0 {
+                let steps = self.wheel_steps(raw);
+                if steps != 0 {
                     if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                         let (r, c) = cell_at(p);
-                        let cb = if raw > 0.0 { 64 } else { 65 };
-                        let steps = (raw.abs().round() as i32).clamp(1, 3);
-                        for _ in 0..steps {
+                        let cb = if steps > 0 { 64 } else { 65 };
+                        for _ in 0..steps.abs() {
                             encode_mouse(menc, cb, c, r, true, &mut mouse_out);
                         }
                     }
@@ -852,14 +879,14 @@ impl Terminal {
                 // 方向键转发过去；这只是经验性兼容策略，不是任何终端协议承诺的行为，具体某个
                 // TUI 是否真的把方向键当滚动用，以它自己的按键处理为准。
                 self.local_scroll_accum = 0.0;
-                if raw != 0.0 {
-                    let steps = (raw.abs().round() as i32).clamp(1, 3);
-                    let key = if raw > 0.0 {
+                let steps = self.wheel_steps(raw);
+                if steps != 0 {
+                    let key = if steps > 0 {
                         b"\x1b[A".as_slice()
                     } else {
                         b"\x1b[B".as_slice()
                     };
-                    for _ in 0..steps {
+                    for _ in 0..steps.abs() {
                         mouse_out.extend_from_slice(key);
                     }
                 }
@@ -868,6 +895,7 @@ impl Terminal {
                 // 的单帧增量常常小于半个字符高度，逐帧 round 会让这些小增量永远舍入成 0、
                 // 白白丢掉（"滚了但纹丝不动"）。这里跨帧累计余量，凑够整行才真正移动
                 // scrollback，不足一行的部分留到下一帧继续累加，方向反转时自然抵消。
+                self.wheel_accum = 0.0;
                 self.local_scroll_accum += smooth;
                 let whole_lines = (self.local_scroll_accum / char_h).trunc() as i64;
                 if whole_lines != 0 {
@@ -930,14 +958,20 @@ impl Terminal {
                         button,
                         pressed,
                         modifiers,
-                    } if on_top(*pos) => {
-                        let (r, c) = cell_at(*pos);
+                    } => {
                         let base = match button {
                             egui::PointerButton::Primary => 0u8,
                             egui::PointerButton::Middle => 1,
                             egui::PointerButton::Secondary => 2,
                             _ => 0,
                         };
+                        // 按下必须落在终端上；释放不管落在哪都要上报——只要这个键是在终端里
+                        // 按下的。拖到侧栏 / 窗口外松开时不报释放，远端的拖选就卡住了，我们
+                        // 自己也一直以为键还按着（之后划过终端就持续上报拖动）。
+                        if !(on_top(*pos) || (!*pressed && self.held_btns.held(base))) {
+                            continue;
+                        }
+                        let (r, c) = cell_at(*pos); // 终端外的位置钳到边缘格
                         let mut cb = base;
                         if modifiers.alt {
                             cb += 8;
@@ -976,13 +1010,23 @@ impl Terminal {
                             if cur_mods.ctrl || cur_mods.command {
                                 cb += 16;
                             }
-                            encode_mouse(menc, cb, c, r, true, &mut mouse_out);
+                            // 按单元格去重（xterm 只在跨格时上报）：同一格里挪几十像素不该
+                            // 给远端发几十条一模一样的坐标
+                            if self.last_motion != Some((r, c, cb)) {
+                                self.last_motion = Some((r, c, cb));
+                                encode_mouse(menc, cb, c, r, true, &mut mouse_out);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
         } else {
+            // 没在上报（远端关了鼠标模式，或按着 Shift 临时本地选择）：按键状态不能留着。
+            // 否则按下后按住 Shift 再松开、或按住期间远端关了又开鼠标模式，都会让我们一直
+            // 以为键还按着。
+            self.held_btns = HeldButtons::default();
+            self.last_motion = None;
             // 拖动起点落在右侧滚动条上 → 拖滚动条；否则本地拖拽选择文本。
             // 拖拽需移动超过阈值才激活，此刻指针已离开真实按下点——路由判断（滚动条/文本）
             // 和选区锚点都必须用「按下位置」，否则起始处会被误判/漏选（与 editor.rs 的同类修法一致）。

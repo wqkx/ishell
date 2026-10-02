@@ -65,7 +65,9 @@ impl Terminal {
                     }
                     self.clear_selection(); // 输入字符即取消选择（与按键分支一致）
                     if !alt {
-                        self.input_line.push_str(&t);
+                        if !self.input_untracked {
+                            self.input_line.push_str(&t);
+                        }
                         self.hist = None;
                     }
                     out.extend_from_slice(t.as_bytes());
@@ -78,7 +80,9 @@ impl Terminal {
                     log::debug!("IME Commit: {t:?}");
                     self.ime_preedit.clear();
                     if !alt {
-                        self.input_line.push_str(&t);
+                        if !self.input_untracked {
+                            self.input_line.push_str(&t);
+                        }
                         self.hist = None;
                     }
                     out.extend_from_slice(t.as_bytes());
@@ -92,7 +96,9 @@ impl Terminal {
                     // 记下「这一下 Ctrl+V 是有文本的」，供下面 V 松开时判断——见那段说明。
                     self.saw_text_paste = true;
                     if !alt {
-                        self.input_line.push_str(&t);
+                        if !self.input_untracked {
+                            self.input_line.push_str(&t);
+                        }
                         self.hist = None;
                     }
                     // bracketed paste：远端开了就套括号，否则多行内容会被逐行当成回车敲进去。
@@ -216,13 +222,34 @@ impl Terminal {
                             // 换行继续输入（见 keys.rs），若也当成提交会把半截命令推进本地
                             // 历史、并清空正在跟踪的输入行。
                             Key::Enter if !modifiers.shift && !modifiers.alt => self.commit_line(),
-                            Key::Backspace => {
+                            Key::Backspace if !modifiers.ctrl && !modifiers.alt => {
                                 self.input_line.pop();
                                 self.hist = None;
                             }
-                            Key::C | Key::U if modifiers.ctrl => {
+                            // Ctrl+C 让 shell 给出一个全新的空行：影子重新可信
+                            Key::C if modifiers.ctrl => {
                                 self.input_line.clear();
                                 self.hist = None;
+                                self.input_untracked = false;
+                            }
+                            Key::U if modifiers.ctrl => {
+                                self.input_line.clear();
+                                self.hist = None;
+                            }
+                            // 影子只会跟「在行尾追加 / 退格」。其它会改动或移动远端命令行的键
+                            //（光标移动、删词、补全、远端自己的历史……）我们跟不了：从这里起
+                            // 影子不可信，停用本地前缀历史，直到下一次回车 / Ctrl+C。
+                            Key::ArrowLeft
+                            | Key::ArrowRight
+                            | Key::ArrowUp
+                            | Key::ArrowDown
+                            | Key::Home
+                            | Key::End
+                            | Key::Delete
+                            | Key::Backspace
+                            | Key::Tab => self.untrack_input_line(),
+                            _ if modifiers.ctrl || modifiers.alt || modifiers.command => {
+                                self.untrack_input_line()
                             }
                             _ => {}
                         }
@@ -247,8 +274,14 @@ impl Terminal {
         out
     }
 
+    fn untrack_input_line(&mut self) {
+        self.input_untracked = true;
+        self.input_line.clear();
+        self.hist = None;
+    }
+
     pub(super) fn history_nav(&mut self, up: bool) -> Vec<u8> {
-        if self.input_line.is_empty() {
+        if self.input_line.is_empty() || self.input_untracked {
             self.hist = None;
             return if up {
                 b"\x1b[A".to_vec()
@@ -341,7 +374,8 @@ impl Terminal {
         if is_ai_cli_command(&self.input_line) {
             self.ai_cli_seen = true;
         }
-        if !self.input_line.trim().is_empty()
+        if !self.input_untracked
+            && !self.input_line.trim().is_empty()
             // 带换行/控制字符的（未开 bracketed paste 的多行粘贴）不收：之后 ↑ 会把它原样
             // 重发，里面的换行等于替用户按了回车
             && !self.input_line.chars().any(|c| c.is_control())
@@ -359,6 +393,7 @@ impl Terminal {
         }
         self.input_line.clear();
         self.hist = None;
+        self.input_untracked = false; // 新的一行，重新开始跟踪
     }
 }
 
