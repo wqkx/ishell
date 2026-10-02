@@ -176,20 +176,46 @@ fn push_sgr_color(p: &mut Vec<String>, c: vt100::Color, fg: bool) {
 /// 把可见屏第 `row` 行序列化为带 SGR 的字节（裁掉行尾空白；空行返回空 Vec）。
 /// 行内属性变化时插入自包含 SGR，行尾补 `\x1b[0m`，使各行互不影响。
 pub(super) fn serialize_row(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<u8> {
-    // 该行最后一个有内容的列(+1)，用于裁掉行尾空白
+    serialize_cells(screen, row, 0, row_content_end(screen, row, cols))
+}
+
+/// 该行最后一个有内容的列(+1)。
+fn row_content_end(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
     let mut last = 0u16;
     for c in 0..cols {
         if screen.cell(row, c).is_some_and(|cell| cell.has_contents()) {
             last = c + 1;
         }
     }
-    if last == 0 {
+    last
+}
+
+/// 把一行在第 `at` 列处切成两半分别序列化：前半 `[0, at)`、后半 `[at, 行尾内容)`。
+/// 给回流时定位光标用——前半**不裁空白**（空着的格子补空格），重放完前半，光标就正好
+/// 停在第 `at` 列上。
+pub(super) fn serialize_row_split(
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+    at: u16,
+) -> (Vec<u8>, Vec<u8>) {
+    let end = row_content_end(screen, row, cols);
+    let at = at.min(cols);
+    (
+        serialize_cells(screen, row, 0, at),
+        serialize_cells(screen, row, at, end),
+    )
+}
+
+/// 序列化一行的 `[from, to)` 列。范围为空返回空 Vec。
+fn serialize_cells(screen: &vt100::Screen, row: u16, from: u16, to: u16) -> Vec<u8> {
+    if to <= from {
         return Vec::new();
     }
     let mut out = Vec::new();
-    let mut cur = CellAttrs::DEFAULT; // 行首解析器状态为默认（上一行尾已 reset）
-    let mut col = 0u16;
-    while col < last {
+    let mut cur = CellAttrs::DEFAULT; // 起点解析器状态为默认（上一段尾已 reset）
+    let mut col = from;
+    while col < to {
         let Some(cell) = screen.cell(row, col) else {
             out.push(b' ');
             col += 1;

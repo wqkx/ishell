@@ -8,7 +8,7 @@ use super::{
         unterminated_string_tail, Osc133,
     },
     theme::TermColors,
-    vt::{find_sub, incomplete_utf8_tail, serialize_row, strip_ansi_to_text},
+    vt::{find_sub, incomplete_utf8_tail, serialize_row, serialize_row_split, strip_ansi_to_text},
     CaptureMode, Terminal, DEFAULT_SCROLLBACK,
 };
 
@@ -663,13 +663,21 @@ impl Terminal {
 
     /// 把整个缓冲（回滚 + 可见屏）连同颜色/属性序列化为带 SGR 的字节流（行间 `\r\n`）。
     /// 供 resize 重排使用：vt100 的 `set_size` 不回流（缩小截断底部、放大底部补空白），
-    /// 重建解析器并重放这段字节即可让内容按新宽度回流并贴底（颜色/粗体等属性保留）。
-    fn serialize_buffer(&mut self) -> Vec<u8> {
+    /// 重建解析器并重放这段字节即可让内容按新宽度回流（颜色/粗体等属性保留）。
+    ///
+    /// 返回 `(光标之前, 光标之后)` 两段：重放完前一段，新解析器的光标就停在原来那个字符上——
+    /// 调用方记下这个位置，重放完后一段再把光标放回去。不这样做的话，回流完光标一律落在
+    /// 内容末尾：正在命令行中间编辑时拖一下窗口，光标就跑到行尾去了。
+    fn serialize_buffer(&mut self) -> (Vec<u8>, Vec<u8>) {
         let saved = self.parser.screen().scrollback();
         self.parser.screen_mut().set_scrollback(usize::MAX);
         let sb = self.parser.screen().scrollback();
         let rows = self.rows as usize;
         let cols = self.cols;
+        // 光标所在行的全局行索引，以及它在行内的列（落在宽字符的续格上时取这个字的起始格）
+        let (cur_row, cur_col) = self.parser.screen().cursor_position();
+        let cur_idx = sb + cur_row as usize;
+        let mut cur_split: (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
         // 按「全局行索引」去重收集每行的序列化字节（与 collect_lines 同样的遍历方式）
         // 每行连同它的软换行标志：软换行的行与下一行本是同一条逻辑行
         let mut lines: Vec<(Vec<u8>, bool)> = Vec::new();
@@ -684,6 +692,14 @@ impl Terminal {
                     if idx < lines.len() {
                         continue;
                     }
+                    if idx == cur_idx {
+                        let on_cont = cur_col > 0
+                            && screen
+                                .cell(r as u16, cur_col)
+                                .is_some_and(|c| c.is_wide_continuation());
+                        let at = if on_cont { cur_col - 1 } else { cur_col };
+                        cur_split = serialize_row_split(screen, r as u16, cols, at);
+                    }
                     lines.push((
                         serialize_row(screen, r as u16, cols),
                         screen.row_wrapped(r as u16),
@@ -696,23 +712,35 @@ impl Terminal {
             off = off.saturating_sub(rows);
         }
         self.parser.screen_mut().set_scrollback(saved);
-        // 去掉末尾空行（多为放大补出的空白/未用行），重放后内容自然贴底
-        while lines.last().is_some_and(|(l, _)| l.is_empty()) {
+        // 去掉末尾空行（多为放大补出的空白/未用行），重放后内容自然贴底。光标所在行及其
+        // 之前的不裁：光标停在最后一行内容下面的空行上时（刚输出完、提示符还没来），那几个
+        // 空行是真实存在的位置。
+        while lines.len() > cur_idx + 1 && lines.last().is_some_and(|(l, _)| l.is_empty()) {
             lines.pop();
         }
-        let mut out = Vec::new();
+        let (mut before, mut after) = (Vec::new(), Vec::new());
         let mut joined = false; // 上一行是软换行：这一行接在它后面，不补换行
         for (i, (line, wrapped)) in lines.iter().enumerate() {
+            let out = if i <= cur_idx {
+                &mut before
+            } else {
+                &mut after
+            };
             // 软换行处不写换行，重放时由新宽度重新折行——这才是真正的回流。一律写换行的话，
             // 变宽后折开的长命令 / 链接接不回去；宽字符折行（行尾留一格空）的行更是会在
             // 中间多出一个硬换行。
             if i > 0 && !joined {
                 out.extend_from_slice(b"\r\n");
             }
-            out.extend_from_slice(line);
+            if i == cur_idx {
+                before.extend_from_slice(&cur_split.0);
+                after.extend_from_slice(&cur_split.1);
+            } else {
+                out.extend_from_slice(line);
+            }
             joined = *wrapped;
         }
-        out
+        (before, after)
     }
 
     /// 喂入来自远程的原始字节。
@@ -1135,33 +1163,35 @@ impl Terminal {
             self.parser.screen_mut().set_size(rows, cols);
         } else {
             let prev_sb = self.scrollback;
-            let data = self.serialize_buffer();
+            let (before, after) = self.serialize_buffer();
             let restore = Self::mode_restore_bytes(self.parser.screen());
             // 同时变高又改了宽度：宽度变了必须回流（直接 set_size 会把每行右侧截掉、不进历史），
             // 但不能按更高的视口重放（见上面的说明：历史行会被吸回可见区）。所以按**原来的
             // 行数**和新宽度回流，再原地加高——加出来的是底部空白，回滚缓冲原样保留。
             let reflow_rows = rows.min(self.rows);
-            // 序列化会裁掉末尾的空行（缩小时让内容贴底）。加高时不该贴底：光标若停在最后
-            // 一行内容下面的空行上（刚输出完、提示符还没来），裁掉它就等于少了一行，
-            // 回滚行数跟着变。把光标到最后一行内容之间的空行补回去。
-            let blank_tail = if rows > self.rows {
-                self.parser.screen_mut().set_scrollback(0);
-                let screen = self.parser.screen();
-                let last_text = screen
-                    .rows(0, self.cols)
-                    .enumerate()
-                    .filter(|(_, l)| !l.is_empty())
-                    .map(|(i, _)| i)
-                    .last();
-                let cursor_row = screen.cursor_position().0 as usize;
-                last_text.map_or(0, |l| cursor_row.saturating_sub(l))
-            } else {
-                0
-            };
             let mut np = vt100::Parser::new(reflow_rows, cols, DEFAULT_SCROLLBACK);
-            np.process(&data);
-            for _ in 0..blank_tail {
-                np.process(b"\r\n");
+            // 重放到光标处，记下它的绝对位置（累计历史行数 + 屏幕行）；再重放光标之后的内容
+            //（可能把屏幕往上顶），最后按新的累计行数换算回屏幕行，把光标放回去。
+            np.process(&before);
+            let (r, mut c) = np.screen().cursor_position();
+            let mut cursor_abs = np.screen().scrollback_total() + r as usize;
+            // 前一段恰好写满一行：光标此刻「悬」在行尾等着折行（报出来的列是最后一列，而那
+            // 一格刚被写过）。它真正的位置是下一行行首——后一段的第一个字符就落在那里。
+            //（这个状态下 vt100 报的列可能是最后一列，也可能是越过最后一列的那个位置）
+            let hanging = c + 1 >= cols
+                && np
+                    .screen()
+                    .cell(r, cols - 1)
+                    .is_some_and(|x| x.has_contents() || x.is_wide_continuation());
+            if hanging && !after.is_empty() {
+                cursor_abs += 1;
+                c = 0;
+            }
+            np.process(&after);
+            // 悬在行尾、后面又没有内容：解析器自己停的位置就是对的，不用挪
+            if !(hanging && after.is_empty()) {
+                let row = cursor_abs.saturating_sub(np.screen().scrollback_total());
+                np.process(format!("\x1b[{};{}H", row + 1, c + 1).as_bytes());
             }
             np.process(&restore);
             if rows > reflow_rows {

@@ -2933,3 +2933,53 @@ fn growing_taller_while_changing_width_still_reflows() {
     t.parser.screen_mut().set_scrollback(0);
     assert!(sb_after >= sb_before, "回滚缓冲被吸回可见区：{sb_before} → {sb_after}");
 }
+
+fn char_under_cursor(t: &Terminal) -> String {
+    let sc = t.parser.screen();
+    let (r, c) = sc.cursor_position();
+    sc.cell(r, c).map(|x| x.contents().to_string()).unwrap_or_default()
+}
+
+/// 缩放窗口触发回流之后，光标必须还在原来那个字符上。原先回流完光标一律落到内容末尾：
+/// 正在命令行中间编辑时拖一下窗口，光标就跑到行尾去了（屏幕上的位置和 shell 以为的位置
+/// 从此对不上，直到 shell 重画提示符）。
+#[test]
+fn the_cursor_stays_on_its_character_across_a_reflow() {
+    // 光标在一行中间
+    let mut t = Terminal::new();
+    t.resize(40, 10);
+    t.feed(b"first line\r\n$ hello world\x1b[5D");
+    assert_eq!(char_under_cursor(&t), "w");
+    t.resize(8, 9); // 变窄：这一行折成好几段
+    assert_eq!(char_under_cursor(&t), "w", "变窄后");
+    t.resize(60, 8); // 再变宽：接回一行
+    assert_eq!(char_under_cursor(&t), "w", "变宽后");
+
+    // 光标在汉字上
+    let mut t = Terminal::new();
+    t.resize(40, 10);
+    t.feed("$ 文件名 中文\x1b[4D".as_bytes());
+    assert_eq!(char_under_cursor(&t), "中");
+    t.resize(7, 9);
+    assert_eq!(char_under_cursor(&t), "中");
+    t.resize(30, 8);
+    assert_eq!(char_under_cursor(&t), "中");
+
+    // 光标在行尾（最常见的提示符状态）：仍在行尾，后面没有字符
+    let mut t = Terminal::new();
+    t.resize(40, 10);
+    t.feed(b"output\r\n$ ls -la");
+    t.resize(30, 9);
+    let (r, c) = t.parser.screen().cursor_position();
+    assert_eq!(t.screen_text().lines().nth(r as usize), Some("$ ls -la"));
+    assert_eq!(c, 8);
+
+    // 光标后面还有内容（上移过光标的全屏式输出）：光标不动，后面的内容也还在
+    let mut t = Terminal::new();
+    t.resize(40, 10);
+    t.feed(b"aaa\r\nbbb\r\nccc\x1b[2A\x1b[1G");
+    assert_eq!(char_under_cursor(&t), "a");
+    t.resize(30, 9);
+    assert_eq!(char_under_cursor(&t), "a");
+    assert!(t.screen_text().contains("ccc"));
+}
