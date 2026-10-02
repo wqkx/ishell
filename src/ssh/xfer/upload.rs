@@ -1280,4 +1280,110 @@ mod live_sftp_tests {
         assert!(!env.exists(&part).await, "换入后分段文件应当已被 rename 走");
         let _ = std::fs::remove_file(&src);
     }
+
+    /// 在只读目录里用**编辑器保存**（`WriteFile`）写 `config.yaml`：`existing` 为原文件的
+    /// 权限位（None = 不存在）。返回 (保存结果事件, ⚠ 提示, 之后的内容, 之后的权限位, 目录列表)。
+    async fn editor_save_into_read_only_dir(
+        env: &Env,
+        existing: Option<u32>,
+    ) -> (Option<WorkerEvent>, Vec<String>, Option<Vec<u8>>, String, String) {
+        let dir = env.path("locked");
+        let target = format!("{dir}/config.yaml");
+        env.sftp.create_dir(dir.clone()).await.expect("建目录");
+        if let Some(mode) = existing {
+            crate::ssh::sftp::sftp_overwrite(
+                &env.sftp,
+                &target,
+                b"ORIGINAL CONTENT, LONGER THAN THE NEW ONE",
+            )
+            .await
+            .expect("预置原文件");
+            env.exec(&format!("chmod {mode:o} '{target}'")).await;
+        }
+        env.exec(&format!("chmod 555 '{dir}'")).await;
+
+        let (s, rx) = sink();
+        crate::ssh::sftp::handle_fs_op(
+            &env.sftp,
+            crate::proto::UiCommand::WriteFile {
+                id: 7,
+                path: target.clone(),
+                content: "REPLACEMENT".into(),
+                encoding: "UTF-8".into(),
+                eol: crate::proto::Eol::Lf,
+                expect_mtime: 0,
+                force: true,
+            },
+            &s,
+        )
+        .await;
+
+        let mode = env.exec(&format!("stat -c %a '{target}' 2>/dev/null")).await.1;
+        env.exec(&format!("chmod 755 '{dir}'")).await; // 让清理能删掉
+        let listing = env.exec(&format!("ls -A '{dir}'")).await.1;
+        let mut result = None;
+        let mut notices = Vec::new();
+        for e in rx.try_iter() {
+            match e {
+                WorkerEvent::Status(t) if t.starts_with('⚠') => notices.push(t),
+                WorkerEvent::FileSaved { .. } | WorkerEvent::FileSaveFailed { .. } => {
+                    result = Some(e)
+                }
+                _ => {}
+            }
+        }
+        (
+            result,
+            notices,
+            env.read(&target).await,
+            mode.trim().to_string(),
+            listing.trim().to_string(),
+        )
+    }
+
+    /// 目录不可写、文件可写：编辑器保存退化成原地覆盖写——内容对（新内容更短，尾巴要截掉）、
+    /// 权限位不变、不留临时文件、带「非原子」标记和 ⚠ 提示。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_editor_save_in_read_only_dir_writes_in_place() {
+        let env = env_or_skip!();
+        let (result, notices, content, mode, listing) =
+            editor_save_into_read_only_dir(&env, Some(0o640)).await;
+        assert!(
+            matches!(result, Some(WorkerEvent::FileSaved { in_place: true, size: 11, .. })),
+            "应当报「已保存（原地覆盖）」：{result:?}"
+        );
+        assert_eq!(content.as_deref(), Some(&b"REPLACEMENT"[..]));
+        assert_eq!(mode, "640", "原地写不该改权限位");
+        assert_eq!(listing, "config.yaml", "留下了临时文件");
+        assert_eq!(notices.len(), 1, "提示：{notices:?}");
+    }
+
+    /// 钉子不是门禁（只读文件带不带 truncate 都打不开）：目录和文件都不可写时保存失败，
+    /// 原文件分毫未动。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_editor_save_read_only_file_stays_intact() {
+        let env = env_or_skip!();
+        let (result, notices, content, _, listing) =
+            editor_save_into_read_only_dir(&env, Some(0o444)).await;
+        assert!(matches!(result, Some(WorkerEvent::FileSaveFailed { .. })), "{result:?}");
+        assert_eq!(
+            content.as_deref(),
+            Some(&b"ORIGINAL CONTENT, LONGER THAN THE NEW ONE"[..])
+        );
+        assert_eq!(listing, "config.yaml");
+        assert!(notices.is_empty());
+    }
+
+    /// 钉子不是门禁：目录不可写时新建文件照旧失败，什么都不留下。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_sftp_editor_save_new_file_in_read_only_dir_fails() {
+        let env = env_or_skip!();
+        let (result, _, content, _, listing) = editor_save_into_read_only_dir(&env, None).await;
+        assert!(matches!(result, Some(WorkerEvent::FileSaveFailed { .. })), "{result:?}");
+        assert_eq!(content, None);
+        assert_eq!(listing, "");
+    }
 }
