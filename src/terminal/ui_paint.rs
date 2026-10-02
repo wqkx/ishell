@@ -347,7 +347,6 @@ impl Terminal {
 
         // 右侧滚动条（仅有可回滚历史时显示）：滑块高=视口/总量，位置由 scrollback 决定（0=底/最新）。
         if max_sb > 0 {
-            let total = self.rows as f32 + max_sb as f32;
             let handle_h = scroll_handle_h(sb_track.height(), self.rows, max_sb);
             let pos_frac = 1.0 - (self.scrollback as f32 / max_sb as f32);
             let handle_top = sb_track.top() + (sb_track.height() - handle_h) * pos_frac;

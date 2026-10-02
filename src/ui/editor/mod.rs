@@ -542,6 +542,84 @@ mod state_tests {
 }
 
 #[cfg(test)]
+mod reveal_tests {
+    use super::*;
+
+    #[allow(deprecated)]
+    fn frames(ed: &mut Editor, n: usize) {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        for _ in 0..n {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 300.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    content(ui, ed, egui::Id::new("reveal_probe"));
+                });
+            });
+        }
+    }
+
+    /// 查找 / 跳转把光标放到某处后，那一处必须滚进视口——竖向和横向都要。
+    /// 原先横向跟随只认「键盘移动了光标」，查找跳到长行右侧的命中时选区在屏幕外。
+    #[test]
+    fn a_jump_reveals_the_target_horizontally() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), format!("{}needle\n", "x".repeat(600)));
+        frames(&mut ed, 2);
+        assert_eq!(ed.vlast_hoff, 0.0);
+        ed.vsel = Some(600);
+        ed.vcaret = 606;
+        ed.pending_scroll = Some(0); // 查找跳转就是这么设的
+        frames(&mut ed, 3);
+        assert!(ed.vlast_hoff > 0.0, "命中在第 600 列，视图却没有横向滚过去");
+    }
+
+    /// 换行模式下，跳转目标在一个折成很多段的长行深处：要滚到光标所在的**那一段**，
+    /// 而不是这一行的第一段。
+    #[test]
+    fn a_jump_reveals_the_target_row_inside_a_wrapped_line() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), format!("{}needle\n", "x".repeat(20_000)));
+        ed.wrap = true;
+        frames(&mut ed, 2);
+        ed.vcaret = 20_006;
+        ed.pending_scroll = Some(0);
+        frames(&mut ed, 3);
+        let caret_row = virtual_::test_caret_vrow(&ed);
+        assert!(
+            caret_row >= ed.vtop && caret_row < ed.vtop + ed.vlast_vis.max(1),
+            "光标在第 {caret_row} 视觉行，视口却停在 {}..{}",
+            ed.vtop,
+            ed.vtop + ed.vlast_vis
+        );
+    }
+
+    /// 跳转目标落在折叠区里：必须先展开再定位，否则居中的是折叠着的那一行。
+    ///
+    /// **钉子不是门禁**：真实缺陷是帧内顺序（展开检查排在跳转之前），而这里只能在帧外
+    /// 把光标放进折叠区，修复前同样通过。留着保证「光标进折叠区即展开并可见」这条不退化。
+    #[test]
+    fn a_jump_into_a_folded_region_unfolds_it() {
+        let body: String = (0..200).map(|i| format!("    line{i};\n")).collect();
+        let mut ed = Editor::new("/tmp/a.rs".into(), format!("fn f() {{\n{body}}}\n"));
+        frames(&mut ed, 2);
+        ed.folds = vec![(0, 200)];
+        ed.fold_ver = ed.fold_ver.wrapping_add(1);
+        frames(&mut ed, 2);
+        // 模拟「跳转到行」把光标放进折叠区（跳转发生在状态栏/查找栏处理里）
+        virtual_::test_goto_line(&mut ed, 149);
+        frames(&mut ed, 1);
+        assert!(ed.folds.is_empty(), "光标进了折叠区，折叠却没展开");
+        let row = virtual_::test_caret_vrow(&ed);
+        assert!(row >= ed.vtop && row < ed.vtop + ed.vlast_vis.max(1), "展开后目标行不在视口内");
+    }
+}
+
+#[cfg(test)]
 mod preview_tests {
     use super::*;
 

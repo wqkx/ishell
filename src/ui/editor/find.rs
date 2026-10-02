@@ -95,15 +95,58 @@ pub(super) fn nav_match(
     }
 }
 
+/// 把一处匹配的替换文本追加到 `out`：正则模式展开捕获组（`$1` 等），字面模式原样。
+fn push_replacement(ed: &Editor, caps: &regex::Captures, out: &mut String) {
+    if ed.find_regex {
+        caps.expand(&ed.replace, out);
+    } else {
+        out.push_str(&ed.replace);
+    }
+}
+
+/// 「替换」单处：`content[a..b]` 这处匹配替换后的文本。
+///
+/// 在**原文的那个位置**上重新匹配来取捕获组，不能把命中的子串抠出来单独匹配——依赖上下文
+/// 的断言（`\B`、`^`、`\b`）在孤立子串上不成立，结果就是点了「替换」什么都没换。
+pub(super) fn replace_one_text(ed: &Editor, a: usize, b: usize) -> String {
+    let mut out = String::new();
+    let caps = build_find_regex(&ed.find, ed.find_case, ed.find_word, ed.find_regex)
+        .and_then(|re| re.captures_at(&ed.content, a))
+        .filter(|c| c.get(0).is_some_and(|m| m.start() == a && m.end() == b));
+    match caps {
+        Some(caps) => push_replacement(ed, &caps, &mut out),
+        // 对不上（匹配列表已陈旧）：退回字面替换串，至少不 panic、不乱展开
+        None => out.push_str(&ed.replace),
+    }
+    out
+}
+
+/// 替换完一处后要选中的下一处：起点不早于 `pos`（替换文本的末尾）的第一处，没有则回绕。
+/// 不能写成「起点 > pos-1」：pos 为 0（在文首替换成空串）时会把正在 0 的那一处跳过去。
+pub(super) fn match_after_replace(matches: &[(usize, usize)], pos: usize) -> Option<(usize, usize)> {
+    matches
+        .iter()
+        .find(|&&(a, _)| a >= pos)
+        .or(matches.first())
+        .copied()
+}
+
+/// 「全部替换」后的全文。只替换**非空**匹配——与 `rebuild_matches` 的计数口径一致：
+/// 界面上显示几项，就只动那几项（`a*` 这类能空匹配的模式否则会把替换串塞满全文）。
 fn replace_all_content(ed: &Editor) -> Option<String> {
     let re = build_find_regex(&ed.find, ed.find_case, ed.find_word, ed.find_regex)?;
-    Some(if ed.find_regex {
-        re.replace_all(&ed.content, ed.replace.as_str())
-            .into_owned()
-    } else {
-        re.replace_all(&ed.content, regex::NoExpand(ed.replace.as_str()))
-            .into_owned()
-    })
+    let mut out = String::with_capacity(ed.content.len());
+    let mut last = 0;
+    for caps in re.captures_iter(&ed.content) {
+        let Some(m) = caps.get(0).filter(|m| m.end() > m.start()) else {
+            continue;
+        };
+        out.push_str(&ed.content[last..m.start()]);
+        push_replacement(ed, &caps, &mut out);
+        last = m.end();
+    }
+    out.push_str(&ed.content[last..]);
+    Some(out)
 }
 
 fn find_toggle(ui: &mut egui::Ui, label: &str, on: bool, tip: &str) -> bool {
@@ -397,7 +440,55 @@ pub(super) fn find_widget(
 
 #[cfg(test)]
 mod tests {
-    use super::nav_match;
+    use super::*;
+
+    fn ed_find(content: &str, find: &str, replace: &str, regex: bool) -> Editor {
+        let mut ed = Editor::new("/tmp/a.txt".into(), content.into());
+        super::super::v_recompute(&mut ed);
+        ed.find = find.into();
+        ed.replace = replace.into();
+        ed.find_regex = regex;
+        ed.find_case = true;
+        ed
+    }
+
+    /// 「全部替换」只能动界面上数得出来的那些匹配。计数时空匹配被丢掉了（`a*` 在每个
+    /// 位置都能空匹配），替换时却没丢——显示 1 项，实际把替换串塞满了全文。
+    #[test]
+    fn replace_all_only_touches_the_counted_matches() {
+        let mut ed = ed_find("baab", "a*", "X", true);
+        rebuild_matches(&mut ed);
+        assert_eq!(ed.find_matches, vec![(1, 3)]);
+        assert_eq!(replace_all_content(&ed).as_deref(), Some("bXb"));
+        // 捕获组照常展开；字面模式里的 `$1` 就是字面
+        let ed = ed_find("k=v; a=b", r"(\w)=(\w)", "$2=$1", true);
+        assert_eq!(replace_all_content(&ed).as_deref(), Some("v=k; b=a"));
+        let ed = ed_find("a.b", ".", "$1", false);
+        assert_eq!(replace_all_content(&ed).as_deref(), Some("a$1b"));
+    }
+
+    /// 单个「替换」要在**原文的那个位置**上重新匹配，不能把命中的子串抠出来单独匹配：
+    /// 依赖上下文的断言（`\B`、`^`、`\b`）在孤立子串上会不成立，于是点「替换」什么都没换。
+    #[test]
+    fn replacing_one_match_keeps_its_context() {
+        let ed = ed_find("xfoo", r"\Bfoo", "bar", true);
+        assert_eq!(replace_one_text(&ed, 1, 4), "bar");
+        let ed = ed_find("ab12", r"(\d)(\d)", "$2$1", true);
+        assert_eq!(replace_one_text(&ed, 2, 4), "21");
+        let ed = ed_find("a.b", ".", "$1", false);
+        assert_eq!(replace_one_text(&ed, 1, 2), "$1");
+    }
+
+    /// 替换后选中的是「替换文本之后」的第一处。替换发生在文首且替换成空串时，
+    /// 新的第一处就在 0，不能被跳过。
+    #[test]
+    fn next_match_after_a_replacement_at_the_very_start() {
+        let m = [(0, 2), (5, 7)];
+        assert_eq!(match_after_replace(&m, 0), Some((0, 2)));
+        assert_eq!(match_after_replace(&m, 3), Some((5, 7)));
+        assert_eq!(match_after_replace(&m, 8), Some((0, 2))); // 回绕
+        assert_eq!(match_after_replace(&[], 0), None);
+    }
 
     /// 「上一个」必须跳过光标所在的匹配（跳转后光标停在匹配末尾）：
     /// 此前按起点 `a < caret` 判定会命中自己，表现为「上一个不管用」。

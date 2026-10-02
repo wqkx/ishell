@@ -56,9 +56,14 @@ pub(super) fn v_line_of_vrow(ed: &Editor, vrow: usize) -> (usize, usize) {
 pub(super) fn v_vpos_of_byte(ed: &Editor, byte: usize, cols: usize) -> (usize, usize) {
     let cols = cols.max(1);
     let line = v_line_of(ed, byte);
-    let (ls, _) = v_line_range(ed, line);
+    let (ls, le) = v_line_range(ed, line);
     let col = ed.content[ls..byte.max(ls)].chars().count();
     let base = ed.vrow_pre.get(line).copied().unwrap_or(0) as usize;
+    // 行末恰好落在段边界上（字符数是列数的整数倍）：属于最后一段的末尾。按公式算会得到
+    // 「下一段第 0 列」，而那一段并不存在（见 `line_vrows`）。
+    if col > 0 && col.is_multiple_of(cols) && byte >= le {
+        return (base + col / cols - 1, cols);
+    }
     (base + col / cols, col % cols)
 }
 /// (视觉行, 段内列) → 字节偏移（钳到行尾）。
@@ -83,4 +88,28 @@ pub fn v_recompute(ed: &mut Editor) {
         ))
         .max()
         .unwrap_or(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一行的字符数恰好是折行列数的整数倍时，行末光标属于**最后一段的末尾**，而不是
+    /// 「下一段第 0 列」——那一段并不存在（行数是 chars/cols，没有多出来的一行）。
+    /// 算错的话，在这种行的行末按 ↓ 会跳过一整行，按 ↑ 会留在本行回到行首。
+    #[test]
+    fn caret_at_the_end_of_an_exactly_full_line_stays_on_its_last_row() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "abcdefgh\nxy\n".into());
+        v_recompute(&mut ed);
+        v_wrap_sync(&mut ed, 4); // 第 0 行 8 字符 → 2 段
+        assert_eq!(v_total_vrows(&ed), 4);
+        assert_eq!(v_vpos_of_byte(&ed, 8, 4), (1, 4), "行末应在第 2 段末尾");
+        assert_eq!(v_vpos_of_byte(&ed, 4, 4), (1, 0), "行中的段边界属于下一段开头");
+        assert_eq!(v_vpos_of_byte(&ed, 0, 4), (0, 0));
+        assert_eq!(v_vpos_of_byte(&ed, 9, 4), (2, 0)); // 下一逻辑行
+        // 往返：行末位置能映射回同一个字节
+        assert_eq!(v_byte_of_vpos(&ed, 1, 4, 4), 8);
+        // 空行不受影响
+        assert_eq!(v_vpos_of_byte(&ed, 12, 4), (3, 0));
+    }
 }

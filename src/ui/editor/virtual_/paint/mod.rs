@@ -159,9 +159,16 @@ pub(super) fn paint_visible_rows(
         let visible = (view_h / row_h).ceil() as usize + 2;
         let max_top = (nrows + pad_rows).saturating_sub(visible.saturating_sub(2));
         let caret_row = v_vpos_of_byte(ed, ed.vcaret, eff_cols).0;
+        // 跳转（查找命中 / 跳转到行）与键盘移动一样要把光标**横向**也带进视口
+        let jumped = ed.pending_scroll.is_some();
         if let Some(tl) = ed.pending_scroll.take() {
-            // 跳转/定位：居中（逻辑行 → 其首个视觉行）
-            let tl_row = ed.vrow_pre.get(tl).copied().unwrap_or(0) as usize;
+            // 跳转/定位：居中。目标就是光标所在行时按光标所在的那一**段**算——换行模式下
+            // 一个逻辑行可以折成几百段，只对齐到首段的话命中处根本不在屏幕上。
+            let tl_row = if v_line_of(ed, ed.vcaret) == tl {
+                caret_row
+            } else {
+                ed.vrow_pre.get(tl).copied().unwrap_or(0) as usize
+            };
             ed.vtop = tl_row.saturating_sub(visible / 2).min(max_top);
         } else if moved {
             // 键盘移动：只在越界时「一行」地滚（不要整屏跳）
@@ -176,7 +183,7 @@ pub(super) fn paint_visible_rows(
             };
             ed.vtop = tt.min(max_top);
         }
-        if moved && !wrap {
+        if (moved || jumped) && !wrap {
             let (ls2, _) = v_line_range(ed, v_line_of(ed, ed.vcaret));
             let cx = gutter_w + ed.content[ls2..ed.vcaret].chars().count() as f32 * char_w; // 光标在内容坐标里的 x
             if cx < ed.vlast_hoff + gutter_w + char_w {

@@ -34,6 +34,13 @@ pub(super) fn paint_text_row(
     let col_of =
         |b: usize| -> usize { byte_to_char(line_full, b.saturating_sub(ls).min(line_full.len())) };
     let in_win = |c: usize| c >= col0 && c <= col0 + ncols;
+    // 光标属于哪一段：换行模式下，段边界上的光标画在**下一段开头**，只有行末才画在本段
+    // 末尾。两端都算的话，上一段末尾和下一段开头各画一个。
+    let wrapping = ctx.wrap;
+    let caret_here = |b: usize| {
+        let c = col_of(b);
+        c >= col0 && (c < col0 + ncols || (c == col0 + ncols && (!wrapping || b >= le)))
+    };
     // 当前行高亮（极淡）：聚焦且无选区时，给光标所在行铺一层很淡的底
     if ctx.focused && ctx.sels.is_empty() && i == ctx.caret_line {
         ctx.painter.rect_filled(
@@ -265,7 +272,7 @@ pub(super) fn paint_text_row(
         let blink_on = ((now - ctx.ed.caret_blink_at).rem_euclid(1.06)) < 0.53;
         if blink_on {
             for &cp in ctx.carets {
-                if cp >= ls && cp <= le && in_win(col_of(cp)) {
+                if cp >= ls && cp <= le && caret_here(cp) {
                     let cx = x_of(cp - ls);
                     ctx.painter.vline(
                         cx,
@@ -280,7 +287,7 @@ pub(super) fn paint_text_row(
         // 注意这里**只**记坐标，不再顺手上报 `o.ime`——上报改到了 paint/mod.rs 的行循环之后。
         // 原因见那里的注释：在这里报等于「光标可见才报」，光标滚出视口的那一帧 `o.ime` 变成
         // None，X11 上就是一次 XDestroyIC，滚回来又是 XCreateIC，都是同步的 XIM 往返。
-        if ctx.ed.vcaret >= ls && ctx.ed.vcaret <= le && in_win(col_of(ctx.ed.vcaret)) {
+        if ctx.ed.vcaret >= ls && ctx.ed.vcaret <= le && caret_here(ctx.ed.vcaret) {
             let cx = x_of(ctx.ed.vcaret - ls);
             caret_px_frame = Some(egui::pos2(cx, y + ctx.row_h));
         }

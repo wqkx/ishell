@@ -20,6 +20,18 @@ pub(super) fn test_insert(ed: &mut super::Editor, t: &str) {
     edit::v_insert(ed, t);
 }
 #[cfg(test)]
+pub(super) fn test_caret_vrow(ed: &super::Editor) -> usize {
+    wrap::v_vpos_of_byte(ed, ed.vcaret, ed.vrow_cols.max(1)).0
+}
+/// 测试用：像「跳转到行」那样只设光标与待滚动目标（它发生在折叠自动展开的检查之后）。
+#[cfg(test)]
+pub(super) fn test_goto_line(ed: &mut super::Editor, line: usize) {
+    ed.goto_open = false;
+    ed.vcaret = geom::v_line_range(ed, line).0;
+    ed.vsel = None;
+    ed.pending_scroll = Some(line);
+}
+#[cfg(test)]
 pub(super) fn test_undo(ed: &mut super::Editor) {
     edit::v_undo(ed);
 }

@@ -1,7 +1,7 @@
 use egui::RichText;
 
 use super::super::find::{
-    build_find_regex, find_widget, goto_widget, nav_match, rebuild_matches, FindOut,
+    find_widget, goto_widget, match_after_replace, rebuild_matches, replace_one_text, FindOut,
 };
 use super::super::Editor;
 use super::edit::{normalize_paste, v_apply, v_insert};
@@ -175,16 +175,7 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
             }
             FindOut::ReplaceOne(a, b) => {
                 // 与「全部替换」保持一致：正则模式下展开捕获组（$1 等），字面模式直接用替换串。
-                let rep: String = if ed.find_regex {
-                    match build_find_regex(&ed.find, ed.find_case, ed.find_word, ed.find_regex) {
-                        Some(re) => re
-                            .replace(&ed.content[a..b], ed.replace.as_str())
-                            .into_owned(),
-                        None => ed.replace.clone(),
-                    }
-                } else {
-                    ed.replace.clone()
-                };
+                let rep = replace_one_text(ed, a, b);
                 let rep_end = a + rep.len();
                 v_apply(ed, a, b - a, &rep);
                 // VSCode 行为：替换后立即选中**下一处**匹配——光标落回匹配范围内，
@@ -192,8 +183,7 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                 // 计数退化为总数，用户得再点一次「下一个」才恢复。
                 ed.find_sig = 0; // 强制 rebuild_matches 重算（签名里含内容版本）
                 rebuild_matches(ed);
-                if let Some((na, nb)) = nav_match(&ed.find_matches, rep_end.saturating_sub(1), true)
-                {
+                if let Some((na, nb)) = match_after_replace(&ed.find_matches, rep_end) {
                     ed.vsel = Some(na);
                     ed.vcaret = nb;
                     ed.pending_scroll = Some(v_line_of(ed, nb));
@@ -203,8 +193,12 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
             }
             FindOut::ReplaceAll(newc) => {
                 let old = ed.content.len();
+                // 整篇重写后 v_apply 会把光标放到文末；留在原来那一行，视图才不会跳走
+                let line = v_line_of(ed, ed.vcaret);
                 v_apply(ed, 0, old, &newc);
-                ed.pending_scroll = Some(v_line_of(ed, ed.vcaret));
+                let line = line.min(ed.vlines.len().saturating_sub(1));
+                ed.vcaret = v_line_range(ed, line).0;
+                ed.pending_scroll = Some(line);
             }
             FindOut::None => {}
         }

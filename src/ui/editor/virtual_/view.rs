@@ -95,8 +95,11 @@ pub fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -
     };
     v_sync_leads(ed, unit_cols_now);
 
+    show_status_and_find(ui, ed, text_id);
     // 折叠维护：编辑时区间已由 v_remap_folds 平移/展开；
-    // 这里只处理跳转/查找把光标放进隐藏行的情况——自动展开所在折叠
+    // 这里只处理跳转/查找把光标放进隐藏行的情况——自动展开所在折叠。
+    // 必须排在 show_status_and_find **之后**：查找跳转、跳转到行就发生在那里面。排在前面的话
+    // 本帧按「还折着」的行映射去居中，下一帧才展开，而那时已经没人再修正滚动位置了。
     if !ed.folds.is_empty() {
         let cl = v_line_of(ed, ed.vcaret);
         if v_line_hidden(ed, cl) {
@@ -105,7 +108,6 @@ pub fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -
         }
     }
 
-    show_status_and_find(ui, ed, text_id);
     paint_visible_rows(
         ui,
         ed,
