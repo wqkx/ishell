@@ -417,8 +417,12 @@ impl Editor {
     pub fn mtime(&self) -> u32 {
         self.mtime
     }
-    pub fn set_mtime(&mut self, m: u32) {
-        self.mtime = m;
+    /// 保存成功后回填远端的新 mtime。0 表示「写完没能 stat 到」——这时保留原值：记成 0 的话
+    /// 之后每次保存都会跳过外部改动检测（0 = 不检测）。代价是下一次保存可能多问一次冲突。
+    pub fn note_saved_mtime(&mut self, m: u32) {
+        if m != 0 {
+            self.mtime = m;
+        }
     }
     /// 改行尾/编码后一律走 `recompute_dirty`，不能直接置 `dirty_flag = true`。
     /// `dirty()` 比的是与**打开时**的差异，改回原值就该重新变干净；直接置位会让
@@ -531,6 +535,18 @@ mod dirty_tests {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    /// 保存后没能 stat 到新 mtime（回报 0）时不能把 0 记下来：0 在保存请求里的意思是
+    /// 「不做外部改动检测」，记下来就等于这个文件此后永远不再检测。
+    #[test]
+    fn an_unknown_mtime_after_saving_keeps_the_previous_one() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "a\n".into());
+        ed.note_saved_mtime(1234);
+        ed.note_saved_mtime(0);
+        assert_eq!(ed.mtime(), 1234);
+        ed.note_saved_mtime(5678);
+        assert_eq!(ed.mtime(), 5678);
+    }
 
     /// 「记住光标行」：`Editor::new` 不建行索引（首帧才懒建），而恢复紧跟在 new 之后调用——
     /// 原先因此每次都被「行号越界」挡回去，这个功能一次都没生效过。

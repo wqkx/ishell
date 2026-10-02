@@ -29,7 +29,8 @@ pub(super) fn strip_ansi_to_text(bytes: &[u8]) -> String {
                     // OSC：ESC ] ... BEL 或 ESC \
                     chars.next();
                     while let Some(c2) = chars.next() {
-                        if c2 == '\x07' {
+                        // BEL 收尾；CAN / SUB 打断序列，后面的内容回到正文
+                        if matches!(c2, '\x07' | '\x18' | '\x1a') {
                             break;
                         }
                         if c2 == '\x1b' && chars.peek() == Some(&'\\') {
@@ -42,7 +43,8 @@ pub(super) fn strip_ansi_to_text(bytes: &[u8]) -> String {
                 Some('P' | 'X' | '^' | '_') => {
                     chars.next();
                     while let Some(c2) = chars.next() {
-                        if c2 == '\x07' {
+                        // BEL 收尾；CAN / SUB 打断序列，后面的内容回到正文
+                        if matches!(c2, '\x07' | '\x18' | '\x1a') {
                             break;
                         }
                         if c2 == '\x1b' && chars.peek() == Some(&'\\') {
@@ -57,6 +59,8 @@ pub(super) fn strip_ansi_to_text(bytes: &[u8]) -> String {
                     chars.next();
                     chars.next();
                 }
+                // `ESC ESC`：第二个 ESC 才是下一个序列的开头，不能当成第二字节吞掉
+                Some('\x1b') => {}
                 Some(_) => {
                     chars.next(); // 简单双字节转义（如 ESC=、ESC7），跳过第二个字符
                 }

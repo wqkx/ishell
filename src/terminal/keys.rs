@@ -396,8 +396,18 @@ pub(super) fn encode_mouse(
             let m = if press { 'M' } else { 'm' };
             out.extend_from_slice(format!("\x1b[<{cb};{cx};{cy}{m}").as_bytes());
         }
-        // 传统 X10/normal 编码：ESC [ M (cb+32) (x+32) (y+32)，坐标上限 223
-        _ => {
+        // 1005：与传统编码同形，但每个值按 UTF-8 码点发（xterm 上限 2047，即坐标 2015）。
+        // 落进下面的单字节分支的话，超过 95 列发出去的就不是合法 UTF-8 了。
+        vt100::MouseProtocolEncoding::Utf8 => {
+            out.extend_from_slice(b"\x1b[M");
+            for v in [32 + cb as u32, 32 + cx.min(2015), 32 + cy.min(2015)] {
+                let ch = char::from_u32(v).unwrap_or(' ');
+                out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+        }
+        // 传统 X10/normal 编码：ESC [ M (cb+32) (x+32) (y+32)。一个字节装不下 223 以上的
+        // 坐标，这里钳到 223（上报成最右一列）而不是丢掉事件——丢掉的话按下有、释放没有。
+        vt100::MouseProtocolEncoding::Default => {
             let b = 32u32.saturating_add(cb as u32);
             let x = 32 + cx.min(223);
             let y = 32 + cy.min(223);

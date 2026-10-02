@@ -997,15 +997,13 @@ impl Terminal {
                         pressed,
                         modifiers,
                     } => {
-                        // 右键属于本地菜单（复制 / 粘贴 / 查找都在那里），不转发给远端：两边都
-                        // 响应的话，tmux 弹它自己的菜单、vim 扩展选区，和本地菜单叠在一起。
-                        if *button == egui::PointerButton::Secondary {
-                            continue;
-                        }
+                        // 右键照常转发（tmux 的菜单、mc、vim 都要用）；这时本地菜单不弹（见下方
+                        // context_menu），按住 Shift 右键才是本地菜单——与本地选择同一个约定。
                         let base = match button {
                             egui::PointerButton::Primary => 0u8,
                             egui::PointerButton::Middle => 1,
-                            _ => 0,
+                            egui::PointerButton::Secondary => 2,
+                            _ => continue,
                         };
                         // 按下必须落在终端上；释放不管落在哪都要上报——只要这个键是在终端里
                         // 按下的。拖到侧栏 / 窗口外松开时不报释放，远端的拖选就卡住了，我们
@@ -1163,7 +1161,8 @@ impl Terminal {
         let mut do_paste = false;
         let mut do_find = false;
         let mut start_log = false;
-        resp.context_menu(|ui| {
+        // 远端开着鼠标上报时右键归远端，两边都响应会叠出两个菜单。
+        let local_menu = |ui: &mut egui::Ui| {
             ui.set_min_width(170.0); // 菜单宽度足些，看着舒服
                                      // 菜单项不换行（否则英文较长的「Highlight ERROR/WARN」会折行，复选框被挤到两行正中）
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -1343,7 +1342,10 @@ impl Terminal {
                 start_log = true;
                 ui.close();
             }
-        });
+        };
+        if !report_mouse {
+            resp.context_menu(local_menu);
+        }
         if start_log {
             // 原生文件对话框是**同步**的（Linux 上 rfd 走 xdg-portal + pollster），而这里就在事件循环线程上：
             // 用户翻目录的那十几秒界面一帧都不出。圈起来，免得卡死看门狗把它误判成卡死。

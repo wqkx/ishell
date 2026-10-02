@@ -103,6 +103,27 @@ mod tests {
         assert_eq!(st2[1], LineState::InStr("'''"));
     }
 
+    /// 反斜杠续行的字符串：整篇分词把两行当成一个串，逐行高亮也得从「串内」接着染，
+    /// 否则第二行的收尾引号会被当成一个新开的、没闭合的串。
+    #[test]
+    fn backslash_continued_strings_carry_over() {
+        for (ext, src) in [
+            ("py", "x = \"a \\\nb\" + 1\ny = 2"),
+            ("c", "char *s = \"a \\\nb\"; int n = 1;\nint y;"),
+            ("js", "let s = 'a \\\nb' + 1;\nlet y;"),
+        ] {
+            let st = line_states(src, ext);
+            assert!(matches!(st[1], LineState::InStr(_)), "{ext}: {:?}", st[1]);
+            assert_eq!(st[2], LineState::Normal, "{ext}");
+        }
+        // 续行里转义的引号不是收尾：串一直到真正的引号为止
+        let lang = lang::lang_for("c");
+        let segs = token::tokenize_with_state("b\\\" c\" + 1", &lang, LineState::InStr("\""));
+        assert_eq!(segs[0], (0, 6, token::Tok::Str));
+        // 不续行的没闭合串到行尾为止，不染下一行
+        assert_eq!(line_states("s = \"abc\nx = 1", "py")[1], LineState::Normal);
+    }
+
     #[test]
     fn backtick_and_raw_multiline_states() {
         // JS 模板串跨行：中间行行首在串内

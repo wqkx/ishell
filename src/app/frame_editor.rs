@@ -353,14 +353,14 @@ impl App {
                         .iter_mut()
                         .find(|t| t.uid == uid && t.editor.path == _path && !t.is_saving())
                     {
-                        t.editor.set_mtime(mtime);
+                        t.editor.note_saved_mtime(mtime);
                         t.file_size = Some(size);
                     }
                     continue;
                 }
                 if let Some(t) = ed.tabs.iter_mut().find(|t| t.uid == uid && t.save_op == id) {
                     t.file_size = Some(size); // 文件现在这么大：跟随模式从这里接着读
-                    t.editor.set_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
+                    t.editor.note_saved_mtime(mtime); // 回填服务器新 mtime，避免下次保存把「自己刚写入」误判为外部改动
                                                // 取出本次保存发出时的签名与关闭意图（Saving 状态里）；非 Saving 则忽略这条确认。
                     let (sent_rev, close_after) = match &t.save {
                         SaveState::Saving { rev, close_after } => (rev.clone(), *close_after),

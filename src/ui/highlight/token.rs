@@ -346,7 +346,7 @@ pub fn line_states(text: &str, ext: &str) -> Vec<LineState> {
     }
     let mut states = vec![LineState::Normal; starts.len()];
     let lang = lang_for(ext);
-    if lang.multi.is_empty() && lang.block.is_none() && !lang.strings.contains(&'`') {
+    if lang.multi.is_empty() && lang.block.is_none() && lang.strings.is_empty() {
         return states; // 该语言没有跨行结构
     }
     for (s, e, tok) in tokenize(text, &lang) {
@@ -368,7 +368,13 @@ pub fn line_states(text: &str, ext: &str) -> Vec<LineState> {
                 } else if text.as_bytes().get(k) == Some(&b'`') {
                     LineState::InStr("`")
                 } else {
-                    continue;
+                    // 普通引号串只有靠「反斜杠 + 换行」才跨行（C / JS / Python / shell 的续行）；
+                    // 不续行的串到行尾就结束了，下方循环自然不命中
+                    match text.as_bytes().get(k) {
+                        Some(b'"') => LineState::InStr("\""),
+                        Some(b'\'') => LineState::InStr("'"),
+                        _ => continue,
+                    }
                 }
             }
             _ => continue,
@@ -383,8 +389,22 @@ pub fn line_states(text: &str, ext: &str) -> Vec<LineState> {
     states
 }
 
+/// 行首处于普通引号串内时，这个串在本行的结束字节位（含收尾引号）；没有收尾则到行末。
+fn unescaped_quote_end(text: &str, quote: u8) -> usize {
+    let b = text.as_bytes();
+    let mut j = 0;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            c if c == quote => return j + 1,
+            _ => j += 1,
+        }
+    }
+    text.len()
+}
+
 /// 按行首状态起始分词：先把「延续中的多行结构」收尾，再对剩余部分常规分词。
-fn tokenize_with_state(text: &str, lang: &Lang, state: LineState) -> Vec<(usize, usize, Tok)> {
+pub(super) fn tokenize_with_state(text: &str, lang: &Lang, state: LineState) -> Vec<(usize, usize, Tok)> {
     let mut segs: Vec<(usize, usize, Tok)> = Vec::new();
     let mut i = 0usize;
     match state {
@@ -396,10 +416,14 @@ fn tokenize_with_state(text: &str, lang: &Lang, state: LineState) -> Vec<(usize,
             }
         }
         LineState::InStr(delim) => {
-            let end = text
-                .find(delim)
-                .map(|e| e + delim.len())
-                .unwrap_or(text.len());
+            let end = match delim {
+                // 续行过来的普通引号串：`\"` 不是收尾
+                "\"" | "'" => unescaped_quote_end(text, delim.as_bytes()[0]),
+                _ => text
+                    .find(delim)
+                    .map(|e| e + delim.len())
+                    .unwrap_or(text.len()),
+            };
             segs.push((0, end, Tok::Str));
             i = end;
         }

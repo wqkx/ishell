@@ -271,6 +271,11 @@ pub(super) fn count_bel(data: &[u8]) -> usize {
                                 i += 1;
                                 break;
                             }
+                            // CAN / SUB 打断序列（解析器如此），后面的内容回到正文
+                            if matches!(data[i], 0x18 | 0x1a) {
+                                i += 1;
+                                break;
+                            }
                             if data[i] == 0x1b && data.get(i + 1) == Some(&b'\\') {
                                 i += 2;
                                 break;
@@ -300,9 +305,15 @@ pub(super) fn count_bel(data: &[u8]) -> usize {
                                 i += 2;
                                 break;
                             }
+                            if matches!(data[i], 0x18 | 0x1a) {
+                                i += 1;
+                                break;
+                            }
                             i += 1;
                         }
                     }
+                    // `ESC ESC`：第二个 ESC 才是下一个序列的开头
+                    Some(0x1b) => i += 1,
                     _ => i += 2,
                 }
             }

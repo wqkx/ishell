@@ -3153,31 +3153,81 @@ fn a_string_payload_continued_in_the_next_packet_is_still_payload() {
     assert!(history.contains("after"));
 }
 
-/// 右键属于本地菜单（复制 / 粘贴是这个应用最常用的入口）：不再同时转发给远端——
-/// 否则 tmux 弹它自己的菜单、vim 扩展选区，和本地菜单叠在一起。
+/// 远端开着鼠标上报时，右键照常转发（tmux 的菜单、mc、vim 都靠它）；按住 Shift 的右键
+/// 留给本地菜单，不转发——与「Shift 拖动 = 本地选择」同一个约定。
 #[test]
-fn right_click_is_not_forwarded_to_the_remote() {
-    let ctx = egui::Context::default();
-    crate::theme::apply(&ctx);
-    let mut t = Terminal::new();
-    t.feed(b"\x1b[?1000h\x1b[?1006h");
-    ui_frame(&mut t, &ctx, vec![]);
-    let pos = egui::pos2(200.0, 200.0);
-    ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(pos)]);
+fn right_click_goes_to_the_remote_and_shift_keeps_it_local() {
+    let click = |modifiers: egui::Modifiers| {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut t = Terminal::new();
+        t.feed(b"\x1b[?1000h\x1b[?1006h");
+        ui_frame(&mut t, &ctx, vec![]);
+        let pos = egui::pos2(200.0, 200.0);
+        ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(pos)]);
+        let mut out = Vec::new();
+        for pressed in [true, false] {
+            // 「按着 Shift」读的是整帧的修饰键状态，所以这里不能用 ui_frame（它不带）
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                modifiers,
+                events: vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| out.extend(t.ui(ui)));
+            });
+        }
+        String::from_utf8(out).unwrap()
+    };
+    let sent = click(egui::Modifiers::default());
+    assert!(sent.starts_with("\x1b[<2;"), "右键没有按按钮 2 上报：{sent:?}");
+    assert!(sent.ends_with('m'), "右键的释放没有上报：{sent:?}");
+    let shift = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    assert_eq!(click(shift), "", "Shift+右键是本地菜单，不该转发");
+}
+
+/// 1005（UTF-8）鼠标编码：每个值按码点发。走单字节分支的话，96 列以后发出去的不是合法
+/// UTF-8，远端解出来的坐标是乱的。传统编码装不下 223 以上的坐标，钳到 223。
+#[test]
+fn utf8_mouse_encoding_sends_code_points() {
     let mut out = Vec::new();
-    for pressed in [true, false] {
-        out.extend(ui_frame(
-            &mut t,
-            &ctx,
-            vec![egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Secondary,
-                pressed,
-                modifiers: egui::Modifiers::default(),
-            }],
-        ));
+    keys::encode_mouse(vt100::MouseProtocolEncoding::Utf8, 0, 199, 4, true, &mut out);
+    let s = String::from_utf8(out).expect("1005 编码必须是合法 UTF-8");
+    let vals: Vec<u32> = s.chars().skip(3).map(|c| c as u32).collect();
+    assert_eq!(vals, [32, 32 + 200, 32 + 5]);
+
+    let mut out = Vec::new();
+    keys::encode_mouse(vt100::MouseProtocolEncoding::Default, 0, 500, 4, true, &mut out);
+    assert_eq!(out, [0x1b, b'[', b'M', 32, 255, 37]);
+}
+
+/// 「响铃计数」和「给 AI 的纯文本」各有一个自己的转义扫描器，规则要和解析器一致：
+/// CAN / SUB 打断字符串类序列，`ESC ESC` 里第二个 ESC 才是序列开头。
+#[test]
+fn bell_counting_and_text_stripping_agree_with_the_parser() {
+    use super::vt::strip_ansi_to_text as strip;
+    for abort in ["\x18", "\x1a"] {
+        let osc = format!("\x1b]0;title{abort}shown\x07");
+        assert_eq!(osc::count_bel(osc.as_bytes()), 1, "打断之后的 BEL 是真响铃");
+        assert_eq!(strip(osc.as_bytes()), "shown");
+        let dcs = format!("\x1bPpayload{abort}shown\x07");
+        assert_eq!(osc::count_bel(dcs.as_bytes()), 1);
+        assert_eq!(strip(dcs.as_bytes()), "shown");
     }
-    assert!(out.is_empty(), "右键被上报给了远端：{out:?}");
+    assert_eq!(strip(b"a\x1b\x1b[31mb"), "ab");
+    assert_eq!(osc::count_bel(b"\x1b\x1b]0;t\x07"), 0, "那个 BEL 是 OSC 的收尾");
 }
 
 /// 传统（非 SGR）鼠标编码下，释放事件的按钮码是 3，但修饰键位要照带（xterm 如此）。
