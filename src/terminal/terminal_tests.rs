@@ -50,7 +50,7 @@ fn osc133_parsing() {
     use osc::Osc133::*;
     assert_eq!(
         osc::parse_osc133(b"\x1b]133;C\x07", 0),
-        vec![(0, CommandStart)]
+        vec![(8, CommandStart)] // C 记的是序列**末尾**：它之前（含标记自己）都不算输出
     );
     assert_eq!(
         osc::parse_osc133(b"\x1b]133;D;42\x07", 0),
@@ -1303,10 +1303,11 @@ fn unterminated_sequence_tail_is_capped() {
     let mut t = Terminal::new();
     run_ai_cli(&mut t, "claude");
     t.feed(b"\x1b]9;");
-    // 远超 8KB 的垃圾内容且始终不终止
-    for _ in 0..12 {
-        t.feed(&vec![b'x'; 1024]);
+    // 远超上限（1MiB）的垃圾内容且始终不终止
+    for _ in 0..40 {
+        t.feed(&vec![b'x'; 32 * 1024]);
     }
+    assert!(t.notice_tail.len() <= 1024 * 1024, "暂存超过了上限");
     let _ = t.take_notices();
     // 暂存已被丢弃 → 这一块是干净的一条完整通知，不会被前面那堆垃圾污染
     t.feed(b"\x1b]9;fresh\x07");
@@ -2625,4 +2626,110 @@ fn pointer_motion_inside_one_cell_is_reported_once() {
         reports += out.iter().filter(|b| **b == b'M').count();
     }
     assert_eq!(reports, 1, "同一格内的移动被重复上报");
+}
+
+/// `clear` 发的是 `ESC[H ESC[2J ESC[3J`。网络把 `[3J` 切到下一包时，回滚缓冲同样要清——
+/// 原先要求两段落在同一次处理里，切开后 `clear` 完还能上滚看到旧内容。
+#[test]
+fn clear_split_between_2j_and_3j_still_clears_scrollback() {
+    let mut t = Terminal::new();
+    for i in 0..30 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    assert!(t.history_text(100).contains("line 0"));
+    t.feed(b"\x1b[H\x1b[2J");
+    t.feed(b"\x1b[3Jprompt$ ");
+    let history = t.history_text(100);
+    assert!(!history.contains("line 0"), "分包后的 clear 没清掉回滚：{history:?}");
+    assert!(history.contains("prompt$"));
+    // 单独一个 [3J（前面没有 [2J）不触发重建
+    let mut t = Terminal::new();
+    for i in 0..30 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.feed(b"text");
+    t.feed(b"\x1b[3J");
+    assert!(t.history_text(100).contains("line 0"));
+}
+
+/// `clear` 重建解析器时要把旧模式带过去（鼠标上报、光标隐藏……），但那是「重建之前」的
+/// 状态：`[3J` 之后程序自己发的模式切换必须在它之后生效，不能被回放盖掉。
+#[test]
+fn modes_set_after_a_clear_are_not_overridden_by_the_restored_ones() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?25l\x1b[?1000h");
+    t.feed(b"\x1b[2J\x1b[3J\x1b[?25h\x1b[?1000l");
+    assert!(!t.parser.screen().hide_cursor(), "程序刚恢复的光标又被藏回去了");
+    assert_eq!(
+        t.parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None,
+        "程序刚关掉的鼠标上报又被打开了"
+    );
+    // 没被改动的模式照旧保留
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1000h");
+    t.feed(b"\x1b[2J\x1b[3J");
+    assert_ne!(t.parser.screen().mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+}
+
+/// 远端 nvim / tmux 的「复制」走 OSC 52，几 KB 的选区就超过一个旧的 8KB 上限：序列跨包时
+/// 前半截被丢掉，后半截找不到开头，这次复制就静默失败了。
+#[test]
+fn a_long_osc_split_across_packets_is_kept_until_it_terminates() {
+    let mut t = Terminal::new();
+    let mut first = b"\x1b]52;c;".to_vec();
+    first.extend(std::iter::repeat_n(b'A', 40_000));
+    t.feed(&first);
+    assert!(t.notice_tail.len() >= 40_000, "未终止的长 OSC 被提前丢弃");
+    // 真正没完没了的序列仍然有界
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]52;c;");
+    for _ in 0..80 {
+        t.feed(&vec![b'A'; 32 * 1024]);
+    }
+    assert!(t.notice_tail.len() <= 1024 * 1024);
+}
+
+/// 通知序列来自远端输出，不可信：一段刷屏的 `OSC 9` 不能变成成千上万条桌面通知
+///（macOS 上每条都要起一个 osascript 进程）。
+#[test]
+fn a_flood_of_notifications_is_rate_limited() {
+    let mut t = Terminal::new();
+    t.feed(&b"\x1b]9;spam\x07".repeat(5000));
+    assert!(t.notices.len() <= 10, "一次输出产生了 {} 条通知", t.notices.len());
+    assert!(!t.notices.is_empty(), "限速不是全丢");
+    // 分多包喂也一样
+    for _ in 0..200 {
+        t.feed(b"\x1b]9;spam\x07");
+    }
+    assert!(t.notices.len() <= 10);
+}
+
+/// 给 AI 的命令输出要是干净文本。`ESC ( B`（选字符集，`tput sgr0` 每次复位都发）是三字节
+/// 序列，只跳两字节的话每次复位都在输出里留下一个 `B`；DCS/APC 的负载也不该漏成正文。
+#[test]
+fn captured_output_has_no_escape_residue() {
+    use super::vt::strip_ansi_to_text as strip;
+    assert_eq!(strip(b"a\x1b(B\x1b[mb"), "ab");
+    assert_eq!(strip(b"a\x1b)0b\x1b*Bc"), "abc");
+    assert_eq!(strip(b"a\x1bPtmux;payload\x1b\\b"), "ab");
+    assert_eq!(strip(b"a\x1b_apc\x1b\\b\x1b^pm\x1b\\c"), "abc");
+    assert_eq!(strip(b"a\x1b=\x1b>\x1b7\x1b8b"), "ab"); // 双字节序列照旧
+    assert_eq!(strip(b"a\x1b"), "a"); // 孤立 ESC
+}
+
+/// `133;C` 这条序列自己被包边界切开时，它后半截的字节不能混进捕获到的输出里。
+#[test]
+fn a_command_start_marker_split_across_packets_leaves_no_residue() {
+    let seq = b"$ echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07$ ";
+    let c_start = seq.windows(2).position(|w| w == b"\x1b]").unwrap();
+    for cut in c_start + 1..c_start + 8 {
+        let mut t = Terminal::new();
+        t.arm_ai_capture_integration();
+        t.feed(&seq[..cut]);
+        t.feed(&seq[cut..]);
+        let (code, out) = t.take_ai_done().expect("应收束");
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "hi", "在第 {cut} 字节切开后输出里混进了序列残余：{out:?}");
+    }
 }

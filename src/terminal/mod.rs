@@ -147,6 +147,10 @@ pub struct Terminal {
     search_hl: Option<u16>,
     /// 鼠标上报模式下当前按住的按钮（支持多键同持）
     held_btns: HeldButtons,
+    /// 上一段喂给解析器的普通字节是否以 `ESC[2J` 结尾（`clear` 的 `[3J` 可能在下一包）。
+    ended_with_2j: bool,
+    /// OSC 通知限速窗口：(窗口起点, 窗口内已放行的条数)。
+    notice_window: (std::time::Instant, u32),
     /// 上一次上报的鼠标移动：(行, 列, 按钮码)。同一格内的移动不重复上报。
     last_motion: Option<(u16, u16, u8)>,
     /// 离散滚轮路径（鼠标上报 / 备用屏转方向键）的亚行余量，攒够一行才发一步。
@@ -333,6 +337,8 @@ impl Terminal {
             saw_text_paste: false,
             saw_v_press: false,
             held_btns: HeldButtons::default(),
+            ended_with_2j: false,
+            notice_window: (std::time::Instant::now(), 0),
             last_motion: None,
             wheel_accum: 0.0,
             input_untracked: false,

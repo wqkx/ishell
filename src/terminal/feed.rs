@@ -351,6 +351,17 @@ impl Terminal {
         }
     }
 
+    /// OSC 通知限速：每秒最多 5 条，多的丢弃。
+    fn notice_allowed(&mut self) -> bool {
+        const PER_SECOND: u32 = 5;
+        let now = std::time::Instant::now();
+        if now.duration_since(self.notice_window.0).as_secs_f32() >= 1.0 {
+            self.notice_window = (now, 0);
+        }
+        self.notice_window.1 += 1;
+        self.notice_window.1 <= PER_SECOND
+    }
+
     fn finish_osc8_span(&mut self) {
         let Some(url) = self.osc8_url.clone() else {
             return;
@@ -729,7 +740,11 @@ impl Terminal {
         // 8KB 上限：未终止序列会让尾巴每块都变长（后面的全算在这段序列"里面"），到顶就
         // 整段丢弃、下一块从干净状态重扫，内存有界。不在 `ESC[3J` 重建解析器时清空——
         // 清屏并不会终止一条正在传输的 OSC，清了反而会丢掉本来能拼完整的通知。
-        const NOTICE_TAIL_CAP: usize = 8 * 1024;
+        //
+        // 上限要容得下一条正常的长序列：远端 nvim/tmux 的「复制」走 OSC 52，负载是 base64，
+        // 几 KB 的选区就超过 8KB、几十 KB 就跨好几个 SSH 包——上限太小时前半截被丢、后半截
+        // 找不到开头，那次复制静默失败。
+        const NOTICE_TAIL_CAP: usize = 1024 * 1024;
         let joined: Vec<u8>;
         let tail = std::mem::take(&mut self.notice_tail);
         // 留下来的这截**上一轮已经扫过**了。对响铃无所谓（未终止序列不计数），但对通知有所谓：
@@ -784,7 +799,10 @@ impl Terminal {
                 Some(super::NOTICE_TAG_DONE) | Some(super::NOTICE_TAG_NEED) => None,
                 _ => title,
             };
-            self.notices.push(super::TermNotice { title, body, kind });
+            // 通知序列来自远端输出，不可信：限速，免得一段刷屏变成成千上万条桌面通知
+            if self.notice_allowed() {
+                self.notices.push(super::TermNotice { title, body, kind });
+            }
         }
         // OSC 52 剪贴板（opencode/nvim/tmux 等 TUI 的「复制」走这条；远端程序的唯一通道）。
         // 同一块里有多条时后者覆盖前者，与序列到达顺序一致。
@@ -856,7 +874,12 @@ impl Terminal {
         // 导致旧内容仍留在 scrollback（可上滚看到）。这里在 [3J 处重建解析器，
         // 真正清空回滚缓冲；[3J 之后的字节（新提示符等）喂入全新解析器。
         // 必须在 OSC/DCS 负载外匹配：tmux 透传等序列里碰巧含同款字节时绝不能重建。
-        if find_sub_outside_string_escapes(bytes, b"\x1b[2J").is_some() {
+        //
+        // 两段可能被网络切到两次处理里（`clear` 发的是连着的 `[H [2J [3J`，切点正好落在
+        // 中间时就是「上一块以 [2J 结尾、这一块以 [3J 开头」）：记住上一块的结尾。
+        let after_2j = std::mem::take(&mut self.ended_with_2j) && bytes.starts_with(b"\x1b[3J");
+        self.ended_with_2j = bytes.ends_with(b"\x1b[2J");
+        if after_2j || find_sub_outside_string_escapes(bytes, b"\x1b[2J").is_some() {
             if let Some(pos) = find_sub_outside_string_escapes(bytes, b"\x1b[3J") {
                 let (before, after) = bytes.split_at(pos + 4);
                 let mut replies = self.process_with_replies(before);
@@ -871,8 +894,10 @@ impl Terminal {
                 self.osc8_spans.clear();
                 self.osc8_url = None;
                 self.osc8_anchor = None;
-                replies.extend(self.process_with_replies(after));
+                // 先回放旧模式，再喂 `[3J` 之后的字节：回放的是「重建之前」的状态，程序紧接着
+                // 发的模式切换（恢复光标、关鼠标上报……）必须排在它后面才不会被盖掉。
                 self.parser.process(&restore);
+                replies.extend(self.process_with_replies(after));
                 return replies;
             }
         }

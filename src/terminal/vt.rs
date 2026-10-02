@@ -38,8 +38,27 @@ pub(super) fn strip_ansi_to_text(bytes: &[u8]) -> String {
                         }
                     }
                 }
+                // 字符串类序列（DCS / SOS / PM / APC）：负载一直到 ST（或 BEL），整体丢弃
+                Some('P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\x07' {
+                            break;
+                        }
+                        if c2 == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // 选字符集等带中间字节的序列是**三**字节：`ESC ( B`。只跳两字节的话，
+                // `tput sgr0` 每次复位都会在输出里留下一个 `B`。
+                Some('(' | ')' | '*' | '+' | '-' | '.' | '/' | '#' | '%' | ' ') => {
+                    chars.next();
+                    chars.next();
+                }
                 Some(_) => {
-                    chars.next(); // 简单双字节转义（如 ESC(、ESC)），跳过第二个字符
+                    chars.next(); // 简单双字节转义（如 ESC=、ESC7），跳过第二个字符
                 }
                 None => {}
             }

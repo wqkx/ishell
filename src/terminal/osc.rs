@@ -150,7 +150,7 @@ pub(super) fn parse_osc133(data: &[u8], carried: usize) -> Vec<(usize, Osc133)> 
             continue;
         };
         match rest.first() {
-            Some(b'C') => out.push((seq_start, Osc133::CommandStart)),
+            Some(b'C') => out.push((seq_end(data, end), Osc133::CommandStart)),
             Some(b'D') => {
                 // `133;D` 可以不带退出码（shell 未取到 $? 时），也可以是 `133;D;<code>`。
                 let code = rest
@@ -190,8 +190,12 @@ fn is_conemu_progress(payload: &str) -> bool {
 /// 终止符是 BEL 占 1 字节、是 ST（`ESC \`）占 2 字节——只看负载结束位置的话，ST 被切在
 /// ESC 与 `\` 之间时，这条**刚刚才完整**的序列会被当成处理过的而整条丢掉。
 fn seen_last_round(data: &[u8], end: usize, carried: usize) -> bool {
-    let term_len = if data.get(end) == Some(&0x07) { 1 } else { 2 };
-    end + term_len <= carried
+    seq_end(data, end) <= carried
+}
+
+/// 序列结束位置（终止符之后）：`end` 是负载结束处，终止符 BEL 占 1 字节、ST 占 2 字节。
+fn seq_end(data: &[u8], end: usize) -> usize {
+    end + if data.get(end) == Some(&0x07) { 1 } else { 2 }
 }
 
 fn osc_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
@@ -204,11 +208,28 @@ fn osc_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
         let start = i + rel;
         let body = start + 2;
         let mut end = body;
+        let mut aborted = false;
         while end < data.len() {
-            if data[end] == 0x07 || (data[end] == 0x1b && data.get(end + 1) == Some(&b'\\')) {
-                break;
+            match data[end] {
+                0x07 => break,
+                0x1b => match data.get(end + 1) {
+                    Some(b'\\') => break,
+                    // OSC 里出现别的转义序列 = 这条 OSC 被打断了（vte 也是这么处理的）。
+                    // 从这个 ESC 重新扫，否则一条没收尾的 OSC 会把后面真正的序列吞成自己
+                    // 的负载——通知正文里混进一大段垃圾，或者干脆整条认不出来。
+                    Some(_) => {
+                        aborted = true;
+                        break;
+                    }
+                    // ST 的后半个字节可能还没到：当作不完整
+                    None => end = data.len(),
+                },
+                _ => end += 1,
             }
-            end += 1;
+        }
+        if aborted {
+            i = end;
+            continue;
         }
         if end >= data.len() {
             break; // 不完整：等下一块（与 osc7 处理一致，直接放弃本次）
@@ -319,6 +340,10 @@ pub(super) fn unterminated_string_tail(data: &[u8]) -> Option<usize> {
                             }
                             // ST 的后半个字节还没到：整段留到下一块再判
                             None => {}
+                            // OSC 被别的转义序列打断：到此为止，从这个 ESC 重新判
+                            //（与 `osc_sequences` 一致）。DCS 等不这么算——tmux 透传在
+                            // 负载里就是靠成对的 ESC 转义的。
+                            Some(_) if bel_terminates => terminated = true,
                             Some(_) => {
                                 i += 1;
                                 continue;
@@ -548,7 +573,9 @@ pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
         // OSC 133
         if let Some(rest) = payload.strip_prefix(b"133;") {
             match rest.first() {
-                Some(b'C') => out.osc133.push((seq_start, Osc133::CommandStart)),
+                // C 的位置取**序列末尾**：它之前的一切（含这条标记自己）都不算命令输出。
+                // 取起始位置的话，标记被包边界切开时后半截会留在捕获缓冲里、混进输出。
+                Some(b'C') => out.osc133.push((seq_end(data, end), Osc133::CommandStart)),
                 Some(b'D') => {
                     let code = rest
                         .strip_prefix(b"D;")
