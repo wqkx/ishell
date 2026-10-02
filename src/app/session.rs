@@ -77,7 +77,7 @@ pub(super) struct Session {
     /// 不设的话每帧都会满足提示条件——它只在「其余注入条件全满足、只差 never_typed」时为真，
     /// 那种状态会一直保持到连接结束。
     pub(super) pair_inject_skipped: bool,
-    /// AI 专用会话是否已注入 `AI_SESSION_SNIPPET`（OSC 7 cwd 上报 + shell 集成 OSC 133）。
+    /// AI 专用会话是否已注入 `ai_session_snippet`（OSC 7 cwd 上报 + shell 集成 OSC 133）。
     /// 用户会话的 OSC 7 走 consent 弹窗、不经此标记。没注入的后果有两条：list_sessions 的
     /// cwd 恒为 null（AI 只能跑 pwd 猜目录），且命令完成检测只能退回脆弱的哨兵办法
     /// （见 `terminal::CaptureMode`）。断线重连后远端是新 shell，Connected 时复位以便重注。

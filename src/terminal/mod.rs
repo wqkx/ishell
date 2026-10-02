@@ -147,6 +147,11 @@ pub struct Terminal {
     search_hl: Option<u16>,
     /// 鼠标上报模式下当前按住的按钮（支持多键同持）
     held_btns: HeldButtons,
+    /// OSC 52 刚写过剪贴板：写入的字符数，等 App 取走弹提示。
+    clipboard_note: Option<usize>,
+    /// shell 集成（OSC 133）的 token：只认带 `aid=<它>` 的标记。None = 没注入过我们的片段，
+    /// 一条 133 都不认（见 `set_integration_token`）。
+    osc133_token: Option<String>,
     /// 上一段喂给解析器的普通字节是否以 `ESC[2J` 结尾（`clear` 的 `[3J` 可能在下一包）。
     ended_with_2j: bool,
     /// OSC 通知限速窗口：(窗口起点, 窗口内已放行的条数)。
@@ -337,6 +342,8 @@ impl Terminal {
             saw_text_paste: false,
             saw_v_press: false,
             held_btns: HeldButtons::default(),
+            clipboard_note: None,
+            osc133_token: None,
             ended_with_2j: false,
             notice_window: (std::time::Instant::now(), 0),
             last_motion: None,
@@ -460,6 +467,16 @@ impl Terminal {
     /// 到下一个 `\x1e` 之间会被解析出来，见 `take_ai_done`。
     pub fn arm_ai_capture(&mut self, prefix: Vec<u8>) {
         self.arm_capture(CaptureMode::Sentinel { prefix });
+    }
+
+    /// 登记本次注入的 shell 集成片段所用的 token。此后只有带 `aid=<token>` 的 OSC 133 才算数。
+    ///
+    /// OSC 133 是输出里的字节，谁都能发：`cat` 一个文件、ssh 到的另一台机器的横幅、一个
+    /// 网页的响应体。不校验来源的话，一段输出里的 `133;D;0` 就能让 AI 的命令捕获提前收束
+    /// 并拿到一个伪造的「退出码 0」；一条 `133` 还会把集成模式永久打开。token 只存在于我们
+    /// 注入的提示符钩子里，静态内容里不会有。
+    pub fn set_integration_token(&mut self, token: String) {
+        self.osc133_token = Some(token);
     }
 
     /// 武装一次 **shell 集成**捕获：不需要任何哨兵，`OSC 133;C` 起算输出、`D;<code>` 收束。

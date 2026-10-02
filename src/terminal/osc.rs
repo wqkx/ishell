@@ -140,29 +140,37 @@ pub(super) enum Osc133 {
 /// `carried`：终止符落在已扫前缀里的序列上一轮已处理过，跳过。
 /// `A`（提示符开始）/`B`（提示符结束）我们用不到，直接忽略——只认 C 与 D，少一条依赖。
 #[cfg(test)]
-pub(super) fn parse_osc133(data: &[u8], carried: usize) -> Vec<(usize, Osc133)> {
-    let mut out = Vec::new();
-    for (seq_start, body_start, end) in osc_sequences(data) {
-        if seen_last_round(data, end, carried) {
-            continue;
-        }
-        let Some(rest) = data[body_start..end].strip_prefix(b"133;") else {
-            continue;
-        };
-        match rest.first() {
-            Some(b'C') => out.push((seq_end(data, end), Osc133::CommandStart)),
-            Some(b'D') => {
-                // `133;D` 可以不带退出码（shell 未取到 $? 时），也可以是 `133;D;<code>`。
-                let code = rest
-                    .strip_prefix(b"D;")
-                    .and_then(|c| std::str::from_utf8(c).ok())
-                    .and_then(|c| c.trim().parse::<i32>().ok());
-                out.push((seq_start, Osc133::CommandEnd(code)));
-            }
-            _ => {}
+pub(super) fn parse_osc133(data: &[u8], carried: usize, token: Option<&str>) -> Vec<(usize, Osc133)> {
+    scan_osc_effects(data, carried, token).osc133
+}
+
+/// 解析一条 `133;` 之后的负载。字段以 `;` 分隔：首段是类别（C / D），D 的第二段是退出码
+///（可省略），其余是 `key=value` 选项。**必须带 `aid=<token>` 且与 `token` 相符**才认——
+/// 没登记过 token（没注入过我们的片段）时一律不认。见 `Terminal::set_integration_token`。
+fn osc133_event(rest: &[u8], token: Option<&str>) -> Option<Osc133> {
+    let token = token?;
+    let rest = std::str::from_utf8(rest).ok()?;
+    let mut parts = rest.split(';');
+    let kind = parts.next()?;
+    let mut code = None;
+    let mut authentic = false;
+    for (i, p) in parts.enumerate() {
+        match p.split_once('=') {
+            Some(("aid", v)) => authentic = v == token,
+            Some(_) => {}
+            // D 的第一个裸字段是退出码
+            None if i == 0 => code = p.trim().parse::<i32>().ok(),
+            None => {}
         }
     }
-    out
+    if !authentic {
+        return None;
+    }
+    match kind {
+        "C" => Some(Osc133::CommandStart),
+        "D" => Some(Osc133::CommandEnd(code)),
+        _ => None,
+    }
 }
 
 /// `OSC 9` 的这段负载（已去掉 `9;` 前缀）是不是 ConEmu 的**进度条**上报，而不是通知。
@@ -478,7 +486,7 @@ pub(super) struct OscEffects {
     pub osc133: Vec<(usize, Osc133)>,
 }
 
-pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
+pub(super) fn scan_osc_effects(data: &[u8], carried: usize, osc133_token: Option<&str>) -> OscEffects {
     use base64::Engine as _;
     let mut out = OscEffects::default();
     for (seq_start, body_start, end) in osc_sequences(data) {
@@ -572,18 +580,14 @@ pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
 
         // OSC 133
         if let Some(rest) = payload.strip_prefix(b"133;") {
-            match rest.first() {
+            match osc133_event(rest, osc133_token) {
                 // C 的位置取**序列末尾**：它之前的一切（含这条标记自己）都不算命令输出。
                 // 取起始位置的话，标记被包边界切开时后半截会留在捕获缓冲里、混进输出。
-                Some(b'C') => out.osc133.push((seq_end(data, end), Osc133::CommandStart)),
-                Some(b'D') => {
-                    let code = rest
-                        .strip_prefix(b"D;")
-                        .and_then(|c| std::str::from_utf8(c).ok())
-                        .and_then(|c| c.trim().parse::<i32>().ok());
-                    out.osc133.push((seq_start, Osc133::CommandEnd(code)));
+                Some(Osc133::CommandStart) => {
+                    out.osc133.push((seq_end(data, end), Osc133::CommandStart))
                 }
-                _ => {}
+                Some(ev) => out.osc133.push((seq_start, ev)),
+                None => {}
             }
         }
     }
@@ -593,13 +597,13 @@ pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
 /// OSC 0/2 窗口标题：返回本块里**最后一条**完整标题（空串表示远端清标题）。
 #[cfg(test)]
 pub(super) fn parse_osc_title(data: &[u8], carried: usize) -> Option<String> {
-    scan_osc_effects(data, carried).title
+    scan_osc_effects(data, carried, None).title
 }
 
 /// OSC 10/11 颜色查询号列表（10=前景，11=背景）。
 #[cfg(test)]
 pub(super) fn parse_osc_color_queries(data: &[u8], carried: usize) -> Vec<u8> {
-    scan_osc_effects(data, carried).color_queries
+    scan_osc_effects(data, carried, None).color_queries
 }
 
 /// 把 8-bit RGB 编成 xterm 常用的 `rgb:RRRR/GGGG/BBBB`（每分量 16-bit，字节复制到高低位）。

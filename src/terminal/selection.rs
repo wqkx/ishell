@@ -201,13 +201,27 @@ impl Terminal {
 
     /// OSC 52 落剪贴板：远端/TUI 程序「复制」的终点。复用 Terminal 已有的 arboard 实例。
     /// 失败静默——无剪贴板服务的环境（某些无头/远程桌面）里序列不生效，但终端不受影响。
+    ///
+    /// 这段序列来自远端输出，不可信：受设置开关与大小上限约束，写成功了记一笔让 App
+    /// 弹提示（见 `take_clipboard_note`）——不能悄悄把用户的剪贴板换掉。
     pub(super) fn set_clipboard_from_osc52(&mut self, text: String) {
+        if !osc52_accept(crate::app::view_state::osc52_allowed(), text.len()) {
+            return;
+        }
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
         }
+        let chars = text.chars().count();
         if let Some(c) = self.clipboard.as_mut() {
-            let _ = c.set_text(text);
+            if c.set_text(text).is_ok() {
+                self.clipboard_note = Some(chars);
+            }
         }
+    }
+
+    /// 取走「终端程序刚写了剪贴板」的记录（写入的字符数；0 = 清空）。
+    pub fn take_clipboard_note(&mut self) -> Option<usize> {
+        self.clipboard_note.take()
     }
 
     /// 剪贴板里若是图片，编码成 PNG 存进 `paste_image`，等 App 取走。
@@ -258,4 +272,13 @@ impl Terminal {
         out.extend_from_slice(END);
         out
     }
+}
+
+/// OSC 52 单次写入的字节上限：复制一大段代码绰绰有余，又不至于让一段输出往剪贴板里塞
+/// 几十 MB。
+pub(super) const OSC52_MAX: usize = 1024 * 1024;
+
+/// 要不要执行一次 OSC 52 写剪贴板。
+pub(super) fn osc52_accept(allowed: bool, len: usize) -> bool {
+    allowed && len <= OSC52_MAX
 }

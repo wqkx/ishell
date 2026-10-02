@@ -253,6 +253,33 @@ pub fn view_context_menu(resp: &egui::Response) {
             },
         );
 
+        // 终端程序写剪贴板（OSC 52）
+        {
+            let mut allow = super::view_state::osc52_allowed();
+            if ui
+                .checkbox(
+                    &mut allow,
+                    crate::i18n::tr(
+                        "允许终端程序写入剪贴板",
+                        "Let terminal programs write the clipboard",
+                    ),
+                )
+                .on_hover_text(crate::i18n::tr(
+                    "远端的 nvim / tmux 等程序「复制」到本机剪贴板靠的是 OSC 52。\n\
+                     它是终端输出里的一段序列，任何输出（包括 cat 一个文件）都能发，\n\
+                     所以每次写入都会有提示；不需要这个功能可以关掉。\n\
+                     读取剪贴板的请求一律不响应。",
+                    "Remote nvim / tmux copy to your clipboard via OSC 52. It is a sequence in \n\
+                     terminal output, so any output can send it; each write shows a notice. \n\
+                     Turn it off if you don't need it. Clipboard reads are never answered.",
+                ))
+                .clicked()
+            {
+                super::view_state::set_osc52_allowed(allow);
+                ui.close();
+            }
+        }
+
         // 强制 X11：仅 Linux 有意义（修复 Wayland 下输入法），其它平台连这一项都不该出现。
         #[cfg(target_os = "linux")]
         ui.menu_button(

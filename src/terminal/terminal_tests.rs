@@ -49,22 +49,22 @@ fn osc52_parsing() {
 fn osc133_parsing() {
     use osc::Osc133::*;
     assert_eq!(
-        osc::parse_osc133(b"\x1b]133;C\x07", 0),
-        vec![(8, CommandStart)] // C 记的是序列**末尾**：它之前（含标记自己）都不算输出
+        osc::parse_osc133(b"\x1b]133;C;aid=T\x07", 0, Some("T")),
+        vec![(14, CommandStart)] // C 记的是序列**末尾**：它之前（含标记自己）都不算输出
     );
     assert_eq!(
-        osc::parse_osc133(b"\x1b]133;D;42\x07", 0),
+        osc::parse_osc133(b"\x1b]133;D;42;aid=T\x07", 0, Some("T")),
         vec![(0, CommandEnd(Some(42)))]
     );
     // ST 终止符、以及不带退出码的 D
     assert_eq!(
-        osc::parse_osc133(b"\x1b]133;D\x1b\\", 0),
+        osc::parse_osc133(b"\x1b]133;D;aid=T\x1b\\", 0, Some("T")),
         vec![(0, CommandEnd(None))]
     );
     // 提示符标记与其它 OSC 一概忽略
-    assert!(osc::parse_osc133(b"\x1b]133;A\x07\x1b]7;file://h/tmp\x07", 0).is_empty());
+    assert!(osc::parse_osc133(b"\x1b]133;A;aid=T\x07\x1b]7;file://h/tmp\x07", 0, Some("T")).is_empty());
     // carried：终止符落在已扫前缀里的，上一轮已处理过
-    assert!(osc::parse_osc133(b"\x1b]133;C\x07", 20).is_empty());
+    assert!(osc::parse_osc133(b"\x1b]133;C;aid=T\x07", 20, Some("T")).is_empty());
 }
 
 /// 集成模式的捕获：`C` 之前的字节（命令行回显/上一个提示符）不算输出，`D` 到达即收束。
@@ -72,8 +72,9 @@ fn osc133_parsing() {
 #[test]
 fn integration_capture_takes_output_between_c_and_d() {
     let mut t = Terminal::new();
+    t.set_integration_token("T".into());
     t.arm_ai_capture_integration();
-    t.feed(b"$ echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07$ ");
+    t.feed(b"$ echo hi\r\n\x1b]133;C;aid=T\x07hi\r\n\x1b]133;D;0;aid=T\x07$ ");
     let (code, out) = t.take_ai_done().expect("D 到达即收束");
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "hi", "只取 C 与 D 之间的输出，实际：{out:?}");
@@ -83,11 +84,12 @@ fn integration_capture_takes_output_between_c_and_d() {
 #[test]
 fn integration_capture_survives_chunk_splits() {
     let mut t = Terminal::new();
+    t.set_integration_token("T".into());
     t.arm_ai_capture_integration();
-    t.feed(b"\x1b]133;C\x07par");
+    t.feed(b"\x1b]133;C;aid=T\x07par");
     assert!(t.take_ai_done().is_none(), "还没收到 D");
     t.feed(b"tial\r\n\x1b]13");
-    t.feed(b"3;D;7\x07");
+    t.feed(b"3;D;7;aid=T\x07");
     let (code, out) = t.take_ai_done().expect("拆包后仍要收束");
     assert_eq!(code, 7);
     assert_eq!(out.trim(), "partial");
@@ -101,15 +103,16 @@ fn integration_capture_survives_chunk_splits() {
 #[test]
 fn integration_capture_ignores_a_d_without_its_c() {
     let mut t = Terminal::new();
-    t.feed(b"\x1b]133;C\x07"); // 这个 shell 发得出 C（此后没有 C 的 D 只能是杂散的）
-    t.feed(b"\x1b]133;D;0\x07$ ");
+    t.set_integration_token("T".into());
+    t.feed(b"\x1b]133;C;aid=T\x07"); // 这个 shell 发得出 C（此后没有 C 的 D 只能是杂散的）
+    t.feed(b"\x1b]133;D;0;aid=T\x07$ ");
     t.arm_ai_capture_integration();
-    t.feed(b"\r\n\x1b]133;D;5\x07$ "); // 空行产生的杂散 D
+    t.feed(b"\r\n\x1b]133;D;5;aid=T\x07$ "); // 空行产生的杂散 D
     assert!(
         t.take_ai_done().is_none(),
         "没有配对 C 的 D 不是本次运行的结束，更不该把上一条命令的退出码当成结果"
     );
-    t.feed(b"real\r\n\x1b]133;C\x07out\r\n\x1b]133;D;3\x07$ ");
+    t.feed(b"real\r\n\x1b]133;C;aid=T\x07out\r\n\x1b]133;D;3;aid=T\x07$ ");
     let (code, out) = t.take_ai_done().expect("真正配对的 C/D 照常收束");
     assert_eq!(code, 3);
     assert_eq!(out.trim(), "out");
@@ -120,8 +123,9 @@ fn integration_capture_ignores_a_d_without_its_c() {
 #[test]
 fn integration_capture_still_finishes_on_shells_that_never_send_c() {
     let mut t = Terminal::new();
+    t.set_integration_token("T".into());
     t.arm_ai_capture_integration();
-    t.feed(b"echo hi\r\nhi\r\n\x1b]133;D;0\x07$ ");
+    t.feed(b"echo hi\r\nhi\r\n\x1b]133;D;0;aid=T\x07$ ");
     let (code, out) = t.take_ai_done().expect("发不出 C 的 shell 也要能收束");
     assert_eq!(code, 0);
     assert!(out.contains("hi"), "实际：{out:?}");
@@ -168,9 +172,10 @@ fn partial_echo_match_stops_swallowing_newlines_after_cap() {
 #[test]
 fn shell_integration_flag_only_turns_on_with_osc133() {
     let mut t = Terminal::new();
+    t.set_integration_token("T".into());
     t.feed(b"$ ls\r\nfoo bar\r\n");
     assert!(!t.shell_integration_active());
-    t.feed(b"\x1b]133;D;0\x07");
+    t.feed(b"\x1b]133;D;0;aid=T\x07");
     assert!(t.shell_integration_active());
 }
 
@@ -2721,10 +2726,11 @@ fn captured_output_has_no_escape_residue() {
 /// `133;C` 这条序列自己被包边界切开时，它后半截的字节不能混进捕获到的输出里。
 #[test]
 fn a_command_start_marker_split_across_packets_leaves_no_residue() {
-    let seq = b"$ echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07$ ";
+    let seq = b"$ echo hi\r\n\x1b]133;C;aid=T\x07hi\r\n\x1b]133;D;0;aid=T\x07$ ";
     let c_start = seq.windows(2).position(|w| w == b"\x1b]").unwrap();
     for cut in c_start + 1..c_start + 8 {
         let mut t = Terminal::new();
+    t.set_integration_token("T".into());
         t.arm_ai_capture_integration();
         t.feed(&seq[..cut]);
         t.feed(&seq[cut..]);
@@ -2982,4 +2988,64 @@ fn the_cursor_stays_on_its_character_across_a_reflow() {
     t.resize(30, 9);
     assert_eq!(char_under_cursor(&t), "a");
     assert!(t.screen_text().contains("ccc"));
+}
+
+/// OSC 133 是输出里的字节，谁都能发。只有带**本次注入的 token** 的标记才算数：
+/// 命令输出里伪造的 `133;D;0` 不能让 AI 的捕获提前收束、拿到一个假的「退出码 0」；
+/// 没注入过我们片段的终端（比如用户自己的 shell 配了别家的集成）一条都不认。
+#[test]
+fn forged_osc133_markers_are_ignored() {
+    // 没登记 token：不认，也不打开集成模式
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]133;C\x07out\x1b]133;D;0\x07");
+    assert!(!t.shell_integration_active(), "不带 token 的 133 把集成模式打开了");
+
+    // 登记了 token：伪造的（不带 / 带错 token）不算，真的才算
+    let mut t = Terminal::new();
+    t.set_integration_token("secret".into());
+    t.arm_ai_capture_integration();
+    t.feed(b"$ cat evil.txt\r\n\x1b]133;C;aid=secret\x07");
+    t.feed(b"line one\r\n\x1b]133;D;0\x07\x1b]133;D;0;aid=guess\x07line two\r\n");
+    assert!(t.take_ai_done().is_none(), "输出里伪造的 D 让捕获提前结束了");
+    t.feed(b"\x1b]133;D;7;aid=secret\x07$ ");
+    let (code, out) = t.take_ai_done().expect("真正的 D 才收束");
+    assert_eq!(code, 7);
+    assert!(out.contains("line one") && out.contains("line two"), "{out:?}");
+}
+
+/// 字段顺序、多余字段都不影响解析；退出码缺省仍是 None。
+#[test]
+fn osc133_fields_are_parsed_by_position_and_key() {
+    use osc::Osc133::*;
+    let p = |s: &[u8]| osc::parse_osc133(s, 0, Some("T")).into_iter().map(|x| x.1).collect::<Vec<_>>();
+    assert_eq!(p(b"\x1b]133;D;3;aid=T\x07"), [CommandEnd(Some(3))]);
+    assert_eq!(p(b"\x1b]133;D;aid=T\x07"), [CommandEnd(None)]);
+    assert_eq!(p(b"\x1b]133;D;3;err=x;aid=T;cl=m\x07"), [CommandEnd(Some(3))]);
+    assert_eq!(p(b"\x1b]133;C;aid=T\x07"), [CommandStart]);
+    assert!(p(b"\x1b]133;D;3\x07").is_empty());
+    assert!(p(b"\x1b]133;D;3;aid=TT\x07").is_empty());
+    assert!(p(b"\x1b]133;D;3;aid=\x07").is_empty());
+}
+
+/// 注入的片段里每条 133 标记都带 token，而且 token 只含字母数字（它被原样拼进引号里）。
+#[test]
+fn the_injected_snippet_tags_every_marker_with_the_token() {
+    let token = crate::app::view_state::new_integration_token();
+    assert!(token.len() >= 16 && token.chars().all(|c| c.is_ascii_alphanumeric()));
+    assert_ne!(token, crate::app::view_state::new_integration_token(), "token 应每次不同");
+    let snippet = crate::app::view_state::ai_session_snippet(&token);
+    let tagged = snippet.matches(&format!(";aid={token}")).count();
+    assert_eq!(tagged, snippet.matches("]133;").count(), "有 133 标记没带 token");
+    assert!(tagged >= 3);
+    assert!(!snippet.contains("@T@"));
+}
+
+/// OSC 52 写剪贴板的放行条件：开关开着，且不超过大小上限。
+#[test]
+fn osc52_writes_respect_the_switch_and_the_size_cap() {
+    use super::selection::{osc52_accept, OSC52_MAX};
+    assert!(osc52_accept(true, 0));
+    assert!(osc52_accept(true, OSC52_MAX));
+    assert!(!osc52_accept(true, OSC52_MAX + 1));
+    assert!(!osc52_accept(false, 10));
 }

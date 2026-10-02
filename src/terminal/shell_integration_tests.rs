@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize, SlavePty};
 
 use super::Terminal;
-use crate::app::view_state::AI_SESSION_SNIPPET;
+use crate::app::view_state::{ai_session_snippet, new_integration_token};
 
 /// 一个跑着真 bash 的终端：PTY 主端的读写 + 喂给它的 [`Terminal`]。
 struct ShellHarness {
@@ -109,8 +109,11 @@ impl ShellHarness {
 
     /// 注入 AI 会话片段（与 `frame.rs` 的自动注入同一条路径：打字 + 吞回显）。
     fn inject(&mut self) {
-        self.term.expect_auto_inject_echo(AI_SESSION_SNIPPET);
-        self.type_line(AI_SESSION_SNIPPET);
+        let token = new_integration_token();
+        let snippet = ai_session_snippet(&token);
+        self.term.set_integration_token(token);
+        self.term.expect_auto_inject_echo(&snippet);
+        self.type_line(&snippet);
         self.pump(Duration::from_millis(500));
     }
 
@@ -122,7 +125,7 @@ impl ShellHarness {
 }
 
 /// 片段注入后，shell 必须开始发 OSC 133——这是「完成检测走集成而不是哨兵」的前提。
-/// 反向对照：把 `AI_SESSION_SNIPPET` 换回只有 OSC 7 的 `OSC7_SNIPPET`，本条当场挂。
+/// 反向对照：把 `ai_session_snippet` 换回只有 OSC 7 的 `OSC7_SNIPPET`，本条当场挂。
 #[test]
 fn injecting_the_snippet_turns_on_shell_integration() {
     let mut h = ShellHarness::start();

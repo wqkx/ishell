@@ -135,6 +135,28 @@ pub fn save_osc7_consent(on: bool) {
     }
 }
 
+fn osc52_allow_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("osc52_allow"))
+}
+
+/// 是否允许终端里的程序通过 OSC 52 写本机剪贴板。默认允许——远端 nvim / tmux 的「复制」
+/// 靠的就是它；不放心让远端输出碰剪贴板的可以关掉。
+pub fn load_osc52_allow() -> bool {
+    osc52_allow_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() != "0")
+        .unwrap_or(true)
+}
+
+pub fn save_osc52_allow(on: bool) {
+    if let Some(p) = osc52_allow_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        write_setting(p, if on { "1" } else { "0" });
+    }
+}
+
 /// AI 通知的范围。默认 `NeedsInput`——「任务完成」那类每轮都来的提醒最吵，而真正不能错过的
 /// 是「AI 在等你确认」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

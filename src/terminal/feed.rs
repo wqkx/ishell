@@ -800,7 +800,7 @@ impl Terminal {
         };
         // 一次扫完 OSC 副作用（cwd / 标题 / 颜色查询 / 通知 / 剪贴板 / 133），
         // 避免热路径对同一缓冲反复全量扫描。
-        let osc = scan_osc_effects(scan, carried);
+        let osc = scan_osc_effects(scan, carried, self.osc133_token.as_deref());
         if let Some(p) = osc.cwd {
             self.osc7_cwd = Some(p);
         }

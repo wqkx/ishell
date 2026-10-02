@@ -91,7 +91,7 @@ impl Session {
                     //
                     // AI 专用会话同样需要恢复 cwd：它是唯一自动做 OSC 7 注入的会话，重连后
                     // 若跳过 cd，list_sessions / 后续命令会落在 $HOME 而非断线前目录。
-                    // （旧注释「ai_owned 从不做 OSC 7」已过时，见 frame.rs AI_SESSION_SNIPPET。）
+                    // （旧注释「ai_owned 从不做 OSC 7」已过时，见 frame.rs ai_session_snippet。）
                     if self.restore_cwd && !self.last_cwd.is_empty() {
                         self.restore_cwd_until =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(15));

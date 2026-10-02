@@ -18,6 +18,19 @@ pub(crate) fn set_osc7_consent(v: bool) {
 /// 仅作用于当前会话、不写 rc、不持久化；前导空格尽量不进 history。
 pub(crate) const OSC7_SNIPPET: &str = r#" __ishell_cwd(){ printf '\033]7;file://localhost%s\007' "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd __ishell_cwd 2>/dev/null; else case "$PROMPT_COMMAND" in *__ishell_cwd*) ;; *) PROMPT_COMMAND="__ishell_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac; fi; __ishell_cwd"#;
 
+/// 是否允许终端程序经 OSC 52 写剪贴板（进程级缓存，见 `store::load_osc52_allow`）。
+pub(crate) static OSC52_ALLOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn osc52_allowed() -> bool {
+    OSC52_ALLOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_osc52_allowed(v: bool) {
+    OSC52_ALLOW.store(v, std::sync::atomic::Ordering::Relaxed);
+    crate::store::save_osc52_allow(v);
+}
+
 /// AI 专用会话注入的片段：OSC 7 工作目录上报 **+ shell 集成（OSC 133）**，一次打字装两件事。
 ///
 /// 为什么 AI 会话要多装 OSC 133：AI 命令的「跑完没有、退出码多少」此前靠往 tty 里多打一行
@@ -26,10 +39,35 @@ pub(crate) const OSC7_SNIPPET: &str = r#" __ishell_cwd(){ printf '\033]7;file://
 /// 不经过任何程序的 stdin，退出码取自 shell 的 `$?`，上面那一族问题整体消失
 /// （见 `terminal::CaptureMode`）。
 ///
+/// **`token`**：每条标记都带 `aid=<token>`，终端只认带对 token 的标记（见
+/// `Terminal::set_integration_token`）。OSC 133 是输出里的字节，`cat` 一个文件、远端服务的
+/// 横幅都能发——不带 token 的话，一段输出里的 `133;D;0` 就能让 AI 以为命令已经成功结束。
+/// token 每次注入随机生成，只存在于这个 shell 的提示符钩子里，静态内容猜不到。
+///
 /// 兼容性：zsh 走 preexec/precmd 钩子；bash 的「开始执行」用 PS0（bash ≥ 4.4），老 bash 只发
 /// 得出 `D`——捕获端对「只有 D」也能收束，退化的代价只是输出里多带一段命令行回显。
 /// 与 `OSC7_SNIPPET` 一样：仅作用于当前会话、不写 rc、前导空格尽量不进 history。
-pub(crate) const AI_SESSION_SNIPPET: &str = r#" __ishell_cwd(){ printf '\033]7;file://localhost%s\007' "$PWD"; }; __ishell_end(){ __ishell_e=$?; printf '\033]133;D;%d\007' "$__ishell_e"; return $__ishell_e; }; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __ishell_pre(){ printf '\033]133;C\007'; }; __ishell_post(){ __ishell_end; __ishell_cwd; }; add-zsh-hook preexec __ishell_pre 2>/dev/null; add-zsh-hook precmd __ishell_post 2>/dev/null; else PS0=$'\033]133;C\007'; case "$PROMPT_COMMAND" in *__ishell_end*) ;; *) PROMPT_COMMAND="__ishell_end; __ishell_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac; fi; __ishell_cwd"#;
+/// 别的终端会忽略它不认识的 `aid=` 字段。
+pub(crate) fn ai_session_snippet(token: &str) -> String {
+    // token 只能是字母数字：它被原样拼进单引号 / $'…' 里
+    debug_assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+    const TEMPLATE: &str = r#" __ishell_cwd(){ printf '\033]7;file://localhost%s\007' "$PWD"; }; __ishell_end(){ __ishell_e=$?; printf '\033]133;D;%d;aid=@T@\007' "$__ishell_e"; return $__ishell_e; }; if [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __ishell_pre(){ printf '\033]133;C;aid=@T@\007'; }; __ishell_post(){ __ishell_end; __ishell_cwd; }; add-zsh-hook preexec __ishell_pre 2>/dev/null; add-zsh-hook precmd __ishell_post 2>/dev/null; else PS0=$'\033]133;C;aid=@T@\007'; case "$PROMPT_COMMAND" in *__ishell_end*) ;; *) PROMPT_COMMAND="__ishell_end; __ishell_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac; fi; __ishell_cwd"#;
+    TEMPLATE.replace("@T@", token)
+}
+
+/// 生成一个 shell 集成 token（16 位十六进制）。
+pub(crate) fn new_integration_token() -> String {
+    let mut buf = [0u8; 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // 取不到随机数：退回时间 + 地址。弱一些，但对手是「静态文件里预先写好的序列」
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        buf = (ns ^ (&buf as *const _ as u64).rotate_left(17)).to_le_bytes();
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 // ===== 全局视图状态（折叠监控栏/文件栏、界面缩放）=====
 // 设为进程级全局，便于侧栏背景层与各子控件（进程行/网卡/IP 等）共用同一右键菜单，
@@ -96,6 +134,10 @@ pub(crate) fn init_view_state() {
     );
     OSC7_CONSENT.store(
         crate::store::load_osc7_consent(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    OSC52_ALLOW.store(
+        crate::store::load_osc52_allow(),
         std::sync::atomic::Ordering::Relaxed,
     );
 }

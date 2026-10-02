@@ -288,7 +288,7 @@ impl App {
         // 右键同意后注入 OSC 7，AI 自己的会话无需征求同意——没人「正在用」这个 shell，代价
         // 只是提示符上多两条看不见的 OSC 序列。
         // 注入后：`list_sessions` 的 cwd 字段有值（否则 AI 只能跑 pwd 猜目录），且 AI 命令的
-        // 完成检测改走集成判据、不再往 tty 里多打哨兵行（见 `view_state::AI_SESSION_SNIPPET`）。
+        // 完成检测改走集成判据、不再往 tty 里多打哨兵行（见 `view_state::ai_session_snippet`）。
         // 与上面各趟分开：判据走 AI 专用闸门
         // `ai_shell_idle_for_injection`（同样含 injection_idle_for，上一趟注入的回显吞除
         // 不会被这趟冲掉；不能用 `shell_idle_for_injection`——它的 !ai_owned/never_typed
@@ -298,11 +298,14 @@ impl App {
                 continue;
             }
             if s.ai_shell_idle_for_injection() {
-                let cmd = super::view_state::AI_SESSION_SNIPPET;
+                // 每次注入换一个 token：终端只认带它的 OSC 133 标记（防输出伪造）
+                let token = super::view_state::new_integration_token();
+                let cmd = super::view_state::ai_session_snippet(&token);
+                s.terminal.set_integration_token(token);
                 let _ = s
                     .cmd_tx
                     .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
-                s.terminal.expect_auto_inject_echo(cmd);
+                s.terminal.expect_auto_inject_echo(&cmd);
                 s.osc7_injected = true;
             }
         }
@@ -446,6 +449,27 @@ impl App {
         // 纯后台轮询，放在只有窗口可见时才跑的这里，窗口一藏起来就全停摆了。
         // 设置持久化失败（磁盘满/只读/权限）也冒泡成顶部 toast，避免「以为已保存、其实没落盘」。
         warns.extend(crate::store::take_setting_write_errors());
+        // 终端程序经 OSC 52 写了剪贴板：说一声。它来自远端输出，不能悄悄发生——用户下次
+        // 粘贴出来的可能不是自己复制的东西。
+        if let Some(n) = self
+            .sessions
+            .iter_mut()
+            .filter_map(|s| s.terminal.take_clipboard_note())
+            .last()
+        {
+            let msg = if n == 0 {
+                crate::i18n::tr("终端程序清空了剪贴板", "A terminal program cleared the clipboard")
+                    .to_string()
+            } else {
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("终端程序写入了剪贴板（{n} 个字符）"),
+                    crate::i18n::Lang::En => {
+                        format!("A terminal program wrote to the clipboard ({n} chars)")
+                    }
+                }
+            };
+            self.toast = Some((msg, self.ctx.input(|i| i.time)));
+        }
         // 警告（如编码丢字）弹顶部 toast
         if let Some(w) = warns.into_iter().next_back() {
             self.toast = Some((w, self.ctx.input(|i| i.time)));
