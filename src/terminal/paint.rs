@@ -92,7 +92,16 @@ fn url_regex() -> &'static regex::Regex {
         // 只识别可安全交给浏览器的 scheme（与 open_url 白名单一致）：
         // ssh/sftp/file 等不再高亮——点击它们会触发本地协议处理器，终端输出不可信。
         // \b 防子串误匹配（如 sftp:// 中间的 ftp://）
-        regex::Regex::new(r#"(?i)\b(?:(?:https?|ftps?)://|www\.)[^\s"'<>`|]+"#).unwrap()
+        //
+        // 两处为中文环境做的调整：
+        // - 开头用 ASCII 单词边界 `(?-u:\b)`。默认的 Unicode `\b` 把汉字也算作单词字符，
+        //   「详见https://…」这种紧贴汉字的链接两侧都是单词字符、没有边界，整条认不出来。
+        // - 正文遇到全角标点即止。「见 https://a.com，然后重试」不能把逗号和后面的汉字
+        //   吞进链接里（路径里的汉字本身是允许的）。
+        regex::Regex::new(
+            r#"(?i)(?-u:\b)(?:(?:https?|ftps?)://|www\.)[^\s"'<>`|，。；：！？、（）【】《》「」『』“”‘’…]+"#,
+        )
+        .unwrap()
     })
 }
 
@@ -103,42 +112,99 @@ pub(super) fn find_row_urls(
     row: u16,
     cols: u16,
 ) -> Vec<(u16, u16, String)> {
-    // 逐字符记录 (起始列, 字符)；宽字符续格跳过
-    let mut chars: Vec<(u16, char)> = Vec::new();
-    let mut col = 0u16;
-    while col < cols {
-        let wide = screen.cell(row, col).is_some_and(|c| c.is_wide());
-        match screen.cell(row, col) {
-            Some(c) if c.is_wide_continuation() => {}
-            Some(c) => chars.push((col, c.contents().chars().next().unwrap_or(' '))),
-            None => chars.push((col, ' ')),
-        }
-        col += if wide { 2 } else { 1 };
+    // 链接可能被终端折到下一行：沿软换行把这一行所在的整条逻辑行拼起来再找，然后只取落在
+    // 本行上的那一段——这样每一行上的格子都指向**完整**的链接（否则第一行点开的是半截，
+    // 后面几行根本不可点）。上下各最多扩 8 行，够一条很长的链接，也给扫描量封了顶。
+    const SPAN: u16 = 8;
+    let rows = screen.size().0;
+    let mut first = row;
+    while first > 0 && row - first < SPAN && screen.row_wrapped(first - 1) {
+        first -= 1;
     }
-    let text: String = chars.iter().map(|(_, c)| *c).collect();
+    let mut last = row;
+    while last + 1 < rows && last - row < SPAN && screen.row_wrapped(last) {
+        last += 1;
+    }
+    // 逐字符记录 (行, 起始列, 字符)；宽字符续格跳过
+    let mut chars: Vec<(u16, u16, char)> = Vec::new();
+    for r in first..=last {
+        let mut col = 0u16;
+        while col < cols {
+            let cell = screen.cell(r, col);
+            let wide = cell.is_some_and(|c| c.is_wide());
+            match cell {
+                Some(c) if c.is_wide_continuation() => {}
+                // 软换行行末尾空着的那一格是「宽字符放不下」留的，不是文字里的空格
+                Some(c) if c.contents().is_empty() && r != last && col + 1 == cols => {}
+                Some(c) => chars.push((r, col, c.contents().chars().next().unwrap_or(' '))),
+                None => chars.push((r, col, ' ')),
+            }
+            col += if wide { 2 } else { 1 };
+        }
+    }
     if chars.is_empty() {
         return Vec::new();
     }
+    let text: String = chars.iter().map(|(_, _, c)| *c).collect();
+    urls_in_text(&text)
+        .into_iter()
+        .filter_map(|(start_char, ulen, url)| {
+            let end = (start_char + ulen).min(chars.len());
+            let mut on_row = chars[start_char.min(end)..end]
+                .iter()
+                .filter(|(r, _, _)| *r == row)
+                .map(|(_, c, _)| *c);
+            let sc = on_row.next()?;
+            let ec = on_row.next_back().unwrap_or(sc);
+            Some((sc, ec, url))
+        })
+        .collect()
+}
+
+/// 裁掉链接末尾不属于它的句读：`. , ; : ! ?` 一律裁；右括号只裁**落单**的——成对的括号
+/// 是链接的一部分（`…/wiki/Rust_(programming_language)`），链接外面包着的那一个才不是
+///（`(see https://a.com/x)`）。
+fn trim_url_tail(mut s: &str) -> &str {
+    loop {
+        let Some(last) = s.chars().next_back() else {
+            return s;
+        };
+        let drop = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            ')' | ']' | '}' => {
+                let open = match last {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                s.matches(last).count() > s.matches(open).count()
+            }
+            _ => false,
+        };
+        if !drop {
+            return s;
+        }
+        s = &s[..s.len() - last.len_utf8()];
+    }
+}
+
+/// 在一段文本里找链接，返回 (起始字符下标, 字符数, url)。
+pub(super) fn urls_in_text(text: &str) -> Vec<(usize, usize, String)> {
     let mut urls = Vec::new();
-    for m in url_regex().find_iter(&text) {
-        // 裁掉常见的尾随句读（URL 紧跟逗号/句号/右括号等时不应纳入）
-        let trimmed = m
-            .as_str()
-            .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '!', '?']);
+    for m in url_regex().find_iter(text) {
+        let trimmed = trim_url_tail(m.as_str());
         let ulen = trimmed.chars().count();
         if ulen == 0 {
             continue;
         }
         let start_char = text[..m.start()].chars().count();
-        let sc = chars[start_char.min(chars.len() - 1)].0;
-        let ec = chars[(start_char + ulen - 1).min(chars.len() - 1)].0;
         // 裸 www. 补全协议，便于浏览器直接打开
         let url = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("www.") {
             format!("https://{trimmed}")
         } else {
             trimmed.to_string()
         };
-        urls.push((sc, ec, url));
+        urls.push((start_char, ulen, url));
     }
     urls
 }

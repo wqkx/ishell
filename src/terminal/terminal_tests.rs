@@ -2733,3 +2733,155 @@ fn a_command_start_marker_split_across_packets_leaves_no_residue() {
         assert_eq!(out.trim(), "hi", "在第 {cut} 字节切开后输出里混进了序列残余：{out:?}");
     }
 }
+
+fn url_list(text: &str) -> Vec<String> {
+    super::paint::urls_in_text(text).into_iter().map(|u| u.2).collect()
+}
+
+/// 链接识别要经得起中文环境：紧贴汉字的链接要认得出来，后面的全角标点和汉字不能被吞进
+/// 链接里；成对的括号属于链接（维基百科），落单的右括号不属于。
+#[test]
+fn urls_next_to_chinese_text_and_brackets() {
+    assert_eq!(url_list("见 https://a.com，然后重试"), ["https://a.com"]);
+    assert_eq!(url_list("详见https://a.com/x 结束"), ["https://a.com/x"]);
+    assert_eq!(url_list("（https://a.com/x）。"), ["https://a.com/x"]);
+    assert_eq!(url_list("打开「https://a.com」即可"), ["https://a.com"]);
+    assert_eq!(
+        url_list("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+        ["https://en.wikipedia.org/wiki/Rust_(programming_language)"]
+    );
+    assert_eq!(url_list("(see https://a.com/x)"), ["https://a.com/x"]);
+    assert_eq!(url_list("[https://a.com/x]."), ["https://a.com/x"]);
+    // 路径里的中文属于链接；sftp:// 里的 ftp:// 不算
+    assert_eq!(url_list("https://zh.wikipedia.org/wiki/中文 "), ["https://zh.wikipedia.org/wiki/中文"]);
+    assert!(url_list("sftp://host/path").is_empty());
+    assert_eq!(url_list("www.Example.com."), ["https://www.Example.com"]);
+}
+
+/// 长链接被终端折到下一行：两行上的任何一格都要指向**完整**的链接，
+/// 而不是第一行点开半截、第二行点不了。
+#[test]
+fn a_url_wrapped_across_rows_is_whole_on_every_row() {
+    let mut t = Terminal::new();
+    t.resize(20, 6);
+    let url = "https://example.com/aaaaaaaaaaaaaaaa/bbbbbbbbbbbb/end";
+    t.feed(format!("go {url} ok\r\n").as_bytes());
+    let screen = t.parser.screen();
+    for row in 0..3u16 {
+        let found = super::paint::find_row_urls(screen, row, 20);
+        assert_eq!(
+            found.iter().map(|u| u.2.as_str()).collect::<Vec<_>>(),
+            [url],
+            "第 {row} 行"
+        );
+    }
+    // 各行覆盖的列：首行从 URL 开始处到行尾，中间行整行，末行到 URL 结束处
+    assert_eq!(super::paint::find_row_urls(screen, 0, 20)[0].0, 3);
+    assert_eq!(super::paint::find_row_urls(screen, 1, 20)[0].0, 0);
+    assert_eq!(super::paint::find_row_urls(screen, 1, 20)[0].1, 19);
+}
+
+/// 行尾只剩一格、下一个是宽字符（汉字）时，它被折到下一行——这也是软换行。不标记的话，
+/// 复制中文长行会在这里多出一个换行，查找和缩放重排也会把它当成两行。
+#[test]
+fn a_wide_char_pushed_to_the_next_row_marks_a_soft_wrap() {
+    let mut t = Terminal::new();
+    t.resize(10, 5);
+    t.feed("abcdefghi中文\r\nnext".as_bytes());
+    assert!(t.parser.screen().row_wrapped(0), "宽字符折行没有被记成软换行");
+    assert!(!t.parser.screen().row_wrapped(1), "真正的换行不该被记成软换行");
+    t.sel_anchor = Some((0, 0));
+    t.sel_cursor = Some((1, 3));
+    assert_eq!(t.selected_text().as_deref(), Some("abcdefghi中文"));
+}
+
+/// 从汉字的右半格开始选：高亮画出了这个字的一半，复制结果里就得有这个字。
+#[test]
+fn selecting_from_the_right_half_of_a_wide_char_includes_it() {
+    let mut t = Terminal::new();
+    t.feed("中文abc".as_bytes());
+    t.sel_anchor = Some((0, 1)); // 「中」的右半格
+    t.sel_cursor = Some((0, 4));
+    assert_eq!(t.selected_text().as_deref(), Some("中文a"));
+}
+
+/// 上滚回看历史时远端继续输出：视口要钉在正在看的内容上，不能一行行被推走。
+#[test]
+fn viewport_stays_anchored_while_new_output_arrives() {
+    let mut t = Terminal::new();
+    for i in 0..200 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.scrollback = 50;
+    t.parser.screen_mut().set_scrollback(50);
+    let before = t.parser.screen().contents();
+    assert!(before.contains("line 140"), "前提：视口确实在历史里");
+    for i in 0..7 {
+        t.feed(format!("new {i}\r\n").as_bytes());
+    }
+    // 绘制前会「探测最大回滚、再按我们记的偏移还原」——这里照做一遍
+    let ours = t.scrollback;
+    t.parser.screen_mut().set_scrollback(usize::MAX);
+    t.parser.screen_mut().set_scrollback(ours);
+    assert_eq!(t.parser.screen().contents(), before, "回看的内容被新输出推走了");
+    assert_eq!(t.scrollback, 57);
+}
+
+fn find_in(t: &mut Terminal, query: &str) {
+    t.find = Some(super::search::Find {
+        query: query.into(),
+        ..Default::default()
+    });
+    t.run_search();
+}
+
+/// `clear`、缩小窗口都会重建解析器，行坐标体系随之归零。查找命中记的是旧坐标，
+/// 必须跟着重算，否则查找栏还显示旧的命中数，「下一个」跳到不相干的行。
+#[test]
+fn find_hits_are_recomputed_when_the_buffer_is_rebuilt() {
+    let mut t = Terminal::new();
+    for i in 0..60 {
+        t.feed(format!("needle {i}\r\n").as_bytes());
+    }
+    find_in(&mut t, "needle");
+    assert!(t.find.as_ref().unwrap().hits.len() >= 60);
+    t.feed(b"\x1b[H\x1b[2J\x1b[3Jone needle here\r\n");
+    assert_eq!(t.find.as_ref().unwrap().hits.len(), 1, "clear 之后还留着旧命中");
+    // 缩小重排同理
+    let mut t = Terminal::new();
+    for i in 0..60 {
+        t.feed(format!("needle {i}\r\n").as_bytes());
+    }
+    find_in(&mut t, "needle");
+    let (cols, rows) = (t.cols, t.rows);
+    t.resize(cols - 10, rows - 2);
+    let hits = t.find.as_ref().unwrap().hits.clone();
+    let total = t.parser.screen().scrollback_total() + t.rows as usize;
+    assert!(hits.iter().all(|&h| h < total), "重排后命中行号越界：{hits:?} / {total}");
+    assert_eq!(hits.len(), 60);
+}
+
+/// 查找高亮标的是「当前命中在屏幕上的第几行」。停在底部时远端继续输出，内容上移，
+/// 高亮必须跟着那一行走，而不是留在原来的屏幕行上盖住别的内容。
+#[test]
+fn the_find_highlight_follows_its_line_as_output_scrolls() {
+    let mut t = Terminal::new();
+    for i in 0..10 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.feed(b"the needle\r\n");
+    find_in(&mut t, "needle");
+    t.jump_to_current();
+    t.scrollback = 0;
+    t.parser.screen_mut().set_scrollback(0);
+    t.recompute_search_hl();
+    let row = t.search_hl.expect("命中在屏幕上");
+    assert!(t.screen_text().lines().nth(row as usize).unwrap().contains("needle"));
+    for i in 0..(t.rows as usize) {
+        t.feed(format!("more {i}\r\n").as_bytes());
+        if let Some(r) = t.search_hl {
+            let line = t.screen_text().lines().nth(r as usize).unwrap_or("").to_string();
+            assert!(line.contains("needle"), "高亮留在了第 {r} 行，那里是 {line:?}");
+        }
+    }
+}

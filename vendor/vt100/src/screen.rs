@@ -757,7 +757,11 @@ impl Screen {
                     // self.grid().pos() which we assume to always have a valid
                     // row value. size.cols - 1 is also always a valid column.
                     .unwrap();
-                if last_cell.has_contents() || last_cell.is_wide_continuation() {
+                // ishell 补丁：宽字符因为行尾只剩一格而被推到下一行，同样是自动折行
+                //（末格是空的，原判据因此不认）。不标记的话，这一行会被当成硬换行：复制中文
+                // 长行在这里多出一个换行，查找与缩放重排也把它当成两行。
+                let pushed_wide = width == 2 && pos.col == size.cols - 1;
+                if last_cell.has_contents() || last_cell.is_wide_continuation() || pushed_wide {
                     wrap = true;
                 }
             }

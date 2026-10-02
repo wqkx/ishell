@@ -148,6 +148,22 @@ impl Terminal {
                     } else {
                         self.cols.saturating_sub(1)
                     };
+                    // 边界落在宽字符的半格上时把整个字画进高亮：与复制结果一致
+                    //（起点在右半格 → 补上左半格；终点在左半格 → 补上右半格）
+                    let c0 = if c0 > 0
+                        && screen
+                            .cell(row, c0)
+                            .is_some_and(|c| c.is_wide_continuation())
+                    {
+                        c0 - 1
+                    } else {
+                        c0
+                    };
+                    let c1 = if screen.cell(row, c1).is_some_and(|c| c.is_wide()) {
+                        c1 + 1
+                    } else {
+                        c1
+                    };
                     let x0 = origin.x + c0 as f32 * char_w;
                     let x1 = origin.x + (c1 as f32 + 1.0) * char_w;
                     let a = crate::theme::Palette::ACCENT;
@@ -261,8 +277,24 @@ impl Terminal {
         // 失焦时珊瑚色描边，避免点到文件栏/侧栏后光标看似「消失」。
         if !screen.hide_cursor() && self.scrollback == 0 {
             let (cr, cc) = screen.cursor_position();
+            // 光标在宽字符上：盖住整个字（两格）；落在续格上则从这个字的起始格算
+            let cc = if cc > 0
+                && screen
+                    .cell(cr, cc)
+                    .is_some_and(|c| c.is_wide_continuation())
+            {
+                cc - 1
+            } else {
+                cc
+            };
+            let on_wide = screen.cell(cr, cc).is_some_and(|c| c.is_wide());
             let cpos = origin + Vec2::new(cc as f32 * char_w, cr as f32 * char_h);
-            let crect = Rect::from_min_size(cpos, cell);
+            let csize = if on_wide {
+                Vec2::new(cell.x * 2.0, cell.y)
+            } else {
+                cell
+            };
+            let crect = Rect::from_min_size(cpos, csize);
             if focused {
                 let (inv_bg, inv_fg) = match screen.cell(cr, cc) {
                     Some(c) => {

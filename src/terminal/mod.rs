@@ -760,7 +760,9 @@ impl Terminal {
         // 去抖：拖拽窗口时尺寸每帧都变，稳定 ~130ms 后才真正 resize——避免普通屏每帧序列化+重建
         // 解析器、以及向远端连发 SIGWINCH 触发 codex 等 TUI 反复重绘（表现为历史从头刷到尾）。
         // 注意：worker 侧的 Resize 上报读的是 self.size()，本地推迟 resize 后上报自然一并去抖。
-        let new_cols = (avail.x / char_w).floor().max(2.0) as u16;
+        // 右侧 8pt 留给滚动条：不扣的话最右一列字符被滑块盖住，在那一列按下拖动还会被判成
+        // 拖滚动条、选不了文本。始终预留（而不是「有历史才留」），列数才不会随输出跳变。
+        let new_cols = ((avail.x - 8.0) / char_w).floor().max(2.0) as u16;
         let new_rows = (avail.y / char_h).floor().max(1.0) as u16;
         const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(130);
         if (new_cols, new_rows) == (self.cols, self.rows) {

@@ -45,6 +45,18 @@ pub(super) fn build_search_regex(f: &Find) -> Option<regex::Regex> {
 
 impl Terminal {
     pub(super) fn run_search(&mut self) {
+        self.search(true);
+    }
+
+    /// 缓冲被重建（`clear`、缩小重排）之后重算命中：行坐标体系变了，旧命中全部失效。
+    /// 与 `run_search` 的区别是不跳转——这是输出/缩放引起的，不该把用户的视图带走。
+    pub(super) fn refresh_search(&mut self) {
+        if self.find.is_some() {
+            self.search(false);
+        }
+    }
+
+    fn search(&mut self, jump: bool) {
         let empty = self.find.as_ref().is_none_or(|f| f.query.is_empty());
         if empty {
             if let Some(f) = &mut self.find {
@@ -132,10 +144,18 @@ impl Terminal {
         }
         let hits: Vec<usize> = hit_set.into_iter().collect();
         if let Some(f) = &mut self.find {
+            f.cur = if jump {
+                0
+            } else {
+                f.cur.min(hits.len().saturating_sub(1))
+            };
             f.hits = hits;
-            f.cur = 0;
         }
-        self.jump_to_current();
+        if jump {
+            self.jump_to_current();
+        } else {
+            self.recompute_search_hl();
+        }
     }
 
     pub(super) fn search_step(&mut self, dir: i32) {

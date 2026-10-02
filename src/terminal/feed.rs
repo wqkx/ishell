@@ -860,6 +860,14 @@ impl Terminal {
 
         let mut replies = osc_color_replies;
         replies.extend(self.process_with_sync(bytes));
+        // 回看历史时 vt100 会随新输出自增偏移，把视口钉在用户正在看的内容上。我们自己记的
+        // 偏移要跟上：不同步的话，下一帧绘制前「探测最大回滚再还原」会用旧值把它拨回去，
+        // 画面就随着新输出一行行滑走了。
+        self.scrollback = self.parser.screen().scrollback();
+        // 内容上移了，查找高亮（记的是屏幕行）要跟着它那一行走
+        if self.find.is_some() {
+            self.recompute_search_hl();
+        }
         self.ensure_cursor_after_alt();
         if bel {
             self.push_bel_notice();
@@ -898,6 +906,7 @@ impl Terminal {
                 // 发的模式切换（恢复光标、关鼠标上报……）必须排在它后面才不会被盖掉。
                 self.parser.process(&restore);
                 replies.extend(self.process_with_replies(after));
+                self.refresh_search(); // 行坐标归零了，旧的查找命中全部失效
                 return replies;
             }
         }
@@ -1137,6 +1146,7 @@ impl Terminal {
             self.osc8_spans.clear();
             self.osc8_url = None;
             self.osc8_anchor = None;
+            self.refresh_search(); // 回流后行坐标变了，查找命中要重算
         }
         true
     }

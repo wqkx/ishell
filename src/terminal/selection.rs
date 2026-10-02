@@ -44,6 +44,18 @@ impl Terminal {
             };
             let mut line = String::new();
             let screen = self.parser.screen();
+            // 起点落在宽字符的右半格：这个字被选中了一半，复制时要带上它（高亮同样补齐，
+            // 见 ui_paint）
+            let c0 = if c0 > 0
+                && screen
+                    .cell(view_row, c0)
+                    .is_some_and(|c| c.is_wide_continuation())
+            {
+                c0 - 1
+            } else {
+                c0
+            };
+            let soft_wrap = screen.row_wrapped(view_row);
             for col in c0..=c1 {
                 let Some(cell) = screen.cell(view_row, col) else {
                     line.push(' ');
@@ -53,13 +65,16 @@ impl Terminal {
                     continue;
                 }
                 let ch = cell.contents();
+                // 软换行行末尾空着的那一格是「宽字符放不下」留出来的，不是文字里的空格
+                if ch.is_empty() && soft_wrap && col + 1 == self.cols {
+                    continue;
+                }
                 line.push_str(if ch.is_empty() { " " } else { ch });
             }
             // 「软换行」（一条长逻辑行被终端折到下一屏幕行）不能当成换行符复制出去：
             // 它在原文里根本没有 \n，粘贴时凭空多出的换行会把一条命令/一个 URL 拆断。
             // vt100 给每行记了 wrapped 标志（行满后自动折行时置位，真正收到 \n 则清零），
             // 据此区分：软换行只把两行首尾相接，真实换行才补 \n。
-            let soft_wrap = screen.row_wrapped(view_row);
             // 软换行行是被字符填满才折的，行尾没有真实空白可言；trim_end 会把「刚好在行尾
             // 的空格」这种有意义的内容吃掉，导致接起来的两段粘连（如 `ls -la` 变 `ls-la`）。
             if soft_wrap {
