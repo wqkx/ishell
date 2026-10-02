@@ -1,6 +1,9 @@
 use egui::text::CCursor;
 
-use super::super::geom::{byte_to_char, char_to_byte, v_line_range};
+use super::super::geom::{byte_to_char, v_line_range};
+
+/// 超过这个字节数的行不做语法高亮（VSCode 也有同样的上限）。
+const LONG_LINE_PLAIN: usize = 20_000;
 use super::gutter;
 use super::{RowPaintContext, TextRowResult};
 use crate::theme::Palette;
@@ -11,35 +14,35 @@ pub(super) fn paint_text_row(
     row: usize,
     row_offset: usize,
 ) -> TextRowResult {
-    // 视觉行 → 逻辑行 i / 起始列 col0 / 本行列数 ncols / 绘制起点 gx / 是否首段
-    //（两种模式都经 v_line_of_vrow：折叠行占 0 视觉行，映射自动跳过）
-    let (li, seg) = super::super::wrap::v_line_of_vrow(ctx.ed, row);
-    let (i, col0, ncols, gx, is_first) = if ctx.wrap {
-        (li, seg * ctx.wrap_cols, ctx.wrap_cols, ctx.text_x, seg == 0)
-    } else {
-        (
-            li,
-            ctx.first_col,
-            ctx.cols_vis,
-            ctx.text_x + ctx.first_col as f32 * ctx.char_w,
-            true,
-        )
-    };
-    if i >= ctx.total {
+    // 视觉行 → 逻辑行 i + 要画的那段文本（换行模式：一个折段；非换行模式：横向可视窗口）。
+    // 两种模式都经 v_line_of_vrow：折叠行占 0 视觉行，映射自动跳过。
+    // 窗口按**显示宽度**取，两端落在字符边界上——见 `wrap::v_row_window`。
+    if ctx.total == 0 {
         return TextRowResult::stop();
     }
+    let win = super::super::wrap::v_row_window(
+        ctx.ed,
+        row,
+        ctx.wrap,
+        ctx.eff_cols,
+        ctx.first_col,
+        ctx.cols_vis,
+    );
+    let i = win.line;
+    let is_first = win.first;
+    let (seg_a, seg_b) = (win.a, win.b);
+    let gx = ctx.text_x + win.x0 * ctx.char_w;
+    let ncols = if ctx.wrap { ctx.wrap_cols } else { ctx.cols_vis };
     let (ls, le) = v_line_range(ctx.ed, i);
     let line_full: &str = &ctx.ed.content[ls..le]; // 切片，不整行拷贝
     let y = ctx.clip.top() + row_offset as f32 * ctx.row_h;
-    let col_of =
-        |b: usize| -> usize { byte_to_char(line_full, b.saturating_sub(ls).min(line_full.len())) };
-    let in_win = |c: usize| c >= col0 && c <= col0 + ncols;
-    // 光标属于哪一段：换行模式下，段边界上的光标画在**下一段开头**，只有行末才画在本段
-    // 末尾。两端都算的话，上一段末尾和下一段开头各画一个。
+    // 位置 b（全文字节偏移）是否落在本段里。段的右端：换行模式下属于**下一段开头**，只有
+    // 行末才算本段（否则上一段末尾和下一段开头各画一个光标）；非换行模式窗口两端都算。
     let wrapping = ctx.wrap;
-    let caret_here = |b: usize| {
-        let c = col_of(b);
-        c >= col0 && (c < col0 + ncols || (c == col0 + ncols && (!wrapping || b >= le)))
+    let to_end = win.to_end;
+    let caret_here = move |b: usize| {
+        let lb = b.saturating_sub(ls);
+        b >= ls && lb >= seg_a && (lb < seg_b || (lb == seg_b && (!wrapping || to_end)))
     };
     // 当前行高亮（极淡）：聚焦且无选区时，给光标所在行铺一层很淡的底
     if ctx.focused && ctx.sels.is_empty() && i == ctx.caret_line {
@@ -120,9 +123,6 @@ pub(super) fn paint_text_row(
             }
         }
     }
-    // 仅取窗口片段（char_to_byte 至多遍历到 last_col 个字符）
-    let seg_a = char_to_byte(line_full, col0);
-    let seg_b = char_to_byte(line_full, col0 + ncols);
     let seg = &line_full[seg_a..seg_b];
     let seg_x = gx;
     let seg_right = gx + ncols as f32 * ctx.char_w;
@@ -142,21 +142,26 @@ pub(super) fn paint_text_row(
             .collect()
     };
     let galley = {
-        // 整行分词（行首带跨行状态，docstring/块注释正确延续）、仅窗口布局
-        let state = ctx
-            .ed
-            .hl_states
-            .get(i)
-            .copied()
-            .unwrap_or(highlight::LineState::Normal);
-        let mut job = highlight::highlight_segment(
-            line_full,
-            seg_a..seg_b,
-            ctx.lang,
-            ctx.fsize,
-            &lint_errs,
-            state,
-        );
+        let mut job = if line_full.len() > LONG_LINE_PLAIN {
+            // 超长行不上色（见 `plain_segment`）
+            highlight::plain_segment(seg, ctx.fsize)
+        } else {
+            // 整行分词（行首带跨行状态，docstring/块注释正确延续）、仅窗口布局
+            let state = ctx
+                .ed
+                .hl_states
+                .get(i)
+                .copied()
+                .unwrap_or(highlight::LineState::Normal);
+            highlight::highlight_segment(
+                line_full,
+                seg_a..seg_b,
+                ctx.lang,
+                ctx.fsize,
+                &lint_errs,
+                state,
+            )
+        };
         job.wrap.max_width = f32::INFINITY;
         ctx.ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
@@ -236,7 +241,7 @@ pub(super) fn paint_text_row(
     // 括号匹配：给光标相邻括号及其匹配括号描边
     if let Some((ba, bb)) = ctx.brackets {
         for &bp in &[ba, bb] {
-            if bp >= ls && bp < le && in_win(col_of(bp)) {
+            if bp >= ls && bp < le && (seg_a..seg_b).contains(&(bp - ls)) {
                 let bx0 = x_of(bp - ls);
                 let bx1 = x_of(bp + 1 - ls);
                 ctx.painter.rect_stroke(
@@ -296,7 +301,7 @@ pub(super) fn paint_text_row(
     let mut fold_click = None;
     // 折叠 header：行尾画「⋯ N」胶囊提示（点击展开）
     // 换行模式下 header 行可能折成几段：胶囊只画在最后一段的行尾
-    let last_seg = !ctx.wrap || col0 + ncols >= byte_to_char(line_full, line_full.len());
+    let last_seg = !ctx.wrap || seg_b >= line_full.len();
     if let Some(fe) = folded_end.filter(|_| last_seg) {
         let bx = seg_x + galley.size().x + 10.0;
         let label = format!("⋯ {}", fe - i);

@@ -181,7 +181,20 @@ impl App {
                 let md = "# iShell Markdown 预览\n\n这是一段**加粗**、*斜体*、~~删除线~~ 与 `行内代码` 的正文，\n源码里折行的中文不该多出空格。See [the docs](https://example.com/docs) for more.\n\n| 名称 | 说明 | 数值 |\n|---|---|---:|\n| **alpha** | 第一行 | 1 |\n| beta | 含 `code` 的单元格，这一格故意写得很长，用来核对超过限宽之后会不会折行而不是把表格一路撑出窗口右边界去 | 22 |\n\n---\n\n![架构图](img/arch.png) 图片只显示占位。\n\n## 列表\n\n- 无序项\n  - 嵌套项，带 `code`\n- [x] 已完成的任务\n- [ ] 待办的任务\n\n1. 第一步\n2. 第二步\n\n   续段：松散列表项的第二段。\n\n> 引用块第一段。\n>\n> > 嵌套引用。\n\n## 代码\n\n```rust\n// 示例：读取并打印\nfn main() {\n    let s = String::from(\"你好\");\n    println!(\"{s}\");\n}\n```\n".to_string();
                 let text_id = self.alloc_editor_id();
                 let mut editor = crate::ui::editor::Editor::new("/home/e5-1/README.md".into(), md);
-                if mode != "src" {
+                if mode == "cjk" {
+                    // 核对中文 / Tab 混排在换行模式下的折行（每段都该放得进窗口）
+                    editor = crate::ui::editor::Editor::new(
+                        "/home/e5-1/折行.txt".into(),
+                        format!(
+                            "{}\n\n{}\n\n\t带 Tab 缩进的一行：{}\n\nASCII only: {}\n",
+                            "纯中文长行，用来核对折行宽度是否按真实字宽计算。".repeat(8),
+                            "mixed 中英混排 text，with 全角标点。".repeat(8),
+                            "制表符\t占四列\t".repeat(6),
+                            "the quick brown fox jumps over the lazy dog ".repeat(6),
+                        ),
+                    );
+                    editor.set_wrap(true);
+                } else if mode != "src" {
                     editor.toggle_preview();
                 }
                 let mut ed = lock_mutex(&self.editor_state);

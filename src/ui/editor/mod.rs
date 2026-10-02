@@ -97,6 +97,10 @@ pub struct Editor {
     /// 换行缓存对应的列宽与版本（不匹配则重算 vrow_pre）
     vrow_cols: usize,
     vrow_ver: u64,
+    /// 换行缓存对应的字宽度量版本（字体换了，同样的内容折出来的行数会变）
+    vrow_wepoch: u64,
+    /// 长行的折段位置缓存（见 `virtual_::wrap::SegCache`）
+    vseg_cache: std::cell::RefCell<virtual_::SegCache>,
     /// 上下移动时保持的目标列（字符数；None 表示用当前列）
     vgoal_col: Option<usize>,
     /// 选区锚点（Some 时 [anchor, caret] 为选区）
@@ -227,6 +231,8 @@ impl Editor {
             vrow_pre: Vec::new(),
             vrow_cols: 0,
             vrow_ver: u64::MAX,
+            vrow_wepoch: u64::MAX,
+            vseg_cache: Default::default(),
             vgoal_col: None,
             vsel: None,
             vundo: Vec::new(),
@@ -383,6 +389,11 @@ impl Editor {
     /// 状态栏提示文字。
     pub fn set_status(&mut self, s: &str) {
         self.status = s.to_string();
+    }
+    /// 自动换行开关。
+    pub fn set_wrap(&mut self, on: bool) {
+        self.wrap = on;
+        self.vgoal_col = None;
     }
     pub fn set_loading(&mut self, v: bool) {
         self.loading = v;
@@ -587,6 +598,55 @@ mod reveal_tests {
         ed.pending_scroll = Some(0); // 查找跳转就是这么设的
         frames(&mut ed, 3);
         assert!(ed.vlast_hoff > 0.0, "命中在第 600 列，视图却没有横向滚过去");
+    }
+
+    /// 非换行模式下横向跟随光标要按**真实字宽**算光标的位置。按「每个字符一列」算的话，
+    /// 中文长行的行尾实际在更右边，视图滚不到那里，光标在屏幕外。
+    #[test]
+    fn horizontal_follow_reaches_the_end_of_a_cjk_line() {
+        let line = "汉字".repeat(300);
+        let mut ed = Editor::new("/tmp/a.txt".into(), format!("{line}\n"));
+        frames(&mut ed, 2);
+        ed.vcaret = line.len();
+        ed.pending_scroll = Some(0);
+        frames(&mut ed, 3);
+        // 这一行真实的像素宽度（用同一套字体量）
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut true_w = 0.0;
+        #[allow(deprecated)]
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let mono = egui::TextStyle::Monospace.resolve(&ctx.global_style());
+            true_w = ctx
+                .fonts_mut(|f| f.layout_no_wrap(line.clone(), mono, egui::Color32::BLACK))
+                .size()
+                .x;
+        });
+        assert!(
+            ed.vlast_hoff + ed.vlast_vieww > true_w * 0.95,
+            "行宽 {true_w:.0}px，视图只滚到 {:.0}..{:.0}",
+            ed.vlast_hoff,
+            ed.vlast_hoff + ed.vlast_vieww
+        );
+    }
+
+    /// 换行模式下，用**字体实测的字宽**折出来的每一段都得放得进视口——这是用户看到的
+    /// 那个问题本身：纯中文行每段都比窗口宽，右半截被裁掉。
+    #[test]
+    fn wrapped_cjk_segments_fit_inside_the_viewport() {
+        let text = format!("{}\n{}\n", "汉字宽字符".repeat(60), "mixed 中英 text ".repeat(30));
+        let mut ed = Editor::new("/tmp/a.txt".into(), text);
+        ed.wrap = true;
+        frames(&mut ed, 3);
+        let cols = ed.vrow_cols;
+        assert!(cols > 10 && cols < 200, "前提：换行列数来自视口宽度（{cols}）");
+        for line in 0..2 {
+            let widths = virtual_::test_seg_widths(&ed, line);
+            assert!(widths.len() > 2, "前提：这一行折成了多段");
+            for (seg, w) in widths.iter().enumerate() {
+                assert!(*w <= cols as f32 + 1e-3, "第 {line} 行第 {seg} 段宽 {w} 列，视口只有 {cols} 列");
+            }
+        }
     }
 
     /// 换行模式下，跳转目标在一个折成很多段的长行深处：要滚到光标所在的**那一段**，

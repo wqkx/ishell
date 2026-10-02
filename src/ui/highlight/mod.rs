@@ -11,7 +11,7 @@ mod token;
 pub use indent::{detect_indent, Indent};
 pub use lang::{completion_words, is_code};
 pub use lint::{lint_enabled, lint_syntax};
-pub use token::{highlight_segment, line_states, LineState};
+pub use token::{highlight_segment, line_states, plain_segment, LineState};
 
 #[cfg(test)]
 mod tests {

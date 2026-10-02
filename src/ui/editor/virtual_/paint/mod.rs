@@ -7,8 +7,8 @@ use super::chrome::ChromeActions;
 use super::commands::bracket_match;
 use super::edit::v_word_range;
 use super::fold::v_lead;
-use super::geom::{char_to_byte, v_line_of, v_line_range, v_sel_range};
-use super::wrap::{v_line_of_vrow, v_total_vrows, v_vpos_of_byte, v_wrap_sync};
+use super::geom::{char_to_byte, str_cols, v_line_of, v_line_range, v_sel_range};
+use super::wrap::{v_line_of_vrow, v_row_window, v_total_vrows, v_vpos_of_byte, v_wrap_sync};
 use crate::theme::Palette;
 use crate::ui::highlight::{self, Indent};
 
@@ -62,6 +62,8 @@ pub(super) struct RowPaintContext<'a> {
     fsize: f32,
     wrap: bool,
     wrap_cols: usize,
+    /// 折行映射用的列数（换行模式 = wrap_cols；非换行模式 = 超大值，每行一段）
+    eff_cols: usize,
     first_col: usize,
     cols_vis: usize,
     total: usize,
@@ -121,7 +123,8 @@ pub(super) fn paint_visible_rows(
     } else {
         ui.available_width()
     };
-    let wrap_cols = (((view_w_pre - gutter_w) / char_w) as i64).max(1) as usize;
+    // 右侧 12pt 是竖向滚动条的轨道：不扣掉的话每段末尾一两个字符落在滚动条下面，点不到
+    let wrap_cols = (((view_w_pre - gutter_w - 12.0) / char_w) as i64).max(1) as usize;
     // 两种模式都维护「视觉行」映射：换行模式按折行数，非换行模式每行 1 视觉行
     //（列数取超大值），折叠行占 0 视觉行——行映射/滚动/折叠由同一套机制处理
     let eff_cols = if ed.wrap { wrap_cols } else { usize::MAX / 4 };
@@ -187,7 +190,8 @@ pub(super) fn paint_visible_rows(
         }
         if (moved || jumped) && !wrap {
             let (ls2, _) = v_line_range(ed, v_line_of(ed, ed.vcaret));
-            let cx = gutter_w + ed.content[ls2..ed.vcaret].chars().count() as f32 * char_w; // 光标在内容坐标里的 x
+            // 光标在内容坐标里的 x：按真实字宽算（中文、Tab 都不是一列宽）
+            let cx = gutter_w + str_cols(&ed.content[ls2..ed.vcaret]) * char_w;
             if cx < ed.vlast_hoff + gutter_w + char_w {
                 force_h = Some((cx - gutter_w - char_w * 2.0).max(0.0));
             } else if cx > ed.vlast_hoff + view_w - char_w * 2.0 {
@@ -446,6 +450,7 @@ pub(super) fn paint_visible_rows(
                         fsize,
                         wrap,
                         wrap_cols,
+                        eff_cols,
                         first_col,
                         cols_vis,
                         total,
@@ -563,16 +568,13 @@ pub(super) fn paint_visible_rows(
                         let byte_at = |p: egui::Pos2, include_nl: bool| -> usize {
                             let k = ((p.y - clip.top()) / row_h).floor().max(0.0) as usize;
                             let row = (top_row + k).min(nrows.saturating_sub(1));
-                            let (l, seg2) = v_line_of_vrow(ed, row);
-                            let (li, c0, nc, gx) = if wrap {
-                                (l, seg2 * wrap_cols, wrap_cols, text_x)
-                            } else {
-                                (l, first_col, cols_vis, text_x + first_col as f32 * char_w)
-                            };
+                            // 与绘制用同一个窗口（同一段文本、同一个起点 x），命中才对得上
+                            let win = v_row_window(ed, row, wrap, eff_cols, first_col, cols_vis);
+                            let li = win.line;
+                            let gx = text_x + win.x0 * char_w;
                             let (ls, le) = v_line_range(ed, li);
                             let line_full: &str = &ed.content[ls..le];
-                            let seg_a = char_to_byte(line_full, c0);
-                            let seg_b = char_to_byte(line_full, c0 + nc);
+                            let (seg_a, seg_b) = (win.a, win.b);
                             let seg = line_full[seg_a..seg_b].to_string();
                             let g = ctx.fonts_mut(|f| {
                                 f.layout_no_wrap(seg.clone(), mono.clone(), Palette::TEXT)

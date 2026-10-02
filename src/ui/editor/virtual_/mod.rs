@@ -14,6 +14,7 @@ pub(super) use geom::{v_line_of, v_sel_range};
 pub(super) use input::v_cancel_preedit;
 pub(super) use view::editable_virtual;
 pub(super) use wrap::v_recompute;
+pub(super) use wrap::SegCache;
 
 #[cfg(test)]
 pub(super) fn test_insert(ed: &mut super::Editor, t: &str) {
@@ -30,6 +31,19 @@ pub(super) fn test_goto_line(ed: &mut super::Editor, line: usize) {
     ed.vcaret = geom::v_line_range(ed, line).0;
     ed.vsel = None;
     ed.pending_scroll = Some(line);
+}
+/// 测试用：某逻辑行各折段的显示宽度（列）。
+#[cfg(test)]
+pub(super) fn test_seg_widths(ed: &super::Editor, line: usize) -> Vec<f32> {
+    let (ls, le) = geom::v_line_range(ed, line);
+    let text = &ed.content[ls..le];
+    let n = (ed.vrow_pre[line + 1] - ed.vrow_pre[line]) as usize;
+    (0..n)
+        .map(|seg| {
+            let (a, b) = wrap::v_seg_range(ed, line, seg, ed.vrow_cols);
+            geom::str_cols(&text[a..b])
+        })
+        .collect()
 }
 #[cfg(test)]
 pub(super) fn test_undo(ed: &mut super::Editor) {

@@ -1,7 +1,7 @@
 use super::super::super::Editor;
 use super::super::edit::v_complete_accept;
 use super::super::fold::v_lead;
-use super::super::geom::{char_to_byte, v_line_range};
+use super::super::geom::v_line_range;
 use crate::theme::Palette;
 use crate::ui::highlight;
 
@@ -193,7 +193,7 @@ pub(super) fn paint_sticky_scope(
         painter.rect_filled(row_rect, 0.0, Palette::PANEL_2);
         let (ls2, le2) = v_line_range(ed, l);
         let line_full = &ed.content[ls2..le2];
-        let seg_b2 = char_to_byte(line_full, cols_vis);
+        let seg_b2 = super::super::geom::byte_at_cols_ceil(line_full, cols_vis as f32);
         let state = ed
             .hl_states
             .get(l)

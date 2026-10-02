@@ -29,6 +29,9 @@ pub fn editable_virtual(ui: &mut egui::Ui, ed: &mut Editor, text_id: egui::Id) -
     mono.size = ((mono.size * ppp).round().max(1.0)) / ppp;
     let row_h = ui.ctx().fonts_mut(|f| f.row_height(&mono));
     let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&mono, ' ')).max(1.0);
+    // 登记本帧的等宽字体：折行、横向窗口、光标位置都按它实测的字宽算（见 geom::Metric）。
+    // 放在处理输入之前——上下移动光标要用。
+    super::geom::set_metric_font(ui.ctx(), &mono, char_w);
     let bg = egui::Color32::from_rgb(252, 252, 250);
     let focused = ui.memory(|m| m.focused() == Some(text_id));
     // 聚焦时尽早锁定 Tab/方向键/Esc 到编辑器：必须在底部状态栏菜单按钮等可聚焦控件渲染之前设置，

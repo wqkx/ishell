@@ -347,6 +347,16 @@ fn tokenize_with_state(text: &str, lang: &Lang, state: LineState) -> Vec<(usize,
     segs
 }
 
+/// 不分词、整段按普通文字排版。给超长行用：分词要从行首扫到片段末尾，一条 1MB 的行每个
+/// 可见片段都扫一遍就是每帧几十 MB，而这种行（压缩过的 JS / JSON）上色本来也没什么意义。
+pub fn plain_segment(text: &str, font_size: f32) -> LayoutJob {
+    LayoutJob::simple_singleline(
+        text.to_string(),
+        FontId::monospace(font_size),
+        color(Tok::Plain),
+    )
+}
+
 /// 对整行 `line` 按 `state` 分词，仅对窗口 `win`（字节范围）生成布局；
 /// `errors` 的字节范围以窗口起点为 0（调用方已裁剪平移）。
 /// 分词整行是为了跨行/行内状态正确；布局只做窗口，超长行不付整行 layout 成本。
