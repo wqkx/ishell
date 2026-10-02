@@ -169,12 +169,13 @@ impl App {
             };
             match super::session::cwd_restore_decision(never_typed, idle, expired) {
                 super::session::CwdRestore::Inject => {
-                    let cmd = format!("cd '{}'", s.last_cwd.replace('\'', "'\\''"));
-                    let _ = s.cmd_tx.send(crate::proto::UiCommand::TerminalInput(
-                        format!("{cmd}\r").into_bytes(),
-                    ));
-                    // 吞掉回显，否则 `cd '…'` 会原样留在屏幕上
-                    s.terminal.expect_auto_inject_echo(&cmd);
+                    if let Some(cmd) = super::session::cwd_restore_command(&s.last_cwd) {
+                        let _ = s.cmd_tx.send(crate::proto::UiCommand::TerminalInput(
+                            format!("{cmd}\r").into_bytes(),
+                        ));
+                        // 吞掉回显，否则 `cd '…'` 会原样留在屏幕上
+                        s.terminal.expect_auto_inject_echo(&cmd);
+                    }
                     s.restore_cwd = false;
                     s.restore_cwd_until = None;
                 }

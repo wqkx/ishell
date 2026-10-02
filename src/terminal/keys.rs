@@ -61,12 +61,19 @@ pub(super) fn encode_key(key: Key, mods: Modifiers, app_cursor: bool, out: &mut 
             out.push((c as u8 - b'a') + 1);
             return;
         }
-        // Ctrl+0..9 → 0x10..0x19（与字母同：清 bit5）。缺了这条按 Ctrl+数字什么都不发。
+        // Ctrl+数字按 xterm 约定：2→NUL、3..7→0x1b..0x1f、8→DEL；0/1/9 没有对应的控制
+        // 字符，发数字本身。不能图省事一律 `& 0x1f`：那样 Ctrl+3 是 0x13（XOFF，tty 开着
+        // IXON 时输出当场冻结）、Ctrl+1 是 XON、Ctrl+0 是 Ctrl+P。
         if let Some(d) = key_to_ascii_digit(key) {
             if mods.alt {
                 out.push(0x1b);
             }
-            out.push(d & 0x1f);
+            out.push(match d {
+                b'2' => 0x00,
+                b'3'..=b'7' => d - b'3' + 0x1b,
+                b'8' => 0x7f,
+                _ => d,
+            });
             return;
         }
         if let Some(c) = ctrl_symbol(key, &mods) {
@@ -571,15 +578,25 @@ mod encode_tests {
     /// Ctrl+0..9 → 0x10..0x19（清 bit5）。缺了这条按 Ctrl+数字什么都不发。
     #[test]
     fn ctrl_digits_map_to_control_characters() {
-        assert_eq!(enc(Key::Num0, ctrl(), false), vec![0x10]);
-        assert_eq!(enc(Key::Num1, ctrl(), false), vec![0x11]);
-        assert_eq!(enc(Key::Num9, ctrl(), false), vec![0x19]);
+        // xterm 约定。原先一律 `数字 & 0x1f`：Ctrl+3 发的是 0x13（XOFF，tty 开着 IXON 时
+        // 终端输出当场冻结，要 Ctrl+Q 才恢复）、Ctrl+1 是 XON、Ctrl+0 是 Ctrl+P。
+        assert_eq!(enc(Key::Num2, ctrl(), false), vec![0x00]);
+        assert_eq!(enc(Key::Num3, ctrl(), false), vec![0x1b]);
+        assert_eq!(enc(Key::Num4, ctrl(), false), vec![0x1c]);
+        assert_eq!(enc(Key::Num5, ctrl(), false), vec![0x1d]);
+        assert_eq!(enc(Key::Num6, ctrl(), false), vec![0x1e]);
+        assert_eq!(enc(Key::Num7, ctrl(), false), vec![0x1f]);
+        assert_eq!(enc(Key::Num8, ctrl(), false), vec![0x7f]);
+        // 0 / 1 / 9 没有对应的控制字符：发数字本身
+        assert_eq!(enc(Key::Num0, ctrl(), false), b"0");
+        assert_eq!(enc(Key::Num1, ctrl(), false), b"1");
+        assert_eq!(enc(Key::Num9, ctrl(), false), b"9");
         let ca = Modifiers {
             ctrl: true,
             alt: true,
             ..Default::default()
         };
-        assert_eq!(enc(Key::Num2, ca, false), vec![0x1b, 0x12]);
+        assert_eq!(enc(Key::Num2, ca, false), vec![0x1b, 0x00]);
     }
 
     /// Ctrl+Shift+C/V/F 留给复制/粘贴/查找，**不能**当终端输入发出去。

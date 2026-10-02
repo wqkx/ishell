@@ -373,7 +373,11 @@ impl Terminal {
         }
         let total = self.parser.screen().scrollback_total();
         let saved_sb = self.parser.screen().scrollback();
-        for abs in start_abs..=end_abs {
+        // 只有最后 CAP 行留得下（见循环后的封顶）。没闭合的链接可能跨过几十万行输出才收束
+        //（`ls --hyperlink` 被 Ctrl+C 打断就会留下），不能为中间每一行都克隆一份 URL。
+        const CAP: usize = 256;
+        let first_abs = start_abs.max(end_abs.saturating_sub(CAP - 1));
+        for abs in first_abs..=end_abs {
             let sc = if abs == start_abs { start_col } else { 0 };
             let mut excl = if abs == end_abs {
                 end_excl
@@ -405,7 +409,6 @@ impl Terminal {
         }
         self.parser.screen_mut().set_scrollback(saved_sb);
         // 容量封顶，丢掉最旧的
-        const CAP: usize = 256;
         if self.osc8_spans.len() > CAP {
             let drop = self.osc8_spans.len() - CAP;
             self.osc8_spans.drain(..drop);

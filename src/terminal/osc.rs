@@ -82,7 +82,7 @@ pub(super) fn parse_osc52(data: &[u8], carried: usize) -> Vec<String> {
     let mut out = Vec::new();
     for (seq_start, body_start, end) in osc_sequences(data) {
         // 终止符在已扫过的前缀里 = 上一轮已经处理过这一条
-        if end < carried {
+        if seen_last_round(data, end, carried) {
             continue;
         }
         let payload = &data[body_start..end];
@@ -143,7 +143,7 @@ pub(super) enum Osc133 {
 pub(super) fn parse_osc133(data: &[u8], carried: usize) -> Vec<(usize, Osc133)> {
     let mut out = Vec::new();
     for (seq_start, body_start, end) in osc_sequences(data) {
-        if end < carried {
+        if seen_last_round(data, end, carried) {
             continue;
         }
         let Some(rest) = data[body_start..end].strip_prefix(b"133;") else {
@@ -186,6 +186,14 @@ fn is_conemu_progress(payload: &str) -> bool {
 
 /// 枚举数据块里的完整 OSC 序列：(序列起始, 负载起始(ESC]x; 的 `x` 处), 负载结束(BEL/ST 前))。
 /// 不完整序列（无终止符）跳过——与 parse_osc7 的既有行为一致。
+/// 这条序列上一轮是否已经处理过：整条（**含终止符**）都落在上一轮带过来的字节里才算。
+/// 终止符是 BEL 占 1 字节、是 ST（`ESC \`）占 2 字节——只看负载结束位置的话，ST 被切在
+/// ESC 与 `\` 之间时，这条**刚刚才完整**的序列会被当成处理过的而整条丢掉。
+fn seen_last_round(data: &[u8], end: usize, carried: usize) -> bool {
+    let term_len = if data.get(end) == Some(&0x07) { 1 } else { 2 };
+    end + term_len <= carried
+}
+
 fn osc_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -449,7 +457,7 @@ pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
     use base64::Engine as _;
     let mut out = OscEffects::default();
     for (seq_start, body_start, end) in osc_sequences(data) {
-        if end < carried {
+        if seen_last_round(data, end, carried) {
             continue;
         }
         let payload = &data[body_start..end];
@@ -459,7 +467,12 @@ pub(super) fn scan_osc_effects(data: &[u8], carried: usize) -> OscEffects {
             if let Ok(s) = std::str::from_utf8(rest) {
                 if let Some(rest) = s.strip_prefix("file://") {
                     if let Some(slash) = rest.find('/') {
-                        out.cwd = Some(percent_decode(&rest[slash..]));
+                        // 这个目录来自远端输出（不可信），之后会被拼进 `cd '…'` 自动敲回
+                        // shell。带控制字符（^U、回车、ESC…）的一律不认——正常路径里不会有。
+                        let cwd = percent_decode(&rest[slash..]);
+                        if !cwd.chars().any(|c| c.is_control()) {
+                            out.cwd = Some(cwd);
+                        }
                     }
                 }
             }

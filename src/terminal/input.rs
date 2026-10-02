@@ -129,6 +129,8 @@ impl Terminal {
                         if self.paste_image.is_none() && !modifiers.shift {
                             out.push(0x16);
                         }
+                        // 这次粘贴的按下事件被 egui-winit 吞了，上面的输入时钟没记到
+                        self.note_user_input();
                     }
                     self.saw_text_paste = false;
                     self.saw_v_press = false;
@@ -308,12 +310,42 @@ impl Terminal {
         out
     }
 
+    /// 刚敲的这行是不是回显在屏幕上了（光标前的文字以它的前半段以上结尾）。
+    ///
+    /// 本地历史只该收「在提示符上敲的命令」，而我们并不知道远端此刻是不是提示符——
+    /// 能观察到的区别是回显：shell 会把敲的字显示出来，密码提示符（sudo / ssh / `read -s`）
+    /// 不会。没回显的输入进了历史，之后前缀匹配按 ↑ 就会把密码明文打回命令行。
+    ///
+    /// 只要求前一半以上：网络慢、手快时最后几个字的回显可能还在路上。判不准时一律当作
+    /// 没回显——少记一条历史的代价远小于泄露一次密码。
+    fn input_echoed(&self) -> bool {
+        let typed = self.input_line.trim_end();
+        let screen = self.parser.screen();
+        let (row, col) = screen.cursor_position();
+        // 光标前的文字：长命令会软折行，往上多带 3 行（软折处没有换行符，硬换行有，去掉）
+        let before = screen
+            .contents_between(row.saturating_sub(3), 0, row, col)
+            .replace('\n', "");
+        let before = before.trim_end();
+        let mut ends: Vec<usize> = typed.char_indices().map(|(i, _)| i).skip(1).collect();
+        ends.push(typed.len());
+        let need = ends.len().div_ceil(2).max(1);
+        ends[need - 1..]
+            .iter()
+            .rev()
+            .any(|&e| before.ends_with(&typed[..e]))
+    }
+
     pub(super) fn commit_line(&mut self) {
         // 本标签跑过 AI CLI → 此后允许裸 BEL 当通知（见 `Terminal::ai_cli_seen`）。
         if is_ai_cli_command(&self.input_line) {
             self.ai_cli_seen = true;
         }
         if !self.input_line.trim().is_empty()
+            // 带换行/控制字符的（未开 bracketed paste 的多行粘贴）不收：之后 ↑ 会把它原样
+            // 重发，里面的换行等于替用户按了回车
+            && !self.input_line.chars().any(|c| c.is_control())
+            && self.input_echoed()
             && self
                 .history
                 .last()

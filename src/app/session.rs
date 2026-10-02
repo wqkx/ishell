@@ -758,6 +758,52 @@ impl App {
     }
 }
 
+/// 关会话标签前要不要先问：仍连接、AI 正在用、或者它名下有没保存的编辑器标签。
+/// 最后一条与连接状态无关——断线的会话存不了盘，但关掉它会连同未保存的修改一起扔掉，
+/// 用户至少该有机会取消、去把内容复制出来。
+pub(super) fn session_close_needs_confirm(
+    connected: bool,
+    ai_owned: bool,
+    dirty_tabs: usize,
+) -> bool {
+    connected || ai_owned || dirty_tabs > 0
+}
+
+/// 重连后恢复目录要替用户敲的命令。目录里有控制字符就不恢复（返回 None）。
+///
+/// 单引号转义挡得住 shell 元字符，挡不住**行编辑器**：`^U` 清行、回车提交，都在引号
+/// 生效之前就被 readline 处理了。目录的来源（OSC 7）已经拒收这类值，这里是第二道——
+/// 「替用户敲键盘」的入口不该依赖上游某处记得过滤。
+pub(super) fn cwd_restore_command(cwd: &str) -> Option<String> {
+    if cwd.is_empty() || cwd.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(format!("cd '{}'", cwd.replace('\'', "'\\''")))
+}
+
+#[cfg(test)]
+mod close_and_restore_tests {
+    use super::{cwd_restore_command, session_close_needs_confirm as need};
+
+    /// 断开的普通会话原先直接关、不问——连同它名下没保存的编辑器标签一起。
+    #[test]
+    fn unsaved_editor_tabs_force_a_confirmation_even_when_disconnected() {
+        assert!(!need(false, false, 0));
+        assert!(need(false, false, 1));
+        assert!(need(true, false, 0));
+        assert!(need(false, true, 0));
+    }
+
+    #[test]
+    fn quotes_are_escaped_and_control_characters_refuse() {
+        assert_eq!(cwd_restore_command("/tmp/a b").as_deref(), Some("cd '/tmp/a b'"));
+        assert_eq!(cwd_restore_command("/tmp/it's").as_deref(), Some("cd '/tmp/it'\\''s'"));
+        for evil in ["/tmp\u{15}rm -rf ~\r", "/tmp\nid", "/tmp\u{3}", "/tmp\u{1b}[2J", ""] {
+            assert_eq!(cwd_restore_command(evil), None, "{evil:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod paste_path_tests {
     use super::quote_shell_arg;

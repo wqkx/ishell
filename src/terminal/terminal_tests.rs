@@ -233,6 +233,9 @@ fn prefix_history_search() {
     let mut t = Terminal::new();
     for cmd in ["cd /tmp", "ls -la", "cd /var/log", "cat x"] {
         t.input_line = cmd.into();
+        // shell 把敲的字回显出来了——历史只收回显过的输入（见
+        // `unechoed_input_never_enters_local_history`）
+        t.feed(format!("\r\n$ {cmd}").as_bytes());
         t.commit_line();
     }
     // 前缀 "cd " 上键 -> 最近的 "cd /var/log"，并带清行前缀 Ctrl+E/Ctrl+U
@@ -1335,6 +1338,9 @@ const SPLIT_CORPUS: &[&[u8]] = &[
     b"\x1b[6n",
     b"\x1b[2J\x1b[3Jcleared\r\n",
     b"\x1b]9;4;1;50\x07progress\r\n",
+    // ST（`ESC \`）终止的 OSC：切在 ESC 与 `\` 之间时曾整条丢失
+    b"\x1b]9;st terminated\x1b\\after\r\n",
+    b"\x1b]777;notify;T;st body\x1b\\",
     // 同步输出帧（DEC 私有模式 2026）：整帧攒齐才上屏，任意分包结果须一致
     b"\x1b[?2026h\x1b[1;1H\x1b[J\x1b[1;1Hframe one\r\n\x1b[?2026l",
     // 帧内又来个 2026h（畸形但容错）：一个 2026l 即结束，多余的 h 喂给 vt100 忽略
@@ -2335,4 +2341,138 @@ fn malformed_osc8_closed_in_one_packet_does_not_hold_the_next() {
     let text = t.screen_text();
     assert!(text.contains("OK"), "{text:?}");
     assert!(t.osc8_spans.is_empty(), "{:?}", t.osc8_spans);
+}
+
+/// OSC 7 上报的目录来自**远端输出**（`cat` 一个恶意文件、嵌套 ssh 到别的主机都能发），而它
+/// 会在断线重连时被拼进 `cd '…'` 自动敲回 shell。目录里带控制字符（`%15`=Ctrl+U 清行、
+/// `%0D`=回车）就等于让远端输出替用户敲命令。带控制字符的目录一律不认。
+#[test]
+fn osc7_cwd_with_control_characters_is_rejected() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]7;file://h/home/u\x07");
+    assert_eq!(t.cwd(), Some("/home/u"));
+    for evil in [
+        &b"\x1b]7;file://h/tmp%15touch%20/tmp/pwned%0D\x07"[..],
+        b"\x1b]7;file://h/tmp%0Aid\x07",
+        b"\x1b]7;file://h/tmp%03\x07",
+        b"\x1b]7;file://h/tmp%7F\x07",
+        b"\x1b]7;file://h/tmp%1b[2J\x07",
+    ] {
+        t.feed(evil);
+        assert_eq!(t.cwd(), Some("/home/u"), "接受了带控制字符的目录：{evil:?}");
+    }
+    // 正常的中文 / 空格路径照常接受
+    t.feed("\x1b]7;file://h/tmp/%E4%B8%AD%20文\x07".as_bytes());
+    assert_eq!(t.cwd(), Some("/tmp/中 文"));
+}
+
+/// 本地前缀历史只该收「在提示符上敲、且回显出来了」的命令。密码提示符不回显——
+/// 原先照样把输入收进历史，之后敲同一个首字母再按 ↑，密码就被明文打回命令行。
+#[test]
+fn unechoed_input_never_enters_local_history() {
+    let mut t = Terminal::new();
+    // 正常命令：敲了、也回显了
+    t.feed(b"user@h:~$ ");
+    t.push_input_line("sudo ls");
+    t.feed(b"sudo ls");
+    t.commit_line();
+    assert_eq!(t.history, vec!["sudo ls".to_string()]);
+    // 密码：敲了，屏幕上没有回显
+    t.feed(b"\r\n[sudo] password for user: ");
+    t.push_input_line("Passw0rd");
+    t.commit_line();
+    assert_eq!(t.history, vec!["sudo ls".to_string()], "无回显的输入进了历史");
+    // 回显还没到齐（网络慢、手快）：到了一半以上就认，不然正常命令也记不住
+    t.feed(b"\r\nuser@h:~$ ");
+    t.push_input_line("make test");
+    t.feed(b"make t");
+    t.commit_line();
+    assert_eq!(t.history.len(), 2);
+    // 带换行/控制字符的输入（未开 bracketed paste 的多行粘贴）不进历史：
+    // 之后 ↑ 会把它原样重发，其中的换行等于替用户按了回车
+    t.feed(b"\r\nuser@h:~$ ");
+    t.push_input_line("echo a\necho b");
+    t.feed(b"echo a\r\necho b");
+    t.commit_line();
+    assert_eq!(t.history.len(), 2);
+}
+
+/// 没闭合的 OSC 8 链接（`ls --hyperlink` 被 Ctrl+C 打断就会留下）跨过海量输出后收束：
+/// 只有最后 256 行有用，不能为中间每一行都克隆一份 URL。
+///
+/// 这是**钉子不是门禁**：修复前结果同样 ≤256（循环结束后才裁），差别只在中途的瞬时
+/// 内存与耗时，断言测不出来。留着是保证这条路径至少被执行到、不 panic。
+#[test]
+fn unclosed_osc8_across_many_lines_stays_bounded() {
+    let mut t = Terminal::new();
+    t.feed(b"\x1b]8;;http://example.com/x\x07link");
+    t.feed(&b"\n".repeat(200_000));
+    t.feed(b"\x1b]8;;\x07");
+    assert!(t.osc8_spans.len() <= 256);
+}
+
+/// 滚动条滑块最小 24pt；但轨道本身比 24pt 还矮时 `f32::clamp(24, h)` 会因 min > max
+/// 直接 panic——终端区被压得很矮（窗口最小 + 文件面板拉到最高）且有回滚历史时就是这样。
+#[test]
+fn scroll_handle_height_never_panics_on_a_tiny_track() {
+    for track in [0.0_f32, 1.0, 10.0, 23.9, 24.0, 400.0] {
+        let h = super::ui_paint::scroll_handle_h(track, 24, 5000);
+        assert!(h <= track.max(0.0) + f32::EPSILON, "滑块比轨道还高：{h} > {track}");
+    }
+    assert_eq!(super::ui_paint::scroll_handle_h(400.0, 24, 5000), 24.0);
+}
+
+/// 跑一帧完整的终端 `ui()`（含鼠标处理、右键菜单），返回发往远端的字节。
+fn ui_frame(t: &mut Terminal, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            out = t.ui(ui);
+        });
+    });
+    out
+}
+
+/// `never_typed` 是自动注入（配对 token、重连 cd）唯一的安全边界：用户只要亲手往远端送过
+/// 东西，就不许再替他敲键盘。原先只有键盘事件算数——鼠标上报、右键粘贴、被吞掉按下事件
+/// 的 Ctrl+V 都是用户送出的字节，却不翻这个闸门。
+///
+/// 这条测的是**调用方**：真跑一帧 `ui()`，鼠标在终端里点一下。右键菜单粘贴与它共用同一行
+/// 置位代码，但无头环境读不到剪贴板、合成不出那条路径，没有被直接测到。
+#[test]
+fn mouse_reports_and_swallowed_paste_count_as_user_input() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1000h"); // 远端程序开了鼠标上报
+    ui_frame(&mut t, &ctx, vec![]); // 首帧：布局
+    assert!(t.never_typed());
+    let pos = egui::pos2(200.0, 200.0);
+    ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    let out = ui_frame(
+        &mut t,
+        &ctx,
+        vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }],
+    );
+    assert!(!out.is_empty(), "前提：这次点击确实上报给了远端");
+    assert!(!t.never_typed(), "鼠标上报了字节，闸门却仍认为用户没动过手");
+
+    // 被 egui-winit 吞掉按下事件的 Ctrl+V：只有松开事件到达，补发 0x16
+    let mut t = Terminal::new();
+    let out = feed_events(&mut t, &ctx, vec![key_v(false)]);
+    assert_eq!(out, vec![0x16], "前提：补发了 0x16");
+    assert!(!t.never_typed());
 }

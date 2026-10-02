@@ -579,6 +579,12 @@ impl Terminal {
         self.last_input_at.is_none()
     }
 
+    /// 记一次「用户亲手向远端送了输入」。键盘事件在 `collect_input` 里就地记；不经过
+    /// 那里的路径（右键粘贴、鼠标上报、被吞掉按下事件的 Ctrl+V）调这个。
+    pub(super) fn note_user_input(&mut self) {
+        self.last_input_at = Some(std::time::Instant::now());
+    }
+
     /// （重）连时复位输入时钟：新 shell 是全新的一轮，`never_typed` 该重新计。
     pub fn reset_input_clock(&mut self) {
         self.last_input_at = None;
@@ -1301,6 +1307,12 @@ impl Terminal {
         if !out.is_empty() && self.scrollback != 0 {
             self.scrollback = 0;
             self.parser.screen_mut().set_scrollback(0);
+        }
+        // 右键菜单粘贴、鼠标上报都是用户亲手往远端送的字节，却不经过键盘事件循环——
+        // 不记的话 `never_typed` 仍为真：刚连上就右键粘贴一条 `ssh 别的主机`，停在密码
+        // 提示符时自动注入会把配对 token 打进密码框。
+        if do_paste || !mouse_out.is_empty() {
+            self.note_user_input();
         }
         // 鼠标上报字节（若有）
         out.extend_from_slice(&mouse_out);

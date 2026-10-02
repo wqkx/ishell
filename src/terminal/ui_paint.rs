@@ -348,8 +348,7 @@ impl Terminal {
         // 右侧滚动条（仅有可回滚历史时显示）：滑块高=视口/总量，位置由 scrollback 决定（0=底/最新）。
         if max_sb > 0 {
             let total = self.rows as f32 + max_sb as f32;
-            let handle_h =
-                (sb_track.height() * (self.rows as f32 / total)).clamp(24.0, sb_track.height());
+            let handle_h = scroll_handle_h(sb_track.height(), self.rows, max_sb);
             let pos_frac = 1.0 - (self.scrollback as f32 / max_sb as f32);
             let handle_top = sb_track.top() + (sb_track.height() - handle_h) * pos_frac;
             let handle = Rect::from_min_size(
@@ -383,4 +382,11 @@ impl Terminal {
                 .request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
+}
+
+/// 滚动条滑块高度：按「视口 / 总量」占比，最小 24pt。
+pub(super) fn scroll_handle_h(track_h: f32, rows: u16, max_sb: usize) -> f32 {
+    let total = rows as f32 + max_sb as f32;
+    // 不能写 `.clamp(24.0, track_h)`：轨道比 24pt 还矮时 min > max，f32::clamp 直接 panic
+    (track_h * (rows as f32 / total)).max(24.0).min(track_h.max(0.0))
 }
