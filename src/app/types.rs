@@ -484,8 +484,10 @@ pub(super) struct EditorState {
     pub(super) focus: bool,
     /// 「关闭全部」时若有未保存修改，弹确认框
     pub(super) close_confirm: bool,
-    /// 关闭单个「脏」标签前的确认（标签索引）
-    pub(super) close_tab_confirm: Option<usize>,
+    /// 关闭单个「脏」标签前的确认：记的是标签的 `text_id` 而不是下标——弹窗开着的时候
+    /// 别的标签可能被移除（另一个「保存并关闭」完成、加载失败）或拖动重排，下标会指到
+    /// 另一个标签上，「不保存」就关错了。
+    pub(super) close_tab_confirm: Option<egui::Id>,
     /// 关闭标签后请求主循环归还内存（trim）
     pub(super) trim_request: bool,
     /// 标签拖动重排状态（仿主窗口）：拖动索引 / 抓取偏移 / 内容总宽缓存
@@ -501,6 +503,24 @@ pub(super) struct EditorState {
 }
 
 impl EditorState {
+    /// 待确认关闭的标签现在的下标；标签已不在则顺手清掉确认。
+    pub(super) fn confirm_tab_index(&mut self) -> Option<usize> {
+        let id = self.close_tab_confirm?;
+        let idx = self.tabs.iter().position(|t| t.text_id == id);
+        if idx.is_none() {
+            self.close_tab_confirm = None;
+        }
+        idx
+    }
+
+    /// 某会话下有未保存修改的编辑器标签数。
+    pub(super) fn dirty_tabs_for_session(&self, uid: u64) -> usize {
+        self.tabs
+            .iter()
+            .filter(|t| t.uid == uid && t.doc.is_none() && t.editor.dirty())
+            .count()
+    }
+
     /// 移除指定标签：修正 active、可选保存光标、清理 egui TextEditState，并请求 trim。
     pub(super) fn remove_tab_at(&mut self, ctx: &egui::Context, index: usize) -> bool {
         if index >= self.tabs.len() {
@@ -661,6 +681,47 @@ mod save_fsm_tests {
             save_op: 0,
             save_deadline: None,
         }
+    }
+
+    fn tab_with(uid: u64, id: u8, dirty: bool) -> EditorTab {
+        let mut t = tab();
+        t.uid = uid;
+        t.text_id = egui::Id::new(id);
+        if dirty {
+            t.editor.set_encoding("GBK".into()); // 切编码即算有改动
+        }
+        t
+    }
+
+    /// 关闭确认弹窗开着时，排在前面的标签被移除（它的「保存并关闭」完成了）：
+    /// 确认必须仍然指向原来那个标签，而不是顺位顶上来的下一个。
+    #[test]
+    fn close_confirmation_follows_the_tab_not_the_index() {
+        let mut ed = EditorState {
+            tabs: vec![tab_with(1, 1, true), tab_with(1, 2, true), tab_with(1, 3, true)],
+            ..Default::default()
+        };
+        ed.close_tab_confirm = Some(ed.tabs[1].text_id); // 对 B 弹了确认
+        ed.tabs.remove(0); // A 存完关掉了
+        let i = ed.confirm_tab_index().expect("B 还在");
+        assert_eq!(ed.tabs[i].text_id, egui::Id::new(2u8), "确认指到了别的标签上");
+        ed.tabs.swap(0, 1); // 拖动重排
+        let i = ed.confirm_tab_index().expect("B 还在");
+        assert_eq!(ed.tabs[i].text_id, egui::Id::new(2u8));
+        ed.tabs.retain(|t| t.text_id != egui::Id::new(2u8)); // B 自己没了
+        assert_eq!(ed.confirm_tab_index(), None);
+        assert_eq!(ed.close_tab_confirm, None);
+    }
+
+    #[test]
+    fn dirty_tabs_are_counted_per_session() {
+        let ed = EditorState {
+            tabs: vec![tab_with(1, 1, true), tab_with(1, 2, false), tab_with(2, 3, true)],
+            ..Default::default()
+        };
+        assert_eq!(ed.dirty_tabs_for_session(1), 1);
+        assert_eq!(ed.dirty_tabs_for_session(2), 1);
+        assert_eq!(ed.dirty_tabs_for_session(9), 0);
     }
 
     #[test]

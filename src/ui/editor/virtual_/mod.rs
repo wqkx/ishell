@@ -14,3 +14,12 @@ pub(super) use geom::{v_line_of, v_sel_range};
 pub(super) use input::v_cancel_preedit;
 pub(super) use view::editable_virtual;
 pub(super) use wrap::v_recompute;
+
+#[cfg(test)]
+pub(super) fn test_insert(ed: &mut super::Editor, t: &str) {
+    edit::v_insert(ed, t);
+}
+#[cfg(test)]
+pub(super) fn test_undo(ed: &mut super::Editor) {
+    edit::v_undo(ed);
+}

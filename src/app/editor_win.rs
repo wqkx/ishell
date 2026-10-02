@@ -13,16 +13,18 @@ impl App {
         let Some(idx) = self.pending_close_tab else {
             return;
         };
-        // 若该会话已不在、已断开且不是 AI 会话，则无需确认
-        let Some((title, ai_owned)) = self
-            .sessions
-            .get(idx)
-            .filter(|s| s.connected || s.ai_owned)
-            .map(|s| (s.title.clone(), s.ai_owned))
-        else {
+        // 若该会话已不在，或已断开、不是 AI 会话、名下也没有未保存的编辑器标签，则无需确认
+        let Some((title, ai_owned, connected, dirty)) = self.sessions.get(idx).map(|s| {
+            let dirty = super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(s.uid);
+            (s.title.clone(), s.ai_owned, s.connected, dirty)
+        }) else {
             self.pending_close_tab = None;
             return;
         };
+        if !super::session::session_close_needs_confirm(connected, ai_owned, dirty) {
+            self.pending_close_tab = None;
+            return;
+        }
         let mut decision: Option<bool> = None;
         egui::Modal::new(egui::Id::new("close_tab_modal")).show(ctx, |ui| {
             ui.set_width(320.0);
@@ -45,14 +47,34 @@ impl App {
                              on it will fail. Close it?"
                         ),
                     }
-                } else {
+                } else if connected {
                     match crate::i18n::current() {
                         crate::i18n::Lang::Zh => format!("「{title}」仍在连接中，确定关闭吗？"),
                         crate::i18n::Lang::En => {
                             format!("\"{title}\" is still connected. Close it?")
                         }
                     }
+                } else {
+                    match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => format!("确定关闭「{title}」吗？"),
+                        crate::i18n::Lang::En => format!("Close \"{title}\"?"),
+                    }
                 });
+                // 关会话会连同它打开的编辑器标签一起关掉：有没保存的修改必须说出来
+                if dirty > 0 {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!(
+                                "编辑器里有 {dirty} 个文件的修改尚未保存，关闭后这些修改会丢失。"
+                            ),
+                            crate::i18n::Lang::En => format!(
+                                "{dirty} file(s) in the editor have unsaved changes that will be lost."
+                            ),
+                        })
+                        .color(Palette::DANGER),
+                    );
+                }
             });
             ui.add_space(12.0);
             ui.horizontal(|ui| {

@@ -107,6 +107,12 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
     // 用户还没保存的远端文件——为一个算错的偏移崩掉整个应用不值得。这里刻意**不加**
     // debug_assert：越界/非边界正是它要兜住的输入，加了断言等于让 dev 构建在我们明确
     // 决定要容忍的场景上崩掉。真正的不变量守在源头（见 v_undo 里的 floor_boundary）。
+    //
+    // 也因为是唯一入口，只读（大文件只读 / 跟随）的门设在这里：键盘、右键菜单、查找替换、
+    // 各种行命令最终都走到这儿，在上游按事件类型一个个拦是拦不全的。
+    if ed.is_readonly() {
+        return;
+    }
     let (at, end) = crate::ui::ime_safe::clamp_range(&ed.content, (at, at + removed_len));
     let removed_len = end - at;
     v_remap_folds(ed, at, removed_len, inserted);
@@ -257,8 +263,35 @@ pub(super) fn v_delete_fwd(ed: &mut Editor) {
     v_apply(ed, ed.vcaret, next - ed.vcaret, "");
     ed.vgoal_col = None;
 }
+/// 撤销/重做前的共同检查：只读不许改；组字中的临时文本不在撤销栈的账上，先撤掉。
+fn history_ready(ed: &mut Editor) -> bool {
+    if ed.is_readonly() {
+        return false;
+    }
+    super::input::v_cancel_preedit(ed);
+    true
+}
+
+/// 撤销栈记的是字节偏移，只在「内容就是这条操作留下的样子」时才有效。对不上说明有修改
+/// 绕过了栈——继续按旧偏移改写，轻则改错位置、重则越界 panic 带走全部未保存内容。
+/// 宁可作废历史（两个栈此时都不可信）。
+fn history_matches(ed: &mut Editor, at: usize, expect: &str) -> bool {
+    let ok = ed.content.get(at..at + expect.len()) == Some(expect);
+    if !ok {
+        ed.vundo.clear();
+        ed.vredo.clear();
+    }
+    ok
+}
+
 pub(super) fn v_undo(ed: &mut Editor) {
+    if !history_ready(ed) {
+        return;
+    }
     if let Some(op) = ed.vundo.pop() {
+        if !history_matches(ed, op.at, &op.inserted) {
+            return;
+        }
         let end = op.at + op.inserted.len();
         v_remap_folds(ed, op.at, op.inserted.len(), &op.removed);
         ed.content.replace_range(op.at..end, &op.removed);
@@ -276,7 +309,13 @@ pub(super) fn v_undo(ed: &mut Editor) {
     }
 }
 pub(super) fn v_redo(ed: &mut Editor) {
+    if !history_ready(ed) {
+        return;
+    }
     if let Some(op) = ed.vredo.pop() {
+        if !history_matches(ed, op.at, &op.removed) {
+            return;
+        }
         let end = op.at + op.removed.len();
         v_remap_folds(ed, op.at, op.removed.len(), &op.inserted);
         ed.content.replace_range(op.at..end, &op.inserted);

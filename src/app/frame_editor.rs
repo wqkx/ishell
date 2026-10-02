@@ -331,6 +331,7 @@ impl App {
                             close_after_save.push((uid, t.tid));
                         }
                     } else if close_after {
+                        t.editor.note_remote_diverged();
                         // 保存期间内容又变了但用户要「保存并关闭」：用最新内容再存一次，
                         // 存完（届时签名一致）再关闭；否则「保存并关闭」会静默不生效。
                         t.begin_save(true); // 重新进入保存中（新的 save_op / deadline），保持关闭意图
@@ -344,7 +345,10 @@ impl App {
                             force: false,
                         });
                     } else {
-                        // 保存成功但内容已变、无关闭意图：解锁，保留 dirty 交用户再存
+                        // 保存成功但内容已变、无关闭意图：解锁，保留 dirty 交用户再存。
+                        // 远端现在是「发出保存那一刻」的内容，记下这件事——否则撤销回打开时
+                        // 的内容会被判成干净，而远端其实不是它。
+                        t.editor.note_remote_diverged();
                         t.save = SaveState::Idle;
                         t.save_op = 0;
                         t.save_deadline = None;

@@ -20,6 +20,8 @@ pub struct Editor {
     /// 「有改动」标记：由各内容/编码/行尾变更点维护（undo/redo 后全量重算），
     /// 避免 dirty() 每帧全文 memcmp（20MB 文件曾每帧比较一次）。
     dirty_flag: bool,
+    /// 远端文件与 `orig` 已不一致（见 `note_remote_diverged`）。
+    remote_diverged: bool,
     find: String,
     replace: String,
     show_find: bool,
@@ -171,6 +173,7 @@ impl Editor {
         Self {
             orig: content.clone(),
             dirty_flag: false,
+            remote_diverged: false,
             path,
             content,
             language,
@@ -303,14 +306,22 @@ impl Editor {
     }
     /// 全量重算 dirty 标记（undo/redo 可能精确回到保存点，必须重新比较）。
     pub(crate) fn recompute_dirty(&mut self) {
-        self.dirty_flag = self.content != self.orig
+        self.dirty_flag = self.remote_diverged
+            || self.content != self.orig
             || self.encoding != self.orig_encoding
             || self.eol != self.orig_eol;
+    }
+    /// 保存成功了，但落盘的不是当前内容（保存途中又有编辑/切了编码或行尾）。
+    /// 此后「与打开时一致」不再等于「与远端一致」，直到下一次签名吻合的保存为止都算有改动。
+    pub fn note_remote_diverged(&mut self) {
+        self.remote_diverged = true;
+        self.dirty_flag = true;
     }
     pub fn mark_saved(&mut self) {
         self.orig = self.content.clone();
         self.orig_encoding = self.encoding.clone();
         self.orig_eol = self.eol;
+        self.remote_diverged = false;
         self.dirty_flag = false;
     }
     /// 保存修订签名 = (正文版本, 编码, 行尾)。保存确认据此判断「是否仍是当时发出去的那份」：
@@ -332,6 +343,11 @@ impl Editor {
     }
     /// 恢复上次的光标行：光标置行首并滚动到该行（行号越界则忽略）。
     pub fn restore_line(&mut self, line: usize) {
+        // 行索引是懒建的（`new` 只存内容）。调用方紧跟在 `new` 之后恢复光标，不先建的话
+        // 下面的越界判断恒真——这个功能就一次都不会生效。
+        if self.vlines.is_empty() {
+            v_recompute(self);
+        }
         if line == 0 || line >= self.vlines.len() {
             return;
         }
@@ -480,6 +496,43 @@ mod dirty_tests {
         // 仅切换行尾 → dirty
         ed.set_eol(crate::proto::Eol::Crlf);
         assert!(ed.dirty());
+        ed.mark_saved();
+        assert!(!ed.dirty());
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// 「记住光标行」：`Editor::new` 不建行索引（首帧才懒建），而恢复紧跟在 new 之后调用——
+    /// 原先因此每次都被「行号越界」挡回去，这个功能一次都没生效过。
+    #[test]
+    fn restore_line_works_right_after_construction() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "a\nb\nc\nd\n".into());
+        ed.restore_line(2);
+        assert_eq!(ed.caret_line(), 2);
+        // 越界行号仍然忽略
+        let mut ed = Editor::new("/tmp/a.txt".into(), "a\nb\n".into());
+        ed.restore_line(99);
+        assert_eq!(ed.caret_line(), 0);
+    }
+
+    /// 保存途中又改了内容：远端落盘的是**发出去那一刻**的内容，既不是打开时的，也不是现在的。
+    /// 这时「与打开时一致」不再等于「与远端一致」——撤销回打开时的内容必须仍算有改动，
+    /// 否则远端与所见不同、却没有脏标记，也存不回去。
+    #[test]
+    fn a_save_that_landed_stale_content_keeps_the_tab_dirty_until_resaved() {
+        let mut ed = Editor::new("/tmp/a.txt".into(), "O".into());
+        v_recompute(&mut ed);
+        ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);
+        virtual_::test_insert(&mut ed, "1"); // S1：此刻发出保存
+        virtual_::test_insert(&mut ed, "\n2"); // S2：保存途中继续编辑
+        ed.note_remote_diverged(); // FileSaved 到达，但签名对不上
+        virtual_::test_undo(&mut ed);
+        virtual_::test_undo(&mut ed);
+        assert_eq!(ed.content, "O");
+        assert!(ed.dirty(), "远端是 S1、编辑器是 O，却被判成干净");
         ed.mark_saved();
         assert!(!ed.dirty());
     }

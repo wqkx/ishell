@@ -451,13 +451,13 @@ impl App {
             if let Some(i) = close_tab {
                 // 脏标签：先弹确认（保存并关闭 / 不保存 / 取消）；干净标签直接关
                 if ed.tabs.get(i).map(|t| t.editor.dirty()).unwrap_or(false) {
-                    ed.close_tab_confirm = Some(i);
+                    ed.close_tab_confirm = ed.tabs.get(i).map(|t| t.text_id);
                 } else {
                     ed.remove_tab_at(vctx, i);
                 }
             }
             // 脏标签关闭确认
-            if let Some(ti) = ed.close_tab_confirm {
+            if let Some(ti) = ed.confirm_tab_index() {
                 let name = ed
                     .tabs
                     .get(ti)

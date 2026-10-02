@@ -421,7 +421,15 @@ impl App {
                         let need_confirm = self
                             .sessions
                             .get(i)
-                            .map(|s| s.connected || s.ai_owned)
+                            .map(|s| {
+                                let dirty = super::util::lock_mutex(&self.editor_state)
+                                    .dirty_tabs_for_session(s.uid);
+                                super::session::session_close_needs_confirm(
+                                    s.connected,
+                                    s.ai_owned,
+                                    dirty,
+                                )
+                            })
                             .unwrap_or(false);
                         if need_confirm {
                             self.pending_close_tab = Some(i);

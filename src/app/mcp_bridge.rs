@@ -3024,6 +3024,19 @@ impl App {
                     send_err(resp_tx, msg);
                     return;
                 }
+                // 用户可能在这个会话的文件面板里打开并改了文件：关会话会连同未保存的修改
+                // 一起扔掉，而 AI 这条路没有确认框——所以直接拒绝，让用户先处理。
+                let dirty = super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(s.uid);
+                if dirty > 0 {
+                    send_err(
+                        resp_tx,
+                        format!(
+                            "这个会话在编辑器里还有 {dirty} 个文件的修改没保存，关闭会话会丢掉它们。\
+                             请让用户先在编辑器窗口里保存或关闭这些标签，再关闭会话"
+                        ),
+                    );
+                    return;
+                }
                 self.close_session(idx);
                 let _ = resp_tx.send(McpResponse {
                     id,

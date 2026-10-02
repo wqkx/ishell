@@ -34,6 +34,52 @@ pub(in crate::ui::editor) fn v_cancel_preedit(ed: &mut Editor) {
     v_recompute(ed);
 }
 
+/// 输入法组字（预编辑）文本更新。
+pub(super) fn v_preedit(ed: &mut Editor, t: &str) {
+    // 没有组字在进行、来的又是空组字：什么都不该发生（尤其不该把选区删掉）
+    if t.is_empty() && ed.vime_preedit.is_none() {
+        return;
+    }
+    // 组字文本是临时的：直接改 content、不入撤销栈。
+    // 但组字**开始时**若有选区，被替换掉的原文是一次真实的删除，必须作为正式编辑进撤销栈：
+    // 悄悄抹掉的话，栈里更早的操作偏移全部错位（再撤销就越界 panic 或改错位置），而且
+    // 取消组字后那段原文再也找不回来。
+    let r = match ed.vime_preedit.take() {
+        Some(r) => r,
+        None => {
+            if let Some((a, b)) = v_sel_range(ed).filter(|(a, b)| b > a) {
+                v_apply(ed, a, b - a, "");
+            }
+            (ed.vcaret, ed.vcaret)
+        }
+    };
+    // 必须走 replace_preedit 而不是裸 replace_range：撤销/重新加载会在两条
+    // Preedit 之间换掉 content，旧区间可能落在多字节字符中间——那是 panic，
+    // 不是越界，`.min(len)` 挡不住。
+    let (s, end) = replace_preedit(&mut ed.content, r, t);
+    ed.vcaret = end;
+    ed.vsel = None;
+    ed.msel.clear();
+    ed.dirty_flag = true; // 组字内容已上屏（取消时由 Disabled 分支重算）
+    ed.vime_preedit = if t.is_empty() { None } else { Some((s, end)) };
+    v_recompute(ed);
+}
+
+/// 输入法提交：撤掉组字文本，再把提交的文字作为一次正式编辑插入。
+pub(super) fn v_ime_commit(ed: &mut Editor, t: &str) {
+    if let Some(r) = ed.vime_preedit.take() {
+        ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
+        ed.vsel = None;
+        v_recompute(ed);
+    }
+    // 多光标模式：英文/输入法提交也要作用到全部光标（系统输入法激活后字母走 Commit 而非 Text）
+    if ed.msel.is_empty() {
+        v_insert(ed, t);
+    } else {
+        v_multi_replace(ed, t);
+    }
+}
+
 pub(super) fn handle_input(
     ui: &mut egui::Ui,
     ed: &mut Editor,
@@ -74,38 +120,13 @@ pub(super) fn handle_input(
                         if t == "\n" || t == "\r" {
                             continue;
                         }
-                        // 组字是临时的：直接改 content、不入撤销栈
-                        let r = ed
-                            .vime_preedit
-                            .take()
-                            .or_else(|| v_sel_range(ed))
-                            .unwrap_or((ed.vcaret, ed.vcaret));
-                        // 必须走 replace_preedit 而不是裸 replace_range：撤销/重新加载会在两条
-                        // Preedit 之间换掉 content，旧区间可能落在多字节字符中间——那是 panic，
-                        // 不是越界，`.min(len)` 挡不住。
-                        let (s, end) = replace_preedit(&mut ed.content, r, &t);
-                        ed.vcaret = end;
-                        ed.vsel = None;
-                        ed.msel.clear();
-                        ed.dirty_flag = true; // 组字内容已上屏（取消时由 Disabled 分支重算）
-                        ed.vime_preedit = if t.is_empty() { None } else { Some((s, end)) };
-                        v_recompute(ed);
+                        v_preedit(ed, &t);
                     }
                     egui::ImeEvent::Commit(t) => {
                         if t == "\n" || t == "\r" {
                             continue;
                         }
-                        if let Some(r) = ed.vime_preedit.take() {
-                            ed.vcaret = replace_preedit(&mut ed.content, r, "").0;
-                            ed.vsel = None;
-                            v_recompute(ed);
-                        }
-                        // 多光标模式：英文/输入法提交也要作用到全部光标（系统输入法激活后字母走 Commit 而非 Text）
-                        if ed.msel.is_empty() {
-                            v_insert(ed, &t);
-                        } else {
-                            v_multi_replace(ed, &t);
-                        }
+                        v_ime_commit(ed, &t);
                     }
                     egui::ImeEvent::Disabled => v_cancel_preedit(ed),
                 }
@@ -448,5 +469,80 @@ mod preedit_healing_tests {
         v_cancel_preedit(&mut ed);
         assert!(ed.vime_preedit.is_none());
         assert!(ed.content.is_char_boundary(ed.vcaret));
+    }
+
+    /// 带选区开始组字：被替换掉的原文必须能撤销回来，而且撤销栈不能和内容错位。
+    ///
+    /// 原先组字直接把选区从 content 里抹掉、不留任何撤销记录：栈里更早的操作偏移从此全错，
+    /// 再按 Ctrl+Z 就是拿旧偏移去 `replace_range`——越界即 panic，连带丢掉所有未保存内容；
+    /// 不越界则是悄悄改错位置。
+    #[test]
+    fn composing_over_a_selection_keeps_the_undo_stack_consistent() {
+        use super::super::edit::{v_insert, v_undo};
+        let mut ed = Editor::new("/tmp/a.txt".into(), String::new());
+        super::super::wrap::v_recompute(&mut ed);
+        v_insert(&mut ed, "hello world");
+        ed.vsel = Some(6);
+        ed.vcaret = 11; // 选中 "world"
+        v_preedit(&mut ed, "shijie");
+        v_ime_commit(&mut ed, "世界");
+        assert_eq!(ed.content, "hello 世界");
+        // 一路撤销到底：不能 panic，且必须经过「原文还在」的状态、最终回到空文件
+        let mut seen = vec![ed.content.clone()];
+        for _ in 0..8 {
+            v_undo(&mut ed);
+            seen.push(ed.content.clone());
+        }
+        assert!(seen.contains(&"hello world".to_string()), "被组字覆盖的原文撤销不回来：{seen:?}");
+        assert_eq!(ed.content, "");
+    }
+
+    /// 带选区开始组字后又取消：选中的原文不能就此消失（至少能 Ctrl+Z 找回）。
+    #[test]
+    fn cancelling_a_composition_over_a_selection_does_not_lose_the_text() {
+        use super::super::edit::v_undo;
+        let mut ed = Editor::new("/tmp/a.txt".into(), "hello world".into());
+        super::super::wrap::v_recompute(&mut ed);
+        ed.vsel = Some(6);
+        ed.vcaret = 11;
+        v_preedit(&mut ed, "sh");
+        v_cancel_preedit(&mut ed);
+        if ed.content != "hello world" {
+            v_undo(&mut ed);
+        }
+        assert_eq!(ed.content, "hello world");
+    }
+
+    /// 只读（大文件只读 / 跟随）是「内容不许变」，不是「某几个键不许按」。原先的只读门只吞
+    /// 文本/退格/回车等几类事件，Ctrl+Z、删行、注释切换、行移动，以及右键菜单和查找替换
+    /// 都能照改不误。门设在所有修改的必经之路上才封得住。
+    #[test]
+    fn readonly_blocks_every_mutation_path() {
+        use super::super::commands::{v_delete_line, v_duplicate_line, v_move_line, v_toggle_comment};
+        use super::super::edit::{v_apply, v_block_indent, v_insert, v_redo, v_undo};
+        let mut ed = Editor::new("/tmp/a.rs".into(), "fn a() {}\nfn b() {}\n".into());
+        super::super::wrap::v_recompute(&mut ed);
+        v_insert(&mut ed, "x"); // 撤销栈里留一条
+        v_undo(&mut ed); // 重做栈里也留一条
+        v_insert(&mut ed, "y");
+        let before = ed.content.clone();
+        let dirty = ed.dirty();
+        ed.readonly = true;
+        v_undo(&mut ed);
+        v_redo(&mut ed);
+        v_delete_line(&mut ed);
+        v_duplicate_line(&mut ed, true);
+        v_move_line(&mut ed, false);
+        v_toggle_comment(&mut ed, "//");
+        v_block_indent(&mut ed, true);
+        v_apply(&mut ed, 0, 2, "zz"); // 右键剪切/粘贴、查找替换最终都落到这里
+        assert_eq!(ed.content, before);
+        assert_eq!(ed.dirty(), dirty);
+        // 跟随模式同理
+        ed.readonly = false;
+        ed.follow = true;
+        v_apply(&mut ed, 0, 2, "zz");
+        v_undo(&mut ed);
+        assert_eq!(ed.content, before);
     }
 }
