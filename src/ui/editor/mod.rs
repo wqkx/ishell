@@ -701,9 +701,15 @@ mod reveal_tests {
             frame(&mut ed, Some(egui::Key::ArrowDown));
             assert_eq!(ed.vcaret, line.len() + 1 + after_third, "wrap={wrap}：↓ 应落在下一行同一个字符后");
             frame(&mut ed, Some(egui::Key::ArrowDown));
-            // 第三行是纯 ASCII：三个汉字约占 4.7 列，加上 ab 两列 ≈ 第 7 列附近
+            // 第三行是纯 ASCII：应落在「ab中文字」实测宽度对应的那一列附近。期望值按当前字体
+            // 实测推算，不能写死：中日韩字体读的是系统字体（Noto CJK 下汉字约 1.56 列，
+            // CI 镜像没装它时退回别的字形，宽度不同）——曾在 CI 上因此挂过一次。
+            let w = virtual_::test_str_cols("ab中文字");
             let col = ed.vcaret - 2 * (line.len() + 1);
-            assert!((6..=7).contains(&col), "wrap={wrap}：落在 ASCII 行第 {col} 列，视觉上应在第 6–7 列");
+            assert!(
+                (w.floor() as usize..=w.ceil() as usize).contains(&col),
+                "wrap={wrap}：落在 ASCII 行第 {col} 列，视觉上应在第 {w:.2} 列附近"
+            );
             frame(&mut ed, Some(egui::Key::ArrowUp));
             frame(&mut ed, Some(egui::Key::ArrowUp));
             assert_eq!(ed.vcaret, after_third, "wrap={wrap}：↑↑ 应回到原位");

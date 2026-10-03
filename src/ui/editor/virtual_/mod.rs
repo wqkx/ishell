@@ -20,6 +20,12 @@ pub(super) use wrap::SegCache;
 pub(super) fn test_insert(ed: &mut super::Editor, t: &str) {
     edit::v_insert(ed, t);
 }
+/// 当前登记的字体下，一段文字的显示宽度（列）。测试里按它推期望值，别硬编码某台机器上
+/// 的字宽——中日韩字体读的是系统字体，CI 镜像和开发机装的不一样。
+#[cfg(test)]
+pub(super) fn test_str_cols(s: &str) -> f32 {
+    geom::str_cols(s)
+}
 #[cfg(test)]
 pub(super) fn test_caret_vrow(ed: &super::Editor) -> usize {
     wrap::v_vpos_of_byte(ed, ed.vcaret, ed.vrow_cols.max(1)).0
