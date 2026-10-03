@@ -1,6 +1,6 @@
 # iShell patches to eframe 0.34.3
 
-Upstream crate from crates.io `eframe` 0.34.3, with two local fixes so a minimized /
+Upstream crate from crates.io `eframe` 0.34.3, with a local fix so a minimized /
 hidden window cannot freeze the event-loop thread (and with it MCP request handling):
 
 1. **`src/native/run.rs`** — On Wayland, `Window::is_minimized` / `Occluded` are
@@ -15,11 +15,9 @@ hidden window cannot freeze the event-loop thread (and with it MCP request handl
      must not keep pushing it out, or direct paint never fires while hidden.
    - Clear the fallback when `RedrawRequested` is delivered.
 
-2. **`src/native/glow_integration.rs`** (and wgpu twin) — Treat
-   `is_invisible_or_minimized` as not visible for paint/swap. On X11/macOS/Windows
-   this skips `swap_buffers` while minimized so vsync cannot block forever on a
-   surface the compositor is no longer presenting (glutin documents this for
-   Wayland `SwapInterval::Wait`). `App::logic` still runs via `epi_integration`.
+Do **not** fold `is_invisible_or_minimized` into the paint-time `is_visible` flag:
+that skipped `App::ui` whenever the OS reported the window invisible/minimized,
+and on some desktops the first frames look “invisible”, so the UI never appeared.
 
 iShell also disables vsync by default on Wayland (`DontWait`) so a fallback
 direct paint cannot hang inside `swap_buffers` — see `src/main.rs`.

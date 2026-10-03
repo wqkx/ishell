@@ -629,10 +629,7 @@ impl WgpuWinitRunning<'_> {
             };
             egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
 
-            // See glow_integration: skip paint/present when minimized/invisible so a
-            // vsync wait cannot park the event-loop thread. App::logic still runs.
-            let is_visible =
-                info.visible().unwrap_or(true) && !is_invisible_or_minimized(window);
+            let is_visible = info.visible().unwrap_or(true);
 
             {
                 profiling::scope!("set_window");
