@@ -202,13 +202,16 @@ pub(super) fn v_insert(ed: &mut Editor, t: &str) {
 /// 回车自动缩进：沿用当前行前导空白；行尾是 : { ( [ 时再加一级。
 pub(super) fn v_newline_indent(ed: &mut Editor) {
     let at = v_sel_range(ed).map(|(a, _)| a).unwrap_or(ed.vcaret);
-    let ls = v_line_range(ed, v_line_of(ed, at)).0;
+    let li = v_line_of(ed, at);
+    let (ls, le) = v_line_range(ed, li);
     let before = &ed.content[ls..at.max(ls)];
     let lead: String = before
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
-    let mut t = String::from("\n");
+    // 混合行尾的文件里，在一个 CRLF 行里回车也断出 CRLF：两半都保持这一行原来的行尾
+    let crlf = super::geom::v_line_next(ed, li) == le + 2;
+    let mut t = String::from(if crlf { "\r\n" } else { "\n" });
     t.push_str(&lead);
     if matches!(
         before.trim_end().chars().last(),
@@ -460,7 +463,12 @@ pub(super) fn v_word_boundary(s: &str, b: usize, fwd: bool) -> usize {
             }
         }
         if let Some('\n') = s[..i].chars().next_back() {
-            return i - 1;
+            // 停在上一行的行末文字之后：`\r\n` 整个算行尾（见 `v_line_range`）
+            return if s.as_bytes()[..i].ends_with(b"\r\n") {
+                i - 2
+            } else {
+                i - 1
+            };
         }
         let word = s[..i].chars().next_back().map(is_w).unwrap_or(false);
         loop {
@@ -713,6 +721,79 @@ mod tests {
     /// 此后第一次退格就崩在 `v_apply` 的 `content[at..at+len]` 上——注意光标吸附必须做在
     /// **撤销那一步**：只让 `prev_char_boundary` 内部吸附是不够的，调用方仍拿未吸附的
     /// `vcaret` 去算删除长度，panic 只是从一处挪到另一处。
+    /// 混合行尾的文件（`a` 行是 CRLF，其余 LF）：`\r` 原样留在内容里，但它属于行尾——
+    /// 光标停不进 `\r` 与 `\n` 之间，打字不会插到 `\r` 后面，整行操作不丢不留它。
+    fn mixed() -> Editor {
+        let mut ed = ed_with("a\r\nbc\nd");
+        super::super::wrap::v_recompute(&mut ed);
+        ed
+    }
+
+    #[test]
+    fn end_stops_before_the_cr_of_a_crlf_line() {
+        let mut ed = mixed();
+        ed.vcaret = 0;
+        v_move_edge(&mut ed, true, false);
+        assert_eq!(ed.vcaret, 1, "End 停在了 \\r 之后");
+        v_insert(&mut ed, "X");
+        assert_eq!(ed.content, "aX\r\nbc\nd");
+    }
+
+    #[test]
+    fn arrows_backspace_and_delete_treat_crlf_as_one_line_end() {
+        let mut ed = mixed();
+        ed.vcaret = 1;
+        v_move_h(&mut ed, true, false);
+        assert_eq!(ed.vcaret, 3, "右移应直接到下一行行首");
+        v_move_h(&mut ed, false, false);
+        assert_eq!(ed.vcaret, 1, "左移应回到上一行行末文字之后");
+        ed.vcaret = 3;
+        v_move_word(&mut ed, false, false);
+        assert_eq!(ed.vcaret, 1, "按词左移停在了 \\r 与 \\n 之间");
+
+        let mut ed = mixed();
+        ed.vcaret = 3;
+        v_backspace(&mut ed);
+        assert_eq!(ed.content, "abc\nd", "退格应删掉整个 \\r\\n");
+        let mut ed = mixed();
+        ed.vcaret = 1;
+        v_delete_fwd(&mut ed);
+        assert_eq!(ed.content, "abc\nd", "Delete 应删掉整个 \\r\\n");
+    }
+
+    #[test]
+    fn vertical_moves_and_enter_respect_the_crlf_line_end() {
+        let mut ed = mixed();
+        ed.wrap = false;
+        ed.vcaret = 5; // bc 行末
+        v_move_v(&mut ed, -1, false);
+        assert_eq!(ed.vcaret, 1, "上移落进了 \\r 与 \\n 之间");
+
+        let mut ed = mixed();
+        ed.vcaret = 1;
+        v_newline_indent(&mut ed);
+        assert_eq!(ed.content, "a\r\n\r\nbc\nd", "CRLF 行里回车应断出 CRLF");
+    }
+
+    #[test]
+    fn line_commands_keep_each_line_end_intact() {
+        use super::super::commands::{v_delete_line, v_duplicate_line, v_move_line};
+        let mut ed = mixed();
+        ed.vcaret = 0;
+        v_delete_line(&mut ed);
+        assert_eq!(ed.content, "bc\nd", "删行留下了半个行尾");
+
+        let mut ed = mixed();
+        ed.vcaret = 0;
+        v_duplicate_line(&mut ed, true);
+        assert_eq!(ed.content, "a\r\na\r\nbc\nd");
+
+        let mut ed = mixed();
+        ed.vcaret = 0;
+        v_move_line(&mut ed, false);
+        assert_eq!(ed.content, "bc\r\na\nd", "两行之间的行尾被改写了");
+    }
+
     fn ed_with(content: &str) -> Editor {
         let mut ed = Editor::new("/tmp/a.txt".into(), content.into());
         ed.set_meta("UTF-8".into(), crate::proto::Eol::Lf, 1);

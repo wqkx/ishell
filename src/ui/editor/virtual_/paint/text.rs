@@ -238,6 +238,22 @@ pub(super) fn paint_text_row(
     // 正文
     ctx.painter
         .galley(egui::pos2(seg_x, y), galley.clone(), Palette::TEXT);
+    // 行尾是 `\r\n`（混合行尾的文件里原样保留）：在行末画一个淡色 CR，让这个看不见的
+    // 字节可见。不用 U+240D「␍」——字体里不一定有这个字形，缺了就是一个方框。
+    if to_end && super::super::geom::v_line_next(ctx.ed, i) == le + 2 {
+        ctx.painter.text(
+            egui::pos2(seg_x + galley.size().x + ctx.char_w * 0.3, y + ctx.row_h * 0.5),
+            egui::Align2::LEFT_CENTER,
+            "CR",
+            egui::FontId::monospace(ctx.fsize * 0.7),
+            egui::Color32::from_rgba_unmultiplied(
+                Palette::TEXT_DIM.r(),
+                Palette::TEXT_DIM.g(),
+                Palette::TEXT_DIM.b(),
+                110,
+            ),
+        );
+    }
     // 括号匹配：给光标相邻括号及其匹配括号描边
     if let Some((ba, bb)) = ctx.brackets {
         for &bp in &[ba, bb] {

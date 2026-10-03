@@ -77,8 +77,19 @@ pub(super) fn v_toggle_comment(ed: &mut Editor, prefix: &str) {
 pub(super) fn v_duplicate_line(ed: &mut Editor, down: bool) {
     let li = v_line_of(ed, ed.vcaret);
     let (ls, le) = v_line_range(ed, li);
-    let line = ed.content[ls..le].to_string();
+    let next = super::geom::v_line_next(ed, li);
     let col = ed.vcaret - ls;
+    if next > le {
+        // 有行尾：整行连同它自己的行尾（`\n` 或 `\r\n`）复制一份，插在本行之前——
+        // 原行一个字节不动，副本行尾与原行一致
+        let whole = ed.content[ls..next].to_string();
+        v_apply(ed, ls, 0, &whole);
+        ed.vcaret = if down { next + col } else { ls + col };
+        ed.vsel = None;
+        ed.vgoal_col = None;
+        return;
+    }
+    let line = ed.content[ls..le].to_string();
     if down {
         v_apply(ed, le, 0, &format!("\n{line}"));
         ed.vcaret = le + 1 + col;
@@ -99,9 +110,12 @@ pub(super) fn v_move_line(ed: &mut Editor, up: bool) {
     let (a, b) = if up { (li - 1, li) } else { (li, li + 1) };
     let (as_, _) = v_line_range(ed, a);
     let (bs, be) = v_line_range(ed, b);
-    let la = ed.content[as_..v_line_range(ed, a).1].to_string();
+    let ae = v_line_range(ed, a).1;
+    let la = ed.content[as_..ae].to_string();
     let lb = ed.content[bs..be].to_string();
-    v_apply(ed, as_, be - as_, &format!("{lb}\n{la}"));
+    // 两行之间原来的行尾（`\n` 或 `\r\n`）原样放回中间，不写死成 `\n`
+    let mid = ed.content[ae..bs].to_string();
+    v_apply(ed, as_, be - as_, &format!("{lb}{mid}{la}"));
     let target = if up { li - 1 } else { li + 1 };
     let (ts, te) = v_line_range(ed, target);
     ed.vcaret = ts + col.min(te - ts);
@@ -113,7 +127,8 @@ pub(super) fn v_delete_line(ed: &mut Editor) {
     let (ls, le) = v_line_range(ed, li);
     let total = ed.vlines.len();
     if li + 1 < total {
-        v_apply(ed, ls, (le + 1) - ls, "");
+        // 连同行尾一起删（CRLF 是两个字节，用「行尾 + 1」会把 `\n` 留下成一个空行）
+        v_apply(ed, ls, super::geom::v_line_next(ed, li) - ls, "");
     } else if ls > 0 {
         v_apply(ed, ls - 1, le - (ls - 1), "");
     } else {

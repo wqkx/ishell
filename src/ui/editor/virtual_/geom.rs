@@ -18,6 +18,11 @@ pub(super) fn compute_line_starts(s: &str) -> Vec<usize> {
 /// 退格/左移就会崩在 `s[..b]` 上。这里和下面 `next_char_boundary` 一并收口。
 pub(super) fn prev_char_boundary(s: &str, b: usize) -> usize {
     let b = crate::ui::ime_safe::floor_boundary(s, b);
+    // 混合行尾文件里留在内容中的 `\r\n` 是**一个**行尾：左移 / 退格一步跨过整个，
+    // 光标永远不停在 `\r` 与 `\n` 之间（见 `v_line_range`）
+    if s.as_bytes()[..b].ends_with(b"\r\n") {
+        return b - 2;
+    }
     s[..b]
         .chars()
         .next_back()
@@ -26,6 +31,9 @@ pub(super) fn prev_char_boundary(s: &str, b: usize) -> usize {
 }
 pub(super) fn next_char_boundary(s: &str, b: usize) -> usize {
     let b = crate::ui::ime_safe::floor_boundary(s, b);
+    if s.as_bytes()[b..].starts_with(b"\r\n") {
+        return b + 2;
+    }
     s[b..]
         .chars()
         .next()
@@ -35,15 +43,29 @@ pub(super) fn next_char_boundary(s: &str, b: usize) -> usize {
 pub fn v_line_of(ed: &Editor, b: usize) -> usize {
     ed.vlines.partition_point(|&s| s <= b).saturating_sub(1)
 }
-/// 第 i 行的字节范围 [起, 止)（止不含行尾换行符）。
+/// 第 i 行文字的字节范围 [起, 止)：不含行尾。
+///
+/// 行尾可能是 `\n`，也可能是 `\r\n`：全文都是 CRLF 的文件打开时统一成 LF，混合行尾的
+/// 文件则原样保留（保存时没改过的行一个字节都不变），`\r` 就留在内容里。它算行尾的一部分：
+/// End、点击行末、上下移动都停在它前面，绘制也不把它当正文（行末另画一个淡色 CR 标记）。
 pub(super) fn v_line_range(ed: &Editor, i: usize) -> (usize, usize) {
     let s = ed.vlines[i];
     let e = if i + 1 < ed.vlines.len() {
-        ed.vlines[i + 1] - 1
+        let nl = ed.vlines[i + 1] - 1;
+        if nl > s && ed.content.as_bytes()[nl - 1] == b'\r' {
+            nl - 1
+        } else {
+            nl
+        }
     } else {
         ed.content.len()
     };
     (s, e)
+}
+/// 第 i 行连同行尾的结束位置（= 下一行的起点；最后一行为全文末尾）。整行操作（删除、
+/// 复制、三击选中）用它，别用「行尾 + 1」——CRLF 的行尾是两个字节。
+pub(super) fn v_line_next(ed: &Editor, i: usize) -> usize {
+    ed.vlines.get(i + 1).copied().unwrap_or(ed.content.len())
 }
 pub fn v_sel_range(ed: &Editor) -> Option<(usize, usize)> {
     ed.vsel

@@ -194,6 +194,12 @@ impl App {
                         ),
                     );
                     editor.set_wrap(true);
+                } else if mode == "eol" {
+                    // 核对混合行尾：CRLF 行末应画淡色 CR 标记，LF 行没有
+                    editor = crate::ui::editor::Editor::new(
+                        "/home/e5-1/mixed.conf".into(),
+                        "# 这一行是 CRLF\r\nkey = value\r\n# 这一行是 LF\nother = 1\n".into(),
+                    );
                 } else if mode != "src" {
                     editor.toggle_preview();
                 }

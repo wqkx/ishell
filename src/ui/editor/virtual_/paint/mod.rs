@@ -589,7 +589,7 @@ pub(super) fn paint_visible_rows(
                                 && li + 1 < ed.vlines.len()
                                 && p.x - gx > g.size().x + char_w
                             {
-                                le + 1
+                                super::geom::v_line_next(ed, li)
                             } else {
                                 ls + seg_a + char_to_byte(&seg, cc)
                             }
@@ -623,9 +623,9 @@ pub(super) fn paint_visible_rows(
                         } else if resp.triple_clicked() {
                             // 三击选中当前逻辑行（含行尾换行符，与主流编辑器一致）
                             let li = ed.vlines.partition_point(|&p| p <= b).saturating_sub(1);
-                            let (ls, le) = v_line_range(ed, li);
+                            let (ls, _) = v_line_range(ed, li);
                             ed.vsel = Some(ls);
-                            ed.vcaret = (le + 1).min(ed.content.len());
+                            ed.vcaret = super::geom::v_line_next(ed, li);
                         } else if resp.double_clicked() {
                             // 双击选中光标处的词
                             if let Some((wa, wb)) = v_word_range(&ed.content, b) {
