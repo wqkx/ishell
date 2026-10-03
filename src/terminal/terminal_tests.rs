@@ -1587,6 +1587,18 @@ fn feed_events(t: &mut Terminal, ctx: &egui::Context, events: Vec<egui::Event>) 
     out
 }
 
+/// Linux / Windows 上 Ctrl+C 到终端时是 `Event::Copy`（egui-winit 转的），由它发出 0x03。
+/// 这条路径也要让输入影子重新可信，否则按过方向键之后再 Ctrl+C，本地前缀历史一直停用。
+#[test]
+fn ctrl_c_as_a_copy_event_retracks_the_input_line() {
+    let ctx = egui::Context::default();
+    let mut t = Terminal::new();
+    t.input_untracked = true; // 如按过方向键之后
+    let out = feed_events(&mut t, &ctx, vec![egui::Event::Copy]);
+    assert_eq!(out, [0x03]);
+    assert!(!t.input_untracked);
+}
+
 fn key_v(pressed: bool) -> egui::Event {
     egui::Event::Key {
         key: egui::Key::V,
@@ -3227,6 +3239,19 @@ fn bell_counting_and_text_stripping_agree_with_the_parser() {
         assert_eq!(strip(dcs.as_bytes()), "shown");
     }
     assert_eq!(strip(b"a\x1b\x1b[31mb"), "ab");
+    // OSC 被另一条转义序列打断：后面那条是真的（与 osc_sequences / vte 一致）
+    assert_eq!(osc::count_bel(b"\x1b]0;x\x1b[m\x07"), 1, "打断后的 BEL 是真响铃");
+    assert_eq!(strip(b"\x1b]0;x\x1b[31mshown"), "shown");
+    assert_eq!(
+        osc::find_sub_outside_string_escapes(b"\x1b]0;x\x1b[2J", b"\x1b[2J"),
+        Some(5),
+        "没收尾的 OSC 后面的清屏是真的"
+    );
+    assert_eq!(
+        osc::find_sub_outside_string_escapes(b"\x1bPq\x18\x1b[2J", b"\x1b[2J"),
+        Some(4),
+        "DCS 被 CAN 打断后的清屏是真的"
+    );
     assert_eq!(osc::count_bel(b"\x1b\x1b]0;t\x07"), 0, "那个 BEL 是 OSC 的收尾");
 }
 

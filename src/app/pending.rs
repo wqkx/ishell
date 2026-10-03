@@ -27,7 +27,7 @@ pub(super) struct SessionPending {
     /// 保存写入进度（path, done, total）——驱动编辑器标签「珊瑚→绿」保存动画
     pub save_progress: Vec<(String, u64, u64)>,
     /// 跟随读取返回：(路径, 新增字节, 新 offset, 是否截断/轮转)
-    pub tail: Vec<(String, Vec<u8>, u64, bool)>,
+    pub tail: Vec<(String, u64, Vec<u8>, u64, bool)>, // path, from, data, offset, truncated
     /// PDF 页数查询返回：(占位标签 id, 页数)
     pub pdf_info: Vec<(u64, u32)>,
     /// PDF 单页 PNG 返回：(路径, 页码, PNG 字节)

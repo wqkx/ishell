@@ -441,6 +441,9 @@ pub enum WorkerEvent {
     /// truncated = 文件被截断/轮转（此时 offset 已重置为新大小）
     FileTail {
         path: String,
+        /// 这次读取的起点（即请求里的 offset）。UI 只收起点与当前位置一致的回包：超时重发后
+        /// 新旧两个回包都会到，不核对的话同一段内容会被追加两次。
+        from: u64,
         data: Vec<u8>,
         offset: u64,
         truncated: bool,

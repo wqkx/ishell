@@ -561,6 +561,7 @@ async fn tail_file(path: &str, offset: u64, sink: &UiSink) {
         Err(_) => {
             sink.send(WorkerEvent::FileTail {
                 path: path.to_string(),
+                from: offset,
                 data: Vec::new(),
                 offset,
                 truncated: false,
@@ -572,6 +573,7 @@ async fn tail_file(path: &str, offset: u64, sink: &UiSink) {
         // 初始化：只报当前大小，不读数据（相当于 tail -f -n 0）
         sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
             offset: size,
             truncated: false,
@@ -579,11 +581,13 @@ async fn tail_file(path: &str, offset: u64, sink: &UiSink) {
         return;
     }
     if size < offset {
-        // 文件被截断/轮转：重置到新大小
+        // 截断/轮转：下一次从新文件的**开头**读（与 SFTP 一致）。回报 size 的话，轮转后已经
+        // 写进去的内容会被整段跳过——而提示文案说的是「其后为新文件的内容」。
         sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
-            offset: size,
+            offset: 0,
             truncated: true,
         });
         return;
@@ -591,6 +595,7 @@ async fn tail_file(path: &str, offset: u64, sink: &UiSink) {
     if size == offset {
         sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
             offset,
             truncated: false,
@@ -619,6 +624,7 @@ async fn tail_file(path: &str, offset: u64, sink: &UiSink) {
             let n = data.len() as u64;
             sink.send(WorkerEvent::FileTail {
                 path: path.to_string(),
+                from: offset,
                 data,
                 offset: offset + n,
                 truncated: false,
@@ -626,6 +632,7 @@ async fn tail_file(path: &str, offset: u64, sink: &UiSink) {
         }
         Err(_) => sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
             offset,
             truncated: false,
@@ -1054,6 +1061,27 @@ mod tests {
             .build()
             .expect("build test runtime")
             .block_on(f)
+    }
+
+    /// 本机文件被截断/轮转后，下一次跟随读取从新文件开头读起（与 SFTP 一致）。回报新大小的
+    /// 话，轮转后已经写进新文件的内容整段被跳过。
+    #[test]
+    fn a_truncated_local_file_is_followed_from_its_start() {
+        let tmp = TmpDir::new("tail-trunc");
+        let file = tmp.0.join("app.log");
+        std::fs::write(&file, b"new\n").expect("w");
+        let (sink, rx) = test_sink();
+        block_on(tail_file(&file.to_string_lossy(), 100, &sink));
+        let got = rx.try_iter().find_map(|e| match e {
+            WorkerEvent::FileTail {
+                from,
+                offset,
+                truncated,
+                ..
+            } => Some((from, offset, truncated)),
+            _ => None,
+        });
+        assert_eq!(got, Some((100, 0, true)));
     }
 
     /// 临时目录，Drop 时清理。不引 tempfile 依赖。

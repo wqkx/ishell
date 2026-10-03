@@ -451,6 +451,52 @@ impl EditorTab {
         });
     }
 
+    /// 一次已判超时的保存其实成功了（迟到的 `FileSaved`）。远端现在是那次写入的内容，而
+    /// 不知道它是哪个版本——按「与远端不一致」处理：宁可多提示一次未保存，也不能在用户撤销回
+    /// 打开时的内容后把标签判成干净（那样远端那份就再也存不回去了）。mtime 照样回填，否则
+    /// 下一次保存必然被判成「文件已被外部修改」。
+    pub(super) fn note_late_save(&mut self, mtime: u32, size: u64) {
+        self.editor.note_saved_mtime(mtime);
+        self.file_size = Some(size);
+        self.editor.note_remote_diverged();
+    }
+
+    /// 收到一次跟随读取的回包。`from` 是那次读取的起点：与当前位置不符的是过时回包（超时
+    /// 重发后，新旧两个回包都会到，两者起点相同），整个丢掉——否则同一段内容追加两次。
+    pub(super) fn apply_tail_reply(&mut self, from: u64, data: &[u8], offset: u64, truncated: bool) {
+        if from != self.tail_offset {
+            return;
+        }
+        self.tail_pending = false;
+        self.tail_offset = offset;
+        if !self.editor.follow {
+            return; // 已关闭跟随：丢弃迟到的数据
+        }
+        if truncated {
+            self.tail_carry.clear(); // 旧文件残留的半个字符不能拼到新内容前面
+            // 只在状态栏提示，不往缓冲里写字：写进去的话，退出跟随后再保存，
+            // 这行提示就成了文件内容。
+            self.editor.set_status(crate::i18n::tr(
+                "文件被截断/轮转，其后为新文件的内容",
+                "File was truncated/rotated; what follows is the new file",
+            ));
+        }
+        if !data.is_empty() {
+            // 跨块解码：与上一块留下的尾字节拼接，再把本块末尾「还没读完」的部分
+            //（被切开的多字节字符、可能是 CRLF 前一半的 \r）留到下一块。
+            let mut bytes = std::mem::take(&mut self.tail_carry);
+            bytes.extend_from_slice(data);
+            let enc = crate::textcodec::encoding_for(self.editor.encoding());
+            let keep = crate::textcodec::tail_carry_len(enc, &bytes);
+            self.tail_carry = bytes.split_off(bytes.len() - keep);
+            if !bytes.is_empty() {
+                let (cow, _) = enc.decode_without_bom_handling(&bytes);
+                let txt = cow.replace("\r\n", "\n");
+                self.editor.append_tail(&txt);
+            }
+        }
+    }
+
     /// 按指定编码重新读取文件（自动探测猜错了编码时用）。只在「没有未保存的修改、不在
     /// 跟随、不在加载」时进行——重新读取会换掉整个缓冲。返回是否已发起。
     pub(super) fn begin_reopen(&mut self, encoding: String) -> bool {
@@ -741,6 +787,36 @@ mod save_fsm_tests {
             save_op: 0,
             save_deadline: None,
         }
+    }
+
+    /// 超时后迟到的保存成功：远端已是那次写入的内容。撤销回打开时的内容也不能算干净。
+    #[test]
+    fn a_late_save_keeps_the_tab_dirty_after_undoing_to_the_opened_content() {
+        let mut t = tab();
+        t.editor.set_encoding("GBK".into());
+        t.editor.set_encoding("UTF-8".into()); // 改回打开时的样子
+        assert!(!t.editor.dirty());
+        t.note_late_save(42, 3);
+        assert!(t.editor.dirty(), "远端是迟到写入的内容，与编辑器不一致");
+        assert_eq!(t.editor.mtime(), 42);
+        assert_eq!(t.file_size, Some(3));
+    }
+
+    /// 跟随读取超时重发后，新旧两个回包都会到（起点相同）。只能追加一次。
+    #[test]
+    fn a_duplicate_tail_reply_is_not_appended_twice() {
+        let mut t = tab();
+        t.editor.follow = true;
+        t.tail_offset = 3;
+        t.tail_pending = true;
+        t.apply_tail_reply(3, b"abc\n", 7, false);
+        t.apply_tail_reply(3, b"abc\n", 7, false); // 重发那次的回包
+        assert_eq!(t.editor.content.matches("abc").count(), 1, "{:?}", t.editor.content);
+        assert_eq!(t.tail_offset, 7);
+        assert!(!t.tail_pending);
+        // 起点对得上的下一块照常追加
+        t.apply_tail_reply(7, b"def\n", 11, false);
+        assert!(t.editor.content.ends_with("abc\ndef\n"), "{:?}", t.editor.content);
     }
 
     fn tab_with(uid: u64, id: u8, dirty: bool) -> EditorTab {

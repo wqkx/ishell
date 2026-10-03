@@ -81,8 +81,11 @@ impl App {
             let mut bytes = self.broadcast_input.clone().into_bytes();
             bytes.push(b'\r'); // 用 CR（Enter）提交，与其它终端输入一致；\n 在多数行规程下不会执行命令
                                // ai_owned 会话是只读的（AI 专用），广播不应该往里面灌用户输入
-            for s in self.sessions.iter().filter(|s| s.connected && !s.ai_owned) {
+            for s in self.sessions.iter_mut().filter(|s| s.connected && !s.ai_owned) {
                 let _ = s.cmd_tx.send(UiCommand::TerminalInput(bytes.clone()));
+                // 用户亲手送出的输入：自动注入（配对 token、重连 cd）从此不许再替他敲键盘。
+                // 不记的话，广播一条 `ssh 别的主机` 停在密码提示符时，注入可能打进密码框。
+                s.terminal.note_user_input();
             }
             self.broadcast_input.clear();
         }

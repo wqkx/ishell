@@ -151,8 +151,11 @@ impl Terminal {
                     } else {
                         out.push(0x03);
                         if !alt {
+                            // Ctrl+C 让 shell 给出一个全新的空行：影子重新可信（同下方 Key::C
+                            // 分支——Linux / Windows 上 Ctrl+C 走的是这里，那个分支走不到）
                             self.input_line.clear();
                             self.hist = None;
+                            self.input_untracked = false;
                         }
                     }
                 }

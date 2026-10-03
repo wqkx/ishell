@@ -325,7 +325,7 @@ impl App {
         let mut new_images: Vec<(String, Vec<u8>, String, u64)> = Vec::new(); // path, data, title, uid
         let mut warns: Vec<String> = Vec::new(); // 需弹 toast 的警告
         let mut too_large: Vec<(u64, u64, String, u64)> = Vec::new(); // uid, id, path, size
-        let mut tails: Vec<(u64, String, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, data, offset, truncated
+        let mut tails: Vec<(u64, String, u64, Vec<u8>, u64, bool)> = Vec::new(); // uid, path, from, data, offset, truncated
         let mut pdf_infos: Vec<(u64, u64, u32)> = Vec::new(); // uid, 占位 id, 页数
         let mut pdf_pages: Vec<(u64, String, u32, Vec<u8>)> = Vec::new(); // uid, path, page, png
         let mut pdf_searches: Vec<FramePdfSearch> = Vec::new();
@@ -353,8 +353,8 @@ impl App {
             for f in s.pending.open.drain(..) {
                 filled.push((s.uid, f));
             }
-            for (path, data, offset, truncated) in s.pending.tail.drain(..) {
-                tails.push((s.uid, path, data, offset, truncated));
+            for (path, from, data, offset, truncated) in s.pending.tail.drain(..) {
+                tails.push((s.uid, path, from, data, offset, truncated));
             }
             for w in s.pending.warn.drain(..) {
                 warns.push(w);
@@ -489,40 +489,13 @@ impl App {
             let now = self.ctx.input(|i| i.time);
             let mut edst = lock_mutex(&self.editor_state);
             let mut any_follow = false;
-            for (uid, path, data, offset, truncated) in tails {
+            for (uid, path, from, data, offset, truncated) in tails {
                 if let Some(t) = edst
                     .tabs
                     .iter_mut()
                     .find(|t| t.uid == uid && t.editor.path == path)
                 {
-                    t.tail_pending = false;
-                    t.tail_offset = offset;
-                    if !t.editor.follow {
-                        continue; // 已关闭跟随：丢弃迟到的数据
-                    }
-                    if truncated {
-                        t.tail_carry.clear(); // 旧文件残留的半个字符不能拼到新内容前面
-                        // 只在状态栏提示，不往缓冲里写字：写进去的话，退出跟随后再保存，
-                        // 这行提示就成了文件内容。
-                        t.editor.set_status(crate::i18n::tr(
-                            "文件被截断/轮转，其后为新文件的内容",
-                            "File was truncated/rotated; what follows is the new file",
-                        ));
-                    }
-                    if !data.is_empty() {
-                        // 跨块解码：与上一块留下的尾字节拼接，再把本块末尾「还没读完」的部分
-                        //（被切开的多字节字符、可能是 CRLF 前一半的 \r）留到下一块。
-                        let mut bytes = std::mem::take(&mut t.tail_carry);
-                        bytes.extend_from_slice(&data);
-                        let enc = crate::textcodec::encoding_for(t.editor.encoding());
-                        let keep = crate::textcodec::tail_carry_len(enc, &bytes);
-                        t.tail_carry = bytes.split_off(bytes.len() - keep);
-                        if !bytes.is_empty() {
-                            let (cow, _) = enc.decode_without_bom_handling(&bytes);
-                            let txt = cow.replace("\r\n", "\n");
-                            t.editor.append_tail(&txt);
-                        }
-                    }
+                    t.apply_tail_reply(from, &data, offset, truncated);
                 }
             }
             for t in edst.tabs.iter_mut() {

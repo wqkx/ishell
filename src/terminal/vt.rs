@@ -28,13 +28,21 @@ pub(super) fn strip_ansi_to_text(bytes: &[u8]) -> String {
                 Some(']') => {
                     // OSC：ESC ] ... BEL 或 ESC \
                     chars.next();
-                    while let Some(c2) = chars.next() {
-                        // BEL 收尾；CAN / SUB 打断序列，后面的内容回到正文
-                        if matches!(c2, '\x07' | '\x18' | '\x1a') {
+                    while let Some(&c2) = chars.peek() {
+                        // OSC 里的 ESC：`ESC \` 是收尾；别的 ESC 打断这条 OSC（同
+                        // osc_sequences / vte），留给外层当一条新序列处理
+                        if c2 == '\x1b' {
+                            let mut ahead = chars.clone();
+                            ahead.next();
+                            if ahead.peek() == Some(&'\\') {
+                                chars.next();
+                                chars.next();
+                            }
                             break;
                         }
-                        if c2 == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
+                        chars.next();
+                        // BEL 收尾；CAN / SUB 打断序列，后面的内容回到正文
+                        if matches!(c2, '\x07' | '\x18' | '\x1a') {
                             break;
                         }
                     }

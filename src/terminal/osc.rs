@@ -276,8 +276,10 @@ pub(super) fn count_bel(data: &[u8]) -> usize {
                                 i += 1;
                                 break;
                             }
-                            if data[i] == 0x1b && data.get(i + 1) == Some(&b'\\') {
-                                i += 2;
+                            if data[i] == 0x1b {
+                                if data.get(i + 1) == Some(&b'\\') {
+                                    i += 2;
+                                } // 否则 OSC 被这个 ESC 打断（同 osc_sequences），从它重新扫
                                 break;
                             }
                             i += 1;
@@ -463,8 +465,10 @@ pub(super) fn find_sub_outside_string_escapes(hay: &[u8], needle: &[u8]) -> Opti
                         i += 1;
                         break;
                     }
-                    if hay[i] == 0x1b && hay.get(i + 1) == Some(&b'\\') {
-                        i += 2;
+                    if hay[i] == 0x1b {
+                        if hay.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                        } // 否则 OSC 被这个 ESC 打断（同 osc_sequences），从它重新扫
                         break;
                     }
                     i += 1;
@@ -473,6 +477,10 @@ pub(super) fn find_sub_outside_string_escapes(hay: &[u8], needle: &[u8]) -> Opti
             Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
                 i += 2;
                 while i < hay.len() {
+                    if matches!(hay[i], 0x18 | 0x1a) {
+                        i += 1;
+                        break;
+                    }
                     if hay[i] == 0x1b && hay.get(i + 1) == Some(&b'\\') {
                         i += 2;
                         break;
@@ -676,10 +684,15 @@ mod string_escape_scan_tests {
         assert_eq!(find_sub_outside_string_escapes(data, b"\x1b[3J"), Some(15));
     }
 
+    /// OSC 负载里不能有 ESC：vte 0.15 的 `advance_osc_string` 遇到 0x1B 就结束这条 OSC、
+    /// 转入 Escape 状态，后面的 `[6n` 是一条真查询（解析器照样执行它）。扫描器跟着解析器走；
+    /// 真正当负载跳过的是 BEL / ST 之前的普通字节。
     #[test]
-    fn cpr_inside_osc_payload_is_ignored() {
+    fn an_escape_inside_an_osc_ends_it_like_the_parser_does() {
         let osc = b"\x1b]9;oops\x1b[6n\x07";
-        assert!(find_sub_outside_string_escapes(osc, b"\x1b[6n").is_none());
+        assert_eq!(find_sub_outside_string_escapes(osc, b"\x1b[6n"), Some(8));
+        let plain = b"\x1b]9;oops [6n\x07\x1b[0m";
+        assert!(find_sub_outside_string_escapes(plain, b"[6n").is_none());
     }
 
     #[test]

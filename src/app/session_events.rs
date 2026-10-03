@@ -271,11 +271,12 @@ impl Session {
                 }
                 WorkerEvent::FileTail {
                     path,
+                    from,
                     data,
                     offset,
                     truncated,
                 } => {
-                    self.pending.tail.push((path, data, offset, truncated));
+                    self.pending.tail.push((path, from, data, offset, truncated));
                 }
                 WorkerEvent::PdfInfo { id, path: _, pages } => {
                     self.pending.pdf_info.push((id, pages));

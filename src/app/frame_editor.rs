@@ -353,8 +353,7 @@ impl App {
                         .iter_mut()
                         .find(|t| t.uid == uid && t.editor.path == _path && !t.is_saving())
                     {
-                        t.editor.note_saved_mtime(mtime);
-                        t.file_size = Some(size);
+                        t.note_late_save(mtime, size);
                     }
                     continue;
                 }

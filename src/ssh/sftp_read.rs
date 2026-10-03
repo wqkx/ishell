@@ -23,6 +23,7 @@ pub(in crate::ssh) async fn tail_file(
             // 瞬时错误（弱网等）：offset 原样返回，UI 下一轮重试
             sink.send(WorkerEvent::FileTail {
                 path: path.to_string(),
+                from: offset,
                 data: Vec::new(),
                 offset,
                 truncated: false,
@@ -33,6 +34,7 @@ pub(in crate::ssh) async fn tail_file(
     if offset == u64::MAX {
         sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
             offset: size,
             truncated: false,
@@ -44,6 +46,7 @@ pub(in crate::ssh) async fn tail_file(
         // 内容会被整段跳过——而提示文案说的是「以下为新内容」。
         sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
             offset: 0,
             truncated: true,
@@ -53,6 +56,7 @@ pub(in crate::ssh) async fn tail_file(
     if size == offset {
         sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
             offset,
             truncated: false,
@@ -81,6 +85,7 @@ pub(in crate::ssh) async fn tail_file(
             let n = data.len() as u64;
             sink.send(WorkerEvent::FileTail {
                 path: path.to_string(),
+                from: offset,
                 data,
                 offset: offset + n,
                 truncated: false,
@@ -88,6 +93,7 @@ pub(in crate::ssh) async fn tail_file(
         }
         Err(_) => sink.send(WorkerEvent::FileTail {
             path: path.to_string(),
+            from: offset,
             data: Vec::new(),
             offset,
             truncated: false,

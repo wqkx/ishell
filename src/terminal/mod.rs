@@ -612,8 +612,8 @@ impl Terminal {
     }
 
     /// 记一次「用户亲手向远端送了输入」。键盘事件在 `collect_input` 里就地记；不经过
-    /// 那里的路径（右键粘贴、鼠标上报、被吞掉按下事件的 Ctrl+V）调这个。
-    pub(super) fn note_user_input(&mut self) {
+    /// 那里的路径（右键粘贴、鼠标上报、被吞掉按下事件的 Ctrl+V、广播输入）调这个。
+    pub fn note_user_input(&mut self) {
         self.last_input_at = Some(std::time::Instant::now());
     }
 
