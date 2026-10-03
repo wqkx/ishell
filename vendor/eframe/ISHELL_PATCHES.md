@@ -15,9 +15,18 @@ hidden window cannot freeze the event-loop thread (and with it MCP request handl
      must not keep pushing it out, or direct paint never fires while hidden.
    - Clear the fallback when `RedrawRequested` is delivered.
 
-Do **not** fold `is_invisible_or_minimized` into the paint-time `is_visible` flag:
-that skipped `App::ui` whenever the OS reported the window invisible/minimized,
-and on some desktops the first frames look “invisible”, so the UI never appeared.
+2. **`src/native/glow_integration.rs`** — While the window is minimized (and after
+   the first frame), skip only `swap_buffers`; `App::ui` and painting still run so
+   texture deltas are not lost. Decision in `winit_integration::skip_swap_while_minimized`;
+   `EpiIntegration::is_first_frame` added for it. The wgpu twin is **not** patched:
+   iShell builds only the `glow` backend, and wgpu presents inside painting.
 
-iShell also disables vsync by default on Wayland (`DontWait`) so a fallback
-direct paint cannot hang inside `swap_buffers` — see `src/main.rs`.
+Do **not** fold `is_invisible_or_minimized` into the paint-time `is_visible` flag
+(0.24.2 did, reverted in 0.24.4): eframe creates windows hidden and shows them from
+the first painted frame (`post_rendering`). X11, Windows and macOS report that hidden
+window as invisible, so the first frame never happened and the UI never appeared.
+Only Wayland (which reports `None`) escaped.
+
+iShell also disables vsync by default in Wayland sessions (`DontWait`) so a fallback
+direct paint cannot hang inside `swap_buffers` — including when iShell is forced onto
+X11 (XWayland) for input methods; see `src/main.rs`.

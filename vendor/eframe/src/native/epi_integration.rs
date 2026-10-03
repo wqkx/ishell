@@ -323,6 +323,11 @@ impl EpiIntegration {
         self.frame.info.cpu_usage = Some(seconds);
     }
 
+    /// iShell: whether the first frame (the one that un-hides the window) is still to come.
+    pub fn is_first_frame(&self) -> bool {
+        self.is_first_frame
+    }
+
     pub fn post_rendering(&mut self, window: &winit::window::Window) {
         profiling::function_scope!();
         if std::mem::take(&mut self.is_first_frame) {

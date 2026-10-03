@@ -673,6 +673,12 @@ impl GlowWinitRunning<'_> {
 
         egui_winit.handle_platform_output(&window, platform_output);
 
+        // iShell: decided before `post_rendering` clears the first-frame flag.
+        let skip_swap = crate::native::winit_integration::skip_swap_while_minimized(
+            window.is_minimized(),
+            integration.is_first_frame(),
+        );
+
         if is_visible {
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
@@ -743,7 +749,9 @@ impl GlowWinitRunning<'_> {
                     )
                 })?;
 
-                gl_surface.swap_buffers(context)?;
+                if !skip_swap {
+                    gl_surface.swap_buffers(context)?;
+                }
                 frame_timer.resume();
             }
 

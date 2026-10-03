@@ -65,6 +65,12 @@ fn main() -> eframe::Result<()> {
     // 强制 X11（XWayland）：Wayland 下 winit 类应用 fcitx/输入法常失效（与 Chrome/Electron 同病），
     // 清空 WAYLAND_DISPLAY 让 winit 退回 X11（其 XIM 输入法正常）。须在 eframe/winit 初始化前。
     // 由持久化设置或环境变量 ISHELL_X11 开启；仅 Linux 有意义。
+    // 必须在下面清掉 WAYLAND_DISPLAY **之前**判断：强制 X11 时跑在 XWayland 上，被藏起的窗口
+    // 同样收不到合成器的帧回调，vsync 的风险和原生 Wayland 一样。
+    let wayland_session = is_wayland_session(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+    );
     #[cfg(target_os = "linux")]
     if store::load_force_x11() || std::env::var_os("ISHELL_X11").is_some() {
         std::env::remove_var("WAYLAND_DISPLAY");
@@ -105,9 +111,10 @@ fn main() -> eframe::Result<()> {
     // callback；窗口一旦被合成器藏起（最小化/其它工作区），那次回调可能永远不来，事件循环
     // 线程（连带 MCP 排空）就停死。glutin 文档也写了这一点。而且 Wayland 上
     // `Window::is_minimized` / `Occluded` 都不可用，应用侧无法靠「检测到最小化就跳过绘制」
-    // 规避——所以 **Wayland 默认关 vsync**（`DontWait`）。X11 / 其它平台仍默认开。
+    // 规避——所以 **Wayland 会话默认关 vsync**（`DontWait`），强制 X11（XWayland）时也一样。
+    // 纯 X11 / 其它平台仍默认开。
     //
-    // 另有 eframe 本地补丁（`vendor/eframe`）：可检测最小化的平台跳过 paint/swap；Wayland
+    // 另有 eframe 本地补丁（`vendor/eframe`）：可检测最小化的平台只跳过 swap；Wayland
     // 上优先 `request_redraw`，若 ~100ms 内没有 `RedrawRequested` 再直接 paint（见
     // ISHELL_PATCHES.md）——可见窗口仍跟合成器节奏，隐藏时 MCP 不会饿死。
     //
@@ -116,12 +123,12 @@ fn main() -> eframe::Result<()> {
     let vsync = choose_vsync(
         std::env::var_os("ISHELL_NO_VSYNC").is_some(),
         std::env::var_os("ISHELL_VSYNC").is_some(),
-        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        wayland_session,
     );
     if !vsync {
         if std::env::var_os("ISHELL_NO_VSYNC").is_some() {
             log::info!("已关闭垂直同步（ISHELL_NO_VSYNC）：交换缓冲不再等垂直同步");
-        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        } else if wayland_session {
             log::info!(
                 "Wayland 下默认关闭垂直同步，避免最小化后 swap_buffers 阻塞事件循环/MCP；\
                  需要时可设 ISHELL_VSYNC=1（有卡死风险）"
@@ -142,6 +149,12 @@ fn main() -> eframe::Result<()> {
 }
 
 /// 是否启用垂直同步。纯函数，便于单测覆盖 Wayland 默认关 / 环境变量覆盖。
+/// 是否运行在 Wayland 会话里（含被强制走 XWayland 的情况）。`XDG_SESSION_TYPE` 兜住
+/// `WAYLAND_DISPLAY` 已被别处清掉的情形；两者都没有就按 X11 / 其它平台算。
+fn is_wayland_session(wayland_display: bool, session_type: Option<&str>) -> bool {
+    wayland_display || session_type.is_some_and(|t| t.eq_ignore_ascii_case("wayland"))
+}
+
 fn choose_vsync(force_no_vsync: bool, force_vsync: bool, on_wayland: bool) -> bool {
     if force_no_vsync {
         false
@@ -210,7 +223,30 @@ mod desktop_entry_tests {
 
 #[cfg(test)]
 mod vsync_policy_tests {
-    use super::choose_vsync;
+    use super::{choose_vsync, is_wayland_session};
+
+    /// 强制 X11 会清掉 WAYLAND_DISPLAY，但会话仍是 Wayland（XWayland）：照样默认关 vsync。
+    #[test]
+    fn forced_x11_inside_a_wayland_session_counts_as_wayland() {
+        assert!(is_wayland_session(false, Some("wayland")));
+        assert!(is_wayland_session(true, None));
+        assert!(!is_wayland_session(false, Some("x11")));
+        assert!(!is_wayland_session(false, None));
+    }
+
+    /// 钉子不是门禁（同下方 wayland_repaint_policy_tests：eframe 不是 workspace 成员，
+    /// 这里复述 `winit_integration::skip_swap_while_minimized` 的合约）。首帧绝不能跳过——
+    /// 窗口是首帧画完才显示的，跳过就永远不显示（0.24.2 的「启动没界面」）。
+    #[test]
+    fn swap_is_skipped_only_when_minimized_after_the_first_frame() {
+        fn skip(min: Option<bool>, first: bool) -> bool {
+            !first && min == Some(true)
+        }
+        assert!(skip(Some(true), false));
+        assert!(!skip(Some(true), true), "首帧被跳过，窗口永远不显示");
+        assert!(!skip(Some(false), false));
+        assert!(!skip(None, false), "Wayland 报不了最小化，交给 run.rs 的回退");
+    }
 
     #[test]
     fn wayland_defaults_to_no_vsync() {

@@ -17,6 +17,21 @@ pub fn is_invisible_or_minimized(window: &Window) -> bool {
     window.is_visible() == Some(false) || window.is_minimized() == Some(true)
 }
 
+/// iShell: skip `swap_buffers` for this frame?
+///
+/// Only while the window is **minimized** and only **after the first frame**. With vsync on,
+/// a swap on a surface the compositor no longer presents may block the event-loop thread
+/// (and with it `App::logic` / MCP). `App::ui` and painting still run, so texture updates are
+/// not lost; only the present is skipped.
+///
+/// Do not use `is_invisible_or_minimized` here: windows start hidden and are shown by the
+/// first painted frame (`post_rendering`), and X11/Windows/macOS report that hidden window as
+/// invisible — gating on it means the first frame never happens and the window never shows.
+/// The first-frame exemption also covers a window that is minimized before it was ever shown.
+pub fn skip_swap_while_minimized(is_minimized: Option<bool>, is_first_frame: bool) -> bool {
+    !is_first_frame && is_minimized == Some(true)
+}
+
 /// Create an egui context, restoring it from storage if possible.
 pub fn create_egui_context(storage: Option<&dyn crate::Storage>) -> egui::Context {
     profiling::function_scope!();
