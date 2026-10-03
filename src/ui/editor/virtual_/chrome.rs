@@ -4,7 +4,7 @@ use super::super::find::{
     find_widget, goto_widget, match_after_replace, rebuild_matches, replace_one_text, FindOut,
 };
 use super::super::Editor;
-use super::edit::{normalize_paste, v_apply, v_insert};
+use super::edit::{normalize_paste, v_apply, v_insert, v_mixed_eol, v_unify_eol};
 use super::geom::{v_line_of, v_line_range};
 use crate::theme::Palette;
 use crate::ui::highlight::Indent;
@@ -143,9 +143,30 @@ pub(super) fn show_status_and_find(ui: &mut egui::Ui, ed: &mut Editor, text_id: 
                     let col = ed.content[lsx..caret].chars().count() + 1;
                     ui.label(RichText::new(format!("Ln {}, Col {}", cl + 1, col)).color(Palette::TEXT_DIM).size(11.0));
                     ui.add_space(10.0);
-                    // 行尾：点击切换 LF/CRLF
+                    // 行尾：点击切换 LF/CRLF。混合行尾（部分行 CRLF，行末标着 CR）时显示「混合」，
+                    // 点开可统一成一种——否则选 LF 什么都不会发生（文件本来就按 LF 记），没有办法
+                    // 把它变成纯 LF。
                     let eol_txt = match ed.eol() { crate::proto::Eol::Crlf => "CRLF", crate::proto::Eol::Lf => "LF" };
-                    if ui.add(egui::Label::new(RichText::new(eol_txt).color(Palette::TEXT_DIM).size(11.0)).sense(egui::Sense::click())).on_hover_text(crate::i18n::tr("点击切换行尾 LF/CRLF", "Click to toggle LF/CRLF")).clicked() {
+                    if v_mixed_eol(ed) {
+                        ui.menu_button(RichText::new(crate::i18n::tr("混合", "Mixed")).color(Palette::WARN).size(11.0), |ui| {
+                            ui.set_min_width(150.0);
+                            let editable = !ed.is_readonly();
+                            for (label, eol) in [
+                                (crate::i18n::tr("统一为 LF", "Convert all to LF"), crate::proto::Eol::Lf),
+                                (crate::i18n::tr("统一为 CRLF", "Convert all to CRLF"), crate::proto::Eol::Crlf),
+                            ] {
+                                if ui.add_enabled(editable, egui::Button::new(label)).clicked() {
+                                    v_unify_eol(ed, eol);
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(crate::i18n::tr(
+                            "行尾不统一：标着 CR 的行是 CRLF，其余是 LF。保存时各行保持原样；点击可统一成一种。",
+                            "Mixed line endings: lines marked CR end in CRLF, the rest in LF. Saving keeps each line as is; click to convert.",
+                        ));
+                    } else if ui.add(egui::Label::new(RichText::new(eol_txt).color(Palette::TEXT_DIM).size(11.0)).sense(egui::Sense::click())).on_hover_text(crate::i18n::tr("点击切换行尾 LF/CRLF", "Click to toggle LF/CRLF")).clicked() {
                         let n = match ed.eol() { crate::proto::Eol::Crlf => crate::proto::Eol::Lf, crate::proto::Eol::Lf => crate::proto::Eol::Crlf };
                         ed.set_eol(n);
                     }

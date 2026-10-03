@@ -200,6 +200,32 @@ pub(super) fn v_insert(ed: &mut Editor, t: &str) {
     ed.vgoal_col = None;
 }
 /// 回车自动缩进：沿用当前行前导空白；行尾是 : { ( [ 时再加一级。
+/// 内容里还有 `\r\n` 吗（混合行尾：全文都是 CRLF 的文件打开时已统一成 LF，留下的 `\r\n`
+/// 只来自混合行尾的文件）。按内容版本缓存。
+pub(super) fn v_mixed_eol(ed: &mut Editor) -> bool {
+    if ed.eol_mixed.0 != ed.vver {
+        ed.eol_mixed = (ed.vver, ed.content.contains("\r\n"));
+    }
+    ed.eol_mixed.1
+}
+/// 把混合行尾统一成一种：内容里的 `\r\n` 全部归一成 `\n`（一次可撤销的编辑），保存时
+/// 按 `eol` 写出。光标留在原来那个字符上。只读时不动。
+pub(super) fn v_unify_eol(ed: &mut Editor, eol: crate::proto::Eol) {
+    if ed.is_readonly() {
+        return;
+    }
+    if ed.content.contains("\r\n") {
+        let caret = crate::ui::ime_safe::floor_boundary(&ed.content, ed.vcaret);
+        let shift = ed.content[..caret].matches("\r\n").count();
+        let norm = ed.content.replace("\r\n", "\n");
+        let len = ed.content.len();
+        v_apply(ed, 0, len, &norm);
+        ed.vcaret = caret - shift;
+        ed.vsel = None;
+        ed.vgoal_col = None;
+    }
+    ed.set_eol(eol);
+}
 pub(super) fn v_newline_indent(ed: &mut Editor) {
     let at = v_sel_range(ed).map(|(a, _)| a).unwrap_or(ed.vcaret);
     let li = v_line_of(ed, at);
@@ -792,6 +818,32 @@ mod tests {
         ed.vcaret = 0;
         v_move_line(&mut ed, false);
         assert_eq!(ed.content, "bc\r\na\nd", "两行之间的行尾被改写了");
+    }
+
+    /// 状态栏的「混合 → 统一为 LF / CRLF」：一次可撤销的编辑，光标留在原来那个字符上。
+    #[test]
+    fn unifying_mixed_line_ends_is_one_undoable_edit() {
+        let mut ed = mixed();
+        assert!(v_mixed_eol(&mut ed));
+        ed.vcaret = 4; // bc 的 c
+        v_unify_eol(&mut ed, crate::proto::Eol::Lf);
+        assert_eq!(ed.content, "a\nbc\nd");
+        assert_eq!(&ed.content[ed.vcaret..ed.vcaret + 1], "c", "光标没跟着字符走");
+        assert!(!v_mixed_eol(&mut ed), "缓存没随内容失效");
+        assert!(ed.dirty());
+        v_undo(&mut ed);
+        assert_eq!(ed.content, "a\r\nbc\nd");
+        assert!(v_mixed_eol(&mut ed));
+
+        let mut ed = mixed();
+        v_unify_eol(&mut ed, crate::proto::Eol::Crlf);
+        assert_eq!(ed.content, "a\nbc\nd");
+        assert_eq!(ed.eol(), crate::proto::Eol::Crlf, "保存时按 CRLF 写出");
+
+        let mut ed = mixed();
+        ed.readonly = true;
+        v_unify_eol(&mut ed, crate::proto::Eol::Lf);
+        assert_eq!(ed.content, "a\r\nbc\nd", "只读时不该改");
     }
 
     fn ed_with(content: &str) -> Editor {

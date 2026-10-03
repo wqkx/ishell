@@ -92,6 +92,9 @@ pub struct Editor {
     font_pt: Option<f32>,
     /// 内容版本号（每次 v_recompute +1，用于失效换行行数缓存）
     vver: u64,
+    /// 内容里是否还有 `\r\n`（混合行尾），按内容版本 vver 缓存：状态栏每帧要看，
+    /// 而大文件每帧扫一遍全文太贵。(版本, 结果)
+    eol_mixed: (u64, bool),
     /// 换行缓存：vrow_pre[i] = 第 i 逻辑行之前的累计视觉行数；末元素为总视觉行数
     vrow_pre: Vec<u32>,
     /// 换行缓存对应的列宽与版本（不匹配则重算 vrow_pre）
@@ -228,6 +231,7 @@ impl Editor {
             wrap: false,
             font_pt: crate::store::load_editor_font(),
             vver: 0,
+            eol_mixed: (u64::MAX, false),
             vrow_pre: Vec::new(),
             vrow_cols: 0,
             vrow_ver: u64::MAX,
