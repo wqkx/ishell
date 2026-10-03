@@ -174,6 +174,9 @@ pub(super) struct EditOp {
     /// 操作后光标位置（用于撤销/重做后定位）
     caret_after: usize,
     caret_before: usize,
+    /// 这次编辑同时改了保存用的行尾（之前, 之后）：「统一为 CRLF」。撤销 / 重做要一并还原，
+    /// 否则内容回到混合行尾、保存却仍按 CRLF 整篇写出。
+    eol_change: Option<(crate::proto::Eol, crate::proto::Eol)>,
 }
 
 impl Editor {

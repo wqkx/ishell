@@ -60,9 +60,20 @@ pub(super) fn rebuild_matches(ed: &mut Editor) {
         return;
     }
     if let Some(re) = build_find_regex(&ed.find, ed.find_case, ed.find_word, ed.find_regex) {
+        let bytes = ed.content.as_bytes();
+        // 混合行尾文件里的 `\r\n` 是一个行尾，选区 / 替换不能把它拆开：正则的 `.`、`\s` 会
+        // 吃进 `\r`。终点落在两者之间就退到 `\r` 之前，起点落在两者之间就把 `\r` 带上。
+        let splits = |p: usize| p > 0 && bytes[p - 1] == b'\r' && bytes.get(p) == Some(&b'\n');
         for m in re.find_iter(&ed.content).take(200_000) {
-            if m.end() > m.start() {
-                ed.find_matches.push((m.start(), m.end()));
+            let (mut a, mut b) = (m.start(), m.end());
+            if splits(b) {
+                b -= 1;
+            }
+            if splits(a) {
+                a -= 1;
+            }
+            if b > a {
+                ed.find_matches.push((a, b));
             }
         }
     }
@@ -450,6 +461,18 @@ mod tests {
         ed.find_regex = regex;
         ed.find_case = true;
         ed
+    }
+
+    /// 混合行尾文件里，正则的 `.` 会吃进 CRLF 的 `\r`：匹配不能把 `\r\n` 拆开——选区终点
+    /// 落进去，收起选区再打字就把字插到 `\r` 后面；替换则悄悄把这一行改成 LF。
+    #[test]
+    fn regex_matches_never_split_a_crlf_line_end() {
+        let mut ed = ed_find("foo bar\r\nfoo\n", "foo.*", "X", true);
+        rebuild_matches(&mut ed);
+        assert_eq!(ed.find_matches, [(0, 7), (9, 12)]);
+        let mut ed = ed_find("a\r\nb", "\\nb", "", true);
+        rebuild_matches(&mut ed);
+        assert_eq!(ed.find_matches, [(1, 4)], "起点要把 \\r 带上");
     }
 
     /// 「全部替换」只能动界面上数得出来的那些匹配。计数时空匹配被丢掉了（`a*` 在每个

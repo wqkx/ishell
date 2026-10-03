@@ -151,6 +151,7 @@ pub(super) fn v_apply(ed: &mut Editor, at: usize, removed_len: usize, inserted: 
         inserted: inserted.to_string(),
         caret_before,
         caret_after: ed.vcaret,
+        eol_change: None,
     });
     if ed.vundo.len() > 5000 {
         ed.vundo.remove(0);
@@ -219,10 +220,16 @@ pub(super) fn v_unify_eol(ed: &mut Editor, eol: crate::proto::Eol) {
         let shift = ed.content[..caret].matches("\r\n").count();
         let norm = ed.content.replace("\r\n", "\n");
         let len = ed.content.len();
+        let before = ed.eol();
         v_apply(ed, 0, len, &norm);
         ed.vcaret = caret - shift;
         ed.vsel = None;
         ed.vgoal_col = None;
+        // 行尾变化记进这条撤销记录（这是一条全文替换，不会和别的输入合并）
+        if let Some(op) = ed.vundo.last_mut() {
+            op.caret_after = ed.vcaret;
+            op.eol_change = Some((before, eol));
+        }
     }
     ed.set_eol(eol);
 }
@@ -363,6 +370,9 @@ pub(super) fn v_undo(ed: &mut Editor) {
         let end = op.at + op.inserted.len();
         v_remap_folds(ed, op.at, op.inserted.len(), &op.removed);
         ed.content.replace_range(op.at..end, &op.removed);
+        if let Some((before, _)) = op.eol_change {
+            ed.eol = before;
+        }
         // floor_boundary 而不是 `.min(len)`：`caret_before` 是**另一个形状**的缓冲区留下的
         // 偏移，撤销一段含组字文本的编辑后，它完全可能落在某个多字节字符中间。`.min` 只挡
         // 越界，落在字符中间照样 panic——而且不是崩在这里，是崩在下一次退格/删除/绘制上，
@@ -388,6 +398,9 @@ pub(super) fn v_redo(ed: &mut Editor) {
         let end = op.at + op.removed.len();
         v_remap_folds(ed, op.at, op.removed.len(), &op.inserted);
         ed.content.replace_range(op.at..end, &op.inserted);
+        if let Some((_, after)) = op.eol_change {
+            ed.eol = after;
+        }
         ed.vcaret = crate::ui::ime_safe::floor_boundary(&ed.content, op.caret_after); // 同 v_undo
         ed.vsel = None;
         ed.vgoal_col = None;
@@ -809,6 +822,13 @@ mod tests {
         v_delete_line(&mut ed);
         assert_eq!(ed.content, "bc\nd", "删行留下了半个行尾");
 
+        // 删最后一行：连上一行的整个 CRLF 一起删，不留下孤立的 \r
+        let mut ed = ed_with("a\r\nb");
+        super::super::wrap::v_recompute(&mut ed);
+        ed.vcaret = 4;
+        v_delete_line(&mut ed);
+        assert_eq!(ed.content, "a");
+
         let mut ed = mixed();
         ed.vcaret = 0;
         v_duplicate_line(&mut ed, true);
@@ -839,6 +859,16 @@ mod tests {
         v_unify_eol(&mut ed, crate::proto::Eol::Crlf);
         assert_eq!(ed.content, "a\nbc\nd");
         assert_eq!(ed.eol(), crate::proto::Eol::Crlf, "保存时按 CRLF 写出");
+
+        // 撤销「统一为 CRLF」要连行尾一起还原，否则内容回到混合、保存却整篇写成 CRLF
+        let mut ed = mixed();
+        v_unify_eol(&mut ed, crate::proto::Eol::Crlf);
+        v_undo(&mut ed);
+        assert_eq!(ed.eol(), crate::proto::Eol::Lf);
+        assert!(!ed.dirty(), "撤销回到打开时的样子应当是干净的");
+        v_redo(&mut ed);
+        assert_eq!(ed.eol(), crate::proto::Eol::Crlf);
+        assert_eq!(ed.content, "a\nbc\nd");
 
         let mut ed = mixed();
         ed.readonly = true;

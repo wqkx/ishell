@@ -130,7 +130,10 @@ pub(super) fn v_delete_line(ed: &mut Editor) {
         // 连同行尾一起删（CRLF 是两个字节，用「行尾 + 1」会把 `\n` 留下成一个空行）
         v_apply(ed, ls, super::geom::v_line_next(ed, li) - ls, "");
     } else if ls > 0 {
-        v_apply(ed, ls - 1, le - (ls - 1), "");
+        // 最后一行：连同上一行的行尾一起删。从上一行的行末文字处起删——`ls - 1` 只删掉 `\n`，
+        // CRLF 的 `\r` 会留下来成为正文
+        let prev_end = v_line_range(ed, li - 1).1;
+        v_apply(ed, prev_end, le - prev_end, "");
     } else {
         v_apply(ed, ls, le - ls, "");
     }
