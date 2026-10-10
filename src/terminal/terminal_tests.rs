@@ -3165,49 +3165,144 @@ fn a_string_payload_continued_in_the_next_packet_is_still_payload() {
     assert!(history.contains("after"));
 }
 
-/// 远端开着鼠标上报时，右键照常转发（tmux 的菜单、mc、vim 都靠它）；按住 Shift 的右键
-/// 留给本地菜单，不转发——与「Shift 拖动 = 本地选择」同一个约定。
-#[test]
-fn right_click_goes_to_the_remote_and_shift_keeps_it_local() {
-    let click = |modifiers: egui::Modifiers| {
-        let ctx = egui::Context::default();
-        crate::theme::apply(&ctx);
-        let mut t = Terminal::new();
-        t.feed(b"\x1b[?1000h\x1b[?1006h");
-        ui_frame(&mut t, &ctx, vec![]);
-        let pos = egui::pos2(200.0, 200.0);
-        ui_frame(&mut t, &ctx, vec![egui::Event::PointerMoved(pos)]);
-        let mut out = Vec::new();
-        for pressed in [true, false] {
-            // 「按着 Shift」读的是整帧的修饰键状态，所以这里不能用 ui_frame（它不带）
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(800.0, 600.0),
-                )),
-                modifiers,
-                events: vec![egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Secondary,
-                    pressed,
-                    modifiers,
-                }],
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| out.extend(t.ui(ui)));
-            });
-        }
-        String::from_utf8(out).unwrap()
+/// 跑一帧 `ui()`，带上整帧的修饰键状态（Shift 读的是 `i.modifiers`，`ui_frame` 不带）。
+fn ui_frame_mods(
+    t: &mut Terminal,
+    ctx: &egui::Context,
+    modifiers: egui::Modifiers,
+    events: Vec<egui::Event>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        modifiers,
+        events,
+        ..Default::default()
     };
-    let sent = click(egui::Modifiers::default());
-    assert!(sent.starts_with("\x1b[<2;"), "右键没有按按钮 2 上报：{sent:?}");
-    assert!(sent.ends_with('m'), "右键的释放没有上报：{sent:?}");
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| out = t.ui(ui));
+    });
+    out
+}
+
+/// Claude Code 全屏模式 / codex / opencode 一启动就开鼠标上报，却不处理右键。右键必须
+/// 弹本地菜单（复制 / 粘贴 / 查找都在里面）而不是被转发给它们吞掉；而且菜单一旦打开，
+/// 就不能因为 Shift 状态变了（`report_mouse` 每帧重算）在下一帧消失——d9f0d28 之后的
+/// 实现正是这样坏的：右键没菜单，Shift+右键的菜单一松 Shift 就没了。
+#[test]
+fn right_click_opens_the_local_menu_even_while_the_remote_tracks_the_mouse() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h"); // Claude Code 全屏：备用屏 + 鼠标上报
+    let none = egui::Modifiers::default();
+    ui_frame_mods(&mut t, &ctx, none, vec![]);
+    let pos = egui::pos2(200.0, 200.0);
+    ui_frame_mods(&mut t, &ctx, none, vec![egui::Event::PointerMoved(pos)]);
+    let mut sent = Vec::new();
+    for pressed in [true, false] {
+        sent.extend(ui_frame_mods(
+            &mut t,
+            &ctx,
+            none,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: none,
+            }],
+        ));
+    }
+    assert!(sent.is_empty(), "右键不该转发给远端：{sent:?}");
+    assert!(egui::Popup::is_any_open(&ctx), "右键没有弹出本地菜单");
+    // 菜单开着时 Shift 按下 / 松开都不能让它消失
     let shift = egui::Modifiers {
         shift: true,
         ..Default::default()
     };
-    assert_eq!(click(shift), "", "Shift+右键是本地菜单，不该转发");
+    for mods in [shift, shift, none, none] {
+        ui_frame_mods(&mut t, &ctx, mods, vec![]);
+        assert!(egui::Popup::is_any_open(&ctx), "菜单随 Shift 状态变化消失了");
+    }
+}
+
+/// Shift+右键是留给 tmux / mc / vim 的逃生口：转发给远端，且不弹本地菜单。释放只看按下
+/// 有没有转发过——先松 Shift 再松右键，远端也必须收到释放。
+#[test]
+fn shift_right_click_is_forwarded_and_opens_no_local_menu() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    t.feed(b"\x1b[?1000h\x1b[?1006h");
+    let none = egui::Modifiers::default();
+    let shift = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    ui_frame_mods(&mut t, &ctx, none, vec![]);
+    let pos = egui::pos2(200.0, 200.0);
+    ui_frame_mods(&mut t, &ctx, shift, vec![egui::Event::PointerMoved(pos)]);
+    let ev = |pressed, modifiers| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers,
+    };
+    let down = String::from_utf8(ui_frame_mods(&mut t, &ctx, shift, vec![ev(true, shift)])).unwrap();
+    // 释放时 Shift 已经先松开
+    let up = String::from_utf8(ui_frame_mods(&mut t, &ctx, none, vec![ev(false, none)])).unwrap();
+    assert!(down.starts_with("\x1b[<2;") && down.ends_with('M'), "Shift+右键按下没转发：{down:?}");
+    assert!(up.starts_with("\x1b[<2;") && up.ends_with('m'), "释放没转发：{up:?}");
+    assert!(!egui::Popup::is_any_open(&ctx), "被转发的右键不该再弹本地菜单");
+    // 之后不带 Shift 的右键回到本地菜单、不转发
+    let mut sent = Vec::new();
+    for pressed in [true, false] {
+        sent.extend(ui_frame_mods(&mut t, &ctx, none, vec![ev(pressed, none)]));
+    }
+    assert!(sent.is_empty(), "普通右键不该转发：{sent:?}");
+    assert!(egui::Popup::is_any_open(&ctx), "普通右键没有弹本地菜单");
+}
+
+/// 鼠标上报开着、又在备用屏上（Claude Code 全屏模式）时，按住 Shift 拖动仍要能做本地选择并
+/// 复制出文字——否则屏幕上的内容根本没有办法用 iShell 自己的剪贴板复制。
+#[test]
+fn shift_drag_selects_locally_on_the_alternate_screen_while_mouse_is_tracked() {
+    let ctx = egui::Context::default();
+    crate::theme::apply(&ctx);
+    let mut t = Terminal::new();
+    let shift = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    ui_frame_mods(&mut t, &ctx, shift, vec![]); // 先布局定下行列数，再写内容
+    t.feed(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+    for _ in 0..60 {
+        t.feed(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
+    }
+    let (a, b) = (egui::pos2(100.0, 200.0), egui::pos2(220.0, 200.0));
+    let btn = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: shift,
+    };
+    ui_frame_mods(&mut t, &ctx, shift, vec![egui::Event::PointerMoved(a)]);
+    let mut sent = ui_frame_mods(&mut t, &ctx, shift, vec![btn(a, true)]);
+    for step in 1..=4 {
+        let p = egui::pos2(a.x + (b.x - a.x) * step as f32 / 4.0, a.y);
+        sent.extend(ui_frame_mods(&mut t, &ctx, shift, vec![egui::Event::PointerMoved(p)]));
+    }
+    sent.extend(ui_frame_mods(&mut t, &ctx, shift, vec![btn(b, false)]));
+    assert!(sent.is_empty(), "按着 Shift 的拖动不该上报给远端：{sent:?}");
+    assert!(t.has_selection(), "备用屏上 Shift+拖动没有建立本地选区");
+    let text = t.selected_text().expect("选区里应有文字");
+    assert!(
+        text.len() > 3 && text.chars().all(|c| c.is_ascii_uppercase()),
+        "复制出来的不是屏幕上那行字母：{text:?}"
+    );
 }
 
 /// 1005（UTF-8）鼠标编码：每个值按码点发。走单字节分支的话，96 列以后发出去的不是合法

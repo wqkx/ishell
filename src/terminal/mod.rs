@@ -147,6 +147,8 @@ pub struct Terminal {
     search_hl: Option<u16>,
     /// 鼠标上报模式下当前按住的按钮（支持多键同持）
     held_btns: HeldButtons,
+    /// 一次 Shift+右键已转发给远端、释放还没转发（见 `ui()` 里的右键转发块）。
+    right_fwd: bool,
     /// OSC 52 刚写过剪贴板：写入的字符数，等 App 取走弹提示。
     clipboard_note: Option<usize>,
     /// shell 集成（OSC 133）的 token：只认带 `aid=<它>` 的标记。None = 没注入过我们的片段，
@@ -342,6 +344,7 @@ impl Terminal {
             saw_text_paste: false,
             saw_v_press: false,
             held_btns: HeldButtons::default(),
+            right_fwd: false,
             clipboard_note: None,
             osc133_token: None,
             ended_with_2j: false,
@@ -979,6 +982,56 @@ impl Terminal {
         let sb_w = 8.0;
         let sb_track = Rect::from_min_max(egui::pos2(rect.right() - sb_w, rect.top()), rect.max);
 
+        // Shift+右键：远端开着鼠标上报时转发给它（tmux / mc / vim 的右键菜单），其余右键
+        // 都是本地菜单。与 xterm 惯例（Shift = 绕过上报）正好相反，但 iShell 的右键菜单承载
+        // 复制 / 粘贴 / 查找，而 Claude Code 这类 TUI 开着上报却不处理右键，所以默认归本地。
+        // 判据用事件自带的修饰键；释放只看这次是否转发过按下，不管 Shift 此刻还按不按着，
+        // 否则先松 Shift 的话远端收不到释放。
+        let mut right_fwd_click = false; // 这一帧是一次被转发的右键点击：本地菜单不弹
+        if mmode != vt100::MouseProtocolMode::None || self.right_fwd {
+            let term_layer = resp.layer_id;
+            let ctx = ui.ctx().clone();
+            let events = ui.input(|i| i.events.clone());
+            for ev in &events {
+                let egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers,
+                } = ev
+                else {
+                    continue;
+                };
+                let mut cb = 2u8;
+                if modifiers.alt {
+                    cb += 8;
+                }
+                if modifiers.ctrl || modifiers.command {
+                    cb += 16;
+                }
+                let (r, c) = cell_at(*pos);
+                if *pressed {
+                    let on_top = rect.contains(*pos) && ctx.layer_id_at(*pos) == Some(term_layer);
+                    if modifiers.shift && mmode != vt100::MouseProtocolMode::None && on_top {
+                        self.right_fwd = true;
+                        encode_mouse(menc, cb, c, r, true, &mut mouse_out);
+                    }
+                } else if self.right_fwd {
+                    self.right_fwd = false;
+                    right_fwd_click = true;
+                    // X10(Press) 模式不上报释放；SGR 用原按钮码，传统编码用 3
+                    if mmode != vt100::MouseProtocolMode::Press {
+                        let rel = if menc == vt100::MouseProtocolEncoding::Sgr {
+                            cb
+                        } else {
+                            3 + (cb - 2)
+                        };
+                        encode_mouse(menc, rel, c, r, false, &mut mouse_out);
+                    }
+                }
+            }
+        }
+
         if report_mouse {
             // 转发鼠标按键/移动给远端。注意：这些事件取自全局输入队列（未经 egui 分层命中），
             // 故须自行判定终端是否为该点最上层——否则弹窗（如「新建连接」）盖在终端上时，
@@ -997,12 +1050,17 @@ impl Terminal {
                         pressed,
                         modifiers,
                     } => {
-                        // 右键照常转发（tmux 的菜单、mc、vim 都要用）；这时本地菜单不弹（见下方
-                        // context_menu），按住 Shift 右键才是本地菜单——与本地选择同一个约定。
+                        // 右键默认属于本地菜单（复制 / 粘贴 / 查找都在那里），不在这里转发；
+                        // Shift+右键转发给远端，见下面的右键转发块。
+                        //
+                        // 这里曾一度反过来（右键归远端、Shift+右键才是本地菜单）：而 Claude Code
+                        // 全屏模式 / codex / opencode 这类 TUI 一启动就开鼠标上报（`?1000h`
+                        // `?1006h`）又根本不处理右键——于是在它们里面右键既没有菜单、也没有
+                        // 任何反应，右键粘贴 / 复制 / 查找全部无路可走。转发右键带来的好处
+                        // （tmux / mc 的右键菜单）远小于这个代价；它们要用右键时按住 Shift。
                         let base = match button {
                             egui::PointerButton::Primary => 0u8,
                             egui::PointerButton::Middle => 1,
-                            egui::PointerButton::Secondary => 2,
                             _ => continue,
                         };
                         // 按下必须落在终端上；释放不管落在哪都要上报——只要这个键是在终端里
@@ -1076,12 +1134,10 @@ impl Terminal {
                     let press = crate::ui::drag_press_pos(ui, p);
                     if max_sb > 0 && press.x >= sb_track.left() {
                         self.sb_dragging = true;
-                    } else if self.parser.screen().alternate_screen() {
-                        // 备用屏选区与主屏历史共用绝对行坐标系——在 less 等上拖选、
-                        // 退出后再复制会拿到陈旧主屏内容。备用屏上禁用本地选区。
-                        self.sel_anchor = None;
-                        self.sel_cursor = None;
                     } else {
+                        // 备用屏上同样允许本地选区（Claude Code 全屏模式 / vim / less 里按住
+                        // Shift 拖选是复制屏幕文字的唯一办法）。选区跨进出备用屏会拿到陈旧
+                        // 内容的问题，由 `ensure_cursor_after_alt` 在进出时清掉选区负责。
                         let (ar, ac) = cell_at(press);
                         let (cr, cc) = cell_at(p);
                         // 锚点/游标都换算成绝对历史行：之后滚动/新输出选区跟随内容
@@ -1161,7 +1217,6 @@ impl Terminal {
         let mut do_paste = false;
         let mut do_find = false;
         let mut start_log = false;
-        // 远端开着鼠标上报时右键归远端，两边都响应会叠出两个菜单。
         let local_menu = |ui: &mut egui::Ui| {
             ui.set_min_width(170.0); // 菜单宽度足些，看着舒服
                                      // 菜单项不换行（否则英文较长的「Highlight ERROR/WARN」会折行，复选框被挤到两行正中）
@@ -1343,7 +1398,11 @@ impl Terminal {
                 ui.close();
             }
         };
-        if !report_mouse {
+        // 必须**每帧**调用，且不能以 `report_mouse` 为条件：egui 的弹出菜单是即时模式，只有
+        // 调用了才会画。`report_mouse` 里读的是当帧的 Shift 状态——以它为条件的话，Shift+右键
+        // 打开菜单后一松 Shift 去点菜单项，下一帧就不再调用，菜单当场消失。
+        // 被转发给远端的那次右键不弹本地菜单（菜单已经开着的话本来就是左键 / 别处的点击关它）
+        if !(right_fwd_click && resp.secondary_clicked()) {
             resp.context_menu(local_menu);
         }
         if start_log {
