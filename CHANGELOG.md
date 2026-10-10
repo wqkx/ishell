@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-10-10
+
 ### Fixed
 
 - **终端：Claude Code 全屏模式 / codex / opencode 里右键没有菜单、没法复制粘贴**：0.25.0 起远端开着
