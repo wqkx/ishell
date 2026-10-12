@@ -369,6 +369,10 @@ pub enum WorkerEvent {
     Disconnected(String),
     /// 来自远程 shell 的原始字节，喂给 vt100 解析器
     TerminalData(Vec<u8>),
+    /// 这条 SSH 连接专属的 MCP 反向转发 socket 已在**远端**注册成功，携带它的远端路径。
+    /// 每次（重）连接都是新的随机路径；UI 把它连同本次运行的密钥注入终端（见
+    /// `session::mcp_env_export_cmd`）。没开 AI 控制 / 注册失败时不会有这条事件。
+    McpEndpoint(String),
     /// 远端是否支持 Linux /proc 系统监控（连接后探测一次）
     MonitorSupport(bool),
     /// 目录列表结果。`gen` 原样回传自对应的 `ListDir` 请求，UI 据此丢弃乱序/陈旧结果。

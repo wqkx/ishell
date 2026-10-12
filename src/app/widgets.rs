@@ -173,8 +173,8 @@ pub fn view_context_menu(resp: &egui::Response) {
                         "让 AI（Claude Code 等）驱动已打开的真实终端：跑命令、读输出、读写文件。\n\
                          · 只监听本机 Unix socket（0600），不开任何网络端口\n\
                          · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
-                         · 多机共用一台 AI 服务器时：终端会话会自动注入配对 token（见下方\
-                         「配对 token」），代理只回你这台电脑\n\
+                         · 多机共用一台 AI 服务器时：只有在你这台 iShell 的终端里启动的 AI 才连得上\
+                         你的 iShell（终端会自动注入连接环境），别人的 AI 碰不到它\n\
                          · 关闭后立刻拒绝新的 MCP 操作；若本次启动时开关已开（监听还在），\
                          再打开即恢复，不必重启\n\
                          · 若启动时开关是关的，打开后需要重启 iShell 才会开始监听",
@@ -182,8 +182,9 @@ pub fn view_context_menu(resp: &egui::Response) {
                          read/write files.\n\
                          · Local Unix socket only (mode 0600) — no network port is opened\n\
                          · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
-                         · Sharing one AI server: terminal sessions auto-inject the pairing token \
-                         (see \"Pairing token\" below), so the proxy answers only YOUR computer\n\
+                         · Sharing one AI server: only an AI started inside one of YOUR iShell \
+                         terminals can reach your iShell (the terminal injects the connection \
+                         environment); anyone else's AI cannot touch it\n\
                          · Turning off refuses new MCP ops immediately; if the switch was on at \
                          startup (listener already running), turning it back on resumes without restart\n\
                          · If it was off at startup, turning it on needs an iShell restart to listen",
@@ -194,62 +195,14 @@ pub fn view_context_menu(resp: &egui::Response) {
                     ui.close();
                 }
 
-                // 0.21 起，原来的三个子开关（「AI 新开会话无需逐次确认」「自动注入配对标识」
-                // 「只响应配对请求」）不再是用户选项：全部内化为总开关的固定行为——总开关打开时，
-                // 新开会话默认不逐次打扰、每个会话自动注入配对标识、对匿名 AI 隐身。判定收敛在
-                // store 的三个 loader（恒真）与 `pair_inject_allowed`/`session_owned_by` 里。
-                // 多机配对 token：多台电脑共用同一台 AI 服务器账号时，各家 iShell 反向转发的
-                // socket 会堆在一起、代理无从区分谁是谁（见 store::mcp_pairing_token）。
-                // iShell 终端会话会在空闲时自动注入它（export ISHELL_PAIR_TOKEN），多数情况
-                // 无需手动配置；只有 AI 跑在 iShell 终端之外时才需要把下面这行填进那份 AI
-                // 的启动前缀（不要写进全局 MCP 配置 env）。
-                if mcp_on {
-                    let token = crate::store::mcp_pairing_token();
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(crate::i18n::tr("配对 token：", "Pairing token: "))
-                                .color(Palette::TEXT_DIM)
-                                .size(12.0),
-                        );
-                        ui.label(RichText::new(&token).monospace().size(12.0));
-                    });
-                    if ui
-                        .button(format!(
-                            "{}  {}",
-                            egui_phosphor::regular::COPY,
-                            crate::i18n::tr("复制配对配置", "Copy pairing config")
-                        ))
-                        .on_hover_text(crate::i18n::tr(
-                            "iShell 终端会自动注入配对 token 和主机名，多数情况无需手动配置。\n\
-                             仅当 AI 不在 iShell 终端里启动时，把复制的内容加在启动命令前面\
-                             （如 `ISHELL_PAIR_TOKEN=… ISHELL_HOST=… claude`）。\n\
-                             不要写进 AI 的全局 MCP 配置（如 ~/.claude.json 的 user 级 env）：\
-                             多人共用服务器账号时那份配置是所有人共用的，会把所有人的 AI 都绑到\
-                             你这台电脑上。",
-                            "iShell terminals auto-inject the pairing token and hostname; manual \
-                             setup is usually unnecessary.\n\
-                             Only if the AI is not started inside an iShell terminal, prefix its \
-                             launch command with the copied text (e.g. `ISHELL_PAIR_TOKEN=… \
-                             ISHELL_HOST=… claude`).\n\
-                             Do NOT put it in the AI's global MCP config (e.g. user-level env in \
-                             ~/.claude.json): on a server account shared by several people that \
-                             config is shared, and it would bind everyone's AI to YOUR computer.",
-                        ))
-                        .clicked()
-                    {
-                        // 只复制 ISHELL_PAIR_TOKEN（+ HOST）：不要再用已废弃的旧变量名。
-                        // 一并带上 ISHELL_HOST，手动前缀才和终端注入一样能挡住绑到别的机器。
-                        let host = crate::mcp_protocol::local_hostname();
-                        let text = if host.is_empty() || host == "unknown-host" {
-                            format!("ISHELL_PAIR_TOKEN={token}")
-                        } else {
-                            format!("ISHELL_PAIR_TOKEN={token} ISHELL_HOST={host}")
-                        };
-                        ui.ctx().copy_text(text);
-                        ui.close();
-                    }
-                }
+                // 0.21 起，原来的三个子开关（「AI 新开会话无需逐次确认」「自动注入连接环境」
+                // 「只响应带凭据的请求」）不再是用户选项：全部内化为总开关的固定行为。判定收敛在
+                // store 的 loader（恒真）与 `mcp_env_inject_allowed`/`session_owned_by` 里。
+                //
+                // 协议 v8 起不再有「配对 token」这个用户可见的东西，也没有「复制配对配置」：
+                // 只有 iShell 终端里启动的 AI 才有连接环境（`ISHELL_MCP_ENDPOINT` + 本次运行的
+                // `ISHELL_MCP_KEY`，由 iShell 自动注入），不在 iShell 终端里启动的 AI 一律连不上
+                // iShell——没有手动配置的口子，也就没有「写进共享配置而串台」这条路。
             },
         );
 

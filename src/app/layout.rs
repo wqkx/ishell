@@ -83,7 +83,7 @@ impl App {
                                // ai_owned 会话是只读的（AI 专用），广播不应该往里面灌用户输入
             for s in self.sessions.iter_mut().filter(|s| s.connected && !s.ai_owned) {
                 let _ = s.cmd_tx.send(UiCommand::TerminalInput(bytes.clone()));
-                // 用户亲手送出的输入：自动注入（配对 token、重连 cd）从此不许再替他敲键盘。
+                // 用户亲手送出的输入：自动注入（MCP 连接环境、重连 cd）从此不许再替他敲键盘。
                 // 不记的话，广播一条 `ssh 别的主机` 停在密码提示符时，注入可能打进密码框。
                 s.terminal.note_user_input();
             }

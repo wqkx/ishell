@@ -20,7 +20,7 @@
 
 日常 SSH 运维需要的一切都在**同一个窗口**里——而且不打扰你。
 
-- 🤖 **让 AI 直接驱动终端（MCP）** —— Claude Code、Codex CLI、Kimi Code、OpenCode 均可操作真实持久会话（cwd/环境/历史保留），命令实时出现在标签里；默认开启（设置里可关），配套代理二进制内置在 iShell 里、一次点击即可装到服务器上。多机共用一台 AI 服务器时请启用配对。详见「AI / MCP 集成」。
+- 🤖 **让 AI 直接驱动终端（MCP）** —— Claude Code、Codex CLI、Kimi Code、OpenCode 均可操作真实持久会话（cwd/环境/历史保留），命令实时出现在标签里；默认开启（设置里可关），配套代理二进制内置在 iShell 里、一次点击即可装到服务器上。AI 只会连到「启动它的那个终端」所属的 iShell，多台电脑可以安全地共用一台 AI 服务器。详见「AI / MCP 集成」。
 - ⚡ **快、占用低** —— 纯 Rust + GPU 即时模式 UI。单文件（约 8–12 MB）、秒开、**空闲 CPU ≈ 0%**、**内存约 80 MB**。无 Electron / JVM / Python，无守护进程，无运行时依赖。
 - 🎯 **用心打磨的体验** —— 干净的暖色浅色主题、标签平滑拖拽排序、不堆砌工具栏、中文 / English 随时切换、默认值合理，开箱即用。
 - 📁 **便捷的文件操作** —— 框选多选、批量删除/下载、远端服务器侧复制/移动、**下载断点续传**且**断线后自动续传**、文件夹 **压缩下载**（tar.gz）应对成千上万小文件。
@@ -43,7 +43,7 @@
 **AI / MCP 集成**（默认开启，详见下文「AI / MCP 集成」一节）
 - 让 Claude Code、Codex CLI、Kimi Code、OpenCode **驱动真实终端会话**（保留 cwd/环境/历史），命令与输出实时可见
 - 完整工具集：跑命令、读屏幕/历史、交互输入、中断、开关会话、读写/传输远端文件
-- SSH 反向转发到远端后，AI 在服务器上也能回控本机 iShell；**多机共用一台 AI 服务器时务必启用配对**（见下文）
+- SSH 反向转发到远端后，AI 在服务器上也能回控本机 iShell；**在哪个终端里启动的 AI 就只能连到那个终端的 iShell，多台电脑可以安全地共用一台 AI 服务器**（见下文）
 
 **连接与会话**
 - 多会话标签：状态圆点、**平滑拖拽排序动画**、溢出渐隐、关闭确认
@@ -214,13 +214,13 @@ cargo run --release
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
      # Claude Code、Kimi Code、OpenCode：在各自的 MCP 设置中注册 stdio server。
      ```
-     **Codex CLI：**在 `~/.codex/config.toml`（或适用的 Codex 配置文件）中添加 server，并允许配对环境变量传给 MCP 子进程：
+     **Codex CLI：**在 `~/.codex/config.toml`（或适用的 Codex 配置文件）中添加 server，并允许两个连接变量传给 MCP 子进程——Codex 给 MCP server 的是一份**过滤过的环境**，没在这里列出的变量根本到不了代理：
      ```toml
      [mcp_servers.ishell]
      command = "/home/you/.ishell-mcp/bin/ishell-mcp"
-     env_vars = ["ISHELL_PAIR_TOKEN", "ISHELL_HOST"]
+     env_vars = ["ISHELL_MCP_ENDPOINT", "ISHELL_MCP_KEY"]
      ```
-     `env_vars` 会从 Codex 的本地运行环境转发变量，**不会自动生成变量值**。请从已注入这两个变量的 iShell 终端启动 Codex，或确保启动 Codex 的环境中已有它们。不要把配对 token 明文固定写入多人共用的 MCP 配置。Claude Code、Kimi Code、OpenCode 在各自 MCP 设置中将 stdio server 的命令指向同一个 `ishell-mcp` 即可；其它 MCP 客户端也可用相同方式配置。GUI 与 `ishell-mcp` **必须同版本**；升级后重跑安装脚本。
+     `env_vars` 会从 Codex 自己的运行环境转发变量，**不会自动生成变量值**。请在 iShell 终端里启动 Codex（见下面「AI 怎么找到你的 iShell」）。**不要把这两个值写死进任何配置文件**——它们每次连接、每次 iShell 运行都会变。Claude Code、Kimi Code、OpenCode 在各自 MCP 设置中将 stdio server 的命令指向同一个 `ishell-mcp` 即可；其它 MCP 客户端也可用相同方式配置。GUI 与 `ishell-mcp` **必须同版本**；升级后重跑安装脚本。
 
 ### 工具一览
 
@@ -235,30 +235,31 @@ cargo run --release
 | `copy_to_remote` / `copy_from_remote` | 流式单文件传输（字节不进 MCP JSON）；`local_path` 在 **跑 ishell-mcp 的机器** |
 | `copy_between_sessions` | 两个已打开远端会话之间复制单文件 |
 
-### 远端回控（反向转发）
+### AI 怎么找到你的 iShell（以及为什么它永远碰不到别的 iShell）
 
-开关打开后，连上 SSH 时会把本机 MCP socket 反向转发到远端 `~/.ishell-mcp/mcp-<随机>.sock`（走现有加密通道，无额外端口）。远端的 `ishell-mcp` 会自动探测，一般无需配路径。
+开关打开后，连上 SSH 时会把本机 MCP socket 反向转发到远端一个**每次连接都随机的**路径 `~/.ishell-mcp/mcp-<随机>.sock`（走现有加密通道，无额外端口）。随后 iShell 往**那个终端**里注入两个变量：
 
-**谁能 SSH 到那台服务器（同账号），谁就能经转发 socket 触达这边的 iShell——只对你信任的服务器开这个开关。** 即便碰到了 socket，也只有完成配对握手的代理才能从你的 iShell 拿到连接凭据（协议 v6）；而且 AI 只能读写它自己开的会话——你自己打开的会话对它不可见、碰不了。
+- `ISHELL_MCP_ENDPOINT` —— 这条连接专属的 socket 路径；
+- `ISHELL_MCP_KEY` —— **这一次** iShell 运行启动时生成的随机密钥（只在内存里，从不落盘）。
 
-### ⚠️ 多机共用一台 AI 服务器（必读）
+在那个 shell 里启动的 AI 继承它们，`ishell-mcp` **只连这一个端点，别的一概不碰**——不列目录、不探测邻居、不弹选择框、没有任何兜底。规则没有例外：
 
-典型场景：AI 跑在共享服务器上，多台电脑各自用 iShell 连过去。转发 socket 会堆在同一远端目录，未配对时代理只能弹窗让人点选——**打扰别人，点错还会改到别人的环境**。
+1. **不是从 iShell 终端里启动的 → 拒绝。** 没变量就不连接，报错说明原因和该怎么做。没有手动配置，也没有「复制配对配置」。
+2. **环境不对或已过期 → 拒绝，且对方一声不吭。** 端点只应答能证明自己持有密钥的对端（HMAC 挑战-应答；密钥不过线，iShell 先自证、代理验过才自证）。iShell 对未认证的调用者**一个字节都不回**——连版本、主机名都不给。
+3. **iShell 重启会让所有在跑的 agent 失效。** 密钥每次运行一份，重启前启动的 agent 再也连不上，要在新的终端里重新启动。SSH 重连同理（新 shell、新端点）。
+4. **没有降级。** 端点连不上就是报错，绝不「试试下一个」。
 
-正确做法（任选其一，推荐 1）：
+所以电脑 B 和 C 连到同一台 AI 服务器的同一个账号时：在 B 的终端里启动的 agent 永远只能到 B 的 iShell，C 连它的一个字节都收不到。（残留风险，明说：如果有一份包含 C 的**有效**端点和密钥的环境被拷进了 B 的 agent——比如 C 的终端先启动的那个 tmux 服务端——那个 agent 就会连到 C。请在 iShell 终端里直接启动 AI，不要跨电脑复用 tmux/screen 的环境。）
 
-1. **在 iShell 的终端会话里启动 AI**：iShell 会在会话空闲时自动注入 ` export ISHELL_PAIR_TOKEN=…`（0.21 起为内置行为，随「允许 AI 通过 MCP 控制终端」生效），此后在该终端启动的 AI / `ishell-mcp` 只绑定你这台电脑，多数情况零配置。
-2. AI 不在 iShell 终端里跑时：设置里「复制配对配置」，加在启动命令前面（如 `ISHELL_PAIR_TOKEN=… claude`）。**多人共用服务器账号时，不要把 token 写进 AI 的全局 MCP 配置**（如 `~/.claude.json` 的 user 级 `env`）：那份配置是所有人共用的，写进去的 token 会覆盖每个人终端注入的 token，把所有人的 AI 都路由到你的电脑。
-3. 从协议 v5（0.21）起，**未配对的代理会被直接拒绝**，并提示上面两条配置方法——「弹窗点选机器」已移除：未配对代理的广播绑定正是「弹窗落到服务器上每一台 iShell、点错绑到别人环境」的那条路径。
+连上就立刻打字导致自动注入被跳过时：右键终端 →「**立即注入 MCP 连接环境**」，再在那个 shell 里（重新）启动 AI。Codex 需要上面那行 `env_vars`；其它 agent 若「启动时变量还在、后来才没了」，是 agent 用一份被过滤的环境重新拉起了代理——`ishell-mcp` 会把「谁拉起了它、它看到了哪些 `ISHELL_*` 变量」写进 `~/.ishell-mcp/diag.log` 并附在报错里。
 
-配对 token 会进入远端 shell 环境（及同 UID 可见的 `/proc/*/environ`）——这是共享账号上启用配对的代价；不要把 token 发到不可信主机，也不要贴进聊天。
+已知边界，明说：
 
-手动隧道（不用自动转发时）：
+- **shell 历史。** 注入的那行以空格开头，只有 shell 忽略「空格开头的行」时才不进历史（`HISTCONTROL=ignorespace`/`ignoreboth`——Debian/Ubuntu 的 bash 默认如此；zsh 需要 `setopt HIST_IGNORE_SPACE`；RHEL 的 bash 默认不是）。否则**正在运行**的 iShell 的密钥与端点会落进 `~/.bash_history`/`~/.zsh_history`，而共享账号上的每个人都读得到它。它们随这次 iShell 运行 / 这条 SSH 连接一起失效，但在它还活着时，读到那个文件的人就能用。共享账号上请开上面那个选项。
+- **`ls ~/.ishell-mcp/` 会列出所有转发 socket**（包括别的电脑的）。代理不看；人能看。
+- **同一个 iShell 里的 agent 之间不互相隔离。**「只能碰自己开的会话」靠每个 agent 如实声明自己是谁；撒谎的 agent 能碰**同一台 iShell** 上兄弟 agent 开的会话。它到不了别的电脑。
 
-```bash
-ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
-ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
-```
+**谁能 SSH 到那台服务器（同账号），谁就能摸到转发 socket——只对你信任的服务器开这个开关。** 但摸到不等于连得上：没有运行密钥得不到任何应答；而且 AI 只能读写它自己开的会话——你自己打开的会话对它不可见、碰不了。
 
 ### 其它注意
 
@@ -270,7 +271,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 - **主机密钥校验**：known_hosts 校验，未知主机首次连接弹窗确认 SHA256 指纹（TOFU）并写入；密钥改变则拒绝告警。
 - **保存密码加密**：以 ChaCha20-Poly1305 加密落盘，密钥优先系统钥匙串，不可用时回退本地 `~/.config/ishell/key`（0600）。
-- **MCP**：0.19 起默认开启（设置里可关）；仅本机 socket（`0600`），不监听网络端口；每条请求都必须带上 iShell 在配对握手成功后签发的连接凭据（协议 v6），且 **AI 只能读写自己开的会话**，你自己打开的会话一律拒绝、没有弹窗也没有开关能放行；多机共享 AI 服务器时用配对 token 避免串台。配对 token 以 `0600` 落盘，且**本身从不出现在线上**——配对走双向挑战-应答（两侧互相出示 `HMAC(token, 随机数)`），代理验过对端的证明才出示自己的，因此既不会被冒充的 socket 骗走密钥，也不会把密钥送给任何连上来的人。已知残留风险：同账号的攻击者若在你的代理与你的 iShell 之间**实时中继**双方的挑战与证明，仍可冒充——这类 socket 上没有信道绑定可用（大家共用同一个 UID，`SO_PEERCRED` 也无从区分），无法根除。
+- **MCP**：0.19 起默认开启（设置里可关）；仅本机 socket（`0600`），不监听网络端口。身份来自 iShell 注入**它自己终端**的环境（一个端点 + 一把每次运行随机的密钥）；代理只连那一个端点，iShell 对证明不了自己持有密钥的调用者什么都不回。之后每条请求都带这次握手签发的凭据，且 **AI 只能读写自己开的会话**，你自己打开的会话一律拒绝、没有弹窗也没有开关能放行。密钥本身从不出现在线上（双向 HMAC 挑战-应答，代理验过对端才出示自己的证明），也从不落盘，所以重启 iShell 就让所有在跑的 agent 失效。已知残留风险：能读到你终端里启动的进程环境的同账号攻击者，或在你的代理与你的 iShell 之间**实时中继**的攻击者，仍可冒充——这类 socket 上没有信道绑定可用（大家共用同一个 UID，`SO_PEERCRED` 也无从区分），无法根除。
 
 ## 📄 许可证
 

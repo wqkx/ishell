@@ -964,22 +964,6 @@ pub(super) struct PendingOpenConsent {
     deadline: Instant,
 }
 
-/// 一个尚未绑定的 AI 客户端请求接管本 iShell 窗口——弹窗让用户当面选。
-///
-/// 只在用户同时开着多个 iShell 时才会出现：代理发现多个实例后，会向**每一个**都发一条
-/// `Bind`，于是每个窗口上都弹出这个框，用户在想用的那个窗口上点「允许」即可。选择因此
-/// 发生在用户的眼睛和鼠标上，而不是配置文件里——实例标识是纯内部的，不该让用户去认。
-///
-/// 落选的那些窗口不需要用户逐个点「拒绝」：代理拿到第一个「允许」后就挂断其余连接，
-/// `resp_tx.is_closed()` 随即为真，弹窗自动消失（见 `sweep_pending_consents`）。
-pub(super) struct PendingBindConsent {
-    resp_tx: oneshot::Sender<McpResponse>,
-    req_id: u64,
-    /// 发起方的可读来源描述（代理 `Bind` 时携带，见 `McpRequest::origin`），弹窗展示用。
-    pub(super) origin: Option<String>,
-    deadline: Instant,
-}
-
 /// **AI 只能碰它自己开的会话**：读和写一样。
 ///
 /// 用户拍板（2026-09-18）：「AI 只能读取自己打开的窗口，不允许读取和操作客户自己的窗口，否则
@@ -1014,20 +998,31 @@ fn first_foreign_session<'a>(
     })
 }
 
-/// 拒绝时回给 AI 的话：说清规则与下一步，不透露那个会话的任何信息（标题/主机都不给）。
-fn foreign_session_refusal(uid: u64) -> String {
-    format!(
-        "会话 uid={uid} 不是你用 open_session 开的：AI 只能读写**自己开的**会话，用户自己打开的\
-         窗口和其它 AI 的窗口一律不许读取或操作（硬规则，没有授权弹窗，重试也没用）。需要在\
-         某台机器上干活，请用 list_saved_connections 查连接名、open_session 开你自己的会话"
-    )
-}
-
 /// 启动 socket 监听（若用户未在设置里开启 AI 控制，返回一个永远收不到数据的空通道）。
 /// 整套本地 IPC 建立在 Unix domain socket 上，tokio 的 UnixListener/UnixStream 只在 unix
 /// 平台提供——Windows 上这个特性眼下确实不支持，下面 `#[cfg(not(unix))]` 版本直接返回一个
 /// 永远收不到数据的空通道（等价于"用户没开启"的路径），其余 App 代码按同一通道消费事件，
 /// 不需要为平台差异专门分叉。
+/// 本进程的 MCP 监听 socket 是否**真的**在监听（绑定成功才置位）。
+///
+/// 为什么需要它：「允许 AI 控制」开关打开后要重启 iShell 才开始监听（见设置里的提示），而反向转发
+/// 只看开关、不看监听——本次启动时开关是关的、运行中才打开的话，新连接会把一个**没人监听**的端点
+/// 注入终端，agent 连上去只会看到静默断开，报错还怪密钥。没在监听就不注入，并让用户知道要重启。
+#[cfg(unix)]
+static LISTENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 见 [`LISTENING`]。非 unix 上整套 IPC 都不存在，恒为 false。
+pub(crate) fn mcp_listening() -> bool {
+    #[cfg(unix)]
+    {
+        LISTENING.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn spawn_mcp_listener(
     runtime: &Arc<tokio::runtime::Runtime>,
@@ -1083,14 +1078,17 @@ pub(super) fn spawn_mcp_listener(
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
         }
+        LISTENING.store(true, std::sync::atomic::Ordering::Relaxed);
         // 这个 socket 会被反向转发到远端主机（见 src/ssh/mod.rs），意味着任何能连到那台
-        // 远端主机的人都摸得到它——不能像纯本地场景那样假设连接数天然很少。握手/Identify
-        // 与长操作分两档信号量：上传卡住时仍要让新的 Identify 进得来，否则整个 MCP 发现层
+        // 远端主机的人都摸得到它——不能像纯本地场景那样假设连接数天然很少。握手/认证
+        // 与长操作分两档信号量：上传卡住时仍要让新的握手进得来，否则整个 MCP 认证层
         // 会被 32 个挂死的 copy_to_remote 堵死约 24h。
         let handshake_limit = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_HANDSHAKES));
         let work_limit = Arc::new(tokio::sync::Semaphore::new(MAX_MCP_CONNECTIONS));
         loop {
             let Ok((stream, _)) = listener.accept().await else {
+                // 持续失败（如 fd 耗尽）时不退避会空转占满一个 worker
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             };
             let Ok(permit) = Arc::clone(&handshake_limit).try_acquire_owned() else {
@@ -1122,7 +1120,7 @@ pub(super) fn spawn_mcp_listener(
 /// 并发连接数上限（见 spawn_mcp_listener 里的工作信号量）。长操作（上传/命令）占这一档。
 #[cfg(unix)]
 const MAX_MCP_CONNECTIONS: usize = 32;
-/// 读首行 + Identify/握手的并发上限。必须高于 `MAX_MCP_CONNECTIONS`，否则挂死的上传会把
+/// 认证阶段（读首行 + 握手）的并发上限。必须高于 `MAX_MCP_CONNECTIONS`，否则挂死的上传会把
 /// 发现层一起堵死。
 #[cfg(unix)]
 const MAX_MCP_HANDSHAKES: usize = 64;
@@ -1154,33 +1152,40 @@ async fn reply(
     id: u64,
     result: Result<McpReqResult, String>,
 ) {
-    let resp = McpResponse { id, result };
-    if let Ok(mut json) = serde_json::to_string(&resp) {
-        json.push('\n');
-        let _ = w.write_all(json.as_bytes()).await;
-    }
+    write_json_line(w, &McpResponse { id, result }).await;
 }
 
-/// iShell 签发的**连接凭据**（v6，见 `McpRequest::ticket`）：配对握手验过对方的 token 证明
-/// 之后才签发，之后每条业务请求都要出示。凭据 → 握手时声明的 actor。
+/// iShell 签发的**连接凭据**（见 `McpRequest::ticket`）：认证握手验过对方持有本次运行密钥之后
+/// 才签发，之后每条业务请求都要出示。凭据 → 握手时声明的 actor。
 ///
-/// 只活在本进程内存里：iShell 重启即全部作废（实例 id 也随之换掉）。代理在找不到旧 id、
-/// 且恰好只剩一个 token 匹配实例时会改绑到新实例并换一张凭据；多开时仍拒绝静默换绑。
-/// 有界：按空闲时长过期，超过上限淘汰最久没用过的——代理被拒后会自动重新握手（见
-/// `TICKET_REJECTED`），所以淘汰只多一次握手、不会让 AI 失联。
+/// 只活在本进程内存里：iShell 重启即全部作废（运行密钥也随之换掉，旧 agent 连握手都过不了）。
+/// **不按空闲过期**：凭据的寿命就是这次 iShell 运行的寿命，失效只有「iShell 重启」一种原因，
+/// 而那时代理早就连不上端点了。所以代理没有「凭据被拒就重新握手」这条路——它不存在。
+/// 有界：全局与每个 actor 各有上限，淘汰都按**最近使用**（LRU）走，并且先淘汰超额者**自己**的，
+/// 所以正常使用中的凭据不会被挤掉，守规矩的 agent 也挤不掉别人的。
+///
+/// 能力边界（明说）：`actor` 是调用方在握手时自报的字符串，所以持有运行密钥的**恶意** agent 每次换
+/// 一个新 actor，就能绕过每 actor 上限，握手约 4096 次把别人闲置的凭据挤出去。这与「同一台 iShell
+/// 内的 agent 之间不互相隔离」是同一条已声明的边界；被挤掉的代理不会自动重握手——静默断开分不清
+/// 「没执行」还是「执行完才断」，重试可能让一条命令跑两遍，所以宁可报错让用户重开 agent。
 #[cfg(unix)]
 mod tickets {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    /// 空闲这么久没用过的凭据作废。远长于一次 AI 会话里的调用间隔。
-    const IDLE_EXPIRY: Duration = Duration::from_secs(7 * 24 * 3600);
-    /// 存量上限：每次代理探测/重连都会握手签发一张，不设上限会随运行时长无界增长。
+    /// 全局存量上限：不设上限会随运行时长无界增长。
     const CAP: usize = 4096;
+    /// 单个 actor 最多同时持有的凭据数。同一个 AI 客户端每次 `/mcp` 重连都会新拉起一个代理、
+    /// 握手签一张；旧代理进程不一定马上退出，所以不能「新的顶掉旧的」。但也不能让一个 actor 靠
+    /// 反复握手把别人的凭据挤出去（持密钥者在 4096 次握手内就能做到）——超过这个数先淘汰
+    /// **它自己**最久没用的那张。
+    pub(super) const PER_ACTOR_CAP: usize = 32;
 
     struct Entry {
         actor: String,
+        /// 最近一次被核对的时刻：淘汰按它走（最久没用的先走），所以一个一直在用的 agent 的凭据
+        /// 永远不会因为「签发得早」而被挤掉。
         last_used: Instant,
     }
 
@@ -1192,42 +1197,52 @@ mod tickets {
         // 两个 32 字节随机数拼起来：512 位，远超猜测可能。
         let ticket = format!(
             "{}{}",
-            crate::mcp_protocol::pair_nonce()?,
-            crate::mcp_protocol::pair_nonce()?
+            crate::mcp_protocol::auth_nonce()?,
+            crate::mcp_protocol::auth_nonce()?
         );
         let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
-        let now = Instant::now();
-        map.retain(|_, e| now.duration_since(e.last_used) < IDLE_EXPIRY);
-        if map.len() >= CAP {
-            if let Some(oldest) = map
-                .iter()
+        let lru = |map: &HashMap<String, Entry>, only: Option<&str>| {
+            map.iter()
+                .filter(|(_, e)| only.is_none_or(|a| e.actor == a))
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
+        };
+        if map.values().filter(|e| e.actor == actor).count() >= PER_ACTOR_CAP {
+            if let Some(k) = lru(map, Some(&actor)) {
+                map.remove(&k);
+            }
+        }
+        if map.len() >= CAP {
+            if let Some(k) = lru(map, None) {
+                map.remove(&k);
             }
         }
         map.insert(
             ticket.clone(),
             Entry {
                 actor,
-                last_used: now,
+                last_used: Instant::now(),
             },
         );
         Some(ticket)
     }
 
-    /// 核对凭据：有效则刷新使用时刻并返回它绑定的 actor。
+    /// 核对凭据：有效返回它绑定的 actor，并刷新「最近使用」。
     pub(super) fn redeem(ticket: &str) -> Option<String> {
         let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.as_mut()?.get_mut(ticket)?;
-        let now = Instant::now();
-        if now.duration_since(entry.last_used) >= IDLE_EXPIRY {
-            return None;
-        }
-        entry.last_used = now;
-        Some(entry.actor.clone())
+        let e = guard.as_mut()?.get_mut(ticket)?;
+        e.last_used = Instant::now();
+        Some(e.actor.clone())
+    }
+
+    /// 某个 actor 当前持有的凭据数（测试用）。
+    #[cfg(test)]
+    pub(super) fn count_for(actor: &str) -> usize {
+        let guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .map_or(0, |m| m.values().filter(|e| e.actor == actor).count())
     }
 }
 
@@ -1250,20 +1265,121 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for NotifyOnDrop<R> {
     }
 }
 
-/// Identify / 握手应答共用：带上本机主机名（v7），旧代理会忽略未知字段。
+/// 往连接上写一行 JSON。失败一律忽略：对端已经走了的话，这里没有任何补救可做。
 #[cfg(unix)]
-fn instance_hello(ticket: String) -> McpReqResult {
-    McpReqResult::Instance {
-        id: crate::store::mcp_instance_id().to_string(),
-        proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
-        token: String::new(),
-        ticket,
-        host: crate::mcp_protocol::local_hostname(),
+async fn write_json_line<T: serde::Serialize>(w: &mut tokio::net::unix::OwnedWriteHalf, v: &T) {
+    if let Ok(mut json) = serde_json::to_string(v) {
+        json.push('\n');
+        let _ = w.write_all(json.as_bytes()).await;
     }
 }
 
+/// 认证握手（线格式与理由见 `mcp_protocol` 的「认证层」一节）。
+///
+/// **每一个失败分支都是 `return`，不回任何字节**：mac 不对、版本不对、第二行超时/不对、cmac
+/// 不对——对一个还没证明过自己的对端，连「你错在哪」都不能说。只有 cmac 验过之后（对方已经
+/// 证明持有本次运行密钥）才开口，用明确的文字报业务协议版本不拢这类可以帮到它的事。
+#[cfg(unix)]
+async fn handle_hello(
+    first: serde_json::Value,
+    w: &mut tokio::net::unix::OwnedWriteHalf,
+    rd: &mut BufReader<tokio::io::Take<tokio::net::unix::OwnedReadHalf>>,
+) {
+    use crate::mcp_protocol as p;
+    // 本次运行没有密钥（熵源不可用）= 不提供 MCP 控制，谁来都不应。
+    let Some(key) = crate::store::mcp_run_key() else {
+        return;
+    };
+    let Ok(p::HelloFrame { hello }) = serde_json::from_value(first) else {
+        return;
+    };
+    // `cn` 必须恰是 64 位十六进制（代理就是这么生成的）：MAC 的输入用 NUL 分隔各字段，放任 `cn`
+    // 里出现 NUL 等任意字节，字段边界就是模糊的。形状不对一律不理，哪怕 mac 恰好对得上。
+    if hello.auth != p::AUTH_VERSION || !p::is_hex64(&hello.cn) {
+        return;
+    }
+    if !p::auth_mac_matches(key, p::AuthStep::Hello, &hello.cn, "", &hello.mac) {
+        return;
+    }
+    let Some(sn) = p::auth_nonce() else {
+        return;
+    };
+    write_json_line(
+        w,
+        &p::HelloOkFrame {
+            hello_ok: p::HelloOk {
+                smac: p::auth_mac(key, p::AuthStep::Server, &hello.cn, &sn),
+                sn: sn.clone(),
+                app_min: p::MCP_APP_MIN,
+                app_max: p::MCP_APP_MAX,
+                caps: p::MCP_CAPS.iter().map(|c| c.to_string()).collect(),
+                peer: p::Peer {
+                    host: p::local_hostname(),
+                    run: crate::store::mcp_instance_id().to_string(),
+                },
+            },
+        },
+    )
+    .await;
+    // 第二行同样有界、带短超时：对端开了个头就赖着不说话的话，这条连接会一直占着握手信号量里
+    // 的名额（`handshake_permit`）；超长的话（对端还没证明过自己）就是在白白消耗内存。
+    let Some(line2) = tokio::time::timeout(
+        p::AUTH_LINE_TIMEOUT,
+        p::read_line_bounded(rd, p::AUTH_LINE_MAX),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        return;
+    };
+    let Ok(p::ProveFrame { prove }) = serde_json::from_str(&line2) else {
+        return;
+    };
+    if !p::auth_mac_matches(key, p::AuthStep::Client, &hello.cn, &sn, &prove.cmac) {
+        return;
+    }
+    // ── 从这里起对方已证明持有本次运行密钥，可以开口了 ──
+    if p::negotiate_app(p::MCP_APP_MIN, p::MCP_APP_MAX, prove.app, prove.app).is_none() {
+        let msg = format!(
+            "iShell 与 ishell-mcp 的业务协议版本对不上（iShell 支持 v{}–v{}，本代理要 v{}）。\
+             请用与当前 iShell 配套的 ishell-mcp 重新部署（终端右键「安装 AI 控制代理到这台服务器…」），\
+             然后在 iShell 终端里重新启动 AI。",
+            p::MCP_APP_MIN,
+            p::MCP_APP_MAX,
+            prove.app
+        );
+        write_json_line(w, &McpResponse { id: 0, result: Err(msg) }).await;
+        return;
+    }
+    // actor 是代理进程标识：要求非空且有界，免得凭据表里存进一个巨型字符串。
+    if prove.actor.is_empty() || prove.actor.len() > 128 {
+        write_json_line(
+            w,
+            &McpResponse {
+                id: 0,
+                result: Err("握手缺少有效的 actor（代理进程标识），不签发连接凭据".into()),
+            },
+        )
+        .await;
+        return;
+    }
+    let Some(ticket) = tickets::issue(prove.actor) else {
+        return; // 熵源不可用：宁可握手失败，也不签一张可预测的凭据
+    };
+    write_json_line(
+        w,
+        &p::TicketFrame {
+            ticket: p::TicketGrant {
+                ticket,
+                app: prove.app,
+            },
+        },
+    )
+    .await;
+}
+
 /// 一条连接只处理一问一答：读一行 JSON 请求，转发进 mpsc，等 App 帧循环回填后写一行 JSON 响应。
-/// `handshake_permit` 覆盖读首行与 Identify/握手；业务请求随后换成 `work_limit` 里的名额，
+/// `handshake_permit` 覆盖读首行与握手；业务请求随后换成 `work_limit` 里的名额，
 /// 好让卡住的上传不堵住新的发现探测。
 #[cfg(unix)]
 async fn handle_conn(
@@ -1274,166 +1390,58 @@ async fn handle_conn(
     work_limit: Arc<tokio::sync::Semaphore>,
 ) {
     let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r.take(MAX_MCP_LINE_BYTES)).lines();
+    // `Take` 限的是整条连接的总字节数，也是后面那行真正的请求的上限（见 `MAX_MCP_LINE_BYTES`）；
+    // 认证阶段那几行另有小得多的上限（`AUTH_LINE_MAX`），由 `read_line_bounded` 自己把关。
+    let mut rd = BufReader::new(r.take(MAX_MCP_LINE_BYTES));
+    // **认证先于一切，且对未认证者零应答**：第一行要么是握手（`hello`），要么是出示凭据
+    // （`bearer`）；除此之外——读不到、超时、超长、JSON 解不出、没有凭据、凭据无效——一律直接断开，
+    // 一个字节都不回。匿名连接过来的人（同账号下任何能摸到这条 socket 的进程）学不到「这里有没有
+    // iShell」之外的任何东西：没有实例 id、没有主机名、没有版本、连一条解析错误都没有。
+    //
+    // 第一行只肯缓冲 `AUTH_LINE_MAX`、只肯等 `AUTH_LINE_TIMEOUT`：认证之前对端是谁都有可能，
+    // 不能让它用一行 32MB 的垃圾把整个进程的内存吃掉（或用沉默占着握手名额）。真正的请求在
+    // 凭据核对通过之后才去读。
+    let Some(line) = tokio::time::timeout(
+        crate::mcp_protocol::AUTH_LINE_TIMEOUT,
+        crate::mcp_protocol::read_line_bounded(&mut rd, crate::mcp_protocol::AUTH_LINE_MAX),
+    )
+    .await
+    .ok()
+    .flatten() else {
+        return;
+    };
+    let Ok(first) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return;
+    };
+    if first.get("hello").is_some() {
+        handle_hello(first, &mut w, &mut rd).await;
+        return;
+    }
+    let Some(actor) = first
+        .get("bearer")
+        .and_then(|t| t.as_str())
+        .and_then(tickets::redeem)
+    else {
+        return;
+    };
+    // 凭据有效 = 对方已通过认证，从这里起才可以给出人话的错误，也才肯读大请求。
+    let mut lines = rd.lines();
     let Ok(Ok(Some(line))) = tokio::time::timeout(FIRST_LINE_TIMEOUT, lines.next_line()).await
     else {
-        return; // 对端没写完就断了连接/超时/超长，没东西可读也没法回应
+        return; // 凭据对、请求没来/超长：没东西可答（对方已认证，但半截请求无从解析）
     };
     let mut req: McpRequest = match serde_json::from_str(&line) {
         Ok(r) => r,
         Err(e) => {
-            // JSON 解不出来时，之前是直接静默关闭连接——对端只会看到一个空响应/EOF，
-            // 完全不知道发生了什么。这里至少回一条结构化错误（id 用 0，因为请求本身
-            // 都没解出来，不知道真实 id 是什么）。
-            let resp = McpResponse {
-                id: 0,
-                result: Err(format!("请求 JSON 解析失败：{e}")),
-            };
-            if let Ok(mut json) = serde_json::to_string(&resp) {
-                json.push('\n');
-                let _ = w.write_all(json.as_bytes()).await;
-            }
+            reply(&mut w, 0, Err(format!("请求 JSON 解析失败：{e}"))).await;
             return;
         }
     };
+    drop(line); // 请求可能很大（write_file 的 content），解析完就别再留一份
+    // 归属判定用的 actor 是 iShell 自己按凭据记下的，不是请求里自报的（线上根本没有这个字段）。
+    req.actor = Some(actor);
     let id = req.id;
-    // 实例校验：先于任何会话逻辑，也先于把请求递进 App 帧循环。这里是「一个代理只操作一个
-    // iShell」的执行点——校验放在被叫的一方，代理侧无论探测出什么错路径都越不过来。
-    let own = crate::store::mcp_instance_id();
-    if !req.is_addressed_to(own) {
-        reply(
-            &mut w,
-            id,
-            Err(
-                "这条请求点名的是另一个 iShell 实例（或没有点名）。请重新发起 MCP 连接：\
-                 绑定的那个 iShell 可能已经退出或重启；代理会在只剩一个匹配实例时改绑，\
-                 多开时仍不会静默换到别的窗口——命令落到你没预期的机器上更糟"
-                    .to_string(),
-            ),
-        )
-        .await;
-        return;
-    }
-    // Identify 在连接层就地回答：它只是「你是谁」，不碰任何会话状态，没必要绕一趟 App
-    // 帧循环。代理发现多个实例时会向每一个都问一次，让这条路尽量轻。
-    // Identify / IdentifyPair：连接层就地回答，不进 App 帧循环。
-    // v3 起 Instance.token 恒为空——真实配对走双向挑战-应答让调用方出示证明，
-    // 绝不在响应里回传（反向转发后同账号他人也能连上 socket 发 Identify）。
-    //
-    // v5 起匿名发现的语义（与代理侧「无 token 直接拒绝绑定」配套，见 MCP_PROTOCOL_VERSION
-    // 的版本志）：
-    // - 匿名 `Identify` 照常应答，当**版本信标**用：它是全协议唯一跨版本可解析的请求，
-    //   旧代理的「版本不符，请重新部署」提示全靠它问出版本号。应答不构成泄露——实例 id
-    //   本就不是秘密（`ishell-mcp` 的 `connect_bound` 注释写明并接受了这一点），真正的
-    //   授权边界是绑定 consent 弹窗与配对握手，不在发现层。
-    // - 匿名 `IdentifyPair`（v3 明文配对）只对 **token 正确**的调用方应答：v3 旧代理凭
-    //   正确 token 仍能走到版本校验、打印「请重新部署」；token 不符的调用方零应答（v4 及
-    //   以前 GUI 忽略 token 无条件应答，等于向同账号任何人确认「这里有一台 iShell」，
-    //   v5 收紧）。配对握手（PairHello/PairProve）不受影响。
-    match &req.kind {
-        McpReqKind::Identify => {
-            reply(&mut w, id, Ok(instance_hello(String::new()))).await;
-            return;
-        }
-        // v3 的旧代理才会发这个。v5 起**校验 token 才答话**（见上面块注释）：token 正确，
-        // v3 代理才能走到自己的 `check_proto_version`、打印「请重新部署 ishell-mcp」；
-        // token 不符则静默丢弃——调用方什么也学不到。
-        McpReqKind::IdentifyPair { token } => {
-            if *token != crate::store::mcp_pairing_token() {
-                return; // 静默丢弃：probe 分类为 Dead，实例从候选集里消失
-            }
-            reply(&mut w, id, Ok(instance_hello(String::new()))).await;
-            return;
-        }
-        // 配对握手（v4）：本进程先出示 `Server` 证明，对端验过再送 `Client` 证明上来。
-        // 全协议唯一一处「一条连接两问两答」——双向证明必须共用同一对随机数。
-        McpReqKind::PairHello { nonce_c } => {
-            let nonce_c = nonce_c.clone();
-            // 握手时声明的进程身份：握手通过后绑到签发的凭据上，此后以它为准（见 `tickets`）。
-            let hello_actor = req.actor.clone();
-            let token = crate::store::mcp_pairing_token();
-            // 熵源失败一律拒绝握手，绝不用可预测的值凑合（那等于把挑战-应答降级成静态口令）。
-            let Some(nonce_s) = crate::mcp_protocol::pair_nonce() else {
-                reply(&mut w, id, Err("本机熵源不可用，无法完成配对握手".into())).await;
-                return;
-            };
-            reply(
-                &mut w,
-                id,
-                Ok(McpReqResult::PairChallenge {
-                    id: own.to_string(),
-                    proto_version: crate::mcp_protocol::MCP_PROTOCOL_VERSION,
-                    nonce_s: nonce_s.clone(),
-                    server_proof: crate::mcp_protocol::pair_proof(
-                        &token,
-                        &nonce_c,
-                        &nonce_s,
-                        crate::mcp_protocol::PairRole::Server,
-                    ),
-                }),
-            )
-            .await;
-            // 第二行必须带超时：对端开了个头就赖着不说话的话，这条连接会一直占着握手
-            // 信号量里的名额（`handshake_permit`），几条半开握手就能把发现层堵死。
-            let second = tokio::time::timeout(FIRST_LINE_TIMEOUT, lines.next_line()).await;
-            let Ok(Ok(Some(line2))) = second else {
-                return; // 超时/断开：没什么可回的，直接收工
-            };
-            let ok = match serde_json::from_str::<McpRequest>(&line2) {
-                Ok(McpRequest {
-                    id: id2,
-                    kind: McpReqKind::PairProve { client_proof },
-                    ..
-                }) => {
-                    let pass = crate::mcp_protocol::pair_proof_matches(
-                        &token,
-                        &nonce_c,
-                        &nonce_s,
-                        crate::mcp_protocol::PairRole::Client,
-                        &client_proof,
-                    );
-                    Some((id2, pass))
-                }
-                // 握手中途改发别的请求：不接受。握手没走完就不算配对成功，
-                // 更不能让一条没证明过身份的连接顺势去执行别的东西。
-                _ => None,
-            };
-            match ok {
-                Some((id2, true)) => {
-                    // 验过了才签发凭据。没声明 actor 的握手不签：凭据要绑一个身份，否则 iShell
-                    // 没法把「窗口归开它的那个 AI」落到实处。
-                    let Some(actor) = hello_actor else {
-                        reply(
-                            &mut w,
-                            id2,
-                            Err("配对握手缺少 actor（代理进程标识），不签发连接凭据".into()),
-                        )
-                        .await;
-                        return;
-                    };
-                    let Some(ticket) = tickets::issue(actor) else {
-                        reply(&mut w, id2, Err("本机熵源不可用，无法签发连接凭据".into())).await;
-                        return;
-                    };
-                    reply(&mut w, id2, Ok(instance_hello(ticket))).await;
-                }
-                Some((id2, false)) => {
-                    reply(&mut w, id2, Err("配对证明不符".into())).await;
-                }
-                None => {
-                    reply(&mut w, 0, Err("配对握手第二步应当是 PairProve".into())).await;
-                }
-            }
-            return;
-        }
-        // 没先握手就直接出示证明：无从校验（这一步必须用本连接第一步约定的那对随机数），拒绝。
-        McpReqKind::PairProve { .. } => {
-            reply(&mut w, id, Err("配对握手未开始（应先发 PairHello）".into())).await;
-            return;
-        }
-        _ => {}
-    }
-    // 业务请求换到工作信号量：Identify/握手已在上面 return，不再占握手名额。
+    // 业务请求换到工作信号量：握手已在上面 return，不再占握手名额。
     // 上传卡死时新的发现探测仍能进来。
     let Ok(_work) = work_limit.try_acquire_owned() else {
         reply(
@@ -1454,40 +1462,6 @@ async fn handle_conn(
         return;
     };
     drop(handshake_permit);
-    // **iShell 端身份校验（v6）**：除上面的发现与握手，其余每条请求都必须出示本进程签发过的
-    // 有效连接凭据。这是「严禁操作其他人的客户端」的执行点，而且放在权威侧——此前这里只核对
-    // 公开的实例 id，谁拿到 id 谁就能驱动这台 iShell，隔离全靠代理自觉。
-    // 凭据绑定的 actor 覆盖请求里自报的值：归属判定（只能碰自己开的会话）用的是 iShell 自己
-    // 记下的身份，冒用别人的 actor 没有用。
-    match req.ticket.as_deref().and_then(tickets::redeem) {
-        Some(actor) => req.actor = Some(actor),
-        None => {
-            reply(
-                &mut w,
-                id,
-                Err(format!(
-                    "{}：这台 iShell 只接受完成配对握手的请求（需要与它配对 token 一致的 \
-                     ishell-mcp，协议 v{}）。代理会自动重新握手；仍失败请重新连接 MCP",
-                    crate::mcp_protocol::TICKET_REJECTED,
-                    crate::mcp_protocol::MCP_PROTOCOL_VERSION
-                )),
-            )
-            .await;
-            // 上传请求：调用方此刻多半还在推文件体。直接关连接，它后续的写会撞上 RST，尚未
-            // 读出的这条错误随 RST 被内核丢掉，只剩一句 Broken pipe——代理就认不出「凭据被拒」、
-            // 也就不会自动重新握手。先把残留字节读到 EOF 再关（与下方上传报错路径同一个道理），
-            // 带兜底时限。
-            if matches!(req.kind, McpReqKind::CopyToRemoteFromCaller { .. }) {
-                let mut rest = lines.into_inner().into_inner().into_inner();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    tokio::io::copy(&mut rest, &mut tokio::io::sink()),
-                )
-                .await;
-            }
-            return;
-        }
-    }
     let is_caller_upload = matches!(&req.kind, McpReqKind::CopyToRemoteFromCaller { .. });
     if is_caller_upload {
         // 这里必须把 `Take` 摘掉。`MAX_MCP_LINE_BYTES` 要限的是**请求行**，而文件字节紧跟在
@@ -1690,7 +1664,7 @@ async fn handle_conn(
         _ = lines.next_line() => {
             // 丢弃 resp_rx（return 即可）会让 App 那侧的 resp_tx.is_closed() 变真，但**没人会
             // 去看**：egui 按需重绘，此刻这个窗口没有任何输入事件，帧循环根本不转，清扫逻辑
-            // 就永远不执行。绑定弹窗正是靠这条挂断感知自动消失的（见 sweep_pending_consents），
+            // 就永远不执行。open_session 的确认框靠这条挂断感知自动消失（见 sweep_pending_consents），
             // 少了这一下，落选窗口的框会一直杵到用户手动关掉——实测如此。
             ctx.request_repaint();
             return;
@@ -1817,28 +1791,6 @@ impl App {
                 }
             }
         }
-        // 绑定弹窗的清扫比新开会话那个多一条「对端走了」：代理把 Bind 同时发给了每一个实例，
-        // 用户在某个窗口点「允许」之后，代理立刻挂断其余连接。落选的窗口据此静默收起弹窗，
-        // 用户不必挨个去点「拒绝」——他已经用点击表达过选择了，再逼他关掉 N-1 个框是骚扰。
-        if let Some(pending) = self.pending_bind_consent.as_ref() {
-            if pending.resp_tx.is_closed() {
-                self.pending_bind_consent = None;
-            } else if Instant::now() >= pending.deadline {
-                let pending = self
-                    .pending_bind_consent
-                    .take()
-                    .expect("上一行刚确认是 Some");
-                let _ = pending.resp_tx.send(McpResponse {
-                    id: pending.req_id,
-                    result: Err(
-                        "等待用户选择 iShell 窗口超时（5 分钟）：用户同时开着多个 iShell，\
-                         需要他在想让你操作的那个窗口上点「允许」。请让用户切回 iShell 处理\
-                         后重试"
-                            .into(),
-                    ),
-                });
-            }
-        }
     }
 
     /// 给「最近的那个超时」排一次定时重绘。每帧末尾调用一次（见 frame.rs）。
@@ -1858,7 +1810,6 @@ impl App {
     pub(super) fn arm_timeout_repaint(&self) {
         let consents = [
             self.pending_open_consent.as_ref().map(|p| p.deadline),
-            self.pending_bind_consent.as_ref().map(|p| p.deadline),
         ];
         let sessions = self.sessions.iter().flat_map(|s| {
             s.pending_ai_run
@@ -2535,30 +2486,11 @@ impl App {
             ai_owned: s.ai_owned,
             ai_owner: s.ai_owner_label.clone(),
             mine: true, // 开它的就是发起者自己
-            token_injected: s.mcp_token_injected,
+            endpoint_injected: s.mcp_env_injected,
         };
         let _ = resp_tx.send(McpResponse {
             id,
             result: Ok(McpReqResult::Opened(info)),
-        });
-    }
-
-    /// 用户在绑定弹窗里点了「允许」/「拒绝」——即在这个窗口上决定「让那个 AI 客户端操作我」。
-    ///
-    /// 注意这里**不需要**在 App 里记任何绑定状态：绑定活在代理进程的内存里（它记住 id，此后
-    /// 每条请求都点名），而 iShell 只做「这条请求是不是在叫我」的校验（`is_addressed_to`）。
-    /// 把绑定同时记在两侧只会多出一份能和对方失配的状态，却换不来任何额外保证。
-    pub(super) fn resolve_bind_consent(&mut self, allow: bool) {
-        let Some(pending) = self.pending_bind_consent.take() else {
-            return;
-        };
-        let _ = pending.resp_tx.send(McpResponse {
-            id: pending.req_id,
-            result: if allow {
-                Ok(McpReqResult::Ok)
-            } else {
-                Err("用户在这个 iShell 窗口上拒绝了绑定请求".into())
-            },
         });
     }
 
@@ -2604,12 +2536,14 @@ impl App {
         if list.is_empty() {
             return format!(
                 "会话不存在（uid={uid}）：你当前没有自己开的会话（iShell 重启后 uid 会重新分配）。\
-                 用 open_session 开一个"
+                 提示：你只能读写**自己用 open_session 开的**会话（硬规则，没有授权弹窗）；用 \
+                 list_saved_connections 查连接名、open_session 开一个"
             );
         }
         format!(
             "会话不存在（uid={uid}）：可能是 iShell 已重启（重启后 uid 会重新分配）或这个会话\
-             已被关闭。你自己的会话（uid:标题）：{}",
+             已被关闭。提示：你只能读写**自己用 open_session 开的**会话（硬规则，没有授权弹窗）。\
+             你自己的会话（uid:标题）：{}",
             list.join(", ")
         )
     }
@@ -2640,13 +2574,15 @@ impl App {
         let id = call.req.id;
         let _ = call.resp_tx.send(McpResponse {
             id,
-            result: Err(foreign_session_refusal(uid)),
+            // 与「会话不存在」是**同一句话**：不然 uid 是否存在就能被枚举出来（别人的窗口连存在与否都
+            // 不该透露）。
+            result: Err(self.session_not_found_msg(uid, actor.as_deref())),
         });
         None
     }
 
     fn handle_mcp_call(&mut self, call: McpCall) {
-        // 设置里关掉 MCP 后立刻拒绝业务请求（含 Bind 弹窗）。监听 socket 仍要等重启才撤，
+        // 设置里关掉 MCP 后立刻拒绝业务请求。监听 socket 仍要等重启才撤，
         // 但用户把开关拧掉的意图是「现在别再动我的终端」，不能再等一次重启才生效。
         if !crate::store::load_mcp_consent() {
             let id = call.req.id;
@@ -2681,37 +2617,6 @@ impl App {
             });
         };
         match req.kind {
-            // Identify / IdentifyPair / 配对握手都在连接层就地答完了（见 handle_conn），
-            // 根本到不了这里。
-            McpReqKind::Identify
-            | McpReqKind::IdentifyPair { .. }
-            | McpReqKind::PairHello { .. }
-            | McpReqKind::PairProve { .. } => {
-                send_err(resp_tx, "Identify/配对握手 不应该到达 App 层".into());
-            }
-            McpReqKind::Bind => {
-                // 只跟「另一个绑定请求」互斥。这里**不能**因为恰好挂着一个 open/use 授权框
-                // 就把 Bind 顶回去：代理会把那条 Err 当成「这个窗口不是胜出者」，于是用户想
-                // 选的那个窗口压根不弹绑定框，他连点的机会都没有；若每个窗口都恰好忙着，
-                // 整次绑定还会以「没有任何一个窗口批准」告终，而用户一个框都没见过。
-                // 两个框不同时显示是**渲染**层的事，交给 handle_ai_bind_consent 去排队。
-                if self.pending_bind_consent.is_some() {
-                    send_err(
-                        resp_tx,
-                        "已有另一个 AI 客户端正在等待用户选择窗口，请稍候重试".into(),
-                    );
-                    return;
-                }
-                self.pending_bind_consent = Some(PendingBindConsent {
-                    resp_tx,
-                    req_id: id,
-                    // 代理（≥某个版本起）会带上发起方的来源描述，弹窗原样展示给用户看。
-                    // 旧代理不带：None，弹窗就不显示这一行。
-                    origin: req.origin.clone(),
-                    // 与另外两个确认框同样给 5 分钟：用户可能不在电脑前。
-                    deadline: Instant::now() + Duration::from_secs(300),
-                });
-            }
             McpReqKind::ListSessions => {
                 // 只列发起方自己开的会话：用户的窗口、其它 AI 的窗口连标题/主机/cwd 都不给看
                 // （见 `session_owned_by`）。
@@ -2732,7 +2637,7 @@ impl App {
                         ai_owner: s.ai_owner_label.clone(),
                         // 列表里只剩自己的会话，恒为 true；字段保留是线格式兼容。
                         mine: true,
-                        token_injected: s.mcp_token_injected,
+                        endpoint_injected: s.mcp_env_injected,
                     })
                     .collect();
                 let _ = resp_tx.send(McpResponse {
@@ -3614,8 +3519,8 @@ mod timeout_chokepoint_tests {
         };
         // 显式豁免：**不是**帧循环轮询的截止时刻、到点也不需要谁来处理的 `Instant` 字段。
         // 每加一条都要写明理由——这份清单就是门禁的「逃生口」，不写理由等于把门拆了。
-        // - `last_used`（`tickets::Entry`）：连接凭据的最近使用时刻。过期是在下一次签发/核对时
-        //   顺手判断的（惰性），过期那一刻没有任何人在等结果，不需要排重绘。
+        // - `last_used`（`tickets::Entry`）：连接凭据的最近使用时刻，只用来在凭据表满时淘汰最久没用
+        //   的一张。它不是截止时刻，没有任何人在等它，不需要排重绘。
         const NOT_FRAME_POLLED: &[&str] = &["last_used"];
         let mut missing: Vec<&str> = Vec::new();
         for line in src.lines() {
@@ -4015,381 +3920,370 @@ mod tests {
     }
 }
 
-/// 配对握手（v4）在**真 socket 上**的行为测试。
+/// 认证层在**真 socket 上**的行为测试：把 `handle_conn` 整个拉起来，用照规范手写的客户端去撞它。
 ///
-/// 为什么非要开真连接、把 `handle_conn` 整个拉起来跑：握手是全协议唯一一处「一条连接两问
-/// 两答」，它的分帧、第二行的超时、以及"证明不过就不放行"这些性质，全都不在纯函数里——
-/// `mcp_protocol` 那几个单测只证明 HMAC 算得对，证明不了这条连接会不会在第二行上挂死、
-/// 或者干脆把没证明过的连接放过去。编译绿 ≠ 能用。
+/// 为什么非要开真连接：握手的分帧、第二行的超时、「证明不过就不放行」「对未认证者零应答」这些
+/// 性质全都不在纯函数里——`mcp_protocol` 的单测只证明 HMAC 算得对，证明不了这条连接会不会把
+/// 没证明过的连接放过去、或在拒绝时多说了一个字。编译绿 ≠ 能用。
 ///
-/// 仍然没被覆盖的部分（必须由人在真机上过）：`ishell-mcp` 那半边的时序，以及跨 SSH 反向
-/// 转发时的实际行为。这里的客户端是照协议手写的，与真代理共用 `mcp_protocol` 的证明算法，
-/// 但发包顺序是各写各的。
+/// 仍然没被覆盖的部分（必须在真机上过）：`ishell-mcp` 那半边的时序，以及跨 SSH 反向转发时的
+/// 实际行为。这里的客户端与真代理共用 `mcp_protocol` 的 MAC 算法，但发包顺序是各写各的。
 #[cfg(all(test, unix))]
-mod pair_handshake_tests {
+mod auth_tests {
     use super::*;
-    use crate::mcp_protocol::{pair_nonce, pair_proof, PairRole};
+    use crate::mcp_protocol as p;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    /// 起一个只服务一条连接的 `handle_conn`，返回客户端那一端。
-    async fn serve_one() -> UnixStream {
-        let dir = std::env::temp_dir().join(format!(
-            "ishell-pair-test-{}-{:?}",
+    /// 起一个能服务多条连接的 `handle_conn` 监听，返回路径与 `McpCall` 的接收端。
+    async fn serve() -> (std::path::PathBuf, mpsc::UnboundedReceiver<McpCall>) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ishell-auth-test-{}-{}",
             std::process::id(),
-            std::thread::current().id()
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_file(&dir);
-        let listener = UnixListener::bind(&dir).expect("绑定测试 socket");
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let ctx = egui::Context::default();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-            let permit = sem.acquire_owned().await.expect("permit");
-            let work = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-            handle_conn(stream, tx, ctx, permit, work).await;
-        });
-        let s = UnixStream::connect(&dir).await.expect("连接测试 socket");
-        let _ = std::fs::remove_file(&dir); // 路径已不需要，连接照常存活
-        s
-    }
-
-    /// 发一行请求、收一行响应。
-    async fn round(
-        r: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-        w: &mut tokio::net::unix::OwnedWriteHalf,
-        id: u64,
-        kind: McpReqKind,
-    ) -> Result<McpReqResult, String> {
-        let mut line = serde_json::to_string(&McpRequest {
-            id,
-            instance: None,
-            origin: None,
-            // v6：握手要声明 actor 才签发凭据（签发的凭据绑定它）。
-            actor: Some(TEST_ACTOR.into()),
-            ticket: None,
-            kind,
-        })
-        .unwrap();
-        line.push('\n');
-        w.write_all(line.as_bytes()).await.expect("写请求");
-        let mut resp = String::new();
-        r.read_line(&mut resp).await.expect("读响应");
-        assert!(!resp.is_empty(), "对端没回任何东西就断了");
-        serde_json::from_str::<McpResponse>(resp.trim())
-            .expect("响应应能解析")
-            .result
-    }
-
-    /// 走完整条握手；`token` 是客户端用来算证明的密钥。返回最终那一步的结果。
-    async fn handshake_with(token: &str) -> Result<McpReqResult, String> {
-        let (r, mut w) = serve_one().await.into_split();
-        let mut r = BufReader::new(r);
-        let nonce_c = pair_nonce().expect("熵源");
-        let challenge = round(
-            &mut r,
-            &mut w,
-            1,
-            McpReqKind::PairHello {
-                nonce_c: nonce_c.clone(),
-            },
-        )
-        .await?;
-        let (nonce_s, server_proof) = match challenge {
-            McpReqResult::PairChallenge {
-                nonce_s,
-                server_proof,
-                ..
-            } => (nonce_s, server_proof),
-            other => panic!("第一步应回 PairChallenge，实际：{other:?}"),
-        };
-        // 客户端本该在这里验服务器证明；测试里按需分别断言，所以此处只把它带出去。
-        assert_eq!(
-            server_proof,
-            pair_proof(
-                &crate::store::mcp_pairing_token(),
-                &nonce_c,
-                &nonce_s,
-                PairRole::Server
-            ),
-            "服务器证明与共享算法算出来的不一致"
-        );
-        round(
-            &mut r,
-            &mut w,
-            2,
-            McpReqKind::PairProve {
-                client_proof: pair_proof(token, &nonce_c, &nonce_s, PairRole::Client),
-            },
-        )
-        .await
-    }
-
-    /// 正路：知道 token 的调用方能走完握手，拿到实例标识。
-    #[tokio::test]
-    async fn correct_token_completes_the_handshake() {
-        let token = crate::store::mcp_pairing_token();
-        match handshake_with(&token).await {
-            Ok(McpReqResult::Instance { id, .. }) => {
-                assert_eq!(id, crate::store::mcp_instance_id())
-            }
-            other => panic!("正确 token 应握手成功，实际：{other:?}"),
-        }
-    }
-
-    /// 反路：token 不对就必须被拒——这是整条隔离的意义所在。
-    #[tokio::test]
-    async fn wrong_token_is_refused() {
-        let err = handshake_with("definitely-not-the-token")
-            .await
-            .expect_err("错误 token 必须被拒");
-        assert!(err.contains("证明不符"), "错误信息应指明是证明不符：{err}");
-    }
-
-    /// 每条连接的服务器随机数必须是新的：复用随机数会让抓到的证明可以重放。
-    #[tokio::test]
-    async fn each_connection_gets_a_fresh_server_nonce() {
-        async fn nonce_of() -> String {
-            let (r, mut w) = serve_one().await.into_split();
-            let mut r = BufReader::new(r);
-            match round(
-                &mut r,
-                &mut w,
-                1,
-                McpReqKind::PairHello {
-                    nonce_c: "fixed".into(),
-                },
-            )
-            .await
-            .expect("第一步应成功")
-            {
-                McpReqResult::PairChallenge { nonce_s, .. } => nonce_s,
-                other => panic!("应回 PairChallenge：{other:?}"),
-            }
-        }
-        assert_ne!(nonce_of().await, nonce_of().await, "服务器随机数被复用了");
-    }
-
-    /// 没先握手就直接出示证明：拒绝。否则调用方就能自选挑战，双向证明形同虚设。
-    #[tokio::test]
-    async fn prove_without_hello_is_refused() {
-        let (r, mut w) = serve_one().await.into_split();
-        let mut r = BufReader::new(r);
-        let err = round(
-            &mut r,
-            &mut w,
-            1,
-            McpReqKind::PairProve {
-                client_proof: "whatever".into(),
-            },
-        )
-        .await
-        .expect_err("未开始握手就出示证明必须被拒");
-        assert!(err.contains("未开始"), "{err}");
-    }
-
-    /// 握手中途改发别的请求：不放行。没走完握手的连接不该顺势拿到执行能力。
-    #[tokio::test]
-    async fn switching_to_another_request_mid_handshake_is_refused() {
-        let (r, mut w) = serve_one().await.into_split();
-        let mut r = BufReader::new(r);
-        let _ = round(
-            &mut r,
-            &mut w,
-            1,
-            McpReqKind::PairHello {
-                nonce_c: pair_nonce().expect("熵源"),
-            },
-        )
-        .await
-        .expect("第一步应成功");
-        let err = round(&mut r, &mut w, 2, McpReqKind::ListSessions)
-            .await
-            .expect_err("握手第二步只接受 PairProve");
-        assert!(err.contains("PairProve"), "{err}");
-    }
-
-    /// 测试握手声明的进程身份。
-    const TEST_ACTOR: &str = "test-actor";
-
-    /// 发一条点名本实例的业务请求（`ListSessions`），带上给定凭据与自报 actor，返回原始响应。
-    async fn business_request(
-        ticket: Option<String>,
-        claimed_actor: &str,
-    ) -> Result<McpReqResult, String> {
-        let (r, mut w) = serve_one().await.into_split();
-        let mut r = BufReader::new(r);
-        let mut line = serde_json::to_string(&McpRequest {
-            id: 1,
-            instance: Some(crate::store::mcp_instance_id().to_string()),
-            origin: None,
-            actor: Some(claimed_actor.into()),
-            ticket,
-            kind: McpReqKind::ListSessions,
-        })
-        .unwrap();
-        line.push('\n');
-        w.write_all(line.as_bytes()).await.expect("写请求");
-        let mut resp = String::new();
-        r.read_line(&mut resp).await.expect("读响应");
-        match serde_json::from_str::<McpResponse>(resp.trim()) {
-            Ok(r) => r.result,
-            // serve_one 的接收端已丢弃：通过了门禁的请求递不进 App，连接会被直接收掉——
-            // 这正说明它**通过了**凭据校验。
-            Err(_) => Ok(McpReqResult::Ok),
-        }
-    }
-
-    /// **iShell 端身份校验（v6）**：点名点对了实例、却没带有效凭据的业务请求，必须拒绝。
-    /// 此前这里只核对实例 id——而 id 任何人发一句匿名 Identify 就能问到，于是任何客户端都能
-    /// 驱动别人的 iShell（用户：「严禁操作其他人的客户端」）。
-    /// 反向对照：删掉 `handle_conn` 里凭据核对那一段，前两条断言当场挂。
-    #[tokio::test]
-    async fn a_request_without_a_valid_ticket_is_refused_even_with_the_right_instance() {
-        let err = business_request(None, TEST_ACTOR)
-            .await
-            .expect_err("没带凭据必须拒绝");
-        assert!(
-            err.starts_with(crate::mcp_protocol::TICKET_REJECTED),
-            "{err}"
-        );
-        let err = business_request(Some("f".repeat(128)), TEST_ACTOR)
-            .await
-            .expect_err("伪造的凭据必须拒绝");
-        assert!(
-            err.starts_with(crate::mcp_protocol::TICKET_REJECTED),
-            "{err}"
-        );
-        // 握手拿到的凭据：放行。
-        let ticket = match handshake_with(&crate::store::mcp_pairing_token()).await {
-            Ok(McpReqResult::Instance { ticket, .. }) => ticket,
-            other => panic!("握手应签发凭据，实际：{other:?}"),
-        };
-        assert!(!ticket.is_empty(), "握手成功的应答里必须带凭据");
-        assert!(business_request(Some(ticket), TEST_ACTOR).await.is_ok());
-    }
-
-    /// 凭据绑定握手时声明的 actor，iShell 以它为准——请求里自报别人的 actor 没用。
-    /// 反向对照：把 `req.actor = Some(actor)` 那一行删掉，本条挂（自报的 impostor 会被采信）。
-    #[tokio::test]
-    async fn the_ticket_pins_the_actor_declared_at_handshake() {
-        let ticket = match handshake_with(&crate::store::mcp_pairing_token()).await {
-            Ok(McpReqResult::Instance { ticket, .. }) => ticket,
-            other => panic!("握手应签发凭据，实际：{other:?}"),
-        };
-        let (stream, mut rx) = serve_keep_rx().await;
-        let (r, mut w) = stream.into_split();
-        let mut line = serde_json::to_string(&McpRequest {
-            id: 1,
-            instance: Some(crate::store::mcp_instance_id().to_string()),
-            origin: None,
-            actor: Some("impostor".into()),
-            ticket: Some(ticket),
-            kind: McpReqKind::ListSessions,
-        })
-        .unwrap();
-        line.push('\n');
-        w.write_all(line.as_bytes()).await.expect("写请求");
-        let call = rx.recv().await.expect("带有效凭据的请求应递进 App");
-        assert_eq!(
-            call.req.actor.as_deref(),
-            Some(TEST_ACTOR),
-            "应以凭据绑定的 actor 为准"
-        );
-        drop(r);
-    }
-
-    /// 与 `serve_one` 相同，但保留接收端，用来看请求递进 App 时的样子。
-    async fn serve_keep_rx() -> (UnixStream, mpsc::UnboundedReceiver<McpCall>) {
-        let dir = std::env::temp_dir().join(format!(
-            "ishell-ticket-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&dir);
-        let listener = UnixListener::bind(&dir).expect("绑定测试 socket");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("绑定测试 socket");
         let (tx, rx) = mpsc::unbounded_channel();
         let ctx = egui::Context::default();
+        let hs = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+        let work = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-            let permit = sem.acquire_owned().await.expect("permit");
-            let work = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-            handle_conn(stream, tx, ctx, permit, work).await;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let permit = hs.clone().acquire_owned().await.expect("permit");
+                tokio::spawn(handle_conn(
+                    stream,
+                    tx.clone(),
+                    ctx.clone(),
+                    permit,
+                    work.clone(),
+                ));
+            }
         });
-        let s = UnixStream::connect(&dir).await.expect("连接测试 socket");
-        let _ = std::fs::remove_file(&dir);
-        (s, rx)
+        (path, rx)
     }
 
-    /// 发一行请求，断言**零应答**（对端静默关闭连接）：token 不符的 `IdentifyPair` 探测在
-    /// v5 下的期望行为——调用方什么也学不到。
-    async fn assert_silenced(kind: McpReqKind) {
-        let (r, mut w) = serve_one().await.into_split();
-        let mut r = BufReader::new(r);
-        let mut line = serde_json::to_string(&McpRequest {
-            id: 1,
-            instance: None,
-            origin: None,
-            actor: None,
-            ticket: None,
-            kind,
-        })
-        .unwrap();
+    fn key() -> &'static str {
+        crate::store::mcp_run_key().expect("测试环境熵源应可用")
+    }
+
+    /// 读到对端关闭为止，返回收到的全部字节（超时视为失败）。
+    async fn drain(r: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        // 对端带着没读完的数据就关连接时，我们这边读到的是 ECONNRESET——同样是「被关了」
+        match tokio::time::timeout(std::time::Duration::from_secs(10), r.read_to_end(&mut out))
+            .await
+            .expect("对端应当关闭连接，而不是挂着")
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("读失败：{e}"),
+        }
+        out
+    }
+
+    async fn send(w: &mut tokio::net::unix::OwnedWriteHalf, v: &impl serde::Serialize) {
+        let mut line = serde_json::to_string(v).unwrap();
         line.push('\n');
         w.write_all(line.as_bytes()).await.expect("写请求");
-        let mut resp = String::new();
-        let n = r.read_line(&mut resp).await.expect("读响应");
-        assert_eq!(n, 0, "token 不符的探测必须零应答（连接被静默关闭）");
     }
 
-    /// v5 的匿名发现语义：匿名 `Identify` 是**版本信标**，照常应答（旧代理全靠它拿到
-    /// 「版本不符，请重新部署」的提示）；匿名 `IdentifyPair` 只对 **token 正确**的调用方
-    /// 应答（v3 旧代理凭正确 token 走到版本校验），token 不符零应答；配对握手照常完成。
-    #[tokio::test]
-    async fn anonymous_identify_beacons_version_but_pair_probe_requires_the_token() {
-        // 匿名 Identify：照答——版本信标，全协议唯一跨版本可解析的请求。
-        let (r, mut w) = serve_one().await.into_split();
-        let mut r = BufReader::new(r);
-        match round(&mut r, &mut w, 1, McpReqKind::Identify).await {
-            Ok(McpReqResult::Instance {
-                id, proto_version, ..
-            }) => {
-                assert_eq!(id, crate::store::mcp_instance_id());
-                assert_eq!(proto_version, crate::mcp_protocol::MCP_PROTOCOL_VERSION);
-            }
-            other => panic!("匿名 Identify 应当照答（版本信标），实际：{other:?}"),
+    async fn send_raw(w: &mut tokio::net::unix::OwnedWriteHalf, line: &str) {
+        w.write_all(format!("{line}\n").as_bytes()).await.expect("写请求");
+    }
+
+    fn hello_frame(key: &str, cn: &str) -> p::HelloFrame {
+        p::HelloFrame {
+            hello: p::Hello {
+                auth: p::AUTH_VERSION,
+                cn: cn.into(),
+                mac: p::auth_mac(key, p::AuthStep::Hello, cn, ""),
+            },
         }
-        // 匿名 IdentifyPair：token 不符零应答；token 正确照答（v3 兼容，走到版本校验）。
-        assert_silenced(McpReqKind::IdentifyPair {
-            token: "definitely-not-the-token".into(),
-        })
-        .await;
-        let token = crate::store::mcp_pairing_token();
-        let (r, mut w) = serve_one().await.into_split();
+    }
+
+    /// 走完整条握手，返回签发的凭据。`app` 是声明的业务协议版本。
+    async fn handshake(path: &std::path::Path, key: &str, actor: &str, app: u32) -> Result<String, String> {
+        let (r, mut w) = UnixStream::connect(path).await.expect("连接").into_split();
         let mut r = BufReader::new(r);
-        match round(
-            &mut r,
+        let cn = p::auth_nonce().expect("熵源");
+        send(&mut w, &hello_frame(key, &cn)).await;
+        let mut line = String::new();
+        r.read_line(&mut line).await.expect("读");
+        if line.is_empty() {
+            return Err("对端没应答就断开了".into());
+        }
+        let ok: p::HelloOkFrame = serde_json::from_str(line.trim()).expect("hello_ok 应能解析");
+        // 客户端本该在这里验服务器证明：测试里直接断言它与共享算法一致。
+        assert!(
+            p::auth_mac_matches(key, p::AuthStep::Server, &cn, &ok.hello_ok.sn, &ok.hello_ok.smac),
+            "服务器证明与共享算法算出来的不一致"
+        );
+        assert_eq!((ok.hello_ok.app_min, ok.hello_ok.app_max), (p::MCP_APP_MIN, p::MCP_APP_MAX));
+        assert_eq!(ok.hello_ok.peer.run, crate::store::mcp_instance_id());
+        send(
             &mut w,
-            1,
-            McpReqKind::IdentifyPair {
-                token: token.clone(),
+            &p::ProveFrame {
+                prove: p::Prove {
+                    cmac: p::auth_mac(key, p::AuthStep::Client, &cn, &ok.hello_ok.sn),
+                    actor: actor.into(),
+                    app,
+                },
             },
         )
-        .await
-        {
-            Ok(McpReqResult::Instance { id, .. }) => {
-                assert_eq!(id, crate::store::mcp_instance_id())
-            }
-            other => panic!("正确 token 的 IdentifyPair 应当照答，实际：{other:?}"),
+        .await;
+        let mut line2 = String::new();
+        r.read_line(&mut line2).await.expect("读");
+        if line2.is_empty() {
+            return Err("对端没应答就断开了".into());
         }
-        // 配对握手：知道 token 的调用方照常拿到实例标识
-        match handshake_with(&token).await {
-            Ok(McpReqResult::Instance { id, .. }) => {
-                assert_eq!(id, crate::store::mcp_instance_id())
-            }
-            other => panic!("配对握手不应被挡，实际：{other:?}"),
+        if let Ok(t) = serde_json::from_str::<p::TicketFrame>(line2.trim()) {
+            return Ok(t.ticket.ticket);
         }
+        match serde_json::from_str::<McpResponse>(line2.trim()).expect("应是错误应答").result {
+            Err(e) => Err(e),
+            Ok(_) => panic!("意外的成功应答"),
+        }
+    }
+
+    async fn business(path: &std::path::Path, ticket: &str, extra: &str) {
+        let (_r, mut w) = UnixStream::connect(path).await.expect("连接").into_split();
+        // 第一行出示凭据，第二行是请求；请求手写一行，好带上 `actor` 这种线上本不该有的字段
+        send(&mut w, &p::BearerFrame { bearer: ticket.into() }).await;
+        send_raw(
+            &mut w,
+            &format!(r#"{{"id":1{extra},"kind":"ListSessions"}}"#),
+        )
+        .await;
+        std::mem::forget(w); // 保持连接不关，让 handle_conn 把请求递进来
+    }
+
+    /// 正路：持有本次运行密钥的调用方走完握手，拿到凭据；凭据在后续业务请求里生效，且业务请求
+    /// 到达 App 层时带的 actor 是**握手时声明的**——线上自报的 `actor` 字段被无视。
+    #[tokio::test]
+    async fn correct_key_completes_the_handshake_and_the_ticket_pins_the_actor() {
+        let (path, mut rx) = serve().await;
+        let ticket = handshake(&path, key(), "alice", p::MCP_APP_MIN).await.expect("应握手成功");
+        business(&path, &ticket, r#","actor":"forged-by-the-caller""#).await;
+        let call = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("请求应被递进来")
+            .expect("通道未关");
+        assert_eq!(call.req.actor.as_deref(), Some("alice"), "actor 必须来自凭据，不是自报");
+        // 不同 actor 的握手签发不同凭据，互不串
+        let other = handshake(&path, key(), "bob", p::MCP_APP_MIN).await.expect("握手");
+        assert_ne!(other, ticket);
+        business(&path, &other, "").await;
+        let call = rx.recv().await.expect("通道未关");
+        assert_eq!(call.req.actor.as_deref(), Some("bob"));
+    }
+
+    /// **对未认证者零应答**：任何没有持有本次运行密钥/有效凭据的第一行——旧协议的 Identify、
+    /// 垃圾、伪造的凭据、错误的 mac——都只会看到连接被关闭，一个字节都收不到。
+    /// 这是「B 的 agent 探测 C 的 iShell 什么也学不到」的执行点。
+    /// 反向对照：让 `handle_conn` 对解析失败的行回一条错误（旧行为），第二条起当场挂。
+    #[tokio::test]
+    async fn unauthenticated_callers_get_zero_bytes() {
+        let (path, mut rx) = serve().await;
+        let cn = p::auth_nonce().unwrap();
+        let attempts: Vec<(&str, String)> = vec![
+            ("旧版匿名 Identify", r#"{"id":1,"instance":null,"kind":"Identify"}"#.into()),
+            ("垃圾", "this is not json".into()),
+            ("伪造的凭据", r#"{"bearer":"deadbeef"}"#.into()),
+            ("旧版内联 ticket（v8 之前的请求形状）", r#"{"id":1,"ticket":"deadbeef","kind":"ListSessions"}"#.into()),
+            ("bearer 不是字符串", r#"{"bearer":123}"#.into()),
+            ("bearer 为 null", r#"{"bearer":null}"#.into()),
+            ("没有凭据", r#"{"id":1,"kind":"ListSessions"}"#.into()),
+            (
+                "旧版 PairHello",
+                r#"{"id":1,"kind":{"PairHello":{"nonce_c":"aa"}}}"#.into(),
+            ),
+            (
+                "错误密钥的 hello",
+                serde_json::to_string(&hello_frame("some-other-key", &cn)).unwrap(),
+            ),
+            (
+                "认证层版本不对的 hello",
+                serde_json::to_string(&p::HelloFrame {
+                    hello: p::Hello {
+                        auth: 99,
+                        cn: cn.clone(),
+                        mac: p::auth_mac(key(), p::AuthStep::Hello, &cn, ""),
+                    },
+                })
+                .unwrap(),
+            ),
+        ];
+        for (what, line) in attempts {
+            let (r, mut w) = UnixStream::connect(&path).await.expect("连接").into_split();
+            let mut r = BufReader::new(r);
+            send_raw(&mut w, &line).await;
+            let got = drain(&mut r).await;
+            assert!(got.is_empty(), "{what}：对未认证者回了 {} 字节：{:?}", got.len(), String::from_utf8_lossy(&got));
+        }
+        assert!(rx.try_recv().is_err(), "未认证的请求不得被递进 App 层");
+    }
+
+    /// 握手第三步的 cmac 不对（知道 hello 的 mac 算法但没有密钥的人到不了这里；这里模拟拿着
+    /// 另一个握手的 cmac 来重放）：静默断开，且不签发凭据。
+    #[tokio::test]
+    async fn a_replayed_or_wrong_proof_is_refused_silently() {
+        let (path, _rx) = serve().await;
+        let cn = p::auth_nonce().unwrap();
+        let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
+        let mut r = BufReader::new(r);
+        send(&mut w, &hello_frame(key(), &cn)).await;
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap();
+        let ok: p::HelloOkFrame = serde_json::from_str(line.trim()).unwrap();
+        // 用「另一个 sn」算的 cmac——等价于重放上一次握手里抓到的证明
+        let replayed = p::auth_mac(key(), p::AuthStep::Client, &cn, &"00".repeat(32));
+        assert_ne!(ok.hello_ok.sn, "00".repeat(32));
+        send(
+            &mut w,
+            &p::ProveFrame {
+                prove: p::Prove {
+                    cmac: replayed,
+                    actor: "mallory".into(),
+                    app: p::MCP_APP_MIN,
+                },
+            },
+        )
+        .await;
+        assert!(drain(&mut r).await.is_empty(), "重放的证明被回应了");
+        // 把 iShell 自己的 `Server` 证明当成客户端证明送回来（反射）：同样静默
+        let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
+        let mut r = BufReader::new(r);
+        send(&mut w, &hello_frame(key(), &cn)).await;
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap();
+        let ok: p::HelloOkFrame = serde_json::from_str(line.trim()).unwrap();
+        send(
+            &mut w,
+            &p::ProveFrame {
+                prove: p::Prove {
+                    cmac: ok.hello_ok.smac.clone(),
+                    actor: "mallory".into(),
+                    app: p::MCP_APP_MIN,
+                },
+            },
+        )
+        .await;
+        assert!(drain(&mut r).await.is_empty(), "反射的证明被回应了");
+    }
+
+    /// 认证通过**之后**才开口：业务协议版本对不上时给出明确的「请升级/重新部署」，且不签凭据。
+    #[tokio::test]
+    async fn a_version_gap_is_explained_only_to_an_authenticated_peer() {
+        let (path, _rx) = serve().await;
+        let err = handshake(&path, key(), "alice", p::MCP_APP_MAX + 1)
+            .await
+            .expect_err("版本越界不得签发凭据");
+        assert!(err.contains("版本") && err.contains("重新部署"), "{err}");
+    }
+
+    /// **认证前的内存/时间上限**：没有密钥的调用方塞超长的第一行（有无换行都一样）、或沉默，
+    /// 都在 `AUTH_LINE_MAX` / `AUTH_LINE_TIMEOUT` 内被零应答地关掉——iShell 不会为它缓冲 32MB。
+    /// 反向对照：把认证阶段的读取改回 `lines.next_line()`（要等到换行才返回），超长无换行那条
+    /// 会一直挂到 30 秒超时，本条断言「2 秒内关闭」当场挂。
+    #[tokio::test]
+    async fn oversized_or_silent_first_lines_are_cut_off_early_without_a_reply() {
+        let (path, mut rx) = serve().await;
+        let t0 = std::time::Instant::now();
+        for (what, payload) in [
+            // 字面量而不是由上限常量推出来：否则有人把上限调大，这条测试会跟着一起放行
+            ("超过上限的一整行（有换行）", format!("[{}]\n", "0,".repeat(8192))),
+            ("超过上限且永不换行", "a".repeat(64 * 1024)),
+        ] {
+            let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
+            let mut r = BufReader::new(r);
+            let _ = w.write_all(payload.as_bytes()).await;
+            let got = drain(&mut r).await;
+            assert!(got.is_empty(), "{what}：回了 {} 字节", got.len());
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "超限的第一行应当立刻被断开，而不是等超时：{:?}",
+            t0.elapsed()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// 沉默的连接最多占握手名额 `AUTH_LINE_TIMEOUT`，到点被关、零应答（此前是 30 秒）。
+    #[tokio::test]
+    async fn a_silent_connection_is_dropped_after_the_short_auth_timeout() {
+        let (path, _rx) = serve().await;
+        let (r, _w) = UnixStream::connect(&path).await.unwrap().into_split();
+        let mut r = BufReader::new(r);
+        let t0 = std::time::Instant::now();
+        let got = drain(&mut r).await;
+        assert!(got.is_empty());
+        let dt = t0.elapsed();
+        assert!(
+            dt >= p::AUTH_LINE_TIMEOUT - std::time::Duration::from_millis(500)
+                && dt < p::AUTH_LINE_TIMEOUT + std::time::Duration::from_secs(2),
+            "沉默连接应在 {:?} 左右被关，实际 {dt:?}",
+            p::AUTH_LINE_TIMEOUT
+        );
+    }
+
+    /// `cn` 长度不是 64 / 含 NUL 的 hello：即使 mac 是用同一个 `cn` 算对的也不理（零应答）。
+    /// 第一行同时带 `hello` 与有效 `bearer`：只走 hello 分支，不会顺手当成业务请求执行。
+    #[tokio::test]
+    async fn odd_hellos_and_mixed_first_lines_are_refused_without_executing_anything() {
+        let (path, mut rx) = serve().await;
+        let ticket = handshake(&path, key(), "alice", p::MCP_APP_MIN).await.expect("握手");
+        for (what, cn) in [("cn 63 位", "a".repeat(63)), ("cn 65 位", "a".repeat(65)), ("cn 含 NUL", format!("{}\0", "a".repeat(63))), ("cn 64 位但非十六进制", "z".repeat(64))] {
+            let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
+            let mut r = BufReader::new(r);
+            send(&mut w, &hello_frame(key(), &cn)).await;
+            assert!(drain(&mut r).await.is_empty(), "{what}");
+        }
+        let cn = p::auth_nonce().unwrap();
+        let mixed = serde_json::json!({
+            "hello": {"auth": 1, "cn": cn, "mac": p::auth_mac(key(), p::AuthStep::Hello, &cn, "")},
+            "bearer": ticket, "id": 1, "kind": "ListSessions",
+        });
+        let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
+        let mut r = BufReader::new(r);
+        send(&mut w, &mixed).await;
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap();
+        assert!(line.contains("hello_ok"), "应当走握手分支：{line}");
+        drop(w);
+        assert!(rx.try_recv().is_err(), "混合第一行不得被当成业务请求递进 App 层");
+    }
+
+    /// 凭据表的淘汰按**最近使用**走，且一个 actor 挤不掉别人的凭据：
+    /// 一个 actor 反复握手只会淘汰它自己最久没用的那张；一直在用的凭据不会因为「签发得早」被挤掉。
+    /// 反向对照：把淘汰改回「按签发时间、全局最老」，两条断言都挂。
+    #[test]
+    fn ticket_eviction_is_lru_and_one_actor_cannot_evict_another() {
+        let victim = tickets::issue("lru-victim".into()).unwrap();
+        let busy = tickets::issue("lru-busy".into()).unwrap();
+        for _ in 0..200 {
+            tickets::issue("lru-greedy".into()).unwrap();
+            // busy 的凭据一直在被使用，签发时刻再早也不该被挤掉
+            assert_eq!(tickets::redeem(&busy).as_deref(), Some("lru-busy"));
+        }
+        assert_eq!(tickets::count_for("lru-greedy"), tickets::PER_ACTOR_CAP, "超额者只淘汰它自己的");
+        assert_eq!(tickets::redeem(&victim).as_deref(), Some("lru-victim"), "别人的凭据被挤掉了");
+        assert_eq!(tickets::redeem(&busy).as_deref(), Some("lru-busy"));
+    }
+
+    /// 凭据不可跨 iShell 运行使用的前提：凭据只存在于本进程内存，随机、足够长、互不相同。
+    #[test]
+    fn tickets_are_long_random_and_unique() {
+        let a = tickets::issue("x".into()).unwrap();
+        let b = tickets::issue("x".into()).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 128);
+        assert_eq!(tickets::redeem(&a).as_deref(), Some("x"));
+        assert_eq!(tickets::redeem("nope"), None);
     }
 }
 
@@ -4427,14 +4321,15 @@ mod upload_stream_tests {
     async fn upload_bytes_with(size: usize, err_while_reading: bool) -> usize {
         let (stream, mut rx) = serve_one_keep_rx().await;
         let (_r, mut w) = stream.into_split();
+        // 业务连接第一行必须出示 iShell 签发的凭据（这里直接签一张，握手本身另有测试）
+        let bearer = serde_json::to_string(&crate::mcp_protocol::BearerFrame {
+            bearer: super::tickets::issue("upload-test".into()).expect("签发凭据"),
+        })
+        .expect("序列化凭据");
         let mut line = serde_json::to_string(&McpRequest {
             id: 1,
-            // 非握手类请求必须点名实例，否则会被 `is_addressed_to` 挡在门外
-            instance: Some(crate::store::mcp_instance_id().to_string()),
             origin: None,
             actor: None,
-            // v6：业务请求必须带 iShell 签发的凭据（这里直接签一张，握手本身另有测试）
-            ticket: super::tickets::issue("upload-test".into()),
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 1,
                 remote_path: "/tmp/whatever".into(),
@@ -4443,7 +4338,7 @@ mod upload_stream_tests {
             },
         })
         .expect("序列化请求");
-        line.push('\n');
+        line = format!("{bearer}\n{line}\n");
         w.write_all(line.as_bytes()).await.expect("写请求行");
 
         // 负载分块写：写端要和下面的读端并发跑，否则 socket 缓冲区一满就双双卡死。
@@ -4548,12 +4443,15 @@ mod upload_stream_tests {
         let stream = UnixStream::connect(&path).await.expect("连接测试 socket");
         let _ = std::fs::remove_file(&path);
         let (r, mut w) = stream.into_split();
+        // 凭据先于并发名额核对（无效凭据静默断开），所以这里必须是一张有效的
+        let bearer = serde_json::to_string(&crate::mcp_protocol::BearerFrame {
+            bearer: super::tickets::issue("work-limit-test".into()).expect("签发凭据"),
+        })
+        .expect("序列化凭据");
         let mut line = serde_json::to_string(&McpRequest {
             id: 7,
-            instance: Some(crate::store::mcp_instance_id().to_string()),
             origin: None,
             actor: None,
-            ticket: None,
             kind: McpReqKind::CopyToRemoteFromCaller {
                 session_uid: 1,
                 remote_path: "/tmp/whatever".into(),
@@ -4562,7 +4460,7 @@ mod upload_stream_tests {
             },
         })
         .expect("序列化请求");
-        line.push('\n');
+        line = format!("{bearer}\n{line}\n");
         w.write_all(line.as_bytes()).await.expect("写请求行");
         let writer = tokio::spawn(async move {
             let chunk = vec![0xABu8; 64 * 1024];

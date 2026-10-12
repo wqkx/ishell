@@ -194,8 +194,9 @@ pub async fn run(
     //
     // 远端路径带随机后缀（而非固定名字）：同一台主机短时间内被反复连接/重连时，服务器端
     // 可能因为迟迟未判定旧连接已死（无 keepalive 时 TCP 层探测很慢）而拒绝复用同一个固定
-    // 路径的新注册请求（"rejected by the other party"）。加上随机后缀后各次连接互不冲突；
-    // 对端按 `~/.ishell-mcp/mcp-*.sock` 通配、取最新一个即可发现当前有效的路径。
+    // 路径的新注册请求（"rejected by the other party"）。加上随机后缀后各次连接互不冲突。
+    // 注册成功后路径经 `WorkerEvent::McpEndpoint` 交给 UI，随本次运行的密钥一起注入终端
+    // （`ISHELL_MCP_ENDPOINT` / `ISHELL_MCP_KEY`）——代理只连这一条，**不再**按通配去发现。
     //
     // 这些 socket 文件统一放进 `~/.ishell-mcp/` 子目录（而不是散落在 `$HOME` 根），且在本次
     // 连接正常断开时（见下方 `run()` 收尾处）主动删除本次注册的那一个——用一个共享的
@@ -219,6 +220,7 @@ pub async fn run(
     {
         let fwd_handle = handle.clone();
         let path_slot = mcp_forward_path.clone();
+        let fwd_sink = sink.clone();
         Some(tokio::spawn(async move {
             // 注册尝试的结论：成功则返回落地的 remote_path，放弃/失败则 None。
             let registered: Option<String> = async {
@@ -236,14 +238,21 @@ pub async fn run(
                     ),
                 )
                 .await;
-                let nonce = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or_default();
+                // 真随机后缀（熵源失败才退回纳秒时间戳——路径不是秘密，认证靠密钥，这里只求不撞名、
+                // 不好猜；`ls ~/.ishell-mcp/` 本来就能看到文件，隐藏不了，也不指望隐藏）。
+                let nonce = crate::mcp_protocol::random_hex(12).unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos().to_string())
+                        .unwrap_or_default()
+                });
                 let remote_path = format!("{dir}/mcp-{nonce}.sock");
                 match fwd_handle.streamlocal_forward(remote_path.clone()).await {
                     Ok(()) => {
                         *path_slot.lock().unwrap() = Some(remote_path.clone());
+                        // 把这条连接专属的端点交给 UI：它连同本次运行的密钥一起注入终端，
+                        // 在这个终端里启动的 AI 只会连这一条 socket（代理不再扫目录）。
+                        fwd_sink.send(WorkerEvent::McpEndpoint(remote_path.clone()));
                         Some(remote_path)
                     }
                     Err(e) => {

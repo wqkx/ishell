@@ -232,17 +232,17 @@ pub fn save_ai_notify_mode(m: AiNotifyMode) {
     }
 }
 
-/// 是否自动把配对标识注入空闲的终端会话（` export ISHELL_PAIR_TOKEN=…` 并回车执行）。
+/// 是否自动把 MCP 连接环境注入空闲的终端会话（` export ISHELL_MCP_ENDPOINT=… ISHELL_MCP_KEY=…`
+/// 并回车执行）。
 ///
 /// 0.21 起这是**内置行为、不再是用户选项**：AI 控制总开关（`load_mcp_consent`）打开时
-/// 恒为真。它解决的是多用户服务器上「无 token 代理向每台 iShell 广播绑定弹窗」的问题
-/// （见 `app::mcp_bridge::PendingBindConsent`）：token 生效的前提是 AI 的进程环境里有它，
-/// 注入让「iShell 终端里启动的 AI」自动携带配对身份，绑定只回本机。
+/// 恒为真。协议 v8 里 AI 能连上哪台 iShell **只**取决于这两个变量（见 `mcp_protocol` 的
+/// 「认证层」），注入让「iShell 终端里启动的 AI」自动携带它们，只回本机。
 ///
 /// 保留本函数（调用点不写死 `true`）是为了让「该不该注入」的判定仍收敛在一处
-/// （见 `app::frame::pair_inject_allowed`），也保住那条「AI 控制开 ≠ 允许替用户敲键盘」
+/// （见 `app::frame::mcp_env_inject_allowed`），也保住那条「AI 控制开 ≠ 允许替用户敲键盘」
 /// 的回归测试。
-pub fn load_mcp_auto_pair() -> bool {
+pub fn load_mcp_auto_inject() -> bool {
     true
 }
 
@@ -413,127 +413,31 @@ pub fn mcp_instance_id() -> &'static str {
 /// 进新实例，导致旧实例的 SSH 反向转发 MCP 通道被错误地路由到新实例、操作到旧实例都不认识
 /// 的会话。每进程一个独立路径从根本上消除这个冲突，不需要任何「探测占用」之类的运行时逻辑。
 ///
-/// 注意路径只是**发现**用的候选，不是身份：认人靠 `McpReqKind::Identify` 问出来的实例标识
-/// （见 `src/mcp_protocol.rs`）。同一个 iShell 可能对应多条路径，残留的死文件也还躺在目录里。
+/// 注意这个本机路径不是身份，也不被任何人扫描：本机终端会话里，它由 iShell 自己作为
+/// `ISHELL_MCP_ENDPOINT` 注入；远端会话里，反向转发出去的是另一个随机路径（见 `ssh/mod.rs`）。
+/// 认人只靠运行密钥（`mcp_run_key`）与握手签发的凭据（见 `src/mcp_protocol.rs`）。
 pub fn mcp_socket_path() -> Option<PathBuf> {
     Some(config_dir()?.join(format!("mcp-{}.sock", mcp_instance_id())))
 }
 
-/// 配对 token 的落盘文件。**v6 起换了文件名**（旧的是 `mcp_pairing_token`），效果是每台电脑
-/// 升级后自动生成一个全新的 token、旧 token 作废。
+/// 本次运行的 **MCP 运行密钥**：iShell 每次启动随机生成一个 256 位密钥，**只放内存、绝不落盘**。
 ///
-/// 为什么要作废旧 token：多人共用 AI 服务器账号时，有人把自己的旧 token 写进了共享的
-/// `~/.claude.json` MCP 配置，它会覆盖每个人终端注入的 token、把所有人的 AI 都路由到他的
-/// 电脑（2026-09-18 生产实测）。换新 token 之后，那个写死的旧值再也匹配不上任何 iShell，
-/// 不用去动别人共用的配置文件就自然失效。旧文件原样留着，不删（删了无益，留着便于排查）。
-fn mcp_pairing_token_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("mcp_pairing_token_v2"))
-}
-
-/// 本安装的 **MCP 配对 token**：稳定、每安装唯一、跨重启不变。首次调用时自动生成并以
-/// `0600` 持久化。
+/// 它是 iShell 与「从它的终端里启动的 AI 代理」之间唯一的共享秘密，经终端注入的
+/// `ISHELL_MCP_KEY` 环境变量交给代理（配套的 `ISHELL_MCP_ENDPOINT` 指明连哪条 socket）。
+/// 代理与 iShell 之间只跑 HMAC 挑战-应答（见 `mcp_protocol` 的认证层），密钥本身永不过线。
 ///
-/// 用途：多台电脑共用同一台 AI 服务器的同一个账号时，各家 iShell 反向转发的 socket 会全堆在
-/// 同一个目录里，代理无从区分谁是谁。iShell 在自己的终端会话里注入环境变量
-/// `ISHELL_PAIR_TOKEN`（AI 不在 iShell 终端里启动时，手动加在启动命令前面；**不要**写进多人
-/// 共用的 MCP 配置）——代理与 iShell 之间跑一次**双向
-/// 挑战-应答**握手（`McpReqKind::PairHello`/`PairProve`）来互证知道该 token，请求只落到
-/// 自己电脑。**token 本身永不过线**：线上只出现 `HMAC(token, 两个随机数)`，任何一方都不会
-/// 把密钥出示给尚未证明过身份的对端。
+/// 为什么每次运行一份、且不持久化：
+/// - **iShell 重启即作废**：旧进程里已经在跑的 agent 握着旧密钥，新进程认不得它，只能重开——
+///   这正是要的语义（agent 的身份跟「那一次 iShell 运行」绑死）；
+/// - 没有任何落盘的长期密钥可被拷走、同步、写进共享的 MCP 配置里串台（旧的每安装一份的
+///   配对 token 正是这样被写进共享 `~/.claude.json` 而把所有人的 AI 路由到同一台电脑的）；
+/// - B、C 两台电脑各自随机，互不相同，不存在「两台共用同一个密钥」的配置同步路径。
 ///
-/// 因此这个 token 是货真价实的 HMAC 密钥，长度就是安全边界：生成的是 128 位。要手动换新，
-/// 删掉 `mcp_pairing_token_v2` 文件让它重新生成即可（终端会在下次连接时自动注入新值）。
-///
-/// 与 [`mcp_instance_id`] 的关键区别：instance_id 是**每进程**的、随进程生灭（用于同机多开
-/// 去重），**绝不持久化**；pairing token 是**每安装**的、必须**稳定持久**。二者用途正交。
-pub fn mcp_pairing_token() -> String {
-    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TOKEN
-        .get_or_init(|| {
-            let Some(p) = mcp_pairing_token_path() else {
-                // 配置目录不可用（极罕见）：退化为本进程内一致的随机值，至少本次运行可用。
-                return gen_pairing_token();
-            };
-            // 已有则用已有的（持久稳定是这个 token 的全部意义）。顺手收紧权限：旧版本可能
-            // 以默认 umask 写成 0644，同机其它账户可读走密钥。
-            if let Ok(s) = std::fs::read_to_string(&p) {
-                let s = s.trim().to_string();
-                if !s.is_empty() {
-                    #[cfg(unix)]
-                    super::crypto::restrict_perms(&p);
-                    return s;
-                }
-            }
-            // 首次：生成并以 0600 落盘（与主密钥同级敏感——能让代理跳过绑定弹窗）。
-            let token = gen_pairing_token();
-            if let Some(d) = p.parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            write_pairing_token_file(&p, &token);
-            token
-        })
-        .clone()
-}
-
-/// 以 0600 写入配对 token（unix）；失败时仍经 WRITE_ERRORS 冒泡。
-fn write_pairing_token_file(path: &std::path::Path, token: &str) {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        let write = (|| {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(token.as_bytes())?;
-            let _ = f.sync_all();
-            drop(f);
-            std::fs::rename(&tmp, path)
-        })();
-        if let Err(e) = write {
-            let _ = std::fs::remove_file(&tmp);
-            log::warn!("写入配对 token 失败 {}：{e}", path.display());
-            let msg = match crate::i18n::current() {
-                crate::i18n::Lang::Zh => format!("⚠ 设置未能保存（{}）：{e}", path.display()),
-                crate::i18n::Lang::En => {
-                    format!("⚠ Failed to save setting ({}): {e}", path.display())
-                }
-            };
-            if let Ok(mut v) = WRITE_ERRORS.lock() {
-                if v.len() < 16 {
-                    v.push(msg);
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        write_setting(path, token);
-    }
-}
-
-/// 生成新的配对 token：32 位十六进制（128 位熵）。v4 起它是 HMAC 的密钥——攻击者向任一
-/// iShell 发一句 `PairHello` 就能换到一条 `(随机数, 证明)` 拿去离线暴力破解，密钥长度就是
-/// 这里的安全边界。旧安装留下的 64 位 token 继续可用（见 `mcp_pairing_token`），只是余量小些。
-///
-/// 熵源不可用（极罕见）时退化到**完整的**纪元纳秒（128 位里填满 16 字节中的 12 字节），
-/// 而不是只填 4 字节 subsec——后者会留下 12 字节恒零，把密钥实际熵压到 32 位。这仍然是个
-/// 可猜测的退化路径（时间戳终究不是随机数），只是不至于差到荒谬；配对功能本身是可选的，
-/// 为它让 iShell 起不来不划算。
-fn gen_pairing_token() -> String {
-    let mut buf = [0u8; 16];
-    if getrandom::getrandom(&mut buf).is_err() {
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        buf[..12].copy_from_slice(&ns.to_le_bytes()[..12]);
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+/// 熵源失败返回 `None`：**不退化成时间戳**（可预测的密钥等于没有密钥）。调用方必须把 `None`
+/// 当成「本次运行不提供 MCP 控制」——不监听认证请求、不注入。
+pub fn mcp_run_key() -> Option<&'static str> {
+    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| crate::mcp_protocol::random_hex(32)).as_deref()
 }
 
 // ---------- 终端配色（多套主题，按索引存储） ----------

@@ -20,7 +20,7 @@ Let Claude Code, Codex CLI, Kimi Code, OpenCode, or another MCP-compatible agent
 
 Everything you need for daily SSH work in **one window** — and it stays out of your way.
 
-- 🤖 **Let AI drive the terminal (MCP)** — Claude Code, Codex CLI, Kimi Code, and OpenCode operate a real persistent session (cwd/env/history intact); commands appear live in the tab. On by default (Settings turns it off); the matching proxy binary ships inside iShell and installs onto a server in one click. When several computers share one AI server, enable pairing. See "AI / MCP integration".
+- 🤖 **Let AI drive the terminal (MCP)** — Claude Code, Codex CLI, Kimi Code, and OpenCode operate a real persistent session (cwd/env/history intact); commands appear live in the tab. On by default (Settings turns it off); the matching proxy binary ships inside iShell and installs onto a server in one click. An AI only ever reaches the iShell of the terminal it was started in, so several computers can share one AI server. See "AI / MCP integration".
 - ⚡ **Fast & lightweight** — pure Rust + GPU immediate-mode UI. A single binary (~8–12 MB), instant startup, **~0% idle CPU**, **~80 MB RAM**. No Electron / JVM / Python, no daemon, no runtime deps.
 - 🎯 **Refined user experience** — a clean, warm light theme; smooth drag-to-reorder tabs; no toolbar clutter; English / 中文 switchable on the fly; sensible defaults so it just works.
 - 📁 **Effortless file operations** — multi-select rubber-band, batch delete/download, server-side copy/move, **resumable** transfers that **auto-resume after reconnect**, and folder **compress-download** (tar.gz) for thousands of small files.
@@ -43,7 +43,7 @@ Everything you need for daily SSH work in **one window** — and it stays out of
 **AI / MCP integration** (on by default — see "AI / MCP integration" below)
 - Let Claude Code, Codex CLI, Kimi Code, and OpenCode drive a **real terminal session** (cwd/env/history intact), with live commands and output
 - Full tool set: run commands, read screen/history, interactive input, interrupt, open/close sessions, read/write/transfer remote files
-- SSH reverse-forward lets the AI on a remote server reach back to this iShell; **enable pairing when several computers share one AI server** (see below)
+- SSH reverse-forward lets the AI on a remote server reach back to this iShell; **an AI started in a terminal can only reach that terminal's iShell, so several computers can safely share one AI server** (see below)
 
 **Connections & sessions**
 - Multi-session tabs: status dots, **smooth drag-to-reorder animation**, overflow fade, close confirmation
@@ -211,13 +211,13 @@ Let an AI (Claude Code, Codex CLI, Kimi Code, or OpenCode) drive a **real, persi
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
      # Claude Code, Kimi Code, and OpenCode: register the stdio server using the client’s MCP settings.
      ```
-     **Codex CLI:** add the server to `~/.codex/config.toml` (or the applicable Codex config) and allow the pairing variables to reach the MCP subprocess:
+     **Codex CLI:** add the server to `~/.codex/config.toml` (or the applicable Codex config) and allow the two connection variables to reach the MCP subprocess — Codex hands MCP servers a filtered environment, so anything not listed here never arrives:
      ```toml
      [mcp_servers.ishell]
      command = "/home/you/.ishell-mcp/bin/ishell-mcp"
-     env_vars = ["ISHELL_PAIR_TOKEN", "ISHELL_HOST"]
+     env_vars = ["ISHELL_MCP_ENDPOINT", "ISHELL_MCP_KEY"]
      ```
-     `env_vars` forwards these values from Codex’s local environment; it does not create them. Start Codex from an iShell terminal where the variables have been injected, or otherwise ensure they are present in the environment that launches Codex. Do not hard-code a pairing token in a shared MCP config. For Claude Code, Kimi Code, and OpenCode, register the stdio server with the same `ishell-mcp` command; other MCP clients can do the same. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
+     `env_vars` forwards these values from Codex’s own environment; it does not create them. Start Codex from an iShell terminal (see “How an AI finds your iShell” below). Never hard-code the values in a config file — they change on every connection / every iShell run. For Claude Code, Kimi Code, and OpenCode, register the stdio server with the same `ishell-mcp` command; other MCP clients can do the same. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
 
 ### Tools
 
@@ -232,30 +232,31 @@ Let an AI (Claude Code, Codex CLI, Kimi Code, or OpenCode) drive a **real, persi
 | `copy_to_remote` / `copy_from_remote` | Streaming single-file transfer (bytes stay out of MCP JSON); `local_path` is on the **ishell-mcp host** |
 | `copy_between_sessions` | Copy a single file between two open remote sessions |
 
-### Remote reach-back (reverse forward)
+### How an AI finds your iShell (and why it can never reach another one)
 
-With the switch on, each SSH connect reverse-forwards the local MCP socket to `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). Remote `ishell-mcp` auto-discovers it — usually no path to configure.
+With the switch on, each SSH connect reverse-forwards the local MCP socket to a **random, per-connection** path `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). iShell then types two variables into that terminal:
 
-**Anyone who can SSH into that server (same account) can reach this iShell through the forwarded socket — enable only for servers you trust.** Even then, only a proxy that completes the pairing handshake gets a connection credential from your iShell (protocol v6), and an AI can only read and act in sessions it opened itself — sessions *you* opened are invisible and off-limits to it.
+- `ISHELL_MCP_ENDPOINT` — that connection's socket path;
+- `ISHELL_MCP_KEY` — a random key generated when *this run* of iShell started (memory only, never written to disk).
 
-### ⚠️ Several computers sharing one AI server (read this)
+An AI started in that shell inherits them, and `ishell-mcp` connects to **exactly that endpoint and nothing else** — it does not list directories, probe neighbours, pop up a chooser, or fall back to anything. The rules, with no exceptions:
 
-Typical setup: the AI runs on a shared server; several people connect with their own iShell. Forwarded sockets then pile up on that server, and without pairing the proxy can only ask someone to click which window — **that bothers others, and a wrong click can change someone else's environment**.
+1. **Not started from an iShell terminal → refused.** No variables, no connection; the error says why and what to do. There is no manual configuration, no “copy pairing config”.
+2. **Wrong or stale environment → refused, silently.** The endpoint only answers a peer that proves it holds the key (HMAC challenge–response; the key never goes over the wire, and the proxy proves itself only after the iShell has proved itself). An iShell answers an unauthenticated caller with **zero bytes** — not even its version or host name.
+3. **Restarting iShell invalidates every running agent.** The key is per run, so agents started before the restart can no longer connect; start them again from the new terminal. The same goes for an SSH reconnect (the endpoint changes with the new shell).
+4. **No degradation.** A dead endpoint is an error, never “try the next one”.
 
-Do one of these (prefer 1):
+So with computers B and C both connected to one AI server account, an agent started in B's terminal can only ever reach B's iShell, and C never even sees a byte from it. (Residual risk, stated plainly: if an environment containing a *live* endpoint+key of C is copied into B's agent — e.g. a tmux server that C's terminal started — that agent reaches C. Start AIs directly in the iShell terminal; don't reuse tmux/screen environments across computers.)
 
-1. **Start the AI inside an iShell terminal.** Once the session goes idle, iShell types ` export ISHELL_PAIR_TOKEN=…` into it (built in since 0.21, active whenever “Allow AI to control terminals via MCP” is on); AI / `ishell-mcp` started in that shell binds only to *your* computer. Zero configuration in most cases.
-2. If the AI is *not* started inside an iShell terminal: Settings → “Copy pairing config”, and prefix the AI's launch command with it (e.g. `ISHELL_PAIR_TOKEN=… claude`). **Do not put the token in the AI's global MCP config** (such as the user-level `env` in `~/.claude.json`) on a server account shared by several people: that file is shared, and a token written there overrides everyone's terminal-injected token, routing every user's AI to your computer.
-3. Since protocol v5 (0.21) an **unpaired proxy is refused outright** with the two options above — the “click a window to choose” dialog is gone: an unpaired proxy's broadcast bind is exactly how the prompt reached every iShell on the server and one wrong click bound someone else's AI to you.
+If the auto-injection was skipped because you typed right after connecting, right-click the terminal → **Inject MCP connection environment now**, then (re)start the AI in that shell. Codex needs the `env_vars` line above; for other agents, if the variables are present when the AI starts but gone later, the agent re-launched the proxy with a filtered environment — `ishell-mcp` writes who started it and which `ISHELL_*` variables it saw to `~/.ishell-mcp/diag.log` and into the error.
 
-The pairing token ends up in the remote shell environment (and same-UID `/proc/*/environ`) — that's the cost of pairing on a shared account. Don't put the token on untrusted hosts or paste it into chat.
+Known limits, stated plainly:
 
-Manual tunnel (skip auto reverse-forward):
+- **Shell history.** The injected line starts with a space, which keeps it out of the history only if the shell ignores space-prefixed lines (`HISTCONTROL=ignorespace`/`ignoreboth` — the Debian/Ubuntu bash default; zsh needs `setopt HIST_IGNORE_SPACE`; RHEL's bash default does not). Otherwise the key and endpoint of a *running* iShell can end up in `~/.bash_history`/`~/.zsh_history`, which every user of a shared server account can read. They die with the iShell run / the SSH connection, but while it lives, someone reading that file could use them. On a shared account, set the option above.
+- **`ls ~/.ishell-mcp/` shows every forwarded socket** (including other computers'). The proxy never looks; a person can.
+- **Agents inside one iShell are not isolated from each other.** The “only sessions it opened itself” rule relies on each agent declaring who it is; an agent that lies can touch a sibling agent's sessions *on the same iShell*. It cannot reach another computer.
 
-```bash
-ssh -N -L /tmp/ishell-mcp.sock:$HOME/.config/ishell/mcp-<pid>.sock user@ishell-host &
-ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
-```
+**Anyone who can SSH into that server (same account) can reach the forwarded socket — enable only for servers you trust.** But reaching it is not enough: they get no answer without the run key, and an AI can only read and act in sessions it opened itself — sessions *you* opened are invisible and off-limits to it.
 
 ### Other notes
 
@@ -267,7 +268,7 @@ ISHELL_MCP_SOCKET=/tmp/ishell-mcp.sock /path/to/ishell-mcp
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
-- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port; every request must carry a credential your iShell issued after a successful pairing handshake (protocol v6), and the AI can only read and act in sessions it opened itself — your own sessions are refused, with no prompt and no setting to allow it; when several computers share one AI server, use the pairing token to avoid cross-machine mix-ups. The pairing token is stored `0600` and **never travels over the wire**: pairing is a mutual challenge-response (each side shows `HMAC(token, nonces)`), and the proxy only presents its own proof after verifying the peer's — so neither a spoofed socket can trick the secret out of it, nor is the secret handed to whoever connects. Known residual risk: a same-account attacker who **relays live** between your proxy and your iShell can still impersonate. There is no channel binding available on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart), so this cannot be eliminated.
+- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port. Identity comes from the environment iShell injects into *its own terminals* (an endpoint + a per-run random key); the proxy connects to that one endpoint only and the iShell answers nothing to a caller that cannot prove it holds the key. Every request then carries a credential issued by that handshake, and the AI can only read and act in sessions it opened itself — your own sessions are refused, with no prompt and no setting to allow it. The key never travels over the wire (mutual HMAC challenge–response; the proxy proves itself only after verifying the peer) and is never written to disk, so restarting iShell revokes every running agent. Known residual risk: a same-account attacker who can read the environment of a process started from your terminal, or who **relays live** between your proxy and your iShell, can still impersonate — there is no channel binding on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart).
 
 ## 📄 License
 
