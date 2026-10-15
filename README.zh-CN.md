@@ -12,7 +12,7 @@
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-> **最新版本：** [v0.26.0](https://github.com/wqkx/ishell/releases/tag/v0.26.0)
+> **最新版本：** [v0.27.0](https://github.com/wqkx/ishell/releases/tag/v0.27.0)
 
 </div>
 
@@ -214,13 +214,12 @@ cargo run --release
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
      # Claude Code、Kimi Code、OpenCode：在各自的 MCP 设置中注册 stdio server。
      ```
-     **Codex CLI：**在 `~/.codex/config.toml`（或适用的 Codex 配置文件）中添加 server，并允许两个连接变量传给 MCP 子进程——Codex 给 MCP server 的是一份**过滤过的环境**，没在这里列出的变量根本到不了代理：
+     **Codex CLI：**在 `~/.codex/config.toml`（或适用的 Codex 配置文件）中添加 server：
      ```toml
      [mcp_servers.ishell]
      command = "/home/you/.ishell-mcp/bin/ishell-mcp"
-     env_vars = ["ISHELL_MCP_ENDPOINT", "ISHELL_MCP_KEY"]
      ```
-     `env_vars` 会从 Codex 自己的运行环境转发变量，**不会自动生成变量值**。请在 iShell 终端里启动 Codex（见下面「AI 怎么找到你的 iShell」）。**不要把这两个值写死进任何配置文件**——它们每次连接、每次 iShell 运行都会变。Claude Code、Kimi Code、OpenCode 在各自 MCP 设置中将 stdio server 的命令指向同一个 `ishell-mcp` 即可；其它 MCP 客户端也可用相同方式配置。GUI 与 `ishell-mcp` **必须同版本**；升级后重跑安装脚本。
+     并在 iShell 终端里**用 `codex --no-daemon` 启动 Codex**（可 `alias codex='codex --no-daemon'`）。Codex 默认把 agent 放在共享后台服务（`codex app-server`，常驻、没有终端）里，由它拉起的 MCP 代理不是你终端的后代进程，iShell 无从知道它属于哪个终端，会被拒绝。现在不涉及任何环境变量——没有要转发的、也没有要写死的。Claude Code、Kimi Code、OpenCode 在各自 MCP 设置中将 stdio server 的命令指向同一个 `ishell-mcp` 即可；其它 MCP 客户端也可用相同方式配置。GUI 与 `ishell-mcp` **必须同版本**；升级后重跑安装脚本。
 
 ### 工具一览
 
@@ -237,25 +236,21 @@ cargo run --release
 
 ### AI 怎么找到你的 iShell（以及为什么它永远碰不到别的 iShell）
 
-开关打开后，连上 SSH 时会把本机 MCP socket 反向转发到远端一个**每次连接都随机的**路径 `~/.ishell-mcp/mcp-<随机>.sock`（走现有加密通道，无额外端口）。随后 iShell 往**那个终端**里注入两个变量：
+开关打开后，连上 SSH 时会把本机 MCP socket 反向转发到远端一个**每次连接都随机的**路径 `~/.ishell-mcp/mcp-<随机>.sock`（走现有加密通道，无额外端口）。随后 iShell 在服务器上**登记这条连接的登录 shell**：写一个 `~/.ishell-mcp/sess/<主机名>/<shell pid>`（权限 `0600`），里面是那个 socket 路径、**这一次** iShell 运行启动时生成的随机密钥（只在内存里，你的电脑上从不落盘），以及 shell 的 pid 和启动时间。整个过程不往你的终端里打任何字，你连上后多快开始敲键盘都不影响。
 
-- `ISHELL_MCP_ENDPOINT` —— 这条连接专属的 socket 路径；
-- `ISHELL_MCP_KEY` —— **这一次** iShell 运行启动时生成的随机密钥（只在内存里，从不落盘）。
+`ishell-mcp` 沿自己的**父进程链**往上找，用第一个有合法登记文件的祖先（pid 对、启动时间吻合、属主是你、组和其它人没有权限）。然后**只连那一个端点，别的一概不碰**——不列目录、不探测邻居、不弹选择框、没有任何兜底。「你是哪个终端的后代」是内核给的事实，不是环境变量能声明的东西。规则没有例外：
 
-在那个 shell 里启动的 AI 继承它们，`ishell-mcp` **只连这一个端点，别的一概不碰**——不列目录、不探测邻居、不弹选择框、没有任何兜底。规则没有例外：
-
-1. **不是从 iShell 终端里启动的 → 拒绝。** 没变量就不连接，报错说明原因和该怎么做。没有手动配置，也没有「复制配对配置」。
-2. **环境不对或已过期 → 拒绝，且对方一声不吭。** 端点只应答能证明自己持有密钥的对端（HMAC 挑战-应答；密钥不过线，iShell 先自证、代理验过才自证）。iShell 对未认证的调用者**一个字节都不回**——连版本、主机名都不给。
-3. **iShell 重启会让所有在跑的 agent 失效。** 密钥每次运行一份，重启前启动的 agent 再也连不上，要在新的终端里重新启动。SSH 重连同理（新 shell、新端点）。
+1. **不是某个已登记登录 shell 的后代 → 拒绝。** 包括 IDE、systemd 服务、tmux/screen（它们的进程挂在复用器下面，不在登录 shell 的进程树里）、以及 Codex 的共享后台服务拉起的 agent。报错会说明原因和该怎么做；没有手动配置，也没有「复制配对配置」。
+2. **登记不对或已过期 → 拒绝，且对方一声不吭。** 端点只应答能证明自己持有密钥的对端（HMAC 挑战-应答；密钥不过线，iShell 先自证、代理验过才自证）。iShell 对未认证的调用者**一个字节都不回**——连版本、主机名都不给。
+3. **iShell 重启会让所有在跑的 agent 失效。** 密钥每次运行一份，重启前启动的 agent 再也连不上，要在终端里重新启动。SSH 重连同理（新 shell、新登记）。
 4. **没有降级。** 端点连不上就是报错，绝不「试试下一个」。
+5. **登记结果可查。** 登记脚本在服务器上执行失败时，会话状态栏和提示框会明说（「MCP 登记失败 …」）；服务器拒绝反向转发、探测不到远端 HOME 只在状态栏说明（不弹 toast）；本次启动时 AI 控制是关的（运行中打开要重启）则静默。这些情形下 `list_sessions` 的 `bound` 字段为 `false`，agent 侧的报错也会带诊断信息。
 
-所以电脑 B 和 C 连到同一台 AI 服务器的同一个账号时：在 B 的终端里启动的 agent 永远只能到 B 的 iShell，C 连它的一个字节都收不到。（残留风险，明说：如果有一份包含 C 的**有效**端点和密钥的环境被拷进了 B 的 agent——比如 C 的终端先启动的那个 tmux 服务端——那个 agent 就会连到 C。请在 iShell 终端里直接启动 AI，不要跨电脑复用 tmux/screen 的环境。）
-
-连上就立刻打字导致自动注入被跳过时：右键终端 →「**立即注入 MCP 连接环境**」，再在那个 shell 里（重新）启动 AI。Codex 需要上面那行 `env_vars`；其它 agent 若「启动时变量还在、后来才没了」，是 agent 用一份被过滤的环境重新拉起了代理——`ishell-mcp` 会把「谁拉起了它、它看到了哪些 `ISHELL_*` 变量」写进 `~/.ishell-mcp/diag.log` 并附在报错里。
+所以电脑 B 和 C 连到同一台 AI 服务器的同一个账号时：在 B 的终端里启动的 agent 永远只能到 B 的 iShell，C 连它的一个字节都收不到。Linux 与 macOS 服务器都支持（只需要 POSIX 的 `ps`），iShell 自己的「本机」终端在 Linux 和 macOS 上也支持；Windows 没有 MCP。macOS 路径只做了编译检查，没有在真机上跑过。若 agent 报告找不到终端，看它报错里的诊断（会列出它看到的进程祖先链），同样内容也写进 `~/.ishell-mcp/diag.log`。
 
 已知边界，明说：
 
-- **shell 历史。** 注入的那行以空格开头，只有 shell 忽略「空格开头的行」时才不进历史（`HISTCONTROL=ignorespace`/`ignoreboth`——Debian/Ubuntu 的 bash 默认如此；zsh 需要 `setopt HIST_IGNORE_SPACE`；RHEL 的 bash 默认不是）。否则**正在运行**的 iShell 的密钥与端点会落进 `~/.bash_history`/`~/.zsh_history`，而共享账号上的每个人都读得到它。它们随这次 iShell 运行 / 这条 SSH 连接一起失效，但在它还活着时，读到那个文件的人就能用。共享账号上请开上面那个选项。
+- **同账号可见。** 登记文件是 `0600`，但共享服务器账号上的所有人是同一个 Unix 用户，以该账号登录的人都读得到它们（就像能通过 `/proc` 读环境变量一样）。它们随这次 iShell 运行 / 这条 SSH 连接一起失效。你的 shell 历史里不再会留下任何敏感内容。
 - **`ls ~/.ishell-mcp/` 会列出所有转发 socket**（包括别的电脑的）。代理不看；人能看。
 - **同一个 iShell 里的 agent 之间不互相隔离。**「只能碰自己开的会话」靠每个 agent 如实声明自己是谁；撒谎的 agent 能碰**同一台 iShell** 上兄弟 agent 开的会话。它到不了别的电脑。
 

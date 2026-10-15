@@ -12,7 +12,7 @@ Let Claude Code, Codex CLI, Kimi Code, OpenCode, or another MCP-compatible agent
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-> **Latest release:** [v0.26.0](https://github.com/wqkx/ishell/releases/tag/v0.26.0)
+> **Latest release:** [v0.27.0](https://github.com/wqkx/ishell/releases/tag/v0.27.0)
 
 </div>
 
@@ -211,13 +211,12 @@ Let an AI (Claude Code, Codex CLI, Kimi Code, or OpenCode) drive a **real, persi
      claude mcp add ishell -s user -- ~/.ishell-mcp/bin/ishell-mcp   # Claude Code
      # Claude Code, Kimi Code, and OpenCode: register the stdio server using the client’s MCP settings.
      ```
-     **Codex CLI:** add the server to `~/.codex/config.toml` (or the applicable Codex config) and allow the two connection variables to reach the MCP subprocess — Codex hands MCP servers a filtered environment, so anything not listed here never arrives:
+     **Codex CLI:** add the server to `~/.codex/config.toml` (or the applicable Codex config):
      ```toml
      [mcp_servers.ishell]
      command = "/home/you/.ishell-mcp/bin/ishell-mcp"
-     env_vars = ["ISHELL_MCP_ENDPOINT", "ISHELL_MCP_KEY"]
      ```
-     `env_vars` forwards these values from Codex’s own environment; it does not create them. Start Codex from an iShell terminal (see “How an AI finds your iShell” below). Never hard-code the values in a config file — they change on every connection / every iShell run. For Claude Code, Kimi Code, and OpenCode, register the stdio server with the same `ishell-mcp` command; other MCP clients can do the same. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
+     and start Codex from an iShell terminal **with `codex --no-daemon`** (e.g. `alias codex='codex --no-daemon'`). By default Codex runs agents inside a shared background server (`codex app-server`, long-lived, with no terminal); MCP proxies spawned by that server are not descendants of your terminal, so iShell cannot tell which terminal they belong to and they are refused. No environment variables are involved any more — nothing to forward or hard-code. For Claude Code, Kimi Code, and OpenCode, register the stdio server with the same `ishell-mcp` command; other MCP clients can do the same. The GUI and `ishell-mcp` **must be the same version**; re-run the install script after upgrading.
 
 ### Tools
 
@@ -234,25 +233,21 @@ Let an AI (Claude Code, Codex CLI, Kimi Code, or OpenCode) drive a **real, persi
 
 ### How an AI finds your iShell (and why it can never reach another one)
 
-With the switch on, each SSH connect reverse-forwards the local MCP socket to a **random, per-connection** path `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). iShell then types two variables into that terminal:
+With the switch on, each SSH connect reverse-forwards the local MCP socket to a **random, per-connection** path `~/.ishell-mcp/mcp-<nonce>.sock` on that server (same encrypted channel, no extra port). iShell then **registers the connection's login shell** on the server: it writes `~/.ishell-mcp/sess/<host>/<shell pid>` (mode `0600`) containing that socket path, a random key generated when *this run* of iShell started (memory only, never written on your computer), and the shell's pid and start time. Nothing is typed into your terminal; it works however fast you start typing.
 
-- `ISHELL_MCP_ENDPOINT` — that connection's socket path;
-- `ISHELL_MCP_KEY` — a random key generated when *this run* of iShell started (memory only, never written to disk).
+`ishell-mcp` walks up its own **parent processes** and uses the first ancestor that has a valid registration file (right pid, matching start time, owned by you, not group/world accessible). It then connects to **exactly that endpoint and nothing else** — it never lists directories, probes neighbours, pops up a chooser, or falls back to anything. Which terminal you are a descendant of is a fact the kernel gives, not something an environment variable can claim. The rules, with no exceptions:
 
-An AI started in that shell inherits them, and `ishell-mcp` connects to **exactly that endpoint and nothing else** — it does not list directories, probe neighbours, pop up a chooser, or fall back to anything. The rules, with no exceptions:
-
-1. **Not started from an iShell terminal → refused.** No variables, no connection; the error says why and what to do. There is no manual configuration, no “copy pairing config”.
-2. **Wrong or stale environment → refused, silently.** The endpoint only answers a peer that proves it holds the key (HMAC challenge–response; the key never goes over the wire, and the proxy proves itself only after the iShell has proved itself). An iShell answers an unauthenticated caller with **zero bytes** — not even its version or host name.
-3. **Restarting iShell invalidates every running agent.** The key is per run, so agents started before the restart can no longer connect; start them again from the new terminal. The same goes for an SSH reconnect (the endpoint changes with the new shell).
+1. **Not a descendant of a registered login shell → refused.** That includes agents run by an IDE, a systemd service, tmux/screen (their processes hang off the multiplexer, not the login shell), or Codex's shared background server. The error says why and what to do; there is no manual configuration, no “copy pairing config”.
+2. **Wrong or stale registration → refused, silently.** The endpoint only answers a peer that proves it holds the key (HMAC challenge–response; the key never goes over the wire, and the proxy proves itself only after the iShell has proved itself). An iShell answers an unauthenticated caller with **zero bytes** — not even its version or host name.
+3. **Restarting iShell invalidates every running agent.** The key is per run, so agents started before the restart can no longer connect; start them again from the terminal. The same goes for an SSH reconnect (new shell, new registration).
 4. **No degradation.** A dead endpoint is an error, never “try the next one”.
+5. **Registration results are inspectable.** If the registration script fails on the server, the session status bar and a toast say “MCP registration failed …”. A server that refuses the reverse forward, or an undetectable remote `$HOME`, is explained in the status bar only (no toast); AI control being off at launch (turning it on needs a restart) is silent. In all of these `list_sessions` reports `bound: false` and the agent-side error carries diagnostics.
 
-So with computers B and C both connected to one AI server account, an agent started in B's terminal can only ever reach B's iShell, and C never even sees a byte from it. (Residual risk, stated plainly: if an environment containing a *live* endpoint+key of C is copied into B's agent — e.g. a tmux server that C's terminal started — that agent reaches C. Start AIs directly in the iShell terminal; don't reuse tmux/screen environments across computers.)
-
-If the auto-injection was skipped because you typed right after connecting, right-click the terminal → **Inject MCP connection environment now**, then (re)start the AI in that shell. Codex needs the `env_vars` line above; for other agents, if the variables are present when the AI starts but gone later, the agent re-launched the proxy with a filtered environment — `ishell-mcp` writes who started it and which `ISHELL_*` variables it saw to `~/.ishell-mcp/diag.log` and into the error.
+So with computers B and C both connected to one AI server account, an agent started in B's terminal can only ever reach B's iShell, and C never sees a byte from it. Works on Linux and macOS servers (it only needs POSIX `ps`) and for iShell's own “local” terminals on Linux and macOS; Windows has no MCP. The macOS paths are compile-checked but have not been run on a Mac. If an agent says it cannot find a terminal, its error lists the process ancestry it saw; the same goes to `~/.ishell-mcp/diag.log`.
 
 Known limits, stated plainly:
 
-- **Shell history.** The injected line starts with a space, which keeps it out of the history only if the shell ignores space-prefixed lines (`HISTCONTROL=ignorespace`/`ignoreboth` — the Debian/Ubuntu bash default; zsh needs `setopt HIST_IGNORE_SPACE`; RHEL's bash default does not). Otherwise the key and endpoint of a *running* iShell can end up in `~/.bash_history`/`~/.zsh_history`, which every user of a shared server account can read. They die with the iShell run / the SSH connection, but while it lives, someone reading that file could use them. On a shared account, set the option above.
+- **Same-account visibility.** The registration files are `0600`, but everyone sharing the server account is the same Unix user, so anyone logged in as that account can read them (as they could read an environment variable through `/proc`). They die with the iShell run / the SSH connection. Nothing sensitive goes into your shell history any more.
 - **`ls ~/.ishell-mcp/` shows every forwarded socket** (including other computers'). The proxy never looks; a person can.
 - **Agents inside one iShell are not isolated from each other.** The “only sessions it opened itself” rule relies on each agent declaring who it is; an agent that lies can touch a sibling agent's sessions *on the same iShell*. It cannot reach another computer.
 
