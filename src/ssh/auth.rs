@@ -1411,6 +1411,39 @@ pub(super) async fn exec_status(
     Ok((code, String::from_utf8_lossy(&err).into_owned()))
 }
 
+/// 执行命令并把 `input` 写进它的 stdin，返回 (退出码, stdout, stderr)。
+///
+/// 要往远端交一段**不能出现在命令行里**的内容（密钥）时用它：命令行在远端的 `ps` 里同账号别的
+/// 进程都看得见，stdin 看不见。
+pub(super) async fn exec_with_stdin(
+    handle: &Handle<ClientHandler>,
+    cmd: &str,
+    input: &[u8],
+) -> anyhow::Result<(i32, String, String)> {
+    let mut channel = handle.channel_open_session().await?;
+    channel.exec(true, cmd).await?;
+    channel.data(input).await?;
+    channel.eof().await?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut code = -1i32;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => push_capped(&mut out, &data, EXEC_STDERR_LIMIT),
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                push_capped(&mut err, &data, EXEC_STDERR_LIMIT)
+            }
+            ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
+            _ => {}
+        }
+    }
+    Ok((
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

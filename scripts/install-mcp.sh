@@ -45,11 +45,9 @@ cat <<EOF
 之后升级 iShell 时，重跑本脚本覆盖同一位置即可；若忘记升级代理，代理会在连接时
 以「版本不一致，请重新部署」明确报错，不会静默出错。
 
-连接哪台 iShell 完全由「启动 AI 的那个 iShell 终端」决定：开启 AI 控制后，iShell 会在连上后的空闲
-提示符处往该终端注入 ISHELL_MCP_ENDPOINT 和 ISHELL_MCP_KEY，在那个 shell 里启动的 AI 只会连到
-那一台 iShell，不会串到别人的电脑。不是从 iShell 终端启动的 AI 一律连不上（没有手动配置的口子）。
-注入要求「连上后还没动过键盘」（避免把内容打进某个正在等输入的密码提示符）——连上就立刻打字的
-话本次不注入，可在终端右键「立即注入 MCP 连接环境」补上。Codex 需要在 config.toml 里加：
-  env_vars = ["ISHELL_MCP_ENDPOINT", "ISHELL_MCP_KEY"]
+连接哪台 iShell 完全由「启动 AI 的那个 iShell 终端」决定：iShell 连上后会在服务器上给该终端的登录 shell
+登记会话（~/.ishell-mcp/sess/<主机名>/<pid>），代理沿进程祖先找到它——在那个终端里启动的 AI 只会连到那一台
+iShell，不会串到别人的电脑；不是从 iShell 终端里直接启动的（IDE、systemd 服务、tmux/screen、Codex 的
+共享后台服务）一律连不上。Codex 请用 `codex --no-daemon` 启动。
 详见 README「AI / MCP 集成」。
 EOF

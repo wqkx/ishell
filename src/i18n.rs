@@ -57,6 +57,16 @@ pub fn tr(zh: &'static str, en: &'static str) -> &'static str {
     }
 }
 
+/// MCP 登记失败的提示（带 ⚠ 前缀，会弹 toast）：SSH 与本机终端两条路径共用。
+pub fn mcp_register_failed(e: &str) -> String {
+    match current() {
+        Lang::Zh => format!("⚠ MCP 登记失败（在这个终端里启动的 AI 连不上 iShell）：{e}"),
+        Lang::En => format!(
+            "⚠ MCP registration failed (an AI started in this terminal cannot reach iShell): {e}"
+        ),
+    }
+}
+
 /// 渲染语言选项（中文 / English），选中即切换并持久化。供右键菜单使用。
 pub fn language_menu(ui: &mut egui::Ui) {
     for l in [Lang::Zh, Lang::En] {

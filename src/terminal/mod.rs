@@ -187,7 +187,7 @@ pub struct Terminal {
     /// 回显吞除队列：每条「我们替用户/AI 键入的命令」对应一条武装记录，按打字先后排队。
     /// 到达的字节与**队首**记录做前缀匹配；队首完整命中（含尾随换行）后出队、同一字节
     /// 继续与新的队首比较。不再是一次武装整体覆写上一条——哨兵吞除与自动注入（OSC 7/
-    /// MCP 连接环境/cwd 恢复）的回显可以同时挂着：谁先打字谁先回显，tty 输出顺序与打字
+    /// cwd 恢复）的回显可以同时挂着：谁先打字谁先回显，tty 输出顺序与打字
     /// 顺序一致，FIFO 天然对齐。深度有界（见 `expect_echo`），溢出丢最旧的一条（回显漏出
     /// 可见）而不是无限攒。
     echo_queue: std::collections::VecDeque<EchoArm>,
@@ -230,7 +230,6 @@ pub struct Terminal {
     notify_setup_request: bool,
     /// 右键菜单「把 AI 控制代理装到这台服务器」请求：App 取走后下发 `DeployMcpAgent`。
     deploy_agent_request: bool,
-    mcp_env_inject_request: bool,
     /// 本标签里是否**跑过** AI CLI（claude/codex 等）。裸 BEL 只有在这个标志为真时才当通知，
     /// 否则普通 shell 的补全失败/readline 报错会让每个标签都在弹提醒。见 `is_ai_cli_command`。
     ///
@@ -374,7 +373,6 @@ impl Terminal {
             notices: Vec::new(),
             notify_setup_request: false,
             deploy_agent_request: false,
-            mcp_env_inject_request: false,
             ai_cli_seen: false,
             url_cache: std::collections::HashMap::new(),
             hl_cache: std::collections::HashMap::new(),
@@ -575,10 +573,6 @@ impl Terminal {
         std::mem::take(&mut self.deploy_agent_request)
     }
 
-    /// 取走「立即注入 MCP 连接环境」请求（右键菜单触发）。
-    pub fn take_mcp_env_inject_request(&mut self) -> bool {
-        std::mem::take(&mut self.mcp_env_inject_request)
-    }
 
     pub fn take_notify_setup_request(&mut self) -> bool {
         std::mem::take(&mut self.notify_setup_request)
@@ -602,7 +596,7 @@ impl Terminal {
 
     /// 本次（重）连以来用户一次键都没敲过。
     ///
-    /// 自动注入 MCP 连接环境的**必要**前提。光靠「输出静止 + 用户停笔」分不清
+    /// 自动注入（重连后 cd 回原目录）的**必要**前提。光靠「输出静止 + 用户停笔」分不清
     /// 「shell 提示符」和「某个程序正阻塞在 stdin 上」——`sudo`/`ssh` 的密码提示符
     /// 恰好也是不输出、不动的，而 `expect_echo` 还会把注入的回显吞掉，token 就这么
     /// 无声无息进了对方的 auth log。而要走到那种提示符前，用户必然先敲过命令，
@@ -664,7 +658,7 @@ impl Terminal {
         self.input_line.is_empty() && self.last_input_at.is_none_or(|t| t.elapsed() >= d)
     }
 
-    /// 终端是否**疑似**正在运行前台任务。用于「在终端打开当前目录」「注入 MCP 连接环境」
+    /// 终端是否**疑似**正在运行前台任务。用于「在终端打开当前目录」
     /// 等注入式操作：任务运行时注入的字符会被前台程序吃掉或排队到任务结束后才执行，
     /// 行为不可预期。
     ///
@@ -1233,33 +1227,6 @@ impl Terminal {
                 do_paste = true;
                 ui.close();
             }
-            // 只在「允许 AI 通过 MCP 控制终端」开启时显示：总开关关了，socket 都没监听，
-            // 注入连接环境毫无意义（自动注入同样被 `mcp_env_inject_allowed` 的总开关前置挡住）。
-            if crate::store::load_mcp_consent()
-                && ui
-                    .button(crate::i18n::tr(
-                        "立即注入 MCP 连接环境",
-                        "Inject MCP connection environment now",
-                    ))
-                    .on_hover_text(crate::i18n::tr(
-                        "立刻往本终端执行 ` export ISHELL_MCP_ENDPOINT=… ISHELL_MCP_KEY=…`（回显吞除）。\n\
-                         自动注入只发生在「连接后一个键都没敲过」的会话上；你敲过键盘的会话会\
-                         静默跳过——在其中启动的 AI 没有连接环境，连不上 iShell（也不会连到别处）。\
-                         点这里手动补上即可（等价于替你在 shell 里执行那行 export），\
-                         之后在这个 shell 里（重新）启动 AI。",
-                        "Runs ` export ISHELL_MCP_ENDPOINT=… ISHELL_MCP_KEY=…` in this terminal \
-                         right now (echo swallowed).\n\
-                         Auto-injection only happens in sessions where you haven't typed since \
-                         connecting; a session you typed in is silently skipped — an AI started \
-                         there has no connection environment and cannot reach iShell (nor any \
-                         other). Click here to inject manually (same as typing that export \
-                         yourself), then (re)start the AI in this shell.",
-                    ))
-                    .clicked()
-            {
-                self.mcp_env_inject_request = true;
-                ui.close();
-            }
             ui.separator();
             // 查找终端内容（等价快捷键 Ctrl+Shift+F；放菜单里更易发现、且不受桌面快捷键占用影响）
             if ui
@@ -1288,9 +1255,8 @@ impl Terminal {
                 }
                 ui.close();
             }
-            // 「启用 AI 配对」曾经在这里。已去掉：MCP 连接环境由 App 在会话空闲时自动注入
-            // （见 layout_body 的自动注入分支），不需要用户自己在菜单里点一下——那一项只是
-            // 把同一件事又摆到用户面前，还得由他判断"现在能不能点"。
+            // 「启用 AI 配对」「立即注入 MCP 连接环境」曾经在这里。都已去掉：MCP 连接信息由各 worker
+            // 在连接时自己登记到服务器上（`ssh/mcp_session.rs`），不需要、也不该让用户在菜单里点。
             //
             // 「配置 AI 完成通知」则相反，必须由用户显式点：它要**改对方机器上的配置文件**
             // （`~/.claude/settings.json`），不像 token 注入那样只是设个环境变量、关掉终端
@@ -1466,7 +1432,7 @@ impl Terminal {
         }
         // 右键菜单粘贴、鼠标上报都是用户亲手往远端送的字节，却不经过键盘事件循环——
         // 不记的话 `never_typed` 仍为真：刚连上就右键粘贴一条 `ssh 别的主机`，停在密码
-        // 提示符时自动注入会把 MCP 连接环境打进密码框。
+        // 提示符时自动注入的 `cd` 会被打进密码框。
         if do_paste || !mouse_out.is_empty() {
             self.note_user_input();
         }

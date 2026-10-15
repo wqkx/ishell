@@ -161,17 +161,7 @@ impl App {
                         .into();
                     }
                 }
-                // 右键菜单「立即注入 MCP 连接环境」：用户亲手点的 = 本人同意，即刻注入，绕过
-                // 「连接后没敲过键」的自动注入闸门——那种会话自动循环只会静默跳过（后果
-                // 是在这里启动的 AI 连不上 iShell，见 advance_auto_injections 的提示分支），
-                // 这里是它的手动补救。
-                if s.terminal.take_mcp_env_inject_request() {
-                    s.status = match s.inject_mcp_env_now() {
-                        Ok(()) => crate::i18n::tr("已注入 MCP 连接环境", "MCP connection environment injected").into(),
-                        Err(msg) => msg,
-                    };
-                }
-                // 两处「程序替用户敲键盘」的自动注入——重连后恢复工作目录、MCP 连接环境
+                // 「程序替用户敲键盘」的自动注入——重连后恢复工作目录
                 // ——都**不在这里**：它们挂在 `App::advance_auto_injections` 上
                 // （`pump_background`，与标签页无关的每帧路径）。本函数只对当前活动标签
                 // 调用，而「该不该替用户敲这一行」跟用户正在看哪个标签毫无关系。

@@ -153,8 +153,8 @@ fn a_head_arm_that_never_echoes_is_dropped_instead_of_blocking_the_queue() {
 #[test]
 fn partial_echo_match_stops_swallowing_newlines_after_cap() {
     let mut t = Terminal::new();
-    // 注入命令以 "export" 开头；用户恰好敲了 "exp" + 回车
-    t.expect_echo("export ISHELL_MCP_KEY=secret");
+    // 待回显的命令以 "export" 开头；用户恰好敲了 "exp" + 回车（真正的前缀命中）
+    t.expect_echo("export FOO=bar");
     t.feed(b"exp\r\n");
     t.feed(b"bash: exp: command not found\r\n");
     let screen = t.screen_text();
@@ -2460,7 +2460,7 @@ fn ui_frame(t: &mut Terminal, ctx: &egui::Context, events: Vec<egui::Event>) -> 
     out
 }
 
-/// `never_typed` 是自动注入（MCP 连接环境、重连 cd）唯一的安全边界：用户只要亲手往远端送过
+/// `never_typed` 是自动注入（重连 cd）唯一的安全边界：用户只要亲手往远端送过
 /// 东西，就不许再替他敲键盘。原先只有键盘事件算数——鼠标上报、右键粘贴、被吞掉按下事件
 /// 的 Ctrl+V 都是用户送出的字节，却不翻这个闸门。
 ///

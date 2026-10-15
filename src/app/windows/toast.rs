@@ -32,20 +32,14 @@ impl App {
             .interactable(false)
             .show(ctx, |ui| {
                 ui.set_opacity(alpha);
-                egui::Frame::new()
-                    .fill(Palette::PANEL_2)
-                    .stroke(egui::Stroke::new(1.0, Palette::ACCENT))
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(14, 10))
+                // 与其它弹出框（对话框、传输浮窗）同一套窗口外观：阴影 + 细边框 + 圆角全来自
+                // 全局 style，靠阴影表达层次；底色用 PANEL，比页面底色亮，浮在上面。
+                // 不再用橙色描边和前导图标——那种「抢眼」的样式放在转瞬即逝的提示上显得突兀。
+                egui::Frame::window(&ctx.global_style())
+                    .fill(Palette::PANEL)
+                    .inner_margin(egui::Margin::symmetric(16, 10))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(egui_phosphor::regular::INFO)
-                                    .color(Palette::ACCENT)
-                                    .size(15.0),
-                            );
-                            ui.label(RichText::new(&msg).color(Palette::TEXT).size(13.0));
-                        });
+                        ui.label(RichText::new(&msg).color(Palette::TEXT).size(13.0));
                     });
             });
         ctx.request_repaint(); // 维持淡出动画

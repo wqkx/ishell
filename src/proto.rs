@@ -369,10 +369,9 @@ pub enum WorkerEvent {
     Disconnected(String),
     /// 来自远程 shell 的原始字节，喂给 vt100 解析器
     TerminalData(Vec<u8>),
-    /// 这条 SSH 连接专属的 MCP 反向转发 socket 已在**远端**注册成功，携带它的远端路径。
-    /// 每次（重）连接都是新的随机路径；UI 把它连同本次运行的密钥注入终端（见
-    /// `session::mcp_env_export_cmd`）。没开 AI 控制 / 注册失败时不会有这条事件。
-    McpEndpoint(String),
+    /// 这条连接的 MCP 登记结果：`true` = 已在服务器上给这个登录 shell 写好会话文件（在它里面启动的
+    /// AI 能连上这台 iShell）；`false` = 登记失败（原因另有一条 `Status` 以 ⚠ 开头）。
+    McpBound(bool),
     /// 远端是否支持 Linux /proc 系统监控（连接后探测一次）
     MonitorSupport(bool),
     /// 目录列表结果。`gen` 原样回传自对应的 `ListDir` 请求，UI 据此丢弃乱序/陈旧结果。

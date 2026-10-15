@@ -232,20 +232,6 @@ pub fn save_ai_notify_mode(m: AiNotifyMode) {
     }
 }
 
-/// 是否自动把 MCP 连接环境注入空闲的终端会话（` export ISHELL_MCP_ENDPOINT=… ISHELL_MCP_KEY=…`
-/// 并回车执行）。
-///
-/// 0.21 起这是**内置行为、不再是用户选项**：AI 控制总开关（`load_mcp_consent`）打开时
-/// 恒为真。协议 v8 里 AI 能连上哪台 iShell **只**取决于这两个变量（见 `mcp_protocol` 的
-/// 「认证层」），注入让「iShell 终端里启动的 AI」自动携带它们，只回本机。
-///
-/// 保留本函数（调用点不写死 `true`）是为了让「该不该注入」的判定仍收敛在一处
-/// （见 `app::frame::mcp_env_inject_allowed`），也保住那条「AI 控制开 ≠ 允许替用户敲键盘」
-/// 的回归测试。
-pub fn load_mcp_auto_inject() -> bool {
-    true
-}
-
 fn ime_follow_caret_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ime_follow_caret"))
 }
@@ -406,24 +392,73 @@ pub fn mcp_instance_id() -> &'static str {
 }
 
 /// 本进程独占的 AI/MCP 控制 socket 路径。文件名带上实例标识，这样同机多开的几个 iShell
-/// 各自监听各自的 socket，互不覆盖；代理进程按 `mcp-*.sock` 通配即可枚举出本机所有实例。
+/// 各自监听各自的 socket，互不覆盖（路径只是个不撞名的名字，代理不会按通配去扫描它）。
 ///
 /// 为什么不是全实例共享一个固定文件名：新实例启动时 remove_file+bind 会顶掉旧实例已经绑定
 /// 的 listener——删文件并不会让旧 listener 停止接受连接，但此后所有连到这个路径的请求都会
 /// 进新实例，导致旧实例的 SSH 反向转发 MCP 通道被错误地路由到新实例、操作到旧实例都不认识
 /// 的会话。每进程一个独立路径从根本上消除这个冲突，不需要任何「探测占用」之类的运行时逻辑。
 ///
-/// 注意这个本机路径不是身份，也不被任何人扫描：本机终端会话里，它由 iShell 自己作为
-/// `ISHELL_MCP_ENDPOINT` 注入；远端会话里，反向转发出去的是另一个随机路径（见 `ssh/mod.rs`）。
+/// 注意这个本机路径不是身份，也不被任何人扫描：本机终端会话里，iShell 把它写进那个 shell 的会话文件
+/// （`local/mcp_session.rs`）；远端会话里，反向转发出去的是另一个随机路径（见 `ssh/mod.rs`）。
 /// 认人只靠运行密钥（`mcp_run_key`）与握手签发的凭据（见 `src/mcp_protocol.rs`）。
 pub fn mcp_socket_path() -> Option<PathBuf> {
     Some(config_dir()?.join(format!("mcp-{}.sock", mcp_instance_id())))
 }
 
+static MCP_LISTENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 本进程的 MCP 监听 socket 是否**真的**在监听（绑定成功才置位，见 `app::mcp_bridge::spawn_mcp_listener`）。
+///
+/// 「允许 AI 控制」开关要重启才开始监听，而反向转发/会话登记只看开关：本次启动时开关是关的、运行中才打开
+/// 的话，登记出去的端点后面没有人，agent 连上去只会撞静默断开。没在监听就不登记（并让用户知道要重启）。
+pub fn mcp_listening() -> bool {
+    MCP_LISTENING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_mcp_listening(on: bool) {
+    MCP_LISTENING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static MCP_BIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 监听 socket 绑定失败过（本次运行没有 AI 控制）。与「开关关着/运行中才打开」区分：后者是预期内、只需重启，
+/// 前者是故障，登记时要让用户看见。
+pub fn mcp_bind_failed() -> bool {
+    MCP_BIND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_mcp_bind_failed(on: bool) {
+    MCP_BIND_FAILED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static MCP_STARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 监听任务已排上、但还没绑定成功（也没失败）。`spawn_mcp_listener` 同步置位，绑定成功/失败时清除。
+pub fn set_mcp_starting(on: bool) {
+    MCP_STARTING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 等本进程的 MCP 监听就绪，返回此刻是否在监听。启动时监听任务是异步的（建目录、清旧 socket 之后才
+/// 绑定），启动即恢复的标签/本机终端可能比它先连上；一次性判断会把「还没好」误当「没开」，整条连接
+/// 就永远不登记。只在「监听已排上」时等（最多 5 秒）；根本没排上（开关关着）立刻返回。
+pub async fn await_mcp_listening() -> bool {
+    for _ in 0..50 {
+        if mcp_listening() {
+            return true;
+        }
+        if !MCP_STARTING.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    mcp_listening()
+}
+
 /// 本次运行的 **MCP 运行密钥**：iShell 每次启动随机生成一个 256 位密钥，**只放内存、绝不落盘**。
 ///
-/// 它是 iShell 与「从它的终端里启动的 AI 代理」之间唯一的共享秘密，经终端注入的
-/// `ISHELL_MCP_KEY` 环境变量交给代理（配套的 `ISHELL_MCP_ENDPOINT` 指明连哪条 socket）。
+/// 它是 iShell 与「从它的终端里启动的 AI 代理」之间唯一的共享秘密，随端点路径一起写进那个登录 shell
+/// 的会话文件（`0600`，见 `ssh/mcp_session.rs`），代理沿进程祖先读到它。
 /// 代理与 iShell 之间只跑 HMAC 挑战-应答（见 `mcp_protocol` 的认证层），密钥本身永不过线。
 ///
 /// 为什么每次运行一份、且不持久化：

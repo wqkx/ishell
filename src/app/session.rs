@@ -70,18 +70,9 @@ pub(super) struct Session {
     /// 「在终端打开当前目录」忙碌拦截的强制窗口：首次点击若终端疑似在跑任务则 toast 拦截，
     /// 在此刻之前再次点击视为用户确认、强制注入 cd（应对任务已停但判定信号未消失的误拦）
     pub(super) cd_force_until: Option<std::time::Instant>,
-    /// 本会话是否已注入过 MCP 连接环境（`export ISHELL_MCP_ENDPOINT=… ISHELL_MCP_KEY=…`）。
-    /// 断线重连后远端是新 shell（env 已丢），Connected 时复位以便重新注入。
-    pub(super) mcp_env_injected: bool,
-    /// 这条 SSH 连接专属的 MCP 反向转发 socket 在**远端**的路径（worker 注册成功后上报，见
-    /// `WorkerEvent::McpEndpoint`）。`None` = 还没注册好（或没开 AI 控制 / 注册失败）——此时
-    /// 没有东西可注入，也就**不注入**：绝不退到「让代理去扫目录」。重连换 worker 时清空。
-    /// 本机会话不用它（端点就是本进程的监听 socket，见 [`Session::mcp_env_cmd`]）。
-    pub(super) mcp_endpoint: Option<String>,
-    /// 「因用户连上后敲过键盘而跳过连接环境自动注入」的提示是否已发过（每连接复位）。
-    /// 不设的话每帧都会满足提示条件——它只在「其余注入条件全满足、只差 never_typed」时为真，
-    /// 那种状态会一直保持到连接结束。
-    pub(super) mcp_env_inject_skipped: bool,
+    /// 这个会话的登录 shell 是否已登记为「属于这台 iShell」（服务器/本机上有它的会话文件，见
+    /// `ssh/mcp_session.rs`）。重连换 worker 时复位，等新 worker 重新登记。
+    pub(super) mcp_bound: bool,
     /// AI 专用会话是否已注入 `ai_session_snippet`（OSC 7 cwd 上报 + shell 集成 OSC 133）。
     /// 用户会话的 OSC 7 走 consent 弹窗、不经此标记。没注入的后果有两条：list_sessions 的
     /// cwd 恒为 null（AI 只能跑 pwd 猜目录），且命令完成检测只能退回脆弱的哨兵办法
@@ -169,7 +160,7 @@ pub(super) enum CwdRestore {
 
 /// - `never_typed`：本次连接以来用户一个键都没敲过。敲过就说明他已经在用这个 shell 了，
 ///   此时替他 `cd` 只会打断他——直接放弃，别再等。
-/// - `idle`：终端不忙、远端输出与用户输入都静止了一段时间（与 MCP 连接环境注入同一套判据）。
+/// - `idle`：终端不忙、远端输出与用户输入都静止了一段时间（与其它「替用户敲键盘」的注入同一套判据）。
 /// - `expired`：等过了截止时刻。
 ///
 /// **`expired` 判在 `idle` 前面，过期一律放弃。** 求值由 `App::advance_auto_injections` 每帧
@@ -281,31 +272,8 @@ fn ai_injection_allowed(
     connected && !ai_busy && terminal_idle(t, quiet)
 }
 
-/// 注入 MCP 连接环境的那行命令（自动注入与右键「立即注入」共用，两处不会漂移）。
-///
-/// 只导出两个变量，它们合起来就是「这个终端里启动的 AI 该连哪台 iShell」的全部事实：
-/// - `ISHELL_MCP_ENDPOINT`：这条连接专属的 socket 路径。代理**只**连它，不扫目录、没有候选；
-/// - `ISHELL_MCP_KEY`：本次 iShell 运行的随机密钥（只在内存，重启即换）。代理凭它与 iShell
-///   做 HMAC 互证，密钥本身不过线。
-///
-/// **不要**把这两个写进 AI 的 MCP 配置 `env` 或任何持久位置：端点每次连接都换，密钥每次运行
-/// 都换，写死的值只会在下次重连后失效——而「能连就连、不能连就不能连」正是这套设计要的。
-///
-/// 前导空格：配合 bash/zsh 常见的 HISTCONTROL=ignorespace，不进 shell 历史。端点是路径，含家
-/// 目录，可能有空格等特殊字符，必须引起来；密钥是 64 位十六进制，无需引号。
-/// 密钥不可用（熵源失败）返回 `None`：本次运行不提供 MCP 控制，也就没有东西可注入。
-pub(super) fn mcp_env_export_cmd(endpoint: &str) -> Option<String> {
-    let key = crate::store::mcp_run_key()?;
-    Some(format!(
-        " export {}={} {}={key}",
-        crate::mcp_protocol::ENV_ENDPOINT,
-        quote_shell_arg(endpoint, false),
-        crate::mcp_protocol::ENV_KEY,
-    ))
-}
-
 impl Session {
-    /// 见 [`injection_allowed`]。与 MCP 连接环境的自动注入共用同一道闸门**是有意的**：
+    /// 见 [`injection_allowed`]。与其它「替用户敲键盘」的自动注入共用同一道闸门**是有意的**：
     /// 两处干的是同一件事（程序替用户敲键盘），判据分成两份迟早会漂移，而漂移的后果是
     /// 往某个正在等输入的程序（sudo/ssh 的密码提示符）里打字。
     pub(super) fn shell_idle_for_injection(&self) -> bool {
@@ -331,95 +299,6 @@ impl Session {
             &self.terminal,
             QUIET,
         )
-    }
-
-    /// 这个会话该注入的 MCP 连接环境命令；`None` = 现在没有东西可注入。
-    ///
-    /// 本机会话：端点就是本进程监听的 socket；远端会话：worker 注册反向转发后上报的那条路径。
-    /// 路径还没上报（注册要先连上、探测 `$HOME`）时返回 `None`，调用方**等下一帧**，不要退而求其次。
-    pub(super) fn mcp_env_cmd(&self) -> Option<String> {
-        // 本进程没在监听（开关是运行中才打开的、需要重启）：注入出去的端点后面没有人，
-        // 与其让 agent 连上去撞静默断开，不如不注入（见 `mcp_bridge::LISTENING`）。
-        if !super::mcp_bridge::mcp_listening() {
-            return None;
-        }
-        let endpoint = if self.cfg.is_local() {
-            if !cfg!(unix) {
-                return None; // Windows 上没有这套 IPC（见 `spawn_mcp_listener`）
-            }
-            crate::store::mcp_socket_path()?.to_str()?.to_string()
-        } else {
-            self.mcp_endpoint.clone()?
-        };
-        mcp_env_export_cmd(&endpoint)
-    }
-
-    /// 用户从终端右键菜单手动触发「立即注入 MCP 连接环境」：即刻注入，绕过 never_typed 闸门——
-    /// 用户亲手点击等价于本人同意，且他正看着这个终端，注入的回显吞除与否都在他眼皮底下。
-    /// AI 专用会话同样允许：嵌套 AI 需要从环境继承连接环境（自动注入的空档没等到时的人工
-    /// 补救）。但不绕过 `ai_busy` 闸门：会话里有正在执行的 AI 命令时注入会打断它（见
-    /// `injection_allowed`），这种时候要求用户等命令结束。发送失败（连接已断）也不伪装成功。
-    /// 返回 Err(原因) 时不注入，由调用处显示在会话状态栏。
-    pub(super) fn inject_mcp_env_now(&mut self) -> Result<(), String> {
-        if !self.connected {
-            return Err(crate::i18n::tr(
-                "会话尚未连接，等连上后再试",
-                "Session is not connected yet — try again once connected",
-            )
-            .into());
-        }
-        if self.mcp_env_injected {
-            return Err(crate::i18n::tr(
-                "本会话已注入过 MCP 连接环境",
-                "This session already has the MCP connection environment",
-            )
-            .into());
-        }
-        // 与自动注入同一道闸（见 `injection_allowed` 的 `ai_busy`）：本会话有挂起的 AI 命令、
-        // 或终端正武装着哨兵捕获时，`expect_echo` 会覆盖哨兵的吞除状态、打断正在进行的
-        // run_command——用户亲手点的注入也不例外。
-        if self.pending_ai_run.is_some() || self.terminal.ai_capture_pending() {
-            return Err(crate::i18n::tr(
-                "本会话正有 AI 命令在执行，等它结束后再注入",
-                "An AI command is still running in this session — inject again after it finishes",
-            )
-            .into());
-        }
-        let Some(cmd) = self.mcp_env_cmd() else {
-            return Err(crate::i18n::tr(
-                "没有东西可注入：这条连接没有 MCP 端点（反向转发注册失败/尚未完成），或本次启动时 AI \
-                 控制是关的（运行中打开它需要重启 iShell 才开始监听）",
-                "Nothing to inject: this connection has no MCP endpoint (reverse forward failed / not \
-                 ready yet), or AI control was off when iShell started (turning it on later needs a \
-                 restart before it listens)",
-            )
-            .into());
-        };
-        self.cmd_tx
-            .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()))
-            .map_err(|_| {
-                crate::i18n::tr(
-                    "命令未能送达（会话连接已断开），等重连后再试",
-                    "The command never reached the session (connection lost) — retry after reconnect",
-                )
-                .to_string()
-            })?;
-        self.terminal.expect_auto_inject_echo(&cmd);
-        self.mcp_env_injected = true;
-        self.mcp_env_inject_skipped = false;
-        Ok(())
-    }
-
-    /// 除「用户一个键都没敲过」外、其余注入条件全部满足——用于区分「跳过注入」的原因。
-    /// true 表示「就因为你连上后敲过键盘，本次连接不再自动注入」：在这个终端里启动的 AI 因此
-    /// 没有连接环境、连不上 iShell（不会连到别处），所以值得一次性提示用户，并给出终端右键
-    /// 「立即注入 MCP 连接环境」的补救。
-    pub(super) fn shell_idle_for_injection_but_typed(&self) -> bool {
-        const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
-        self.connected
-            && !self.ai_owned
-            && !(self.pending_ai_run.is_some() || self.terminal.ai_capture_pending())
-            && terminal_idle(&self.terminal, QUIET)
     }
 
     /// 用户往终端里粘了一张图（Ctrl+V / 右键粘贴，剪贴板里是图片而不是文本）。
@@ -642,15 +521,13 @@ impl App {
             osc7_confirm: false,
             osc7_pending_reveal: false,
             cd_force_until: None,
-            mcp_env_injected: false,
-            mcp_endpoint: None,
+            mcp_bound: false,
             monitor_ok: None,
             pending_ai_run: None,
             pending_paste_image: std::collections::HashMap::new(),
             ai_owned: false,
             ai_owner: None,
             ai_owner_label: None,
-            mcp_env_inject_skipped: false,
             osc7_injected: false,
             pending_file_ops: Vec::new(),
             file_op_tombstones: std::collections::VecDeque::new(),
@@ -679,7 +556,7 @@ impl App {
         s.terminal = Terminal::new();
         s.sysinfo = None;
         s.monitor_ok = None;
-        s.mcp_endpoint = None; // 新 worker 会注册新的随机端点
+        s.mcp_bound = false; // 新 worker 会重新登记
         s.pending_ai_run = None; // worker 已重启：旧的 AI 命令等待作废（对端 oneshot 断线会收到错误）
         s.pending_file_ops.clear(); // 同上：旧的 write_file/read_file/copy 等待也一并作废
                                     // M3：保留端口转发（不再 clear），标记「重连中」；Connected 事件里用新 worker 重建

@@ -5,6 +5,7 @@ mod auth;
 mod commands;
 mod forward;
 mod mcp_deploy;
+mod mcp_session;
 mod sftp;
 pub mod sysinfo;
 mod xfer;
@@ -195,8 +196,8 @@ pub async fn run(
     // 远端路径带随机后缀（而非固定名字）：同一台主机短时间内被反复连接/重连时，服务器端
     // 可能因为迟迟未判定旧连接已死（无 keepalive 时 TCP 层探测很慢）而拒绝复用同一个固定
     // 路径的新注册请求（"rejected by the other party"）。加上随机后缀后各次连接互不冲突。
-    // 注册成功后路径经 `WorkerEvent::McpEndpoint` 交给 UI，随本次运行的密钥一起注入终端
-    // （`ISHELL_MCP_ENDPOINT` / `ISHELL_MCP_KEY`）——代理只连这一条，**不再**按通配去发现。
+    // 注册成功后，路径连同本次运行的密钥一起写进服务器上这个登录 shell 的会话文件
+    // （`mcp_session::register`）——代理沿进程祖先找到它、只连这一条，**不再**按通配去发现。
     //
     // 这些 socket 文件统一放进 `~/.ishell-mcp/` 子目录（而不是散落在 `$HOME` 根），且在本次
     // 连接正常断开时（见下方 `run()` 收尾处）主动删除本次注册的那一个——用一个共享的
@@ -215,6 +216,7 @@ pub async fn run(
     // `cfg!(unix)`：Windows 上 `spawn_mcp_listener` 是个空实现（整套 IPC 建在 Unix domain
     // socket 上），没有任何东西在监听。0.19 起这个开关默认是开的，不加这个条件的话每次连接
     // 都会往远端注册一个后面空无一人的反向转发 socket，纯粹是垃圾。
+    // 本进程没在监听 MCP socket（开关是运行中才打开的，需要重启）就不注册：转发出去的端点后面没有人。
     let mcp_forward_task: Option<tokio::task::JoinHandle<()>> = if cfg!(unix)
         && crate::store::load_mcp_consent()
     {
@@ -224,9 +226,32 @@ pub async fn run(
         Some(tokio::spawn(async move {
             // 注册尝试的结论：成功则返回落地的 remote_path，放弃/失败则 None。
             let registered: Option<String> = async {
+                // 等本进程的监听就绪（启动即恢复的标签可能比监听先连上）。等在这个后台任务里，
+                // 不耽误 shell 与监控任务启动。
+                if !crate::store::await_mcp_listening().await {
+                    // 开关是运行中才打开的（要重启）是预期内，静默；绑定失败是故障，要让用户看见。
+                    if crate::store::mcp_bind_failed() {
+                        fwd_sink.send(WorkerEvent::Status(
+                            crate::i18n::mcp_register_failed(
+                                crate::i18n::tr("本机 MCP socket 绑定失败", "the local MCP socket failed to bind"),
+                            ),
+                        ));
+                    }
+                    return None;
+                }
                 let home = match exec_capture(&fwd_handle, "echo -n $HOME").await {
                     Ok(h) if !h.trim().is_empty() => h.trim().to_string(),
-                    _ => return None, // 探测不到远端 HOME：放弃转发，不影响其余功能
+                    _ => {
+                        // 探测不到远端 HOME：放弃转发，不影响其余功能——但要让状态栏说清为什么这个终端里 AI 用不了。
+                        fwd_sink.send(WorkerEvent::Status(
+                            crate::i18n::tr(
+                                "MCP：探测不到远端 HOME，这个终端里的 AI 无法使用 iShell",
+                                "MCP: cannot determine the remote $HOME — an AI in this terminal cannot use iShell",
+                            )
+                            .into(),
+                        ));
+                        return None;
+                    }
                 };
                 let dir = format!("{home}/.ishell-mcp");
                 let _ = exec_status(
@@ -250,13 +275,43 @@ pub async fn run(
                 match fwd_handle.streamlocal_forward(remote_path.clone()).await {
                     Ok(()) => {
                         *path_slot.lock().unwrap() = Some(remote_path.clone());
-                        // 把这条连接专属的端点交给 UI：它连同本次运行的密钥一起注入终端，
-                        // 在这个终端里启动的 AI 只会连这一条 socket（代理不再扫目录）。
-                        fwd_sink.send(WorkerEvent::McpEndpoint(remote_path.clone()));
+                        // 登记「这个登录 shell 属于这台 iShell」：在服务器上写一个会话文件（端点 +
+                        // 本次运行的密钥 + shell 的 pid/启动时间），在这个 shell 里启动的 AI 的代理
+                        // 沿进程祖先找到它。失败必须让用户看见（⚠ 前缀会弹 toast）——登记不上，
+                        // 在这个终端里启动的 AI 就连不上 iShell。
+                        match crate::store::mcp_run_key() {
+                            None => fwd_sink.send(WorkerEvent::Status(
+                                crate::i18n::tr(
+                                    "⚠ MCP：本机熵源不可用，本次运行不提供 AI 控制",
+                                    "⚠ MCP: no entropy source — AI control is unavailable this run",
+                                )
+                                .into(),
+                            )),
+                            Some(key) => match mcp_session::register(&fwd_handle, &remote_path, key).await {
+                                Ok(_) => {
+                                    fwd_sink.send(WorkerEvent::McpBound(true));
+                                }
+                                Err(e) => {
+                                    log::warn!("MCP 会话登记失败：{e}");
+                                    fwd_sink.send(WorkerEvent::McpBound(false));
+                                    fwd_sink.send(WorkerEvent::Status(crate::i18n::mcp_register_failed(&e)));
+                                }
+                            },
+                        }
                         Some(remote_path)
                     }
                     Err(e) => {
                         log::debug!("AI/MCP 反向转发注册失败：{e}");
+                        // 常见原因：服务器 sshd 禁止 Unix socket 转发（AllowStreamLocalForwarding no）。
+                        // 非 ⚠（不弹 toast：有些服务器本来就禁，不该每次连接都吵），只在状态栏说明。
+                        fwd_sink.send(WorkerEvent::Status(match crate::i18n::current() {
+                            crate::i18n::Lang::Zh => format!(
+                                "MCP：服务器拒绝了反向转发（可能是 sshd 禁止 Unix socket 转发），这个终端里的 AI 无法使用 iShell：{e}"
+                            ),
+                            crate::i18n::Lang::En => format!(
+                                "MCP: the server refused the reverse forward (sshd may forbid Unix-socket forwarding) — an AI in this terminal cannot use iShell: {e}"
+                            ),
+                        }));
                         None
                     }
                 }
@@ -945,9 +1000,10 @@ pub async fn run(
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), reg_done_rx).await;
         task.abort();
     }
+    // 清理本次登记（会话文件按端点认、再删 socket 文件）：一条命令。锁先放掉再 await。
     let forward_cleanup = mcp_forward_path.lock().unwrap().take();
     if let Some(remote_path) = forward_cleanup {
-        let _ = exec_status(&handle, &format!("rm -f {}", sh_quote(&remote_path))).await;
+        mcp_session::unregister(&handle, &remote_path).await;
     }
     for (_, task) in forwards {
         task.abort();

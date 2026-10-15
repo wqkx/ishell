@@ -69,14 +69,9 @@ impl Session {
                     self.reconnect_at = None;
                     self.shell_exited = false;
                     self.status = crate::i18n::tr("已连接", "Connected").into();
-                    // （重）连后是全新的远端 shell：此前注入的 MCP 连接环境（export 进 shell
-                    // env）已随旧 shell 丢失——复位标记，等静止窗口出现时重新注入。
-                    self.mcp_env_injected = false;
                     // 同时复位输入时钟：注入的前提之一是「本次连接以来没敲过键」
                     // （见 Terminal::never_typed），重连后要重新开始计。
                     self.terminal.reset_input_clock();
-                    // 「跳过注入」的提示同理：新连接是全新一轮，若再次被跳过应重新提示。
-                    self.mcp_env_inject_skipped = false;
                     // OSC 7 上报片段同理：新 shell 的 PROMPT_COMMAND/precmd 里没有上报钩子。
                     self.osc7_injected = false;
                     // 重连后恢复工作目录（若断线前由 OSC 7 记录过）。
@@ -85,7 +80,7 @@ impl Session {
                     // 提示符上等着了」——此刻远端多半正在吐 MOTD/banner，甚至可能停在某个登录
                     // 脚本起的程序或密码提示符上。往那儿打一行 `cd …\r`，轻则被 MOTD 冲掉、
                     // 回显原样留在屏幕上（这里此前连 expect_echo 都没有），重则把这一行喂给
-                    // 那个正在等输入的程序。这和 MCP 连接环境注入是同一类问题，那边已经有一
+                    // 那个正在等输入的程序。这和其它「替用户敲键盘」的注入是同一类问题，那边已经有一
                     // 整套闲置判据，这里改成复用它：先记下意图，等 shell 真的闲下来再注入
                     // （见 layout_body.rs 里的分支与 `cwd_restore_decision`）。
                     //
@@ -158,10 +153,9 @@ impl Session {
                 WorkerEvent::Disconnected(reason) => {
                     self.apply_disconnected(reason);
                 }
-                WorkerEvent::McpEndpoint(path) => {
-                    // 不在 Connected 里清：注册任务与 Connected 谁先到不确定，清了会丢掉先到的这条。
-                    // 换 worker（重连）时由 `reconnect_session` 清空。
-                    self.mcp_endpoint = Some(path);
+                WorkerEvent::McpBound(ok) => {
+                    // 新 worker 会重新登记；`reconnect_session` 换 worker 时已把它复位成 false。
+                    self.mcp_bound = ok;
                 }
                 WorkerEvent::MonitorSupport(ok) => {
                     self.monitor_ok = Some(ok);

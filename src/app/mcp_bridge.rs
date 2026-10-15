@@ -1003,26 +1003,6 @@ fn first_foreign_session<'a>(
 /// 平台提供——Windows 上这个特性眼下确实不支持，下面 `#[cfg(not(unix))]` 版本直接返回一个
 /// 永远收不到数据的空通道（等价于"用户没开启"的路径），其余 App 代码按同一通道消费事件，
 /// 不需要为平台差异专门分叉。
-/// 本进程的 MCP 监听 socket 是否**真的**在监听（绑定成功才置位）。
-///
-/// 为什么需要它：「允许 AI 控制」开关打开后要重启 iShell 才开始监听（见设置里的提示），而反向转发
-/// 只看开关、不看监听——本次启动时开关是关的、运行中才打开的话，新连接会把一个**没人监听**的端点
-/// 注入终端，agent 连上去只会看到静默断开，报错还怪密钥。没在监听就不注入，并让用户知道要重启。
-#[cfg(unix)]
-static LISTENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 见 [`LISTENING`]。非 unix 上整套 IPC 都不存在，恒为 false。
-pub(crate) fn mcp_listening() -> bool {
-    #[cfg(unix)]
-    {
-        LISTENING.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
-}
-
 #[cfg(unix)]
 pub(super) fn spawn_mcp_listener(
     runtime: &Arc<tokio::runtime::Runtime>,
@@ -1035,6 +1015,8 @@ pub(super) fn spawn_mcp_listener(
     let Some(sock_path) = crate::store::mcp_socket_path() else {
         return rx;
     };
+    // 同步置位：连接任务据此知道「监听马上就绪」，而不是「没开」（见 `store::await_mcp_listening`）。
+    crate::store::set_mcp_starting(true);
     runtime.spawn(async move {
         // 配置目录可能压根还不存在：0.19 起这个开关默认是开的，全新安装的用户可能一次设置
         // 都没存过就直接起来了，此时 ~/.config/ishell/ 还没被任何 save_* 建出来，
@@ -1070,6 +1052,8 @@ pub(super) fn spawn_mcp_listener(
             Ok(l) => l,
             Err(e) => {
                 log::warn!("MCP socket 监听失败：{e}");
+                crate::store::set_mcp_bind_failed(true);
+                crate::store::set_mcp_starting(false);
                 return;
             }
         };
@@ -1078,7 +1062,8 @@ pub(super) fn spawn_mcp_listener(
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
         }
-        LISTENING.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::store::set_mcp_listening(true);
+        crate::store::set_mcp_starting(false);
         // 这个 socket 会被反向转发到远端主机（见 src/ssh/mod.rs），意味着任何能连到那台
         // 远端主机的人都摸得到它——不能像纯本地场景那样假设连接数天然很少。握手/认证
         // 与长操作分两档信号量：上传卡住时仍要让新的握手进得来，否则整个 MCP 认证层
@@ -2486,7 +2471,7 @@ impl App {
             ai_owned: s.ai_owned,
             ai_owner: s.ai_owner_label.clone(),
             mine: true, // 开它的就是发起者自己
-            endpoint_injected: s.mcp_env_injected,
+            bound: s.mcp_bound,
         };
         let _ = resp_tx.send(McpResponse {
             id,
@@ -2637,7 +2622,7 @@ impl App {
                         ai_owner: s.ai_owner_label.clone(),
                         // 列表里只剩自己的会话，恒为 true；字段保留是线格式兼容。
                         mine: true,
-                        endpoint_injected: s.mcp_env_injected,
+                        bound: s.mcp_bound,
                     })
                     .collect();
                 let _ = resp_tx.send(McpResponse {

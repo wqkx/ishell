@@ -174,7 +174,7 @@ pub fn view_context_menu(resp: &egui::Response) {
                          · 只监听本机 Unix socket（0600），不开任何网络端口\n\
                          · 控制通道经 SSH 反向转发到所连服务器——只对信任的服务器开启\n\
                          · 多机共用一台 AI 服务器时：只有在你这台 iShell 的终端里启动的 AI 才连得上\
-                         你的 iShell（终端会自动注入连接环境），别人的 AI 碰不到它\n\
+                         你的 iShell（连上时会给该终端的登录 shell 登记），别人的 AI 碰不到它\n\
                          · 关闭后立刻拒绝新的 MCP 操作；若本次启动时开关已开（监听还在），\
                          再打开即恢复，不必重启\n\
                          · 若启动时开关是关的，打开后需要重启 iShell 才会开始监听",
@@ -183,8 +183,8 @@ pub fn view_context_menu(resp: &egui::Response) {
                          · Local Unix socket only (mode 0600) — no network port is opened\n\
                          · Channel is reverse-forwarded over SSH — enable only for servers you trust\n\
                          · Sharing one AI server: only an AI started inside one of YOUR iShell \
-                         terminals can reach your iShell (the terminal injects the connection \
-                         environment); anyone else's AI cannot touch it\n\
+                         terminals can reach your iShell (it registers each terminal's login shell \
+                         when it connects); anyone else's AI cannot touch it\n\
                          · Turning off refuses new MCP ops immediately; if the switch was on at \
                          startup (listener already running), turning it back on resumes without restart\n\
                          · If it was off at startup, turning it on needs an iShell restart to listen",
@@ -195,14 +195,14 @@ pub fn view_context_menu(resp: &egui::Response) {
                     ui.close();
                 }
 
-                // 0.21 起，原来的三个子开关（「AI 新开会话无需逐次确认」「自动注入连接环境」
+                // 0.21 起，原来的三个子开关（「AI 新开会话无需逐次确认」「自动登记终端」
                 // 「只响应带凭据的请求」）不再是用户选项：全部内化为总开关的固定行为。判定收敛在
-                // store 的 loader（恒真）与 `mcp_env_inject_allowed`/`session_owned_by` 里。
+                // store 的 loader（恒真）与 `session_owned_by` 里。
                 //
                 // 协议 v8 起不再有「配对 token」这个用户可见的东西，也没有「复制配对配置」：
-                // 只有 iShell 终端里启动的 AI 才有连接环境（`ISHELL_MCP_ENDPOINT` + 本次运行的
-                // `ISHELL_MCP_KEY`，由 iShell 自动注入），不在 iShell 终端里启动的 AI 一律连不上
-                // iShell——没有手动配置的口子，也就没有「写进共享配置而串台」这条路。
+                // 只有 iShell 终端里启动的 AI 才连得上（iShell 连上后给该终端的登录 shell 登记会话，代理沿
+                // 进程祖先找到它），不在 iShell 终端里启动的 AI 一律连不上 iShell——没有手动配置的口子，
+                // 也就没有「写进共享配置而串台」这条路。
             },
         );
 

@@ -2,9 +2,10 @@
 //! 只是把工具调用转发到**启动它的那个终端所属的 iShell**（经 Unix domain socket，一次连接一问
 //! 一答），iShell 再落到它已经持有的 SSH 会话上执行。
 //!
-//! 连哪台 iShell 只由环境里的 `ISHELL_MCP_ENDPOINT` + `ISHELL_MCP_KEY` 决定（iShell 在自己的终端里
-//! 注入）。**没有发现、没有候选、没有降级**：缺环境就拒绝，握手不过就失败，iShell 重启后旧
-//! agent 的密钥作废、只能重开。见下面「连接层」一节与 `src/mcp_protocol.rs` 的「认证层」。
+//! 连哪台 iShell 只取决于「我是哪个登录 shell 的后代」：iShell 在服务器上给每个终端的登录 shell 登记
+//! 会话文件，代理沿进程祖先找到它。**没有发现、没有候选、没有降级**：找不到祖先登记就拒绝，握手
+//! 不过就失败，iShell 重启后旧 agent 的密钥作废、只能重开。见下面「连接层」一节与
+//! `src/mcp_protocol.rs` 的「认证层」。
 //! 与主二进制共享同一份线协议类型（见 src/mcp_protocol.rs），这里用 #[path] 直接纳入，
 //! 避免为共享几个 struct 拆出独立的 lib crate。
 
@@ -31,20 +32,21 @@ use mcp_protocol::{McpReqKind, McpReqResult, McpRequest, McpResponse};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-// ───────────────────────── 连接层：环境给什么就连什么 ─────────────────────────
+// ───────────────────────── 连接层：祖先是谁，就连谁 ─────────────────────────
 //
-// 这个代理**只**操作启动它的那个终端所属的 iShell，依据只有环境里的两个变量：
-//   `ISHELL_MCP_ENDPOINT`  这条 SSH 连接专属的 socket 路径；
-//   `ISHELL_MCP_KEY`       那台 iShell 本次运行的随机密钥。
-// 二者由 iShell 在自己的终端里注入（见 `session::mcp_env_export_cmd`），AI 客户端启动代理时
-// 原样继承。**这里没有任何兜底**：
+// 这个代理**只**操作启动它的那个终端所属的 iShell。依据是进程祖先：iShell 连上后在服务器上给这条
+// 连接的登录 shell 登记一个会话文件（`~/.ishell-mcp/sess/<主机名>/<shell pid>`，端点 + 本次运行的随机密钥 +
+// shell 的 pid/启动时间），代理沿父进程一路往上找，第一个有合法会话文件的祖先就是它的主人。
+// 不靠环境变量：agent 过滤环境（Codex）、注入时机、shell 历史留痕这几类问题一并不存在。
+// **这里没有任何兜底**：
 //   · 不列目录、不探测、没有候选，所以不存在「选哪个」；
-//   · 缺任何一个变量就拒绝，不退到别的变量名、别的路径、别的办法；
+//   · 祖先里找不到登记过的登录 shell 就拒绝（比如 agent 跑在 Codex 的共享后台服务里、tmux 里、
+//     或根本不是从 iShell 终端启动的），不退到别的办法；
 //   · 握手失败就是失败，不重试别的端点；iShell 重启后旧 agent 的密钥作废，只能重开；
 //   · 没有「改绑」：端点连不上就是连不上。
 // 线协议见 `src/mcp_protocol.rs` 的「认证层」一节。
 
-/// 终端注入的连接信息。
+/// 找到的连接信息。
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 struct Launch {
@@ -52,98 +54,196 @@ struct Launch {
     key: String,
 }
 
-/// 把两个环境变量的原始值判成 [`Launch`]。纯函数，便于单测。
-///
-/// 空白值视同没设；端点必须是绝对路径（注入的永远是绝对路径，相对路径只可能是手写错了，
-/// 而相对路径的解析取决于代理的当前目录——那就成了「碰巧连到哪个算哪个」）。
-/// 失败返回**缺失/非法的变量名**，由调用方拼成给人看的文字。
+/// 当前用户的家目录：先看 `$HOME`，没有（agent 过滤了环境）就问系统的用户数据库。
 #[cfg(unix)]
-fn launch_from(endpoint: Option<String>, key: Option<String>) -> Result<Launch, Vec<String>> {
-    let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let (endpoint, key) = (clean(endpoint), clean(key));
-    let mut bad = Vec::new();
-    match &endpoint {
-        None => bad.push(mcp_protocol::ENV_ENDPOINT.to_string()),
-        Some(e) if !e.starts_with('/') => {
-            bad.push(format!("{}（不是绝对路径：{e}）", mcp_protocol::ENV_ENDPOINT))
+fn home_dir() -> Option<std::path::PathBuf> {
+    if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return Some(h.into());
+    }
+    let mut buf = vec![0u8; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut out,
+        )
+    };
+    if rc != 0 || out.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_str().ok()?;
+    Some(dir.into())
+}
+
+/// 读一个会话文件，并检查它**确实是本人写的、别人写不了**：普通文件（不是符号链接）、属主是当前用户、
+/// 组与其它人都没有任何权限位、大小有界。同一个账号下别的进程本来就能读到，这里挡的是「别的用户
+/// 在共享目录里放个文件冒充」和「权限被改宽后被别人换了内容」。
+#[cfg(unix)]
+fn load_session_file(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return None;
+    }
+    if meta.len() > 4096 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// 登记晚于 agent 启动的最长等待。iShell 连上后要探测 HOME、注册反向转发、跑登记脚本（正常几百毫秒，慢链路上可达数秒；iShell 侧最多重试约 6 秒、单次执行上限 15 秒），
+/// 「刚连上就启动 AI 并马上调工具」会先于登记落盘。等的是**同一条祖先链**上的同一个登记，规则不变：
+/// 等到了就连，等不到照旧拒绝——这不是降级，只是不把「还没写完」误判成「不存在」。
+#[cfg(unix)]
+const REGISTRATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(unix)]
+const REGISTRATION_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 从本进程起沿祖先找会话文件；找不到时在宽限期内每 500ms 重查（见 [`REGISTRATION_GRACE`]；整个进程只有一份宽限）。
+#[cfg(unix)]
+fn resolve_launch() -> Result<Launch, String> {
+    // 宽限期从本进程**第一次**查找起算、整个进程只有这一份：之后的每次工具调用不再重复等，
+    // 否则不受支持的启动方式（tmux/IDE/systemd）每调一次工具就白等 10 秒。
+    static FIRST_LOOKUP: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let deadline = *FIRST_LOOKUP.get_or_init(std::time::Instant::now) + REGISTRATION_GRACE;
+    loop {
+        match resolve_launch_once() {
+            Ok(l) => return Ok(l),
+            Err(e) => {
+                // 被 Codex 共享后台服务拉起的进程永远不会有登记，不必等。
+                if std::time::Instant::now() >= deadline || e.hopeless {
+                    return Err(e.message);
+                }
+                std::thread::sleep(REGISTRATION_POLL);
+            }
         }
-        Some(_) => {}
-    }
-    if key.is_none() {
-        bad.push(mcp_protocol::ENV_KEY.to_string());
-    }
-    match (endpoint, key) {
-        (Some(e), Some(k)) if bad.is_empty() => Ok(Launch {
-            endpoint: std::path::PathBuf::from(e),
-            key: k,
-        }),
-        _ => Err(bad),
     }
 }
 
-/// 缺环境时给 agent 和用户看的话。除了说清规则，还报出**这个代理是被谁拉起来的**、环境里实际
-/// 看得到哪些 `ISHELL_*` 变量——「环境变量明明刚才还在、过一会儿代理里就没了」这类问题，光看
-/// 「缺变量」无从判断是被 agent 过滤了环境、还是代理被换了个环境重新拉起，这两行就是用来分辨的。
 #[cfg(unix)]
-fn missing_env_message(bad: &[String]) -> String {
-    let (ppid, parent) = parent_process_summary();
-    let seen: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| k.starts_with("ISHELL_"))
+struct NoSession {
+    message: String,
+    /// 祖先里有 `app-server`：再等也不会有登记。
+    hopeless: bool,
+}
+
+#[cfg(unix)]
+fn resolve_launch_once() -> Result<Launch, NoSession> {
+    let Some(home) = home_dir() else {
+        return Err(NoSession {
+            message: no_session_message(&[], "（找不到家目录）"),
+            hopeless: true,
+        });
+    };
+    let dir = mcp_protocol::session_dir(&home);
+    let info = |pid: u32| mcp_protocol::proc_info(pid).map(|i| (i.ppid, i.start));
+    match mcp_protocol::find_session_record(std::process::id(), &dir, &info, &load_session_file) {
+        Ok(rec) => Ok(Launch {
+            endpoint: rec.endpoint.into(),
+            key: rec.key,
+        }),
+        Err(chain) => {
+            let sess_state = match std::fs::read_dir(&dir).map(|rd| rd.count()) {
+                Err(_) => "会话目录不存在（这台机器上没有任何 iShell 登记过）",
+                Ok(0) => "会话目录是空的",
+                Ok(_) => "会话目录里有别的终端的登记，但没有一个属于你的祖先进程",
+            };
+            let hopeless = chain.iter().any(|&p| cmdline_has_word(p, "app-server"));
+            Err(NoSession {
+                message: no_session_message(&chain, sess_state),
+                hopeless,
+            })
+        }
+    }
+}
+
+/// 找不到会话时给 agent 和用户看的话：规则、该做什么，外加「祖先链长什么样」的诊断——
+/// 「刚才还能用、后来不行」这类问题，光看「找不到」分不清是 agent 换了个进程树重新拉起了代理，
+/// 还是 iShell 那边没登记上，这条链就是用来分辨的。
+#[cfg(unix)]
+fn no_session_message(chain: &[u32], sess_state: &str) -> String {
+    let names: Vec<String> = chain
+        .iter()
+        .map(|&p| format!("{}({p})", proc_comm(p)))
         .collect();
+    let codex = if chain.iter().any(|&p| cmdline_has_word(p, "app-server")) {
+        "\n你是被 Codex 的共享后台服务（codex app-server）拉起的：它不在任何终端的进程树里，iShell 无从知道\
+         你属于哪个终端。请让用户用 `codex --no-daemon` 启动 Codex。"
+    } else {
+        ""
+    };
     format!(
-        "这个 ishell-mcp 没有拿到连接 iShell 所需的环境（缺少或无效：{}）。它只在**从某台 iShell \
-         的终端里启动的 AI** 里可用：iShell 连上服务器后会往终端注入连接环境，在那个 shell 里启动的 \
-         AI 才连得上**那一台** iShell；不是从 iShell 终端启动的（本机直接启动、IDE、别人的终端），\
-         一律拒绝，也不会去连别的 iShell。请停止重试，并告诉用户：在他自己的 iShell 终端里（重新）\
-         启动 AI；若那个终端是连上后敲过键盘而被跳过注入的，先右键「立即注入 MCP 连接环境」再启动。\n\
-         诊断：本代理的父进程 pid={ppid} 进程名={parent}；环境里看得到的 ISHELL_* 变量：{}。\
-         若这些变量在 AI 启动时还在、后来才没了，多半是 AI 客户端用一份被过滤的环境重新拉起了代理；\
-         Codex 默认只给 MCP 子进程一份白名单环境，需要在 ~/.codex/config.toml 的 [mcp_servers.ishell] \
-         里加 env_vars = [\"ISHELL_MCP_ENDPOINT\", \"ISHELL_MCP_KEY\"]。",
-        bad.join("、"),
-        if seen.is_empty() {
-            "（无）".to_string()
+        "没有找到这个进程所属的 iShell 终端：沿父进程往上，没有任何一个祖先是 iShell 登记过的登录 shell。\
+         ishell-mcp 只在**从某台 iShell 终端里启动的 AI** 里可用：iShell 连上服务器后会给这个终端的登录 \
+         shell 登记会话，在它里面启动的 AI 只会连到那一台 iShell；其它启动方式（IDE、systemd 服务、tmux/\
+         screen、别人的终端）一律拒绝，也不会去连别的 iShell。请停止重试，并告诉用户：在他自己的 iShell \
+         终端里直接（重新）启动 AI；若刚连上就启动，注意看会话状态栏有没有「MCP 登记失败」的提示。\
+         另一个常见原因：这台电脑上的 iShell 版本早于本代理（0.26.x 及以前不登记会话），升级 iShell 即可。{codex}\n\
+         诊断：{sess_state}；本进程的祖先链：{}。",
+        if names.is_empty() {
+            "（读不到）".to_string()
         } else {
-            seen.join("、")
+            names.join(" ← ")
         }
     )
 }
 
-/// 父进程（拉起代理的那个 AI 客户端）的 `(pid, 进程名)`。取不到就给占位——诊断用，不影响逻辑。
-///
-/// 只取**进程名**（`/proc/<pid>/comm`）和可执行文件名，**不取命令行**：命令行里常带着提示词、
-/// 路径、令牌之类的参数，而这段话会发给 LLM、还会写进诊断文件。
+/// 进程名（`comm`）。取不到给占位——诊断用，不影响逻辑。
 #[cfg(unix)]
-fn parent_process_summary() -> (u32, String) {
-    let ppid = std::os::unix::process::parent_id();
-    let comm = std::fs::read_to_string(format!("/proc/{ppid}/comm"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let exe = std::fs::read_link(format!("/proc/{ppid}/exe"))
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
-    let name = match (comm, exe) {
-        (Some(c), Some(e)) if c != e => format!("{c}（可执行文件 {e}）"),
-        (Some(c), _) => c,
-        (None, Some(e)) => e,
-        (None, None) => "（读不到）".into(),
-    };
-    (ppid, name)
+fn proc_comm(pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.rsplit('/').next().map(str::to_string))
+            .unwrap_or_else(|| "?".into())
+    }
 }
 
-/// 缺环境的诊断也落一份本地文件（尽力而为）：agent 的报错会被它自己的界面折叠、截断，事后
-/// 想查「它到底是怎么被拉起的」时有处可看。只存缺环境这一类事件，超过 64KB 就从头重写。
+/// 进程命令行里有没有这一个词（只在本地判断，**不**把命令行带出去：里面常有提示词、路径、令牌）。
+#[cfg(unix)]
+fn cmdline_has_word(pid: u32, word: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| raw.split(|&b| b == 0).any(|a| a == word.as_bytes()))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().any(|a| a == word))
+    }
+}
+
+/// 缺会话的诊断也落一份本地文件（尽力而为）：agent 的报错会被它自己的界面折叠、截断，事后想查
+/// 「它到底是怎么被拉起的」时有处可看。只存这一类事件，超过 64KB 就从头重写。
 #[cfg(unix)]
 fn write_diag(line: &str) {
     use std::io::Write;
-    let Some(home) = std::env::var_os("HOME") else {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let Some(home) = home_dir() else {
         return;
     };
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = std::path::PathBuf::from(home).join(".ishell-mcp");
-    // 目录、文件都只给本人读写（iShell 反向转发建这个目录时也是 0700）
+    let dir = home.join(".ishell-mcp");
+    // 目录、文件都只给本人读写（iShell 登记会话时建这个目录也是 0700）
     let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
     let path = dir.join("diag.log");
     let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 * 1024);
@@ -163,25 +263,26 @@ fn write_diag(line: &str) {
     }
 }
 
-/// 本进程的连接信息，读一次就定：环境在进程生命周期内不会变，每次调用重读只会多出
-/// 「刚才还行、现在不行」的错觉。
+/// 本进程的连接信息，找到才缓存（找不到每次调用都重找——iShell 那边的登记可能晚到几秒，
+/// 刚连上就启动 agent 的人不该因此永久失败）。**成功之后**祖先不会变，不必重找。
 #[cfg(unix)]
-fn launch() -> Result<&'static Launch, String> {
-    static LAUNCH: std::sync::OnceLock<Result<Launch, String>> = std::sync::OnceLock::new();
-    LAUNCH
-        .get_or_init(|| {
-            launch_from(
-                std::env::var(mcp_protocol::ENV_ENDPOINT).ok(),
-                std::env::var(mcp_protocol::ENV_KEY).ok(),
-            )
-            .map_err(|bad| {
-                let msg = missing_env_message(&bad);
-                write_diag(&msg.replace('\n', " | "));
-                msg
-            })
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+async fn launch() -> Result<&'static Launch, String> {
+    static LAUNCH: std::sync::OnceLock<Launch> = std::sync::OnceLock::new();
+    if let Some(l) = LAUNCH.get() {
+        return Ok(l);
+    }
+    // 宽限期里要 sleep 轮询，放到阻塞线程上，别占着异步运行时。
+    let resolved = tokio::task::spawn_blocking(resolve_launch)
+        .await
+        .map_err(|e| format!("查找 iShell 会话时内部出错：{e}"))
+        .and_then(|r| r);
+    match resolved {
+        Ok(l) => Ok(LAUNCH.get_or_init(|| l)),
+        Err(msg) => {
+            write_diag(&msg.replace('\n', " | "));
+            Err(msg)
+        }
+    }
 }
 
 /// 带超时的 connect。同机 Unix socket 上 connect 基本瞬时，这个护栏平时轮不到触发；但反向
@@ -192,7 +293,7 @@ async fn connect_endpoint(l: &Launch) -> Result<UnixStream, String> {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(format!(
             "连不上 iShell 端点 {}（{e}）。可能原因：iShell 已退出或重启（旧 agent 的密钥随之作废）、\
-             它到这台服务器的 SSH 断了或重连过（端点每次连接都换）、设置里关掉了 AI 控制。\
+             它到这台服务器的 SSH 断了或重连过（端点每次连接都换，会话文件随之换新）、设置里关掉了 AI 控制。\
              不会去连别的 iShell。请在 iShell 终端里重新启动 AI。",
             l.endpoint.display()
         )),
@@ -246,10 +347,10 @@ async fn handshake(l: &Launch) -> Result<Granted, String> {
     //    唯一回应（见 `handle_hello`）。
     let silent = || {
         format!(
-            "iShell 端点 {} 没有应答就断开了连接。最常见的原因：这份环境里的密钥不是那台 iShell 本次运行\
-             的密钥（环境来自别的 iShell、来自 iShell 重启之前，或被别的配置覆盖了）；也可能是那台 iShell \
-             启动时关着 AI 控制、正忙于处理大量连接、或本机熵源不可用。不会改连别的 iShell。请在**你自己\
-             的 iShell 终端**里重新启动 AI；仍不行就看那台 iShell 的日志。",
+            "iShell 端点 {} 没有应答就断开了连接。最常见的原因：会话文件里的密钥不是那台 iShell 本次运行的\
+             密钥（iShell 重启过——旧 agent 必须重开；或会话文件是别的 iShell 留下的陈旧残留）；也可能是那台 \
+             iShell 启动时关着 AI 控制、正忙于处理大量连接、或本机熵源不可用。不会改连别的 iShell。请在**你\
+             自己的 iShell 终端**里重新启动 AI；仍不行就看那台 iShell 的日志。",
             l.endpoint.display()
         )
     };
@@ -347,7 +448,7 @@ async fn read_line(
 /// 该做的是让用户重开 agent，不是替他猜。
 #[cfg(unix)]
 async fn connect_bound() -> Result<(UnixStream, String), String> {
-    connect_with(launch()?, &GRANTED).await
+    connect_with(launch().await?, &GRANTED).await
 }
 
 /// [`connect_bound`] 的本体：连接信息与凭据槽由调用方给，测试可以各自用一份。
@@ -796,7 +897,7 @@ fn default_timeout_ms() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RunCommandArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
     /// 要在该终端里执行的 shell 命令（会像用户手动输入一样实时显示在终端里）
     pub command: String,
@@ -811,21 +912,21 @@ pub struct ListSessionsArgs {
     pub filter: Option<String>,
 }
 
-/// 启动后立即返回的命令参数。它复用 `run_command` 的哨兵和 `poll_run` 状态机，
-/// 只是把等待窗口固定为协议允许的最小值，避免 MCP 客户端的空闲超时占住等待者。
+/// `start_command` 的参数：复用 `run_command` 的完成检测与 `poll_run` 状态机，只是把等待窗口固定为
+/// 协议允许的最小值，免得被 MCP 客户端的空闲超时占住。
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StartCommandArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
     pub command: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PollRunArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
-    /// 可省略：同一会话同一时刻只会有一条挂起的运行，省略就直接续等它，不需要精确转述
-    /// run_command 返回的那个长数字 id。传了会做一致性校验（防止误续等一条不相关的旧运行）。
+    /// 可省略：同一会话同一时刻只有一条挂起的运行，省略即续等它；传了会校验是否对得上，
+    /// 防止误续等一条不相关的旧运行。
     #[serde(default)]
     pub run_id: Option<u64>,
     #[serde(default = "default_timeout_ms")]
@@ -834,7 +935,7 @@ pub struct PollRunArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SessionArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
 }
 
@@ -850,7 +951,7 @@ fn default_max_lines() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReadHistoryArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
     /// 只要最后这么多行（默认 200，够用再加大）；传 0 表示不限制（回滚很长时可能很大）
     #[serde(default = "default_max_lines")]
@@ -859,14 +960,13 @@ pub struct ReadHistoryArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SendInputArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
-    /// 要发送的文本/按键，不会自动加回车。默认逐字节原样发送：反斜杠就是反斜杠，"\r" 两个
-    /// 字符收到的是两个字符、不是回车；发控制键（回车/Ctrl-D/Esc 等）必须设 escapes=true
-    /// （写 "\r" 字面转义即真实回车；真实控制字节也会原样通过）
+    /// 要发送的文本/按键，不自动加回车。默认逐字节原样发送（"\r" 是两个字符，不是回车）；
+    /// 发控制键（回车/Ctrl-D/Esc 等）须设 escapes=true；真实控制字节也会原样通过
     pub text: String,
-    /// 可选，默认 false。true 时把 text 里的字面转义解析成按键：\r \n \t \\ 与 \xHH
-    /// （00-7F）；写错（未定义转义、\x 后不足两位十六进制）会直接报错、不发送
+    /// 默认 false。true 时把 text 里的 \r \n \t \\ 与 \xHH（00-7F）解析成真实按键；
+    /// 写错（未定义转义、\x 后不足两位十六进制）直接报错、不发送
     #[serde(default)]
     pub escapes: bool,
 }
@@ -877,7 +977,7 @@ fn default_file_timeout_ms() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct WriteFileArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
     /// 远端绝对路径，已存在会被直接覆盖
     pub path: String,
@@ -889,11 +989,11 @@ pub struct WriteFileArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReadFileArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
     pub path: String,
-    /// 默认 false：遵守 20MB 软上限、二进制内容直接报错。true：放宽到 128MB 且把二进制也
-    /// 当文本硬解码——只在确实需要读大文件、且确定是文本时才传 true，否则会得到乱码。
+    /// 默认 false：遵守 20MB 软上限、二进制直接报错。true：放宽到 128MB 并把二进制也当文本
+    /// 硬解码——只在确需读大文件、且确定是文本时才传，否则得到乱码。
     #[serde(default)]
     pub force: bool,
     #[serde(default = "default_file_timeout_ms")]
@@ -906,7 +1006,7 @@ fn default_copy_timeout_ms() -> u64 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CopyToRemoteArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
     /// 运行 ishell-mcp 的调用方机器上的单个文件绝对路径
     pub local_path: String,
@@ -918,7 +1018,7 @@ pub struct CopyToRemoteArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CopyFromRemoteArgs {
-    /// 会话 uid：`list_sessions` 返回的整数——**原样复制传入**，不要凭记忆猜、也不要自己编
+    /// 会话 uid：`list_sessions` 返回的整数，原样传入，别猜
     pub session_uid: u64,
     /// 远端绝对路径（仅单个文件；目录请逐文件拉取或用 tar/rsync）
     pub remote_path: String,
@@ -949,15 +1049,12 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "列出**你自己**（本 AI 进程）用 open_session 开的终端会话。用户自己打开的\
-                        窗口、其它 AI 开的窗口**不会出现在这里**，你也不能读取或操作它们（硬规则，\
-                        没有授权弹窗）。每个会话返回：uid（整数，后续所有工具的 session_uid 都直接\
-                        复制它）、标题、主机、连接状态、远端工作目录（上报片段注入后才有值，刚连上\
-                        的一小段时间可能为 null）、endpoint_injected（连接 iShell 的环境是否已注入该 shell；\
-                        false = 在这里面再启动 AI 会连不上 iShell，等 shell 空下来会自动补注），\
-                        以及兼容字段 ai_owned/ai_owner/mine（列表里全是你的会话，mine 恒为 true）。\
-                        同名会话凭 uid 和 host 区分。可传 filter 只返回标题/主机名匹配的会话，省上下文。\
-                        列表为空或没有目标机器：list_saved_connections 查连接名 → open_session。"
+        description = "列出你自己用 open_session 开的会话。用户自己开的窗口、其它 AI 开的窗口不可见，也不能读写（硬规则）。每个会话返回：\
+                        uid（后续所有工具的 session_uid 原样复制它）、title、host、connected、cwd（远端工作目录，上报片段注入后才有值，\
+                        刚连上时可能为 null）、bound（该会话的登录 shell 是否已登记为属于这台 iShell；false 时在其中启动的 AI \
+                        连不上 iShell，原因见会话状态栏的 ⚠ 提示），以及兼容字段 ai_owned/ai_owner/mine（可忽略）。同名会话凭 \
+                        uid 和 host 区分；filter 按标题/主机名过滤，省上下文。列表为空：list_saved_connections \
+                        查连接名 → open_session。"
     )]
     async fn list_sessions(
         &self,
@@ -973,14 +1070,12 @@ impl IshellMcp {
                 }
                 if list.is_empty() {
                     let note = if had_filter {
-                        "没有标题或主机名匹配该 filter 的会话。list_sessions 只列出你自己用 \
-                         open_session 开的会话；放宽或去掉 filter 再试，或 list_saved_connections \
-                         → open_session 开新会话。"
+                        "没有匹配该 filter 的会话（list_sessions 只列你自己用 open_session 开的会话）。\
+                         放宽或去掉 filter，或 list_saved_connections → open_session 开新会话。"
                     } else {
-                        "说明：列表为空是因为你只能看到自己用 open_session 开的会话；\
-                         用户自己打开的窗口不会出现在这里（硬规则，没有授权弹窗）。\
+                        "列表为空：你只能看到自己用 open_session 开的会话，用户自己开的窗口不会出现在这里。\
                          要操作某台机器请 list_saved_connections → open_session。\
-                         你连的是启动你的那个终端所属的 iShell，不是用户当前正在看的那个窗口。"
+                         你连的是启动你的那个终端所属的 iShell，不是用户正在看的那个窗口。"
                     };
                     let mut blocks = vec![
                         ContentBlock::text("[]"),
@@ -998,48 +1093,27 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "在指定终端会话里运行一条命令，等待其执行完成（或超时）后返回输出与退出码。\
-                        命令和输出会实时显示在该会话对应的终端标签里（AI 自己开的会话通常在后台，\
-                        不会抢走用户当前正在看的窗口），效果等同于用户亲自输入。\
-                        会话还在连接/认证中时（open_session 刚返回就是这状态）**会自动等它连上，最\
-                        多约 20 秒**——一般不用先 list_sessions 确认 connected 再发。另一个该知道的\
-                        边界：本工具的等待可能被 MCP 客户端的空闲超时切断（客户端等不到响应会自行\
-                        断开）——预计命令可能跑得很久的，改用 start_command 启动、poll_run 续等。\
-                        重要限制：这是往一个真实交互 shell 里打字+回车，不是独立执行通道——\
-                        前台如果正跑着 vim/top/REPL/sudo 密码提示等非 shell 程序，或者上一条命令\
-                        有反斜杠续行、未闭合引号、heredoc 还没结束，这条命令文本会被当成那个\
-                        程序/续行的输入吃掉，完成检测可能永远等不到，且可能改动那个程序里的\
-                        数据。不确定当前前台状态时，先用 read_screen 看一眼再决定要不要发命令，\
-                        或者改用 send_input 应对交互式场景。\
-                        **command 必须是一条单行命令**：里面的换行等于按下 Enter，shell 会把它拆成\
-                        多条依次执行，而完成检测只认得第一条——所以含换行（含 heredoc）或为空的 \
-                        command 会被直接拒绝并附改写建议。要多步就用 `;` / `&&` 连接成一行，\
-                        要跑长脚本就先 write_file 落一个文件再执行它。\
-                        还有一类命令形态会连**完成哨兵**一起吞掉、让运行永远等不到结束：命令以 `#`\
-                        注释结尾、引号未闭合、以反斜杠续行结尾——表现为反复超时、输出却在增长。\
-                        这时调用 interrupt 释放，用 read_screen/read_history 核实，并把命令改写为\
-                        完整单行重试——不要反复 poll_run 干等（每次都会烧满一个完整超时）。\
-                        **交互式命令（cat/REPL/ssh）在 AI 专用会话里可以正常收尾**：那里的 shell \
-                        装了完成上报（OSC 133），命令的开始/结束/退出码由 shell 自己发，不经过任何\
-                        程序的 stdin。流程照旧：start_command 启动 → send_input 逐键交互（控制键写法\
-                        见 send_input 描述）→ read_screen 观察 → 程序自己退出（如给 cat 发 EOF）即\
-                        收到 finished=true 与退出码。\
-                        没装上这个上报的会话（刚连上、上报片段还没注入时的头一条命令，或 fish/csh \
-                        这类 shell）只能退回老办法（往终端多打一行完成哨兵），那里仍有这条限制：读 \
-                        stdin 的程序会把哨兵当输入吃掉，运行永远 finished=false；此时用 interrupt 释放，\
-                        再用 read_screen 确认提示符干净、无残留的 printf 'AI_DONE_…' 行，然后发新命令。\
-                        （用户自己打开的窗口 AI 碰不到，不在此列。）\
-                        两个解读输出时容易踩的坑：① output 末尾常带一段 shell 提示符残留（比如 \
-                        `(venv) user@host:~$`，有时只剩一个 `$`）——这是刻意不做的清理（早期试过按\
-                        「最后一行大概率是提示符」启发式剥掉，但 PS1 为空/不可见时会把真实输出误删，\
-                        权衡后选择宁可留一点噪声也不丢数据），解析时自己按需忽略即可；② 超时返回的是\
-                        finished=false 加**这一轮已产生的部分输出**（可能是空字符串）——空输出不代表\
-                        命令什么都没打印，只代表还没等到完成哨兵，用 poll_run 续等或用 read_screen \
-                        看实时内容。**命令最后一段是 exit [n] 时（`exit 42`、`make || exit 1`）会自动改写到子 \
-                        shell 执行**：退出码照拿（exit 42 返回 42）、登录 shell 不受影响。exit 后面\
-                        **还接着命令**会被拒绝——改写后的 exit 拦不住后续命令（`cond || exit 1; rm …` \
-                        的守卫会失效），请改成条件分支 `cond && rm …`。logout 一律拒绝。想关掉 AI \
-                        自己开的会话请用 close_session，不要靠 exit/logout。"
+        description = "在指定会话里运行一条命令，等它结束（或超时）后返回输出与退出码；命令与输出实时显示在终端标签里，等同用户亲自输入。会话还在连接中时自动等它连上（最多约 \
+                        20 秒）。这是往真实交互 shell 打字+回车，不是独立执行通道：\n\
+                        · command 必须是单行非空命令（换行等于 Enter；含换行/heredoc 或为空会被拒绝并附改写建议）。多步用 `;\
+                        `/`&&` 连接，长脚本先 write_file 再执行。\n\
+                        · 前台若是 vim/top/REPL/sudo 密码提示等非 shell 程序，或上一条命令有未结束的续行/引号/heredoc，\
+                        命令文本会被当成它们的输入吃掉——完成检测可能永远等不到，还可能改动程序里的数据。拿不准先 read_screen；交互场景用 \
+                        send_input。\n\
+                        · 以 `#` 注释结尾、引号未闭合、或以反斜杠续行结尾的命令会吞掉完成哨兵：反复超时、输出却在增长。此时 interrupt，\
+                        用 read_screen/read_history 核实，改写成完整单行重试，别反复 poll_run 干等。\n\
+                        · 等待会被 MCP 客户端的空闲超时切断；预计很久的命令改用 start_command + poll_run。\n\
+                        · 交互式命令（cat/REPL/ssh）在 AI 专用会话里能正常收尾（那里的 shell 装了完成上报 OSC 133）：start_command \
+                        → send_input 逐键交互 → read_screen → 程序自己退出（如给 cat 发 EOF）即得 finished=true \
+                        与退出码。没装上该上报的会话（刚连上、片段未注入时的头一条命令，或 fish/csh）退回哨兵办法：读 stdin 的程序会吃掉哨兵、\
+                        运行永远 finished=false——interrupt 释放，read_screen 确认提示符干净、没有残留的 printf \
+                        'AI_DONE_…' 行，再发新命令。\n\
+                        · output 末尾常带 shell 提示符残留（如 `(venv) user@host:~$`），刻意不剥（PS1 为空时剥离会误删真实输出）\
+                        ，自行忽略。超时返回 finished=false 加这一轮已有的部分输出（可能为空，不代表没打印）→ poll_run 续等或 \
+                        read_screen。\n\
+                        · 最后一段是 `exit [n]`（如 `exit 42`、`make || exit 1`）时自动改在子 shell 执行：\
+                        退出码照拿，登录 shell 不受影响；exit 后面还接命令会被拒绝（守卫会失效），请改成 `cond && rm …`。logout \
+                        一律拒绝；关会话用 close_session。"
     )]
     async fn run_command(
         &self,
@@ -1061,17 +1135,11 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "启动一条可能很长的命令；命令开始运行后至多 100ms 返回（会话还在连接/\
-                        认证中时会先等它连上，最多约 20 秒），不会因 MCP 客户端的长时间空闲\
-                        限制而占住等待连接。返回 finished=false 时保存 run_id，之后用 poll_run\
-                        以较短 timeout_ms 查询；命令已很快结束时会直接返回 finished=true。\
-                        **预计运行时间可能超过 MCP 客户端空闲超时（几十秒到几分钟）的命令优先用\
-                        本工具**：run_command 的等待会被客户端空闲超时切断，本工具不会。\
-                        command 的要求与 run_command 完全相同：**必须是一条单行非空命令**（含换行\
-                        会被拒绝，用 `;`/`&&` 连接或先 write_file 落脚本）。完成检测也是同一套：\
-                        若命令形态把哨兵吞掉（以 # 注释结尾、引号未闭合、反斜杠续行结尾），运行\
-                        同样永远等不到结束——按 run_command 描述里的处理办法 interrupt 释放、\
-                        改写成完整单行重试。"
+        description = "启动一条可能很长的命令，开始运行后至多 100ms 返回（会话还在连接中时先等，最多约 20 秒）。返回 finished=false \
+                        时保存 run_id，之后用 poll_run 以较短 timeout_ms 查询；命令很快结束则直接 finished=true。\
+                        预计超过 MCP 客户端空闲超时（几十秒到几分钟）的命令优先用本工具：run_command 的等待会被客户端空闲超时切断，本工具不会。\n\
+                        command 的要求与完成检测都和 run_command 完全相同（单行非空；会吞掉哨兵的写法同样永远等不到结束，处理办法见 \
+                        run_command）。"
     )]
     async fn start_command(
         &self,
@@ -1092,9 +1160,8 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "继续等待一次因超时而未完成的 run_command，不会重新发送命令，可反复调用直到 \
-                        finished=true。run_id 可以不填——同一会话同一时刻只会有一条挂起的运行，\
-                        直接省略就行，不需要精确转述那个长数字。"
+        description = "继续等待一次因超时而未完成的 run_command，不会重发命令，可反复调用直到 finished=true。run_id 可省略：\
+                        同一会话同一时刻只有一条挂起的运行，省略即续等它。"
     )]
     async fn poll_run(
         &self,
@@ -1115,8 +1182,8 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "读取指定终端当前可见屏幕的纯文本内容（类似 tmux capture-pane），\
-                        用于查看正在运行的交互式程序（如 vim/top/一个未结束的长任务）而不必等它退出"
+        description = "读取指定会话当前可见屏幕的纯文本（类似 tmux capture-pane），用于查看正在运行的交互程序（vim/top/未结束的长任务）\
+                        而不必等它退出。"
     )]
     async fn read_screen(
         &self,
@@ -1126,20 +1193,14 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "向指定终端发送 Ctrl+C，用于中断一个卡住或不需要的命令。同一会话同一时刻只允许\
-                        一条挂起的运行，新 run_command 会被「已有一条 AI 命令正在执行」拒绝——这种情况下\
-                        调用一次 interrupt 会立即清空这条挂起的运行（之后马上就能发新命令），但代价是\
-                        那条被中断的命令彻底失去结果——执行到哪一步、是否已产生副作用都无法再确认，仅会\
-                        拿到已知的部分输出作参考。（同一时刻只允许一个 poll_run 等待者的限制会在上一个\
-                        等待者所在的连接断开——比如它自己的调用方超时放弃——之后自动解除，不需要靠 \
-                        interrupt 才能恢复。）\n\
-                        AI 专用会话里中断本身就有结论：shell 的完成上报会把 Ctrl-C 结束的命令报成 \
-                        exit 130，不需要额外补救。没装上完成上报、走哨兵回退的会话才有这两个注意点：\
-                        ① 被中断的程序若把终端设成 raw 模式（vim 这类全屏程序），Ctrl-C 不会冲刷输入\
-                        队列——排队中的完成哨兵可能随后以一条自擦除的 printf 'AI_DONE_…' 泄漏为可见行：\
-                        无害，但会混进后续命令的输出文本。② 读 stdin 的程序（cat/REPL）会把哨兵当输入\
-                        吃掉、运行永远 finished=false——程序退出后调一次 interrupt 释放（在提示符上按 \
-                        Ctrl-C 无害）。"
+        description = "向指定会话发送 Ctrl+C，中断卡住或不需要的命令。同一会话同一时刻只允许一条挂起的运行：新 run_command 被「已有一条 \
+                        AI 命令正在执行」拒绝时，调一次 interrupt 会立即清空这条挂起的运行，之后马上能发新命令——代价是被中断命令的结果彻底丢失（执行到哪、\
+                        有无副作用都无法再确认，只能拿已知的部分输出参考）。poll_run 的单等待者限制在上一个等待者的连接断开后会自动解除，不需要靠 \
+                        interrupt。\n\
+                        AI 专用会话里完成上报会把被中断的命令报成 exit 130，无需补救。走哨兵回退的会话（见 run_command）另有两点：\
+                        ① 被中断的 raw 模式程序（vim 等）不冲刷输入队列，排队的完成哨兵可能以自擦除的 printf 'AI_DONE_…' \
+                        泄漏为可见行——无害，但会混进后续输出；② 读 stdin 的程序会吃掉哨兵、运行永远 finished=false——程序退出后调一次 \
+                        interrupt 释放（在提示符上按 Ctrl-C 无害）。"
     )]
     async fn interrupt(
         &self,
@@ -1149,16 +1210,12 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "**你自己已经开着合适的会话时优先复用（见 list_sessions），别为同一台机器重复开新会话**\
-                        ——新会话是全新登录，没有现成的 cwd/venv/登录态。确实需要新登录时：用一\
-                        个已保存的连接（按名称）新开一个终端会话/标签，等价于用户在 iShell 侧栏里\
-                        双击这条已保存连接。name 是已保存连接的名字，不是主机地址，也不是 \
-                        list_sessions 里的会话标题——不确定具体拼写时先调 list_saved_connections \
-                        核对。返回新会话的 uid；此时通常还没连上（connected=false，正在连接/\
-                        认证中）——直接对它用任何会话工具即可：run_command/start_command 以及 \
-                        read_file/write_file/copy_to_remote/copy_from_remote/copy_between_sessions \
-                        都会自动等它连上（最多约 20 秒），不必先 list_sessions 确认 connected。\
-                        只有 send_input/interrupt 不等（这两个遇到「会话尚未连接」等它变 true 再试）。"
+        description = "你已开着合适的会话时优先复用（见 list_sessions），别为同一台机器重复开——新会话是全新登录，没有现成的 cwd/venv/登录态。\
+                        确需新登录时，用已保存连接的名字新开一个标签，等价于在 iShell 侧栏双击它。name 是已保存连接的名字（不是主机地址，也不是会话标题）\
+                        ，拿不准先 list_saved_connections。\n\
+                        返回新会话的 uid；此时通常还没连上（connected=false），直接用即可：run_command/start_command/read_file/write_file/copy_* \
+                        都会自动等它连上（最多约 20 秒）；只有 send_input/interrupt 不等（遇到「会话尚未连接」等它变 true \
+                        再试）。"
     )]
     async fn open_session(
         &self,
@@ -1168,9 +1225,7 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "关闭一个终端会话/标签。只能关闭你自己用 open_session 开的会话（用户自己开的\
-                        会话即使有权限操作也不能用这个工具关掉）。不再需要某个 open_session 开的\
-                        会话时应该主动关掉，避免一直占着连接。"
+        description = "关闭一个会话/标签，只能关你自己用 open_session 开的。不再需要时主动关掉，免得一直占着连接。"
     )]
     async fn close_session(
         &self,
@@ -1180,9 +1235,8 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "读取指定终端的完整历史（回滚缓冲区 + 当前可见屏，从最早到最新），\
-                        不止 read_screen 那样只看当前一屏——适合回顾这个会话从头到现在都发生了什么。\
-                        max_lines 只要最后这么多行（默认 200，避免一次性读回过长历史）。"
+        description = "读取指定会话的完整历史（回滚缓冲区 + 当前可见屏，从最早到最新），不止 read_screen 的当前一屏。max_lines \
+                        只要最后这么多行（默认 200）。"
     )]
     async fn read_history(
         &self,
@@ -1201,26 +1255,21 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "列出所有已保存的连接（名称/主机/用户名/端口，不含密码/密钥），\
-                        用在 open_session 之前确认名字拼写对不对、有哪些机器可以连。"
+        description = "列出已保存的连接（名称/主机/用户名/端口，不含凭据），用于 open_session 前核对名字。"
     )]
     async fn list_saved_connections(&self) -> Result<CallToolResult, McpError> {
         text_result_with_peer(call(McpReqKind::ListSavedConnections).await).await
     }
 
     #[tool(
-        description = "往指定终端直接发送原始文本/按键，不等待、不做完成检测——用于 run_command \
-                        覆盖不到的交互式场景（sudo 密码提示、vim/REPL 里继续输入等）。发送后配合 \
-                        read_screen 看效果。不会自动加回车。\n\
-                        **默认 text 逐字节原样发送**：反斜杠就是反斜杠——写成 \"\\r\" 收到的就是\
-                        反斜杠+r 两个字符、**不是回车**；往 REPL/vim 里敲带 \\n 的代码、密码、正则都\
-                        不会被改动。**要发控制键（回车、Ctrl-D、Esc 等）必须设 escapes=true**：此时 \
-                        text 里的字面转义才会被解析成真实按键——\\r 回车、\\n 换行、\\t、\\\\（字面\
-                        反斜杠）与 \\xHH（两位十六进制、00-7F，如 \\x04=Ctrl-D、\\x1b=Esc），写错\
-                        直接报错、不发送；真实控制字节则原样通过，两种写法都安全。例：提交一行 \
-                        \"ls -l\\r\"、给 cat 发 EOF \"\\x04\"、vim 保存退出 \"\\x1b:wq\\r\"。注意 \
-                        escapes=true 时正文里原本的反斜杠必须写成 \\\\，含代码/密码的长文本不要开\
-                        它；混合场景分两次调用：先 escapes=true 发控制键，再默认模式发正文。"
+        description = "往指定会话直接发送原始文本/按键，不等待、不做完成检测、不自动加回车；用于 run_command 覆盖不到的交互场景（sudo \
+                        密码提示、vim/REPL 里继续输入），发完用 read_screen 看效果。\n\
+                        默认 text 逐字节原样发送：反斜杠就是反斜杠，写成 \"\\r\" 收到的是反斜杠+r 两个字符，不是回车。要发控制键（回车、\
+                        Ctrl-D、Esc 等）必须设 escapes=true：此时 text 里的 \\r \\n \\t \\\\（字面反斜杠）\
+                        与 \\xHH（两位十六进制、00-7F，如 \\x04=Ctrl-D、\\x1b=Esc）被解析成真实按键，写错直接报错、不发送；\
+                        真实控制字节原样通过。例：提交一行 \"ls -l\\r\"，给 cat 发 EOF \"\\x04\"，vim 保存退出 \"\\x1b:\
+                        wq\\r\"。escapes=true 时正文里原有的反斜杠必须写成 \\\\，含代码/密码的长文本不要开；混合场景分两次调用：\
+                        先 escapes=true 发控制键，再用默认模式发正文。"
     )]
     async fn send_input(
         &self,
@@ -1243,11 +1292,8 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "把文本内容写入远端指定路径（存在会被直接覆盖，不做外部改动冲突检测——\
-                        这条通道只给你自己用，默认信任调用方）。复用 iShell 编辑器已有的 SFTP \
-                        写入通路，用于代码同步、生成文件等场景，不需要再单独走一条 scp。content \
-                        必须是合法 UTF-8 文本（走 JSON-RPC 传输）——二进制文件（.so/.tar/图片等）\
-                        或较大的文件请用 copy_to_remote，不要尝试塞进这里。"
+        description = "把文本写入远端指定路径（已存在则直接覆盖，不做外部改动冲突检测）。走 iShell 编辑器的 SFTP 写入通路，不必另走 scp。\
+                        content 必须是合法 UTF-8 文本（走 JSON-RPC）；二进制或较大的文件用 copy_to_remote。"
     )]
     async fn write_file(
         &self,
@@ -1271,10 +1317,8 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "读取远端指定路径的文本文件内容（自动探测编码，行尾统一为 LF）。默认\
-                        遵守 20MB 软上限、二进制文件直接报错；确实需要读取更大的文件（最多\
-                        128MB）或强制把内容当文本读时传 force=true（否则读到二进制文件只会\
-                        得到乱码，不如直接报错清楚）。内容过长时会截断保留末尾部分。"
+        description = "读取远端文本文件（自动探测编码，行尾统一为 LF）。默认遵守 20MB 软上限、二进制直接报错；确需读更大的文件（最多 128MB）\
+                        或强制当文本读时传 force=true（否则读到二进制只会得到乱码）。内容过长时截断并保留末尾。"
     )]
     async fn read_file(
         &self,
@@ -1298,13 +1342,11 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "把运行 ishell-mcp 的调用方机器上的单个文件流式复制到远端（走既有 SFTP \
-                        上传，文件字节不进入 MCP JSON 或模型上下文）。这是跨主机同步大源码/\
-                        二进制的首选，不要用 write_file。local_path 必须是调用方机器的绝对路径；\
-                        remote_path 必须是远端绝对路径且不能含 \".\"/\"..\" 路径段。当前流式模式\
-                        支持单个普通文件，目录请用 git/rsync 或逐文件上传；远端目标存在会直接覆盖。\
-                        传多个文件时可以对同一会话并行发起多次本工具调用（会同时传输，无需等\
-                        上一个传完），同一会话并发上限约 16，超了会返回「并发已达上限」让你稍后重试。"
+        description = "把运行 ishell-mcp 的调用方机器上的单个文件流式复制到远端（走 SFTP 上传，字节不进入 MCP JSON 或模型上下文）\
+                        ，是跨主机同步大源码/二进制的首选，不要用 write_file。local_path 必须是调用方机器的绝对路径；remote_path \
+                        必须是远端绝对路径，且不能含 \".\"/\"..\" 路径段。只支持单个普通文件，目录请用 git/rsync 或逐文件上传；\
+                        远端目标存在会直接覆盖。传多个文件时可对同一会话并行发起多次调用（同时传输），同一会话并发上限约 16，超了会返回「并发已达上限」，\
+                        稍后重试。"
     )]
     async fn copy_to_remote(
         &self,
@@ -1322,15 +1364,11 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "把远端单个文件流式复制到运行 ishell-mcp 的调用方机器（走既有 SFTP 下载，\
-                        文件字节不进入 MCP JSON 或模型上下文），是 copy_to_remote 的反方向。\
-                        拉取大文件时用这个，而不是 read_file——read_file 会把全部内容内联进\
-                        响应 JSON，大文件既浪费上下文又可能被截断。local_path 必须是调用方机器\
-                        的绝对路径；remote_path 必须是远端绝对路径，且不能含 \".\"/\"..\" 路径段。\
-                        当前流式模式仅支持单个文件，remote_path 是目录会报错——目录请多次调用\
-                        本工具逐文件拉取，或用 run_command 执行 tar/rsync。本地目标存在会被\
-                        直接覆盖，不做冲突检测；所在目录不存在会自动创建。拉多个文件时可以对同一\
-                        会话并行发起多次本工具调用（会同时传输），同一会话并发上限约 16。"
+        description = "把远端单个文件流式复制到运行 ishell-mcp 的调用方机器（走 SFTP 下载，字节不进入 MCP JSON 或模型上下文）\
+                        ，是 copy_to_remote 的反方向；拉大文件用它，不要用 read_file（会把全部内容内联进响应、浪费上下文还可能被截断）\
+                        。local_path 必须是调用方机器的绝对路径；remote_path 必须是远端绝对路径，且不能含 \".\"/\"..\" \
+                        路径段。只支持单个文件，remote_path 是目录会报错——请逐文件拉取，或用 run_command 执行 tar/rsync。\
+                        本地目标存在会被直接覆盖，所在目录不存在会自动创建。拉多个文件时可对同一会话并行发起多次调用，并发上限约 16。"
     )]
     async fn copy_from_remote(
         &self,
@@ -1348,21 +1386,14 @@ impl IshellMcp {
     }
 
     #[tool(
-        description = "把一个已打开远端会话（源）上的文件复制到另一个已打开远端会话（目标），\
-                        两边都必须是已连接的远端主机——不是本地文件，本地文件请用 copy_to_remote/\
-                        copy_from_remote。会优先尝试源主机直连目标主机（不经过运行 iShell 的\
-                        机器中转，适合两台主机在同一局域网/集群、直连明显更快的场景）：iShell 会\
-                        生成一个仅限本次使用的一次性密钥对，临时授权源主机免密连接目标主机，\
-                        传输完成后立即撤销这个临时授权、删除临时密钥，不留长期可用的免密信任；\
-                        因为是程序化操作、没有人工确认目标主机指纹的环节，直连时主机密钥策略是\
-                        accept-new。如果直连不可行（网络不通、权限受限等），会自动降级为经 \
-                        iShell 进程内存中转（不落盘任何一方磁盘）；调用方不需要关心具体走了哪条\
-                        路径，返回结果里的 method 字段会标明（\"direct\" 或 \"relay\"）。当前仅\
-                        支持单个文件，src_remote_path 是目录会报错——目录请多次调用本工具逐文件\
-                        复制，或用 run_command 执行 rsync/scp。src_remote_path/dest_remote_path \
-                        都必须是各自远端主机上的绝对路径，且不能含 \".\"/\"..\" 路径段；目标已\
-                        存在会被直接覆盖；源和目标不能是同一个会话（同会话内复制请用 \
-                        run_command 执行 cp）。"
+        description = "把一个已打开远端会话（源）上的单个文件复制到另一个已打开远端会话（目标）。两边都必须是已连接的远端主机（本地文件用 copy_to_remote/copy_from_remote）\
+                        ，且不能是同一个会话（同会话内用 run_command 执行 cp）。\n\
+                        优先让源主机直连目标主机（不经运行 iShell 的机器中转，适合同一局域网/集群）：iShell 生成一次性密钥对，临时授权源主机免密连接目标主机，\
+                        传完立即撤销授权并删除临时密钥；因没有人工确认指纹的环节，直连时主机密钥策略是 accept-new。直连不可行（网络不通、权限受限等）\
+                        会自动降级为经 iShell 进程内存中转（不落盘）；返回里的 method 标明走了哪条（\"direct\" 或 \"relay\"）\
+                        。\n\
+                        只支持单个文件，src_remote_path 是目录会报错——请逐个复制，或用 run_command 执行 rsync/scp。\
+                        两个路径都必须是各自远端主机上的绝对路径，且不能含 \".\"/\"..\" 路径段；目标已存在会被直接覆盖。"
     )]
     async fn copy_between_sessions(
         &self,
@@ -1390,72 +1421,41 @@ impl IshellMcp {
 }
 
 #[tool_handler(
-    instructions = "这是 iShell——一个由用户盯着运行的真实终端管理器——的 MCP 桥。你操作的是**真\
-                    实的交互式终端**（能看到你在打字，前台程序、提示符、sudo 都会受影响），不是\
-                    无状态的执行沙箱。用户能看见你做的每件事。**你只能读写自己用 open_session \
-                    开的会话**：用户自己打开的窗口、其它 AI 的窗口对你不可见，读和写都会被直接拒绝\
-                    （硬规则，没有授权弹窗，重试也没用）。\n\
-                    概念：已保存连接（list_saved_connections）是凭据模板，用来 open_session 发起\
-                    全新登录；会话（list_sessions）是**你自己**已经开着的终端标签。用户说「在 e5 上\
-                    跑一下」：先 list_sessions 看你自己有没有连着 e5 的会话，有就复用（保留你之前的\
-                    cwd/环境，也不多占连接）；没有就 list_saved_connections 核对连接名 → \
-                    open_session。即使用户说「用我那个窗口」，你也碰不到它——开你自己的会话去做，\
-                    并告诉用户原因。\n\
-                    定位会话：报「会话不存在」时别猜新 uid——错误里自带你当前的会话列表（uid:标题），\
-                    按它重新匹配。uid 在同一次 iShell 运行内稳定、断线重连不变；iShell 重启后重新\
-                    分配，历史上下文里的旧 uid 可能已失效——所以一律从最新的 list_sessions 原样复制。\n\
-                    会话状态与报错：connected=false = 还在连接/认证中或已断线（重连中）；run_command \
-                    /start_command 会自动等它连上（最多约 20 秒），send_input/interrupt 不会等——\
-                    后两个遇到「会话尚未连接」就等它变 true。一个会话同时只能有一条 AI 命令在跑，再发\
-                    会报「已有一条正在执行」——用 poll_run 续等或 interrupt 释放。运行中途断线：进\
-                    行中的 run_command/poll_run 会收到「运行已失效、无法再 poll_run」加已知部分输\
-                    出，按它判断执行到哪一步，不要整条重发。每条错误文案都写明了类别和下一步（重试\
-                    /换会话/找用户），按文案行事。\n\
-                    标准流程：定位会话（见上）→ run_command 执行 → 超时用 poll_run 续等（省略 \
-                    run_id，不重发）→ 交互场景（sudo/vim/REPL）用 send_input，看屏用 read_screen → \
-                    自己开的会话用完 close_session（只能关自己开的；开一堆不关会占着连接和标签）。\n\
-                    失败恢复：只读调用（list_sessions/read_screen/read_history/list_*）结果丢失或\
-                    超时就直接重调，幂等安全。写调用结果丢失：先 poll_run 确认有没有在跑；报\
-                    「run_id 不存在或已结束」而你不确定命令执行没有，用 read_screen/read_history \
-                    核实再决定，勿盲目重试有副作用的命令。看到「命令可能已执行、结果未知」先核实\
-                    屏幕。报「已经有一个 poll_run 在等待」说明旧等待者还挂着：别并发 poll，旧等待\
-                    者不要了就 interrupt 释放。连不上 iShell（缺环境、端点连不上、握手被拒）：**按错误文案做，不要重试，也\
-                    不要自己去找别的 iShell**——你只可能连到启动你的那个终端所属的那一台，没有别的\
-                    选项，也没有降级。常见原因：① 你不是从 iShell 终端里启动的（请用户在自己的 iShell \
-                    终端里启动 AI；若那个终端连上后敲过键盘被跳过了注入，右键「立即注入 MCP 连接\
-                    环境」后重新启动 AI）；② iShell 重启过或它到服务器的 SSH 重连过（环境里的端点与\
-                    密钥随之作废，在 iShell 终端里重新启动 AI）；③ 设置里关掉了 AI 控制；④ tmux/screen \
-                    继承的是会话**之前**的环境，里面启动的 AI 拿到的可能是旧的（或别的会话的）\
-                    环境，在 iShell 终端里直接启动。\n\
-                    定位目录与环境：先 list_sessions 的 cwd 字段 → 再看 read_screen 里提示符显示的\
-                    路径 → 还定不了就 run_command 跑 `pwd; ls; git rev-parse --show-toplevel \
-                    2>/dev/null` 这类只读探测；用户没告诉你路径就问他，别猜。\n\
-                    上下文管理：你的上下文是宝贵的，终端输出不是。\n\
-                    · read_screen 只看一屏；read_history 从 max_lines 小的值开始（默认 200），\
-                    别一次性吞整个回滚。\n\
-                    · 大文件/二进制一律走 copy_to_remote/copy_from_remote（字节不进你的上下文）；\
-                    read_file 用于真正需要读内容的文本；grep/sed/head 等就地过滤优先于拉全量。\n\
-                    · run_command 的输出会原样进你的上下文：能定向到文件的别打印，能 tail -1 的\
-                    别 cat。\n\
-                    可靠性：run_command 是往交互 shell 打字+回车——前台全屏程序/REPL/未闭合语法时\
-                    完成检测可能挂起，发命令前先 read_screen；中断用 interrupt；timeout_ms 最长 24h，\
-                    长任务直接等完，勿 sleep 轮询；`&` 优先级低于 `&&`，勿把前置步骤一并丢进后台。远\
-                    端命令/文件优先走本工具集，不要另开 `ssh host cmd`（会丢 cwd/环境/历史，用户也看\
-                    不见）。\n\
-                    典型任务：\n\
-                    · 在 e5 上跑测试：list_sessions 看你自己有没有连着 e5 的会话；没有就 \
-                    open_session 开一个 → run_command 先 cd 到仓库（路径不确定就问用户）再 \
-                    ./run_tests.sh → 超时 poll_run 续等 → read_screen 看结果。\n\
-                    · 机器还没有打开会话：list_saved_connections 核对名字 → open_session → \
-                    直接 run_command `pwd; ls`（会自动等连上）探测环境 → 干活 → close_session。\n\
-                    · 长构建/长测试：run_command timeout_ms 给足直接等；MCP 客户端自己超时断了就 \
-                    poll_run（省略 run_id）续等同一条运行，绝不重发命令。\n\
-                    · 终端卡着交互程序（vim/top/sudo 密码提示）：先 read_screen 看前台是什么 → \
-                    send_input 逐键应对（top 用 \"q\"；回车/EOF/Esc 等控制键写法见 send_input 描述，\
-                    如 escapes=true 时 vim 退出 \"\\x1b:q!\\r\"）→ sudo 密码提示符让用户自己输，或征得同意后 \
-                    send_input。没装上完成上报、走哨兵回退的会话里，交互程序会把完成哨兵当输入吃掉（程序\
-                    退出后运行仍 finished=false，调一次 interrupt 释放再开新命令）；装好上报的 AI 专用\
-                    会话不受此限。"
+    instructions = "这是 iShell（用户盯着运行的真实终端管理器）的 MCP 桥。你操作的是真实的交互式终端：用户看得见你做的每件事，前台程序、\
+                    提示符、sudo 都会受影响。**你只能读写自己用 open_session 开的会话**——用户自己开的窗口、其它 AI 的窗口不可见，\
+                    读写都会被直接拒绝（硬规则，重试没用）。\n\
+                    已保存连接（list_saved_connections）是凭据模板，用来 open_session 新开登录；会话（list_sessions）\
+                    是你自己已开着的终端标签。用户说「在 e5 上跑一下」：先看有没有连着 e5 的会话，有就复用（保留 cwd/环境），没有就核对连接名后 \
+                    open_session。用户说「用我那个窗口」你也碰不到——开自己的会话，并说明原因。\n\
+                    uid 在同一次 iShell 运行内稳定、断线重连不变，iShell 重启后重新分配，所以一律从最新的 list_sessions \
+                    原样复制；报「会话不存在」时别猜，错误里带着你当前的会话列表（uid:标题）。\n\
+                    状态：connected=false 是连接/认证中或断线重连；run_command/start_command 与文件类工具会自动等它连上（最多约 \
+                    20 秒），send_input/interrupt 不等。一个会话同时只能有一条 AI 命令在跑，再发会报「已有一条正在执行」——poll_run \
+                    续等或 interrupt 释放。运行中途断线时，进行中的 run_command/poll_run 会收到「运行已失效、无法再 \
+                    poll_run」加已知的部分输出，据此判断执行到哪一步，别整条重发。每条错误文案都写明了类别和下一步，照做。\n\
+                    标准流程：定位会话 → run_command → 超时用 poll_run 续等（省略 run_id，不重发）→ 交互场景 send_input \
+                    + read_screen → 用完 close_session（不关会一直占着连接和标签）。\n\
+                    失败恢复：只读调用（list_*/read_screen/read_history）丢结果或超时就直接重调。写调用丢结果：先 poll_run \
+                    看有没有在跑；报「run_id 不存在或已结束」而不确定执行了没有，用 read_screen/read_history 核实，\
+                    别盲目重试有副作用的命令；「命令可能已执行、结果未知」同理先核实屏幕。报「已经有一个 poll_run 在等待」是旧等待者还挂着：\
+                    别并发 poll，不要了就 interrupt。\n\
+                    连不上 iShell（找不到登记的会话、端点连不上、握手被拒）：**照错误文案做，不要重试，也不要自己去找别的 iShell**——你只可能连到启动你的那个终端所属的那一台，\
+                    没有别的选项。常见原因：① 不是从 iShell 终端里直接启动的（请用户在 iShell 终端里启动 AI；IDE、systemd 服务、tmux/screen 里的进程不在登录 shell 的进程树里，\
+                    一律拒绝）；Codex 默认把 agent 放在共享后台服务里（不在任何终端的进程树里），需用 `codex --no-daemon` 启动；\
+                    ② iShell 重启过或它到服务器的 SSH 重连过（旧 agent 的密钥/会话随之作废，在 iShell 终端里重新启动 AI）\
+                    ；③ 设置里关掉了 AI 控制，或这次启动时它是关的（运行中打开需重启 iShell）；④ iShell 没能给这个终端登记会话（会话状态栏有「MCP 登记失败」的 ⚠ 提示）\
+                    。\n\
+                    定位目录：list_sessions 的 cwd → read_screen 里提示符的路径 → 只读探测 `pwd; ls; \
+                    git rev-parse --show-toplevel 2>/dev/null`；用户没给路径就问，别猜。\n\
+                    省上下文：read_screen 只看一屏，read_history 从小的 max_lines 起；大文件/二进制走 copy_to_remote/copy_from_remote，\
+                    read_file 只读确需的文本；run_command 的输出原样进上下文——能重定向到文件的别打印，能 tail -1 的别 \
+                    cat。\n\
+                    可靠性：前台全屏程序/REPL/未闭合语法会让 run_command 的完成检测挂起，拿不准先 read_screen；timeout_ms \
+                    最长 24h，长任务直接等完、别 sleep 轮询；`&` 优先级低于 `&&`，别把前置步骤一并丢进后台；远端操作优先走本工具集，\
+                    别另开 `ssh host cmd`（丢 cwd/环境/历史，用户也看不见）。\n\
+                    终端卡在交互程序（vim/top/sudo 密码提示）：先 read_screen 看前台是什么，再 send_input 逐键应对（top \
+                    用 \"q\"，vim 退出用 escapes=true 的 \"\\x1b:q!\\r\"）；sudo 密码让用户自己输，或征得同意后再 \
+                    send_input。"
 )]
 impl ServerHandler for IshellMcp {}
 
@@ -1576,7 +1576,7 @@ fn caller_origin() -> String {
 mod tests {
     use super::caller_origin;
     use super::current_actor;
-    use super::{launch_from, missing_env_message};
+    use super::{load_session_file, no_session_message};
 
     /// 来源描述：优先用 AI 自报的名字（空白/控制字符压平、截断），没有才退回 user+pid。
     /// 两个场景放进同一条测试：它们共用同一个环境变量，并行跑会互相踩。
@@ -1674,31 +1674,94 @@ mod tests {
         assert!(validate_caller_path("notes.txt", "local_path").is_err());
     }
 
-    /// 连接环境的判定：缺哪个就报哪个，空白等于没设，端点必须是绝对路径。
-    /// 反向对照：把 `launch_from` 改成缺密钥也放行，第二条断言当场挂。
-    #[test]
-    fn launch_requires_both_variables_and_an_absolute_endpoint() {
-        let s = |v: &str| Some(v.to_string());
-        let ok = launch_from(s("/home/u/.ishell-mcp/mcp-1.sock"), s("k")).expect("两个都有应放行");
-        assert_eq!(ok.key, "k");
-        let bad = launch_from(s("/x/mcp.sock"), None).unwrap_err();
-        assert_eq!(bad, vec!["ISHELL_MCP_KEY".to_string()]);
-        let bad = launch_from(None, s("k")).unwrap_err();
-        assert_eq!(bad, vec!["ISHELL_MCP_ENDPOINT".to_string()]);
-        assert_eq!(launch_from(None, None).unwrap_err().len(), 2);
-        assert!(launch_from(s("  "), s("  ")).is_err(), "空白等于没设");
-        let rel = launch_from(s("mcp.sock"), s("k")).unwrap_err();
-        assert!(rel[0].contains("绝对路径"), "{rel:?}");
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "ishell-sess-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
-    /// 缺环境的报错必须说清三件事：规则（只在 iShell 终端里启动才可用、不会连别的）、该做什么、
-    /// 诊断（谁拉起的、看得到哪些变量）——后者是分辨「环境被过滤」与「代理被换了环境重拉」的依据。
+    fn record_for(pid: u32, start: u64) -> super::mcp_protocol::SessionRecord {
+        super::mcp_protocol::SessionRecord {
+            endpoint: "/tmp/ishell-test.sock".into(),
+            key: "ab".repeat(32),
+            shell_pid: pid,
+            shell_start: start,
+        }
+    }
+
+    /// 会话文件必须是「本人写的、别人写不了」的普通文件：权限位有组/其它人的位、是符号链接、
+    /// 超过大小上限，一律不认。
+    /// 反向对照：把 `load_session_file` 里的权限位检查去掉，第二条断言当场挂。
     #[test]
-    fn missing_env_message_states_the_rule_and_carries_diagnostics() {
-        let msg = missing_env_message(&["ISHELL_MCP_KEY".to_string()]);
-        for want in ["ISHELL_MCP_KEY", "不会去连别的 iShell", "停止重试", "父进程 pid=", "ISHELL_*"] {
+    fn session_files_must_be_private_regular_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let d = temp_dir("perm");
+        let f = d.join("100");
+        std::fs::write(&f, record_for(100, 1).render()).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_session_file(&f).is_some(), "0600 的本人文件应读得出");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_session_file(&f).is_none(), "别人可读的文件不认（可能被改过）");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(load_session_file(&f).is_none(), "同组可写的文件不认");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let l = d.join("101");
+        symlink(&f, &l).unwrap();
+        assert!(load_session_file(&l).is_none(), "符号链接不认");
+        let big = d.join("102");
+        std::fs::write(&big, "x".repeat(5000)).unwrap();
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_session_file(&big).is_none(), "超大文件不认");
+        assert!(load_session_file(&d.join("nope")).is_none());
+    }
+
+    /// **真进程树**上的祖先查找：给本测试进程登记一个会话文件，它的子孙进程（这里是一个真的
+    /// `sh`）沿父进程链往上就能找到；换一个启动时间对不上的记录（pid 复用）就找不到；另一个无关
+    /// 进程（登记在不相干的 pid 上）不会被拿来用。
+    /// 反向对照：去掉 `find_session_record` 里对启动时间的比对，第二条断言当场挂。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_descendant_finds_its_ancestors_session_and_only_that() {
+        use std::os::unix::fs::PermissionsExt;
+        use super::mcp_protocol::{find_session_record, proc_info};
+        let d = temp_dir("real");
+        let me = std::process::id();
+        let mine = proc_info(me).expect("读得到自己");
+        let write = |pid: u32, start: u64| {
+            let f = d.join(pid.to_string());
+            std::fs::write(&f, record_for(pid, start).render()).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().expect("起子进程");
+        let info = |pid: u32| proc_info(pid).map(|i| (i.ppid, i.start));
+        write(me, mine.start);
+        let found = find_session_record(child.id(), &d, &info, &load_session_file);
+        assert_eq!(found.expect("子进程应沿父进程找到本进程的登记").shell_pid, me);
+        // pid 复用：同一个 pid 的记录里启动时间对不上
+        write(me, mine.start + 1000);
+        assert!(find_session_record(child.id(), &d, &info, &load_session_file).is_err());
+        // 登记在一个不相干的 pid 上：不是祖先，不认
+        std::fs::remove_file(d.join(me.to_string())).unwrap();
+        write(child.id().wrapping_add(7_000_000), mine.start);
+        assert!(find_session_record(child.id(), &d, &info, &load_session_file).is_err());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// 找不到会话的报错必须说清：规则、该做什么、祖先链（诊断）；并在祖先里有 `codex app-server` 时
+    /// 点名 `--no-daemon`。
+    #[test]
+    fn no_session_message_states_the_rule_and_carries_diagnostics() {
+        let msg = no_session_message(&[std::process::id()], "会话目录不存在");
+        for want in ["没有任何一个祖先是 iShell 登记过的登录 shell", "不会去连别的 iShell", "停止重试", "祖先链", "会话目录不存在"] {
             assert!(msg.contains(want), "缺 {want:?}：{msg}");
         }
+        assert!(!msg.contains("--no-daemon"), "普通进程不该被提示 Codex 的事：{msg}");
     }
 }
 

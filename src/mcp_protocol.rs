@@ -88,10 +88,13 @@ where
 // 定下就不再变，所以「版本不一致」永远能在认证通过之后、以明确的文字告诉对方，而不必靠一个
 // 匿名可问的版本信标。
 //
-// 身份来自环境，不来自扫描：iShell 在自己的终端里注入两个变量——
-//   `ISHELL_MCP_ENDPOINT`：这条 SSH 连接专属的 socket 路径（每次连接随机，见 `ssh/mod.rs`）；
-//   `ISHELL_MCP_KEY`：本次 iShell 运行的随机密钥（只在内存，见 `store::mcp_run_key`）。
-// 代理只连 ENDPOINT、只认 KEY，不列目录、不探测、没有候选，也就没有「选哪个」。
+// 身份来自「这个进程是哪个登录 shell 的后代」，不来自扫描、也不来自环境变量：iShell 连上后，在
+// 服务器上给这条连接的登录 shell 登记一个只有本人可读的会话文件 `~/.ishell-mcp/sess/<主机名>/<shell pid>`
+// （内容：端点路径、本次运行的随机密钥、shell 的 pid 与启动时间）；代理从自己往上找父进程，第一个
+// 有合法会话文件的祖先就是它的主人。进程祖先是内核给的、伪造不了的事实：B 终端里启动的 agent，
+// 祖先里不可能有 C 的登录 shell。代理只连那一个端点，不列目录、不探测、没有候选，也就没有「选哪个」。
+// 不靠环境变量还有一层好处：agent 过滤环境（Codex）、不是紧跟着连接后第一个键（注入时机）、shell 历史
+// 里留下密钥，这三类问题一并不存在。
 //
 // 握手（一条连接上三问三答；密钥永不过线，线上只有 HMAC）：
 //   1. 代理 → iShell  `{"hello":{"auth":1,"cn":<随机数>,"mac":HMAC(key,"hello",cn)}}`
@@ -123,9 +126,16 @@ pub const AUTH_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// 代理读 iShell 应答（认证阶段）的字节上限：对端此刻还没证明过自己，同样不能让它无限灌。
 #[allow(dead_code)]
 pub const REPLY_LINE_MAX: usize = 64 * 1024;
-/// 终端注入给代理的两个环境变量名（与 `session::mcp_env_export_cmd` 配套，别各写各的）。
-pub const ENV_ENDPOINT: &str = "ISHELL_MCP_ENDPOINT";
-pub const ENV_KEY: &str = "ISHELL_MCP_KEY";
+/// 会话文件所在的子目录（`~/.ishell-mcp/` 下）。
+#[allow(dead_code)]
+pub const SESSION_SUBDIR: &str = "sess";
+/// 会话文件第一行的魔数 + 格式版本。
+#[allow(dead_code)]
+pub const SESSION_MAGIC: &str = "ishell-mcp-session/1";
+/// 会话文件里记的 shell 启动时间与代理自己算出来的允许差多少秒（两边各算一次，各有 ±1 秒的取整误差）。
+/// 它防的是 pid 复用：旧会话文件残留、同一个 pid 后来被别的登录会话用上时，启动时间对不上就不认。
+#[allow(dead_code)]
+pub const START_TOLERANCE_SECS: u64 = 3;
 
 /// 握手中各步 MAC 的角色标签。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +342,223 @@ pub fn negotiate_app(a_min: u32, a_max: u32, b_min: u32, b_max: u32) -> Option<u
     (lo <= hi).then_some(hi)
 }
 
+// ---------- 会话文件与进程祖先 ----------
+
+/// 一个进程的 `(父进程, 启动时刻)`。启动时刻是 Unix 秒——只用来在 pid 被复用时认出「不是原来那个」，
+/// 不需要精确，两端各算一次、允许差 [`START_TOLERANCE_SECS`]。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ProcInfo {
+    pub ppid: u32,
+    pub start: u64,
+}
+
+/// Linux：读 `/proc/<pid>/stat`（父进程 = 第 4 项，启动时刻 = 第 22 项，单位是开机后的时钟节拍）
+/// 加上开机时刻 `btime`。
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub fn proc_info(pid: u32) -> Option<ProcInfo> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm 可能含空格和括号：只信最后一个 `)` 之后的字段
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ppid: u32 = f.get(1)?.parse().ok()?;
+    let ticks: u64 = f.get(19)?.parse().ok()?;
+    let hz = match unsafe { libc::sysconf(libc::_SC_CLK_TCK) } {
+        n if n > 0 => n as u64,
+        _ => 100,
+    };
+    let btime: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(ProcInfo {
+        ppid,
+        start: btime + ticks / hz,
+    })
+}
+
+/// macOS：`proc_pidinfo(PROC_PIDTBSDINFO)` 直接给父进程与启动秒数，不起子进程。
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub fn proc_info(pid: u32) -> Option<ProcInfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (n == size).then_some(ProcInfo {
+        ppid: info.pbi_ppid,
+        start: info.pbi_start_tvsec,
+    })
+}
+
+/// 其它 unix（BSD 等）：退到 `ps -o ppid=,etime= -p <pid>`，启动时刻 = 现在 − 已运行时间。
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[allow(dead_code)]
+pub fn proc_info(pid: u32) -> Option<ProcInfo> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=,etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut it = text.split_whitespace();
+    let ppid: u32 = it.next()?.parse().ok()?;
+    let elapsed = parse_etime(it.next()?)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(ProcInfo {
+        ppid,
+        start: now.saturating_sub(elapsed),
+    })
+}
+
+/// `ps` 的 `etime` 格式 `[[dd-]hh:]mm:ss` → 秒。
+#[allow(dead_code)]
+pub fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<u64> = rest
+        .split(':')
+        .map(|p| p.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    let secs = match parts.as_slice() {
+        [m, sec] => m * 60 + sec,
+        [h, m, sec] => h * 3600 + m * 60 + sec,
+        _ => return None,
+    };
+    Some(days * 86400 + secs)
+}
+
+/// 会话文件的内容：一个登录 shell 对应的 iShell 连接信息。
+///
+/// 纯文本、固定五行（魔数 / 端点 / 密钥 / shell pid / shell 启动秒数）——远端是用一小段 POSIX
+/// `sh` 写的，不指望那边有 JSON 工具。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct SessionRecord {
+    pub endpoint: String,
+    pub key: String,
+    pub shell_pid: u32,
+    pub shell_start: u64,
+}
+
+#[allow(dead_code)]
+impl SessionRecord {
+    pub fn render(&self) -> String {
+        format!(
+            "{SESSION_MAGIC}\n{}\n{}\n{}\n{}\n",
+            self.endpoint, self.key, self.shell_pid, self.shell_start
+        )
+    }
+
+    /// 解析并校验形状：魔数对、端点是绝对路径、密钥恰为 64 位十六进制、数字能解。
+    /// 多一行、少一行、多余内容都不认——格式是我们自己写的，不该有「宽容」。
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut it = text.lines();
+        if it.next()? != SESSION_MAGIC {
+            return None;
+        }
+        let endpoint = it.next()?.to_string();
+        let key = it.next()?.to_string();
+        let shell_pid: u32 = it.next()?.parse().ok()?;
+        let shell_start: u64 = it.next()?.parse().ok()?;
+        if it.next().is_some() || !endpoint.starts_with('/') || !is_hex64(&key) {
+            return None;
+        }
+        Some(Self {
+            endpoint,
+            key,
+            shell_pid,
+            shell_start,
+        })
+    }
+}
+
+/// 本机主机名，规整成可作目录名的一段：只留 `[A-Za-z0-9._-]`，其余换成 `_`，空、`.`、`..` 则为 `unknown`。
+/// 远端登记脚本用 `uname -n` 做同样的规整（`uname -n` 与 `gethostname` 是同一个内核字段）。
+#[allow(dead_code)]
+pub fn host_tag() -> String {
+    #[cfg(unix)]
+    let raw = {
+        let mut buf = [0u8; 256];
+        // SAFETY：缓冲区长度如实传入；失败时 buf 保持全零，落到 "unknown"。
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } == 0;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+        if ok { String::from_utf8_lossy(&buf[..end]).into_owned() } else { String::new() }
+    };
+    #[cfg(not(unix))]
+    let raw = String::new();
+    sanitize_host_tag(&raw)
+}
+
+#[allow(dead_code)]
+fn sanitize_host_tag(raw: &str) -> String {
+    // 逐字节替换，与远端脚本里的 `tr -c` 一致
+    let t: String = raw
+        .bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') { b as char } else { '_' })
+        .collect();
+    if matches!(t.as_str(), "" | "." | "..") { "unknown".into() } else { t }
+}
+
+/// 会话文件目录：`<home>/.ishell-mcp/sess/<主机名>`。按主机分目录是因为 `$HOME` 可能被多台机器共享
+/// （NFS 家目录的集群）：文件以 pid 命名、清扫按「pid 在本机是否存在」判断，混在一起会互相误删、
+/// 撞名覆盖。
+#[allow(dead_code)]
+pub fn session_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".ishell-mcp").join(SESSION_SUBDIR).join(host_tag())
+}
+
+/// 从 `start_pid` 起沿父进程往上找，返回第一个有**合法**会话文件的祖先对应的记录。
+///
+/// 「合法」= 文件读得出、格式对、记录里的 pid 就是这个祖先、记录里的 shell 启动时间与这个祖先
+/// 实际的启动时间相差不超过 [`START_TOLERANCE_SECS`]（挡 pid 复用）。找不到返回已经检查过的
+/// 祖先 pid 链（诊断用）。`info` / `load` 由调用方给，便于测试用假进程表。
+#[allow(dead_code)]
+pub fn find_session_record(
+    start_pid: u32,
+    dir: &std::path::Path,
+    info: &dyn Fn(u32) -> Option<(u32, u64)>,
+    load: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Result<SessionRecord, Vec<u32>> {
+    let mut chain = Vec::new();
+    let mut pid = start_pid;
+    for _ in 0..64 {
+        if pid <= 1 || chain.contains(&pid) {
+            break;
+        }
+        chain.push(pid);
+        let Some((ppid, start)) = info(pid) else {
+            break;
+        };
+        if let Some(rec) = load(&dir.join(pid.to_string()))
+            .as_deref()
+            .and_then(SessionRecord::parse)
+        {
+            if rec.shell_pid == pid && rec.shell_start.abs_diff(start) <= START_TOLERANCE_SECS {
+                return Ok(rec);
+            }
+        }
+        pid = ppid;
+    }
+    Err(chain)
+}
+
 /// 单个终端会话的摘要（`list_sessions` 的返回项）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionInfo {
@@ -358,12 +585,10 @@ pub struct McpSessionInfo {
     /// 旧代理（不带 actor）开的窗口对任何调用方都报 `false`——它们属于旧版的共享池。
     #[serde(default)]
     pub mine: bool,
-    /// 连接 iShell 所需的环境（`ISHELL_MCP_ENDPOINT` + `ISHELL_MCP_KEY`）是否已注入这个会话的
-    /// shell。`false` 意味着在该终端里启动的 AI 拿不到身份、连不上 iShell——用户会话多是「连上后
-    /// 敲过键盘」被跳过（可终端右键「立即注入 MCP 连接环境」补救），AI 会话在新 shell 的空档里会
-    /// 自动补注。没有这个字段（旧端）时默认 false。
+    /// 这个会话的登录 shell 是否已登记为「属于这台 iShell」（服务器上有它的会话文件）。`false` 时在它里面
+    /// 启动的 AI 连不上 iShell：登记失败（原因见会话状态栏的 ⚠ 提示），或 AI 控制本次启动时是关的。
     #[serde(default)]
-    pub endpoint_injected: bool,
+    pub bound: bool,
 }
 
 /// 一条已保存连接的摘要（`list_saved_connections` 的返回项）。不含密码/密钥等敏感字段——
@@ -914,6 +1139,19 @@ pub struct McpResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_tag_is_a_single_safe_path_component() {
+        use super::sanitize_host_tag as t;
+        assert_eq!(t("node-01.cluster_a"), "node-01.cluster_a");
+        assert_eq!(t("a/b c"), "a_b_c");
+        assert_eq!(t("../etc"), ".._etc");
+        for bad in ["", ".", ".."] {
+            assert_eq!(t(bad), "unknown", "{bad:?}");
+        }
+        assert!(!super::host_tag().contains('/'));
+        assert!(super::session_dir(std::path::Path::new("/h")).starts_with("/h/.ishell-mcp/sess"));
+    }
+
     use super::*;
 
     /// MAC 的正路：同一密钥 + 同一对随机数 + 同一步 → 对得上；换密钥不行。
@@ -986,6 +1224,88 @@ mod tests {
         assert_eq!(read_line_bounded(&mut eof, 64).await, None);
         let mut bad = std::io::Cursor::new(b"\xff\xfe\n".to_vec());
         assert_eq!(read_line_bounded(&mut bad, 64).await, None);
+    }
+
+    /// 会话文件往返；形状不对一律不认（多一行、少一行、端点不是绝对路径、密钥长度不对、魔数不对）。
+    #[test]
+    fn session_record_round_trips_and_rejects_odd_shapes() {
+        let rec = SessionRecord {
+            endpoint: "/home/u/.ishell-mcp/mcp-abc.sock".into(),
+            key: "ab".repeat(32),
+            shell_pid: 4242,
+            shell_start: 1_790_000_000,
+        };
+        assert_eq!(SessionRecord::parse(&rec.render()).as_ref(), Some(&rec));
+        let good = rec.render();
+        for bad in [
+            good.replace(SESSION_MAGIC, "ishell-mcp-session/2"),
+            format!("{good}extra\n"),
+            good.lines().take(4).collect::<Vec<_>>().join("\n"),
+            good.replace("/home/u", "home/u"),
+            good.replace(&rec.key, &"ab".repeat(31)),
+            good.replace("4242", "not-a-pid"),
+        ] {
+            assert_eq!(SessionRecord::parse(&bad), None, "不该认：{bad:?}");
+        }
+    }
+
+    /// `ps` 的 etime 格式：`mm:ss`、`hh:mm:ss`、`dd-hh:mm:ss`。
+    #[test]
+    fn etime_formats_parse() {
+        assert_eq!(parse_etime("00:05"), Some(5));
+        assert_eq!(parse_etime("01:02:03"), Some(3723));
+        assert_eq!(parse_etime("2-03:04:05"), Some(2 * 86400 + 3 * 3600 + 4 * 60 + 5));
+        assert_eq!(parse_etime("garbage"), None);
+        assert_eq!(parse_etime("1:2:3:4"), None);
+    }
+
+    /// **祖先查找**：用假进程表验证性质——
+    /// ① 命中最近的、合法的祖先；② 记录里的 pid 与文件名不一致不认；③ 启动时间对不上（pid 被复用）
+    /// 不认；④ 兄弟/无关进程的记录不会被拿来用（只沿父进程链往上找）；⑤ 环与深度有界。
+    #[test]
+    fn ancestry_lookup_only_trusts_a_valid_ancestor() {
+        use std::collections::HashMap;
+        let key = "cd".repeat(32);
+        let rec = |pid: u32, start: u64, ep: &str| SessionRecord {
+            endpoint: ep.into(),
+            key: key.clone(),
+            shell_pid: pid,
+            shell_start: start,
+        };
+        // 进程树：agent(30) → 代理(31)；agent 的父 = B 的登录 shell(20)，shell 的父 = sshd(10)；
+        // C 的登录 shell(21) 是 sshd(10) 的另一个子进程（兄弟）。
+        let procs: HashMap<u32, (u32, u64)> = HashMap::from([
+            (31, (30, 1000)),
+            (30, (20, 990)),
+            (20, (10, 100)),
+            (21, (10, 200)),
+            (10, (1, 50)),
+        ]);
+        let files: HashMap<String, String> = HashMap::from([
+            ("/s/20".to_string(), rec(20, 100, "/ep/b").render()),
+            ("/s/21".to_string(), rec(21, 200, "/ep/c").render()),
+        ]);
+        let info = |p: u32| procs.get(&p).copied();
+        let load = |path: &std::path::Path| files.get(path.to_str().unwrap()).cloned();
+        let dir = std::path::Path::new("/s");
+        // ① 代理(31) 的祖先里有 B 的 shell(20)，只会找到 B，永远不会是兄弟 C
+        let found = find_session_record(31, dir, &info, &load).expect("应命中 B");
+        assert_eq!(found.endpoint, "/ep/b");
+        // ④ 从 C 的 shell 下面起，只会找到 C
+        assert_eq!(find_session_record(21, dir, &info, &load).unwrap().endpoint, "/ep/c");
+        // ③ pid 被复用：同一个 pid 20 现在是另一个启动更晚的进程，旧记录不认
+        let reused: HashMap<u32, (u32, u64)> = HashMap::from([(31, (20, 5000)), (20, (10, 4990)), (10, (1, 50))]);
+        let info2 = |p: u32| reused.get(&p).copied();
+        let chain = find_session_record(31, dir, &info2, &load).expect_err("pid 复用必须不认");
+        assert_eq!(chain, vec![31, 20, 10]);
+        // ② 文件名与记录里的 pid 不一致（有人把 C 的记录拷成 20 号文件）不认
+        let swapped: HashMap<String, String> = HashMap::from([("/s/20".to_string(), rec(21, 200, "/ep/c").render())]);
+        let load3 = |path: &std::path::Path| swapped.get(path.to_str().unwrap()).cloned();
+        assert!(find_session_record(31, dir, &info, &load3).is_err());
+        // ⑤ 环：父进程指回自己，不会死循环
+        let cyc: HashMap<u32, (u32, u64)> = HashMap::from([(5, (6, 1)), (6, (5, 1))]);
+        let info4 = |p: u32| cyc.get(&p).copied();
+        assert_eq!(find_session_record(5, dir, &info4, &|_: &std::path::Path| None).unwrap_err(), vec![5, 6]);
     }
 
     /// 业务协议区间求交：取最高公共版本；无交集即 `None`（报「请升级」）。

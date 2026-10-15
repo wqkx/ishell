@@ -149,13 +149,8 @@ impl App {
         }
     }
 
-    /// 推进两处**自动注入**——「重连后恢复工作目录」与「MCP 连接环境」。两处干的是同一件
-    /// 事（程序替用户敲键盘），判据早已共用 `Session::shell_idle_for_injection`，现在求值
-    /// 时机也统一：同一条每帧路径、同一次会话遍历、cwd 在前。
-    ///
-    /// **顺序是有意的**：`cd` 一旦注入就 `expect_echo` 武装了回显吞除、并把
-    /// `injection_idle_for` 刷新到当下；同一轮里紧跟着的连接环境注入会读到这个刚更新的
-    /// 时间窗，因而必然被挡下一帧——两条注入错开出现，`cd` 的注入痕迹不会糊成一团。
+    /// 推进**自动注入**——「重连后恢复工作目录」，以及 AI 专用会话的 OSC 7 / shell 集成片段。
+    /// （MCP 连接信息不再靠往终端里敲命令交付，见 `ssh/mcp_session.rs`。）
     ///
     /// **这里是与标签页无关的每帧路径，这一点是本函数存在的全部理由。** 它一度写在
     /// `right_body` 里，而 `right_body` 只对**当前活动标签**调用（`mod.rs` 的
@@ -163,9 +158,8 @@ impl App {
     /// （`check_reconnects`）却跟哪个标签在前台毫无关系。后果是：链路在用户看着别的标签时
     /// 掉线，15s 的截止时刻内判据一次都没被求值，意图到点被清掉，cwd 恢复**必然丢失**。
     ///
-    /// 判据仍与 MCP 连接环境注入共用 `Session::shell_idle_for_injection`——两处干的是同一件
-    /// 事（程序替用户敲键盘），判据分成两份迟早会漂移。差别只在求值时机：那一处天然只关心
-    /// 用户正在看的会话，这一处不能。
+    /// 判据与其它「程序替用户敲键盘」的注入共用 `Session::shell_idle_for_injection`——判据分成两份
+    /// 迟早会漂移。差别只在求值时机：那一处天然只关心用户正在看的会话，这一处不能。
     fn advance_auto_injections(&mut self) {
         let now = std::time::Instant::now();
         for s in &mut self.sessions {
@@ -210,90 +204,8 @@ impl App {
                 super::session::CwdRestore::Wait => {}
             }
         }
-        // MCP 连接环境自动注入（0.21 起为内置行为，随「允许 AI 控制终端」生效，不再是
-        // 独立开关，见 `store::load_mcp_auto_inject`）：每个用户会话在「连接后一个键都没敲过」
-        // 的静止窗口里被注入 ` export ISHELL_MCP_ENDPOINT=… ISHELL_MCP_KEY=…`（回显吞除）——此后该 shell 里
-        // 启动的 AI 自动携带连接环境，只会连到这台 iShell，绝不会碰服务器上别人的 iShell。
-        //
-        // 闲置判据整体交给 `shell_idle_for_injection`（与 cwd 恢复同一道闸门），其中
-        // 「本次连接以来一个键都没敲过」是**安全边界而非优化**：其余信号分不清「shell 闲在
-        // 提示符上」和「某个程序正阻塞在 stdin」，而 sudo/ssh 的密码提示符恰好也是安静不动的。
-        //
-        // 与上面同一条路径、同一批会话，但**不合进同一个循环**：上面那个循环的 `continue`
-        // 是为 cwd 意图写的（没有意图就跳过该会话），而 MCP 连接环境跟有没有 cwd 意图无关。
-        // 分成两趟，语义各自独立。
-        //
-        // 跳过注入时分两类静默处理：开关/会话类型不满足的不打扰用户；**唯独「用户连上后
-        // 敲过键盘」这一种要给一次提示**——在其中启动的 AI 因此连不上 iShell，用户自己不敲打
-        // 永远发现不了。提示每会话每连接一次（`Session::mcp_env_inject_skipped`），补救入口在
-        // 终端右键「立即注入 MCP 连接环境」。不需要另续重绘：能走到这里时 150ms 心跳一定在转。
-        let mut env_skipped_typed = false;
-        for s in &mut self.sessions {
-            if s.ai_owned {
-                // AI 专用会话**同样**注入连接环境：嵌套 AI（用户在这个终端里又启动了别
-                // 的 AI）需要从环境继承它，否则它的代理没有端点和密钥、连接直接被拒——
-                // 「AI 会话无需注入」的旧假设只覆盖「里面是我们自己开的 AI」这一种用法。
-                // 闸门用 AI 专用的 `ai_shell_idle_for_injection`：与用户闸门不同，AI 会话
-                // 的只读键盘也会被记录按键时刻，never_typed 会把注入永久封死（同 OSC 7
-                // 注入的理由）；运行期间不注是 ai_busy 闸门的事：注入行会打进正在运行的
-                // 命令的终端（污染捕获输出或被前台程序吃掉），吞除本身已由队列按序各吞各的。
-                if !s.mcp_env_injected
-                    && crate::store::load_mcp_auto_inject()
-                    && crate::store::load_mcp_consent()
-                    && s.ai_shell_idle_for_injection()
-                {
-                    // 端点还没上报（反向转发注册中）就等下一帧：绝不退到别的办法。
-                    if let Some(cmd) = s.mcp_env_cmd() {
-                        inject_mcp_env(s, &cmd);
-                        s.mcp_env_injected = true;
-                    }
-                }
-                continue;
-            }
-            if !mcp_env_inject_allowed(
-                crate::store::load_mcp_auto_inject(),
-                crate::store::load_mcp_consent(),
-                s.ai_owned,
-                s.mcp_env_injected,
-            ) {
-                continue;
-            }
-            if s.shell_idle_for_injection() {
-                // 端点还没上报就等下一帧（注册只差一两个往返）；上报前用户若敲了键，下面那个
-                // 「敲过键盘」分支会接手并提示。
-                if let Some(cmd) = s.mcp_env_cmd() {
-                    inject_mcp_env(s, &cmd);
-                    s.mcp_env_injected = true;
-                }
-            } else if !s.mcp_env_inject_skipped
-                && s.shell_idle_for_injection_but_typed()
-                // 本来就没有东西可注入（Windows 本机会话、反向转发没注册上）的会话，不该拿
-                // 「你敲过键盘所以跳过」去打扰用户——那不是真正的原因
-                && s.mcp_env_cmd().is_some()
-            {
-                s.mcp_env_inject_skipped = true;
-                env_skipped_typed = true;
-                s.status = crate::i18n::tr(
-                    "已跳过 MCP 连接环境自动注入（连上后敲过键盘）。在此启动的 AI 没有连接环境、连不上 iShell；可在终端右键「立即注入 MCP 连接环境」补救。",
-                    "Skipped auto-injecting the MCP connection environment (you typed after connect). An AI started here cannot reach iShell. Fix: terminal right-click → Inject MCP connection environment now.",
-                )
-                .to_string();
-            }
-        }
-        if env_skipped_typed {
-            self.toast = Some((
-                crate::i18n::tr(
-                    "有会话因连上后敲过键盘而跳过 MCP 连接环境自动注入：在其中启动的 AI 连不上\
-                     iShell（也不会连到别处）。可在终端右键菜单「立即注入 MCP 连接环境」补救。",
-                    "A session skipped auto-injecting the MCP connection environment (you typed \
-                     after it connected): an AI started there cannot reach iShell (and will not \
-                     reach any other either). Fix: terminal right-click menu → \"Inject MCP \
-                     connection environment now\".",
-                )
-                .to_string(),
-                self.ctx.input(|i| i.time),
-            ));
-        }
+        // （MCP 不再有「往终端里敲 export」这一步：登记由各 worker 自己完成，见 `ssh/mcp_session.rs` /
+        // `local/mcp_session.rs`——不挑时机、不需要用户停手，也就没有「敲过键盘就跳过」。）
         // AI 专用会话自动注入：OSC 7 工作目录上报 + shell 集成（OSC 133）。用户会话只在
         // 右键同意后注入 OSC 7，AI 自己的会话无需征求同意——没人「正在用」这个 shell，代价
         // 只是提示符上多两条看不见的 OSC 序列。
@@ -1112,71 +1024,5 @@ mod notice_policy_tests {
         for k in [K::Need, K::Done, K::Untagged, K::Bell] {
             assert!(!alert(k, M::Off), "{k:?} 在 Off 档下仍然弹了");
         }
-    }
-}
-
-/// 该不该往这个会话自动注入连接环境——只管**策略**那几个开关，终端是否闲置由调用处判断。
-///
-/// 单独抽出来是为了能测：这里最要命的错误是「打开 AI 控制就等于允许 iShell 替我敲键盘」，
-/// 那是一条只有真机上开个新会话才看得见的回归，写成纯函数才守得住。
-fn mcp_env_inject_allowed(
-    auto_inject_on: bool,
-    mcp_on: bool,
-    ai_owned: bool,
-    already_injected: bool,
-) -> bool {
-    // `mcp_on` 仍是前置条件：AI 控制都没开，注入连接环境毫无意义。
-    auto_inject_on && mcp_on && !ai_owned && !already_injected
-}
-
-/// 往会话终端注入 MCP 连接环境（`ISHELL_MCP_ENDPOINT` + `ISHELL_MCP_KEY`，命令见
-/// `session::mcp_env_export_cmd`；回显吞除）。
-/// 此后该 shell 里启动的 AI / ishell-mcp 子进程继承这两个变量，代理只连这一个端点、只认这个
-/// 密钥——不扫描、不选择、没有降级。前导空格：配合 bash/zsh 常见的 HISTCONTROL=ignorespace，
-/// 不进 shell 历史。
-fn inject_mcp_env(s: &mut super::Session, cmd: &str) {
-    let _ = s
-        .cmd_tx
-        .send(UiCommand::TerminalInput(format!("{cmd}\r").into_bytes()));
-    s.terminal.expect_auto_inject_echo(cmd);
-}
-
-#[cfg(test)]
-mod mcp_env_inject_tests {
-    use super::mcp_env_inject_allowed;
-
-    /// **回归门禁**：仅仅打开「允许 AI 通过 MCP 控制终端」，不等于允许 iShell 替用户在他
-    /// 自己的 shell 里敲一条命令并回车。
-    ///
-    /// 0.19 把 AI 控制的默认值翻成开启之后，自动注入的门还挂在那个开关上，于是每一个新连上
-    /// 的会话都会被自动打进 ` export ISHELL_MCP_ENDPOINT=…` 并执行——用户报的「iShell 往我当前
-    /// 会话里输东西」就是它。注入必须由**它自己那个默认关闭的开关**把门。
-    #[test]
-    fn enabling_ai_control_alone_never_authorises_typing_into_the_users_shell() {
-        assert!(
-            !mcp_env_inject_allowed(false, true, false, false),
-            "只开了 AI 控制就往用户 shell 里敲命令——这正是 0.19 的那条回归"
-        );
-    }
-
-    /// 显式勾选之后才注入，且只注入一次、只注入用户自己的会话。
-    #[test]
-    fn opted_in_injects_once_into_user_sessions_only() {
-        assert!(
-            mcp_env_inject_allowed(true, true, false, false),
-            "勾选后应当注入"
-        );
-        assert!(
-            !mcp_env_inject_allowed(true, true, true, false),
-            "AI 专用会话不该注入：那里的 AI 是我们自己开的，本来就知道该回哪台电脑"
-        );
-        assert!(
-            !mcp_env_inject_allowed(true, true, false, true),
-            "已经注入过就不该再来一次"
-        );
-        assert!(
-            !mcp_env_inject_allowed(true, false, false, false),
-            "AI 控制没开时注入连接环境毫无意义"
-        );
     }
 }

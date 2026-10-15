@@ -12,6 +12,7 @@
 //! `WorkerEvent`。传输（Phase 3）尚未支持，相关命令暂被忽略。
 
 mod files;
+mod mcp_session;
 mod sys;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, SlavePty};
@@ -57,6 +58,31 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
         }
     };
     sink.send(WorkerEvent::Connected);
+
+    // MCP 登记：给这个 shell 写会话文件，在它里面启动的 AI 的代理沿进程祖先找到它、连上本进程。
+    // 持有到本函数返回（shell 退出 / 会话关闭）时由 drop 删掉。失败要让用户看见（⚠ 会弹 toast）。
+    // 启动即开的本机终端可能比监听先就绪；绑定失败是故障，要让用户看见（没开/要重启则静默）。
+    if !crate::store::await_mcp_listening().await && crate::store::mcp_bind_failed() {
+        sink.send(WorkerEvent::Status(crate::i18n::mcp_register_failed(
+            crate::i18n::tr("本机 MCP socket 绑定失败", "the local MCP socket failed to bind"),
+        )));
+    }
+    let _mcp_session = match child.process_id() {
+        Some(pid) => match mcp_session::register(pid) {
+            Ok(Some(f)) => {
+                sink.send(WorkerEvent::McpBound(true));
+                Some(f)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("本机会话 MCP 登记失败：{e}");
+                sink.send(WorkerEvent::McpBound(false));
+                sink.send(WorkerEvent::Status(crate::i18n::mcp_register_failed(&e)));
+                None
+            }
+        },
+        None => None,
+    };
 
     // 后台作业继承 slave fd 时 master 读端永远等不到 EOF——不能只靠 out_rx 关闭判定退出。
     // 轮询 child.try_wait：shell 已死就收尾（先排空残留输出，再发 ShellExited）。
