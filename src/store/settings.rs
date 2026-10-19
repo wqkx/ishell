@@ -16,7 +16,7 @@ pub fn take_setting_write_errors() -> Vec<String> {
 }
 
 /// 写一个设置文件。失败不再静默吞掉：既 `log::warn!`，也冒泡进 `WRITE_ERRORS` 让 UI 弹提示。
-fn write_setting(path: impl AsRef<std::path::Path>, data: impl AsRef<[u8]>) {
+pub(super) fn write_setting(path: impl AsRef<std::path::Path>, data: impl AsRef<[u8]>) {
     let path = path.as_ref();
     if let Err(e) = std::fs::write(path, data) {
         log::warn!("写入设置失败 {}：{e}", path.display());

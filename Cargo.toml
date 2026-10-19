@@ -1,6 +1,6 @@
 [package]
 name = "ishell"
-version = "0.27.0"
+version = "0.28.0"
 edition = "2021"
 license = "MIT"
 description = "现代化 Rust SSH 客户端：系统信息侧栏 + 终端 + SFTP 文件管理 + 代码/文档查看"
@@ -50,6 +50,8 @@ serde_json = "1"
 chacha20poly1305 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
+# 本机 API 的 HTTP 请求头解析（零依赖、no_std；hyper 内部也用它）。服务器本身自己写，不引入 hyper。
+httparse = "1"
 # MCP 配对握手的证明（HMAC-SHA256）。两个版本本来就在依赖树里（russh 等间接引入），
 # 这里钉到已在 Cargo.lock 中的那一档，避免多拉一份重复编译。
 hmac = "0.12"

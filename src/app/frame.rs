@@ -35,6 +35,13 @@ impl App {
     /// 3. 续下一帧——最小化时 eframe 会把重绘节流到 ≥100ms，但**前提是应用还在请求重绘**，
     ///    不续就直接睡死了。
     pub(super) fn pump_background(&mut self, ctx: &egui::Context) {
+        // 本机 API 的起停跟着左侧面板的开关走（最小化时同样要响应，所以放在这条路径上）。
+        self.local_api.sync(&self.runtime, ctx);
+        if matches!(crate::store::api_state(), crate::store::ApiState::Listening { .. }) {
+            // 与下面“远端输出唤醒”同一个原因：后台线程的 request_repaint 在空闲窗口里会丢，
+            // API 请求才可能躺在队列里没人排空。API 开着期间保持 150ms 心跳，关着时零开销。
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
         self.drain_mcp_calls();
         let mut backlog = false;
         // 跨会话拷贝状态机要吃的那几条 pending 也在这里收走：它同样是纯后台推进，不碰 Ui，

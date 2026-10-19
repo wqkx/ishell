@@ -31,6 +31,7 @@ mod frame_editor;
 mod layout;
 mod layout_body;
 mod layout_tabs;
+mod local_api;
 mod mcp_bridge;
 mod pending;
 mod screenshot;
@@ -134,6 +135,8 @@ pub struct App {
     logo: bool,
     /// AI/MCP 控制通道：本地 socket 收到的请求队列（未开启该功能时是个永远空的通道）
     mcp_rx: tokio::sync::mpsc::UnboundedReceiver<mcp_bridge::McpCall>,
+    /// 本机 API（HTTP，回环）：跟着左侧面板的开关起停，业务请求走同一条 `mcp_rx` 通道。
+    local_api: local_api::ApiService,
     /// AI 请求 `open_session` 时待用户确认的一条连接请求（同一时刻只允许一条待确认）
     pending_open_consent: Option<mcp_bridge::PendingOpenConsent>,
     /// AI 想对用户自己打开的会话做写入类操作，正等用户当面授权。
@@ -196,7 +199,9 @@ impl App {
                 .build()
                 .expect("无法创建 tokio 运行时"),
         );
-        let mcp_rx = mcp_bridge::spawn_mcp_listener(&runtime, cc.egui_ctx.clone());
+        crate::store::remove_stale_api_info();
+        let (mcp_tx, mcp_rx) = tokio::sync::mpsc::unbounded_channel::<mcp_bridge::McpCall>();
+        mcp_bridge::spawn_mcp_listener(&runtime, cc.egui_ctx.clone(), mcp_tx.clone());
         let mut form = ConnectForm::default();
         form.open = true; // 启动即弹出连接框
 
@@ -258,6 +263,7 @@ impl App {
             shot,
             logo: std::env::var("ISHELL_LOGO").is_ok() || std::env::var("ISHELL_ICON").is_ok(),
             mcp_rx,
+            local_api: local_api::ApiService::new(mcp_tx),
             pending_open_consent: None,
             mcp_open_approved: std::collections::HashSet::new(),
             cross_copy_jobs: Vec::new(),
@@ -314,6 +320,7 @@ impl eframe::App for App {
     /// 一起死，再晚就来不及发了）。详见 `mcp_bridge::revoke_temp_keys_on_exit`。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.revoke_temp_keys_on_exit();
+        self.local_api.stop(); // 发现文件里是活的令牌，退出时必须删
     }
 
     /// eframe 0.34 的现代入口。这里只是兜底外壳，真正的绘制在 [`App::ui_impl`]。
@@ -445,6 +452,12 @@ impl App {
                     );
                     // 监控栏右键：语言 / 字体大小 / 折叠开关 / 强制 X11 的统一入口
                     view_context_menu(&bg);
+                    // 左侧面板底部：本机 API 开关（无论有没有连接都在）
+                    egui::Panel::bottom("sidebar_local_api")
+                        .resizable(false)
+                        .show_separator_line(false)
+                        .frame(egui::Frame::new())
+                        .show_inside(ui, |ui| local_api::sidebar_toggle(ui));
                     match self.active {
                         Some(idx) if idx < self.sessions.len() => {
                             let s = &mut self.sessions[idx];

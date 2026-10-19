@@ -12,7 +12,7 @@ Let Claude Code, Codex CLI, Kimi Code, OpenCode, or another MCP-compatible agent
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 
-> **Latest release:** [v0.27.0](https://github.com/wqkx/ishell/releases/tag/v0.27.0)
+> **Latest release:** [v0.28.0](https://github.com/wqkx/ishell/releases/tag/v0.28.0)
 
 </div>
 
@@ -253,6 +253,17 @@ Known limits, stated plainly:
 
 **Anyone who can SSH into that server (same account) can reach the forwarded socket — enable only for servers you trust.** But reaching it is not enough: they get no answer without the run key, and an AI can only read and act in sessions it opened itself — sessions *you* opened are invisible and off-limits to it.
 
+### Local API (for programs on this computer)
+
+Besides MCP, iShell can expose an HTTP+JSON API on the **loopback interface** so other programs on your desktop — local AI agents in particular — can drive it with the same capabilities, without being started from an iShell terminal and without an MCP client.
+
+- **The switch is the “Local API” button at the bottom of the left panel**; it is **off by default** and independent of the MCP switch. When on, the address and a per-enable random token are written to `~/.config/ishell/api.json` (0600) for callers to read.
+- It binds `127.0.0.1:47621` only (if the port is taken it says so and fails — no fallback port); web pages in a browser cannot reach it (`Host` check, requests carrying `Origin` are refused, no CORS headers).
+- Same rule as MCP: **a caller can only read and act in sessions it opened itself**; callers name themselves with `X-Ishell-Actor`, which can never equal an MCP proxy's identity.
+- The only gate is the token: any same-user process on this machine that can read `api.json` can use it — enable it only if you trust the other programs on this computer.
+
+Full reference, endpoint table and curl / Python examples: **[docs/local-api.md](docs/local-api.md)**.
+
 ### Other notes
 
 - **The AI can only read and act in sessions it opened itself.** Sessions *you* opened and other AIs' sessions are refused outright — running commands, keystrokes, interrupting, reading the screen/scrollback, reading/writing/copying files — and `list_sessions` does not even show them. There is no consent prompt and no setting that can allow it. **Settings → “Don't ask before the AI opens a session”** (on by default) covers only the other case: the AI opening a new session of its own from a saved connection.
@@ -263,7 +274,8 @@ Known limits, stated plainly:
 
 - **Host-key verification**: known_hosts is checked; an unknown host prompts you to confirm its SHA256 fingerprint (TOFU) before it is written; a changed key is rejected with a warning.
 - **Saved-password encryption**: ChaCha20-Poly1305 at rest; key prefers the system keychain, with a local `~/.config/ishell/key` (0600) fallback.
-- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port. Identity comes from the environment iShell injects into *its own terminals* (an endpoint + a per-run random key); the proxy connects to that one endpoint only and the iShell answers nothing to a caller that cannot prove it holds the key. Every request then carries a credential issued by that handshake, and the AI can only read and act in sessions it opened itself — your own sessions are refused, with no prompt and no setting to allow it. The key never travels over the wire (mutual HMAC challenge–response; the proxy proves itself only after verifying the peer) and is never written to disk, so restarting iShell revokes every running agent. Known residual risk: a same-account attacker who can read the environment of a process started from your terminal, or who **relays live** between your proxy and your iShell, can still impersonate — there is no channel binding on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart).
+- **MCP**: on by default since 0.19 (Settings turns it off); local socket only (`0600`), no network port. Identity comes from **process ancestry**: after connecting, iShell registers an owner-only session file (endpoint + a per-run random key) for that terminal's login shell on the server, and the proxy walks up its parent processes to find it and connects to that one endpoint only; iShell answers nothing to a caller that cannot prove it holds the key. Every request then carries a credential issued by that handshake, and the AI can only read and act in sessions it opened itself — your own sessions are refused, with no prompt and no setting to allow it. The key never travels over the wire (mutual HMAC challenge–response; the proxy proves itself only after verifying the peer) and is never written to disk, so restarting iShell revokes every running agent. Known residual risk: a same-account attacker who can read the session file (`0600` cannot stop the same user), or who **relays live** between your proxy and your iShell, can still impersonate — there is no channel binding on these sockets (everyone shares one UID, so `SO_PEERCRED` cannot tell them apart).
+- **Local API**: off by default, separate switch in the left panel; binds `127.0.0.1` only, the token is random per enable and written only to an owner-only discovery file; the request body is not read before authentication, and `Host`/`Origin` checks stop browser-side attacks; same rule as MCP (a caller can only touch sessions it opened). The only gate is the token — a same-user local process can read it, so enable it only if you trust the other programs on this machine.
 
 ## 📄 License
 

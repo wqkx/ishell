@@ -493,7 +493,45 @@ pub(super) struct McpCall {
     /// 这条通道自带成功/失败两种结果，`resp_tx` 对这个操作只在"App 层校验就失败"（会话
     /// 不存在、路径非法等，根本没到 worker）时才会被用到，两者互斥、不会竞争。
     download_sink: Option<oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>>,
+    /// 来自本机 API（HTTP）而不是 MCP socket：授权开关不同（见 [`McpCall::from_api`] 与 `handle_mcp_call`）。
+    via_api: bool,
 }
+
+impl McpCall {
+    /// 本机 API 发来的一问一答请求（不带流）。`actor` 已由调用方规整成 `api:<名字>`。
+    pub(super) fn from_api(req: McpRequest, resp_tx: oneshot::Sender<McpResponse>) -> Self {
+        Self {
+            req,
+            resp_tx,
+            upload_source: None,
+            download_sink: None,
+            via_api: true,
+        }
+    }
+
+    #[cfg(test)]
+    /// 测试里扮演“App”时拆开一条请求。
+    pub(super) fn into_parts(self) -> (McpRequest, oneshot::Sender<McpResponse>) {
+        (self.req, self.resp_tx)
+    }
+
+    /// 本机 API 的下载请求：worker 探测到远端文件后经 `download_sink` 交出字节流（见 `local_api::download`）。
+    pub(super) fn from_api_download(
+        req: McpRequest,
+        resp_tx: oneshot::Sender<McpResponse>,
+        download_sink: oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>,
+    ) -> Self {
+        Self {
+            req,
+            resp_tx,
+            upload_source: None,
+            download_sink: Some(download_sink),
+            via_api: true,
+        }
+    }
+}
+
+
 
 /// `run_command`/`start_command` 的命令文本校验：必须是**一条单行命令**。
 ///
@@ -860,7 +898,7 @@ fn validate_remote_path(path: &str) -> Result<(), String> {
 
 /// 校验一个 `copy_file` 用的本地路径：必须绝对、不含 `.`/`..` 路径段、有有效文件名
 /// （拒绝文件系统根目录等 `Path::file_name()` 返回 `None` 的路径）。
-fn validate_local_path(path: &str) -> Result<(), String> {
+pub(super) fn validate_local_path(path: &str) -> Result<(), String> {
     let p = std::path::Path::new(path);
     if !p.is_absolute() {
         return Err(format!("local_path 必须是绝对路径：{path}"));
@@ -952,6 +990,13 @@ fn generate_temp_keypair(marker: &str) -> Result<(Vec<u8>, String), String> {
     Ok((priv_pem, format!("restrict {pub_line}")))
 }
 
+/// MCP 握手里 actor 的合法性：非空、有界，且**不得落在 `api:` 命名空间**——本机 API 的调用方在内部一律记成
+/// `api:<名字>`，让两类身份永不相等；握手若放行了 `api:` 开头的 actor，持运行密钥的 MCP agent
+/// 就能冒用 API 调用方的名字拿走它的会话。
+pub(super) fn actor_acceptable(actor: &str) -> bool {
+    !actor.is_empty() && actor.len() <= 128 && !actor.starts_with(super::local_api::ACTOR_NS)
+}
+
 /// AI 调 `open_session` 时，若这条已保存连接本次运行期间还没被用户批准过，需要弹窗让用户
 /// 确认后才真正建立连接——保留发起时刻的连接快照，避免确认期间用户又改了同名连接。
 pub(super) struct PendingOpenConsent {
@@ -1007,13 +1052,13 @@ fn first_foreign_session<'a>(
 pub(super) fn spawn_mcp_listener(
     runtime: &Arc<tokio::runtime::Runtime>,
     ctx: egui::Context,
-) -> mpsc::UnboundedReceiver<McpCall> {
-    let (tx, rx) = mpsc::unbounded_channel::<McpCall>();
+    tx: mpsc::UnboundedSender<McpCall>,
+) {
     if !crate::store::load_mcp_consent() {
-        return rx;
+        return;
     }
     let Some(sock_path) = crate::store::mcp_socket_path() else {
-        return rx;
+        return;
     };
     // 同步置位：连接任务据此知道「监听马上就绪」，而不是「没开」（见 `store::await_mcp_listening`）。
     crate::store::set_mcp_starting(true);
@@ -1090,16 +1135,14 @@ pub(super) fn spawn_mcp_listener(
             ));
         }
     });
-    rx
 }
 
 #[cfg(not(unix))]
 pub(super) fn spawn_mcp_listener(
     _runtime: &Arc<tokio::runtime::Runtime>,
     _ctx: egui::Context,
-) -> mpsc::UnboundedReceiver<McpCall> {
-    let (_tx, rx) = mpsc::unbounded_channel::<McpCall>();
-    rx
+    _tx: mpsc::UnboundedSender<McpCall>,
+) {
 }
 
 /// 并发连接数上限（见 spawn_mcp_listener 里的工作信号量）。长操作（上传/命令）占这一档。
@@ -1337,7 +1380,7 @@ async fn handle_hello(
         return;
     }
     // actor 是代理进程标识：要求非空且有界，免得凭据表里存进一个巨型字符串。
-    if prove.actor.is_empty() || prove.actor.len() > 128 {
+    if !actor_acceptable(&prove.actor) {
         write_json_line(
             w,
             &McpResponse {
@@ -1486,6 +1529,7 @@ async fn handle_conn(
                 resp_tx,
                 upload_source,
                 download_sink: None,
+                via_api: false,
             })
             .is_err()
         {
@@ -1545,6 +1589,7 @@ async fn handle_conn(
                 resp_tx,
                 upload_source: None,
                 download_sink: Some(dl_tx),
+                via_api: false,
             })
             .is_err()
         {
@@ -1628,6 +1673,7 @@ async fn handle_conn(
             resp_tx,
             upload_source: None,
             download_sink: None,
+            via_api: false,
         })
         .is_err()
     {
@@ -2569,7 +2615,17 @@ impl App {
     fn handle_mcp_call(&mut self, call: McpCall) {
         // 设置里关掉 MCP 后立刻拒绝业务请求。监听 socket 仍要等重启才撤，
         // 但用户把开关拧掉的意图是「现在别再动我的终端」，不能再等一次重启才生效。
-        if !crate::store::load_mcp_consent() {
+        if call.via_api {
+            // 本机 API 有自己的开关（左侧面板）：与 MCP 的授权互不相通，关掉任何一个都不影响另一个。
+            if !crate::store::load_api_enabled() {
+                let id = call.req.id;
+                let _ = call.resp_tx.send(McpResponse {
+                    id,
+                    result: Err("用户已关闭 iShell 的本机 API，本次请求未执行。".into()),
+                });
+                return;
+            }
+        } else if !crate::store::load_mcp_consent() {
             let id = call.req.id;
             let _ = call.resp_tx.send(McpResponse {
                 id,
@@ -2590,6 +2646,7 @@ impl App {
             resp_tx,
             upload_source,
             download_sink,
+            via_api: _,
         } = call;
         // 发起方代理的进程标识：归属判定（CloseSession）与 list_sessions 的 mine 标记都要
         // 用，先在这里快照——match req.kind 之后 req 就被部分移动了。

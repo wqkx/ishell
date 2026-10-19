@@ -2185,6 +2185,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2414,7 +2420,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "ishell"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2430,6 +2436,7 @@ dependencies = [
  "flate2",
  "getrandom 0.2.17",
  "hmac 0.12.1",
+ "httparse",
  "image",
  "keyring",
  "libc",

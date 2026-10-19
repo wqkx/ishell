@@ -9,6 +9,7 @@
 //! 兼容性：所有字段带 `#[serde(default)]`，新增字段不致旧文件解析失败；读到旧明文密码
 //! 会自动改写为密文（迁移）。解析失败时把原文件备份为 `.bak`，避免被覆盖丢失。
 
+mod api;
 mod connections;
 mod crypto;
 mod favorites;
@@ -16,6 +17,10 @@ mod paths;
 mod settings;
 mod snippets;
 
+pub use api::{
+    api_info_path, api_port, api_state, load_api_enabled, remove_api_info, remove_stale_api_info, save_api_enabled, set_api_state,
+    write_api_info, ApiState,
+};
 pub use connections::{import_ssh_config, load, save, BlockedSecret, SavedConnection};
 #[allow(unused_imports)]
 pub use crypto::{decrypt_secret, encrypt_secret, key_perms_were_loose, key_storage, KeyStorage};
