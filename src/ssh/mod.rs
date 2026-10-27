@@ -108,10 +108,20 @@ pub async fn run(
     }));
 
     // `_jump_handle` 须保持存活：目标连接的底层流跑在它的 direct-tcpip 通道上
+    crate::connlog::begin(&cfg);
+    let connect_started = std::time::Instant::now();
     let (handle, _jump_handle, remote_fwds, x11, kbd_prelude) =
         match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
-            Ok(h) => h,
+            Ok(h) => {
+                crate::connlog::note(&format!("connected + authenticated in {:?}", connect_started.elapsed()));
+                h
+            }
             Err(e) => {
+                crate::connlog::note(&format!("connect FAILED after {:?}: {e:#}", connect_started.elapsed()));
+                // 失败后独立探测第一跳（有跳板机就是跳板机）的解析与 TCP，分清是网络层还是 SSH 层；
+                // 放到后台，不拖慢本 worker 退出和 UI 的重连。
+                let (h, p) = cfg.jump.as_ref().map_or((&cfg.host, cfg.port), |j| (&j.host, j.port));
+                tokio::spawn(crate::connlog::probe(h.clone(), p));
                 sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
                     crate::i18n::Lang::Zh => format!("连接失败：{e}"),
                     crate::i18n::Lang::En => format!("Connect failed: {e}"),

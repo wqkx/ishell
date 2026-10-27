@@ -79,7 +79,7 @@ pub fn install_panic_hook() {
 }
 
 /// 建配置目录，unix 上强制 0700——目录默认 0755，而里面装的是 crash.log 和已有的密钥/连接。
-fn create_private_dir(dir: &std::path::Path) {
+pub(crate) fn create_private_dir(dir: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -98,7 +98,7 @@ fn create_private_dir(dir: &std::path::Path) {
 ///
 /// 两步都要：`mode()` 只在**创建那一刻**生效，保证没有 0644 窗口；`set_permissions` 兜住
 /// 「文件已经存在」的情况——比如旧版本或别的 umask 下留下的一份 0644 crash.log。
-fn open_private_append(path: &std::path::Path) -> Option<std::fs::File> {
+pub(crate) fn open_private_append(path: &std::path::Path) -> Option<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]

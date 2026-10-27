@@ -13,5 +13,6 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>iShell 需要访问本地网络，才能通过 SSH 连接局域网内的服务器。 / iShell needs local network access to connect to servers on your LAN over SSH.</string>
 </dict>
 </plist>
