@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-10-27
+
+### Added（连接诊断，排查「终端启动能连、双击启动连不上」）
+
+- 每次 SSH 连接把起点（目标、认证种类、版本、工作目录、`SSH_AUTH_SOCK`/`HOME` 是否设置）、结果与耗时写入
+  `~/.config/ishell/connect.log`（Windows：`%APPDATA%\ishell\connect.log`，Unix 0600，超过 256 KiB 轮换为 `.old`）。
+  **失败时**再后台独立探测第一跳的域名解析与 TCP 建立，并记下操作系统的原始错误码。不记口令/私钥/口令短语。
+- macOS `Info.plist` 补上 `NSLocalNetworkUsageDescription`：macOS 15 起访问局域网地址需用户授权，缺这个声明时 `.app`
+  双击启动拿不到授权入口（从终端启动则沿用终端的授权，所以表现为「终端里能连」）。
+
 ## [0.28.0] - 2026-10-19
 
 ### Added（本机 API：让桌面上的本地程序通过 HTTP 控制 iShell）
