@@ -203,6 +203,11 @@ jobs:
           # 版本号取自 tag（去掉前缀 v）；非法/缺失时回退
           VER="${GITHUB_REF_NAME#v}"; case "$VER" in ""|*[!0-9.]*) VER="0.0.0";; esac
           sed "s/__VERSION__/$VER/g" assets/macos/Info.plist > "$APP/Contents/Info.plist"
+          # ad-hoc 签名整个 .app：未签名（x86_64 交叉编译产物没有链接器的 ad-hoc 签名）的程序
+          # 在 macOS 上没有可记账的身份，「本地网络」等隐私权限弹不出授权窗，局域网连接被
+          # 系统直接拒绝（No route to host）。ad-hoc 签名不需要开发者账号。
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
           ditto -c -k --keepParent "$APP" "${{ matrix.asset }}.app.zip"
 
       # macOS 的 MCP 代理只发压缩包：zip 内单文件 ishell-mcp（已置可执行位）。

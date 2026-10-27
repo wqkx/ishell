@@ -72,6 +72,22 @@ fn auth_kind(a: &AuthMethod) -> &'static str {
     }
 }
 
+/// macOS 的「本地网络」隐私权限被拒时，连接会**立刻**（微秒级、没有任何包发出）以
+/// `EHOSTUNREACH`（`No route to host`）失败，用户看到的只是一句像路由故障的话。
+/// 错误链里有 `HostUnreachable` 就给出可操作的提示；调用方只在 macOS 上用它。
+pub fn local_network_hint(e: &anyhow::Error) -> Option<&'static str> {
+    let hit = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::HostUnreachable)
+    });
+    hit.then(|| {
+        crate::i18n::tr(
+            "若目标在局域网内：这通常是 macOS「本地网络」权限被拒。请打开 系统设置 → 隐私与安全性 → 本地网络，开启 iShell；列表里没有时，先退出 iShell，在终端执行 `codesign --force --deep -s - /Applications/iShell.app` 后重新打开",
+            "If the target is on your LAN, macOS probably denied Local Network access. Open System Settings → Privacy & Security → Local Network and enable iShell. If it is not listed, quit iShell, run `codesign --force --deep -s - /Applications/iShell.app` in a terminal, and reopen it",
+        )
+    })
+}
+
 /// 一次连接开始：目标与进程上下文。上下文里放的都是「终端启动 vs 双击启动」会不同的东西。
 pub fn begin(cfg: &ConnectConfig) {
     let jump = cfg.jump.as_ref().map_or(String::new(), |j| {
@@ -159,6 +175,16 @@ mod tests {
         let lines = rt.block_on(probe_lines("127.0.0.1", port));
         assert!(lines[0].contains("resolved"), "{lines:?}");
         assert!(lines[1].contains("TCP FAILED") && lines[1].contains("ConnectionRefused"), "{lines:?}");
+    }
+
+    #[test]
+    fn host_unreachable_anywhere_in_the_chain_yields_the_hint() {
+        let io = std::io::Error::from(std::io::ErrorKind::HostUnreachable);
+        let wrapped = anyhow::Error::new(io).context("connect");
+        assert!(local_network_hint(&wrapped).is_some());
+        let other = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(local_network_hint(&other).is_none());
+        assert!(local_network_hint(&anyhow::anyhow!("认证被拒绝")).is_none());
     }
 
     #[test]

@@ -122,9 +122,15 @@ pub async fn run(
                 // 放到后台，不拖慢本 worker 退出和 UI 的重连。
                 let (h, p) = cfg.jump.as_ref().map_or((&cfg.host, cfg.port), |j| (&j.host, j.port));
                 tokio::spawn(crate::connlog::probe(h.clone(), p));
+                let hint = if cfg!(target_os = "macos") {
+                    crate::connlog::local_network_hint(&e)
+                        .map_or(String::new(), |h| format!("\n{h}"))
+                } else {
+                    String::new()
+                };
                 sink.send(WorkerEvent::Disconnected(match crate::i18n::current() {
-                    crate::i18n::Lang::Zh => format!("连接失败：{e}"),
-                    crate::i18n::Lang::En => format!("Connect failed: {e}"),
+                    crate::i18n::Lang::Zh => format!("连接失败：{e}{hint}"),
+                    crate::i18n::Lang::En => format!("Connect failed: {e}{hint}"),
                 }));
                 return;
             }
