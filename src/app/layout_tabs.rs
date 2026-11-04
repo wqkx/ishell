@@ -223,7 +223,7 @@ impl App {
                                         let (display_title, title_dup) = labels[vis].clone();
                                         // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
                                         // 有 AI 窗口时圆点外侧多一圈，标题右移一截。
-                                        let extra = if has_kids { 8.0 } else { 0.0 };
+                                        let extra = if has_kids { 3.0 } else { 0.0 };
                                         let title_w = ctx.fonts_mut(|f| {
                                             f.layout_no_wrap(
                                                 display_title.clone(),
@@ -625,22 +625,18 @@ fn paint_status_dot(
         (Palette::OK, Palette::WARN)
     };
     let x = ((time * std::f64::consts::TAU) / 1.4).sin() as f32;
-    let breath = 0.28 + 0.72 * (0.5 + 0.5 * x);
+    // 0..1。只让外圈的透明度呼吸，圆心大小与普通状态点一致，不再描一圈实边。
+    let breath = 0.5 + 0.5 * x;
     let [r, g, b, _] = ring.to_array();
-    p.circle_filled(
-        center,
-        8.0,
-        egui::Color32::from_rgba_unmultiplied(r, g, b, (36.0 + 120.0 * breath) as u8),
-    );
-    p.circle_stroke(
-        center,
-        6.2,
-        egui::Stroke::new(
-            1.7,
-            egui::Color32::from_rgba_unmultiplied(r, g, b, (110.0 + 145.0 * breath) as u8),
-        ),
-    );
-    p.circle_filled(center, 3.2, core);
+    // 两层实心圆叠出软边，外缘停在半径 6（普通圆点是 4），没有描边。
+    for (radius, alpha) in [(6.0, 16.0 + 36.0 * breath), (5.1, 28.0 + 64.0 * breath)] {
+        p.circle_filled(
+            center,
+            radius,
+            egui::Color32::from_rgba_unmultiplied(r, g, b, alpha as u8),
+        );
+    }
+    p.circle_filled(center, 4.0, core);
 }
 
 /// 标签页显示标题：`items` 为每个会话的 `(标题, 远端主机)`（本机/无主机信息为 `None`），
