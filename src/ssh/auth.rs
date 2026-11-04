@@ -32,6 +32,9 @@ pub(crate) struct ClientHandler {
     /// 是否把本机 AI/MCP 控制 socket 反向转发到这台远端主机
     /// （远端能连到转发出来的 socket，等于能控制本机 iShell）
     mcp_forward: bool,
+    /// 这条 SSH 连接对应的 GUI 会话。桥接到本机 MCP socket 时带上，用来把
+    /// 远端 agent 开的窗口折进这个标签。不参与认证。
+    session_uid: u64,
     /// 用户级 `-R`：远端 (listen_addr, port) → 本机 (host, port)。
     /// 远端有人连上监听口时，经 `server_channel_open_forwarded_tcpip` 查表桥接。
     remote_fwds: RemoteFwdTable,
@@ -266,8 +269,9 @@ impl Handler for ClientHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         if self.mcp_forward {
+            let uid = self.session_uid;
             tokio::spawn(async move {
-                if let Err(e) = bridge_local_mcp(channel).await {
+                if let Err(e) = bridge_local_mcp(channel, uid).await {
                     log::debug!("AI/MCP 反向转发桥接结束：{e}");
                 }
             });
@@ -965,17 +969,21 @@ async fn bridge_local_x11(_channel: Channel<client::Msg>, _auth: X11Auth) -> any
 /// `~/.config/ishell/mcp-<pid>.sock`）。MCP 本地 IPC 建立在 Unix domain socket 上，
 /// 目前只支持 unix 平台；Windows 上直接报错（不静默丢弃这条转发通道）。
 #[cfg(unix)]
-async fn bridge_local_mcp(channel: Channel<client::Msg>) -> anyhow::Result<()> {
+async fn bridge_local_mcp(channel: Channel<client::Msg>, session_uid: u64) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
     let sock = crate::store::mcp_socket_path()
         .ok_or_else(|| anyhow::anyhow!("mcp socket 路径不可用（无法确定用户目录）"))?;
     let mut remote = channel.into_stream();
     let mut local = tokio::net::UnixStream::connect(&sock).await?;
+    // 先写一行本进程才认的标记，再原样转发代理的字节。代理自己的协议一个字节都不改。
+    let preamble = crate::mcp_parent::parent_preamble(session_uid);
+    local.write_all(preamble.as_bytes()).await?;
     tokio::io::copy_bidirectional(&mut remote, &mut local).await?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-async fn bridge_local_mcp(_channel: Channel<client::Msg>) -> anyhow::Result<()> {
+async fn bridge_local_mcp(_channel: Channel<client::Msg>, _session_uid: u64) -> anyhow::Result<()> {
     anyhow::bail!("AI/MCP 控制目前仅支持 Unix（Linux/macOS）系统，暂不支持 Windows")
 }
 
@@ -1065,6 +1073,7 @@ pub(super) async fn connect(
     sink: &UiSink,
     hostkey_rx: UnboundedReceiver<bool>,
     cmd_rx: &mut UnboundedReceiver<UiCommand>,
+    session_uid: u64,
 ) -> anyhow::Result<(
     Handle<ClientHandler>,
     Option<Handle<JumpHandler>>,
@@ -1095,6 +1104,7 @@ pub(super) async fn connect(
         // cfg!(unix)：与 ssh/mod.rs 里那个反向转发任务保持同一条件——Windows 上没有
         // 监听方，转发出去的 socket 后面空无一人。
         mcp_forward: cfg!(unix) && crate::store::load_mcp_consent(),
+        session_uid,
         remote_fwds: remote_fwds.clone(),
     };
 

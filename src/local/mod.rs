@@ -23,7 +23,12 @@ use crate::pty_size::{DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS};
 use crate::ssh::UiSink;
 
 /// worker 入口：起本地 PTY shell，桥接 UI 通道，直到 shell 退出或用户断开。
-pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, sink: UiSink) {
+pub async fn run(
+    _cfg: ConnectConfig,
+    mut cmd_rx: UnboundedReceiver<UiCommand>,
+    sink: UiSink,
+    session_uid: u64,
+) {
     sink.send(WorkerEvent::Status(
         crate::i18n::tr("正在启动本机终端 …", "Starting local terminal …").into(),
     ));
@@ -64,14 +69,20 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
     // 启动即开的本机终端可能比监听先就绪；绑定失败是故障，要让用户看见（没开/要重启则静默）。
     if !crate::store::await_mcp_listening().await && crate::store::mcp_bind_failed() {
         sink.send(WorkerEvent::Status(crate::i18n::mcp_register_failed(
-            crate::i18n::tr("本机 MCP socket 绑定失败", "the local MCP socket failed to bind"),
+            crate::i18n::tr(
+                "本机 MCP socket 绑定失败",
+                "the local MCP socket failed to bind",
+            ),
         )));
     }
-    let _mcp_session = match child.process_id() {
+    // shell 活着就占着这条登记：worker 退出（含 panic 之外的提前 return）时 drop 撤掉，
+    // 且只撤自己这一代，重连后的新 shell 不会被旧 drop 清掉。
+    let _shell_bind = match child.process_id() {
         Some(pid) => match mcp_session::register(pid) {
             Ok(Some(f)) => {
+                let gen = crate::mcp_parent::bind_local(pid, session_uid);
                 sink.send(WorkerEvent::McpBound(true));
-                Some(f)
+                Some((f, ShellBind { pid, gen }))
             }
             Ok(None) => None,
             Err(e) => {
@@ -170,6 +181,18 @@ pub async fn run(_cfg: ConnectConfig, mut cmd_rx: UnboundedReceiver<UiCommand>, 
     // out_rx drop → 读线程下次发送失败退出。
     if let Some(t) = sysinfo_task {
         t.abort();
+    }
+}
+
+/// 本机 shell pid 与 GUI 会话的对应。drop 时按代号撤销，见 [`crate::mcp_parent::bind_local`]。
+struct ShellBind {
+    pid: u32,
+    gen: u64,
+}
+
+impl Drop for ShellBind {
+    fn drop(&mut self) {
+        crate::mcp_parent::unbind_local(self.pid, self.gen);
     }
 }
 

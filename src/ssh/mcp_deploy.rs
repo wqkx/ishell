@@ -106,9 +106,7 @@ pub(super) async fn deploy_mcp_agent(
     // 建成 755，socket 目录就悄悄变松了。`-m` 只作用于**最后一级**，所以两级各建一次。
     // `-m` 只作用于新建目录，已存在的 755 `~/.ishell-mcp` 不会被改。socket 落在这里，
     // 补一次 chmod，把以前用默认 umask 建出来的目录收紧。
-    match exec_status(handle, &ensure_private_mcp_dirs_command(&home, &dir))
-    .await
-    {
+    match exec_status(handle, &ensure_private_mcp_dirs_command(&home, &dir)).await {
         Ok((0, _)) => {}
         Ok((_, err)) => fail!(
             format!("在服务器上创建 {dir} 失败：{}", err.trim()),
@@ -296,7 +294,7 @@ mod live_deploy_tests {
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let (handle, _jump, _rf, _x11, _prelude) =
-            super::super::auth::connect(&cfg, &sink, hostkey_rx, &mut cmd_rx)
+            super::super::auth::connect(&cfg, &sink, hostkey_rx, &mut cmd_rx, 0)
                 .await
                 .expect("连上测试服务器");
 

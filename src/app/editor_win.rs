@@ -17,15 +17,36 @@ impl App {
             self.pending_close_tab = None; // 会话已不在
             return;
         };
-        // 若该会话已不在，或已断开、不是 AI 会话、名下也没有未保存的编辑器标签，则无需确认
-        let Some((title, ai_owned, connected, dirty)) = self.sessions.get(idx).map(|s| {
-            let dirty = super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(s.uid);
-            (s.title.clone(), s.ai_owned, s.connected, dirty)
-        }) else {
-            self.pending_close_tab = None;
-            return;
-        };
-        if !super::session::session_close_needs_confirm(connected, ai_owned, dirty) {
+        // 确认的是整个标签：根会话，以及折在它里面的 AI 窗口。
+        let root_uid = super::session::tab_root_uid(&self.sessions, self.sessions[idx].uid);
+        let members = super::session::group_member_indices(&self.sessions, root_uid);
+        let mut title = String::new();
+        let mut ai_owned = false;
+        let mut root_connected = false;
+        let mut dirty = 0usize;
+        let mut ai_kids = 0usize;
+        for &i in &members {
+            let s = &self.sessions[i];
+            if s.uid == root_uid {
+                title = s.title.clone();
+                ai_owned = s.ai_owned;
+                root_connected = s.connected;
+            }
+            if s.ai_owned {
+                ai_kids += 1;
+            }
+            dirty += super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(s.uid);
+        }
+        // 根会话自己也是 AI 开的时，ai_kids 把根算进去了；提示里说的是「另外打开的」。
+        if ai_owned {
+            ai_kids = ai_kids.saturating_sub(1);
+        }
+        let needs = members.iter().any(|&i| {
+            let s = &self.sessions[i];
+            let d = super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(s.uid);
+            super::session::session_close_needs_confirm(s.connected, s.ai_owned, d)
+        });
+        if !needs {
             self.pending_close_tab = None;
             return;
         }
@@ -51,7 +72,7 @@ impl App {
                              on it will fail. Close it?"
                         ),
                     }
-                } else if connected {
+                } else if root_connected {
                     match crate::i18n::current() {
                         crate::i18n::Lang::Zh => format!("「{title}」仍在连接中，确定关闭吗？"),
                         crate::i18n::Lang::En => {
@@ -65,6 +86,17 @@ impl App {
                     }
                 });
                 // 关会话会连同它打开的编辑器标签一起关掉：有没保存的修改必须说出来
+                if ai_kids > 0 {
+                    ui.add_space(6.0);
+                    ui.label(match crate::i18n::current() {
+                        crate::i18n::Lang::Zh => {
+                            format!("其中 AI 打开的 {ai_kids} 个终端会一起关闭。")
+                        }
+                        crate::i18n::Lang::En => format!(
+                            "{ai_kids} terminal(s) opened by AI in this tab will close too."
+                        ),
+                    });
+                }
                 if dirty > 0 {
                     ui.add_space(6.0);
                     ui.label(
@@ -100,7 +132,7 @@ impl App {
         });
         match decision {
             Some(true) => {
-                self.close_session(idx);
+                self.close_session_group(root_uid);
                 self.pending_close_tab = None;
             }
             Some(false) => self.pending_close_tab = None,

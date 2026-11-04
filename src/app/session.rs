@@ -94,6 +94,9 @@ pub(super) struct Session {
     /// 开启它的 AI 的可读来源标签（请求里的 `origin` 快照，如 `e5-1 (ishell-mcp pid 42)`），
     /// 标签页 hover 提示用。`ai_owned=false` 时为 `None`。
     pub(super) ai_owner_label: Option<String>,
+    /// 拉起这次 `open_session` 的那个终端会话。有值时这个会话不单独占标签，折进父会话的标签里。
+    /// 父会话自己也可能是 AI 开的，标签条显示时再往上走到用户的那个标签。
+    pub(super) parent_uid: Option<u64>,
     /// AI/MCP 控制通道正在等待完成的文件读写（write_file/read_file/copy_to_remote/
     /// copy_from_remote/copy_between_sessions）。允许同一会话同时挂多个——SFTP 天然支持
     /// 并发，worker 侧也已有 `MAX_CONCURRENT_XFER` 并发+排队，所以这里放成一个列表让 AI
@@ -413,6 +416,7 @@ impl App {
     fn spawn_worker(
         &self,
         cfg: ConnectConfig,
+        session_uid: u64,
     ) -> (
         UnboundedSender<UiCommand>,
         std::sync::mpsc::Receiver<WorkerEvent>,
@@ -432,9 +436,11 @@ impl App {
         // JoinError::is_panic 时显式发 Disconnected。
         let panic_sink = sink.clone();
         let worker = if cfg.is_local() {
-            self.runtime.spawn(crate::local::run(cfg, cmd_rx, sink))
+            self.runtime
+                .spawn(crate::local::run(cfg, cmd_rx, sink, session_uid))
         } else {
-            self.runtime.spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx))
+            self.runtime
+                .spawn(ssh::run(cfg, cmd_rx, sink, hostkey_rx, session_uid))
         };
         self.runtime.spawn(async move {
             if let Err(e) = worker.await {
@@ -454,11 +460,13 @@ impl App {
 
     pub(super) fn spawn_session(&mut self, cfg: ConnectConfig) {
         self.show_close_confirm = false; // 新建会话则取消退出提示
-        let (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx) = self.spawn_worker(cfg.clone());
-
         self.next_uid += 1;
+        let uid = self.next_uid;
+        // uid 要先于 worker 定下来：本机登记和 SSH 桥都用它把 agent 对回这个会话。
+        let (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx) = self.spawn_worker(cfg.clone(), uid);
+
         self.sessions.push(Session {
-            uid: self.next_uid,
+            uid,
             title: if cfg.label.trim().is_empty() {
                 cfg.username.clone()
             } else {
@@ -528,6 +536,7 @@ impl App {
             ai_owned: false,
             ai_owner: None,
             ai_owner_label: None,
+            parent_uid: None,
             osc7_injected: false,
             pending_file_ops: Vec::new(),
             file_op_tombstones: std::collections::VecDeque::new(),
@@ -542,11 +551,11 @@ impl App {
             return;
         };
         let cfg = s.cfg.clone();
-        let (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx) = self.spawn_worker(cfg);
+        let uid = s.uid;
+        let (cmd_tx, evt_rx, sysinfo_rx, hostkey_tx) = self.spawn_worker(cfg, uid);
         let Some(s) = self.sessions.get_mut(idx) else {
             return;
         };
-        let uid = s.uid;
         s.cmd_tx = cmd_tx.clone();
         s.evt_rx = evt_rx;
         s.sysinfo_rx = sysinfo_rx;
@@ -636,14 +645,32 @@ impl App {
         }
     }
 
+    /// 关掉一个标签以及折进它里面的全部 AI 窗口。下标从大到小关，避免边关边错位。
+    pub(super) fn close_session_group(&mut self, root_uid: u64) {
+        let mut idxs = group_member_indices(&self.sessions, root_uid);
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        for i in idxs {
+            self.close_session(i);
+        }
+    }
+
     /// 切换会话标签（delta=+1 下一个 / -1 上一个，循环）。
+    /// 只在可见标签之间移动：折进别的标签的 AI 窗口不占一格，切过去时先看到用户自己的那个窗口。
     pub(super) fn switch_tab(&mut self, delta: i32) {
-        let n = self.sessions.len();
+        let roots = tab_root_indices(&self.sessions);
+        let n = roots.len();
         if n == 0 {
             return;
         }
-        let cur = self.active.unwrap_or(0) as i32;
-        let next = (cur + delta).rem_euclid(n as i32) as usize;
+        let cur_root = self
+            .active
+            .and_then(|a| self.sessions.get(a))
+            .map(|s| tab_root_uid(&self.sessions, s.uid));
+        let pos = roots
+            .iter()
+            .position(|&i| Some(self.sessions[i].uid) == cur_root)
+            .unwrap_or(0);
+        let next = roots[(pos as i32 + delta).rem_euclid(n as i32) as usize];
         self.active = Some(next);
         self.tabbar.scroll_to_active = true; // 切换后滚动到可视区
         if let Some(s) = self.sessions.get_mut(next) {
@@ -670,6 +697,34 @@ impl App {
         }
         out
     }
+}
+
+/// 这个会话的父会话还在的话返回它的 uid。父已经关掉时当作没有父，自己重新占一个标签。
+fn live_parent(sessions: &[Session], uid: u64) -> Option<u64> {
+    let s = sessions.iter().find(|s| s.uid == uid)?;
+    let p = s.parent_uid?;
+    sessions.iter().any(|s| s.uid == p).then_some(p)
+}
+
+/// 标签条上代表 `uid` 的那个用户标签。AI 窗口沿 `parent_uid` 往上折，直到用户自己开的窗口。
+pub(super) fn tab_root_uid(sessions: &[Session], uid: u64) -> u64 {
+    crate::mcp_parent::root_of(uid, |u| live_parent(sessions, u))
+}
+
+/// 会单独占一个标签的会话下标（用户开的，以及没能对上父窗口的 AI 窗口）。
+pub(super) fn tab_root_indices(sessions: &[Session]) -> Vec<usize> {
+    (0..sessions.len())
+        .filter(|&i| tab_root_uid(sessions, sessions[i].uid) == sessions[i].uid)
+        .collect()
+}
+
+/// 一个标签底下的全部会话：根自己在最前，其余按打开顺序。
+pub(super) fn group_member_indices(sessions: &[Session], root_uid: u64) -> Vec<usize> {
+    let mut idxs: Vec<usize> = (0..sessions.len())
+        .filter(|&i| tab_root_uid(sessions, sessions[i].uid) == root_uid)
+        .collect();
+    idxs.sort_by_key(|&i| (sessions[i].uid != root_uid, i));
+    idxs
 }
 
 /// 关会话标签前要不要先问：仍连接、AI 正在用、或者它名下有没保存的编辑器标签。
@@ -727,9 +782,21 @@ mod close_and_restore_tests {
 
     #[test]
     fn quotes_are_escaped_and_control_characters_refuse() {
-        assert_eq!(cwd_restore_command("/tmp/a b").as_deref(), Some("cd '/tmp/a b'"));
-        assert_eq!(cwd_restore_command("/tmp/it's").as_deref(), Some("cd '/tmp/it'\\''s'"));
-        for evil in ["/tmp\u{15}rm -rf ~\r", "/tmp\nid", "/tmp\u{3}", "/tmp\u{1b}[2J", ""] {
+        assert_eq!(
+            cwd_restore_command("/tmp/a b").as_deref(),
+            Some("cd '/tmp/a b'")
+        );
+        assert_eq!(
+            cwd_restore_command("/tmp/it's").as_deref(),
+            Some("cd '/tmp/it'\\''s'")
+        );
+        for evil in [
+            "/tmp\u{15}rm -rf ~\r",
+            "/tmp\nid",
+            "/tmp\u{3}",
+            "/tmp\u{1b}[2J",
+            "",
+        ] {
             assert_eq!(cwd_restore_command(evil), None, "{evil:?}");
         }
     }

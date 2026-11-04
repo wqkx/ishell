@@ -9,7 +9,7 @@ mod widgets;
 pub(in crate::app) use types::{
     xfer_order, DirectFallback, DirectJob, DocKind, EditorState, EditorTab, FileClip, ForwardEntry,
     ForwardUi, ImageTab, ImageView, KbdPrompt, LocalPeerXfer, PendingPaste, Popups, ProcPopup,
-    Relay, RelayPhase, SaveState, Shot, Snippets, TabBar, Transfer, Transfers, XferFilter,
+    Relay, RelayPhase, SaveState, Shot, Snippets, TabBar, TabMenu, Transfer, Transfers, XferFilter,
     SAVE_TIMEOUT,
 };
 #[allow(unused_imports)]
@@ -72,6 +72,8 @@ pub struct App {
     active: Option<usize>,
     /// 主窗口会话标签条的拖拽重排 + 滚动状态
     tabbar: TabBar,
+    /// 某个标签底下的 shell 切换菜单（点圆点或双击标签打开）
+    tab_menu: Option<TabMenu>,
     /// 会话唯一 id 计数器（标签滑动动画用）
     next_uid: u64,
     connect_form: ConnectForm,
@@ -226,6 +228,7 @@ impl App {
                 total_w: 1.0,
                 ..Default::default()
             },
+            tab_menu: None,
             next_uid: 0,
             connect_form: form,
             download_dir: crate::store::load_download_dir()

@@ -13,6 +13,7 @@ mod i18n;
 mod limits;
 mod local;
 mod mcp_embed;
+mod mcp_parent;
 mod mcp_protocol;
 mod proto;
 mod pty_size;
@@ -246,7 +247,10 @@ mod vsync_policy_tests {
         assert!(skip(Some(true), false));
         assert!(!skip(Some(true), true), "首帧被跳过，窗口永远不显示");
         assert!(!skip(Some(false), false));
-        assert!(!skip(None, false), "Wayland 报不了最小化，交给 run.rs 的回退");
+        assert!(
+            !skip(None, false),
+            "Wayland 报不了最小化，交给 run.rs 的回退"
+        );
     }
 
     #[test]
@@ -350,4 +354,3 @@ mod wayland_repaint_policy_tests {
         assert_eq!(wayland_fallback_deadline(Some(first), t2, delay), first);
     }
 }
-

@@ -101,6 +101,7 @@ pub async fn run(
     mut cmd_rx: UnboundedReceiver<UiCommand>,
     sink: UiSink,
     hostkey_rx: UnboundedReceiver<bool>,
+    session_uid: u64,
 ) {
     sink.send(WorkerEvent::Status(match crate::i18n::current() {
         crate::i18n::Lang::Zh => format!("正在连接 {}:{} …", cfg.host, cfg.port),
@@ -111,16 +112,25 @@ pub async fn run(
     crate::connlog::begin(&cfg);
     let connect_started = std::time::Instant::now();
     let (handle, _jump_handle, remote_fwds, x11, kbd_prelude) =
-        match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx).await {
+        match connect(&cfg, &sink, hostkey_rx, &mut cmd_rx, session_uid).await {
             Ok(h) => {
-                crate::connlog::note(&format!("connected + authenticated in {:?}", connect_started.elapsed()));
+                crate::connlog::note(&format!(
+                    "connected + authenticated in {:?}",
+                    connect_started.elapsed()
+                ));
                 h
             }
             Err(e) => {
-                crate::connlog::note(&format!("connect FAILED after {:?}: {e:#}", connect_started.elapsed()));
+                crate::connlog::note(&format!(
+                    "connect FAILED after {:?}: {e:#}",
+                    connect_started.elapsed()
+                ));
                 // 失败后独立探测第一跳（有跳板机就是跳板机）的解析与 TCP，分清是网络层还是 SSH 层；
                 // 放到后台，不拖慢本 worker 退出和 UI 的重连。
-                let (h, p) = cfg.jump.as_ref().map_or((&cfg.host, cfg.port), |j| (&j.host, j.port));
+                let (h, p) = cfg
+                    .jump
+                    .as_ref()
+                    .map_or((&cfg.host, cfg.port), |j| (&j.host, j.port));
                 tokio::spawn(crate::connlog::probe(h.clone(), p));
                 let hint = if cfg!(target_os = "macos") {
                     crate::connlog::local_network_hint(&e)
@@ -1061,8 +1071,8 @@ Encrypted: no
         use std::sync::mpsc;
         use std::time::Duration;
 
-        use crate::proto::WorkerEvent;
         use super::UiSink;
+        use crate::proto::WorkerEvent;
 
         let (tx, rx) = mpsc::sync_channel::<WorkerEvent>(1);
         let (sys_tx, _sys_rx) = tokio::sync::watch::channel(None);
@@ -1082,7 +1092,9 @@ Encrypted: no
 
         let first = rx.recv_timeout(Duration::from_secs(1)).expect("第一条");
         assert!(matches!(first, WorkerEvent::TerminalData(b) if b == b"keep-me"));
-        let second = rx.recv_timeout(Duration::from_secs(1)).expect("第二条应被保留");
+        let second = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("第二条应被保留");
         assert!(matches!(second, WorkerEvent::TerminalData(b) if b == b"also-kept"));
         producer.join().expect("producer");
     }

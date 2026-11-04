@@ -145,9 +145,10 @@ impl App {
                             let mut new_grab: Option<f32> = None;
                             let mut tab_rects: Vec<(usize, egui::Rect)> = Vec::new();
                             let mut drag_w = 0.0f32; // 被拖标签宽度，用于算其跟手中心
-                                                     // 先取出标量字段，避免在借用 self.sessions 的循环里再借 self
+                            let mut any_group = false;
+                            let mut open_menu: Option<(u64, egui::Pos2)> = None;
+                            // 先取出标量字段，避免在借用 self.sessions 的循环里再借 self
                             let dragging_tab = self.tabbar.drag;
-                            let active = self.active;
                             let grab_dx = self.tabbar.grab_dx;
                             let total_w_cache = self.tabbar.total_w;
                             let want_scroll = self.tabbar.scroll_to_active; // 本帧是否需把激活标签滚到可视区
@@ -174,20 +175,55 @@ impl App {
                                                           // 同名会话消歧（规则见 `tab_labels`）：标签上只在同名会话
                                                           // 分属不同主机时追加「· 主机」；#uid 不上标签，只在 hover
                                                           // 提示里跟在 user@host 后面。
-                                    let labels = tab_labels(self.sessions.iter().map(|s| {
+                                                          // 只给单独占标签的会话算标题。折进去的 AI 窗口不参与同名消歧。
+                                    let roots = super::session::tab_root_indices(&self.sessions);
+                                    let labels = tab_labels(roots.iter().map(|&i| {
+                                        let s = &self.sessions[i];
                                         // 标签固定用连接名（`s.title`），不用 OSC 0/2 动态标题。
                                         // vim/shell 改窗口标题不应搅乱会话标签——那是用户认连接的锚点。
                                         let host = (!s.cfg.is_local() && !s.cfg.host.is_empty())
                                             .then_some(s.cfg.host.as_str());
                                         (s.title.as_str(), host)
                                     }));
-                                    for (i, s) in self.sessions.iter().enumerate() {
-                                        let selected = active == Some(i);
+                                    let active_root = self.active.and_then(|a| {
+                                        self.sessions.get(a).map(|s| {
+                                            super::session::tab_root_uid(&self.sessions, s.uid)
+                                        })
+                                    });
+                                    let active_uid = self
+                                        .active
+                                        .and_then(|a| self.sessions.get(a).map(|s| s.uid));
+                                    let now = ui.input(|i| i.time);
+                                    for (vis, &i) in roots.iter().enumerate() {
+                                        let uid = self.sessions[i].uid;
+                                        let members = super::session::group_member_indices(
+                                            &self.sessions,
+                                            uid,
+                                        );
+                                        let has_kids = members.len() > 1;
+                                        let showing = if has_kids && active_uid != Some(uid) {
+                                            active_uid.and_then(|u| {
+                                                self.sessions
+                                                    .iter()
+                                                    .find(|t| t.uid == u)
+                                                    .map(|t| t.title.clone())
+                                            })
+                                        } else {
+                                            None
+                                        };
+                                        let s = &self.sessions[i];
+                                        let selected = active_root == Some(s.uid);
+                                        if has_kids {
+                                            any_group = true;
+                                        }
+                                        let viewing_child = selected && showing.is_some();
                                         // 标签只显示会话标题：机器人图标、开启者名这类
                                         // MCP 内部标识用户看着只是噪声（归属信息仍在
                                         // list_sessions/写入弹窗里发挥作用，不上屏）。
-                                        let (display_title, title_dup) = labels[i].clone();
+                                        let (display_title, title_dup) = labels[vis].clone();
                                         // 宽度 = 左margin(9)+圆点(10)+间隔(6)+标题+间隔(6)+关闭(18)+右margin(9)
+                                        // 有 AI 窗口时圆点外侧多一圈，标题右移一截。
+                                        let extra = if has_kids { 8.0 } else { 0.0 };
                                         let title_w = ctx.fonts_mut(|f| {
                                             f.layout_no_wrap(
                                                 display_title.clone(),
@@ -197,7 +233,7 @@ impl App {
                                             .rect
                                             .width()
                                         });
-                                        let w = 58.0 + title_w;
+                                        let w = 58.0 + extra + title_w;
                                         let target = acc;
                                         // 激活标签若被请求滚动到可视区：按其「目标槽」位置请求滚动（带边距余量）
                                         if selected && want_scroll {
@@ -211,7 +247,7 @@ impl App {
                                             );
                                         }
                                         let id = egui::Id::new(("tabx", s.uid));
-                                        let dragging_this = drag_down && dragging_tab == Some(i);
+                                        let dragging_this = drag_down && dragging_tab == Some(vis);
                                         if dragging_this {
                                             drag_w = w;
                                         }
@@ -230,17 +266,33 @@ impl App {
                                             egui::vec2(w, tab_h),
                                         );
                                         // 交互：整张标签可点击（激活）/拖动（排序）；关闭区在上层优先
+                                        let mut tip = tab_hover_text(
+                                            &s.tip,
+                                            title_dup.then_some(s.uid),
+                                            s.ai_owner_label.as_deref(),
+                                        );
+                                        if has_kids {
+                                            tip.push_str(" · ");
+                                            tip.push_str(&crate::i18n::tr(
+                                                "点圆点或双击切换窗口",
+                                                "Click the dot or double-click to switch",
+                                            ));
+                                            if viewing_child {
+                                                if let Some(cur) = showing.as_deref() {
+                                                    tip.push_str(&format!(
+                                                        " · {} {cur}",
+                                                        crate::i18n::tr("当前", "Showing")
+                                                    ));
+                                                }
+                                            }
+                                        }
                                         let resp = ui
                                             .interact(
                                                 tab_rect,
                                                 egui::Id::new(("tab", s.uid)),
                                                 Sense::click_and_drag(),
                                             )
-                                            .on_hover_text(tab_hover_text(
-                                                &s.tip,
-                                                title_dup.then_some(s.uid),
-                                                s.ai_owner_label.as_deref(),
-                                            ));
+                                            .on_hover_text(tip);
                                         let close_rect = egui::Rect::from_center_size(
                                             egui::pos2(
                                                 tab_rect.right() - 18.0,
@@ -281,9 +333,13 @@ impl App {
                                                 egui::Stroke::new(2.0, Palette::ACCENT),
                                             );
                                         }
-                                        p.circle_filled(
-                                            egui::pos2(tab_rect.left() + 14.0, tab_rect.center().y),
-                                            4.0,
+                                        let dot_at = egui::pos2(
+                                            tab_rect.left() + 14.0 + extra * 0.5,
+                                            tab_rect.center().y,
+                                        );
+                                        paint_status_dot(
+                                            p,
+                                            dot_at,
                                             if s.ai_owned {
                                                 Palette::ACCENT
                                             } else if s.connected {
@@ -291,14 +347,32 @@ impl App {
                                             } else {
                                                 Palette::WARN
                                             },
+                                            has_kids.then_some((viewing_child, now)),
                                         );
+                                        // 圆点单独接点击，盖在整张标签上面。没有 AI 窗口时不拦，单击仍是激活。
+                                        let dot_clicked = if has_kids {
+                                            let dot_resp = ui.interact(
+                                                egui::Rect::from_center_size(
+                                                    dot_at,
+                                                    egui::vec2(18.0, 18.0),
+                                                ),
+                                                egui::Id::new(("tabdot", s.uid)),
+                                                Sense::click(),
+                                            );
+                                            dot_resp.clicked()
+                                        } else {
+                                            false
+                                        };
                                         let tcolor = if selected {
                                             Palette::TEXT
                                         } else {
                                             Palette::TEXT_DIM
                                         };
                                         p.text(
-                                            egui::pos2(tab_rect.left() + 25.0, tab_rect.center().y),
+                                            egui::pos2(
+                                                tab_rect.left() + 25.0 + extra,
+                                                tab_rect.center().y,
+                                            ),
                                             egui::Align2::LEFT_CENTER,
                                             &display_title,
                                             body_font.clone(),
@@ -316,16 +390,26 @@ impl App {
                                             egui::FontId::proportional(12.0),
                                             xcolor,
                                         );
-                                        // 事件：关闭优先于激活
+                                        // 事件：关闭优先。有 AI 窗口时，圆点或双击打开切换菜单，不把正在看的窗口拽回根会话。
+                                        let menu_anchor = egui::pos2(
+                                            tab_rect.left() + 4.0,
+                                            tab_rect.bottom() + 2.0,
+                                        );
                                         if close_resp.clicked() {
                                             to_close = Some(i);
-                                        } else if resp.clicked() {
+                                        } else if has_kids && (dot_clicked || resp.double_clicked())
+                                        {
+                                            open_menu = Some((s.uid, menu_anchor));
+                                            if !selected {
+                                                to_activate = Some(i);
+                                            }
+                                        } else if resp.clicked() && !selected {
                                             to_activate = Some(i);
                                         } else if resp.middle_clicked() {
                                             to_close = Some(i);
                                         }
                                         if resp.drag_started() {
-                                            drag_start = Some(i);
+                                            drag_start = Some(vis);
                                             if let Some(pp) = pointer {
                                                 // drag_started() 触发时指针已越过拖拽阈值离开真实按下点，
                                                 // 抓取偏移须用按下位置计算，否则拖动起始瞬间标签会相对光标跳动
@@ -335,7 +419,7 @@ impl App {
                                         }
                                         // 命中用「目标槽」位置，稳定判断拖到哪个槽
                                         tab_rects.push((
-                                            i,
+                                            vis,
                                             egui::Rect::from_min_size(
                                                 egui::pos2(origin.x + target, origin.y),
                                                 egui::vec2(w, tab_h),
@@ -346,6 +430,17 @@ impl App {
                                     acc // 返回总宽
                                 });
                             let total_w = out.inner.max(1.0);
+                            if any_group {
+                                ui.ctx()
+                                    .request_repaint_after(std::time::Duration::from_millis(32));
+                            }
+                            if let Some((uid, anchor)) = open_menu {
+                                self.tab_menu = Some(super::TabMenu {
+                                    root_uid: uid,
+                                    anchor,
+                                    opened_pass: ui.ctx().cumulative_pass_nr(),
+                                });
+                            }
                             self.tabbar.total_w = total_w;
                             self.tabbar.scroll_to_active = false; // 滚动请求一次性消费
                                                                   // 溢出渐隐：提示左右还有被隐藏的标签
@@ -402,7 +497,10 @@ impl App {
                         });
                     });
                     if let Some((from, to)) = reorder {
-                        self.reorder_session(from, to);
+                        let roots = super::session::tab_root_indices(&self.sessions);
+                        if let (Some(&from), Some(&to)) = (roots.get(from), roots.get(to)) {
+                            self.reorder_session(from, to);
+                        }
                     }
                     if let Some(i) = to_activate {
                         self.active = Some(i);
@@ -412,30 +510,137 @@ impl App {
                         }
                     }
                     if let Some(i) = to_close {
-                        // 会话仍连接（活动），或是 AI 正在用的会话，则弹确认——后者关闭会
-                        // 立即终止 AI 那条通道，不能悄无声息地关掉。
-                        let need_confirm = self
-                            .sessions
-                            .get(i)
-                            .map(|s| {
-                                let dirty = super::util::lock_mutex(&self.editor_state)
-                                    .dirty_tabs_for_session(s.uid);
-                                super::session::session_close_needs_confirm(
-                                    s.connected,
-                                    s.ai_owned,
-                                    dirty,
-                                )
-                            })
-                            .unwrap_or(false);
+                        // 关掉的是整个标签：根会话以及折在它里面的 AI 窗口。只要其中有一个
+                        // 还连着、是 AI 在用、或有未保存的编辑，就先问一声。
+                        let root_uid = self.sessions.get(i).map(|s| s.uid);
+                        let need_confirm = root_uid.is_some_and(|uid| {
+                            super::session::group_member_indices(&self.sessions, uid)
+                                .iter()
+                                .any(|&j| {
+                                    let s = &self.sessions[j];
+                                    let dirty = super::util::lock_mutex(&self.editor_state)
+                                        .dirty_tabs_for_session(s.uid);
+                                    super::session::session_close_needs_confirm(
+                                        s.connected,
+                                        s.ai_owned,
+                                        dirty,
+                                    )
+                                })
+                        });
                         if need_confirm {
-                            self.pending_close_tab = self.sessions.get(i).map(|s| s.uid);
-                        } else {
-                            self.close_session(i);
+                            self.pending_close_tab = root_uid;
+                        } else if let Some(uid) = root_uid {
+                            self.close_session_group(uid);
                         }
                     }
                 });
             });
+        self.paint_tab_menu(root.ctx());
     }
+
+    /// 标签下拉里切换这个标签底下的 shell。打开它的那一帧不响应「点外面关掉」，
+    /// 否则点圆点的同一下会把它立刻关掉。
+    fn paint_tab_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.tab_menu else {
+            return;
+        };
+        if self.session_idx_by_uid(menu.root_uid).is_none() {
+            self.tab_menu = None;
+            return;
+        }
+        let members = super::session::group_member_indices(&self.sessions, menu.root_uid);
+        if members.len() <= 1 {
+            self.tab_menu = None;
+            return;
+        }
+        let mut picked = None;
+        let popup = egui::Area::new(egui::Id::new(("tab_group_menu", menu.root_uid)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.anchor)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Palette::PANEL)
+                    .stroke(egui::Stroke::new(1.0, Palette::BORDER))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .show(ui, |ui| {
+                        ui.set_min_width(188.0);
+                        ui.set_max_width(360.0);
+                        ui.label(
+                            RichText::new(crate::i18n::tr("切换窗口", "Switch shell"))
+                                .size(11.0)
+                                .color(Palette::TEXT_DIM),
+                        );
+                        for &idx in &members {
+                            let s = &self.sessions[idx];
+                            let mut label = s.title.clone();
+                            if s.uid == menu.root_uid {
+                                label =
+                                    format!("{label} · {}", crate::i18n::tr("本窗口", "this tab"));
+                            } else if let Some(origin) = s.ai_owner_label.as_deref() {
+                                label = format!("{label} · {origin}");
+                            }
+                            if ui
+                                .selectable_label(self.active == Some(idx), label)
+                                .clicked()
+                            {
+                                picked = Some(idx);
+                            }
+                        }
+                    });
+            });
+        let pass = ctx.cumulative_pass_nr();
+        let dismiss = ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            || (pass != menu.opened_pass
+                && ctx.input(|i| i.pointer.any_click())
+                && !popup.response.hovered());
+        if let Some(idx) = picked {
+            self.active = Some(idx);
+            self.tabbar.scroll_to_active = true;
+            if let Some(s) = self.sessions.get_mut(idx) {
+                s.terminal.request_focus();
+            }
+            self.tab_menu = None;
+        } else if dismiss {
+            self.tab_menu = None;
+        }
+    }
+}
+
+/// 连接状态圆点。`grouped` 为 `(正在看 AI 开的窗口, 当前时间)`：
+/// 看自己的窗口时圆心是绿的、外圈黄色呼吸；看 AI 窗口时反过来。
+fn paint_status_dot(
+    p: &egui::Painter,
+    center: egui::Pos2,
+    plain: egui::Color32,
+    grouped: Option<(bool, f64)>,
+) {
+    let Some((viewing_child, time)) = grouped else {
+        p.circle_filled(center, 4.0, plain);
+        return;
+    };
+    let (core, ring) = if viewing_child {
+        (Palette::WARN, Palette::OK)
+    } else {
+        (Palette::OK, Palette::WARN)
+    };
+    let x = ((time * std::f64::consts::TAU) / 1.4).sin() as f32;
+    let breath = 0.28 + 0.72 * (0.5 + 0.5 * x);
+    let [r, g, b, _] = ring.to_array();
+    p.circle_filled(
+        center,
+        8.0,
+        egui::Color32::from_rgba_unmultiplied(r, g, b, (36.0 + 120.0 * breath) as u8),
+    );
+    p.circle_stroke(
+        center,
+        6.2,
+        egui::Stroke::new(
+            1.7,
+            egui::Color32::from_rgba_unmultiplied(r, g, b, (110.0 + 145.0 * breath) as u8),
+        ),
+    );
+    p.circle_filled(center, 3.2, core);
 }
 
 /// 标签页显示标题：`items` 为每个会话的 `(标题, 远端主机)`（本机/无主机信息为 `None`），

@@ -463,7 +463,13 @@ impl EditorTab {
 
     /// 收到一次跟随读取的回包。`from` 是那次读取的起点：与当前位置不符的是过时回包（超时
     /// 重发后，新旧两个回包都会到，两者起点相同），整个丢掉——否则同一段内容追加两次。
-    pub(super) fn apply_tail_reply(&mut self, from: u64, data: &[u8], offset: u64, truncated: bool) {
+    pub(super) fn apply_tail_reply(
+        &mut self,
+        from: u64,
+        data: &[u8],
+        offset: u64,
+        truncated: bool,
+    ) {
         if from != self.tail_offset {
             return;
         }
@@ -474,8 +480,8 @@ impl EditorTab {
         }
         if truncated {
             self.tail_carry.clear(); // 旧文件残留的半个字符不能拼到新内容前面
-            // 只在状态栏提示，不往缓冲里写字：写进去的话，退出跟随后再保存，
-            // 这行提示就成了文件内容。
+                                     // 只在状态栏提示，不往缓冲里写字：写进去的话，退出跟随后再保存，
+                                     // 这行提示就成了文件内容。
             self.editor.set_status(crate::i18n::tr(
                 "文件被截断/轮转，其后为新文件的内容",
                 "File was truncated/rotated; what follows is the new file",
@@ -675,6 +681,14 @@ impl EditorState {
     }
 }
 
+/// 标签组的切换菜单：锚在标签下方，`opened_pass` 用来忽略打开它的那一下点击。
+#[derive(Clone, Copy)]
+pub(super) struct TabMenu {
+    pub(super) root_uid: u64,
+    pub(super) anchor: egui::Pos2,
+    pub(super) opened_pass: u64,
+}
+
 /// 主窗口会话标签条的拖拽重排 + 滚动状态（从 App 抽出的内聚字段组）。
 #[derive(Default)]
 pub(super) struct TabBar {
@@ -781,8 +795,8 @@ mod save_fsm_tests {
             tail_last: 0.0,
             doc: None,
             tail_carry: Vec::new(),
-                    file_size: None,
-                    reopening: false,
+            file_size: None,
+            reopening: false,
             save_done_at: None,
             save_op: 0,
             save_deadline: None,
@@ -811,12 +825,21 @@ mod save_fsm_tests {
         t.tail_pending = true;
         t.apply_tail_reply(3, b"abc\n", 7, false);
         t.apply_tail_reply(3, b"abc\n", 7, false); // 重发那次的回包
-        assert_eq!(t.editor.content.matches("abc").count(), 1, "{:?}", t.editor.content);
+        assert_eq!(
+            t.editor.content.matches("abc").count(),
+            1,
+            "{:?}",
+            t.editor.content
+        );
         assert_eq!(t.tail_offset, 7);
         assert!(!t.tail_pending);
         // 起点对得上的下一块照常追加
         t.apply_tail_reply(7, b"def\n", 11, false);
-        assert!(t.editor.content.ends_with("abc\ndef\n"), "{:?}", t.editor.content);
+        assert!(
+            t.editor.content.ends_with("abc\ndef\n"),
+            "{:?}",
+            t.editor.content
+        );
     }
 
     fn tab_with(uid: u64, id: u8, dirty: bool) -> EditorTab {
@@ -834,13 +857,21 @@ mod save_fsm_tests {
     #[test]
     fn close_confirmation_follows_the_tab_not_the_index() {
         let mut ed = EditorState {
-            tabs: vec![tab_with(1, 1, true), tab_with(1, 2, true), tab_with(1, 3, true)],
+            tabs: vec![
+                tab_with(1, 1, true),
+                tab_with(1, 2, true),
+                tab_with(1, 3, true),
+            ],
             ..Default::default()
         };
         ed.close_tab_confirm = Some(ed.tabs[1].text_id); // 对 B 弹了确认
         ed.tabs.remove(0); // A 存完关掉了
         let i = ed.confirm_tab_index().expect("B 还在");
-        assert_eq!(ed.tabs[i].text_id, egui::Id::new(2u8), "确认指到了别的标签上");
+        assert_eq!(
+            ed.tabs[i].text_id,
+            egui::Id::new(2u8),
+            "确认指到了别的标签上"
+        );
         ed.tabs.swap(0, 1); // 拖动重排
         let i = ed.confirm_tab_index().expect("B 还在");
         assert_eq!(ed.tabs[i].text_id, egui::Id::new(2u8));
@@ -910,7 +941,11 @@ mod save_fsm_tests {
     #[test]
     fn dirty_tabs_are_counted_per_session() {
         let ed = EditorState {
-            tabs: vec![tab_with(1, 1, true), tab_with(1, 2, false), tab_with(2, 3, true)],
+            tabs: vec![
+                tab_with(1, 1, true),
+                tab_with(1, 2, false),
+                tab_with(2, 3, true),
+            ],
             ..Default::default()
         };
         assert_eq!(ed.dirty_tabs_for_session(1), 1);

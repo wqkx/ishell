@@ -495,6 +495,9 @@ pub(super) struct McpCall {
     download_sink: Option<oneshot::Sender<Result<crate::proto::DownloadStreamSource, String>>>,
     /// 来自本机 API（HTTP）而不是 MCP socket：授权开关不同（见 [`McpCall::from_api`] 与 `handle_mcp_call`）。
     via_api: bool,
+    /// 拉起这次连接的终端会话。`open_session` 用它把新窗口折进那个标签。
+    /// 本机 API、对不上 shell 的连接为 `None`，新窗口仍单独占一个标签。
+    parent_uid: Option<u64>,
 }
 
 impl McpCall {
@@ -506,6 +509,7 @@ impl McpCall {
             upload_source: None,
             download_sink: None,
             via_api: true,
+            parent_uid: None,
         }
     }
 
@@ -527,11 +531,10 @@ impl McpCall {
             upload_source: None,
             download_sink: Some(download_sink),
             via_api: true,
+            parent_uid: None,
         }
     }
 }
-
-
 
 /// `run_command`/`start_command` 的命令文本校验：必须是**一条单行命令**。
 ///
@@ -1006,6 +1009,8 @@ pub(super) struct PendingOpenConsent {
     /// 发起方代理的进程标识与可读来源（请求快照，真正开窗口时记到会话归属上）。
     pub(super) actor: Option<String>,
     pub(super) origin: Option<String>,
+    /// 发起这次 open_session 的终端。确认框挂着的几分钟里标签可能关掉，真正开的时候再核对。
+    parent_uid: Option<u64>,
     deadline: Instant,
 }
 
@@ -1376,7 +1381,14 @@ async fn handle_hello(
             p::MCP_APP_MAX,
             prove.app
         );
-        write_json_line(w, &McpResponse { id: 0, result: Err(msg) }).await;
+        write_json_line(
+            w,
+            &McpResponse {
+                id: 0,
+                result: Err(msg),
+            },
+        )
+        .await;
         return;
     }
     // actor 是代理进程标识：要求非空且有界，免得凭据表里存进一个巨型字符串。
@@ -1417,6 +1429,8 @@ async fn handle_conn(
     handshake_permit: tokio::sync::OwnedSemaphorePermit,
     work_limit: Arc<tokio::sync::Semaphore>,
 ) {
+    // 对端 pid 必须在 split 之前取：两个半边是同一个 socket，但这里手里还有完整的 stream。
+    let peer = crate::mcp_parent::peer_pid(stream.as_raw_fd());
     let (r, mut w) = stream.into_split();
     // `Take` 限的是整条连接的总字节数，也是后面那行真正的请求的上限（见 `MAX_MCP_LINE_BYTES`）；
     // 认证阶段那几行另有小得多的上限（`AUTH_LINE_MAX`），由 `read_line_bounded` 自己把关。
@@ -1429,7 +1443,7 @@ async fn handle_conn(
     // 第一行只肯缓冲 `AUTH_LINE_MAX`、只肯等 `AUTH_LINE_TIMEOUT`：认证之前对端是谁都有可能，
     // 不能让它用一行 32MB 的垃圾把整个进程的内存吃掉（或用沉默占着握手名额）。真正的请求在
     // 凭据核对通过之后才去读。
-    let Some(line) = tokio::time::timeout(
+    let Some(mut line) = tokio::time::timeout(
         crate::mcp_protocol::AUTH_LINE_TIMEOUT,
         crate::mcp_protocol::read_line_bounded(&mut rd, crate::mcp_protocol::AUTH_LINE_MAX),
     )
@@ -1437,6 +1451,27 @@ async fn handle_conn(
     .ok()
     .flatten() else {
         return;
+    };
+    // SSH 桥（对端就是本进程）第一行是会话标记，吃掉再读真正的握手。其它对端的第一行
+    // 一律当协议行，哪怕长得像标记——本地代理伪造不了本进程的 pid。
+    let parent_uid = if peer == Some(std::process::id()) {
+        if let Some(uid) = crate::mcp_parent::parse_parent_preamble(&line) {
+            let Some(next) = tokio::time::timeout(
+                crate::mcp_protocol::AUTH_LINE_TIMEOUT,
+                crate::mcp_protocol::read_line_bounded(&mut rd, crate::mcp_protocol::AUTH_LINE_MAX),
+            )
+            .await
+            .ok()
+            .flatten() else {
+                return;
+            };
+            line = next;
+            Some(uid)
+        } else {
+            None
+        }
+    } else {
+        peer.and_then(crate::mcp_parent::parent_of_peer)
     };
     let Ok(first) = serde_json::from_str::<serde_json::Value>(&line) else {
         return;
@@ -1466,7 +1501,7 @@ async fn handle_conn(
         }
     };
     drop(line); // 请求可能很大（write_file 的 content），解析完就别再留一份
-    // 归属判定用的 actor 是 iShell 自己按凭据记下的，不是请求里自报的（线上根本没有这个字段）。
+                // 归属判定用的 actor 是 iShell 自己按凭据记下的，不是请求里自报的（线上根本没有这个字段）。
     req.actor = Some(actor);
     let id = req.id;
     // 业务请求换到工作信号量：握手已在上面 return，不再占握手名额。
@@ -1530,6 +1565,7 @@ async fn handle_conn(
                 upload_source,
                 download_sink: None,
                 via_api: false,
+                parent_uid,
             })
             .is_err()
         {
@@ -1590,6 +1626,7 @@ async fn handle_conn(
                 upload_source: None,
                 download_sink: Some(dl_tx),
                 via_api: false,
+                parent_uid,
             })
             .is_err()
         {
@@ -1674,6 +1711,7 @@ async fn handle_conn(
             upload_source: None,
             download_sink: None,
             via_api: false,
+            parent_uid,
         })
         .is_err()
     {
@@ -1839,9 +1877,7 @@ impl App {
     /// 上就自动被覆盖，不会重蹈「只想起了自己刚写的那个」的覆辙。每帧重排是幂等的，pending
     /// 的增删也能自动跟上。
     pub(super) fn arm_timeout_repaint(&self) {
-        let consents = [
-            self.pending_open_consent.as_ref().map(|p| p.deadline),
-        ];
+        let consents = [self.pending_open_consent.as_ref().map(|p| p.deadline)];
         let sessions = self.sessions.iter().flat_map(|s| {
             s.pending_ai_run
                 .as_ref()
@@ -2483,6 +2519,7 @@ impl App {
         resp_tx: oneshot::Sender<McpResponse>,
         owner: Option<String>,
         owner_label: Option<String>,
+        parent: Option<u64>,
     ) {
         let cfg = match connect_config_from_saved(c) {
             Ok(cfg) => cfg,
@@ -2499,14 +2536,17 @@ impl App {
         let prev_active = self.active;
         self.spawn_session(cfg);
         self.active = prev_active;
+        // 父标签还在才折叠。确认框挂了几分钟、或者对不上 shell 时，新窗口仍单独占一个标签。
+        let attach = parent.filter(|&p| self.sessions.iter().any(|o| o.uid == p));
         let s = self
             .sessions
             .last_mut()
             .expect("spawn_session 刚 push 了一个会话");
         s.ai_owned = true; // AI 新开的会话：只读，用户键盘输入不转发（见 layout_body.rs）
         s.ai_owner = owner; // 归属：只归开它的那个 AI 进程使用（见 session_owned_by）
-                            // 标签 hover 上展示「谁开的」：渲染时由 layout_tabs::tab_hover_text 拼接（#uid 要插在
-                            // user@host 与来源之间，所以不再把来源预先拼进 tip）。
+        s.parent_uid = attach;
+        // 标签 hover 上展示「谁开的」：渲染时由 layout_tabs::tab_hover_text 拼接（#uid 要插在
+        // user@host 与来源之间，所以不再把来源预先拼进 tip）。
         s.ai_owner_label = owner_label.clone();
         let info = McpSessionInfo {
             uid: s.uid,
@@ -2536,6 +2576,7 @@ impl App {
             req_id,
             actor,
             origin,
+            parent_uid,
             ..
         } = pending;
         let Some(resp_tx) = resp_tx else {
@@ -2543,7 +2584,7 @@ impl App {
         };
         if allow {
             self.mcp_open_approved.insert(conn.name.clone());
-            self.do_open_session(&conn, req_id, resp_tx, actor, origin);
+            self.do_open_session(&conn, req_id, resp_tx, actor, origin, parent_uid);
         } else {
             let _ = resp_tx.send(McpResponse {
                 id: req_id,
@@ -2647,6 +2688,7 @@ impl App {
             upload_source,
             download_sink,
             via_api: _,
+            parent_uid,
         } = call;
         // 发起方代理的进程标识：归属判定（CloseSession）与 list_sessions 的 mine 标记都要
         // 用，先在这里快照——match req.kind 之后 req 就被部分移动了。
@@ -2924,7 +2966,7 @@ impl App {
                 // 已批准过、或「AI 操作无需逐次确认」开着（默认）→ 直接开。
                 if self.mcp_open_approved.contains(&name) || crate::store::load_mcp_auto_approve() {
                     self.mcp_open_approved.insert(name);
-                    self.do_open_session(&c, id, resp_tx, req.actor, req.origin);
+                    self.do_open_session(&c, id, resp_tx, req.actor, req.origin, parent_uid);
                     return;
                 }
                 // 同一时刻只挂一个确认框：两个 modal 叠在一起，用户根本分不清自己在批准哪一个。
@@ -2940,6 +2982,7 @@ impl App {
                     req_id: id,
                     actor: req.actor,
                     origin: req.origin,
+                    parent_uid,
                     // 60s 对"用户可能不在电脑前"这种常见情况太紧——超时会被下面的
                     // 拒绝分支吃掉,还得让 AI 重新发起一次 open_session 才能再弹一次
                     // 确认框。放宽到 5 分钟,给用户更充裕的反应时间。
@@ -2980,7 +3023,8 @@ impl App {
                 }
                 // 用户可能在这个会话的文件面板里打开并改了文件：关会话会连同未保存的修改
                 // 一起扔掉，而 AI 这条路没有确认框——所以直接拒绝，让用户先处理。
-                let dirty = super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(s.uid);
+                let dirty =
+                    super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(s.uid);
                 if dirty > 0 {
                     send_err(
                         resp_tx,
@@ -4035,7 +4079,9 @@ mod auth_tests {
     }
 
     async fn send_raw(w: &mut tokio::net::unix::OwnedWriteHalf, line: &str) {
-        w.write_all(format!("{line}\n").as_bytes()).await.expect("写请求");
+        w.write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("写请求");
     }
 
     fn hello_frame(key: &str, cn: &str) -> p::HelloFrame {
@@ -4049,7 +4095,12 @@ mod auth_tests {
     }
 
     /// 走完整条握手，返回签发的凭据。`app` 是声明的业务协议版本。
-    async fn handshake(path: &std::path::Path, key: &str, actor: &str, app: u32) -> Result<String, String> {
+    async fn handshake(
+        path: &std::path::Path,
+        key: &str,
+        actor: &str,
+        app: u32,
+    ) -> Result<String, String> {
         let (r, mut w) = UnixStream::connect(path).await.expect("连接").into_split();
         let mut r = BufReader::new(r);
         let cn = p::auth_nonce().expect("熵源");
@@ -4062,10 +4113,19 @@ mod auth_tests {
         let ok: p::HelloOkFrame = serde_json::from_str(line.trim()).expect("hello_ok 应能解析");
         // 客户端本该在这里验服务器证明：测试里直接断言它与共享算法一致。
         assert!(
-            p::auth_mac_matches(key, p::AuthStep::Server, &cn, &ok.hello_ok.sn, &ok.hello_ok.smac),
+            p::auth_mac_matches(
+                key,
+                p::AuthStep::Server,
+                &cn,
+                &ok.hello_ok.sn,
+                &ok.hello_ok.smac
+            ),
             "服务器证明与共享算法算出来的不一致"
         );
-        assert_eq!((ok.hello_ok.app_min, ok.hello_ok.app_max), (p::MCP_APP_MIN, p::MCP_APP_MAX));
+        assert_eq!(
+            (ok.hello_ok.app_min, ok.hello_ok.app_max),
+            (p::MCP_APP_MIN, p::MCP_APP_MAX)
+        );
         assert_eq!(ok.hello_ok.peer.run, crate::store::mcp_instance_id());
         send(
             &mut w,
@@ -4086,7 +4146,10 @@ mod auth_tests {
         if let Ok(t) = serde_json::from_str::<p::TicketFrame>(line2.trim()) {
             return Ok(t.ticket.ticket);
         }
-        match serde_json::from_str::<McpResponse>(line2.trim()).expect("应是错误应答").result {
+        match serde_json::from_str::<McpResponse>(line2.trim())
+            .expect("应是错误应答")
+            .result
+        {
             Err(e) => Err(e),
             Ok(_) => panic!("意外的成功应答"),
         }
@@ -4095,7 +4158,13 @@ mod auth_tests {
     async fn business(path: &std::path::Path, ticket: &str, extra: &str) {
         let (_r, mut w) = UnixStream::connect(path).await.expect("连接").into_split();
         // 第一行出示凭据，第二行是请求；请求手写一行，好带上 `actor` 这种线上本不该有的字段
-        send(&mut w, &p::BearerFrame { bearer: ticket.into() }).await;
+        send(
+            &mut w,
+            &p::BearerFrame {
+                bearer: ticket.into(),
+            },
+        )
+        .await;
         send_raw(
             &mut w,
             &format!(r#"{{"id":1{extra},"kind":"ListSessions"}}"#),
@@ -4109,15 +4178,23 @@ mod auth_tests {
     #[tokio::test]
     async fn correct_key_completes_the_handshake_and_the_ticket_pins_the_actor() {
         let (path, mut rx) = serve().await;
-        let ticket = handshake(&path, key(), "alice", p::MCP_APP_MIN).await.expect("应握手成功");
+        let ticket = handshake(&path, key(), "alice", p::MCP_APP_MIN)
+            .await
+            .expect("应握手成功");
         business(&path, &ticket, r#","actor":"forged-by-the-caller""#).await;
         let call = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("请求应被递进来")
             .expect("通道未关");
-        assert_eq!(call.req.actor.as_deref(), Some("alice"), "actor 必须来自凭据，不是自报");
+        assert_eq!(
+            call.req.actor.as_deref(),
+            Some("alice"),
+            "actor 必须来自凭据，不是自报"
+        );
         // 不同 actor 的握手签发不同凭据，互不串
-        let other = handshake(&path, key(), "bob", p::MCP_APP_MIN).await.expect("握手");
+        let other = handshake(&path, key(), "bob", p::MCP_APP_MIN)
+            .await
+            .expect("握手");
         assert_ne!(other, ticket);
         business(&path, &other, "").await;
         let call = rx.recv().await.expect("通道未关");
@@ -4133,10 +4210,16 @@ mod auth_tests {
         let (path, mut rx) = serve().await;
         let cn = p::auth_nonce().unwrap();
         let attempts: Vec<(&str, String)> = vec![
-            ("旧版匿名 Identify", r#"{"id":1,"instance":null,"kind":"Identify"}"#.into()),
+            (
+                "旧版匿名 Identify",
+                r#"{"id":1,"instance":null,"kind":"Identify"}"#.into(),
+            ),
             ("垃圾", "this is not json".into()),
             ("伪造的凭据", r#"{"bearer":"deadbeef"}"#.into()),
-            ("旧版内联 ticket（v8 之前的请求形状）", r#"{"id":1,"ticket":"deadbeef","kind":"ListSessions"}"#.into()),
+            (
+                "旧版内联 ticket（v8 之前的请求形状）",
+                r#"{"id":1,"ticket":"deadbeef","kind":"ListSessions"}"#.into(),
+            ),
             ("bearer 不是字符串", r#"{"bearer":123}"#.into()),
             ("bearer 为 null", r#"{"bearer":null}"#.into()),
             ("没有凭据", r#"{"id":1,"kind":"ListSessions"}"#.into()),
@@ -4165,7 +4248,12 @@ mod auth_tests {
             let mut r = BufReader::new(r);
             send_raw(&mut w, &line).await;
             let got = drain(&mut r).await;
-            assert!(got.is_empty(), "{what}：对未认证者回了 {} 字节：{:?}", got.len(), String::from_utf8_lossy(&got));
+            assert!(
+                got.is_empty(),
+                "{what}：对未认证者回了 {} 字节：{:?}",
+                got.len(),
+                String::from_utf8_lossy(&got)
+            );
         }
         assert!(rx.try_recv().is_err(), "未认证的请求不得被递进 App 层");
     }
@@ -4238,7 +4326,10 @@ mod auth_tests {
         let t0 = std::time::Instant::now();
         for (what, payload) in [
             // 字面量而不是由上限常量推出来：否则有人把上限调大，这条测试会跟着一起放行
-            ("超过上限的一整行（有换行）", format!("[{}]\n", "0,".repeat(8192))),
+            (
+                "超过上限的一整行（有换行）",
+                format!("[{}]\n", "0,".repeat(8192)),
+            ),
             ("超过上限且永不换行", "a".repeat(64 * 1024)),
         ] {
             let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
@@ -4278,8 +4369,15 @@ mod auth_tests {
     #[tokio::test]
     async fn odd_hellos_and_mixed_first_lines_are_refused_without_executing_anything() {
         let (path, mut rx) = serve().await;
-        let ticket = handshake(&path, key(), "alice", p::MCP_APP_MIN).await.expect("握手");
-        for (what, cn) in [("cn 63 位", "a".repeat(63)), ("cn 65 位", "a".repeat(65)), ("cn 含 NUL", format!("{}\0", "a".repeat(63))), ("cn 64 位但非十六进制", "z".repeat(64))] {
+        let ticket = handshake(&path, key(), "alice", p::MCP_APP_MIN)
+            .await
+            .expect("握手");
+        for (what, cn) in [
+            ("cn 63 位", "a".repeat(63)),
+            ("cn 65 位", "a".repeat(65)),
+            ("cn 含 NUL", format!("{}\0", "a".repeat(63))),
+            ("cn 64 位但非十六进制", "z".repeat(64)),
+        ] {
             let (r, mut w) = UnixStream::connect(&path).await.unwrap().into_split();
             let mut r = BufReader::new(r);
             send(&mut w, &hello_frame(key(), &cn)).await;
@@ -4297,7 +4395,10 @@ mod auth_tests {
         r.read_line(&mut line).await.unwrap();
         assert!(line.contains("hello_ok"), "应当走握手分支：{line}");
         drop(w);
-        assert!(rx.try_recv().is_err(), "混合第一行不得被当成业务请求递进 App 层");
+        assert!(
+            rx.try_recv().is_err(),
+            "混合第一行不得被当成业务请求递进 App 层"
+        );
     }
 
     /// 凭据表的淘汰按**最近使用**走，且一个 actor 挤不掉别人的凭据：
@@ -4312,8 +4413,16 @@ mod auth_tests {
             // busy 的凭据一直在被使用，签发时刻再早也不该被挤掉
             assert_eq!(tickets::redeem(&busy).as_deref(), Some("lru-busy"));
         }
-        assert_eq!(tickets::count_for("lru-greedy"), tickets::PER_ACTOR_CAP, "超额者只淘汰它自己的");
-        assert_eq!(tickets::redeem(&victim).as_deref(), Some("lru-victim"), "别人的凭据被挤掉了");
+        assert_eq!(
+            tickets::count_for("lru-greedy"),
+            tickets::PER_ACTOR_CAP,
+            "超额者只淘汰它自己的"
+        );
+        assert_eq!(
+            tickets::redeem(&victim).as_deref(),
+            Some("lru-victim"),
+            "别人的凭据被挤掉了"
+        );
         assert_eq!(tickets::redeem(&busy).as_deref(), Some("lru-busy"));
     }
 
