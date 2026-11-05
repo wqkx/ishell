@@ -16,6 +16,7 @@ impl App {
             FileAction::ClipCopy { items } => return self.set_clip(idx, items, false),
             FileAction::ClipCut { items } => return self.set_clip(idx, items, true),
             FileAction::Paste { dest_dir } => return self.start_paste(idx, dest_dir),
+            FileAction::OpenUsage => return self.open_usage(idx),
             _ => {}
         }
         // 大文件并发上限：须在借 session 之前检查（避免与 editor_state 借用冲突）
@@ -293,8 +294,10 @@ impl App {
                 }
             }
             // 已在函数开头前置处理并 return，此处仅为穷尽匹配
-            FileAction::ClipCopy { .. } | FileAction::ClipCut { .. } | FileAction::Paste { .. } => {
-            }
+            FileAction::ClipCopy { .. }
+            | FileAction::ClipCut { .. }
+            | FileAction::Paste { .. }
+            | FileAction::OpenUsage => {}
         }
     }
 }

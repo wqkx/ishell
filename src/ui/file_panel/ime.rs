@@ -96,7 +96,7 @@ pub(super) fn ime_apply_events(
 /// 输一次」（同 editor.rs 的修法，见 memory `ime-secondary-window-fix`）。本函数在 TextEdit
 /// 渲染前抽走并自行落地 Ime 事件，绕开坏门；同时用键盘事件可靠检测回车提交。
 /// 返回 (response, 本帧是否回车提交)。`preedit` 为跨帧维护的组字字节范围。
-pub(super) fn ime_singleline(
+pub(crate) fn ime_singleline(
     ui: &mut egui::Ui,
     id_src: &str,
     buf: &mut String,

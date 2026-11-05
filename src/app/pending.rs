@@ -68,6 +68,8 @@ pub(super) struct SessionPending {
     pub direct_relay_started: Vec<u64>,
     /// 跨会话拷贝-直连优先模式：直连传输的最终结果（op_id, ok, message）。
     pub direct_relay_done: Vec<(u64, bool, String)>,
+    /// 占用分析的结果。窗口关掉之后由 App 清掉，避免积压。
+    pub usage: Vec<(u64, Result<crate::usage::UsageBody, String>)>,
 }
 
 impl SessionPending {
@@ -96,6 +98,7 @@ impl SessionPending {
             && self.temp_key_untrusted.is_empty()
             && self.direct_relay_started.is_empty()
             && self.direct_relay_done.is_empty()
+            && self.usage.is_empty()
     }
 }
 

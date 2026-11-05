@@ -16,7 +16,7 @@ mod xfer;
 pub(crate) use xfer::util::local_nonexistent;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -411,6 +411,9 @@ pub async fn run(
 
     // 端口转发监听任务：id -> JoinHandle
     let mut forwards: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    // 占用分析里正在跑的那一次（分层或搜索）。新的一次会停掉上一次；列磁盘不占这个名额。
+    let mut usage_heavy: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
 
     // 传输并发控制：进行中计数 + 排队 + 取消标志；完成时由任务经 xfer_done 通知主循环
     let mut active_xfer = 0usize;
@@ -1000,6 +1003,34 @@ pub async fn run(
                             pending_xfer.push_back(p);
                         }
                     }
+                    Some(UiCommand::UsageQuery { id, kind, cancel }) => {
+                        let heavy = matches!(
+                            kind,
+                            crate::usage::UsageKind::Level { .. } | crate::usage::UsageKind::Search { .. }
+                        );
+                        if heavy {
+                            if let Some((task, flag)) = usage_heavy.take() {
+                                flag.store(true, Ordering::Relaxed);
+                                task.abort();
+                            }
+                        }
+                        let h = handle.clone();
+                        let s = sink.clone();
+                        let flag = cancel.clone();
+                        let task = tokio::spawn(async move {
+                            let result = remote_usage(&h, kind).await;
+                            if flag.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            match result {
+                                Err(e) if e.is_empty() => {}
+                                other => s.send(WorkerEvent::UsageReady { id, result: other }),
+                            }
+                        });
+                        if heavy {
+                            usage_heavy = Some((task, cancel));
+                        }
+                    }
                     // 键盘交互回答仅在认证阶段由 connect() 消费；正常运行期收到则忽略
                     Some(UiCommand::KbdResponse(_)) => {}
                     Some(UiCommand::Disconnect) | None => {
@@ -1010,6 +1041,11 @@ pub async fn run(
                 }
             }
         }
+    }
+
+    if let Some((task, flag)) = usage_heavy.take() {
+        flag.store(true, Ordering::Relaxed);
+        task.abort();
     }
 
     // 连接生命周期末尾清理本次注册的 AI/MCP 反向转发 socket 文件（`handle` 此时尚未被
@@ -1036,6 +1072,33 @@ pub async fn run(
     }
     probe_task.abort();
 }
+async fn remote_usage(
+    handle: &russh::client::Handle<ClientHandler>,
+    kind: crate::usage::UsageKind,
+) -> Result<crate::usage::UsageBody, String> {
+    use crate::usage::{UsageBody, UsageKind};
+    let cmd = match &kind {
+        UsageKind::Mounts => crate::usage::remote_mounts_cmd().to_string(),
+        UsageKind::Level { path } => {
+            crate::usage::path_ok(path)?;
+            crate::usage::remote_level_cmd(path)
+        }
+        UsageKind::Search { path, needle } => {
+            crate::usage::path_ok(path)?;
+            let needle = crate::usage::needle_ok(needle)?;
+            crate::usage::remote_search_cmd(path, &needle)
+        }
+    };
+    let text = exec_capture(handle, &cmd)
+        .await
+        .map_err(|e| e.to_string())?;
+    match kind {
+        UsageKind::Mounts => Ok(UsageBody::Mounts(crate::usage::parse_df(&text))),
+        UsageKind::Level { path } => crate::usage::parse_level(&path, &text),
+        UsageKind::Search { path, needle } => Ok(crate::usage::parse_search(&path, &needle, &text)),
+    }
+}
+
 /// POSIX 单引号转义，用于把路径安全嵌入 shell 命令。
 pub(super) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))

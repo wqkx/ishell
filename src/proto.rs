@@ -288,6 +288,12 @@ pub enum UiCommand {
     RemoveForward(u64),
     /// 主动断开
     Disconnect,
+    /// 占用分析：只统计一层、按名称搜索，或列出磁盘。`cancel` 置位后结果作废，本地遍历会停。
+    UsageQuery {
+        id: u64,
+        kind: crate::usage::UsageKind,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     /// 把内嵌的 `ishell-mcp` 代理二进制部署到这台服务器（见 `crate::mcp_embed`）。
     /// 结果经 `WorkerEvent::McpAgentDeployed` 回报。
     DeployMcpAgent,
@@ -554,6 +560,11 @@ pub enum WorkerEvent {
     ForwardStatus { id: u64, ok: bool, message: String },
     /// 错误提示
     Error(String),
+    /// 占用分析的一次结果。`id` 对不上窗口里当前那次请求的，直接丢掉。
+    UsageReady {
+        id: u64,
+        result: Result<crate::usage::UsageBody, String>,
+    },
 }
 
 /// 传输方向。

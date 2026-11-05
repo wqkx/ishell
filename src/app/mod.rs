@@ -155,6 +155,8 @@ pub struct App {
     /// 终端通知浮层（BEL 响铃 / OSC 9/777：AI CLI 等待确认、任务完成、脚本通知）。
     /// 右上角纵排，点击跳转对应会话，右键可逐条/全部删除。
     ai_notices: Vec<AiNotice>,
+    /// 目录占用分析小窗（同一时刻一个，绑在打开它的会话上）。
+    usage: Option<windows::usage::UsageWin>,
     /// 上一帧「窗口在前台时的活动会话 uid」（窗口不在前台则为 None）。
     ///
     /// 用来把「切到某标签 → 清掉它的通知」做成**边沿触发**：这个判断每帧都要做，而清理
@@ -272,6 +274,7 @@ impl App {
             mcp_open_approved: std::collections::HashSet::new(),
             cross_copy_jobs: Vec::new(),
             ai_notices: Vec::new(),
+            usage: None,
             last_focused_tab: None,
             term_rect: None,
             ime_sticky: None,
@@ -597,6 +600,9 @@ impl App {
 
         // 传输进度浮窗
         self.transfer_window(&ctx);
+
+        // 目录占用分析
+        self.usage_window(&ctx);
 
         // 端口转发管理浮窗
         self.forward_window(&ctx);

@@ -15,6 +15,9 @@ mod files;
 mod mcp_session;
 mod sys;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, SlavePty};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -99,6 +102,7 @@ pub async fn run(
     // 轮询 child.try_wait：shell 已死就收尾（先排空残留输出，再发 ShellExited）。
     let mut child_poll = tokio::time::interval(std::time::Duration::from_millis(200));
     child_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut usage_heavy: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
 
     loop {
         tokio::select! {
@@ -155,6 +159,38 @@ pub async fn run(
                         pixel_height: 0,
                     });
                 }
+                Some(UiCommand::UsageQuery { id, kind, cancel }) => {
+                    let heavy = matches!(
+                        kind,
+                        crate::usage::UsageKind::Level { .. } | crate::usage::UsageKind::Search { .. }
+                    );
+                    if heavy {
+                        if let Some((task, flag)) = usage_heavy.take() {
+                            flag.store(true, Ordering::Relaxed);
+                            task.abort();
+                        }
+                    }
+                    let s = sink.clone();
+                    let run_flag = cancel.clone();
+                    let watch = cancel.clone();
+                    let task = tokio::spawn(async move {
+                        let joined = tokio::task::spawn_blocking(move || {
+                            crate::usage::run_local(kind, &run_flag)
+                        })
+                        .await;
+                        if watch.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        match joined {
+                            Ok(Err(e)) if e.is_empty() => {}
+                            Ok(result) => s.send(WorkerEvent::UsageReady { id, result }),
+                            Err(_) => {}
+                        }
+                    });
+                    if heavy {
+                        usage_heavy = Some((task, cancel));
+                    }
+                }
                 Some(UiCommand::Disconnect) | None => {
                     // 主动断开 / UI 侧通道关闭：杀掉 shell 子进程并收尾。
                     // `kill` 之后必须 `wait` 回收，否则每关一个本机标签就留一个僵尸进程
@@ -179,6 +215,10 @@ pub async fn run(
     }
     // 循环退出：停掉系统信息采样任务；master/in_tx 在此 drop → PTY 关闭、写线程结束；
     // out_rx drop → 读线程下次发送失败退出。
+    if let Some((task, flag)) = usage_heavy.take() {
+        flag.store(true, Ordering::Relaxed);
+        task.abort();
+    }
     if let Some(t) = sysinfo_task {
         t.abort();
     }

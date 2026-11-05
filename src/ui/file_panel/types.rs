@@ -256,6 +256,8 @@ pub enum FileAction {
     CdTerminal(String),
     /// 直接设置状态栏文案（用于撤销等即时提示）
     Status(String),
+    /// 打开占用分析小窗，目录用文件面板当前目录。
+    OpenUsage,
 }
 
 /// 「打开 / 进入」一个条目的意图——把目录、图片、文本、大文件确认、断链等分支统一，

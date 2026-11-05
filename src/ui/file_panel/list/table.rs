@@ -247,6 +247,7 @@ pub(super) fn file_table(
     let mut bg_cd = false;
     let mut bg_fav = false;
     let mut bg_refresh = false;
+    let mut bg_usage = false;
     bg.context_menu(|ui| {
         if !state.cwd.is_empty()
             && ui
@@ -258,6 +259,18 @@ pub(super) fn file_table(
                 .clicked()
         {
             bg_refresh = true;
+            ui.close();
+        }
+        if !state.cwd.is_empty()
+            && ui
+                .button(format!(
+                    "{}  {}",
+                    icon::CHART_PIE,
+                    crate::i18n::tr("占用分析", "Disk usage")
+                ))
+                .clicked()
+        {
+            bg_usage = true;
             ui.close();
         }
         if ui
@@ -343,6 +356,9 @@ pub(super) fn file_table(
     }
     if bg_refresh && state.refresh_dir(&cwd) {
         actions.push(FileAction::List(cwd.clone()));
+    }
+    if bg_usage {
+        actions.push(FileAction::OpenUsage);
     }
 
     // —— 键盘导航：↑/↓ 移动选中行、Enter 打开/进入目录（与 Ctrl+A/Delete 同一聚焦门：无文本框聚焦时生效）——

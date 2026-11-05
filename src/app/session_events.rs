@@ -275,7 +275,9 @@ impl Session {
                     offset,
                     truncated,
                 } => {
-                    self.pending.tail.push((path, from, data, offset, truncated));
+                    self.pending
+                        .tail
+                        .push((path, from, data, offset, truncated));
                 }
                 WorkerEvent::PdfInfo { id, path: _, pages } => {
                     self.pending.pdf_info.push((id, pages));
@@ -526,6 +528,7 @@ impl Session {
                     self.refresh_dir(refresh_dir);
                 }
                 WorkerEvent::Error(e) => self.status = e,
+                WorkerEvent::UsageReady { id, result } => self.pending.usage.push((id, result)),
             }
         }
     }

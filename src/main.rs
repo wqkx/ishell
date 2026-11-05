@@ -24,6 +24,7 @@ mod terminal;
 mod textcodec;
 mod theme;
 mod ui;
+mod usage;
 mod version;
 
 /// 应用图标（任务栏/窗口/Alt-Tab）。编译期内嵌 PNG，运行时解码为 RGBA。
