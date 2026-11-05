@@ -25,7 +25,7 @@ impl TabColor {
         TabColor::Plum,
     ];
 
-    /// 色点 / 顶边用的实色。明度靠近，避免某一颗特别扎眼。
+    /// 色点，以及选中标签底下那条线用的实色。明度靠近，避免某一颗特别扎眼。
     pub(super) fn rgb(self) -> Color32 {
         match self {
             TabColor::Coral => Color32::from_rgb(0xd1, 0x6a, 0x48),

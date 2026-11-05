@@ -278,11 +278,6 @@ impl App {
                                             tip.push_str(" · ");
                                             tip.push_str(crate::i18n::tr(zh, en));
                                         }
-                                        tip.push('\n');
-                                        tip.push_str(crate::i18n::tr(
-                                            "右键设置颜色",
-                                            "Right-click to set a color",
-                                        ));
                                         if has_kids {
                                             tip.push_str(" · ");
                                             tip.push_str(&crate::i18n::tr(
@@ -330,32 +325,17 @@ impl App {
                                             },
                                             fill,
                                         );
-                                        if let Some(c) = s.tab_color {
-                                            // 顶上一条实色，像文件夹颜色标签：浅底上单靠混色不够认。
-                                            p.rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    tab_rect.min,
-                                                    egui::pos2(
-                                                        tab_rect.right(),
-                                                        tab_rect.top() + 3.0,
-                                                    ),
-                                                ),
-                                                egui::CornerRadius {
-                                                    nw: 6,
-                                                    ne: 6,
-                                                    sw: 0,
-                                                    se: 0,
-                                                },
-                                                c.rgb(),
-                                            );
-                                        }
-                                        // 激活标签底部 2px 珊瑚下划线（更清晰的激活指示）
+                                        // 激活标签底部 2px 下划线。设了颜色就用那颗实色，否则仍是珊瑚。
                                         if selected && !dragging_this {
                                             let y = tab_rect.bottom() - 1.0;
+                                            let mark = s
+                                                .tab_color
+                                                .map(|c| c.rgb())
+                                                .unwrap_or(Palette::ACCENT);
                                             p.hline(
                                                 tab_rect.left()..=tab_rect.right(),
                                                 y,
-                                                egui::Stroke::new(2.0, Palette::ACCENT),
+                                                egui::Stroke::new(2.0, mark),
                                             );
                                         }
                                         let dot_at = egui::pos2(
