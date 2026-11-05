@@ -13,7 +13,7 @@ mod tree;
 mod types;
 
 use dialogs::dialogs;
-pub(crate) use ime::ime_singleline;
+pub(crate) use ime::ime_line;
 use list::file_list;
 pub use types::{Dialog, FileAction, FilePanelState, ViewCache};
 use types::{MoveRecord, OpenIntent, Renaming, SortKey};

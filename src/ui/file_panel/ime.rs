@@ -102,12 +102,30 @@ pub(crate) fn ime_singleline(
     buf: &mut String,
     preedit: &mut Option<(usize, usize)>,
 ) -> (egui::Response, bool) {
+    ime_line(ui, id_src, buf, preedit, true, None)
+}
+
+/// 与 [`ime_singleline`] 相同。`frame` 为 false 时去掉输入框自己的边，嵌进已经画好的圆角条里。
+pub(crate) fn ime_line(
+    ui: &mut egui::Ui,
+    id_src: &str,
+    buf: &mut String,
+    preedit: &mut Option<(usize, usize)>,
+    frame: bool,
+    hint: Option<&'static str>,
+) -> (egui::Response, bool) {
     let id = egui::Id::new(id_src);
     ime_apply_events(ui, id, buf, preedit);
-    let out = egui::TextEdit::singleline(buf)
+    let mut edit = egui::TextEdit::singleline(buf)
         .id(id)
-        .desired_width(f32::INFINITY)
-        .show(ui);
+        .desired_width(f32::INFINITY);
+    if !frame {
+        edit = edit.frame(egui::Frame::NONE);
+    }
+    if let Some(hint) = hint {
+        edit = edit.hint_text(hint);
+    }
+    let out = edit.show(ui);
     let resp = out.response.response; // TextEditOutput.response 是 AtomLayoutResponse，取其内层 Response
                                       // 回车提交：egui 单行不消费回车事件（`lost_focus()+key_pressed(Enter)` 官方惯用法），
                                       // 聚焦或本帧刚失焦时读到回车即视为提交，比单看 lost_focus 更可靠。
