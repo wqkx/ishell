@@ -206,6 +206,8 @@ pub fn view_context_menu(resp: &egui::Response) {
             },
         );
 
+        local_api_menu(ui);
+
         // 终端程序写剪贴板（OSC 52）
         {
             let mut allow = super::view_state::osc52_allowed();
@@ -309,6 +311,96 @@ pub fn view_context_menu(resp: &egui::Response) {
             ui.close();
         }
     });
+}
+
+/// 监控栏右键菜单里的「本机 API」：开关、当前状态、复制地址与令牌文件路径。
+/// 和 MCP 开关互相独立，关掉或打开都立刻生效。
+fn local_api_menu(ui: &mut egui::Ui) {
+    use crate::store::ApiState;
+
+    let enabled = crate::store::load_api_enabled();
+    let state = crate::store::api_state();
+    let icon = if matches!(state, ApiState::Listening { .. }) {
+        egui_phosphor::regular::PLUGS_CONNECTED
+    } else {
+        egui_phosphor::regular::PLUGS
+    };
+    ui.menu_button(
+        format!(
+            "{}  {}",
+            icon,
+            crate::i18n::tr("本机 API", "Local API")
+        ),
+        |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            ui.set_min_width(MENU_MIN_W);
+            let (color, status) = match &state {
+                ApiState::Listening { port } => (Palette::OK, format!("127.0.0.1:{port}")),
+                ApiState::Starting => (
+                    Palette::WARN,
+                    crate::i18n::tr("启动中…", "starting…").to_string(),
+                ),
+                ApiState::Failed(_) => (
+                    Palette::DANGER,
+                    crate::i18n::tr("启动失败", "failed to start").to_string(),
+                ),
+                ApiState::Off => (
+                    Palette::TEXT_DIM,
+                    crate::i18n::tr("已关闭", "off").to_string(),
+                ),
+            };
+            let status_label = ui.label(RichText::new(status).color(color).size(11.0));
+            if let ApiState::Failed(reason) = &state {
+                status_label.on_hover_text(reason);
+            }
+
+            let mut on = enabled;
+            if ui
+                .checkbox(
+                    &mut on,
+                    crate::i18n::tr(
+                        "开启本机 API（立即生效）",
+                        "Enable Local API (takes effect now)",
+                    ),
+                )
+                .on_hover_text(crate::i18n::tr(
+                    "开启后，本机的其它程序（尤其是本地 AI agent）可以通过 HTTP API 控制 iShell，能力与 MCP 相同。\n\
+                     · 只监听 127.0.0.1；令牌每次开启随机生成，写在 ~/.config/ishell/api.json（仅本人可读）\n\
+                     · 持有令牌的本机进程就能用——只在你信任本机其它程序时开启\n\
+                     · 与 MCP 开关互相独立；只能读写 API 调用方自己开的会话，看不到你的窗口",
+                    "Lets other programs on this computer (especially local AI agents) control iShell over an \
+                     HTTP API, with the same capabilities as MCP.\n\
+                     · Listens on 127.0.0.1 only; the token is random per enable and stored in \
+                     ~/.config/ishell/api.json (owner-only)\n\
+                     · Any local process that holds the token can use it — enable only if you trust the other \
+                     programs on this machine\n\
+                     · Independent of the MCP switch; a caller can only touch sessions it opened itself",
+                ))
+                .clicked()
+            {
+                crate::store::save_api_enabled(on);
+            }
+            ui.separator();
+            if let ApiState::Listening { port } = state {
+                if ui
+                    .button(crate::i18n::tr("复制 API 地址", "Copy API address"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(format!("http://127.0.0.1:{port}"));
+                    ui.close();
+                }
+            }
+            if let Some(p) = crate::store::api_info_path() {
+                if ui
+                    .button(crate::i18n::tr("复制令牌文件路径", "Copy token file path"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(p.display().to_string());
+                    ui.close();
+                }
+            }
+        },
+    );
 }
 
 /// 「关于」弹框：软件名 / 版本 / 主页 / 发布 / 许可 / 技术栈。版本号取自 Cargo.toml（编译期内嵌）。

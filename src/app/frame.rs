@@ -35,7 +35,7 @@ impl App {
     /// 3. 续下一帧——最小化时 eframe 会把重绘节流到 ≥100ms，但**前提是应用还在请求重绘**，
     ///    不续就直接睡死了。
     pub(super) fn pump_background(&mut self, ctx: &egui::Context) {
-        // 本机 API 的起停跟着左侧面板的开关走（最小化时同样要响应，所以放在这条路径上）。
+        // 本机 API 的起停跟着右键菜单里的开关走（最小化时同样要响应，所以放在这条路径上）。
         self.local_api.sync(&self.runtime, ctx);
         if matches!(crate::store::api_state(), crate::store::ApiState::Listening { .. }) {
             // 与下面“远端输出唤醒”同一个原因：后台线程的 request_repaint 在空闲窗口里会丢，

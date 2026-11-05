@@ -3,7 +3,7 @@
 //!
 //! 和 MCP 的区别只在“怎么进来”：
 //! - MCP 经 SSH 反向转发给服务器上的 agent，靠**进程祖先**认主人；
-//! - 本机 API 面向本机进程，没有祖先可认，门只有一把**令牌**——所以有独立开关（左侧面板，默认关），
+//! - 本机 API 面向本机进程，没有祖先可认，门只有一把**令牌**——所以有独立开关（监控栏右键菜单，默认关），
 //!   令牌每次开启随机生成，只写进 `~/.config/ishell/api.json`（Unix 上 0600）。
 //!
 //! 安全模型（为什么这样写）：
@@ -208,81 +208,6 @@ async fn serve(listener: TcpListener, shared: Arc<Shared>) {
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
         }
     }
-}
-
-// ───────────────────────────── 左侧面板的开关 ─────────────────────────────
-
-/// 左侧面板底部的“本机 API”开关行：点一下开/关（写入设置、立即生效），状态一眼可见。
-pub(super) fn sidebar_toggle(ui: &mut egui::Ui) {
-    use crate::i18n::tr;
-    use crate::theme::Palette;
-    use egui::RichText;
-
-    let enabled = store::load_api_enabled();
-    let state = store::api_state();
-    let (dot, status): (egui::Color32, String) = match (&state, enabled) {
-        (ApiState::Listening { port }, _) => (Palette::OK, format!("127.0.0.1:{port}")),
-        (ApiState::Starting, _) => (Palette::WARN, tr("启动中…", "starting…").into()),
-        (ApiState::Failed(_), _) => (Palette::DANGER, tr("启动失败", "failed").into()),
-        (ApiState::Off, _) => (Palette::TEXT_DIM, tr("已关闭", "off").into()),
-    };
-    let icon = if matches!(state, ApiState::Listening { .. }) {
-        egui_phosphor::regular::PLUGS_CONNECTED
-    } else {
-        egui_phosphor::regular::PLUGS
-    };
-    ui.add_space(4.0);
-    let resp = ui
-        .horizontal(|ui| {
-            let b = ui.add(
-                egui::Button::new(
-                    RichText::new(format!("{icon}  {}", tr("本机 API", "Local API"))).color(Palette::TEXT),
-                )
-                .fill(if enabled { Palette::ACCENT_SOFT } else { Palette::PANEL_2 }),
-            );
-            ui.label(RichText::new("●").color(dot).size(11.0));
-            ui.label(RichText::new(status).color(Palette::TEXT_DIM).size(11.0));
-            b
-        })
-        .inner;
-    let tip = match &state {
-        ApiState::Failed(m) => m.clone(),
-        _ => tr(
-            "开启后，本机的其它程序（尤其是本地 AI agent）可以通过 HTTP API 控制 iShell，能力与 MCP 相同。\n\
-             · 只监听 127.0.0.1；令牌每次开启随机生成，写在 ~/.config/ishell/api.json（仅本人可读）\n\
-             · 持有令牌的本机进程就能用——只在你信任本机其它程序时开启\n\
-             · 与 MCP 开关互相独立；只能读写 API 调用方自己开的会话，看不到你的窗口\n\
-             · 右键可复制地址",
-            "Lets other programs on this computer (especially local AI agents) control iShell over an \
-             HTTP API, with the same capabilities as MCP.\n\
-             · Listens on 127.0.0.1 only; the token is random per enable and stored in \
-             ~/.config/ishell/api.json (owner-only)\n\
-             · Any local process that holds the token can use it — enable only if you trust the other \
-             programs on this machine\n\
-             · Independent of the MCP switch; a caller can only touch sessions it opened itself\n\
-             · Right-click to copy the address",
-        )
-        .to_string(),
-    };
-    let resp = resp.on_hover_text(tip);
-    if resp.clicked() {
-        store::save_api_enabled(!enabled);
-    }
-    resp.context_menu(|ui| {
-        if let ApiState::Listening { port } = store::api_state() {
-            if ui.button(tr("复制 API 地址", "Copy API address")).clicked() {
-                ui.ctx().copy_text(format!("http://127.0.0.1:{port}"));
-                ui.close();
-            }
-        }
-        if let Some(p) = store::api_info_path() {
-            if ui.button(tr("复制令牌文件路径", "Copy token file path")).clicked() {
-                ui.ctx().copy_text(p.display().to_string());
-                ui.close();
-            }
-        }
-    });
-    ui.add_space(2.0);
 }
 
 // ───────────────────────────── HTTP 解析 ─────────────────────────────

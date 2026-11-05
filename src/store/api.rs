@@ -37,7 +37,7 @@ pub fn api_info_path() -> Option<PathBuf> {
 /// 进程内缓存：`-1` 未读盘，`0/1` 已知（帧循环每帧都要读，不能每次读文件）。
 static API_ENABLED: AtomicI8 = AtomicI8::new(-1);
 
-/// 本机 API 是否开启。**默认关**；只有用户在左侧面板点开才写 `1`。
+/// 本机 API 是否开启。**默认关**；只有用户在监控栏右键菜单里点开才写 `1`。
 pub fn load_api_enabled() -> bool {
     match API_ENABLED.load(Ordering::Relaxed) {
         0 => false,

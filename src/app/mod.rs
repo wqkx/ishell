@@ -137,7 +137,7 @@ pub struct App {
     logo: bool,
     /// AI/MCP 控制通道：本地 socket 收到的请求队列（未开启该功能时是个永远空的通道）
     mcp_rx: tokio::sync::mpsc::UnboundedReceiver<mcp_bridge::McpCall>,
-    /// 本机 API（HTTP，回环）：跟着左侧面板的开关起停，业务请求走同一条 `mcp_rx` 通道。
+    /// 本机 API（HTTP，回环）：跟着右键菜单里的开关起停，业务请求走同一条 `mcp_rx` 通道。
     local_api: local_api::ApiService,
     /// AI 请求 `open_session` 时待用户确认的一条连接请求（同一时刻只允许一条待确认）
     pending_open_consent: Option<mcp_bridge::PendingOpenConsent>,
@@ -453,14 +453,8 @@ impl App {
                         ui.id().with("sidebar_bg"),
                         egui::Sense::click(),
                     );
-                    // 监控栏右键：语言 / 字体大小 / 折叠开关 / 强制 X11 的统一入口
+                    // 监控栏右键：语言 / 字体大小 / 折叠开关 / 本机 API / 强制 X11 的统一入口
                     view_context_menu(&bg);
-                    // 左侧面板底部：本机 API 开关（无论有没有连接都在）
-                    egui::Panel::bottom("sidebar_local_api")
-                        .resizable(false)
-                        .show_separator_line(false)
-                        .frame(egui::Frame::new())
-                        .show_inside(ui, |ui| local_api::sidebar_toggle(ui));
                     match self.active {
                         Some(idx) if idx < self.sessions.len() => {
                             let s = &mut self.sessions[idx];

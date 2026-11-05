@@ -2657,7 +2657,7 @@ impl App {
         // 设置里关掉 MCP 后立刻拒绝业务请求。监听 socket 仍要等重启才撤，
         // 但用户把开关拧掉的意图是「现在别再动我的终端」，不能再等一次重启才生效。
         if call.via_api {
-            // 本机 API 有自己的开关（左侧面板）：与 MCP 的授权互不相通，关掉任何一个都不影响另一个。
+            // 本机 API 有自己的开关（监控栏右键菜单）：与 MCP 的授权互不相通，关掉任何一个都不影响另一个。
             if !crate::store::load_api_enabled() {
                 let id = call.req.id;
                 let _ = call.resp_tx.send(McpResponse {
