@@ -410,22 +410,32 @@ fn path_bar(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
-            ui.set_min_height(22.0);
-            if let Some(p) = crate::ui::file_panel::path_crumbs(
-                ui,
-                &mut crate::ui::file_panel::Crumbs {
-                    cwd: &w.path,
-                    edit: &mut w.path_edit,
-                    focus: &mut w.path_edit_focus,
-                    rsel: &mut w.path_edit_rsel,
-                    ime: &mut w.path_edit_ime,
-                    pending: &mut w.pending_nav,
-                    trail: &mut w.path_trail,
-                    id_salt: "usage_path_edit",
+            // 面包屑内部是「不收缩」的横向滚动区。文件区工具栏自己只有一行高，
+            // 所以那里没问题；这里如果把剩余高度都交给它，路径栏会铺满整个窗口，
+            // 磁盘、列表和搜索都被挤到窗口外面。
+            let row_h = ui.spacing().interact_size.y.max(22.0);
+            let width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, row_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    if let Some(p) = crate::ui::file_panel::path_crumbs(
+                        ui,
+                        &mut crate::ui::file_panel::Crumbs {
+                            cwd: &w.path,
+                            edit: &mut w.path_edit,
+                            focus: &mut w.path_edit_focus,
+                            rsel: &mut w.path_edit_rsel,
+                            ime: &mut w.path_edit_ime,
+                            pending: &mut w.pending_nav,
+                            trail: &mut w.path_trail,
+                            id_salt: "usage_path_edit",
+                        },
+                    ) {
+                        *go = Some(UsageKind::Level { path: p });
+                    }
                 },
-            ) {
-                *go = Some(UsageKind::Level { path: p });
-            }
+            );
         });
 }
 
@@ -440,7 +450,7 @@ fn disk_section(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
     let current = current_mount(&w.path, &w.mounts);
     egui::ScrollArea::vertical()
         .id_salt("usage_disks")
-        .max_height(96.0)
+        .max_height(156.0)
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
@@ -555,8 +565,16 @@ fn nest_level(mounts: &[MountPoint], idx: usize) -> usize {
     mounts
         .iter()
         .enumerate()
-        .filter(|(j, m)| *j != idx && path_on_mount(path, &m.path) && m.path != *path)
+        .filter(|(j, m)| {
+            *j != idx && m.path != *path && !is_fs_root(&m.path) && path_on_mount(path, &m.path)
+        })
         .count()
+}
+
+/// `/` 和 `C:` 是整机的根，不算某一块盘的父级，否则每块盘都会缩进一层。
+fn is_fs_root(path: &str) -> bool {
+    let t = path.trim_end_matches(['/', '\\']);
+    t.is_empty() || (t.len() == 2 && t.as_bytes().get(1) == Some(&b':'))
 }
 
 fn summary_row(ui: &mut egui::Ui, w: &UsageWin) {
@@ -934,5 +952,111 @@ fn path_on_mount(path: &str, mount: &str) -> bool {
     match path.strip_prefix(m) {
         Some(rest) => rest.starts_with('/') || rest.starts_with('\\'),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount(path: &str) -> MountPoint {
+        MountPoint {
+            path: path.into(),
+            label: "ext4".into(),
+            size: 100,
+            used: 40,
+            avail: 60,
+        }
+    }
+
+    #[test]
+    fn root_does_not_indent_every_disk() {
+        let mounts = vec![
+            mount("/"),
+            mount("/boot"),
+            mount("/boot/efi"),
+            mount("/mnt/sda1"),
+        ];
+        assert_eq!(nest_level(&mounts, 0), 0);
+        assert_eq!(nest_level(&mounts, 1), 0);
+        assert_eq!(nest_level(&mounts, 2), 1);
+        assert_eq!(nest_level(&mounts, 3), 0);
+    }
+
+    /// 路径栏里的横向滚动区会占满「剩余高度」。钉成一行之后，下面的搜索框必须还在窗口里。
+    #[test]
+    fn path_bar_does_not_swallow_the_window() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut w = UsageWin::new(1, "/home/wangqi/snap/code".into(), "/home/wangqi".into());
+        w.mounts = vec![mount("/"), mount("/boot/efi"), mount("/mnt/sda1")];
+        w.level = Some(LevelReport {
+            path: w.path.clone(),
+            total: 1000,
+            rows: vec![UsageRow {
+                name: "src".into(),
+                path: "/home/wangqi/snap/code/src".into(),
+                size: 400,
+                is_dir: true,
+            }],
+            omitted: 0,
+            omitted_bytes: 0,
+            partial: false,
+            denied: 0,
+        });
+        let mut cursor_before_path = 0.0f32;
+        let mut cursor_after_path = 0.0f32;
+        let mut content_bottom = 0.0f32;
+        let screen_h = 480.0f32;
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(520.0, screen_h),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::window(&ui.ctx().global_style())
+                            .fill(Palette::PANEL)
+                            .inner_margin(12),
+                    )
+                    .show_inside(ui, |ui| {
+                        let mut go = None;
+                        let mut close = false;
+                        let mut clear = false;
+                        title_row(ui, &mut close);
+                        ui.add_space(8.0);
+                        disk_section(ui, &w, &mut go);
+                        ui.add_space(8.0);
+                        cursor_before_path = ui.cursor().top();
+                        path_bar(ui, &mut w, &mut go);
+                        cursor_after_path = ui.cursor().top();
+                        ui.add_space(10.0);
+                        summary_row(ui, &w);
+                        let avail = ui.available_height();
+                        let list_h = if avail.is_finite() {
+                            (avail - 48.0).max(96.0)
+                        } else {
+                            260.0
+                        };
+                        ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), list_h),
+                            egui::Sense::hover(),
+                        );
+                        ui.add_space(8.0);
+                        search_bar(ui, &mut w, &mut go, &mut clear);
+                        content_bottom = ui.cursor().top();
+                    });
+            });
+        }
+        let path_h = cursor_after_path - cursor_before_path;
+        assert!(path_h < 48.0, "路径栏又把窗口撑满了，这一行高 {path_h}px");
+        assert!(
+            content_bottom <= screen_h + 4.0,
+            "列表和搜索被挤出窗口：内容底边 {content_bottom}px，窗口 {screen_h}px"
+        );
     }
 }

@@ -291,7 +291,7 @@ pub fn parse_df(text: &str) -> Vec<MountPoint> {
             continue;
         }
         let mount = cols[mount_at..].join(" ");
-        if mount.is_empty() {
+        if mount.is_empty() || !is_presented_mount(&mount) {
             continue;
         }
         let Ok(blocks) = blocks.parse::<u64>() else {
@@ -324,6 +324,24 @@ fn df_scale(header: &str) -> u64 {
     } else {
         512
     }
+}
+
+/// 系统自己的挂载点，不是用户要看的磁盘：运行时目录、snap、临时盘。
+fn is_presented_mount(path: &str) -> bool {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let path = if trimmed.is_empty() { path } else { trimmed };
+    const HIDE: &[&str] = &[
+        "/run",
+        "/dev",
+        "/sys",
+        "/proc",
+        "/tmp",
+        "/snap",
+        "/var/snap",
+    ];
+    !HIDE
+        .iter()
+        .any(|pre| path == *pre || path.starts_with(&format!("{pre}/")))
 }
 
 fn is_virtual_fs(name: &str) -> bool {
@@ -871,7 +889,7 @@ fn linux_mounts() -> Option<Vec<MountPoint>> {
         let _dev = cols.next()?;
         let mount = unescape_proc(cols.next()?);
         let fstype = cols.next().unwrap_or("");
-        if is_virtual_fs(fstype) || !seen.insert(mount.clone()) {
+        if is_virtual_fs(fstype) || !is_presented_mount(&mount) || !seen.insert(mount.clone()) {
             continue;
         }
         let (size, used, avail) = statvfs_bytes(&mount).unwrap_or((0, 0, 0));
@@ -1030,6 +1048,22 @@ Filesystem Type 1B-blocks Used Available Use% Mounted on
         let m = parse_df(text);
         let paths: Vec<_> = m.iter().map(|x| x.path.as_str()).collect();
         assert_eq!(paths, vec!["/", "/boot", "/boot/efi"]);
+    }
+
+    #[test]
+    fn mounts_hide_runtime_and_snap() {
+        let text = "\
+Filesystem Type 1B-blocks Used Available Use% Mounted on
+/dev/sda1 ext4 100 40 50 40% /
+/dev/sdb1 vfat 100 10 80 10% /boot/efi
+tmpfs tmpfs 100 1 90 1% /run
+/dev/loop0 squashfs 100 100 0 100% /snap/code/1
+/dev/sda2 ext4 100 20 70 20% /var/snap/firefox/common/host-hunspell
+/dev/sdc1 ext4 100 30 60 30% /mnt/sda1
+";
+        let mounts = parse_df(text);
+        let paths: Vec<_> = mounts.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, vec!["/", "/boot/efi", "/mnt/sda1"]);
     }
 
     #[test]
