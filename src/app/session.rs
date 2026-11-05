@@ -97,6 +97,9 @@ pub(super) struct Session {
     /// 拉起这次 `open_session` 的那个终端会话。有值时这个会话不单独占标签，折进父会话的标签里。
     /// 父会话自己也可能是 AI 开的，标签条显示时再往上走到用户的那个标签。
     pub(super) parent_uid: Option<u64>,
+    /// 用户右键这个标签选的颜色。只挂在这张标签上：断线重连还在，关掉就没了。
+    /// 折进去的 AI 窗口没有自己的标签，颜色记在根会话上。
+    pub(super) tab_color: Option<super::tab_color::TabColor>,
     /// AI/MCP 控制通道正在等待完成的文件读写（write_file/read_file/copy_to_remote/
     /// copy_from_remote/copy_between_sessions）。允许同一会话同时挂多个——SFTP 天然支持
     /// 并发，worker 侧也已有 `MAX_CONCURRENT_XFER` 并发+排队，所以这里放成一个列表让 AI
@@ -537,6 +540,7 @@ impl App {
             ai_owner: None,
             ai_owner_label: None,
             parent_uid: None,
+            tab_color: None,
             osc7_injected: false,
             pending_file_ops: Vec::new(),
             file_op_tombstones: std::collections::VecDeque::new(),

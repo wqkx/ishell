@@ -147,6 +147,8 @@ impl App {
                             let mut drag_w = 0.0f32; // 被拖标签宽度，用于算其跟手中心
                             let mut any_group = false;
                             let mut open_menu: Option<(u64, egui::Pos2)> = None;
+                            let mut color_pick: Option<(u64, Option<super::tab_color::TabColor>)> =
+                                None;
                             // 先取出标量字段，避免在借用 self.sessions 的循环里再借 self
                             let dragging_tab = self.tabbar.drag;
                             let grab_dx = self.tabbar.grab_dx;
@@ -271,6 +273,16 @@ impl App {
                                             title_dup.then_some(s.uid),
                                             s.ai_owner_label.as_deref(),
                                         );
+                                        if let Some(c) = s.tab_color {
+                                            let (zh, en) = c.label();
+                                            tip.push_str(" · ");
+                                            tip.push_str(crate::i18n::tr(zh, en));
+                                        }
+                                        tip.push('\n');
+                                        tip.push_str(crate::i18n::tr(
+                                            "右键设置颜色",
+                                            "Right-click to set a color",
+                                        ));
                                         if has_kids {
                                             tip.push_str(" · ");
                                             tip.push_str(&crate::i18n::tr(
@@ -305,14 +317,8 @@ impl App {
                                             egui::Id::new(("tabclose", s.uid)),
                                             Sense::click(),
                                         );
-                                        // 绘制
-                                        let fill = if dragging_this {
-                                            Palette::ACCENT_SOFT
-                                        } else if selected {
-                                            Palette::PANEL
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        };
+                                        // 绘制。有颜色时铺一层浅色，没选中的标签也不再透明，颜色才看得出来。
+                                        let fill = tab_fill(dragging_this, selected, s.tab_color);
                                         let p = ui.painter();
                                         p.rect_filled(
                                             tab_rect,
@@ -324,6 +330,25 @@ impl App {
                                             },
                                             fill,
                                         );
+                                        if let Some(c) = s.tab_color {
+                                            // 顶上一条实色，像文件夹颜色标签：浅底上单靠混色不够认。
+                                            p.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    tab_rect.min,
+                                                    egui::pos2(
+                                                        tab_rect.right(),
+                                                        tab_rect.top() + 3.0,
+                                                    ),
+                                                ),
+                                                egui::CornerRadius {
+                                                    nw: 6,
+                                                    ne: 6,
+                                                    sw: 0,
+                                                    se: 0,
+                                                },
+                                                c.rgb(),
+                                            );
+                                        }
                                         // 激活标签底部 2px 珊瑚下划线（更清晰的激活指示）
                                         if selected && !dragging_this {
                                             let y = tab_rect.bottom() - 1.0;
@@ -359,10 +384,23 @@ impl App {
                                                 egui::Id::new(("tabdot", s.uid)),
                                                 Sense::click(),
                                             );
+                                            offer_tab_color(
+                                                &dot_resp,
+                                                s.uid,
+                                                s.tab_color,
+                                                &mut color_pick,
+                                            );
                                             dot_resp.clicked()
                                         } else {
                                             false
                                         };
+                                        offer_tab_color(&resp, s.uid, s.tab_color, &mut color_pick);
+                                        offer_tab_color(
+                                            &close_resp,
+                                            s.uid,
+                                            s.tab_color,
+                                            &mut color_pick,
+                                        );
                                         let tcolor = if selected {
                                             Palette::TEXT
                                         } else {
@@ -433,6 +471,11 @@ impl App {
                             if any_group {
                                 ui.ctx()
                                     .request_repaint_after(std::time::Duration::from_millis(32));
+                            }
+                            if let Some((uid, color)) = color_pick {
+                                if let Some(s) = self.sessions.iter_mut().find(|s| s.uid == uid) {
+                                    s.tab_color = color;
+                                }
                             }
                             if let Some((uid, anchor)) = open_menu {
                                 self.tab_menu = Some(super::TabMenu {
@@ -605,6 +648,89 @@ impl App {
             self.tab_menu = None;
         }
     }
+}
+
+/// 标签底色。没设颜色时保持原来的样子：选中是白卡片，其余透明。
+fn tab_fill(
+    dragging: bool,
+    selected: bool,
+    color: Option<super::tab_color::TabColor>,
+) -> egui::Color32 {
+    match (dragging, color, selected) {
+        (true, Some(c), _) => c.tint(Palette::ACCENT_SOFT, 0.35),
+        (true, None, _) => Palette::ACCENT_SOFT,
+        (false, Some(c), true) => c.tint(Palette::PANEL, 0.20),
+        (false, Some(c), false) => c.tint(Palette::PANEL_2, 0.34),
+        (false, None, true) => Palette::PANEL,
+        (false, None, false) => egui::Color32::TRANSPARENT,
+    }
+}
+
+/// 右键标签弹出颜色。圆点、关闭钮盖在标签上面，右键落在它们身上也要能打开同一份菜单。
+fn offer_tab_color(
+    resp: &egui::Response,
+    uid: u64,
+    current: Option<super::tab_color::TabColor>,
+    pick: &mut Option<(u64, Option<super::tab_color::TabColor>)>,
+) {
+    use super::tab_color::TabColor;
+
+    resp.context_menu(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.label(
+            RichText::new(crate::i18n::tr("标签颜色", "Tab color"))
+                .color(Palette::TEXT_DIM)
+                .size(11.0),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if color_swatch(ui, None, current.is_none(), crate::i18n::tr("无", "None")).clicked() {
+                *pick = Some((uid, None));
+                ui.close();
+            }
+            for c in TabColor::ALL {
+                let (zh, en) = c.label();
+                if color_swatch(
+                    ui,
+                    Some(c.rgb()),
+                    current == Some(c),
+                    crate::i18n::tr(zh, en),
+                )
+                .clicked()
+                {
+                    *pick = Some((uid, Some(c)));
+                    ui.close();
+                }
+            }
+        });
+    });
+}
+
+/// 一颗颜色点。`fill = None` 是「无」：空心加一道斜线。当前选中的外面再套一圈。
+fn color_swatch(
+    ui: &mut egui::Ui,
+    fill: Option<egui::Color32>,
+    on: bool,
+    tip: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 22.0), Sense::click());
+    let center = rect.center();
+    let p = ui.painter();
+    let r = if resp.hovered() { 7.2 } else { 6.4 };
+    if let Some(c) = fill {
+        p.circle_filled(center, r, c);
+    } else {
+        p.circle_stroke(center, r, egui::Stroke::new(1.2, Palette::TEXT_DIM));
+        let d = r * 0.65;
+        p.line_segment(
+            [center + egui::vec2(-d, d), center + egui::vec2(d, -d)],
+            egui::Stroke::new(1.2, Palette::TEXT_DIM),
+        );
+    }
+    if on {
+        p.circle_stroke(center, r + 2.6, egui::Stroke::new(1.4, Palette::TEXT));
+    }
+    resp.on_hover_text(tip)
 }
 
 /// 连接状态圆点。`grouped` 为 `(正在看 AI 开的窗口, 当前时间)`：

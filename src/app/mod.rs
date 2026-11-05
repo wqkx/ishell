@@ -37,6 +37,7 @@ mod pending;
 mod screenshot;
 mod session;
 mod session_events;
+mod tab_color;
 mod transfers;
 mod windows;
 pub(in crate::app) use mcp_bridge::{PendingAiFileOp, PendingAiRun};
