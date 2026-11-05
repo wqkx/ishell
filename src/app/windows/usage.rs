@@ -21,7 +21,13 @@ pub(in crate::app) struct UsageWin {
     session_uid: u64,
     path: String,
     home: String,
-    path_ime: Option<(usize, usize)>,
+    /// 与文件区路径栏同一套状态：面包屑、双击编辑、单击延时、幽灵子路径。
+    path_edit: Option<String>,
+    path_edit_focus: bool,
+    path_edit_rsel: Option<(usize, usize)>,
+    path_edit_ime: Option<(usize, usize)>,
+    pending_nav: Option<(String, f64)>,
+    path_trail: Option<String>,
     needle: String,
     needle_ime: Option<(usize, usize)>,
     mode: Mode,
@@ -42,7 +48,12 @@ impl UsageWin {
             session_uid,
             path,
             home,
-            path_ime: None,
+            path_edit: None,
+            path_edit_focus: false,
+            path_edit_rsel: None,
+            path_edit_ime: None,
+            pending_nav: None,
+            path_trail: None,
             needle: String::new(),
             needle_ime: None,
             mode: Mode::Level,
@@ -169,7 +180,7 @@ impl App {
         if got.is_empty() {
             return;
         }
-        let editing = ctx.memory(|m| m.focused()) == Some(egui::Id::new("usage_path"));
+        let editing = ctx.memory(|m| m.focused()) == Some(egui::Id::new("usage_path_edit"));
         let Some(w) = self.usage.as_mut() else {
             return;
         };
@@ -177,7 +188,7 @@ impl App {
             match result {
                 Ok(UsageBody::Level(rep)) if w.level_id == Some(id) => {
                     if !editing {
-                        w.path.clone_from(&rep.path);
+                        set_usage_path(w, &rep.path);
                     }
                     w.level = Some(rep);
                     w.level_id = None;
@@ -210,12 +221,21 @@ impl App {
     }
 
     fn usage_go(&mut self, kind: UsageKind) {
+        let home = self
+            .usage
+            .as_ref()
+            .map(|w| w.home.clone())
+            .unwrap_or_default();
+        let tidy = |path: &str| {
+            crate::ui::file_panel::normalize_path(&crate::ui::file_panel::expand_tilde(
+                &home,
+                path.trim(),
+            ))
+        };
         let kind = match kind {
-            UsageKind::Level { path } => UsageKind::Level {
-                path: path.trim().to_string(),
-            },
+            UsageKind::Level { path } => UsageKind::Level { path: tidy(&path) },
             UsageKind::Search { path, needle } => UsageKind::Search {
-                path: path.trim().to_string(),
+                path: tidy(&path),
                 needle,
             },
             UsageKind::Mounts => UsageKind::Mounts,
@@ -259,7 +279,7 @@ impl App {
                 w.error.clear();
                 match &kind {
                     UsageKind::Level { path } => {
-                        w.path.clone_from(path);
+                        set_usage_path(w, path);
                         w.mode = Mode::Level;
                         w.level = None;
                         w.level_id = Some(id);
@@ -301,12 +321,12 @@ fn paint_usage(
     clear_query: &mut bool,
 ) {
     title_row(ui, close);
-    ui.add_space(8.0);
-    location_bar(ui, w, go);
     if !w.mounts.is_empty() {
-        ui.add_space(6.0);
-        disk_row(ui, w, go);
+        ui.add_space(8.0);
+        disk_section(ui, w, go);
     }
+    ui.add_space(8.0);
+    path_bar(ui, w, go);
     ui.add_space(10.0);
     summary_row(ui, w);
     if !w.error.is_empty() {
@@ -369,110 +389,174 @@ fn title_row(ui: &mut egui::Ui, close: &mut bool) {
     });
 }
 
-fn location_bar(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
-    use egui_phosphor::regular as icon;
-    let mut entered = false;
-    inset_bar(ui, 32.0, |ui| {
-        let parent = crate::usage::parent_path(&w.path);
-        if icon_button(ui, icon::ARROW_UP, tr("上级目录", "Up"), parent.is_some()) {
-            if let Some(path) = parent {
-                *go = Some(UsageKind::Level { path });
-            }
-        }
-        let home_w = if w.home.is_empty() { 0.0 } else { 28.0 };
-        let field_w = (ui.available_width() - home_w).max(40.0);
-        let (_, enter) = ui
-            .allocate_ui_with_layout(
-                egui::vec2(field_w, 24.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    crate::ui::file_panel::ime_line(
-                        ui,
-                        "usage_path",
-                        &mut w.path,
-                        &mut w.path_ime,
-                        false,
-                        None,
-                    )
-                },
-            )
-            .inner;
-        entered = enter;
-        if !w.home.is_empty() && icon_button(ui, icon::HOUSE, tr("主目录", "Home"), true) {
-            *go = Some(UsageKind::Level {
-                path: w.home.clone(),
-            });
-        }
-    });
-    if entered {
-        *go = Some(UsageKind::Level {
-            path: w.path.clone(),
-        });
+fn set_usage_path(w: &mut UsageWin, path: &str) {
+    let path =
+        crate::ui::file_panel::normalize_path(&crate::ui::file_panel::expand_tilde(&w.home, path));
+    if path == w.path {
+        return;
     }
+    let prev = w.path.clone();
+    crate::ui::file_panel::update_trail(&path, &prev, &mut w.path_trail);
+    w.path = path;
+    w.path_edit = None;
+    w.path_edit_focus = false;
+    w.pending_nav = None;
 }
 
-fn disk_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
-    let current = current_mount(&w.path, &w.mounts);
-    egui::ScrollArea::horizontal()
-        .id_salt("usage_mounts")
-        .max_height(28.0)
+/// 文件区同款路径栏：分段按钮，单击进入，双击编辑，右键复制/粘贴。
+fn path_bar(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
+    egui::Frame::new()
+        .fill(Palette::PANEL_2)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.horizontal(|ui| {
-                for (i, m) in w.mounts.iter().enumerate() {
-                    if disk_chip(ui, m, current == Some(i)) {
-                        *go = Some(UsageKind::Level {
-                            path: m.path.clone(),
-                        });
-                    }
-                }
-            });
+            ui.set_min_height(22.0);
+            if let Some(p) = crate::ui::file_panel::path_crumbs(
+                ui,
+                &mut crate::ui::file_panel::Crumbs {
+                    cwd: &w.path,
+                    edit: &mut w.path_edit,
+                    focus: &mut w.path_edit_focus,
+                    rsel: &mut w.path_edit_rsel,
+                    ime: &mut w.path_edit_ime,
+                    pending: &mut w.pending_nav,
+                    trail: &mut w.path_trail,
+                    id_salt: "usage_path_edit",
+                },
+            ) {
+                *go = Some(UsageKind::Level { path: p });
+            }
         });
 }
 
-fn disk_chip(ui: &mut egui::Ui, m: &MountPoint, selected: bool) -> bool {
-    let label = short_label(&mount_label(&m.path));
-    let color = if selected {
-        Palette::ACCENT
-    } else {
-        Palette::TEXT_DIM
-    };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label, egui::FontId::proportional(12.0), color);
-    let width = galley.size().x + 16.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
-    let bg = if selected {
-        Palette::ACCENT_SOFT
-    } else if resp.hovered() {
-        Palette::CARD
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    if bg != egui::Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 11.0, bg);
-    }
-    let pos = egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5);
-    ui.painter().galley(pos, galley, color);
-    let tip = match crate::i18n::current() {
-        crate::i18n::Lang::Zh => format!(
-            "{}  {}\n已用 {} / 共 {}，可用 {}",
-            m.label,
-            m.path,
-            crate::ui::fmt_bytes(m.used as f64),
-            crate::ui::fmt_bytes(m.size as f64),
-            crate::ui::fmt_bytes(m.avail as f64)
-        ),
-        crate::i18n::Lang::En => format!(
-            "{}  {}\n{} used / {} total, {} free",
-            m.label,
-            m.path,
-            crate::ui::fmt_bytes(m.used as f64),
-            crate::ui::fmt_bytes(m.size as f64),
-            crate::ui::fmt_bytes(m.avail as f64)
-        ),
-    };
-    resp.on_hover_text(tip).clicked()
+/// 磁盘在路径之上：先选卷，再看这个卷里的目录。子挂载点缩进在父挂载点下面。
+fn disk_section(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
+    ui.label(
+        RichText::new(tr("磁盘", "Disks"))
+            .size(11.0)
+            .color(Palette::TEXT_DIM),
+    );
+    ui.add_space(4.0);
+    let current = current_mount(&w.path, &w.mounts);
+    egui::ScrollArea::vertical()
+        .id_salt("usage_disks")
+        .max_height(96.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            for (i, m) in w.mounts.iter().enumerate() {
+                let indent = nest_level(&w.mounts, i) as f32 * 14.0;
+                if volume_row(ui, m, current == Some(i), indent) {
+                    *go = Some(UsageKind::Level {
+                        path: m.path.clone(),
+                    });
+                }
+            }
+        });
+}
+
+fn volume_row(ui: &mut egui::Ui, m: &MountPoint, selected: bool, indent: f32) -> bool {
+    ui.horizontal(|ui| {
+        if indent > 0.0 {
+            ui.add_space(indent.min(42.0));
+        }
+        let width = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+        let percent = if m.size == 0 {
+            0.0
+        } else {
+            (m.used as f64 / m.size as f64 * 100.0) as f32
+        };
+        let p = ui.painter();
+        p.rect_filled(
+            rect,
+            4.0,
+            if selected {
+                Palette::ACCENT_SOFT
+            } else {
+                Palette::CARD
+            },
+        );
+        if m.size > 0 {
+            let wash = (rect.width() * (percent / 100.0).clamp(0.0, 1.0)).max(3.0);
+            let fill = egui::Rect::from_min_max(
+                egui::pos2(rect.right() - wash, rect.top()),
+                rect.right_bottom(),
+            );
+            p.rect_filled(
+                fill,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(
+                    0xd9,
+                    0x70,
+                    0x49,
+                    if selected { 70 } else { 36 },
+                ),
+            );
+        }
+        p.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(
+                1.0,
+                if selected {
+                    Palette::ACCENT
+                } else {
+                    Palette::BORDER
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let name_rect = egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(8.0, 0.0),
+            egui::pos2(rect.right() - 48.0, rect.bottom()),
+        );
+        p.with_clip_rect(name_rect).text(
+            name_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            &m.path,
+            egui::FontId::proportional(12.0),
+            Palette::TEXT,
+        );
+        if m.size > 0 {
+            p.text(
+                rect.right_center() - egui::vec2(8.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                format!("{percent:.0}%"),
+                egui::FontId::monospace(11.0),
+                Palette::TEXT_DIM,
+            );
+        }
+        let tip = match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!(
+                "{}  {}\n已用 {} / 共 {}，可用 {}",
+                m.label,
+                m.path,
+                crate::ui::fmt_bytes(m.used as f64),
+                crate::ui::fmt_bytes(m.size as f64),
+                crate::ui::fmt_bytes(m.avail as f64)
+            ),
+            crate::i18n::Lang::En => format!(
+                "{}  {}\n{} used / {} total, {} free",
+                m.label,
+                m.path,
+                crate::ui::fmt_bytes(m.used as f64),
+                crate::ui::fmt_bytes(m.size as f64),
+                crate::ui::fmt_bytes(m.avail as f64)
+            ),
+        };
+        resp.on_hover_text(tip).clicked()
+    })
+    .inner
+}
+
+fn nest_level(mounts: &[MountPoint], idx: usize) -> usize {
+    let path = &mounts[idx].path;
+    mounts
+        .iter()
+        .enumerate()
+        .filter(|(j, m)| *j != idx && path_on_mount(path, &m.path) && m.path != *path)
+        .count()
 }
 
 fn summary_row(ui: &mut egui::Ui, w: &UsageWin) {
@@ -813,32 +897,6 @@ fn pct(size: u64, total: u64) -> String {
     } else {
         "0%".into()
     }
-}
-
-fn mount_label(path: &str) -> String {
-    let t = path.trim_end_matches(['/', '\\']);
-    if t.is_empty() {
-        return "/".into();
-    }
-    if t.len() == 2 && t.as_bytes().get(1) == Some(&b':') {
-        return t.to_string();
-    }
-    t.rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(t)
-        .to_string()
-}
-
-fn short_label(s: &str) -> String {
-    let mut n = 0;
-    for (i, _) in s.char_indices() {
-        if n == 16 {
-            return format!("{}…", &s[..i]);
-        }
-        n += 1;
-    }
-    s.to_string()
 }
 
 fn leaf(path: &str) -> &str {

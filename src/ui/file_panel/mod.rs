@@ -9,12 +9,14 @@ use crate::theme::Palette;
 mod dialogs;
 mod ime;
 mod list;
+mod pathbar;
 mod tree;
 mod types;
 
 use dialogs::dialogs;
 pub(crate) use ime::ime_line;
 use list::file_list;
+pub(crate) use pathbar::{show as path_crumbs, Crumbs};
 pub use types::{Dialog, FileAction, FilePanelState, ViewCache};
 use types::{MoveRecord, OpenIntent, Renaming, SortKey};
 
@@ -192,20 +194,7 @@ impl FilePanelState {
     /// 展开路径开头的 `~` 为会话家目录（`~` 或 `~/...`；`~user/...` 不支持，原样返回）。
     /// home 尚未解析到时原样返回（随后 List 会报「无效」并正确落占位，不会误拼路径）。
     pub fn expand_tilde(&self, p: &str) -> String {
-        let t = p.trim();
-        if t == "~" {
-            return if self.home.is_empty() {
-                p.to_string()
-            } else {
-                self.home.clone()
-            };
-        }
-        if let Some(rest) = t.strip_prefix("~/") {
-            if !self.home.is_empty() {
-                return format!("{}/{rest}", self.home.trim_end_matches('/'));
-            }
-        }
-        p.to_string()
+        expand_tilde(&self.home, p)
     }
 
     /// 列目录失败（无效/无权限路径）由 App 调用：标记该路径无效，并写入空列表占位
@@ -478,6 +467,24 @@ pub(super) fn parent_of(path: &str) -> String {
     }
 }
 
+/// 展开路径开头的 `~` 为会话家目录（`~` 或 `~/...`；`~user/...` 不支持，原样返回）。
+pub(crate) fn expand_tilde(home: &str, p: &str) -> String {
+    let t = p.trim();
+    if t == "~" {
+        return if home.is_empty() {
+            p.to_string()
+        } else {
+            home.to_string()
+        };
+    }
+    if let Some(rest) = t.strip_prefix("~/") {
+        if !home.is_empty() {
+            return format!("{}/{rest}", home.trim_end_matches('/'));
+        }
+    }
+    p.to_string()
+}
+
 /// `prefix` 是否为 `path` 的目录前缀（`/` 或 `prefix/`…）。
 pub(super) fn path_is_prefix(prefix: &str, path: &str) -> bool {
     if prefix == "/" {
@@ -491,20 +498,24 @@ pub(super) fn path_is_prefix(prefix: &str, path: &str) -> bool {
 /// - 沿 trail 下钻 / 上移但仍是前缀 → 保留 trail
 /// - 切到旁支、或 cwd 已等于 trail 末端 → 清除
 pub(super) fn update_path_trail(state: &mut FilePanelState) {
-    let cwd = normalize_path(&state.cwd);
-    let prev = normalize_path(&state.nav_prev);
-    if let Some(trail) = state.path_trail.clone() {
-        let trail = normalize_path(&trail);
-        if cwd == trail || !path_is_prefix(&cwd, &trail) {
-            state.path_trail = None;
+    update_trail(&state.cwd, &state.nav_prev, &mut state.path_trail);
+}
+
+/// 目录切换后维护面包屑幽灵子路径。`prev` 是切换前的目录。
+pub(crate) fn update_trail(cwd: &str, prev: &str, trail: &mut Option<String>) {
+    let cwd = normalize_path(cwd);
+    let prev = normalize_path(prev);
+    if let Some(existing) = trail.clone() {
+        let existing = normalize_path(&existing);
+        if cwd == existing || !path_is_prefix(&cwd, &existing) {
+            *trail = None;
         } else {
-            state.path_trail = Some(trail);
+            *trail = Some(existing);
         }
         return;
     }
-    // 无 trail：若从子路径上移到祖先，把离开前的路径记为幽灵
     if !prev.is_empty() && path_is_prefix(&cwd, &prev) && cwd != prev {
-        state.path_trail = Some(prev);
+        *trail = Some(prev);
     }
 }
 
@@ -517,7 +528,7 @@ pub(super) fn join_path(base: &str, name: &str) -> String {
 }
 
 /// 规范化目录路径：去掉末尾多余 "/"；空或全为 "/" 视为根。
-pub(super) fn normalize_path(p: &str) -> String {
+pub(crate) fn normalize_path(p: &str) -> String {
     let t = p.trim();
     if t == "/" || t.is_empty() {
         return "/".into();

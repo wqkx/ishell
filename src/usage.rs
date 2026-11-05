@@ -311,7 +311,8 @@ pub fn parse_df(text: &str) -> Vec<MountPoint> {
             avail: avail.saturating_mul(scale),
         });
     }
-    out.sort_by(|a, b| a.path.len().cmp(&b.path.len()).then(a.path.cmp(&b.path)));
+    // 按路径排序，子挂载点紧跟在父挂载点后面（/boot 后面是 /boot/efi，而不是按长短打散）。
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
@@ -882,7 +883,8 @@ fn linux_mounts() -> Option<Vec<MountPoint>> {
             avail,
         });
     }
-    out.sort_by(|a, b| a.path.len().cmp(&b.path.len()).then(a.path.cmp(&b.path)));
+    // 按路径排序，子挂载点紧跟在父挂载点后面（/boot 后面是 /boot/efi，而不是按长短打散）。
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     Some(out)
 }
 
@@ -1015,6 +1017,19 @@ tmpfs tmpfs 100 10 90 10% /run
         assert_eq!(m[0].path, "/");
         assert_eq!(m[0].size, 1000 * 1024);
         assert_eq!(m[0].label, "ext4");
+    }
+
+    #[test]
+    fn mounts_follow_path_order() {
+        let text = "\
+Filesystem Type 1B-blocks Used Available Use% Mounted on
+/dev/sda1 ext4 100 40 50 40% /
+/dev/sdb1 ext4 100 10 80 10% /boot/efi
+/dev/sda2 ext4 100 20 70 20% /boot
+";
+        let m = parse_df(text);
+        let paths: Vec<_> = m.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, vec!["/", "/boot", "/boot/efi"]);
     }
 
     #[test]
