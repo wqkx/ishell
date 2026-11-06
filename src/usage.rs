@@ -1,9 +1,10 @@
 //! 目录占用分析。
 //!
-//! 一次只统计**当前目录的直接子项**（子目录的大小是它下面的合计），点进去再统计下一层。
-//! 不跟随符号链接，不跨进别的磁盘。这样一份大目录不会在打开窗口时把整棵树都读进内存。
+//! 点「分析」会把这棵树里每个文件、每个子目录的大小都留下。界面一次只铺当前目录的直接子项，
+//! 点进任意一层都用已经留下的数字，不再重算。不跟随符号链接，不跨进别的磁盘。
+//! 遍历超过 [`WALK_CAP`] 个目录项就停下，并标明数字不完整。
 //!
-//! 本机用 Rust 自己遍历（可中途停下）。远端走一条 `du`/`find`，输出在解析时只留下最大的若干项。
+//! 本机用 Rust 自己遍历（可中途停下）。远端一条 GNU `du -a` 把整棵树的大小打出来。
 
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
@@ -13,8 +14,6 @@ use crate::i18n::tr;
 
 /// 界面上最多铺开的行。其余合成一条「其余 N 项」，合计仍然算在总数里。
 const SHOW_CAP: usize = 2000;
-/// 父目录分析时额外留下的子目录大小。进一层后这些目录不用再算。
-const NEST_CAP: usize = 50_000;
 /// 按名称搜索时保留的最大命中数（按大小）。
 const SEARCH_CAP: usize = 500;
 /// 一次遍历最多看多少个目录项。超过就停下并标明数字不完整，避免百万级目录把机器拖死。
@@ -65,7 +64,7 @@ pub struct LevelReport {
     pub partial: bool,
     /// 读不了的目录个数（权限）。
     pub denied: u64,
-    /// 再下一层目录的大小。进子目录时直接用，不再算一遍。
+    /// 这棵树里，当前这一层以下每个文件和每个目录的大小。
     pub nested: Vec<(String, u64)>,
 }
 
@@ -132,21 +131,18 @@ fn base_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// 远端「这一层」的脚本。GNU `du -b` 和 GNU `find -printf`。
+/// 远端整棵树的大小。GNU `du -a -b` 会打出每个文件和每个目录。
 ///
-/// `du -d 1` 不带 `-a` 只打目录，文件的大小被折进总数，名单里就看不见。
-/// 文件单独用 `find` 取最大的 [`SHOW_CAP`] 条，避免一个平铺目录把整份输出拉回来。
+/// 不带 `-a` 时 `du` 只打目录，文件大小被折进总数，下面几层的文件就没有数字。
+/// 目录名单只用来分辨当前这一层里谁是文件夹。
 pub fn remote_level_cmd(path: &str) -> String {
     let q = shell_quote(path);
-    let n = SHOW_CAP;
     format!(
         "root={q}\n\
          echo ISHELL_DU\n\
-         du -x -d 2 -b -- \"$root\"\n\
+         du -x -a -b -- \"$root\"\n\
          echo ISHELL_TY\n\
          find \"$root\" -mindepth 1 -maxdepth 1 -xdev -type d -print\n\
-         echo ISHELL_FI\n\
-         find \"$root\" -mindepth 1 -maxdepth 1 -xdev \\( -type f -o -type l \\) -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | awk -F'\\t' 'NR<={n} {{print; next}} {{rest += $1; extra++}} END {{printf \"ISHELL_FN %d %d\\n\", extra+0, rest+0}}'\n\
          echo ISHELL_END\n"
     )
 }
@@ -246,7 +242,7 @@ fn find_pattern(needle: &str) -> String {
     p
 }
 
-/// 解析 `du -d 1` + 目录名单 + 这一层的文件名单。
+/// 解析 `du -a` 的整棵树，再加上当前这一层的目录名单。
 pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
     let mut phase = 0u8; // 0 还没到 DU，1 du，2 目录名，3 文件
     let mut du_lines: Vec<(u64, String)> = Vec::new();
@@ -313,6 +309,7 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
     let mut saw_total = false;
     let mut rows = Vec::new();
     let mut nested = Vec::new();
+    let mut partial = false;
     for (size, path) in du_lines {
         match under_root(root_trim, &path) {
             Some(Under::Here) => {
@@ -328,8 +325,14 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
                     is_dir,
                 });
             }
-            // 再下一层的目录。进去之后直接显示，不再算一遍。
-            Some(Under::Grand) => nested.push((path, size)),
+            // 再往下的每一层。文件和目录都留下，进去任意深都不用重算。
+            Some(Under::Deeper) => {
+                if nested.len() >= WALK_CAP as usize {
+                    partial = true;
+                } else {
+                    nested.push((path, size));
+                }
+            }
             None => {}
         }
     }
@@ -338,7 +341,6 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
         total = rows.iter().fold(0u64, |a, r| a.saturating_add(r.size));
     }
     let (rows, omitted, omitted_bytes) = take_largest(rows, SHOW_CAP);
-    keep_largest(&mut nested, NEST_CAP);
     let omitted = omitted.saturating_add(file_extra);
     let omitted_bytes = omitted_bytes.saturating_add(file_extra_bytes);
     Ok(UsageBody::Level(LevelReport {
@@ -347,7 +349,7 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
         rows,
         omitted,
         omitted_bytes,
-        partial: false,
+        partial,
         denied: 0,
         nested,
     }))
@@ -356,10 +358,11 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
 enum Under<'a> {
     Here,
     Child(&'a str),
-    Grand,
+    /// 根下面超过一层的路径。文件和目录都算。
+    Deeper,
 }
 
-/// `du` 的一行落在根上、直接子项，还是再下一层。对不上前缀就丢掉，不能当成总数。
+/// `du` 的一行落在根上、直接子项，还是更深处。对不上前缀就丢掉，不能当成总数。
 fn under_root<'a>(root: &str, path: &'a str) -> Option<Under<'a>> {
     let path_trim = path.trim_end_matches(['/', '\\']);
     if path_trim == root || path_trim == "." || path == root {
@@ -372,28 +375,10 @@ fn under_root<'a>(root: &str, path: &'a str) -> Option<Under<'a>> {
         return Some(Under::Here);
     }
     if !rest.contains('/') && !rest.contains('\\') {
-        return Some(Under::Child(rest));
-    }
-    // 只留再下一层（root/a/b），更深的不进名单。
-    let mut seps = 0;
-    for c in rest.chars() {
-        if c == '/' || c == '\\' {
-            seps += 1;
-        }
-    }
-    if seps == 1 {
-        Some(Under::Grand)
+        Some(Under::Child(rest))
     } else {
-        None
+        Some(Under::Deeper)
     }
-}
-
-fn keep_largest(nested: &mut Vec<(String, u64)>, cap: usize) {
-    if nested.len() <= cap {
-        return;
-    }
-    nested.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    nested.truncate(cap);
 }
 
 fn split_size_path(line: &str) -> Option<(u64, &str)> {
@@ -732,8 +717,7 @@ fn scan_level(root: &Path, cancel: &AtomicBool) -> Result<LevelReport, String> {
             );
         }
     }
-    let (dir_rows, mut nested) = size_dirs(dirs, dev, cancel, &stop, &visited, &denied);
-    keep_largest(&mut nested, NEST_CAP);
+    let (dir_rows, nested) = size_dirs(dirs, dev, cancel, &stop, &visited, &denied);
     let kept: Vec<UsageRow> = file_heap.into_iter().map(|s| s.0).collect();
     let kept_bytes = kept.iter().fold(0u64, |a, r| a.saturating_add(r.size));
     let dropped_n = file_n.saturating_sub(kept.len() as u64);
@@ -817,7 +801,7 @@ fn size_dirs(
     (rows, nested)
 }
 
-/// 这一层目录的总大小，以及它里面每个子目录的大小。子目录大小留下来，进去就不用再算。
+/// 这个目录的总大小，以及它里面每一个文件、每一个子目录的大小。
 fn measure_dir(
     path: &Path,
     own: u64,
@@ -827,18 +811,31 @@ fn measure_dir(
     visited: &AtomicU64,
     denied: &AtomicU64,
 ) -> (u64, Vec<(String, u64)>) {
-    let mut total = own;
-    let mut nested = Vec::new();
+    record_tree(path, own, dev, cancel, stop, visited, denied)
+}
+
+/// 走进 `path`。返回值是它自己的总大小（含目录项本身）。名单里是它下面的全部文件和目录。
+fn record_tree(
+    path: &Path,
+    own: u64,
+    dev: u64,
+    cancel: &AtomicBool,
+    stop: &AtomicBool,
+    visited: &AtomicU64,
+    denied: &AtomicU64,
+) -> (u64, Vec<(String, u64)>) {
+    let mut saved = Vec::new();
     if stopped(cancel, stop) {
-        return (total, nested);
+        return (own, saved);
     }
     let rd = match std::fs::read_dir(path) {
         Ok(rd) => rd,
         Err(_) => {
             denied.fetch_add(1, Ordering::Relaxed);
-            return (total, nested);
+            return (own, saved);
         }
     };
+    let mut content = 0u64;
     for ent in rd.flatten() {
         if bump(visited, stop) || stopped(cancel, stop) {
             break;
@@ -851,8 +848,11 @@ fn measure_dir(
                 continue;
             }
         };
+        let shown = child.display().to_string();
         if meta.file_type().is_symlink() {
-            total = total.saturating_add(meta.len());
+            let len = meta.len();
+            content = content.saturating_add(len);
+            saved.push((shown, len));
             continue;
         }
         if other_device(&meta, dev) {
@@ -860,61 +860,16 @@ fn measure_dir(
         }
         let len = meta.len();
         if meta.is_dir() {
-            let inner = dir_bytes(&child, dev, cancel, stop, visited, denied);
-            let sz = len.saturating_add(inner);
-            total = total.saturating_add(sz);
-            nested.push((child.display().to_string(), sz));
+            let (sz, kids) = record_tree(&child, len, dev, cancel, stop, visited, denied);
+            content = content.saturating_add(sz);
+            saved.push((shown, sz));
+            saved.extend(kids);
         } else {
-            total = total.saturating_add(len);
+            content = content.saturating_add(len);
+            saved.push((shown, len));
         }
     }
-    (total, nested)
-}
-
-fn dir_bytes(
-    root: &Path,
-    dev: u64,
-    cancel: &AtomicBool,
-    stop: &AtomicBool,
-    visited: &AtomicU64,
-    denied: &AtomicU64,
-) -> u64 {
-    let mut stack = vec![root.to_path_buf()];
-    let mut total = 0u64;
-    while let Some(dir) = stack.pop() {
-        if stopped(cancel, stop) {
-            break;
-        }
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(_) => {
-                denied.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-        for ent in rd.flatten() {
-            if bump(visited, stop) || stopped(cancel, stop) {
-                return total;
-            }
-            let path = ent.path();
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.file_type().is_symlink() {
-                total = total.saturating_add(meta.len());
-                continue;
-            }
-            if other_device(&meta, dev) {
-                continue;
-            }
-            total = total.saturating_add(meta.len());
-            if meta.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
-    total
+    (own.saturating_add(content), saved)
 }
 
 /// 返回 true 表示已经超过上限，调用方应停。
@@ -1302,6 +1257,7 @@ ISHELL_END
     fn parse_level_keeps_the_next_directory() {
         let text = "\
 ISHELL_DU
+5\t/data/src/lib/a.rs
 15\t/data/src/lib
 40\t/data/src
 100\t/data
@@ -1316,7 +1272,8 @@ ISHELL_END
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0].name, "src");
         assert_eq!(r.rows[0].size, 40);
-        assert_eq!(r.nested, vec![("/data/src/lib".into(), 15)]);
+        assert!(r.nested.contains(&("/data/src/lib".into(), 15)));
+        assert!(r.nested.contains(&("/data/src/lib/a.rs".into(), 5)));
     }
 
     #[test]
@@ -1336,10 +1293,9 @@ ISHELL_END
     #[test]
     fn remote_level_asks_for_files() {
         let cmd = remote_level_cmd("/data");
-        assert!(cmd.contains("-d 2"), "{cmd}");
-        assert!(cmd.contains("ISHELL_FI"), "{cmd}");
-        assert!(cmd.contains("-type f"), "{cmd}");
-        assert!(!cmd.contains("du -a"), "{cmd}");
+        assert!(cmd.contains("du -x -a -b"), "{cmd}");
+        assert!(cmd.contains("ISHELL_TY"), "{cmd}");
+        assert!(!cmd.contains("ISHELL_FI"), "{cmd}");
     }
 
     #[test]
@@ -1433,8 +1389,31 @@ tmpfs tmpfs 100 1 90 1% /run
         assert!(sub.is_dir && sub.size >= 4100, "{sub:?}");
         assert!(!file.is_dir && file.size == 1000);
         let deep = dir.join("sub").join("deep").display().to_string();
+        let deep_file = dir
+            .join("sub")
+            .join("deep")
+            .join("c.txt")
+            .display()
+            .to_string();
+        let inner_file = dir.join("sub").join("b.txt").display().to_string();
         assert!(
             level.nested.iter().any(|(p, s)| p == &deep && *s >= 100),
+            "{:?}",
+            level.nested
+        );
+        assert!(
+            level
+                .nested
+                .iter()
+                .any(|(p, s)| p == &deep_file && *s == 100),
+            "{:?}",
+            level.nested
+        );
+        assert!(
+            level
+                .nested
+                .iter()
+                .any(|(p, s)| p == &inner_file && *s == 4000),
             "{:?}",
             level.nested
         );

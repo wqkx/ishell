@@ -434,8 +434,8 @@ fn remember_level(w: &mut UsageWin, mut rep: LevelReport) -> LevelReport {
                     row.size = disk;
                 }
             }
-            w.known_size.insert(row.path.clone(), row.size);
         }
+        w.known_size.insert(row.path.clone(), row.size);
     }
     w.known_size.insert(path.clone(), rep.total);
     for (child, size) in std::mem::take(&mut rep.nested) {
@@ -971,8 +971,8 @@ fn summary_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
 
 fn headline(w: &UsageWin) -> (String, String) {
     let limits = tr(
-        "只统计当前这一层，点目录再往下。不跟随符号链接，也不进入别的磁盘。",
-        "One level at a time. Click a folder to go deeper. Symlinks and other disks are not followed.",
+        "分析会记下整棵树里每个文件和目录的大小。不跟随符号链接，也不进入别的磁盘。",
+        "Analyze saves every file and folder in the tree. Symlinks and other disks are not followed.",
     );
     if w.level_id.is_some() {
         return (tr("正在分析…", "Analyzing…").into(), limits.into());
@@ -1007,8 +1007,8 @@ fn headline(w: &UsageWin) -> (String, String) {
                 (
                     crate::ui::fmt_bytes(size as f64),
                     tr(
-                        "这是上层分析时记下的大小，里面的目录也带着。文件大小是直接读到的。",
-                        "Saved from the parent folder, including folders inside. File sizes are read directly.",
+                        "这是分析时留下的大小，下面每一层的文件和目录都有。",
+                        "Saved by the scan, including every file and folder below.",
                     )
                     .into(),
                 )
@@ -1720,9 +1720,11 @@ mod tests {
             },
         );
         assert_eq!(saved_size(&w, "/data/src/lib"), Some(25));
+        assert_eq!(saved_size(&w, "/data/src/main.rs"), Some(15));
         assert!(enter_dir(&mut w, "/data/src").is_some());
         assert_eq!(saved_size(&w, "/data/src"), Some(40));
         assert_eq!(saved_size(&w, "/data/src/lib"), Some(25));
+        assert_eq!(saved_size(&w, "/data/src/main.rs"), Some(15));
     }
 
     #[test]
