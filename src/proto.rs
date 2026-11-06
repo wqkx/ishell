@@ -293,6 +293,8 @@ pub enum UiCommand {
         id: u64,
         kind: crate::usage::UsageKind,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// 已扫描的条目数。worker 侧随走随加，界面按帧读出来显示进度；轻量查询不用管。
+        progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     },
     /// 把内嵌的 `ishell-mcp` 代理二进制部署到这台服务器（见 `crate::mcp_embed`）。
     /// 结果经 `WorkerEvent::McpAgentDeployed` 回报。

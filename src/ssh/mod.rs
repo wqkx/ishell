@@ -16,7 +16,7 @@ mod xfer;
 pub(crate) use xfer::util::local_nonexistent;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1006,7 +1006,12 @@ pub async fn run(
                             pending_xfer.push_back(p);
                         }
                     }
-                    Some(UiCommand::UsageQuery { id, kind, cancel }) => {
+                    Some(UiCommand::UsageQuery {
+                        id,
+                        kind,
+                        cancel,
+                        progress,
+                    }) => {
                         let is_level = matches!(kind, crate::usage::UsageKind::Level { .. });
                         let is_list = matches!(
                             kind,
@@ -1028,7 +1033,7 @@ pub async fn run(
                         let s = sink.clone();
                         let flag = cancel.clone();
                         let task = tokio::spawn(async move {
-                            let result = remote_usage(&h, kind, &flag).await;
+                            let result = remote_usage(&h, kind, &flag, &progress).await;
                             match result {
                                 Ok(body) => {
                                     s.send(WorkerEvent::UsageReady { id, result: Ok(body) });
@@ -1090,6 +1095,7 @@ async fn remote_usage(
     handle: &russh::client::Handle<ClientHandler>,
     kind: crate::usage::UsageKind,
     cancel: &AtomicBool,
+    progress: &AtomicU64,
 ) -> Result<crate::usage::UsageBody, String> {
     use crate::usage::{UsageBody, UsageKind};
     // Level 的输出量由远端目录大小决定（du -a 打整棵树），必须流式解析：
@@ -1105,7 +1111,11 @@ async fn remote_usage(
             EXEC_CAPTURE_LIMIT,
             Some(cancel),
             Some("du: "),
-            |line| parser.feed(line),
+            |line| {
+                // 每行一个目录项，行数就是进度。
+                progress.fetch_add(1, Ordering::Relaxed);
+                parser.feed(line);
+            },
         )
         .await
         .map_err(|e| e.to_string())?;

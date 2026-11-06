@@ -162,7 +162,12 @@ pub async fn run(
                         pixel_height: 0,
                     });
                 }
-                Some(UiCommand::UsageQuery { id, kind, cancel }) => {
+                Some(UiCommand::UsageQuery {
+                    id,
+                    kind,
+                    cancel,
+                    progress,
+                }) => {
                     let is_level = matches!(kind, crate::usage::UsageKind::Level { .. });
                     let is_list = matches!(
                         kind,
@@ -185,7 +190,7 @@ pub async fn run(
                     let watch = cancel.clone();
                     let task = tokio::spawn(async move {
                         let joined = tokio::task::spawn_blocking(move || {
-                            crate::usage::run_local(kind, &run_flag)
+                            crate::usage::run_local(kind, &run_flag, &progress)
                         })
                         .await;
                         // 算完了就交回去。进子目录不会停掉这一次，已经算出来的大小要记下来。

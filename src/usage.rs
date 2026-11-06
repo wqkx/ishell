@@ -631,7 +631,12 @@ fn take_largest(mut rows: Vec<UsageRow>, cap: usize) -> (Vec<UsageRow>, u64, u64
 }
 
 /// 本机统计。`cancel` 在遍历中被置位就马上停，不回报。
-pub fn run_local(kind: UsageKind, cancel: &AtomicBool) -> Result<UsageBody, String> {
+/// `progress` 是界面共享的已扫描条目数，遍历一路累加，界面拿它显示进度。
+pub fn run_local(
+    kind: UsageKind,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> Result<UsageBody, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err(String::new());
     }
@@ -643,7 +648,11 @@ pub fn run_local(kind: UsageKind, cancel: &AtomicBool) -> Result<UsageBody, Stri
         }
         UsageKind::Level { path } => {
             path_ok(&path)?;
-            Ok(UsageBody::Level(scan_level(Path::new(&path), cancel)?))
+            Ok(UsageBody::Level(scan_level(
+                Path::new(&path),
+                cancel,
+                progress,
+            )?))
         }
         UsageKind::Search { path, needle } => {
             path_ok(&path)?;
@@ -652,6 +661,7 @@ pub fn run_local(kind: UsageKind, cancel: &AtomicBool) -> Result<UsageBody, Stri
                 Path::new(&path),
                 &needle,
                 cancel,
+                progress,
             )?))
         }
     }
@@ -698,7 +708,11 @@ fn list_names(root: &str) -> Result<NameReport, String> {
     })
 }
 
-fn scan_level(root: &Path, cancel: &AtomicBool) -> Result<LevelReport, String> {
+fn scan_level(
+    root: &Path,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> Result<LevelReport, String> {
     let meta = std::fs::symlink_metadata(root).map_err(|e| io_msg(root, &e))?;
     if cancel.load(Ordering::Relaxed) {
         return Err(String::new());
@@ -726,7 +740,8 @@ fn scan_level(root: &Path, cancel: &AtomicBool) -> Result<LevelReport, String> {
     }
     let dev = dev_of(&meta);
     let stop = AtomicBool::new(false);
-    let visited = AtomicU64::new(0);
+    // 遍历计数与界面共享：它一路涨，界面把它当进度显示。
+    let visited = progress;
     let denied = AtomicU64::new(0);
     let rd = std::fs::read_dir(root).map_err(|e| io_msg(root, &e))?;
     // 文件名只留最大的 SHOW_CAP 条。平铺目录里有几十万个文件时，不必把每个名字都留在内存里。
@@ -739,7 +754,7 @@ fn scan_level(root: &Path, cancel: &AtomicBool) -> Result<LevelReport, String> {
         if stopped(cancel, &stop) {
             break;
         }
-        bump(&visited, &stop);
+        bump(visited, &stop);
         let path = ent.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
@@ -784,7 +799,7 @@ fn scan_level(root: &Path, cancel: &AtomicBool) -> Result<LevelReport, String> {
             );
         }
     }
-    let (dir_rows, nested) = size_dirs(dirs, dev, cancel, &stop, &visited, &denied);
+    let (dir_rows, nested) = size_dirs(dirs, dev, cancel, &stop, visited, &denied);
     let kept: Vec<UsageRow> = file_heap.into_iter().map(|s| s.0).collect();
     let kept_bytes = kept.iter().fold(0u64, |a, r| a.saturating_add(r.size));
     let dropped_n = file_n.saturating_sub(kept.len() as u64);
@@ -954,7 +969,12 @@ fn stopped(cancel: &AtomicBool, stop: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed)
 }
 
-fn scan_search(root: &Path, needle: &str, cancel: &AtomicBool) -> Result<SearchReport, String> {
+fn scan_search(
+    root: &Path,
+    needle: &str,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> Result<SearchReport, String> {
     if !root.is_dir() {
         return Err(io_msg(
             root,
@@ -967,7 +987,7 @@ fn scan_search(root: &Path, needle: &str, cancel: &AtomicBool) -> Result<SearchR
     let needle_l = needle.to_lowercase();
     let ascii = needle.is_ascii();
     let stop = AtomicBool::new(false);
-    let visited = AtomicU64::new(0);
+    let visited = progress;
     let denied = AtomicU64::new(0);
     let mut stack = vec![root.to_path_buf()];
     let mut matched = 0u64;
@@ -985,7 +1005,7 @@ fn scan_search(root: &Path, needle: &str, cancel: &AtomicBool) -> Result<SearchR
             }
         };
         for ent in rd.flatten() {
-            if bump(&visited, &stop) || stopped(cancel, &stop) {
+            if bump(visited, &stop) || stopped(cancel, &stop) {
                 break;
             }
             let path = ent.path();
@@ -1526,15 +1546,18 @@ tmpfs tmpfs 100 1 90 1% /run
         std::fs::write(dir.join("sub").join("b.txt"), vec![2u8; 4000]).unwrap();
         std::fs::write(dir.join("sub").join("deep").join("c.txt"), vec![3u8; 100]).unwrap();
         let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
         let UsageBody::Level(level) = run_local(
             UsageKind::Level {
                 path: dir.display().to_string(),
             },
             &cancel,
+            &progress,
         )
         .unwrap() else {
             panic!("level");
         };
+        assert!(progress.load(Ordering::Relaxed) >= 5);
         let sub = level.rows.iter().find(|r| r.name == "sub").unwrap();
         let file = level.rows.iter().find(|r| r.name == "a.txt").unwrap();
         assert!(sub.is_dir && sub.size >= 4100, "{sub:?}");
@@ -1574,6 +1597,7 @@ tmpfs tmpfs 100 1 90 1% /run
                 needle: "b.txt".into(),
             },
             &cancel,
+            &AtomicU64::new(0),
         )
         .unwrap() else {
             panic!("search");

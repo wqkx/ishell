@@ -2,7 +2,7 @@
 //! 算过的结果按路径留着，进子目录不会重算，除非再点分析。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use egui::RichText;
@@ -68,6 +68,11 @@ pub(in crate::app) struct UsageWin {
     search_id: Option<u64>,
     mount_id: Option<u64>,
     next_id: u64,
+    /// 进行中的 Level 扫描统计的是哪个目录。离开那一页扫描不停（转后台），
+    /// 回来还能看到「分析中」。
+    level_path: String,
+    /// 已扫描条目数。worker 侧随走随加，界面按帧读出来当进度。
+    progress: Arc<AtomicU64>,
     /// 父目录还在统计时进了子目录，结果回来也要记下来。
     level_keep: HashSet<u64>,
     level_cancel: Option<Arc<AtomicBool>>,
@@ -76,6 +81,8 @@ pub(in crate::app) struct UsageWin {
     select_anchor: Option<usize>,
     /// 待确认删除的 (路径, 显示名)。
     confirm_delete: Option<Vec<(String, String)>>,
+    /// 分析中离开本页的跳转确认：目标是这里存的路径，等用户选继续/停止/取消。
+    confirm_nav: Option<String>,
 }
 
 impl UsageWin {
@@ -107,12 +114,15 @@ impl UsageWin {
             search_id: None,
             mount_id: None,
             next_id: 1,
+            level_path: String::new(),
+            progress: Arc::new(AtomicU64::new(0)),
             level_keep: HashSet::new(),
             level_cancel: None,
             list_cancel: None,
             selected: HashSet::new(),
             select_anchor: None,
             confirm_delete: None,
+            confirm_nav: None,
         }
     }
 
@@ -137,8 +147,13 @@ impl UsageWin {
         }
     }
 
+    /// 本页就是那正在进行 Level 扫描的目录：`level_path` 与 `path` 在写入前都已规范化。
+    fn scan_on_page(&self) -> bool {
+        self.level_id.is_some() && self.level_path == self.path
+    }
+
     fn busy(&self) -> bool {
-        self.level_id.is_some() || self.search_id.is_some() || self.names_id.is_some()
+        self.search_id.is_some() || self.names_id.is_some() || self.scan_on_page()
     }
 
     /// 把排队的大小入库一批。返回 true 表示还有剩余，调用方要接着要重绘。
@@ -202,6 +217,10 @@ impl App {
             // 分析带回的深层大小分帧入库；还有剩余就要重绘接着倒。
             if w.drain_known_batch() {
                 ctx.request_repaint();
+            }
+            // 扫描/搜索进行中让进度数字持续跳动。
+            if w.level_id.is_some() || w.search_id.is_some() || w.names_id.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
             }
         }
         if self.usage.is_none() {
@@ -290,17 +309,19 @@ impl App {
         for (id, result) in got {
             match result {
                 Ok(UsageBody::Level(rep)) if w.level_keep.remove(&id) => {
-                    let show = w.level_id == Some(id);
+                    let current = w.level_id == Some(id);
                     let rep = remember_level(w, rep);
-                    if show && !editing && norm_path(&rep.path) == w.path {
-                        w.level = Some(rep);
-                        w.names = None;
-                        w.mode = Mode::Level;
-                        w.selected.clear();
-                        w.select_anchor = None;
-                    }
-                    if show {
+                    if current {
+                        // 结果一到这次扫描就算结束（后台指示也随之消失）；
+                        // 只有人还停在这一页才把结果铺出来，否则只入库。
                         w.level_id = None;
+                        if !editing && norm_path(&rep.path) == w.path {
+                            w.level = Some(rep);
+                            w.names = None;
+                            w.mode = Mode::Level;
+                            w.selected.clear();
+                            w.select_anchor = None;
+                        }
                     }
                     w.error.clear();
                 }
@@ -394,7 +415,7 @@ impl App {
             kind
         };
         let heavy = !matches!(kind, UsageKind::Mounts);
-        let (uid, id, cancel) = {
+        let (uid, id, cancel, progress) = {
             let Some(w) = self.usage.as_mut() else {
                 return;
             };
@@ -411,6 +432,8 @@ impl App {
                 } else if let Some(prev) = w.list_cancel.replace(cancel.clone()) {
                     prev.store(true, Ordering::Relaxed);
                 }
+                // 每次重查询从零计。worker 侧随走随加，界面按帧读。
+                w.progress = Arc::new(AtomicU64::new(0));
                 w.error.clear();
                 match &kind {
                     UsageKind::Level { path } => {
@@ -418,6 +441,7 @@ impl App {
                         w.page = Page::Dir;
                         w.mode = Mode::Level;
                         w.level_id = Some(id);
+                        w.level_path = norm_path(path);
                         w.search_id = None;
                         w.names_id = None;
                     }
@@ -428,7 +452,7 @@ impl App {
                         w.names = None;
                         w.level = None;
                         w.names_id = Some(id);
-                        w.level_id = None;
+                        // 不动 level_id：进行中的 Level 扫描转后台，结果回来照样入库。
                         w.search_id = None;
                         w.selected.clear();
                         w.select_anchor = None;
@@ -437,7 +461,7 @@ impl App {
                         w.mode = Mode::Search;
                         w.search = None;
                         w.search_id = Some(id);
-                        w.level_id = None;
+                        // 不动 level_id：搜索在另一条任务槽，后台分析不打断。
                         w.names_id = None;
                     }
                     UsageKind::Mounts => {}
@@ -445,11 +469,16 @@ impl App {
             } else {
                 w.mount_id = Some(id);
             }
-            (w.session_uid, id, cancel)
+            (w.session_uid, id, cancel, w.progress.clone())
         };
         let sent = self.sessions.iter().find(|s| s.uid == uid).map(|s| {
             s.cmd_tx
-                .send(UiCommand::UsageQuery { id, kind, cancel })
+                .send(UiCommand::UsageQuery {
+                    id,
+                    kind,
+                    cancel,
+                    progress,
+                })
                 .is_ok()
         });
         if sent != Some(true) {
@@ -572,21 +601,39 @@ fn enter_dir(w: &mut UsageWin, path: &str) -> Option<UsageKind> {
     w.select_anchor = None;
     w.search = None;
     w.search_id = None;
-    // 父目录可能还在统计。不要停掉它，结果回来后子目录大小才留得住。
-    // 只是这一页不再等那一次：按钮不要停在「分析中」。
-    w.level_id = None;
+    // 进行中的 Level 扫描不停：离开那一页它就转后台，结果回来照样入库。
     w.names_id = None;
     if let Some(rep) = w.analyzed.get(&w.path) {
         w.level = Some(rep.clone());
         w.names = None;
         w.names_id = None;
-        w.level_id = None;
         None
     } else {
         Some(UsageKind::Names {
             path: w.path.clone(),
         })
     }
+}
+
+/// 分析进行到一半要离开这一页：先问一声（继续后台分析 / 停止 / 取消跳转），
+/// 不直接掐断，也不静默放后台。其它情况直接进入。
+fn nav_or_confirm(w: &mut UsageWin, path: &str) -> Option<UsageKind> {
+    if w.scan_on_page() && norm_path(path) != w.path {
+        w.confirm_nav = Some(norm_path(path));
+        return None;
+    }
+    enter_dir(w, path)
+}
+
+/// 停掉进行中的 Level 扫描：置取消旗标，摘掉结果回收入库的登记。
+fn stop_level_scan(w: &mut UsageWin) {
+    if let Some(c) = w.level_cancel.take() {
+        c.store(true, Ordering::Relaxed);
+    }
+    if let Some(id) = w.level_id.take() {
+        w.level_keep.remove(&id);
+    }
+    w.level_path.clear();
 }
 
 fn paint_usage(
@@ -607,7 +654,11 @@ fn paint_usage(
             ui.add_space(10.0);
             path_bar(ui, w, go);
             ui.add_space(10.0);
-            summary_row(ui, w, go);
+            let mut stop_scan = false;
+            summary_row(ui, w, go, &mut stop_scan);
+            if stop_scan {
+                stop_level_scan(w);
+            }
             if !w.error.is_empty() {
                 ui.add_space(4.0);
                 ui.label(RichText::new(&w.error).size(FS_BODY).color(Palette::DANGER));
@@ -638,6 +689,15 @@ fn paint_usage(
     }
     if let Some(paths) = delete_modal(ui, w) {
         *delete = Some(paths);
+    }
+    // 分析进行中跳别的目录：确认后才动。继续 = 原目录的分析转后台。
+    if let Some((path, keep)) = nav_modal(ui, w) {
+        if !keep {
+            stop_level_scan(w);
+        }
+        if let Some(kind) = enter_dir(w, &path) {
+            *go = Some(kind);
+        }
     }
 }
 
@@ -686,7 +746,7 @@ fn disk_page(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
         section_head(ui, icon::HOUSE, tr("主目录", "Home"), None);
         if home_row(ui, &w.home) {
             let home = w.home.clone();
-            if let Some(kind) = enter_dir(w, &home) {
+            if let Some(kind) = nav_or_confirm(w, &home) {
                 *go = Some(kind);
             }
         }
@@ -767,7 +827,7 @@ fn path_bar(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
                             id_salt: "usage_path_edit",
                         },
                     ) {
-                        if let Some(kind) = enter_dir(w, &p) {
+                        if let Some(kind) = nav_or_confirm(w, &p) {
                             *go = Some(kind);
                         }
                     }
@@ -824,7 +884,7 @@ fn disk_section(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>)
             let indent = nest_level(&mounts, i) as f32 * 14.0;
             let detail = format!("{:>aw$} / {:>tw$}", avails[i], totals[i]);
             if volume_row(ui, m, &detail, current == Some(i), indent) {
-                if let Some(kind) = enter_dir(w, &m.path) {
+                if let Some(kind) = nav_or_confirm(w, &m.path) {
                     *go = Some(kind);
                 }
             }
@@ -984,31 +1044,36 @@ fn is_fs_root(path: &str) -> bool {
     t.is_empty() || (t.len() == 2 && t.as_bytes().get(1) == Some(&b':'))
 }
 
-fn summary_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
+fn summary_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>, stop_scan: &mut bool) {
     use egui_phosphor::regular as icon;
     let (headline, hint) = headline(w);
     let (note, note_tip, note_color) = summary_note(w);
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let busy = w.level_id.is_some();
+        ui.spacing_mut().item_spacing.x = 6.0;
+        // 主按钮就要有按钮的样子：未分析是珊瑚实心（主操作），分析过是灰底
+        // （次操作），分析中是灰底禁用。不再用无边框的文字按钮。
+        let busy = w.scan_on_page();
         let again = w.analyzed.contains_key(&w.path);
-        let word = if busy {
-            tr("分析中…", "Analyzing…")
+        let (word, fill, color) = if busy {
+            (
+                tr("分析中…", "Analyzing…"),
+                Palette::TRACK,
+                Palette::TEXT_DIM,
+            )
         } else if again {
-            tr("重新分析", "Analyze again")
+            (
+                tr("重新分析", "Analyze again"),
+                Palette::PANEL_2,
+                Palette::TEXT,
+            )
         } else {
-            tr("分析", "Analyze")
-        };
-        let color = if busy {
-            Palette::TEXT_DIM
-        } else {
-            Palette::TEXT
+            (tr("分析", "Analyze"), Palette::ACCENT, Palette::PANEL)
         };
         let label = format!("{}  {word}", icon::CHART_PIE);
         if ui
             .add_enabled(
                 !busy,
-                egui::Button::new(RichText::new(label).size(FS_BODY).color(color)).frame(false),
+                egui::Button::new(RichText::new(label).size(FS_BODY).color(color)).fill(fill),
             )
             .on_hover_text(tr(
                 "计算这一层各项的大小，并按大小排序",
@@ -1020,7 +1085,33 @@ fn summary_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
                 path: w.path.clone(),
             });
         }
-        if !note.is_empty() {
+        if busy {
+            // 分析中的进度：worker 侧实时累加的条目数。
+            let n = fmt_count(w.progress.load(Ordering::Relaxed));
+            let text = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("已统计 {n} 项"),
+                crate::i18n::Lang::En => format!("{n} items scanned"),
+            };
+            ui.label(RichText::new(text).size(FS_NOTE).color(Palette::TEXT_DIM));
+        } else if w.level_id.is_some() {
+            // 后台还在分析别的目录：给个指示，点一下可以停。
+            let n = fmt_count(w.progress.load(Ordering::Relaxed));
+            let name = leaf(&w.level_path);
+            let text = match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("后台分析 {name}（{n} 项）"),
+                crate::i18n::Lang::En => format!("Analyzing {name} ({n} items)"),
+            };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(text).size(FS_NOTE).color(Palette::TEXT_DIM))
+                        .frame(false),
+                )
+                .on_hover_text(tr("点击停止后台分析", "Click to stop the background scan"))
+                .clicked()
+            {
+                *stop_scan = true;
+            }
+        } else if !note.is_empty() {
             ui.label(RichText::new(note).size(FS_NOTE).color(note_color))
                 .on_hover_text(note_tip);
         }
@@ -1039,13 +1130,34 @@ fn summary_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
     hairline(ui);
 }
 
+/// 进度计数：中文到万/亿缩写，英文千分位。
+fn fmt_count(n: u64) -> String {
+    match crate::i18n::current() {
+        crate::i18n::Lang::Zh if n >= 100_000_000 => format!("{:.1} 亿", n as f64 / 1e8),
+        crate::i18n::Lang::Zh if n >= 10_000 => format!("{:.1} 万", n as f64 / 1e4),
+        crate::i18n::Lang::Zh => n.to_string(),
+        crate::i18n::Lang::En => {
+            let s = n.to_string();
+            let mut out = String::with_capacity(s.len() + s.len() / 3);
+            for (i, c) in s.chars().enumerate() {
+                if i > 0 && (s.len() - i) % 3 == 0 {
+                    out.push(',');
+                }
+                out.push(c);
+            }
+            out
+        }
+    }
+}
+
 fn headline(w: &UsageWin) -> (String, String) {
     let limits = tr(
         "分析会记下整棵树里每个文件和目录的大小。不跟随符号链接，也不进入别的磁盘。",
         "Analyze saves every file and folder in the tree. Symlinks and other disks are not followed.",
     );
-    if w.level_id.is_some() {
-        return (tr("正在分析…", "Analyzing…").into(), limits.into());
+    // 分析中的状态交给按钮和进度数字，不再占大标题。
+    if w.scan_on_page() {
+        return (String::new(), limits.into());
     }
     match w.mode {
         Mode::Search => {
@@ -1090,6 +1202,15 @@ fn headline(w: &UsageWin) -> (String, String) {
 }
 
 fn summary_note(w: &UsageWin) -> (String, String, egui::Color32) {
+    // 搜索也有进度：已检查的条目数实时涨。
+    if w.search_id.is_some() {
+        let n = fmt_count(w.progress.load(Ordering::Relaxed));
+        let text = match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!("已检查 {n} 项"),
+            crate::i18n::Lang::En => format!("{n} items checked"),
+        };
+        return (text, String::new(), Palette::TEXT_DIM);
+    }
     if w.busy() {
         return (String::new(), String::new(), Palette::TEXT_DIM);
     }
@@ -1299,15 +1420,6 @@ fn row_hit(
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
     let selected = w.selected.contains(&index);
     let painter = ui.painter();
-    // 和右下文件列表一样：奇数行一块浅底，选中整行铺上强调色，行与行之间不留缝。
-    if selected {
-        painter.rect_filled(rect, 0.0, Palette::ACCENT_SOFT);
-    } else if index % 2 == 1 {
-        painter.rect_filled(rect, 0.0, Palette::PANEL_2);
-    }
-    if resp.hovered() && !selected {
-        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(10));
-    }
     let show_size = analyzed || !row.is_dir || row.size > 0;
     let text_y = rect.top() + 13.0;
     // 挂载点行的大小被回填成整盘已用，父目录总数又不含它——除以总数会冒出
@@ -1328,12 +1440,23 @@ fn row_hit(
             pct(row.size, total),
         )
     };
+    // 行的底色就是进度：铺多宽表示占多少，不再用单独的小条，也不用斑马纹。
+    // 行底留出 1px，窗口底色透出来就是行与行之间的白边界。
+    let fill_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.max.y - 1.0));
     if show_size && frac > 0.0 {
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 8.0, rect.bottom() - 4.0),
-            egui::pos2(rect.right() - 8.0, rect.bottom() - 2.0),
+        let mut fill = fill_rect;
+        fill.set_width((fill_rect.width() * frac.clamp(0.0, 1.0)).max(2.0));
+        let c = Palette::OK;
+        painter.rect_filled(
+            fill,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 48),
         );
-        green_bar(painter, bar, frac);
+    }
+    if selected {
+        painter.rect_filled(fill_rect, 0.0, Palette::ACCENT_SOFT);
+    } else if resp.hovered() {
+        painter.rect_filled(fill_rect, 0.0, egui::Color32::from_black_alpha(10));
     }
     let (mark, icon_color) = if disk.is_some() {
         (icon::HARD_DRIVES, Palette::OK)
@@ -1417,7 +1540,7 @@ fn row_hit(
             None
         };
         if let Some(path) = path {
-            if let Some(kind) = enter_dir(w, &path) {
+            if let Some(kind) = nav_or_confirm(w, &path) {
                 *go = Some(kind);
             }
         }
@@ -1531,6 +1654,72 @@ fn delete_modal(ui: &mut egui::Ui, w: &mut UsageWin) -> Option<Vec<String>> {
         w.confirm_delete = None;
     }
     decided
+}
+
+/// 分析进行到一半要离开这一页时的确认框。
+/// 返回 Some((目标目录, 是否保留下这场分析转后台)) 表示决定跳转；None 表示没定或取消。
+fn nav_modal(ui: &mut egui::Ui, w: &mut UsageWin) -> Option<(String, bool)> {
+    let target = w.confirm_nav.clone()?;
+    let mut keep: Option<bool> = None;
+    let mut cancel = false;
+    egui::Modal::new(egui::Id::new("usage_nav_confirm")).show(ui.ctx(), |ui| {
+        ui.set_min_width(320.0);
+        ui.label(
+            RichText::new(tr("离开正在分析的目录", "Leave the folder being analyzed"))
+                .strong()
+                .size(FS_STRONG)
+                .color(Palette::TEXT),
+        );
+        ui.add_space(6.0);
+        let n = fmt_count(w.progress.load(Ordering::Relaxed));
+        let body = match crate::i18n::current() {
+            crate::i18n::Lang::Zh => format!(
+                "{} 还在分析中（已统计 {n} 项）。\n离开后可以让它在后台继续分析，也可以停止分析。",
+                w.level_path
+            ),
+            crate::i18n::Lang::En => format!(
+                "{} is still being analyzed ({n} items so far).\nYou can keep it running in the background, or stop it.",
+                w.level_path
+            ),
+        };
+        ui.label(RichText::new(body).size(FS_BODY).color(Palette::TEXT));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(tr("继续分析", "Keep analyzing"))
+                            .size(FS_BODY)
+                            .color(Palette::PANEL),
+                    )
+                    .fill(Palette::ACCENT),
+                )
+                .on_hover_text(tr(
+                    "跳过去，原来的目录在后台继续分析",
+                    "Navigate away; the scan keeps running in the background",
+                ))
+                .clicked()
+            {
+                keep = Some(true);
+            }
+            if ui
+                .button(RichText::new(tr("停止分析", "Stop analysis")).size(FS_BODY))
+                .clicked()
+            {
+                keep = Some(false);
+            }
+            if ui
+                .button(RichText::new(tr("取消", "Cancel")).size(FS_BODY))
+                .clicked()
+            {
+                cancel = true;
+            }
+        });
+    });
+    if keep.is_some() || cancel {
+        w.confirm_nav = None;
+    }
+    keep.map(|k| (target, k))
 }
 
 fn search_bar(
@@ -1741,7 +1930,8 @@ mod tests {
                         path_bar(ui, &mut w, &mut go);
                         cursor_after_path = ui.cursor().top();
                         ui.add_space(10.0);
-                        summary_row(ui, &w, &mut go);
+                        let mut stop = false;
+                        summary_row(ui, &w, &mut go, &mut stop);
                         let avail = ui.available_height();
                         let list_h = if avail.is_finite() {
                             (avail - 48.0).max(96.0)
@@ -1963,5 +2153,56 @@ mod tests {
             "/data/other",
             &["/data/src"].into_iter().collect()
         ));
+    }
+
+    /// 本页正在分析时跳别的目录：不直接跳，先记下目标等确认。
+    #[test]
+    fn nav_away_from_a_running_scan_asks_first() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        w.level_id = Some(7);
+        w.level_keep.insert(7);
+        w.level_path = "/data".into();
+        assert!(w.scan_on_page());
+        assert!(nav_or_confirm(&mut w, "/data/src").is_none());
+        assert_eq!(w.confirm_nav.as_deref(), Some("/data/src"));
+        assert_eq!(w.path, "/data", "还没确认，人应该停在原目录");
+        assert_eq!(w.level_id, Some(7), "扫描不能被打断");
+        // 同页内点别的路径段不算跳走（规范化后还是本页），直接进。
+        w.confirm_nav = None;
+        assert!(nav_or_confirm(&mut w, "/data/").is_some());
+    }
+
+    /// 确认「停止分析」：置取消旗标，摘掉登记，后台指示消失。
+    #[test]
+    fn stop_level_scan_cancels_and_forgets() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        let cancel = Arc::new(AtomicBool::new(false));
+        w.level_cancel = Some(cancel.clone());
+        w.level_id = Some(9);
+        w.level_keep.insert(9);
+        w.level_path = "/data".into();
+        stop_level_scan(&mut w);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(w.level_id.is_none());
+        assert!(!w.level_keep.contains(&9));
+        assert!(w.level_path.is_empty());
+        assert!(!w.scan_on_page());
+        // 再停一次不出事。
+        stop_level_scan(&mut w);
+    }
+
+    /// 确认「继续分析」后真正跳走：路径变了，扫描登记原样保留（转后台）。
+    #[test]
+    fn keep_scanning_then_enter_the_new_dir() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        w.level_id = Some(7);
+        w.level_keep.insert(7);
+        w.level_path = "/data".into();
+        let kind = enter_dir(&mut w, "/data/src");
+        assert!(matches!(kind, Some(UsageKind::Names { .. })));
+        assert_eq!(w.path, "/data/src");
+        assert_eq!(w.level_id, Some(7), "扫描转后台，登记还在");
+        assert!(!w.scan_on_page(), "人不在被扫描的那页了");
+        // 后台指示（「后台分析 data（N 项）」）就靠 level_id 亮着。
     }
 }
