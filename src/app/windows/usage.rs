@@ -438,6 +438,14 @@ fn remember_level(w: &mut UsageWin, mut rep: LevelReport) -> LevelReport {
         }
     }
     w.known_size.insert(path.clone(), rep.total);
+    for (child, size) in std::mem::take(&mut rep.nested) {
+        let child = norm_path(&child);
+        if rep.partial {
+            w.known_size.entry(child).or_insert(size);
+        } else {
+            w.known_size.insert(child, size);
+        }
+    }
     w.analyzed.insert(path, rep.clone());
     rep
 }
@@ -999,8 +1007,8 @@ fn headline(w: &UsageWin) -> (String, String) {
                 (
                     crate::ui::fmt_bytes(size as f64),
                     tr(
-                        "这是上层分析时记下的大小。点分析才会列出这里每一项的大小。",
-                        "Saved from the parent folder. Analyze to size each item here.",
+                        "这是上层分析时记下的大小，里面的目录也带着。点分析才会刷新，并带上文件大小。",
+                        "Saved from the parent folder, including folders inside. Analyze to refresh and include files.",
                     )
                     .into(),
                 )
@@ -1116,7 +1124,8 @@ fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
             .get(&w.path)
             .copied()
             .unwrap_or_else(|| rows.iter().fold(0u64, |a, r| a.saturating_add(r.size)));
-        return (rows, any, total, false);
+        // 没把这一层重新分析过：只给已经记下大小的目录显示数字，文件不要显示成 0 B。
+        return (rows, false, total, false);
     }
     (Vec::new(), false, 0, false)
 }
@@ -1592,6 +1601,7 @@ mod tests {
             omitted_bytes: 0,
             partial: false,
             denied: 0,
+            nested: Vec::new(),
         });
         let mut cursor_before_path = 0.0f32;
         let mut cursor_after_path = 0.0f32;
@@ -1665,6 +1675,7 @@ mod tests {
                 omitted_bytes: 0,
                 partial: false,
                 denied: 0,
+                nested: Vec::new(),
             },
         );
         assert_eq!(w.known_size.get("/data/src"), Some(&40));
@@ -1675,6 +1686,36 @@ mod tests {
         assert!(enter_dir(&mut w, "/data").is_none());
         assert_eq!(w.level.as_ref().map(|l| l.total), Some(100));
         assert_eq!(saved_size(&w, "/data/src"), Some(40));
+    }
+
+    #[test]
+    fn parent_scan_keeps_the_next_level() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        remember_level(
+            &mut w,
+            LevelReport {
+                path: "/data".into(),
+                total: 100,
+                rows: vec![UsageRow {
+                    name: "src".into(),
+                    path: "/data/src".into(),
+                    size: 40,
+                    is_dir: true,
+                }],
+                omitted: 0,
+                omitted_bytes: 0,
+                partial: false,
+                denied: 0,
+                nested: vec![
+                    ("/data/src/lib".into(), 25),
+                    ("/data/src/main.rs".into(), 15),
+                ],
+            },
+        );
+        assert_eq!(saved_size(&w, "/data/src/lib"), Some(25));
+        assert!(enter_dir(&mut w, "/data/src").is_some());
+        assert_eq!(saved_size(&w, "/data/src"), Some(40));
+        assert_eq!(saved_size(&w, "/data/src/lib"), Some(25));
     }
 
     #[test]
@@ -1695,6 +1736,7 @@ mod tests {
                 omitted_bytes: 0,
                 partial: false,
                 denied: 0,
+                nested: Vec::new(),
             },
         );
         remember_level(
@@ -1712,6 +1754,7 @@ mod tests {
                 omitted_bytes: 0,
                 partial: true,
                 denied: 0,
+                nested: vec![("/data/src/lib".into(), 1)],
             },
         );
         assert_eq!(w.known_size.get("/data/src"), Some(&40));
