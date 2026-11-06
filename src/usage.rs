@@ -4,7 +4,8 @@
 //! 点进任意一层都用已经留下的数字，不再重算。不跟随符号链接，不跨进别的磁盘。
 //! 遍历超过 [`WALK_CAP`] 个目录项就停下，并标明数字不完整。
 //!
-//! 本机用 Rust 自己遍历（可中途停下）。远端一条 GNU `du -a` 把整棵树的大小打出来。
+//! 本机用 Rust 自己遍历（可中途停下）。远端一条 GNU `du -a` 把整棵树的大小打出来，
+//! 输出按行流式解析（[`LevelParser`]），不占双份内存，超限降级为「不完整」而不是报错。
 
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,8 @@ const SHOW_CAP: usize = 2000;
 /// 按名称搜索时保留的最大命中数（按大小）。
 const SEARCH_CAP: usize = 500;
 /// 一次遍历最多看多少个目录项。超过就停下并标明数字不完整，避免百万级目录把机器拖死。
-const WALK_CAP: u64 = 1_500_000;
+/// 界面侧按路径留下的大小也以此为总量上限（一棵大树足以装满）。
+pub(crate) const WALK_CAP: u64 = 1_500_000;
 
 #[derive(Clone, Debug)]
 pub enum UsageKind {
@@ -134,24 +136,27 @@ fn base_name(path: &str) -> &str {
 /// 远端整棵树的大小。GNU `du -a -b` 会打出每个文件和每个目录。
 ///
 /// 不带 `-a` 时 `du` 只打目录，文件大小被折进总数，下面几层的文件就没有数字。
-/// 目录名单只用来分辨当前这一层里谁是文件夹。
+/// 目录名单只用来分辨当前这一层里谁是文件夹——`du -x` 不跨设备，挂载点目录在 du
+/// 输出里整行缺失，解析时靠这份名单补成占位行。名单必须**先于** du 输出（流式解析
+/// 处理 du 行时就要知道谁是目录）。
 pub fn remote_level_cmd(path: &str) -> String {
     let q = shell_quote(path);
     format!(
         "root={q}\n\
+         echo ISHELL_TY\n\
+         find \"$root\" -mindepth 1 -maxdepth 1 -xdev -type d -print 2>/dev/null\n\
          echo ISHELL_DU\n\
          du -x -a -b -- \"$root\"\n\
-         echo ISHELL_TY\n\
-         find \"$root\" -mindepth 1 -maxdepth 1 -xdev -type d -print\n\
          echo ISHELL_END\n"
     )
 }
 
 /// 远端按名称搜索。`-iname` 是子串（包在 `*` 里），结果在远端按大小取前 [`SEARCH_CAP`] 条。
+/// 多取一条（`SEARCH_CAP + 1`）：拿到第 501 条就说明命中被截断，否则截断标记永远立不起来。
 pub fn remote_search_cmd(path: &str, needle: &str) -> String {
     let root = shell_quote(path);
     let pat = shell_quote(&find_pattern(needle));
-    let n = SEARCH_CAP;
+    let n = SEARCH_CAP + 1;
     format!(
         "root={root}\n\
          pat={pat}\n\
@@ -164,14 +169,24 @@ pub fn remote_mounts_cmd() -> &'static str {
 }
 
 /// 只列出这一层的名字，不计算子目录大小。`%y` 是 `d`/`f`/`l`。
+///
+/// `-printf` 是 GNU 扩展。macOS / BSD / BusyBox 的 find 没有它，直接跑会静默输出空，
+/// 界面会误显示「这个目录是空的」。先用一次空 `-printf` 探路，不行就打出标记让调用方报错。
 pub fn remote_names_cmd(path: &str) -> String {
     let q = shell_quote(path);
     let n = SHOW_CAP + 1;
     format!(
         "root={q}\n\
-         find \"$root\" -mindepth 1 -maxdepth 1 \\( -type d -o -type f -o -type l \\) -printf '%y\\t%s\\t%f\\n' 2>/dev/null | head -n {n}\n"
+         if find \"$root\" -mindepth 1 -maxdepth 1 -printf '' 2>/dev/null; then\n\
+         find \"$root\" -mindepth 1 -maxdepth 1 \\( -type d -o -type f -o -type l \\) -printf '%y\\t%s\\t%f\\n' 2>/dev/null | head -n {n}\n\
+         else\n\
+         echo ISHELL_UNSUPPORTED\n\
+         fi\n"
     )
 }
+
+/// [`remote_names_cmd`] 在不支持 GNU `-printf` 的系统上打出的标记。
+pub const NAMES_UNSUPPORTED_MARK: &str = "ISHELL_UNSUPPORTED";
 
 /// 解析 [`remote_names_cmd`] 的输出。
 pub fn parse_names(root: &str, text: &str) -> NameReport {
@@ -242,117 +257,167 @@ fn find_pattern(needle: &str) -> String {
     p
 }
 
-/// 解析 `du -a` 的整棵树，再加上当前这一层的目录名单。
+/// 解析 `du -a` 的整棵树，再加上当前这一层的目录名单（整段文本版，测试用；
+/// 线上路径走 [`LevelParser`] 流式喂行）。
+#[cfg(test)]
 pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
-    let mut phase = 0u8; // 0 还没到 DU，1 du，2 目录名，3 文件
-    let mut du_lines: Vec<(u64, String)> = Vec::new();
-    let mut dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut files: Vec<UsageRow> = Vec::new();
-    let mut file_extra = 0u64;
-    let mut file_extra_bytes = 0u64;
+    let mut p = LevelParser::new(root);
     for line in text.lines() {
+        p.feed(line);
+    }
+    Ok(UsageBody::Level(p.finish(0, false)?))
+}
+
+/// `du -a` 输出的流式解析器。一行一行喂，不用把整份输出和中间名单都攒在内存里：
+/// 顶层行只留最大的 [`SHOW_CAP`] 条（堆），更深层的大小留到 [`WALK_CAP`] 为止。
+/// 内存占用与树大小无关，超大树的输出超限后由调用方标 `capped`，这里降级为 partial。
+pub struct LevelParser {
+    root: String,
+    root_trim: String,
+    phase: u8, // 0 还没到标记，1 目录名，2 du，3 结束
+    total: u64,
+    saw_total: bool,
+    /// 顶层目录名单（ISHELL_TY 段，先于 du 输出到达）。
+    dirs: std::collections::HashSet<String>,
+    /// du 真的统计过的顶层目录名。名单里有、du 里没有的，是异设备挂载点。
+    seen_dirs: std::collections::HashSet<String>,
+    heap: BinaryHeap<Smaller>,
+    children: u64,
+    children_bytes: u64,
+    nested: Vec<(String, u64)>,
+    nested_full: bool,
+}
+
+impl LevelParser {
+    pub fn new(root: &str) -> Self {
+        Self {
+            root: root.to_string(),
+            root_trim: root.trim_end_matches(['/', '\\']).to_string(),
+            phase: 0,
+            total: 0,
+            saw_total: false,
+            dirs: std::collections::HashSet::new(),
+            seen_dirs: std::collections::HashSet::new(),
+            heap: BinaryHeap::new(),
+            children: 0,
+            children_bytes: 0,
+            nested: Vec::new(),
+            nested_full: false,
+        }
+    }
+
+    pub fn feed(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
-            continue;
+            return;
         }
         match line {
-            "ISHELL_DU" => {
-                phase = 1;
-                continue;
-            }
             "ISHELL_TY" => {
-                phase = 2;
-                continue;
+                self.phase = 1;
+                return;
             }
-            "ISHELL_FI" => {
-                phase = 3;
-                continue;
+            "ISHELL_DU" => {
+                self.phase = 2;
+                return;
             }
-            "ISHELL_END" => break,
+            "ISHELL_END" => {
+                self.phase = 3;
+                return;
+            }
             _ => {}
         }
-        if phase == 1 {
-            if let Some((size, path)) = split_size_path(line) {
-                du_lines.push((size, path.to_string()));
-            }
-        } else if phase == 2 {
-            dirs.insert(base_name(line).to_string());
-        } else if phase == 3 {
-            if let Some(rest) = line.strip_prefix("ISHELL_FN ") {
-                let mut it = rest.split_whitespace();
-                file_extra = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                file_extra_bytes = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                continue;
-            }
-            if let Some((size, path)) = split_size_path(line) {
-                let name = base_name(path).to_string();
-                if !name.is_empty() && !dirs.contains(&name) {
-                    files.push(UsageRow {
-                        path: path.to_string(),
-                        name,
-                        size,
-                        is_dir: false,
-                    });
-                }
-            }
+        if self.phase == 1 {
+            self.dirs.insert(base_name(line).to_string());
+            return;
         }
-    }
-    if du_lines.is_empty() {
-        return Err(tr(
-            "无法统计这个目录（需要 GNU du，或没有权限）",
-            "Could not measure this directory (needs GNU du, or permission denied)",
-        )
-        .into());
-    }
-    let root_trim = root.trim_end_matches(['/', '\\']);
-    let mut total = 0u64;
-    let mut saw_total = false;
-    let mut rows = Vec::new();
-    let mut nested = Vec::new();
-    let mut partial = false;
-    for (size, path) in du_lines {
-        match under_root(root_trim, &path) {
+        if self.phase != 2 {
+            return;
+        }
+        let Some((size, path)) = split_size_path(line) else {
+            return;
+        };
+        match under_root(&self.root_trim, path) {
             Some(Under::Here) => {
-                total = size;
-                saw_total = true;
+                self.total = size;
+                self.saw_total = true;
             }
             Some(Under::Child(name)) => {
-                let is_dir = dirs.contains(name);
-                rows.push(UsageRow {
-                    path: path.clone(),
-                    name: name.to_string(),
-                    size,
-                    is_dir,
-                });
+                self.children += 1;
+                self.children_bytes = self.children_bytes.saturating_add(size);
+                let is_dir = self.dirs.contains(name);
+                if is_dir {
+                    self.seen_dirs.insert(name.to_string());
+                }
+                consider(
+                    &mut self.heap,
+                    UsageRow {
+                        path: path.to_string(),
+                        name: name.to_string(),
+                        size,
+                        is_dir,
+                    },
+                    SHOW_CAP,
+                );
             }
             // 再往下的每一层。文件和目录都留下，进去任意深都不用重算。
             Some(Under::Deeper) => {
-                if nested.len() >= WALK_CAP as usize {
-                    partial = true;
+                if self.nested.len() >= WALK_CAP as usize {
+                    self.nested_full = true;
                 } else {
-                    nested.push((path, size));
+                    self.nested.push((path.to_string(), size));
                 }
             }
             None => {}
         }
     }
-    rows.extend(files);
-    if !saw_total {
-        total = rows.iter().fold(0u64, |a, r| a.saturating_add(r.size));
+
+    /// `denied`：远端统计时数出来的无权限目录数（本机解析给 0）。
+    /// `capped`：输出超限被提前掐断，数字不完整。
+    pub fn finish(mut self, denied: u64, capped: bool) -> Result<LevelReport, String> {
+        if self.children == 0 && !self.saw_total {
+            return Err(tr(
+                "无法统计这个目录（需要 GNU du，或没有权限）",
+                "Could not measure this directory (needs GNU du, or permission denied)",
+            )
+            .into());
+        }
+        let mut rows: Vec<UsageRow> = self.heap.into_iter().map(|s| s.0).collect();
+        let kept = rows.len() as u64;
+        let kept_bytes = rows.iter().fold(0u64, |a, r| a.saturating_add(r.size));
+        // 名单里有、du 没统计的顶层目录：`du -x` 跨不过设备，整行缺失。补占位行露出来，
+        // 大小留 0；界面认得这是挂载点的话会回填磁盘用量。
+        for name in &self.dirs {
+            if !self.seen_dirs.contains(name) {
+                let path = if self.root_trim.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("{}/{name}", self.root_trim)
+                };
+                rows.push(UsageRow {
+                    name: name.clone(),
+                    path,
+                    size: 0,
+                    is_dir: true,
+                });
+            }
+        }
+        rows.sort_by(|a, b| b.size.cmp(&a.size).then(a.name.cmp(&b.name)));
+        let total = if self.saw_total {
+            self.total
+        } else {
+            self.children_bytes
+        };
+        Ok(LevelReport {
+            path: std::mem::take(&mut self.root),
+            total,
+            rows,
+            omitted: self.children.saturating_sub(kept),
+            omitted_bytes: self.children_bytes.saturating_sub(kept_bytes),
+            partial: capped || self.nested_full,
+            denied,
+            nested: std::mem::take(&mut self.nested),
+        })
     }
-    let (rows, omitted, omitted_bytes) = take_largest(rows, SHOW_CAP);
-    let omitted = omitted.saturating_add(file_extra);
-    let omitted_bytes = omitted_bytes.saturating_add(file_extra_bytes);
-    Ok(UsageBody::Level(LevelReport {
-        path: root.to_string(),
-        total,
-        rows,
-        omitted,
-        omitted_bytes,
-        partial,
-        denied: 0,
-        nested,
-    }))
 }
 
 enum Under<'a> {
@@ -538,14 +603,16 @@ pub fn parse_search(root: &str, needle: &str, text: &str) -> UsageBody {
             is_dir: kind.starts_with('d'),
         });
     }
-    let matched = rows.len() as u64;
+    // 远端命令多取了一条（SEARCH_CAP + 1）专门用来判断截断；这条不算进命中数。
+    let truncated = rows.len() > SEARCH_CAP;
     rows.truncate(SEARCH_CAP);
+    let matched = rows.len() as u64;
     UsageBody::Search(SearchReport {
         path: root.to_string(),
         needle: needle.to_string(),
         rows,
         matched,
-        truncated: matched > SEARCH_CAP as u64,
+        truncated,
     })
 }
 
@@ -1208,12 +1275,12 @@ mod tests {
     #[test]
     fn parse_level_keeps_total_and_marks_dirs() {
         let text = "\
+ISHELL_TY
+/data/big
 ISHELL_DU
 100\t/data/small
 5000\t/data/big
 5100\t/data
-ISHELL_TY
-/data/big
 ISHELL_END
 ";
         let UsageBody::Level(r) = parse_level("/data", text).unwrap() else {
@@ -1228,17 +1295,15 @@ ISHELL_END
     }
 
     #[test]
-    fn parse_level_lists_files_and_counts_the_rest() {
+    fn parse_level_lists_files_from_du_a() {
         let text = "\
-ISHELL_DU
-5000\t/data/big
-5000\t/data
 ISHELL_TY
 /data/big
-ISHELL_FI
+ISHELL_DU
 80\t/data/notes.txt
 40\t/data/a file.txt
-ISHELL_FN 3 15
+5000\t/data/big
+5120\t/data
 ISHELL_END
 ";
         let UsageBody::Level(r) = parse_level("/data", text).unwrap() else {
@@ -1249,20 +1314,70 @@ ISHELL_END
         assert_eq!(file.size, 80);
         assert!(r.rows.iter().any(|row| row.name == "a file.txt"));
         assert!(r.rows.iter().any(|row| row.is_dir && row.name == "big"));
-        assert_eq!(r.omitted, 3);
-        assert_eq!(r.omitted_bytes, 15);
+        assert_eq!(r.total, 5120);
+        assert_eq!(r.omitted, 0);
+    }
+
+    /// `du -x` 跨不过设备：挂载点在 du 输出里整行缺失，但目录名单里有。
+    /// 解析要补一条占位行，不然远端永远看不见挂载点。
+    #[test]
+    fn parse_level_shows_mount_dirs_du_skipped() {
+        let text = "\
+ISHELL_TY
+/data/big
+/data/mnt
+ISHELL_DU
+5000\t/data/big
+5000\t/data
+ISHELL_END
+";
+        let UsageBody::Level(r) = parse_level("/data", text).unwrap() else {
+            panic!("level");
+        };
+        let mnt = r.rows.iter().find(|row| row.name == "mnt").unwrap();
+        assert!(mnt.is_dir);
+        assert_eq!(mnt.size, 0);
+        assert_eq!(mnt.path, "/data/mnt");
+        assert!(r
+            .rows
+            .iter()
+            .any(|row| row.name == "big" && row.size == 5000));
+    }
+
+    #[test]
+    fn parse_level_marks_partial_when_nested_overflows() {
+        let mut p = LevelParser::new("/d");
+        p.feed("ISHELL_DU");
+        for i in 0..(WALK_CAP + 10) {
+            p.feed(&format!("1\t/d/a/b/{i}"));
+        }
+        p.feed("10\t/d/a");
+        p.feed("20\t/d");
+        p.feed("ISHELL_END");
+        let r = p.finish(0, false).unwrap();
+        assert!(r.partial);
+        assert_eq!(r.nested.len(), WALK_CAP as usize);
+        assert_eq!(r.total, 20);
+        // 提前掐断（输出超限）：没有总数行时退化为子项合计，也是 partial。
+        let mut q = LevelParser::new("/d");
+        q.feed("ISHELL_DU");
+        q.feed("10\t/d/a");
+        let r = q.finish(3, true).unwrap();
+        assert!(r.partial);
+        assert_eq!(r.total, 10);
+        assert_eq!(r.denied, 3);
     }
 
     #[test]
     fn parse_level_keeps_the_next_directory() {
         let text = "\
+ISHELL_TY
+/data/src
 ISHELL_DU
 5\t/data/src/lib/a.rs
 15\t/data/src/lib
 40\t/data/src
 100\t/data
-ISHELL_TY
-/data/src
 ISHELL_END
 ";
         let UsageBody::Level(r) = parse_level("/data", text).unwrap() else {
@@ -1294,8 +1409,44 @@ ISHELL_END
     fn remote_level_asks_for_files() {
         let cmd = remote_level_cmd("/data");
         assert!(cmd.contains("du -x -a -b"), "{cmd}");
-        assert!(cmd.contains("ISHELL_TY"), "{cmd}");
+        // 目录名单必须先于 du 输出：流式解析处理 du 行时就要知道谁是目录。
+        let ty = cmd.find("ISHELL_TY").unwrap();
+        let du = cmd.find("ISHELL_DU").unwrap();
+        assert!(ty < du, "{cmd}");
         assert!(!cmd.contains("ISHELL_FI"), "{cmd}");
+    }
+
+    #[test]
+    fn remote_names_probes_gnu_find() {
+        let cmd = remote_names_cmd("/data");
+        assert!(cmd.contains("-printf ''"), "{cmd}");
+        assert!(cmd.contains(NAMES_UNSUPPORTED_MARK), "{cmd}");
+    }
+
+    #[test]
+    fn remote_search_takes_one_extra_to_detect_truncation() {
+        let cmd = remote_search_cmd("/data", "log");
+        assert!(
+            cmd.contains(&format!("head -n {}", SEARCH_CAP + 1)),
+            "{cmd}"
+        );
+        // 正好 SEARCH_CAP + 1 行输出：截断标记立起来，命中数只算留下的。
+        let mut text = String::new();
+        for i in 0..(SEARCH_CAP + 1) {
+            text.push_str(&format!("{}\t/d/f{i}.log\n", 1000 - i));
+        }
+        let UsageBody::Search(r) = parse_search("/d", "log", &text) else {
+            panic!("search");
+        };
+        assert!(r.truncated);
+        assert_eq!(r.rows.len(), SEARCH_CAP);
+        assert_eq!(r.matched, SEARCH_CAP as u64);
+        // 少于上限：不截断。
+        let UsageBody::Search(r2) = parse_search("/d", "log", "1\t/d/a.log\n") else {
+            panic!("search");
+        };
+        assert!(!r2.truncated);
+        assert_eq!(r2.matched, 1);
     }
 
     #[test]

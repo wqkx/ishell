@@ -1,7 +1,7 @@
 //! 目录占用分析小窗。打开先看这一层的名字，点「分析」才算大小。
 //! 算过的结果按路径留着，进子目录不会重算，除非再点分析。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -13,6 +13,12 @@ use crate::theme::{Palette, FS_BODY, FS_NOTE, FS_STRONG, FS_TITLE};
 use crate::usage::{
     LevelReport, MountPoint, NameReport, SearchReport, UsageBody, UsageKind, UsageRow,
 };
+
+/// `known_size` 每帧最多入库多少条。一次分析最多带回 [`crate::usage::WALK_CAP`] 条
+/// 深层大小，一帧全插会让界面卡住几百毫秒；分批摊开，数字在约一秒内陆续到位。
+const KNOWN_DRAIN_PER_FRAME: usize = 30_000;
+/// 记下的大小总量上限。与一次遍历的上限对齐：装得下一整棵大树，又不至于无限增长。
+const KNOWN_CAP: usize = crate::usage::WALK_CAP as usize;
 
 use super::super::App;
 
@@ -51,6 +57,9 @@ pub(in crate::app) struct UsageWin {
     analyzed: HashMap<String, LevelReport>,
     /// 父目录分析时记下的子目录大小。键是规范化路径。
     known_size: HashMap<String, u64>,
+    /// 分析带回的深层大小，按「批」排队等分帧入库（一批 = 一次扫描的 nested +
+    /// 它要不要覆盖已有值）。路径规范化和插入都摊到消化时做，结果回来那一帧零拷贝。
+    pending_known: VecDeque<(Vec<(String, u64)>, bool)>,
     search: Option<SearchReport>,
     mounts: Vec<MountPoint>,
     error: String,
@@ -89,6 +98,7 @@ impl UsageWin {
             names: None,
             analyzed: HashMap::new(),
             known_size: HashMap::new(),
+            pending_known: VecDeque::new(),
             search: None,
             mounts: Vec::new(),
             error: String::new(),
@@ -130,6 +140,39 @@ impl UsageWin {
     fn busy(&self) -> bool {
         self.level_id.is_some() || self.search_id.is_some() || self.names_id.is_some()
     }
+
+    /// 把排队的大小入库一批。返回 true 表示还有剩余，调用方要接着要重绘。
+    fn drain_known_batch(&mut self) -> bool {
+        let mut budget = KNOWN_DRAIN_PER_FRAME;
+        while budget > 0 {
+            if self.known_size.len() >= KNOWN_CAP {
+                // 总量到顶：剩下的不再记。一棵树装得下；再分析别的大树，
+                // 深层大小记不住的层点「分析」仍可按需统计。
+                self.pending_known.clear();
+                return false;
+            }
+            let Some((batch, overwrite)) = self.pending_known.front_mut() else {
+                return false;
+            };
+            let Some((path, size)) = batch.pop() else {
+                self.pending_known.pop_front();
+                continue;
+            };
+            let path = norm_path(&path);
+            if *overwrite {
+                self.known_size.insert(path, size);
+            } else {
+                self.known_size.entry(path).or_insert(size);
+            }
+            budget -= 1;
+        }
+        !self.pending_known.is_empty()
+    }
+
+    #[cfg(test)]
+    fn flush_known(&mut self) {
+        while self.drain_known_batch() {}
+    }
 }
 
 impl App {
@@ -155,6 +198,12 @@ impl App {
 
     pub(in crate::app) fn usage_window(&mut self, ctx: &egui::Context) {
         self.drain_usage(ctx);
+        if let Some(w) = self.usage.as_mut() {
+            // 分析带回的深层大小分帧入库；还有剩余就要重绘接着倒。
+            if w.drain_known_batch() {
+                ctx.request_repaint();
+            }
+        }
         if self.usage.is_none() {
             return;
         }
@@ -419,6 +468,7 @@ fn norm_path(path: &str) -> String {
 }
 
 /// 把这一层的分析结果留下。子目录的大小记在 `known_size` 里，进去时不再重算。
+/// 深层大小可能上百万条，推进队列由界面分帧入库，不在这一帧卡住。
 fn remember_level(w: &mut UsageWin, mut rep: LevelReport) -> LevelReport {
     let path = norm_path(&rep.path);
     rep.path = path.clone();
@@ -435,27 +485,29 @@ fn remember_level(w: &mut UsageWin, mut rep: LevelReport) -> LevelReport {
                 }
             }
         }
-        w.known_size.insert(row.path.clone(), row.size);
-    }
-    w.known_size.insert(path.clone(), rep.total);
-    for (child, size) in std::mem::take(&mut rep.nested) {
-        let child = norm_path(&child);
-        if rep.partial {
-            w.known_size.entry(child).or_insert(size);
-        } else {
-            w.known_size.insert(child, size);
+        if w.known_size.len() < KNOWN_CAP {
+            w.known_size.insert(row.path.clone(), row.size);
         }
+    }
+    if w.known_size.len() < KNOWN_CAP {
+        w.known_size.insert(path.clone(), rep.total);
+    }
+    let overwrite = !rep.partial;
+    let nested = std::mem::take(&mut rep.nested);
+    if !nested.is_empty() {
+        w.pending_known.push_back((nested, overwrite));
     }
     w.analyzed.insert(path, rep.clone());
     rep
 }
 
-fn disk_used(w: &UsageWin, path: &str) -> Option<u64> {
+fn disk_of<'a>(w: &'a UsageWin, path: &str) -> Option<&'a MountPoint> {
     let path = norm_path(path);
-    w.mounts
-        .iter()
-        .find(|m| norm_path(&m.path) == path)
-        .map(|m| m.used)
+    w.mounts.iter().find(|m| norm_path(&m.path) == path)
+}
+
+fn disk_used(w: &UsageWin, path: &str) -> Option<u64> {
+    disk_of(w, path).map(|m| m.used)
 }
 
 fn drop_deleted(w: &mut UsageWin, paths: &[String]) {
@@ -481,15 +533,33 @@ fn drop_deleted(w: &mut UsageWin, paths: &[String]) {
     if let Some(search) = w.search.as_mut() {
         search.rows.retain(|row| !set.contains(row.path.as_str()));
     }
-    for path in paths {
-        let prefix = format!("{path}/");
-        w.analyzed
-            .retain(|k, _| k != path && !k.starts_with(&prefix));
-        w.known_size
-            .retain(|k, _| k != path && !k.starts_with(&prefix));
+    // 每张表只过一遍：条目落在任何一个被删路径之下就摘掉。
+    // 逐路径 retain 是 O（删除数 × 表大小），多选删除大树时会卡住界面。
+    w.analyzed.retain(|k, _| !under_deleted(k, &set));
+    w.known_size.retain(|k, _| !under_deleted(k, &set));
+    for (batch, _) in w.pending_known.iter_mut() {
+        batch.retain(|(p, _)| !under_deleted(p, &set));
     }
+    w.pending_known.retain(|(batch, _)| !batch.is_empty());
     w.selected.clear();
     w.select_anchor = None;
+}
+
+/// `path` 是否等于某个被删路径、或在它之下。沿父链逐级查集合，深度有限。
+fn under_deleted(path: &str, set: &HashSet<&str>) -> bool {
+    let mut p = path.trim_end_matches(['/', '\\']);
+    loop {
+        if set.contains(p) {
+            return true;
+        }
+        let Some(i) = p.rfind(['/', '\\']) else {
+            return false;
+        };
+        if i == 0 {
+            return false;
+        }
+        p = &p[..i];
+    }
 }
 
 /// 进入一个目录。已经分析过就直接用缓存，否则只列名字。
@@ -1040,8 +1110,8 @@ fn summary_note(w: &UsageWin) -> (String, String, egui::Color32) {
                 bits.push(tr("未算完", "Incomplete").to_string());
                 tips.push(
                     tr(
-                        "目录太大，统计提前停下，数字不完整",
-                        "Stopped early — this folder is too large, so the total is incomplete",
+                        "目录太大，统计没有走完，部分数字不完整",
+                        "Too large to finish — some figures are incomplete",
                     )
                     .to_string(),
                 );
@@ -1111,8 +1181,12 @@ fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
         let mut rows = names.rows.clone();
         for row in &mut rows {
             row.path = norm_path(&row.path);
-            if let Some(sz) = saved_size(w, &row.path) {
-                row.size = sz;
+            // 缓存只补目录的大小（名字列表里目录没有数字）。文件大小列目录时已经从
+            // metadata 读到，不能用父目录扫描留下的旧值盖掉——文件可能刚变动过。
+            if row.is_dir {
+                if let Some(sz) = saved_size(w, &row.path) {
+                    row.size = sz;
+                }
             }
         }
         // 文件本来就有大小。只有目录也被记下之后，才按大小重排，免得没分析时文件夹沉到底下。
@@ -1235,21 +1309,33 @@ fn row_hit(
         painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(10));
     }
     let show_size = analyzed || !row.is_dir || row.size > 0;
-    let frac = if !show_size || total == 0 {
-        0.0
+    let text_y = rect.top() + 13.0;
+    // 挂载点行的大小被回填成整盘已用，父目录总数又不含它——除以总数会冒出
+    // 好几百的百分比。这类行的比例和百分比都按它自己那块盘算，和磁盘页一致。
+    let disk = disk_of(w, &row.path);
+    let (frac, pct_text) = if let Some(m) = disk {
+        let frac = if m.size == 0 {
+            0.0
+        } else {
+            (m.used as f64 / m.size as f64) as f32
+        };
+        (frac, pct(m.used, m.size))
+    } else if !show_size || total == 0 {
+        (0.0, String::new())
     } else {
-        (row.size as f64 / total as f64) as f32
+        (
+            (row.size as f64 / total as f64).clamp(0.0, 1.0) as f32,
+            pct(row.size, total),
+        )
     };
-    let text_y = rect.top() + if show_size { 10.0 } else { 13.0 };
-    if show_size && row.size > 0 && total > 0 {
+    if show_size && frac > 0.0 {
         let bar = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 8.0, rect.bottom() - 4.0),
             egui::pos2(rect.right() - 8.0, rect.bottom() - 2.0),
         );
         green_bar(painter, bar, frac);
     }
-    let on_disk = disk_used(w, &row.path).is_some();
-    let (mark, icon_color) = if on_disk {
+    let (mark, icon_color) = if disk.is_some() {
         (icon::HARD_DRIVES, Palette::OK)
     } else if row.is_dir {
         (icon::FOLDER, Palette::ACCENT)
@@ -1264,7 +1350,6 @@ fn row_hit(
         icon_color,
     );
     let size_right = if show_size {
-        let pct_text = pct(row.size, total);
         let pct_rect = painter.text(
             egui::pos2(rect.right() - 8.0, text_y),
             egui::Align2::RIGHT_CENTER,
@@ -1289,13 +1374,30 @@ fn row_hit(
         egui::pos2(size_right - 8.0, rect.bottom()),
     );
     if name_rect.width() > 8.0 {
-        painter.with_clip_rect(name_rect).text(
+        let name_g = painter.with_clip_rect(name_rect).text(
             egui::pos2(name_rect.left(), text_y),
             egui::Align2::LEFT_CENTER,
             leaf(&row.path),
             egui::FontId::proportional(FS_BODY),
             Palette::TEXT,
         );
+        // 搜索结果只露文件名会分不清谁是谁，后面用暗色小字跟上所在目录。
+        if search {
+            if let Some(parent) = crate::usage::parent_path(&row.path) {
+                let px = name_g.max.x + 6.0;
+                let prect =
+                    egui::Rect::from_min_max(egui::pos2(px, name_rect.top()), name_rect.max);
+                if prect.width() > 24.0 {
+                    painter.with_clip_rect(prect).text(
+                        egui::pos2(px, text_y),
+                        egui::Align2::LEFT_CENTER,
+                        parent,
+                        egui::FontId::proportional(FS_NOTE),
+                        Palette::TEXT_DIM,
+                    );
+                }
+            }
+        }
     }
     let tip = if search {
         match crate::i18n::current() {
@@ -1685,6 +1787,7 @@ mod tests {
                 nested: Vec::new(),
             },
         );
+        w.flush_known();
         assert_eq!(w.known_size.get("/data/src"), Some(&40));
         let child = enter_dir(&mut w, "/data/src");
         assert!(matches!(child, Some(UsageKind::Names { .. })));
@@ -1719,6 +1822,7 @@ mod tests {
                 ],
             },
         );
+        w.flush_known();
         assert_eq!(saved_size(&w, "/data/src/lib"), Some(25));
         assert_eq!(saved_size(&w, "/data/src/main.rs"), Some(15));
         assert!(enter_dir(&mut w, "/data/src").is_some());
@@ -1766,7 +1870,98 @@ mod tests {
                 nested: vec![("/data/src/lib".into(), 1)],
             },
         );
+        w.flush_known();
         assert_eq!(w.known_size.get("/data/src"), Some(&40));
         assert_eq!(w.analyzed.get("/data").map(|r| r.total), Some(100));
+    }
+
+    /// partial 扫描的深层大小不覆盖已有值（or_insert），完整扫描的覆盖。
+    #[test]
+    fn queued_nested_respects_overwrite_flag() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        let report = |path: &str, nested: Vec<(String, u64)>, partial: bool| LevelReport {
+            path: path.into(),
+            total: 100,
+            rows: Vec::new(),
+            omitted: 0,
+            omitted_bytes: 0,
+            partial,
+            denied: 0,
+            nested,
+        };
+        remember_level(
+            &mut w,
+            report("/data/other", vec![("/data/shared".into(), 10)], false),
+        );
+        w.flush_known();
+        remember_level(
+            &mut w,
+            report("/data", vec![("/data/shared".into(), 99)], true),
+        );
+        w.flush_known();
+        assert_eq!(w.known_size.get("/data/shared"), Some(&10));
+        remember_level(
+            &mut w,
+            report("/data", vec![("/data/shared".into(), 42)], false),
+        );
+        w.flush_known();
+        assert_eq!(w.known_size.get("/data/shared"), Some(&42));
+    }
+
+    /// 删除一棵子树：缓存大小、分析结果和排队待入库的条目一起清掉，且只过一遍表。
+    #[test]
+    fn drop_deleted_clears_caches_and_queue() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        remember_level(
+            &mut w,
+            LevelReport {
+                path: "/data".into(),
+                total: 100,
+                rows: vec![UsageRow {
+                    name: "src".into(),
+                    path: "/data/src".into(),
+                    size: 40,
+                    is_dir: true,
+                }],
+                omitted: 0,
+                omitted_bytes: 0,
+                partial: false,
+                denied: 0,
+                nested: vec![("/data/src/lib".into(), 25), ("/data/other/x".into(), 7)],
+            },
+        );
+        w.flush_known();
+        assert!(w.known_size.contains_key("/data/src/lib"));
+        drop_deleted(&mut w, &["/data/src".to_string()]);
+        assert!(!w.known_size.contains_key("/data/src"));
+        assert!(!w.known_size.contains_key("/data/src/lib"));
+        assert!(w.known_size.contains_key("/data/other/x"));
+        assert!(w.analyzed.contains_key("/data"));
+        // 队列里还没入库的也摘干净。
+        remember_level(
+            &mut w,
+            LevelReport {
+                path: "/data".into(),
+                total: 90,
+                rows: Vec::new(),
+                omitted: 0,
+                omitted_bytes: 0,
+                partial: false,
+                denied: 0,
+                nested: vec![("/data/src/new".into(), 3), ("/data/keep".into(), 1)],
+            },
+        );
+        drop_deleted(&mut w, &["/data/src".to_string()]);
+        w.flush_known();
+        assert!(!w.known_size.contains_key("/data/src/new"));
+        assert!(w.known_size.contains_key("/data/keep"));
+        assert!(under_deleted(
+            "/data/src/lib",
+            &["/data/src"].into_iter().collect()
+        ));
+        assert!(!under_deleted(
+            "/data/other",
+            &["/data/src"].into_iter().collect()
+        ));
     }
 }

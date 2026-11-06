@@ -27,7 +27,9 @@ use crate::proto::{ConnectConfig, UiCommand, WorkerEvent};
 use sysinfo::{SysSampler, PROBE_CMD};
 
 pub(super) use auth::ClientHandler;
-use auth::{connect, exec_capture, exec_status, open_sftp, open_shell};
+use auth::{
+    connect, exec_capture, exec_status, exec_stream, open_sftp, open_shell, EXEC_CAPTURE_LIMIT,
+};
 use sftp::{handle_fs_op, list_dir, read_file_chunked, read_image_file, remote_parent, tail_file};
 use xfer::{
     direct_relay_copy, start_xfer, trust_temp_key, untrust_temp_key, PendingXfer, XferCancel,
@@ -1026,7 +1028,7 @@ pub async fn run(
                         let s = sink.clone();
                         let flag = cancel.clone();
                         let task = tokio::spawn(async move {
-                            let result = remote_usage(&h, kind).await;
+                            let result = remote_usage(&h, kind, &flag).await;
                             match result {
                                 Ok(body) => {
                                     s.send(WorkerEvent::UsageReady { id, result: Ok(body) });
@@ -1087,14 +1089,35 @@ pub async fn run(
 async fn remote_usage(
     handle: &russh::client::Handle<ClientHandler>,
     kind: crate::usage::UsageKind,
+    cancel: &AtomicBool,
 ) -> Result<crate::usage::UsageBody, String> {
     use crate::usage::{UsageBody, UsageKind};
+    // Level 的输出量由远端目录大小决定（du -a 打整棵树），必须流式解析：
+    // 全量缓冲会在大树上撞 64 MiB 上限直接报错，流式则超限降级为「不完整」，
+    // 且取消旗标随读随查，关掉窗口远端的 du 马上就停，不会白跑。
+    if let UsageKind::Level { path } = &kind {
+        crate::usage::path_ok(path)?;
+        let cmd = crate::usage::remote_level_cmd(path);
+        let mut parser = crate::usage::LevelParser::new(path);
+        let end = exec_stream(
+            handle,
+            &cmd,
+            EXEC_CAPTURE_LIMIT,
+            Some(cancel),
+            Some("du: "),
+            |line| parser.feed(line),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if end.cancelled {
+            return Err(String::new());
+        }
+        let rep = parser.finish(end.err_lines, end.capped)?;
+        return Ok(UsageBody::Level(rep));
+    }
     let cmd = match &kind {
         UsageKind::Mounts => crate::usage::remote_mounts_cmd().to_string(),
-        UsageKind::Level { path } => {
-            crate::usage::path_ok(path)?;
-            crate::usage::remote_level_cmd(path)
-        }
+        UsageKind::Level { .. } => unreachable!(),
         UsageKind::Names { path } => {
             crate::usage::path_ok(path)?;
             crate::usage::remote_names_cmd(path)
@@ -1110,8 +1133,22 @@ async fn remote_usage(
         .map_err(|e| e.to_string())?;
     match kind {
         UsageKind::Mounts => Ok(UsageBody::Mounts(crate::usage::parse_df(&text))),
-        UsageKind::Level { path } => crate::usage::parse_level(&path, &text),
-        UsageKind::Names { path } => Ok(UsageBody::Names(crate::usage::parse_names(&path, &text))),
+        UsageKind::Level { .. } => unreachable!(),
+        UsageKind::Names { path } => {
+            // 远端 find 没有 GNU -printf（macOS/BSD/BusyBox）时命令打了标记。
+            // 不查这个标记，非空目录会被误显示成「这个目录是空的」。
+            if text
+                .lines()
+                .any(|l| l.trim() == crate::usage::NAMES_UNSUPPORTED_MARK)
+            {
+                return Err(crate::i18n::tr(
+                    "无法列出这个目录（远端需要 GNU find，或没有权限）",
+                    "Could not list this directory (remote needs GNU find, or permission denied)",
+                )
+                .into());
+            }
+            Ok(UsageBody::Names(crate::usage::parse_names(&path, &text)))
+        }
         UsageKind::Search { path, needle } => Ok(crate::usage::parse_search(&path, &needle, &text)),
     }
 }

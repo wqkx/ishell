@@ -1311,7 +1311,7 @@ pub(super) async fn open_sftp(
 ///
 /// 64 MiB 的取法：单页 PNG 常见是几 MB（A4/300dpi 约 1240×1754），整本书的纯文本通常几 MB，
 /// 都留了一个数量级的余量；真超过了，报错也远好过 OOM。
-const EXEC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
+pub(super) const EXEC_CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
 
 /// stderr 只是给人看的诊断文本，攒够这些就不再追加（但**继续读到通道关闭**，否则拿不到
 /// 退出码）。不像 stdout 那样超限即失败：一条命令刷了一堆警告到 stderr 但其实成功了，
@@ -1366,6 +1366,91 @@ pub(super) async fn exec_capture(
         }
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 流式 exec 的收场状态。
+pub(super) struct StreamEnd {
+    /// 输出字节数超限，提前断开（远端进程随通道关闭而死）。已交出去的行仍然有效。
+    pub capped: bool,
+    /// `cancel` 被置位，提前断开。
+    pub cancelled: bool,
+    /// stderr 里以 `err_prefix` 开头的行数（例如 `du: ` 开头的诊断 = 读不了的目录数）。
+    pub err_lines: u64,
+}
+
+/// 打开一次性 exec 通道，**按行**把 stdout 交给 `on_line`，不在内存里攒整份输出。
+///
+/// 给占用分析这类输出量由远端目录大小决定的命令用：`du -a` 在百万级目录上会打出
+/// 上百 MB，全量缓冲（`exec_capture`）会直接撞上限报错；按行解析则内存与输出量无关。
+/// 超过 `max_bytes` 或 `cancel` 置位都会提前断开通道（远端进程写管道时收到 SIGPIPE
+/// 自然死掉），由调用方决定已收到的部分够不够凑出一份「不完整」的结果。
+///
+/// 行按原始字节在 `\n` 处切开再转 UTF-8，多字节字符不会被通道分片拦腰斩断。
+pub(super) async fn exec_stream(
+    handle: &Handle<ClientHandler>,
+    cmd: &str,
+    max_bytes: usize,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    err_prefix: Option<&str>,
+    mut on_line: impl FnMut(&str),
+) -> anyhow::Result<StreamEnd> {
+    use std::sync::atomic::Ordering;
+    let mut channel = handle.channel_open_session().await?;
+    channel.exec(true, cmd).await?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut err_buf: Vec<u8> = Vec::new();
+    let mut read = 0usize;
+    let mut end = StreamEnd {
+        capped: false,
+        cancelled: false,
+        err_lines: 0,
+    };
+    while let Some(msg) = channel.wait().await {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            end.cancelled = true;
+            break;
+        }
+        match msg {
+            ChannelMsg::Data { data } => {
+                read += data.len();
+                if read > max_bytes {
+                    end.capped = true;
+                    break;
+                }
+                buf.extend_from_slice(&data);
+                // 逐行切出，整块只 drain 一次（逐行 drain 是 O(n²)）。
+                let mut start = 0;
+                for (i, b) in buf.iter().enumerate() {
+                    if *b == b'\n' {
+                        on_line(&String::from_utf8_lossy(&buf[start..i]));
+                        start = i + 1;
+                    }
+                }
+                buf.drain(..start);
+            }
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                if let Some(pre) = err_prefix {
+                    err_buf.extend_from_slice(&data);
+                    let mut start = 0;
+                    for (i, b) in err_buf.iter().enumerate() {
+                        if *b == b'\n' {
+                            if err_buf[start..i].starts_with(pre.as_bytes()) {
+                                end.err_lines += 1;
+                            }
+                            start = i + 1;
+                        }
+                    }
+                    err_buf.drain(..start);
+                }
+            }
+            ChannelMsg::Eof | ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    if !end.capped && !end.cancelled && !buf.is_empty() {
+        on_line(&String::from_utf8_lossy(&buf));
+    }
+    Ok(end)
 }
 
 /// 执行命令并捕获二进制 stdout：返回 (退出码, stdout 字节, stderr 文本)。
