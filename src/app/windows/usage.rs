@@ -7,7 +7,7 @@ use egui::RichText;
 
 use crate::i18n::tr;
 use crate::proto::UiCommand;
-use crate::theme::Palette;
+use crate::theme::{Palette, FS_BODY, FS_NOTE, FS_STRONG, FS_TITLE};
 use crate::usage::{LevelReport, MountPoint, SearchReport, UsageBody, UsageKind, UsageRow};
 
 use super::super::App;
@@ -124,7 +124,7 @@ impl App {
         let mut clear_query = false;
         egui::Window::new("usage_win")
             .title_bar(false)
-            .default_size([520.0, 480.0])
+            .default_size([540.0, 560.0])
             .resizable(true)
             .collapsible(false)
             .frame(
@@ -322,18 +322,18 @@ fn paint_usage(
 ) {
     title_row(ui, close);
     if !w.mounts.is_empty() {
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         disk_section(ui, w, go);
     }
-    ui.add_space(8.0);
+    ui.add_space(10.0);
     path_bar(ui, w, go);
     ui.add_space(10.0);
     summary_row(ui, w);
     if !w.error.is_empty() {
         ui.add_space(4.0);
-        ui.label(RichText::new(&w.error).size(12.0).color(Palette::DANGER));
+        ui.label(RichText::new(&w.error).size(FS_BODY).color(Palette::DANGER));
     }
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     let avail = ui.available_height();
     let list_h = if avail.is_finite() {
         (avail - 48.0).max(96.0)
@@ -344,7 +344,7 @@ fn paint_usage(
     ui.allocate_ui(egui::vec2(full_w, list_h), |ui| {
         if let Some(msg) = list_message(w) {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new(msg).size(12.0).color(Palette::TEXT_DIM));
+                ui.label(RichText::new(msg).size(FS_BODY).color(Palette::TEXT_DIM));
             });
         } else {
             match w.mode {
@@ -372,14 +372,18 @@ fn title_row(ui: &mut egui::Ui, close: &mut bool) {
         ui.label(
             RichText::new(tr("占用分析", "Disk usage"))
                 .strong()
-                .size(13.0)
+                .size(FS_TITLE)
                 .color(Palette::TEXT),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(
-                    egui::Button::new(RichText::new(icon::X).size(12.0).color(Palette::TEXT_DIM))
-                        .frame(false),
+                    egui::Button::new(
+                        RichText::new(icon::X)
+                            .size(FS_STRONG)
+                            .color(Palette::TEXT_DIM),
+                    )
+                    .frame(false),
                 )
                 .clicked()
             {
@@ -440,13 +444,27 @@ fn path_bar(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
 }
 
 /// 磁盘在路径之上：先选卷，再看这个卷里的目录。子挂载点缩进在父挂载点下面。
+/// 右侧数字和侧栏磁盘行一样，是「可用 / 总量」。
 fn disk_section(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
-    ui.label(
-        RichText::new(tr("磁盘", "Disks"))
-            .size(11.0)
-            .color(Palette::TEXT_DIM),
+    use egui_phosphor::regular as icon;
+    let avails: Vec<String> = w
+        .mounts
+        .iter()
+        .map(|m| crate::ui::fmt_bytes(m.avail as f64))
+        .collect();
+    let totals: Vec<String> = w
+        .mounts
+        .iter()
+        .map(|m| crate::ui::fmt_bytes(m.size as f64))
+        .collect();
+    let aw = avails.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let tw = totals.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    section_head(
+        ui,
+        icon::HARD_DRIVES,
+        tr("磁盘", "Disks"),
+        Some(tr("可用 / 总量", "Free / total")),
     );
-    ui.add_space(4.0);
     let current = current_mount(&w.path, &w.mounts);
     egui::ScrollArea::vertical()
         .id_salt("usage_disks")
@@ -456,7 +474,8 @@ fn disk_section(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
             ui.spacing_mut().item_spacing.y = 3.0;
             for (i, m) in w.mounts.iter().enumerate() {
                 let indent = nest_level(&w.mounts, i) as f32 * 14.0;
-                if volume_row(ui, m, current == Some(i), indent) {
+                let detail = format!("{:>aw$} / {:>tw$}", avails[i], totals[i]);
+                if volume_row(ui, m, &detail, current == Some(i), indent) {
                     *go = Some(UsageKind::Level {
                         path: m.path.clone(),
                     });
@@ -465,7 +484,43 @@ fn disk_section(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
         });
 }
 
-fn volume_row(ui: &mut egui::Ui, m: &MountPoint, selected: bool, indent: f32) -> bool {
+fn section_head(ui: &mut egui::Ui, icon: &str, title: &str, aside: Option<&str>) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(RichText::new(icon).color(Palette::ACCENT).size(FS_STRONG));
+        ui.label(
+            RichText::new(title)
+                .strong()
+                .size(FS_STRONG)
+                .color(Palette::TEXT),
+        );
+        if let Some(aside) = aside {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(aside).size(FS_NOTE).color(Palette::TEXT_DIM));
+            });
+        }
+    });
+    hairline(ui);
+}
+
+fn hairline(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        egui::Stroke::new(1.0, Palette::BORDER),
+    );
+    ui.add_space(4.0);
+}
+
+fn volume_row(
+    ui: &mut egui::Ui,
+    m: &MountPoint,
+    detail: &str,
+    selected: bool,
+    indent: f32,
+) -> bool {
     ui.horizontal(|ui| {
         if indent > 0.0 {
             ui.add_space(indent.min(42.0));
@@ -478,16 +533,9 @@ fn volume_row(ui: &mut egui::Ui, m: &MountPoint, selected: bool, indent: f32) ->
             (m.used as f64 / m.size as f64 * 100.0) as f32
         };
         let p = ui.painter();
-        p.rect_filled(
-            rect,
-            4.0,
-            if selected {
-                Palette::ACCENT_SOFT
-            } else {
-                Palette::CARD
-            },
-        );
+        p.rect_filled(rect, 4.0, Palette::CARD);
         if m.size > 0 {
+            let c = crate::ui::usage_color(percent);
             let wash = (rect.width() * (percent / 100.0).clamp(0.0, 1.0)).max(3.0);
             let fill = egui::Rect::from_min_max(
                 egui::pos2(rect.right() - wash, rect.top()),
@@ -496,12 +544,7 @@ fn volume_row(ui: &mut egui::Ui, m: &MountPoint, selected: bool, indent: f32) ->
             p.rect_filled(
                 fill,
                 4.0,
-                egui::Color32::from_rgba_unmultiplied(
-                    0xd9,
-                    0x70,
-                    0x49,
-                    if selected { 70 } else { 36 },
-                ),
+                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 36),
             );
         }
         p.rect_stroke(
@@ -517,24 +560,24 @@ fn volume_row(ui: &mut egui::Ui, m: &MountPoint, selected: bool, indent: f32) ->
             ),
             egui::StrokeKind::Inside,
         );
+        let detail_rect = p.text(
+            rect.right_center() - egui::vec2(8.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            detail,
+            egui::FontId::monospace(FS_NOTE),
+            Palette::TEXT_DIM,
+        );
         let name_rect = egui::Rect::from_min_max(
             rect.left_top() + egui::vec2(8.0, 0.0),
-            egui::pos2(rect.right() - 48.0, rect.bottom()),
+            egui::pos2(detail_rect.left() - 8.0, rect.bottom()),
         );
-        p.with_clip_rect(name_rect).text(
-            name_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            &m.path,
-            egui::FontId::proportional(12.0),
-            Palette::TEXT,
-        );
-        if m.size > 0 {
-            p.text(
-                rect.right_center() - egui::vec2(8.0, 0.0),
-                egui::Align2::RIGHT_CENTER,
-                format!("{percent:.0}%"),
-                egui::FontId::monospace(11.0),
-                Palette::TEXT_DIM,
+        if name_rect.width() > 8.0 {
+            p.with_clip_rect(name_rect).text(
+                name_rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                &m.path,
+                egui::FontId::proportional(FS_BODY),
+                Palette::TEXT,
             );
         }
         let tip = match crate::i18n::current() {
@@ -578,23 +621,37 @@ fn is_fs_root(path: &str) -> bool {
 }
 
 fn summary_row(ui: &mut egui::Ui, w: &UsageWin) {
+    use egui_phosphor::regular as icon;
     let (headline, hint) = headline(w);
     let (note, note_tip, note_color) = summary_note(w);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(
-            RichText::new(headline)
+            RichText::new(icon::CHART_PIE)
+                .color(Palette::ACCENT)
+                .size(FS_STRONG),
+        );
+        ui.label(
+            RichText::new(tr("这一层", "This level"))
                 .strong()
-                .size(18.0)
+                .size(FS_STRONG)
                 .color(Palette::TEXT),
-        )
-        .on_hover_text(hint);
+        );
         if !note.is_empty() {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(note).size(11.0).color(note_color))
-                    .on_hover_text(note_tip);
-            });
+            ui.label(RichText::new(note).size(FS_NOTE).color(note_color))
+                .on_hover_text(note_tip);
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(headline)
+                    .strong()
+                    .size(FS_TITLE)
+                    .color(Palette::TEXT),
+            )
+            .on_hover_text(hint);
+        });
     });
+    hairline(ui);
 }
 
 fn headline(w: &UsageWin) -> (String, String) {
@@ -729,7 +786,7 @@ fn paint_rows(
     egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink([false, false])
-        .show_rows(ui, 28.0, rows.len(), |ui, range| {
+        .show_rows(ui, 32.0, rows.len(), |ui, range| {
             for i in range {
                 let row = &rows[i];
                 if !row_hit(ui, row, total, search) {
@@ -757,25 +814,37 @@ fn row_hit(ui: &mut egui::Ui, row: &UsageRow, total: u64, search: bool) -> bool 
     } else {
         egui::Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), sense);
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 6.0, Palette::PANEL_2);
+        ui.painter().rect_filled(rect, 4.0, Palette::PANEL_2);
     }
     let frac = if total == 0 {
         0.0
     } else {
         (row.size as f64 / total as f64) as f32
     };
+    let painter = ui.painter();
+    let text_y = rect.top() + 12.0;
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 8.0, rect.bottom() - 7.0),
+        egui::pos2(rect.right() - 8.0, rect.bottom() - 3.0),
+    );
+    painter.rect_filled(bar, 2.0, Palette::TRACK);
     if row.size > 0 && frac > 0.0 {
-        let mut fill = rect.shrink2(egui::vec2(0.0, 4.0));
-        fill.set_width((rect.width() * frac.clamp(0.0, 1.0)).max(4.0));
-        ui.painter().rect_filled(
+        let mut fill = bar;
+        fill.set_width((bar.width() * frac.clamp(0.0, 1.0)).max(2.0));
+        let c = Palette::ACCENT;
+        painter.rect_filled(
             fill,
-            5.0,
-            egui::Color32::from_rgba_unmultiplied(0xd9, 0x70, 0x49, 72),
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(
+                c.r(),
+                c.g(),
+                c.b(),
+                if row.is_dir { 190 } else { 110 },
+            ),
         );
     }
-    let painter = ui.painter();
     let icon_color = if row.is_dir {
         Palette::ACCENT
     } else {
@@ -783,39 +852,40 @@ fn row_hit(ui: &mut egui::Ui, row: &UsageRow, total: u64, search: bool) -> bool 
     };
     let mark = if row.is_dir { icon::FOLDER } else { icon::FILE };
     painter.text(
-        rect.left_center() + egui::vec2(10.0, 0.0),
+        egui::pos2(rect.left() + 8.0, text_y),
         egui::Align2::LEFT_CENTER,
         mark,
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(FS_STRONG),
         icon_color,
     );
+    let pct_text = pct(row.size, total);
+    let pct_rect = painter.text(
+        egui::pos2(rect.right() - 8.0, text_y),
+        egui::Align2::RIGHT_CENTER,
+        &pct_text,
+        egui::FontId::monospace(FS_NOTE),
+        Palette::TEXT_DIM,
+    );
+    let size_rect = painter.text(
+        egui::pos2(pct_rect.left() - 10.0, text_y),
+        egui::Align2::RIGHT_CENTER,
+        crate::ui::fmt_bytes(row.size as f64),
+        egui::FontId::monospace(FS_BODY),
+        Palette::TEXT,
+    );
     let name_rect = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(30.0, 0.0),
-        egui::pos2(rect.right() - 128.0, rect.bottom()),
+        egui::pos2(rect.left() + 26.0, rect.top()),
+        egui::pos2(size_rect.left() - 8.0, bar.top()),
     );
     if name_rect.width() > 8.0 {
         painter.with_clip_rect(name_rect).text(
-            name_rect.left_center(),
+            egui::pos2(name_rect.left(), text_y),
             egui::Align2::LEFT_CENTER,
             leaf(&row.path),
-            egui::FontId::proportional(12.0),
+            egui::FontId::proportional(FS_BODY),
             Palette::TEXT,
         );
     }
-    painter.text(
-        rect.right_center() - egui::vec2(54.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        crate::ui::fmt_bytes(row.size as f64),
-        egui::FontId::monospace(12.0),
-        Palette::TEXT,
-    );
-    painter.text(
-        rect.right_center() - egui::vec2(8.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        pct(row.size, total),
-        egui::FontId::monospace(11.0),
-        Palette::TEXT_DIM,
-    );
     let tip = if search {
         match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!("{}\n打开所在目录", row.path),
@@ -839,7 +909,7 @@ fn search_bar(
     inset_bar(ui, 32.0, |ui| {
         ui.label(
             RichText::new(icon::MAGNIFYING_GLASS)
-                .size(14.0)
+                .size(FS_STRONG)
                 .color(Palette::TEXT_DIM),
         );
         let clear_w = if show_clear { 24.0 } else { 0.0 };

@@ -114,15 +114,21 @@ fn base_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// 远端「这一层」的脚本。GNU `du -b`。目录名单用 `find -type d`，BSD/GNU 都有。
+/// 远端「这一层」的脚本。GNU `du -b` 和 GNU `find -printf`。
+///
+/// `du -d 1` 不带 `-a` 只打目录，文件的大小被折进总数，名单里就看不见。
+/// 文件单独用 `find` 取最大的 [`SHOW_CAP`] 条，避免一个平铺目录把整份输出拉回来。
 pub fn remote_level_cmd(path: &str) -> String {
     let q = shell_quote(path);
+    let n = SHOW_CAP;
     format!(
         "root={q}\n\
          echo ISHELL_DU\n\
          du -x -d 1 -b -- \"$root\"\n\
          echo ISHELL_TY\n\
          find \"$root\" -mindepth 1 -maxdepth 1 -xdev -type d -print\n\
+         echo ISHELL_FI\n\
+         find \"$root\" -mindepth 1 -maxdepth 1 -xdev \\( -type f -o -type l \\) -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | awk -F'\\t' 'NR<={n} {{print; next}} {{rest += $1; extra++}} END {{printf \"ISHELL_FN %d %d\\n\", extra+0, rest+0}}'\n\
          echo ISHELL_END\n"
     )
 }
@@ -159,11 +165,14 @@ fn find_pattern(needle: &str) -> String {
     p
 }
 
-/// 解析 `du -d 1` + `find -type d` 的合并输出。
+/// 解析 `du -d 1` + 目录名单 + 这一层的文件名单。
 pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
-    let mut phase = 0u8; // 0 还没到 DU，1 du，2 目录名
+    let mut phase = 0u8; // 0 还没到 DU，1 du，2 目录名，3 文件
     let mut du_lines: Vec<(u64, String)> = Vec::new();
     let mut dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut files: Vec<UsageRow> = Vec::new();
+    let mut file_extra = 0u64;
+    let mut file_extra_bytes = 0u64;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -178,6 +187,10 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
                 phase = 2;
                 continue;
             }
+            "ISHELL_FI" => {
+                phase = 3;
+                continue;
+            }
             "ISHELL_END" => break,
             _ => {}
         }
@@ -187,6 +200,24 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
             }
         } else if phase == 2 {
             dirs.insert(base_name(line).to_string());
+        } else if phase == 3 {
+            if let Some(rest) = line.strip_prefix("ISHELL_FN ") {
+                let mut it = rest.split_whitespace();
+                file_extra = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                file_extra_bytes = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                continue;
+            }
+            if let Some((size, path)) = split_size_path(line) {
+                let name = base_name(path).to_string();
+                if !name.is_empty() && !dirs.contains(&name) {
+                    files.push(UsageRow {
+                        path: path.to_string(),
+                        name,
+                        size,
+                        is_dir: false,
+                    });
+                }
+            }
         }
     }
     if du_lines.is_empty() {
@@ -217,10 +248,13 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
             is_dir,
         });
     }
+    rows.extend(files);
     if !saw_total {
         total = rows.iter().fold(0u64, |a, r| a.saturating_add(r.size));
     }
     let (rows, omitted, omitted_bytes) = take_largest(rows, SHOW_CAP);
+    let omitted = omitted.saturating_add(file_extra);
+    let omitted_bytes = omitted_bytes.saturating_add(file_extra_bytes);
     Ok(UsageBody::Level(LevelReport {
         path: root.to_string(),
         total,
@@ -1021,6 +1055,40 @@ ISHELL_END
         assert!(r.rows[0].is_dir);
         assert!(!r.rows[1].is_dir);
         assert_eq!(r.rows[1].size, 100);
+    }
+
+    #[test]
+    fn parse_level_lists_files_and_counts_the_rest() {
+        let text = "\
+ISHELL_DU
+5000\t/data/big
+5000\t/data
+ISHELL_TY
+/data/big
+ISHELL_FI
+80\t/data/notes.txt
+40\t/data/a file.txt
+ISHELL_FN 3 15
+ISHELL_END
+";
+        let UsageBody::Level(r) = parse_level("/data", text).unwrap() else {
+            panic!("level");
+        };
+        let file = r.rows.iter().find(|row| row.name == "notes.txt").unwrap();
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 80);
+        assert!(r.rows.iter().any(|row| row.name == "a file.txt"));
+        assert!(r.rows.iter().any(|row| row.is_dir && row.name == "big"));
+        assert_eq!(r.omitted, 3);
+        assert_eq!(r.omitted_bytes, 15);
+    }
+
+    #[test]
+    fn remote_level_asks_for_files() {
+        let cmd = remote_level_cmd("/data");
+        assert!(cmd.contains("ISHELL_FI"), "{cmd}");
+        assert!(cmd.contains("-type f"), "{cmd}");
+        assert!(!cmd.contains("du -a"), "{cmd}");
     }
 
     #[test]
