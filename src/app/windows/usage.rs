@@ -247,7 +247,7 @@ impl App {
             );
         // 每次打开都回到屏幕正中；只钉一帧，之后拖走不抢。
         if self.usage.as_ref().is_some_and(|w| w.just_opened) {
-            win = win.current_pos(ctx.screen_rect().center() - size / 2.0);
+            win = win.current_pos(ctx.content_rect().center() - size / 2.0);
             if let Some(w) = self.usage.as_mut() {
                 w.just_opened = false;
             }
