@@ -1330,9 +1330,13 @@ fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
                 }
             }
         }
-        // 文件本来就有大小。只有目录也被记下之后，才按大小重排，免得没分析时文件夹沉到底下。
+        // 排序门槛：这层沾上了已分析的树（父目录扫描时记下了它），或这层本身有
+        // 带大小的目录。最内层的纯文件目录也要排——文件大小是列目录时现读的，准。
+        // 完全没沾边的目录保持「目录在前 + 名字序」，免得没分析的目录（size 还是 0）
+        // 沉到文件底下。
+        let in_analyzed_tree = w.known_size.contains_key(&norm_path(&w.path));
         let have_dir_sizes = rows.iter().any(|r| r.is_dir && r.size > 0);
-        if have_dir_sizes {
+        if in_analyzed_tree || have_dir_sizes {
             rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
         }
         let total = w
@@ -2260,5 +2264,77 @@ mod tests {
         w.known_size.insert("/data".into(), 200);
         let (_, _, total, _) = shown_rows(&w);
         assert_eq!(total, 200, "分析过时按整棵树");
+    }
+
+    /// 父目录分析过，钻进最内层的纯文件目录：文件按大小排（文件大小是 metadata 现读的）。
+    #[test]
+    fn innermost_dir_of_analyzed_tree_sorts_files_by_size() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        remember_level(
+            &mut w,
+            LevelReport {
+                path: "/data".into(),
+                total: 100,
+                rows: vec![UsageRow {
+                    name: "leaf".into(),
+                    path: "/data/leaf".into(),
+                    size: 100,
+                    is_dir: true,
+                }],
+                omitted: 0,
+                omitted_bytes: 0,
+                partial: false,
+                denied: 0,
+                nested: vec![("/data/leaf".into(), 100)],
+            },
+        );
+        w.flush_known();
+        assert!(enter_dir(&mut w, "/data/leaf").is_some());
+        w.names = Some(NameReport {
+            path: "/data/leaf".into(),
+            rows: vec![
+                UsageRow {
+                    name: "small".into(),
+                    path: "/data/leaf/small".into(),
+                    size: 1,
+                    is_dir: false,
+                },
+                UsageRow {
+                    name: "big".into(),
+                    path: "/data/leaf/big".into(),
+                    size: 90,
+                    is_dir: false,
+                },
+            ],
+            omitted: 0,
+        });
+        let (rows, ..) = shown_rows(&w);
+        assert_eq!(rows[0].name, "big", "纯文件目录也要按大小排，{rows:?}");
+    }
+
+    /// 没沾分析边的目录：不排序，保持「目录在前 + 名字序」，目录不沉底。
+    #[test]
+    fn fresh_dir_keeps_dirs_first_by_name() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        w.names = Some(NameReport {
+            path: "/data".into(),
+            rows: vec![
+                UsageRow {
+                    name: "zdir".into(),
+                    path: "/data/zdir".into(),
+                    size: 0,
+                    is_dir: true,
+                },
+                UsageRow {
+                    name: "big".into(),
+                    path: "/data/big".into(),
+                    size: 90,
+                    is_dir: false,
+                },
+            ],
+            omitted: 0,
+        });
+        let (rows, ..) = shown_rows(&w);
+        assert_eq!(rows[0].name, "zdir", "没分析过的目录不能沉到文件底下");
     }
 }
