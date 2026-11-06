@@ -102,7 +102,10 @@ pub async fn run(
     // 轮询 child.try_wait：shell 已死就收尾（先排空残留输出，再发 ShellExited）。
     let mut child_poll = tokio::time::interval(std::time::Duration::from_millis(200));
     child_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut usage_heavy: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    // 分层统计和列名字分开停：进子目录只列名字，不能把还在算的父目录统计掐掉，
+    // 否则子目录大小来不及记下来。
+    let mut usage_level: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    let mut usage_list: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
 
     loop {
         tokio::select! {
@@ -160,17 +163,22 @@ pub async fn run(
                     });
                 }
                 Some(UiCommand::UsageQuery { id, kind, cancel }) => {
-                    let heavy = matches!(
+                    let is_level = matches!(kind, crate::usage::UsageKind::Level { .. });
+                    let is_list = matches!(
                         kind,
-                        crate::usage::UsageKind::Level { .. }
-                            | crate::usage::UsageKind::Names { .. }
+                        crate::usage::UsageKind::Names { .. }
                             | crate::usage::UsageKind::Search { .. }
                     );
-                    if heavy {
-                        if let Some((task, flag)) = usage_heavy.take() {
-                            flag.store(true, Ordering::Relaxed);
-                            task.abort();
-                        }
+                    let prev = if is_level {
+                        usage_level.take()
+                    } else if is_list {
+                        usage_list.take()
+                    } else {
+                        None
+                    };
+                    if let Some((task, flag)) = prev {
+                        flag.store(true, Ordering::Relaxed);
+                        task.abort();
                     }
                     let s = sink.clone();
                     let run_flag = cancel.clone();
@@ -180,17 +188,20 @@ pub async fn run(
                             crate::usage::run_local(kind, &run_flag)
                         })
                         .await;
-                        if watch.load(Ordering::Relaxed) {
-                            return;
-                        }
+                        // 算完了就交回去。进子目录不会停掉这一次，已经算出来的大小要记下来。
                         match joined {
-                            Ok(Err(e)) if e.is_empty() => {}
+                            Ok(Ok(body)) => {
+                                s.send(WorkerEvent::UsageReady { id, result: Ok(body) });
+                            }
+                            Ok(Err(e)) if e.is_empty() || watch.load(Ordering::Relaxed) => {}
                             Ok(result) => s.send(WorkerEvent::UsageReady { id, result }),
                             Err(_) => {}
                         }
                     });
-                    if heavy {
-                        usage_heavy = Some((task, cancel));
+                    if is_level {
+                        usage_level = Some((task, cancel));
+                    } else if is_list {
+                        usage_list = Some((task, cancel));
                     }
                 }
                 Some(UiCommand::Disconnect) | None => {
@@ -217,9 +228,11 @@ pub async fn run(
     }
     // 循环退出：停掉系统信息采样任务；master/in_tx 在此 drop → PTY 关闭、写线程结束；
     // out_rx drop → 读线程下次发送失败退出。
-    if let Some((task, flag)) = usage_heavy.take() {
-        flag.store(true, Ordering::Relaxed);
-        task.abort();
+    for mut slot in [usage_level.take(), usage_list.take()] {
+        if let Some((task, flag)) = slot.take() {
+            flag.store(true, Ordering::Relaxed);
+            task.abort();
+        }
     }
     if let Some(t) = sysinfo_task {
         t.abort();

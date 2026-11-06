@@ -42,8 +42,10 @@ pub struct UsageRow {
 pub struct MountPoint {
     /// 挂载点路径，点了就去统计它。
     pub path: String,
-    /// 文件系统类型或设备名，按钮上的短标签。
+    /// 文件系统类型，例如 `ext4`。
     pub label: String,
+    /// 设备，例如 `/dev/nvme0n1p5`。用来认出这是哪块盘。
+    pub source: String,
     pub size: u64,
     pub used: u64,
     pub avail: u64,
@@ -367,27 +369,29 @@ fn split_size_path(line: &str) -> Option<(u64, &str)> {
 }
 
 /// 解析 `df` 输出。带 Type 列时丢掉 tmpfs 这类虚拟文件系统。
+/// 表头可能是中文（`类型` / `1的块`），不能靠英文单词 `Type` 判断有没有类型列。
 pub fn parse_df(text: &str) -> Vec<MountPoint> {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let Some(header) = lines.next() else {
         return Vec::new();
     };
     let scale = df_scale(header);
-    let has_type = header.split_whitespace().any(|c| c == "Type");
     let mut out = Vec::new();
     for line in lines {
         let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 6 {
+            continue;
+        }
         // 有类型：fs type blocks used avail cap mount...
         // 无类型：fs blocks used avail cap mount...
+        // 第二列不是数字就是文件系统类型。中文表头里没有英文 "Type"。
+        let has_type = cols[1].parse::<u64>().is_err();
         let (label, blocks, used, avail, mount_at) = if has_type {
             if cols.len() < 7 {
                 continue;
             }
             (cols[1], cols[2], cols[3], cols[4], 6)
         } else {
-            if cols.len() < 6 {
-                continue;
-            }
             (cols[0], cols[1], cols[2], cols[3], 5)
         };
         if is_virtual_fs(label) || is_virtual_fs(cols[0]) {
@@ -408,6 +412,7 @@ pub fn parse_df(text: &str) -> Vec<MountPoint> {
         };
         out.push(MountPoint {
             path: mount,
+            source: cols[0].to_string(),
             label: label.to_string(),
             size: blocks.saturating_mul(scale),
             used: used.saturating_mul(scale),
@@ -420,7 +425,9 @@ pub fn parse_df(text: &str) -> Vec<MountPoint> {
 }
 
 fn df_scale(header: &str) -> u64 {
-    if header.contains("1B-blocks") || header.contains("1-blocks") {
+    // GNU df 的中文表头是「1的块」「1024的块」，不是 1B-blocks。
+    // 「1024的块」里不含「1的块」。
+    if header.contains("1B-blocks") || header.contains("1-blocks") || header.contains("1的块") {
         1
     } else if header.contains("1024") {
         1024
@@ -708,7 +715,7 @@ fn scan_level(root: &Path, cancel: &AtomicBool) -> Result<LevelReport, String> {
         rows,
         omitted,
         omitted_bytes,
-        partial: stop.load(Ordering::Relaxed),
+        partial: stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed),
         denied: denied.load(Ordering::Relaxed),
     })
 }
@@ -1023,7 +1030,7 @@ fn linux_mounts() -> Option<Vec<MountPoint>> {
     let mut seen = std::collections::HashSet::new();
     for line in text.lines() {
         let mut cols = line.split_whitespace();
-        let _dev = cols.next()?;
+        let dev = cols.next()?;
         let mount = unescape_proc(cols.next()?);
         let fstype = cols.next().unwrap_or("");
         if is_virtual_fs(fstype) || !is_presented_mount(&mount) || !seen.insert(mount.clone()) {
@@ -1032,6 +1039,7 @@ fn linux_mounts() -> Option<Vec<MountPoint>> {
         let (size, used, avail) = statvfs_bytes(&mount).unwrap_or((0, 0, 0));
         out.push(MountPoint {
             path: mount,
+            source: dev.to_string(),
             label: fstype.to_string(),
             size,
             used,
@@ -1088,7 +1096,8 @@ fn windows_drives() -> Vec<MountPoint> {
         }
         let (size, used, avail) = windows_space(&path).unwrap_or((0, 0, 0));
         out.push(MountPoint {
-            path,
+            path: path.clone(),
+            source: path,
             label: "disk".into(),
             size,
             used,
@@ -1217,6 +1226,26 @@ tmpfs tmpfs 100 10 90 10% /run
         assert_eq!(m[0].path, "/");
         assert_eq!(m[0].size, 1000 * 1024);
         assert_eq!(m[0].label, "ext4");
+        assert_eq!(m[0].source, "/dev/sda1");
+    }
+
+    #[test]
+    fn parse_df_reads_a_chinese_header() {
+        let text = "\
+文件系统       类型             1的块         已用         可用 容量 挂载点
+tmpfs          tmpfs       1665941504      3194880   1662746624   1% /run
+/dev/nvme0n1p5 ext4      117474209792 105241014272   6218563584  95% /
+/dev/sdb       ext4      492051456000 355935469568 111093817344  77% /mnt/sda1
+/dev/nvme0n1p1 vfat         535805952     33001472    502804480   7% /boot/efi
+";
+        let m = parse_df(text);
+        let paths: Vec<_> = m.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, vec!["/", "/boot/efi", "/mnt/sda1"]);
+        assert_eq!(m[0].source, "/dev/nvme0n1p5");
+        assert_eq!(m[0].label, "ext4");
+        assert_eq!(m[0].size, 117474209792);
+        assert_eq!(m[2].source, "/dev/sdb");
+        assert_eq!(m[2].used, 355935469568);
     }
 
     #[test]

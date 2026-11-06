@@ -412,8 +412,9 @@ pub async fn run(
     // 端口转发监听任务：id -> JoinHandle
     let mut forwards: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
 
-    // 占用分析里正在跑的那一次（分层或搜索）。新的一次会停掉上一次；列磁盘不占这个名额。
-    let mut usage_heavy: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    // 分层统计和列名字分开停：进子目录只列名字，不能把还在算的父目录统计掐掉。
+    let mut usage_level: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    let mut usage_list: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
 
     // 传输并发控制：进行中计数 + 排队 + 取消标志；完成时由任务经 xfer_done 通知主循环
     let mut active_xfer = 0usize;
@@ -1004,33 +1005,40 @@ pub async fn run(
                         }
                     }
                     Some(UiCommand::UsageQuery { id, kind, cancel }) => {
-                        let heavy = matches!(
+                        let is_level = matches!(kind, crate::usage::UsageKind::Level { .. });
+                        let is_list = matches!(
                             kind,
-                            crate::usage::UsageKind::Level { .. }
-                                | crate::usage::UsageKind::Names { .. }
+                            crate::usage::UsageKind::Names { .. }
                                 | crate::usage::UsageKind::Search { .. }
                         );
-                        if heavy {
-                            if let Some((task, flag)) = usage_heavy.take() {
-                                flag.store(true, Ordering::Relaxed);
-                                task.abort();
-                            }
+                        let prev = if is_level {
+                            usage_level.take()
+                        } else if is_list {
+                            usage_list.take()
+                        } else {
+                            None
+                        };
+                        if let Some((task, flag)) = prev {
+                            flag.store(true, Ordering::Relaxed);
+                            task.abort();
                         }
                         let h = handle.clone();
                         let s = sink.clone();
                         let flag = cancel.clone();
                         let task = tokio::spawn(async move {
                             let result = remote_usage(&h, kind).await;
-                            if flag.load(Ordering::Relaxed) {
-                                return;
-                            }
                             match result {
-                                Err(e) if e.is_empty() => {}
-                                other => s.send(WorkerEvent::UsageReady { id, result: other }),
+                                Ok(body) => {
+                                    s.send(WorkerEvent::UsageReady { id, result: Ok(body) });
+                                }
+                                Err(e) if e.is_empty() || flag.load(Ordering::Relaxed) => {}
+                                Err(e) => s.send(WorkerEvent::UsageReady { id, result: Err(e) }),
                             }
                         });
-                        if heavy {
-                            usage_heavy = Some((task, cancel));
+                        if is_level {
+                            usage_level = Some((task, cancel));
+                        } else if is_list {
+                            usage_list = Some((task, cancel));
                         }
                     }
                     // 键盘交互回答仅在认证阶段由 connect() 消费；正常运行期收到则忽略
@@ -1045,9 +1053,11 @@ pub async fn run(
         }
     }
 
-    if let Some((task, flag)) = usage_heavy.take() {
-        flag.store(true, Ordering::Relaxed);
-        task.abort();
+    for mut slot in [usage_level.take(), usage_list.take()] {
+        if let Some((task, flag)) = slot.take() {
+            flag.store(true, Ordering::Relaxed);
+            task.abort();
+        }
     }
 
     // 连接生命周期末尾清理本次注册的 AI/MCP 反向转发 socket 文件（`handle` 此时尚未被
