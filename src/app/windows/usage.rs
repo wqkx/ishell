@@ -1291,8 +1291,16 @@ fn list_message(w: &UsageWin) -> Option<String> {
 fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
     if matches!(w.mode, Mode::Search) {
         if let Some(search) = &w.search {
-            let biggest = search.rows.iter().map(|r| r.size).max().unwrap_or(0);
-            return (search.rows.clone(), true, biggest, true);
+            // 百分比分母：搜索根分析过就按整棵树算（「它占这个目录的多少」）；
+            // 没分析过按全部命中的总和（「它在这些结果里的占比」）。
+            // 之前拿最大命中当分母，最大的那条永远 100%，没有信息量。
+            let total = saved_size(w, &search.path).unwrap_or_else(|| {
+                search
+                    .rows
+                    .iter()
+                    .fold(0u64, |a, r| a.saturating_add(r.size))
+            });
+            return (search.rows.clone(), true, total, true);
         }
     }
     if let Some(level) = w.level.as_ref().filter(|l| norm_path(&l.path) == w.path) {
@@ -1750,7 +1758,10 @@ fn search_bar(
                         &mut w.needle,
                         &mut w.needle_ime,
                         false,
-                        Some(tr("搜索文件名，回车", "Search names, then Enter")),
+                        Some(tr(
+                            "搜索文件名（可带 * ? [] 通配符），回车",
+                            "Search names (* ? [] globs ok), then Enter",
+                        )),
                     )
                 },
             )
@@ -2204,5 +2215,38 @@ mod tests {
         assert_eq!(w.level_id, Some(7), "扫描转后台，登记还在");
         assert!(!w.scan_on_page(), "人不在被扫描的那页了");
         // 后台指示（「后台分析 data（N 项）」）就靠 level_id 亮着。
+    }
+
+    /// 搜索结果的百分比分母：根目录分析过按整棵树，没分析过按命中总和；
+    /// 不再拿最大命中当 100%。
+    #[test]
+    fn search_rows_use_tree_total_or_hits_sum() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        w.mode = Mode::Search;
+        w.search = Some(SearchReport {
+            path: "/data".into(),
+            needle: "x".into(),
+            rows: vec![
+                UsageRow {
+                    name: "a".into(),
+                    path: "/data/a".into(),
+                    size: 30,
+                    is_dir: false,
+                },
+                UsageRow {
+                    name: "b".into(),
+                    path: "/data/deep/b".into(),
+                    size: 10,
+                    is_dir: false,
+                },
+            ],
+            matched: 2,
+            truncated: false,
+        });
+        let (_, _, total, _) = shown_rows(&w);
+        assert_eq!(total, 40, "没分析过时按命中总和");
+        w.known_size.insert("/data".into(), 200);
+        let (_, _, total, _) = shown_rows(&w);
+        assert_eq!(total, 200, "分析过时按整棵树");
     }
 }

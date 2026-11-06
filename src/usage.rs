@@ -27,7 +27,8 @@ pub enum UsageKind {
     Level { path: String },
     /// 只列出这一层的名字，不算子目录大小。
     Names { path: String },
-    /// 在这棵树里按名称子串找，结果按大小从大到小。
+    /// 在这棵树里按名称找：普通词是子串；带 `*` `?` `[...]` 按文件名通配；
+    /// 带 `/` 按路径通配。结果按大小从大到小。
     Search { path: String, needle: String },
     /// 磁盘 / 挂载点。
     Mounts,
@@ -151,17 +152,37 @@ pub fn remote_level_cmd(path: &str) -> String {
     )
 }
 
-/// 远端按名称搜索。`-iname` 是子串（包在 `*` 里），结果在远端按大小取前 [`SEARCH_CAP`] 条。
-/// 多取一条（`SEARCH_CAP + 1`）：拿到第 501 条就说明命中被截断，否则截断标记永远立不起来。
+/// 远端按名称搜索。普通词是大小写不敏感子串（`-iname` 包在 `*` 里）；带 glob 元字符的
+/// 按文件名通配；带 `/` 的按路径通配（`-ipath`，`*` 可以跨过目录）。结果在远端按大小取前
+/// [`SEARCH_CAP`] 条。多取一条（`SEARCH_CAP + 1`）：拿到第 501 条就说明命中被截断，
+/// 否则截断标记永远立不起来。
 pub fn remote_search_cmd(path: &str, needle: &str) -> String {
     let root = shell_quote(path);
-    let pat = shell_quote(&find_pattern(needle));
+    let (flag, pat) = search_pattern(needle);
+    let pat = shell_quote(&pat);
     let n = SEARCH_CAP + 1;
     format!(
         "root={root}\n\
          pat={pat}\n\
-         find \"$root\" -xdev -iname \"$pat\" -type f -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | head -n {n}\n"
+         find \"$root\" -xdev {flag} \"$pat\" -type f -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | head -n {n}\n"
     )
+}
+
+/// 由搜索词推出 `find` 的匹配旗标和模式，规则与本地 [`matcher_for`] 一致。
+fn search_pattern(needle: &str) -> (&'static str, String) {
+    if needle.contains('/') {
+        // 路径模式：两端包 `*`，让它落在搜索根之下任意深度；`*` 在 -ipath 里能跨 `/`。
+        ("-ipath", format!("*{needle}*"))
+    } else if is_glob(needle) {
+        ("-iname", needle.to_string())
+    } else {
+        ("-iname", find_pattern(needle))
+    }
+}
+
+/// 搜索词里有没有 glob 元字符（`*`、`?`、成对的 `[...]`）。
+fn is_glob(needle: &str) -> bool {
+    needle.contains('*') || needle.contains('?') || (needle.contains('[') && needle.contains(']'))
 }
 
 pub fn remote_mounts_cmd() -> &'static str {
@@ -984,8 +1005,7 @@ fn scan_search(
     let dev = std::fs::symlink_metadata(root)
         .map(|m| dev_of(&m))
         .unwrap_or(0);
-    let needle_l = needle.to_lowercase();
-    let ascii = needle.is_ascii();
+    let matcher = matcher_for(needle);
     let stop = AtomicBool::new(false);
     let visited = progress;
     let denied = AtomicU64::new(0);
@@ -1015,7 +1035,13 @@ fn scan_search(
             };
             let name = ent.file_name().to_string_lossy().into_owned();
             let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
-            if !is_dir && name_hit(&name, &needle_l, ascii) {
+            let hit = !is_dir
+                && match &matcher {
+                    // 路径模式对完整路径匹配（前缀的 `*` 吃掉搜索根），其余对文件名。
+                    Matcher::Path(_) => matcher.hit(&path.to_string_lossy()),
+                    _ => matcher.hit(&name),
+                };
+            if hit {
                 matched += 1;
                 consider(
                     &mut heap,
@@ -1044,18 +1070,141 @@ fn scan_search(
     })
 }
 
-fn name_hit(name: &str, needle_l: &str, ascii: bool) -> bool {
-    if ascii && name.is_ascii() {
-        let n = needle_l.as_bytes();
-        if n.is_empty() || name.len() < n.len() {
+/// 搜索词的匹配方式，规则与远端 [`search_pattern`] 一致：普通词是大小写不敏感的
+/// 文件名子串；带 glob 元字符（`*` `?` `[...]`）按文件名通配；带 `/` 按路径通配
+/// （两端包 `*`，`*`/`?` 可以跨过 `/`，和 `find -ipath` 一致）。
+enum Matcher {
+    /// 文件名里包着这个词（已小写）。
+    Substring(String),
+    /// 文件名通配。
+    Name(String),
+    /// 完整路径通配。
+    Path(String),
+}
+
+fn matcher_for(needle: &str) -> Matcher {
+    if needle.contains('/') {
+        Matcher::Path(format!("*{needle}*"))
+    } else if is_glob(needle) {
+        Matcher::Name(needle.to_string())
+    } else {
+        Matcher::Substring(needle.to_lowercase())
+    }
+}
+
+impl Matcher {
+    fn hit(&self, text: &str) -> bool {
+        match self {
+            Matcher::Substring(n) => {
+                if n.is_empty() {
+                    return false;
+                }
+                if n.is_ascii() && text.is_ascii() {
+                    return text
+                        .as_bytes()
+                        .windows(n.len())
+                        .any(|w| w.eq_ignore_ascii_case(n.as_bytes()));
+                }
+                text.to_lowercase().contains(n.as_str())
+            }
+            Matcher::Name(pat) | Matcher::Path(pat) => glob_match(pat, text),
+        }
+    }
+}
+
+/// 大小写不敏感的 glob 匹配：`*` 任意串、`?` 单个字符、`[...]` 字符类（`!`/`^` 开头取反，
+/// `-` 表范围）。`*` 和 `?` 都能跨过 `/`，和 `find -ipath` 的规则一样。
+fn glob_match(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().flat_map(char::to_lowercase).collect();
+    let t: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    glob_inner(&p, &t)
+}
+
+fn glob_inner(p: &[char], t: &[char]) -> bool {
+    let (mut pi, mut ti) = (0, 0);
+    // 最近一个 `*` 的位置和它当时吃到的文本位置；后面失配就回来让它多吃一个。
+    let (mut star, mut star_t) = (usize::MAX, 0);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            star_t = ti;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '[' {
+            match class_at(p, pi, t[ti]) {
+                Some((true, next)) => {
+                    pi = next;
+                    ti += 1;
+                }
+                Some((false, _)) => {
+                    if star == usize::MAX {
+                        return false;
+                    }
+                    pi = star + 1;
+                    star_t += 1;
+                    ti = star_t;
+                }
+                // 残缺的 `[` 当字面字符。
+                None => {
+                    if t[ti] == '[' {
+                        pi += 1;
+                        ti += 1;
+                    } else if star == usize::MAX {
+                        return false;
+                    } else {
+                        pi = star + 1;
+                        star_t += 1;
+                        ti = star_t;
+                    }
+                }
+            }
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
             return false;
         }
-        return name
-            .as_bytes()
-            .windows(n.len())
-            .any(|w| w.eq_ignore_ascii_case(n));
     }
-    name.to_lowercase().contains(needle_l)
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// `p[i]` 是 `[`：解析一个字符类，返回 (c 是否命中, 类之后的下标)。
+/// 找不到收尾的 `]`（残缺模式）返回 None。
+fn class_at(p: &[char], i: usize, c: char) -> Option<(bool, usize)> {
+    let mut j = i + 1;
+    let negate = j < p.len() && (p[j] == '!' || p[j] == '^');
+    if negate {
+        j += 1;
+    }
+    // `[]...]` 打头的 `]` 是字面成员。
+    if j < p.len() && p[j] == ']' {
+        j += 1;
+    }
+    let body = j;
+    let mut hit = false;
+    while j < p.len() && p[j] != ']' {
+        if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
+            if p[j] <= c && c <= p[j + 2] {
+                hit = true;
+            }
+            j += 3;
+        } else {
+            if p[j] == c {
+                hit = true;
+            }
+            j += 1;
+        }
+    }
+    if j >= p.len() || j == body {
+        return None;
+    }
+    Some((hit != negate, j + 1))
 }
 
 fn remember_file(
@@ -1535,6 +1684,112 @@ tmpfs tmpfs 100 1 90 1% /run
     #[test]
     fn find_pattern_escapes_globs() {
         assert_eq!(find_pattern("a*b"), "*a\\*b*");
+    }
+
+    #[test]
+    fn search_pattern_picks_the_right_find_mode() {
+        // 普通词：文件名子串。
+        assert_eq!(search_pattern("plain"), ("-iname", "*plain*".to_string()));
+        // 带元字符：文件名通配，不再包外围 `*`。
+        assert_eq!(search_pattern("*.log"), ("-iname", "*.log".to_string()));
+        assert_eq!(
+            search_pattern("sys?.log"),
+            ("-iname", "sys?.log".to_string())
+        );
+        assert_eq!(
+            search_pattern("log[0-9]"),
+            ("-iname", "log[0-9]".to_string())
+        );
+        // 带 `/`：路径通配，两端包 `*` 落到任意深度。
+        assert_eq!(
+            search_pattern("src/*.rs"),
+            ("-ipath", "*src/*.rs*".to_string())
+        );
+        assert_eq!(
+            search_pattern("/var/log/*.log"),
+            ("-ipath", "*/var/log/*.log*".to_string())
+        );
+        let cmd = remote_search_cmd("/data", "*.log");
+        assert!(cmd.contains("pat='*.log'"), "{cmd}");
+        assert!(cmd.contains("-iname \"$pat\""), "{cmd}");
+        let cmd = remote_search_cmd("/data", "src/*.rs");
+        assert!(cmd.contains("pat='*src/*.rs*'"), "{cmd}");
+        assert!(cmd.contains("-ipath \"$pat\""), "{cmd}");
+    }
+
+    #[test]
+    fn glob_match_covers_star_question_and_classes() {
+        assert!(glob_match("*.log", "syslog.log"));
+        assert!(!glob_match("*.log", "syslog.log.bak"));
+        // 大小写不敏感。
+        assert!(glob_match("SYS?.TXT", "sys1.txt"));
+        // `*` 跨 `/`，和 find -ipath 一致。
+        assert!(glob_match("src/*.rs", "src/main.rs"));
+        assert!(glob_match("src/*.rs", "src/deep/lib.rs"));
+        assert!(glob_match("*/deep/*.rs", "a/src/deep/lib.rs"));
+        // `?` 只顶一个字符。
+        assert!(!glob_match("sys?.log", "sys12.log"));
+        // 字符类：范围、取反。
+        assert!(glob_match("file[0-9]", "file7"));
+        assert!(!glob_match("file[0-9]", "filex"));
+        assert!(glob_match("[!a-c]x", "dx"));
+        assert!(!glob_match("[!a-c]x", "bx"));
+        // 残缺的 `[` 当字面。
+        assert!(glob_match("a[", "a["));
+        assert!(!glob_match("a[", "ab"));
+        // `*` 可以匹配空。
+        assert!(glob_match("a*", "a"));
+        assert!(!glob_match("a", "ab"));
+        assert!(glob_match("*", "anything/at/all"));
+    }
+
+    #[test]
+    fn matcher_picks_substring_glob_or_path() {
+        assert!(matches!(matcher_for("plain"), Matcher::Substring(_)));
+        assert!(matches!(matcher_for("*.log"), Matcher::Name(_)));
+        assert!(matches!(matcher_for("src/*.rs"), Matcher::Path(_)));
+        // 文件名子串命中；通配模式不再是子串（`foo.log.bak` 不该命中 `*.log`）。
+        assert!(matcher_for("log").hit("syslog.log"));
+        assert!(matcher_for("*.log").hit("foo.log"));
+        assert!(!matcher_for("*.log").hit("foo.log.bak"));
+        assert!(matcher_for("deep/*.log").hit("/root/a/deep/x.log"));
+        assert!(!matcher_for("deep/*.log").hit("/root/a/other/x.log"));
+    }
+
+    #[test]
+    fn local_search_takes_globs_and_paths() {
+        let dir = std::env::temp_dir().join(format!("ishell-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("deep")).unwrap();
+        std::fs::write(dir.join("foo.log"), b"x").unwrap();
+        std::fs::write(dir.join("foo.log.bak"), b"x").unwrap();
+        std::fs::write(dir.join("deep").join("c.log"), b"x").unwrap();
+        let cancel = AtomicBool::new(false);
+        let search = |needle: &str| {
+            let UsageBody::Search(s) = run_local(
+                UsageKind::Search {
+                    path: dir.display().to_string(),
+                    needle: needle.into(),
+                },
+                &cancel,
+                &AtomicU64::new(0),
+            )
+            .unwrap() else {
+                panic!("search");
+            };
+            s
+        };
+        // 通配：只收 .log 结尾的，.bak 不进来；深层也找得到。
+        let s = search("*.log");
+        assert_eq!(s.matched, 2, "{:?}", s.rows);
+        // 子串：三者都带 log。
+        let s = search("log");
+        assert_eq!(s.matched, 3, "{:?}", s.rows);
+        // 路径模式：只要 deep 下面的。
+        let s = search("deep/*.log");
+        assert_eq!(s.matched, 1, "{:?}", s.rows);
+        assert!(s.rows[0].path.contains("deep"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
