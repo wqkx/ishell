@@ -1006,7 +1006,9 @@ pub async fn run(
                     Some(UiCommand::UsageQuery { id, kind, cancel }) => {
                         let heavy = matches!(
                             kind,
-                            crate::usage::UsageKind::Level { .. } | crate::usage::UsageKind::Search { .. }
+                            crate::usage::UsageKind::Level { .. }
+                                | crate::usage::UsageKind::Names { .. }
+                                | crate::usage::UsageKind::Search { .. }
                         );
                         if heavy {
                             if let Some((task, flag)) = usage_heavy.take() {
@@ -1083,6 +1085,10 @@ async fn remote_usage(
             crate::usage::path_ok(path)?;
             crate::usage::remote_level_cmd(path)
         }
+        UsageKind::Names { path } => {
+            crate::usage::path_ok(path)?;
+            crate::usage::remote_names_cmd(path)
+        }
         UsageKind::Search { path, needle } => {
             crate::usage::path_ok(path)?;
             let needle = crate::usage::needle_ok(needle)?;
@@ -1095,6 +1101,7 @@ async fn remote_usage(
     match kind {
         UsageKind::Mounts => Ok(UsageBody::Mounts(crate::usage::parse_df(&text))),
         UsageKind::Level { path } => crate::usage::parse_level(&path, &text),
+        UsageKind::Names { path } => Ok(UsageBody::Names(crate::usage::parse_names(&path, &text))),
         UsageKind::Search { path, needle } => Ok(crate::usage::parse_search(&path, &needle, &text)),
     }
 }

@@ -1,5 +1,7 @@
-//! 目录占用分析小窗。一次只看当前目录的直接子项，点进去再统计下一层。
+//! 目录占用分析小窗。打开先看这一层的名字，点「分析」才算大小。
+//! 算过的结果按路径留着，进子目录不会重算，除非再点分析。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -8,7 +10,9 @@ use egui::RichText;
 use crate::i18n::tr;
 use crate::proto::UiCommand;
 use crate::theme::{Palette, FS_BODY, FS_NOTE, FS_STRONG, FS_TITLE};
-use crate::usage::{LevelReport, MountPoint, SearchReport, UsageBody, UsageKind, UsageRow};
+use crate::usage::{
+    LevelReport, MountPoint, NameReport, SearchReport, UsageBody, UsageKind, UsageRow,
+};
 
 use super::super::App;
 
@@ -17,10 +21,18 @@ enum Mode {
     Search,
 }
 
+enum Page {
+    /// 主目录和各个磁盘。
+    Disks,
+    /// 当前目录里的文件和文件夹。
+    Dir,
+}
+
 pub(in crate::app) struct UsageWin {
     session_uid: u64,
     path: String,
     home: String,
+    page: Page,
     /// 与文件区路径栏同一套状态：面包屑、双击编辑、单击延时、幽灵子路径。
     path_edit: Option<String>,
     path_edit_focus: bool,
@@ -31,15 +43,27 @@ pub(in crate::app) struct UsageWin {
     needle: String,
     needle_ime: Option<(usize, usize)>,
     mode: Mode,
+    /// 当前路径已经分析过的结果。没分析过是 None。
     level: Option<LevelReport>,
+    /// 还没分析时的名字列表。
+    names: Option<NameReport>,
+    /// 分析过的目录，按路径留着。再进去直接用，不重新计算。
+    analyzed: HashMap<String, LevelReport>,
+    /// 父目录分析时记下的子目录大小。键是规范化路径。
+    known_size: HashMap<String, u64>,
     search: Option<SearchReport>,
     mounts: Vec<MountPoint>,
     error: String,
     level_id: Option<u64>,
+    names_id: Option<u64>,
     search_id: Option<u64>,
     mount_id: Option<u64>,
     next_id: u64,
     level_cancel: Option<Arc<AtomicBool>>,
+    selected: HashSet<usize>,
+    select_anchor: Option<usize>,
+    /// 待确认删除的 (路径, 显示名)。
+    confirm_delete: Option<Vec<(String, String)>>,
 }
 
 impl UsageWin {
@@ -48,6 +72,7 @@ impl UsageWin {
             session_uid,
             path,
             home,
+            page: Page::Dir,
             path_edit: None,
             path_edit_focus: false,
             path_edit_rsel: None,
@@ -58,14 +83,21 @@ impl UsageWin {
             needle_ime: None,
             mode: Mode::Level,
             level: None,
+            names: None,
+            analyzed: HashMap::new(),
+            known_size: HashMap::new(),
             search: None,
             mounts: Vec::new(),
             error: String::new(),
             level_id: None,
+            names_id: None,
             search_id: None,
             mount_id: None,
             next_id: 1,
             level_cancel: None,
+            selected: HashSet::new(),
+            select_anchor: None,
+            confirm_delete: None,
         }
     }
 
@@ -89,7 +121,7 @@ impl UsageWin {
     }
 
     fn busy(&self) -> bool {
-        self.level_id.is_some() || self.search_id.is_some()
+        self.level_id.is_some() || self.search_id.is_some() || self.names_id.is_some()
     }
 }
 
@@ -110,8 +142,8 @@ impl App {
             w.stop();
         }
         self.usage = Some(UsageWin::new(uid, path.clone(), home));
-        self.usage_go(UsageKind::Level { path });
         self.usage_go(UsageKind::Mounts);
+        self.usage_go(UsageKind::Names { path });
     }
 
     pub(in crate::app) fn usage_window(&mut self, ctx: &egui::Context) {
@@ -122,6 +154,7 @@ impl App {
         let mut close = false;
         let mut go: Option<UsageKind> = None;
         let mut clear_query = false;
+        let mut delete: Option<Vec<String>> = None;
         egui::Window::new("usage_win")
             .title_bar(false)
             .default_size([540.0, 560.0])
@@ -135,7 +168,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_min_width(420.0);
                 if let Some(w) = self.usage.as_mut() {
-                    paint_usage(ui, w, &mut close, &mut go, &mut clear_query);
+                    paint_usage(ui, w, &mut close, &mut go, &mut clear_query, &mut delete);
                 }
             });
         if close {
@@ -151,9 +184,23 @@ impl App {
                     w.needle_ime = None;
                 }
             }
+        } else if let Some(paths) = delete {
+            self.usage_delete(paths);
         } else if let Some(kind) = go {
             self.usage_go(kind);
         }
+    }
+
+    fn usage_delete(&mut self, paths: Vec<String>) {
+        let Some(w) = self.usage.as_mut() else {
+            return;
+        };
+        let uid = w.session_uid;
+        drop_deleted(w, &paths);
+        let Some(s) = self.sessions.iter().find(|s| s.uid == uid) else {
+            return;
+        };
+        let _ = s.cmd_tx.send(UiCommand::DeleteMany { paths });
     }
 
     fn drain_usage(&mut self, ctx: &egui::Context) {
@@ -187,12 +234,24 @@ impl App {
         for (id, result) in got {
             match result {
                 Ok(UsageBody::Level(rep)) if w.level_id == Some(id) => {
-                    if !editing {
-                        set_usage_path(w, &rep.path);
+                    let rep = remember_level(w, rep);
+                    if !editing && norm_path(&rep.path) == w.path {
+                        w.level = Some(rep);
+                        w.names = None;
+                        w.mode = Mode::Level;
                     }
-                    w.level = Some(rep);
                     w.level_id = None;
-                    w.mode = Mode::Level;
+                    w.error.clear();
+                    w.selected.clear();
+                    w.select_anchor = None;
+                }
+                Ok(UsageBody::Names(rep)) if w.names_id == Some(id) => {
+                    let path = norm_path(&rep.path);
+                    if path == w.path && !w.analyzed.contains_key(&path) {
+                        w.names = Some(rep);
+                        w.level = None;
+                    }
+                    w.names_id = None;
                     w.error.clear();
                 }
                 Ok(UsageBody::Search(rep)) if w.search_id == Some(id) => {
@@ -206,13 +265,20 @@ impl App {
                     w.mount_id = None;
                 }
                 Err(e) if e.is_empty() => {}
-                Err(e) if w.level_id == Some(id) || w.search_id == Some(id) => {
+                Err(e)
+                    if w.level_id == Some(id)
+                        || w.search_id == Some(id)
+                        || w.names_id == Some(id) =>
+                {
                     w.error = e;
                     if w.level_id == Some(id) {
                         w.level_id = None;
                     }
                     if w.search_id == Some(id) {
                         w.search_id = None;
+                    }
+                    if w.names_id == Some(id) {
+                        w.names_id = None;
                     }
                 }
                 _ => {}
@@ -234,13 +300,17 @@ impl App {
         };
         let kind = match kind {
             UsageKind::Level { path } => UsageKind::Level { path: tidy(&path) },
+            UsageKind::Names { path } => UsageKind::Names { path: tidy(&path) },
             UsageKind::Search { path, needle } => UsageKind::Search {
                 path: tidy(&path),
                 needle,
             },
             UsageKind::Mounts => UsageKind::Mounts,
         };
-        if let UsageKind::Level { path } | UsageKind::Search { path, .. } = &kind {
+        if let UsageKind::Level { path }
+        | UsageKind::Names { path }
+        | UsageKind::Search { path, .. } = &kind
+        {
             if let Err(e) = crate::usage::path_ok(path) {
                 if let Some(w) = self.usage.as_mut() {
                     w.error = e;
@@ -280,16 +350,30 @@ impl App {
                 match &kind {
                     UsageKind::Level { path } => {
                         set_usage_path(w, path);
+                        w.page = Page::Dir;
                         w.mode = Mode::Level;
-                        w.level = None;
                         w.level_id = Some(id);
                         w.search_id = None;
+                        w.names_id = None;
+                    }
+                    UsageKind::Names { path } => {
+                        set_usage_path(w, path);
+                        w.page = Page::Dir;
+                        w.mode = Mode::Level;
+                        w.names = None;
+                        w.level = None;
+                        w.names_id = Some(id);
+                        w.level_id = None;
+                        w.search_id = None;
+                        w.selected.clear();
+                        w.select_anchor = None;
                     }
                     UsageKind::Search { .. } => {
                         w.mode = Mode::Search;
                         w.search = None;
                         w.search_id = Some(id);
                         w.level_id = None;
+                        w.names_id = None;
                     }
                     UsageKind::Mounts => {}
                 }
@@ -308,8 +392,90 @@ impl App {
                 w.error = tr("会话已断开", "Session disconnected").into();
                 w.level_id = None;
                 w.search_id = None;
+                w.names_id = None;
             }
         }
+    }
+}
+
+fn norm_path(path: &str) -> String {
+    crate::ui::file_panel::normalize_path(path)
+}
+
+/// 把这一层的分析结果留下。子目录的大小记在 `known_size` 里，进去时不再重算。
+fn remember_level(w: &mut UsageWin, mut rep: LevelReport) -> LevelReport {
+    let path = norm_path(&rep.path);
+    rep.path = path.clone();
+    for row in &mut rep.rows {
+        row.path = norm_path(&row.path);
+        if row.is_dir {
+            w.known_size.insert(row.path.clone(), row.size);
+        }
+    }
+    w.known_size.insert(path.clone(), rep.total);
+    w.analyzed.insert(path, rep.clone());
+    rep
+}
+
+fn drop_deleted(w: &mut UsageWin, paths: &[String]) {
+    let set: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    if let Some(level) = w.level.as_mut() {
+        let mut gone = 0u64;
+        level.rows.retain(|row| {
+            if set.contains(row.path.as_str()) {
+                gone = gone.saturating_add(row.size);
+                false
+            } else {
+                true
+            }
+        });
+        level.total = level.total.saturating_sub(gone);
+        if let Some(cached) = w.analyzed.get_mut(&level.path) {
+            *cached = level.clone();
+        }
+    }
+    if let Some(names) = w.names.as_mut() {
+        names.rows.retain(|row| !set.contains(row.path.as_str()));
+    }
+    if let Some(search) = w.search.as_mut() {
+        search.rows.retain(|row| !set.contains(row.path.as_str()));
+    }
+    for path in paths {
+        let prefix = format!("{path}/");
+        w.analyzed
+            .retain(|k, _| k != path && !k.starts_with(&prefix));
+        w.known_size
+            .retain(|k, _| k != path && !k.starts_with(&prefix));
+    }
+    w.selected.clear();
+    w.select_anchor = None;
+}
+
+/// 进入一个目录。已经分析过就直接用缓存，否则只列名字。
+fn enter_dir(w: &mut UsageWin, path: &str) -> Option<UsageKind> {
+    set_usage_path(w, path);
+    w.page = Page::Dir;
+    w.mode = Mode::Level;
+    w.error.clear();
+    w.selected.clear();
+    w.select_anchor = None;
+    w.search = None;
+    w.search_id = None;
+    if let Some(prev) = w.level_cancel.take() {
+        prev.store(true, Ordering::Relaxed);
+    }
+    w.level_id = None;
+    w.names_id = None;
+    if let Some(rep) = w.analyzed.get(&w.path) {
+        w.level = Some(rep.clone());
+        w.names = None;
+        w.names_id = None;
+        w.level_id = None;
+        None
+    } else {
+        Some(UsageKind::Names {
+            path: w.path.clone(),
+        })
     }
 }
 
@@ -319,62 +485,73 @@ fn paint_usage(
     close: &mut bool,
     go: &mut Option<UsageKind>,
     clear_query: &mut bool,
+    delete: &mut Option<Vec<String>>,
 ) {
-    title_row(ui, close);
-    if !w.mounts.is_empty() {
-        ui.add_space(10.0);
-        disk_section(ui, w, go);
-    }
-    ui.add_space(10.0);
-    path_bar(ui, w, go);
-    ui.add_space(10.0);
-    summary_row(ui, w);
-    if !w.error.is_empty() {
-        ui.add_space(4.0);
-        ui.label(RichText::new(&w.error).size(FS_BODY).color(Palette::DANGER));
-    }
-    ui.add_space(4.0);
-    let avail = ui.available_height();
-    let list_h = if avail.is_finite() {
-        (avail - 48.0).max(96.0)
-    } else {
-        260.0
-    };
-    let full_w = ui.available_width();
-    ui.allocate_ui(egui::vec2(full_w, list_h), |ui| {
-        if let Some(msg) = list_message(w) {
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new(msg).size(FS_BODY).color(Palette::TEXT_DIM));
-            });
-        } else {
-            match w.mode {
-                Mode::Level => {
-                    if let Some(level) = w.level.as_ref() {
-                        paint_rows(ui, &level.rows, level.total, false, go);
-                    }
-                }
-                Mode::Search => {
-                    if let Some(search) = w.search.as_ref() {
-                        let biggest = search.rows.iter().map(|r| r.size).max().unwrap_or(0);
-                        paint_rows(ui, &search.rows, biggest, true, go);
-                    }
-                }
-            }
+    title_row(ui, w, close);
+    match w.page {
+        Page::Disks => {
+            ui.add_space(8.0);
+            disk_page(ui, w, go);
         }
-    });
-    ui.add_space(8.0);
-    search_bar(ui, w, go, clear_query);
+        Page::Dir => {
+            ui.add_space(10.0);
+            path_bar(ui, w, go);
+            ui.add_space(10.0);
+            summary_row(ui, w, go);
+            if !w.error.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(&w.error).size(FS_BODY).color(Palette::DANGER));
+            }
+            ui.add_space(4.0);
+            let avail = ui.available_height();
+            let list_h = if avail.is_finite() {
+                (avail - 48.0).max(96.0)
+            } else {
+                260.0
+            };
+            let (rows, analyzed, total, search) = shown_rows(w);
+            let full_w = ui.available_width();
+            ui.allocate_ui(egui::vec2(full_w, list_h), |ui| {
+                if rows.is_empty() {
+                    if let Some(msg) = list_message(w) {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(RichText::new(msg).size(FS_BODY).color(Palette::TEXT_DIM));
+                        });
+                    }
+                } else {
+                    paint_rows(ui, w, &rows, total, analyzed, search, go);
+                }
+            });
+            ui.add_space(8.0);
+            search_bar(ui, w, go, clear_query);
+        }
+    }
+    if let Some(paths) = delete_modal(ui, w) {
+        *delete = Some(paths);
+    }
 }
 
-fn title_row(ui: &mut egui::Ui, close: &mut bool) {
+fn title_row(ui: &mut egui::Ui, w: &mut UsageWin, close: &mut bool) {
     use egui_phosphor::regular as icon;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
         ui.label(
             RichText::new(tr("占用分析", "Disk usage"))
                 .strong()
                 .size(FS_TITLE)
                 .color(Palette::TEXT),
         );
+        let on_disks = matches!(w.page, Page::Disks);
+        let label = format!("{} {}", icon::HARD_DRIVES, tr("选择磁盘", "Choose disk"));
+        let mut button = egui::Button::new(RichText::new(label).size(FS_BODY).color(Palette::TEXT));
+        button = if on_disks {
+            button.fill(Palette::ACCENT_SOFT)
+        } else {
+            button.fill(Palette::PANEL_2)
+        };
+        if ui.add(button).clicked() {
+            w.page = if on_disks { Page::Dir } else { Page::Disks };
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(
@@ -391,6 +568,50 @@ fn title_row(ui: &mut egui::Ui, close: &mut bool) {
             }
         });
     });
+}
+
+fn disk_page(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
+    use egui_phosphor::regular as icon;
+    if !w.home.is_empty() {
+        section_head(ui, icon::HOUSE, tr("主目录", "Home"), None);
+        if home_row(ui, &w.home) {
+            let home = w.home.clone();
+            if let Some(kind) = enter_dir(w, &home) {
+                *go = Some(kind);
+            }
+        }
+        ui.add_space(8.0);
+    }
+    disk_section(ui, w, go);
+}
+
+fn home_row(ui: &mut egui::Ui, home: &str) -> bool {
+    use egui_phosphor::regular as icon;
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, Palette::CARD);
+    p.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, Palette::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        rect.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        icon::HOUSE,
+        egui::FontId::proportional(FS_STRONG),
+        Palette::ACCENT,
+    );
+    p.text(
+        rect.left_center() + egui::vec2(28.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        home,
+        egui::FontId::proportional(FS_BODY),
+        Palette::TEXT,
+    );
+    resp.on_hover_text(tr("打开主目录", "Open home")).clicked()
 }
 
 fn set_usage_path(w: &mut UsageWin, path: &str) {
@@ -436,7 +657,9 @@ fn path_bar(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
                             id_salt: "usage_path_edit",
                         },
                     ) {
-                        *go = Some(UsageKind::Level { path: p });
+                        if let Some(kind) = enter_dir(w, &p) {
+                            *go = Some(kind);
+                        }
                     }
                 },
             );
@@ -445,7 +668,7 @@ fn path_bar(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
 
 /// 磁盘在路径之上：先选卷，再看这个卷里的目录。子挂载点缩进在父挂载点下面。
 /// 右侧数字和侧栏磁盘行一样，是「可用 / 总量」。
-fn disk_section(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
+fn disk_section(ui: &mut egui::Ui, w: &mut UsageWin, go: &mut Option<UsageKind>) {
     use egui_phosphor::regular as icon;
     let avails: Vec<String> = w
         .mounts
@@ -466,22 +689,28 @@ fn disk_section(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
         Some(tr("可用 / 总量", "Free / total")),
     );
     let current = current_mount(&w.path, &w.mounts);
-    egui::ScrollArea::vertical()
+    let mounts = w.mounts.clone();
+    let max_h = if matches!(w.page, Page::Disks) {
+        ui.available_height().max(120.0)
+    } else {
+        156.0
+    };
+    let scroll = egui::ScrollArea::vertical()
         .id_salt("usage_disks")
-        .max_height(156.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            for (i, m) in w.mounts.iter().enumerate() {
-                let indent = nest_level(&w.mounts, i) as f32 * 14.0;
-                let detail = format!("{:>aw$} / {:>tw$}", avails[i], totals[i]);
-                if volume_row(ui, m, &detail, current == Some(i), indent) {
-                    *go = Some(UsageKind::Level {
-                        path: m.path.clone(),
-                    });
+        .max_height(max_h)
+        .auto_shrink([false, true]);
+    scroll.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        for (i, m) in mounts.iter().enumerate() {
+            let indent = nest_level(&mounts, i) as f32 * 14.0;
+            let detail = format!("{:>aw$} / {:>tw$}", avails[i], totals[i]);
+            if volume_row(ui, m, &detail, current == Some(i), indent) {
+                if let Some(kind) = enter_dir(w, &m.path) {
+                    *go = Some(kind);
                 }
             }
-        });
+        }
+    });
 }
 
 fn section_head(ui: &mut egui::Ui, icon: &str, title: &str, aside: Option<&str>) {
@@ -526,60 +755,61 @@ fn volume_row(
             ui.add_space(indent.min(42.0));
         }
         let width = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 40.0), egui::Sense::click());
         let percent = if m.size == 0 {
             0.0
         } else {
-            (m.used as f64 / m.size as f64 * 100.0) as f32
+            (m.used as f64 / m.size as f64).clamp(0.0, 1.0) as f32
         };
         let p = ui.painter();
         p.rect_filled(rect, 4.0, Palette::CARD);
-        if m.size > 0 {
-            let c = crate::ui::usage_color(percent);
-            let wash = (rect.width() * (percent / 100.0).clamp(0.0, 1.0)).max(3.0);
-            let fill = egui::Rect::from_min_max(
-                egui::pos2(rect.right() - wash, rect.top()),
-                rect.right_bottom(),
-            );
-            p.rect_filled(
-                fill,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 36),
-            );
-        }
         p.rect_stroke(
             rect,
             4.0,
             egui::Stroke::new(
                 1.0,
                 if selected {
-                    Palette::ACCENT
+                    Palette::OK
                 } else {
                     Palette::BORDER
                 },
             ),
             egui::StrokeKind::Inside,
         );
+        use egui_phosphor::regular as icon;
+        let text_y = rect.top() + 14.0;
+        p.text(
+            egui::pos2(rect.left() + 8.0, text_y),
+            egui::Align2::LEFT_CENTER,
+            icon::HARD_DRIVES,
+            egui::FontId::proportional(FS_STRONG),
+            Palette::OK,
+        );
         let detail_rect = p.text(
-            rect.right_center() - egui::vec2(8.0, 0.0),
+            egui::pos2(rect.right() - 8.0, text_y),
             egui::Align2::RIGHT_CENTER,
             detail,
             egui::FontId::monospace(FS_NOTE),
             Palette::TEXT_DIM,
         );
         let name_rect = egui::Rect::from_min_max(
-            rect.left_top() + egui::vec2(8.0, 0.0),
-            egui::pos2(detail_rect.left() - 8.0, rect.bottom()),
+            egui::pos2(rect.left() + 28.0, rect.top()),
+            egui::pos2(detail_rect.left() - 8.0, rect.top() + 28.0),
         );
         if name_rect.width() > 8.0 {
             p.with_clip_rect(name_rect).text(
-                name_rect.left_center(),
+                egui::pos2(name_rect.left(), text_y),
                 egui::Align2::LEFT_CENTER,
-                &m.path,
+                format!("{}  {}", m.path, m.label),
                 egui::FontId::proportional(FS_BODY),
                 Palette::TEXT,
             );
         }
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
+            egui::pos2(rect.right() - 8.0, rect.bottom() - 4.0),
+        );
+        green_bar(p, bar, percent);
         let tip = match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!(
                 "{}  {}\n已用 {} / 共 {}，可用 {}",
@@ -620,14 +850,14 @@ fn is_fs_root(path: &str) -> bool {
     t.is_empty() || (t.len() == 2 && t.as_bytes().get(1) == Some(&b':'))
 }
 
-fn summary_row(ui: &mut egui::Ui, w: &UsageWin) {
+fn summary_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>) {
     use egui_phosphor::regular as icon;
     let (headline, hint) = headline(w);
     let (note, note_tip, note_color) = summary_note(w);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.label(
-            RichText::new(icon::CHART_PIE)
+            RichText::new(icon::FOLDER)
                 .color(Palette::ACCENT)
                 .size(FS_STRONG),
         );
@@ -637,6 +867,36 @@ fn summary_row(ui: &mut egui::Ui, w: &UsageWin) {
                 .size(FS_STRONG)
                 .color(Palette::TEXT),
         );
+        let busy = w.level_id.is_some();
+        let again = w.analyzed.contains_key(&w.path);
+        let label = if busy {
+            tr("分析中…", "Analyzing…")
+        } else if again {
+            tr("重新分析", "Analyze again")
+        } else {
+            tr("分析", "Analyze")
+        };
+        let text_color = if again || busy {
+            Palette::TEXT
+        } else {
+            Palette::PANEL
+        };
+        let fill = if again || busy {
+            Palette::PANEL_2
+        } else {
+            Palette::OK
+        };
+        if ui
+            .add_enabled(
+                !busy,
+                egui::Button::new(RichText::new(label).size(FS_BODY).color(text_color)).fill(fill),
+            )
+            .clicked()
+        {
+            *go = Some(UsageKind::Level {
+                path: w.path.clone(),
+            });
+        }
         if !note.is_empty() {
             ui.label(RichText::new(note).size(FS_NOTE).color(note_color))
                 .on_hover_text(note_tip);
@@ -659,8 +919,8 @@ fn headline(w: &UsageWin) -> (String, String) {
         "只统计当前这一层，点目录再往下。不跟随符号链接，也不进入别的磁盘。",
         "One level at a time. Click a folder to go deeper. Symlinks and other disks are not followed.",
     );
-    if w.busy() {
-        return (tr("正在统计…", "Measuring…").into(), limits.into());
+    if w.level_id.is_some() {
+        return (tr("正在分析…", "Analyzing…").into(), limits.into());
     }
     match w.mode {
         Mode::Search => {
@@ -686,12 +946,29 @@ fn headline(w: &UsageWin) -> (String, String) {
             (text, hint)
         }
         Mode::Level => {
-            let text = w
-                .level
-                .as_ref()
-                .map(|l| crate::ui::fmt_bytes(l.total as f64))
-                .unwrap_or_else(|| "—".into());
-            (text, limits.into())
+            if let Some(level) = w.level.as_ref().filter(|l| norm_path(&l.path) == w.path) {
+                (crate::ui::fmt_bytes(level.total as f64), limits.into())
+            } else if let Some(size) = w.known_size.get(&w.path) {
+                (
+                    crate::ui::fmt_bytes(*size as f64),
+                    tr(
+                        "这是上层分析时记下的大小。点分析才会列出这一层各项的大小。",
+                        "Saved from the parent folder. Analyze to size the items here.",
+                    )
+                    .into(),
+                )
+            } else if w.names_id.is_some() {
+                (tr("正在读取…", "Loading…").into(), limits.into())
+            } else {
+                (
+                    tr("未分析", "Not analyzed").into(),
+                    tr(
+                        "先看文件和文件夹。点分析后按大小排序。",
+                        "Names first. Analyze to sort by size.",
+                    )
+                    .into(),
+                )
+            }
         }
     }
 }
@@ -704,6 +981,14 @@ fn summary_note(w: &UsageWin) -> (String, String, egui::Color32) {
     let mut tips = Vec::new();
     let mut color = Palette::TEXT_DIM;
     if let Mode::Level = w.mode {
+        if w.level.is_none() {
+            if let Some(names) = w.names.as_ref().filter(|n| n.omitted > 0) {
+                bits.push(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("还有 {} 项未列出", names.omitted),
+                    crate::i18n::Lang::En => format!("{} more not listed", names.omitted),
+                });
+            }
+        }
         if let Some(level) = &w.level {
             if level.partial {
                 bits.push(tr("未算完", "Incomplete").to_string());
@@ -750,30 +1035,58 @@ fn summary_note(w: &UsageWin) -> (String, String, egui::Color32) {
 }
 
 fn list_message(w: &UsageWin) -> Option<String> {
-    if w.busy() {
-        return Some(tr("正在统计…", "Measuring…").into());
-    }
     if !w.error.is_empty() {
         return None;
     }
+    if w.names_id.is_some() || w.level_id.is_some() {
+        return Some(if w.level_id.is_some() {
+            tr("正在分析…", "Analyzing…").into()
+        } else {
+            tr("正在读取…", "Loading…").into()
+        });
+    }
     match w.mode {
-        Mode::Level => w
-            .level
-            .as_ref()
-            .filter(|l| l.rows.is_empty())
-            .map(|_| tr("这个目录是空的", "This folder is empty").to_string()),
-        Mode::Search => w
-            .search
-            .as_ref()
-            .filter(|s| s.rows.is_empty())
-            .map(|_| tr("没有匹配的文件", "No matching files").to_string()),
+        Mode::Level => Some(tr("这个目录是空的", "This folder is empty").into()),
+        Mode::Search => Some(tr("没有匹配的文件", "No matching files").into()),
+    }
+}
+
+fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
+    if matches!(w.mode, Mode::Search) {
+        if let Some(search) = &w.search {
+            let biggest = search.rows.iter().map(|r| r.size).max().unwrap_or(0);
+            return (search.rows.clone(), true, biggest, true);
+        }
+    }
+    if let Some(level) = w.level.as_ref().filter(|l| norm_path(&l.path) == w.path) {
+        return (level.rows.clone(), true, level.total, false);
+    }
+    if let Some(names) = w.names.as_ref().filter(|n| norm_path(&n.path) == w.path) {
+        return (names.rows.clone(), false, 0, false);
+    }
+    (Vec::new(), false, 0, false)
+}
+
+fn green_bar(p: &egui::Painter, rect: egui::Rect, frac: f32) {
+    p.rect_filled(rect, 2.0, Palette::TRACK);
+    if frac > 0.0 {
+        let mut fill = rect;
+        fill.set_width((rect.width() * frac.clamp(0.0, 1.0)).max(2.0));
+        let c = Palette::OK;
+        p.rect_filled(
+            fill,
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 210),
+        );
     }
 }
 
 fn paint_rows(
     ui: &mut egui::Ui,
+    w: &mut UsageWin,
     rows: &[UsageRow],
     total: u64,
+    analyzed: bool,
     search: bool,
     go: &mut Option<UsageKind>,
 ) {
@@ -788,62 +1101,75 @@ fn paint_rows(
         .auto_shrink([false, false])
         .show_rows(ui, 32.0, rows.len(), |ui, range| {
             for i in range {
-                let row = &rows[i];
-                if !row_hit(ui, row, total, search) {
-                    continue;
-                }
-                let path = if search {
-                    crate::usage::parent_path(&row.path)
-                } else if row.is_dir {
-                    Some(row.path.clone())
-                } else {
-                    None
-                };
-                if let Some(path) = path {
-                    *go = Some(UsageKind::Level { path });
-                }
+                row_hit(ui, w, rows, i, total, analyzed, search, go);
             }
         });
 }
 
-fn row_hit(ui: &mut egui::Ui, row: &UsageRow, total: u64, search: bool) -> bool {
-    use egui_phosphor::regular as icon;
-    let clickable = search || row.is_dir;
-    let sense = if clickable {
-        egui::Sense::click()
+fn select_row(w: &mut UsageWin, idx: usize, ui: &egui::Ui) {
+    let (ctrl, shift) = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
+    if ctrl {
+        if !w.selected.insert(idx) {
+            w.selected.remove(&idx);
+        }
+        w.select_anchor = Some(idx);
+    } else if shift {
+        let anchor = w.select_anchor.unwrap_or(idx);
+        let (lo, hi) = (anchor.min(idx), anchor.max(idx));
+        w.selected = (lo..=hi).collect();
     } else {
-        egui::Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), sense);
-    if resp.hovered() {
+        w.selected.clear();
+        w.selected.insert(idx);
+        w.select_anchor = Some(idx);
+    }
+}
+
+fn selected_items(rows: &[UsageRow], selected: &HashSet<usize>) -> Vec<(String, String)> {
+    let mut idxs: Vec<usize> = selected.iter().copied().collect();
+    idxs.sort_unstable();
+    idxs.into_iter()
+        .filter_map(|i| {
+            rows.get(i)
+                .map(|row| (row.path.clone(), leaf(&row.path).to_string()))
+        })
+        .collect()
+}
+
+fn row_hit(
+    ui: &mut egui::Ui,
+    w: &mut UsageWin,
+    rows: &[UsageRow],
+    index: usize,
+    total: u64,
+    analyzed: bool,
+    search: bool,
+    go: &mut Option<UsageKind>,
+) {
+    use egui_phosphor::regular as icon;
+    let row = &rows[index];
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+    let selected = w.selected.contains(&index);
+    if selected || resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, Palette::PANEL_2);
     }
-    let frac = if total == 0 {
+    if selected {
+        let edge = egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height()));
+        ui.painter().rect_filled(edge, 1.0, Palette::OK);
+    }
+    let frac = if !analyzed || total == 0 {
         0.0
     } else {
         (row.size as f64 / total as f64) as f32
     };
     let painter = ui.painter();
-    let text_y = rect.top() + 12.0;
-    let bar = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 8.0, rect.bottom() - 7.0),
-        egui::pos2(rect.right() - 8.0, rect.bottom() - 3.0),
-    );
-    painter.rect_filled(bar, 2.0, Palette::TRACK);
-    if row.size > 0 && frac > 0.0 {
-        let mut fill = bar;
-        fill.set_width((bar.width() * frac.clamp(0.0, 1.0)).max(2.0));
-        let c = Palette::ACCENT;
-        painter.rect_filled(
-            fill,
-            2.0,
-            egui::Color32::from_rgba_unmultiplied(
-                c.r(),
-                c.g(),
-                c.b(),
-                if row.is_dir { 190 } else { 110 },
-            ),
+    let text_y = rect.top() + if analyzed { 12.0 } else { 16.0 };
+    if analyzed {
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, rect.bottom() - 7.0),
+            egui::pos2(rect.right() - 8.0, rect.bottom() - 3.0),
         );
+        green_bar(painter, bar, frac);
     }
     let icon_color = if row.is_dir {
         Palette::ACCENT
@@ -858,24 +1184,30 @@ fn row_hit(ui: &mut egui::Ui, row: &UsageRow, total: u64, search: bool) -> bool 
         egui::FontId::proportional(FS_STRONG),
         icon_color,
     );
-    let pct_text = pct(row.size, total);
-    let pct_rect = painter.text(
-        egui::pos2(rect.right() - 8.0, text_y),
-        egui::Align2::RIGHT_CENTER,
-        &pct_text,
-        egui::FontId::monospace(FS_NOTE),
-        Palette::TEXT_DIM,
-    );
-    let size_rect = painter.text(
-        egui::pos2(pct_rect.left() - 10.0, text_y),
-        egui::Align2::RIGHT_CENTER,
-        crate::ui::fmt_bytes(row.size as f64),
-        egui::FontId::monospace(FS_BODY),
-        Palette::TEXT,
-    );
+    let size_right = if analyzed {
+        let pct_text = pct(row.size, total);
+        let pct_rect = painter.text(
+            egui::pos2(rect.right() - 8.0, text_y),
+            egui::Align2::RIGHT_CENTER,
+            &pct_text,
+            egui::FontId::monospace(FS_NOTE),
+            Palette::TEXT_DIM,
+        );
+        painter
+            .text(
+                egui::pos2(pct_rect.left() - 10.0, text_y),
+                egui::Align2::RIGHT_CENTER,
+                crate::ui::fmt_bytes(row.size as f64),
+                egui::FontId::monospace(FS_BODY),
+                Palette::TEXT,
+            )
+            .left()
+    } else {
+        rect.right()
+    };
     let name_rect = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 26.0, rect.top()),
-        egui::pos2(size_rect.left() - 8.0, bar.top()),
+        egui::pos2(size_right - 8.0, rect.bottom()),
     );
     if name_rect.width() > 8.0 {
         painter.with_clip_rect(name_rect).text(
@@ -894,7 +1226,123 @@ fn row_hit(ui: &mut egui::Ui, row: &UsageRow, total: u64, search: bool) -> bool 
     } else {
         row.path.clone()
     };
-    resp.on_hover_text(tip).clicked() && clickable
+    resp.clone().on_hover_text(tip);
+    if resp.double_clicked() {
+        let path = if search {
+            crate::usage::parent_path(&row.path)
+        } else if row.is_dir {
+            Some(row.path.clone())
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            if let Some(kind) = enter_dir(w, &path) {
+                *go = Some(kind);
+            }
+        }
+    } else if resp.clicked() {
+        select_row(w, index, ui);
+    }
+    if resp.secondary_clicked() && !w.selected.contains(&index) {
+        w.selected.clear();
+        w.selected.insert(index);
+        w.select_anchor = Some(index);
+    }
+    let menu_resp = resp;
+    menu_resp.context_menu(|ui| {
+        let n = w.selected.len().max(1);
+        let label = if n > 1 {
+            match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("删除 {n} 项"),
+                crate::i18n::Lang::En => format!("Delete {n} items"),
+            }
+        } else {
+            tr("删除", "Delete").to_string()
+        };
+        if ui.button(label).clicked() {
+            let items = selected_items(rows, &w.selected);
+            if !items.is_empty() {
+                w.confirm_delete = Some(items);
+            }
+            ui.close();
+        }
+    });
+}
+
+fn delete_modal(ui: &mut egui::Ui, w: &mut UsageWin) -> Option<Vec<String>> {
+    let items = w.confirm_delete.clone()?;
+    let mut decided: Option<Vec<String>> = None;
+    let mut cancel = false;
+    egui::Modal::new(egui::Id::new("usage_delete_confirm")).show(ui.ctx(), |ui| {
+        ui.set_min_width(300.0);
+        ui.label(
+            RichText::new(tr("确认删除", "Confirm delete"))
+                .strong()
+                .size(FS_STRONG)
+                .color(Palette::TEXT),
+        );
+        ui.add_space(6.0);
+        let body = if items.len() == 1 {
+            match crate::i18n::current() {
+                crate::i18n::Lang::Zh => format!("确定删除 {} 吗？此操作不可恢复。", items[0].1),
+                crate::i18n::Lang::En => {
+                    format!("Delete {}? This cannot be undone.", items[0].1)
+                }
+            }
+        } else {
+            match crate::i18n::current() {
+                crate::i18n::Lang::Zh => {
+                    format!("确定删除选中的 {} 项吗？此操作不可恢复。", items.len())
+                }
+                crate::i18n::Lang::En => {
+                    format!(
+                        "Delete the {} selected items? This cannot be undone.",
+                        items.len()
+                    )
+                }
+            }
+        };
+        ui.label(RichText::new(body).size(FS_BODY).color(Palette::TEXT));
+        for (_, name) in items.iter().take(4) {
+            ui.label(RichText::new(name).size(FS_NOTE).color(Palette::TEXT_DIM));
+        }
+        if items.len() > 4 {
+            ui.label(
+                RichText::new(match crate::i18n::current() {
+                    crate::i18n::Lang::Zh => format!("…还有 {} 项", items.len() - 4),
+                    crate::i18n::Lang::En => format!("…and {} more", items.len() - 4),
+                })
+                .size(FS_NOTE)
+                .color(Palette::TEXT_DIM),
+            );
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(tr("删除", "Delete"))
+                            .size(FS_BODY)
+                            .color(Palette::PANEL),
+                    )
+                    .fill(Palette::DANGER),
+                )
+                .clicked()
+            {
+                decided = Some(items.iter().map(|(path, _)| path.clone()).collect());
+            }
+            if ui
+                .button(RichText::new(tr("取消", "Cancel")).size(FS_BODY))
+                .clicked()
+            {
+                cancel = true;
+            }
+        });
+    });
+    if decided.is_some() || cancel {
+        w.confirm_delete = None;
+    }
+    decided
 }
 
 fn search_bar(
@@ -1097,15 +1545,13 @@ mod tests {
                         let mut go = None;
                         let mut close = false;
                         let mut clear = false;
-                        title_row(ui, &mut close);
-                        ui.add_space(8.0);
-                        disk_section(ui, &w, &mut go);
-                        ui.add_space(8.0);
+                        title_row(ui, &mut w, &mut close);
+                        ui.add_space(10.0);
                         cursor_before_path = ui.cursor().top();
                         path_bar(ui, &mut w, &mut go);
                         cursor_after_path = ui.cursor().top();
                         ui.add_space(10.0);
-                        summary_row(ui, &w);
+                        summary_row(ui, &w, &mut go);
                         let avail = ui.available_height();
                         let list_h = if avail.is_finite() {
                             (avail - 48.0).max(96.0)
@@ -1128,5 +1574,34 @@ mod tests {
             content_bottom <= screen_h + 4.0,
             "列表和搜索被挤出窗口：内容底边 {content_bottom}px，窗口 {screen_h}px"
         );
+    }
+
+    #[test]
+    fn parent_scan_is_reused_until_analyze() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/wangqi".into());
+        remember_level(
+            &mut w,
+            LevelReport {
+                path: "/data".into(),
+                total: 100,
+                rows: vec![UsageRow {
+                    name: "src".into(),
+                    path: "/data/src".into(),
+                    size: 40,
+                    is_dir: true,
+                }],
+                omitted: 0,
+                omitted_bytes: 0,
+                partial: false,
+                denied: 0,
+            },
+        );
+        assert_eq!(w.known_size.get("/data/src"), Some(&40));
+        let child = enter_dir(&mut w, "/data/src");
+        assert!(matches!(child, Some(UsageKind::Names { .. })));
+        assert!(w.level.is_none());
+        assert_eq!(w.known_size.get("/data/src"), Some(&40));
+        assert!(enter_dir(&mut w, "/data").is_none());
+        assert_eq!(w.level.as_ref().map(|l| l.total), Some(100));
     }
 }

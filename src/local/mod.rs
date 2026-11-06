@@ -162,7 +162,9 @@ pub async fn run(
                 Some(UiCommand::UsageQuery { id, kind, cancel }) => {
                     let heavy = matches!(
                         kind,
-                        crate::usage::UsageKind::Level { .. } | crate::usage::UsageKind::Search { .. }
+                        crate::usage::UsageKind::Level { .. }
+                            | crate::usage::UsageKind::Names { .. }
+                            | crate::usage::UsageKind::Search { .. }
                     );
                     if heavy {
                         if let Some((task, flag)) = usage_heavy.take() {

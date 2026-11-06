@@ -22,6 +22,8 @@ const WALK_CAP: u64 = 1_500_000;
 pub enum UsageKind {
     /// 当前目录的直接子项，子目录带递归大小。
     Level { path: String },
+    /// 只列出这一层的名字，不算子目录大小。
+    Names { path: String },
     /// 在这棵树里按名称子串找，结果按大小从大到小。
     Search { path: String, needle: String },
     /// 磁盘 / 挂载点。
@@ -71,9 +73,19 @@ pub struct SearchReport {
     pub truncated: bool,
 }
 
+/// 这一层的名字。目录在前，然后按名称排。`size` 都是 0，还没分析。
+#[derive(Clone, Debug)]
+pub struct NameReport {
+    pub path: String,
+    pub rows: Vec<UsageRow>,
+    /// `head` 截断后至少还有这么多项（具体个数未知时为 1）。
+    pub omitted: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum UsageBody {
     Level(LevelReport),
+    Names(NameReport),
     Search(SearchReport),
     Mounts(Vec<MountPoint>),
 }
@@ -147,6 +159,63 @@ pub fn remote_search_cmd(path: &str, needle: &str) -> String {
 
 pub fn remote_mounts_cmd() -> &'static str {
     "df -T -P -B1 2>/dev/null || df -P -k"
+}
+
+/// 只列出这一层的名字，不计算子目录大小。`%y` 是 `d`/`f`/`l`。
+pub fn remote_names_cmd(path: &str) -> String {
+    let q = shell_quote(path);
+    let n = SHOW_CAP + 1;
+    format!(
+        "root={q}\n\
+         find \"$root\" -mindepth 1 -maxdepth 1 \\( -type d -o -type f -o -type l \\) -printf '%y\\t%f\\n' 2>/dev/null | head -n {n}\n"
+    )
+}
+
+/// 解析 [`remote_names_cmd`] 的输出。
+pub fn parse_names(root: &str, text: &str) -> NameReport {
+    let mut rows = Vec::new();
+    let mut omitted = 0u64;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((ty, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        if rows.len() >= SHOW_CAP {
+            omitted = omitted.saturating_add(1);
+            continue;
+        }
+        let path = if root == "/" {
+            format!("/{name}")
+        } else {
+            format!("{root}/{name}")
+        };
+        rows.push(UsageRow {
+            name: name.to_string(),
+            path,
+            size: 0,
+            is_dir: ty == "d",
+        });
+    }
+    sort_names(&mut rows);
+    NameReport {
+        path: root.to_string(),
+        rows,
+        omitted,
+    }
+}
+
+fn sort_names(rows: &mut [UsageRow]) {
+    rows.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 }
 
 /// 把用户输入变成 `find -iname` 的字面子串模式，`*` `?` `[` 不再当通配符。
@@ -470,6 +539,10 @@ pub fn run_local(kind: UsageKind, cancel: &AtomicBool) -> Result<UsageBody, Stri
     }
     match kind {
         UsageKind::Mounts => Ok(UsageBody::Mounts(local_mounts())),
+        UsageKind::Names { path } => {
+            path_ok(&path)?;
+            Ok(UsageBody::Names(list_names(&path)?))
+        }
         UsageKind::Level { path } => {
             path_ok(&path)?;
             Ok(UsageBody::Level(scan_level(Path::new(&path), cancel)?))
@@ -493,6 +566,36 @@ pub(crate) fn needle_ok(needle: &str) -> Result<String, String> {
     } else {
         Ok(needle)
     }
+}
+
+fn list_names(root: &str) -> Result<NameReport, String> {
+    let root_path = Path::new(root);
+    let rd = std::fs::read_dir(root_path).map_err(|e| io_msg(root_path, &e))?;
+    let mut rows = Vec::new();
+    let mut omitted = 0u64;
+    for ent in rd.flatten() {
+        let meta = match std::fs::symlink_metadata(ent.path()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if rows.len() >= SHOW_CAP {
+            omitted = omitted.saturating_add(1);
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().into_owned();
+        rows.push(UsageRow {
+            name,
+            path: ent.path().display().to_string(),
+            size: 0,
+            is_dir: meta.is_dir(),
+        });
+    }
+    sort_names(&mut rows);
+    Ok(NameReport {
+        path: root.to_string(),
+        rows,
+        omitted,
+    })
 }
 
 fn scan_level(root: &Path, cancel: &AtomicBool) -> Result<LevelReport, String> {
@@ -1081,6 +1184,17 @@ ISHELL_END
         assert!(r.rows.iter().any(|row| row.is_dir && row.name == "big"));
         assert_eq!(r.omitted, 3);
         assert_eq!(r.omitted_bytes, 15);
+    }
+
+    #[test]
+    fn parse_names_puts_dirs_first() {
+        let text = "f\treadme.txt\nd\tsrc\nl\tlink\nd\tlib\n";
+        let r = parse_names("/data", &text);
+        let names: Vec<_> = r.rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["lib", "src", "link", "readme.txt"]);
+        assert!(r.rows[0].is_dir && r.rows[1].is_dir);
+        assert!(!r.rows[2].is_dir);
+        assert_eq!(r.rows[0].path, "/data/lib");
     }
 
     #[test]
