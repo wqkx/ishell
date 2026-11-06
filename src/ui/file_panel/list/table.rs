@@ -261,18 +261,6 @@ pub(super) fn file_table(
             bg_refresh = true;
             ui.close();
         }
-        if !state.cwd.is_empty()
-            && ui
-                .button(format!(
-                    "{}  {}",
-                    icon::CHART_PIE,
-                    crate::i18n::tr("占用分析", "Disk usage")
-                ))
-                .clicked()
-        {
-            bg_usage = true;
-            ui.close();
-        }
         if ui
             .button(format!(
                 "{}  {}",
@@ -336,6 +324,17 @@ pub(super) fn file_table(
             };
             if ui.button(lbl).clicked() {
                 bg_fav = true;
+                ui.close();
+            }
+            if ui
+                .button(format!(
+                    "{}  {}",
+                    icon::CHART_PIE,
+                    crate::i18n::tr("占用分析", "Disk usage")
+                ))
+                .clicked()
+            {
+                bg_usage = true;
                 ui.close();
             }
             if ui

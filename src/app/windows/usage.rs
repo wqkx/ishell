@@ -83,6 +83,9 @@ pub(in crate::app) struct UsageWin {
     confirm_delete: Option<Vec<(String, String)>>,
     /// 分析中离开本页的跳转确认：目标是这里存的路径，等用户选继续/停止/取消。
     confirm_nav: Option<String>,
+    /// 刚打开：这一帧把窗口钉到屏幕正中（egui 会记住上次拖到的位置，不钉就回左上）。
+    /// 钉完就清掉，之后用户照常拖动。
+    just_opened: bool,
 }
 
 impl UsageWin {
@@ -123,6 +126,7 @@ impl UsageWin {
             select_anchor: None,
             confirm_delete: None,
             confirm_nav: None,
+            just_opened: true,
         }
     }
 
@@ -230,22 +234,30 @@ impl App {
         let mut go: Option<UsageKind> = None;
         let mut clear_query = false;
         let mut delete: Option<Vec<String>> = None;
-        egui::Window::new("usage_win")
+        let size = egui::vec2(648.0, 560.0);
+        let mut win = egui::Window::new("usage_win")
             .title_bar(false)
-            .default_size([540.0, 560.0])
+            .default_size(size)
             .resizable(true)
             .collapsible(false)
             .frame(
                 egui::Frame::window(&ctx.global_style())
                     .fill(Palette::PANEL)
                     .inner_margin(12),
-            )
-            .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                if let Some(w) = self.usage.as_mut() {
-                    paint_usage(ui, w, &mut close, &mut go, &mut clear_query, &mut delete);
-                }
-            });
+            );
+        // 每次打开都回到屏幕正中；只钉一帧，之后拖走不抢。
+        if self.usage.as_ref().is_some_and(|w| w.just_opened) {
+            win = win.current_pos(ctx.screen_rect().center() - size / 2.0);
+            if let Some(w) = self.usage.as_mut() {
+                w.just_opened = false;
+            }
+        }
+        win.show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            if let Some(w) = self.usage.as_mut() {
+                paint_usage(ui, w, &mut close, &mut go, &mut clear_query, &mut delete);
+            }
+        });
         if close {
             if let Some(w) = self.usage.take() {
                 w.stop();
