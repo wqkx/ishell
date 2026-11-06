@@ -173,7 +173,7 @@ pub fn remote_names_cmd(path: &str) -> String {
     let n = SHOW_CAP + 1;
     format!(
         "root={q}\n\
-         find \"$root\" -mindepth 1 -maxdepth 1 \\( -type d -o -type f -o -type l \\) -printf '%y\\t%f\\n' 2>/dev/null | head -n {n}\n"
+         find \"$root\" -mindepth 1 -maxdepth 1 \\( -type d -o -type f -o -type l \\) -printf '%y\\t%s\\t%f\\n' 2>/dev/null | head -n {n}\n"
     )
 }
 
@@ -186,8 +186,13 @@ pub fn parse_names(root: &str, text: &str) -> NameReport {
         if line.is_empty() {
             continue;
         }
-        let Some((ty, name)) = line.split_once('\t') else {
+        let Some((ty, rest)) = line.split_once('\t') else {
             continue;
+        };
+        // `%y\t%s\t%f`。目录的 `%s` 只是目录项本身，不是里面的占用，留到分析再填。
+        let (size, name) = match rest.split_once('\t') {
+            Some((sz, name)) => (sz.parse::<u64>().unwrap_or(0), name),
+            None => (0, rest),
         };
         if name.is_empty() || name == "." || name == ".." {
             continue;
@@ -196,6 +201,7 @@ pub fn parse_names(root: &str, text: &str) -> NameReport {
             omitted = omitted.saturating_add(1);
             continue;
         }
+        let is_dir = ty == "d";
         let path = if root == "/" {
             format!("/{name}")
         } else {
@@ -204,8 +210,8 @@ pub fn parse_names(root: &str, text: &str) -> NameReport {
         rows.push(UsageRow {
             name: name.to_string(),
             path,
-            size: 0,
-            is_dir: ty == "d",
+            size: if is_dir { 0 } else { size },
+            is_dir,
         });
     }
     sort_names(&mut rows);
@@ -623,11 +629,13 @@ fn list_names(root: &str) -> Result<NameReport, String> {
             continue;
         }
         let name = ent.file_name().to_string_lossy().into_owned();
+        let is_dir = meta.is_dir();
         rows.push(UsageRow {
             name,
             path: ent.path().display().to_string(),
-            size: 0,
-            is_dir: meta.is_dir(),
+            // 文件大小就是目录项上的长度，不用等分析。目录要等这一层算完才有占用。
+            size: if is_dir { 0 } else { meta.len() },
+            is_dir,
         });
     }
     sort_names(&mut rows);
@@ -1313,13 +1321,16 @@ ISHELL_END
 
     #[test]
     fn parse_names_puts_dirs_first() {
-        let text = "f\treadme.txt\nd\tsrc\nl\tlink\nd\tlib\n";
+        let text = "f\t12\treadme.txt\nd\t4096\tsrc\nl\t8\tlink\nd\t4096\tlib\n";
         let r = parse_names("/data", &text);
         let names: Vec<_> = r.rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, vec!["lib", "src", "link", "readme.txt"]);
         assert!(r.rows[0].is_dir && r.rows[1].is_dir);
         assert!(!r.rows[2].is_dir);
         assert_eq!(r.rows[0].path, "/data/lib");
+        assert_eq!(r.rows[0].size, 0);
+        assert_eq!(r.rows[2].size, 8);
+        assert_eq!(r.rows[3].size, 12);
     }
 
     #[test]

@@ -1007,8 +1007,8 @@ fn headline(w: &UsageWin) -> (String, String) {
                 (
                     crate::ui::fmt_bytes(size as f64),
                     tr(
-                        "这是上层分析时记下的大小，里面的目录也带着。点分析才会刷新，并带上文件大小。",
-                        "Saved from the parent folder, including folders inside. Analyze to refresh and include files.",
+                        "这是上层分析时记下的大小，里面的目录也带着。文件大小是直接读到的。",
+                        "Saved from the parent folder, including folders inside. File sizes are read directly.",
                     )
                     .into(),
                 )
@@ -1115,8 +1115,9 @@ fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
                 row.size = sz;
             }
         }
-        let any = rows.iter().any(|r| r.size > 0);
-        if any {
+        // 文件本来就有大小。只有目录也被记下之后，才按大小重排，免得没分析时文件夹沉到底下。
+        let have_dir_sizes = rows.iter().any(|r| r.is_dir && r.size > 0);
+        if have_dir_sizes {
             rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
         }
         let total = w
@@ -1124,7 +1125,6 @@ fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
             .get(&w.path)
             .copied()
             .unwrap_or_else(|| rows.iter().fold(0u64, |a, r| a.saturating_add(r.size)));
-        // 没把这一层重新分析过：只给已经记下大小的目录显示数字，文件不要显示成 0 B。
         return (rows, false, total, false);
     }
     (Vec::new(), false, 0, false)
@@ -1234,7 +1234,7 @@ fn row_hit(
     if resp.hovered() && !selected {
         painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(10));
     }
-    let show_size = analyzed || row.size > 0;
+    let show_size = analyzed || !row.is_dir || row.size > 0;
     let frac = if !show_size || total == 0 {
         0.0
     } else {
@@ -1329,6 +1329,7 @@ fn row_hit(
     }
     let menu_resp = resp;
     menu_resp.context_menu(|ui| {
+        ui.set_min_width(200.0);
         let n = w.selected.len().max(1);
         let label = if n > 1 {
             match crate::i18n::current() {
@@ -1338,7 +1339,13 @@ fn row_hit(
         } else {
             tr("删除", "Delete").to_string()
         };
-        if ui.button(label).clicked() {
+        if ui
+            .add_sized(
+                [200.0, 32.0],
+                egui::Button::new(RichText::new(label).size(FS_BODY)),
+            )
+            .clicked()
+        {
             let items = selected_items(rows, &w.selected);
             if !items.is_empty() {
                 w.confirm_delete = Some(items);
