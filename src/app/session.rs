@@ -627,6 +627,12 @@ impl App {
         if idx >= self.sessions.len() {
             return;
         }
+        // 关之前记下它所在标签的根：关的若是 AI 窗口，落点优先回到开它的那个用户窗口。
+        let parent_root = {
+            let u = self.sessions[idx].uid;
+            let r = tab_root_uid(&self.sessions, u);
+            (r != u).then_some(r)
+        };
         let s = self.sessions.remove(idx);
         let uid = s.uid;
         let _ = s.cmd_tx.send(UiCommand::Disconnect);
@@ -644,7 +650,13 @@ impl App {
             self.active = Some(match self.active {
                 Some(a) if a > idx => a - 1,
                 Some(a) if a < idx => a,
-                _ => idx.min(new_len - 1),
+                // 关的正是正在看的窗口：邻近项按下标取，可能是别的标签里折着的 AI 窗口，
+                // 用户会莫名其妙落进 AI 的窗口，所以要换算成可见的用户窗口。
+                _ => {
+                    let entries: Vec<(u64, Option<u64>)> =
+                        self.sessions.iter().map(|s| (s.uid, s.parent_uid)).collect();
+                    landing_after_close(&entries, idx.min(new_len - 1), parent_root)
+                }
             });
         }
     }
@@ -701,6 +713,25 @@ impl App {
         }
         out
     }
+}
+
+/// 关掉正在看的窗口后落到哪。`entries` 是移除之后的 `(uid, parent_uid)`，`neighbor` 是
+/// 原位置的邻近下标，`parent_root` 是被关窗口所在标签的根（它自己就是根时为 None）。
+/// 落点只会是标签条上看得见的用户窗口：优先回到开它的那个窗口，否则是邻近项所在标签的根。
+fn landing_after_close(
+    entries: &[(u64, Option<u64>)],
+    neighbor: usize,
+    parent_root: Option<u64>,
+) -> usize {
+    let position = |uid: u64| entries.iter().position(|e| e.0 == uid);
+    if let Some(i) = parent_root.and_then(position) {
+        return i;
+    }
+    let root = crate::mcp_parent::root_of(entries[neighbor].0, |u| {
+        let p = entries.iter().find(|e| e.0 == u)?.1?;
+        entries.iter().any(|e| e.0 == p).then_some(p)
+    });
+    position(root).unwrap_or(neighbor)
 }
 
 /// 这个会话的父会话还在的话返回它的 uid。父已经关掉时当作没有父，自己重新占一个标签。
@@ -1082,5 +1113,38 @@ mod injection_gate_tests {
             !injection_allowed(true, false, false, &t, QUIET),
             "同一帧上用户闸门依旧关死——never_typed 是整段连接的性质，两道闸门必须不同"
         );
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::landing_after_close;
+
+    /// R1 带两个 AI 窗口，R2 在最后。关掉 R2（正在看）后，旧写法按下标落到 AI 的最后一个窗口。
+    #[test]
+    fn closing_the_last_tab_lands_on_a_user_window_not_the_previous_tabs_agent() {
+        // 移除 R2 之后：[R1, C1a, C1b]；原下标 3 → 邻近 min(3, 2) = 2 正是 C1b
+        let after = [(1, None), (11, Some(1)), (12, Some(1))];
+        assert_eq!(landing_after_close(&after, 2, None), 0);
+    }
+
+    #[test]
+    fn closing_an_agent_window_returns_to_the_user_window_that_opened_it() {
+        // [R1, C1a, R2]，关掉 C1a 前它在下标 1；移除后邻近是 R2，但应回到 R1
+        let after = [(1, None), (2, None)];
+        assert_eq!(landing_after_close(&after, 1, Some(1)), 0);
+    }
+
+    #[test]
+    fn a_neighbour_that_is_a_root_is_kept() {
+        let after = [(1, None), (2, None), (3, None)];
+        assert_eq!(landing_after_close(&after, 1, None), 1);
+    }
+
+    #[test]
+    fn an_orphaned_agent_window_counts_as_its_own_tab() {
+        // 父窗口已经不在：它自己占标签，邻近项就是它
+        let after = [(1, None), (12, Some(99))];
+        assert_eq!(landing_after_close(&after, 1, None), 1);
     }
 }
