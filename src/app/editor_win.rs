@@ -10,16 +10,28 @@ use super::App;
 impl App {
     /// 关闭活动标签前的二次确认（会话仍连接时）。
     pub(super) fn close_tab_dialog(&mut self, ctx: &egui::Context) {
-        let Some(uid) = self.pending_close_tab else {
-            return;
+        // 单个窗口（标签菜单里点 AI 窗口的 ×）优先；否则确认的是整个标签。
+        let (uid, single) = match (self.pending_close_one, self.pending_close_tab) {
+            (Some(u), _) => (u, true),
+            (None, Some(u)) => (u, false),
+            (None, None) => return,
         };
         let Some(idx) = self.session_idx_by_uid(uid) else {
-            self.pending_close_tab = None; // 会话已不在
+            // 会话已不在
+            self.pending_close_one = None;
+            self.pending_close_tab = None;
             return;
         };
-        // 确认的是整个标签：根会话，以及折在它里面的 AI 窗口。
-        let root_uid = super::session::tab_root_uid(&self.sessions, self.sessions[idx].uid);
-        let members = super::session::group_member_indices(&self.sessions, root_uid);
+        // 整个标签：根会话，以及折在它里面的 AI 窗口。单个窗口：只有它自己。
+        let (root_uid, members) = if single {
+            (uid, vec![idx])
+        } else {
+            let root_uid = super::session::tab_root_uid(&self.sessions, self.sessions[idx].uid);
+            (
+                root_uid,
+                super::session::group_member_indices(&self.sessions, root_uid),
+            )
+        };
         let mut title = String::new();
         let mut ai_owned = false;
         let mut root_connected = false;
@@ -47,6 +59,7 @@ impl App {
             super::session::session_close_needs_confirm(s.connected, s.ai_owned, d)
         });
         if !needs {
+            self.pending_close_one = None;
             self.pending_close_tab = None;
             return;
         }
@@ -132,10 +145,21 @@ impl App {
         });
         match decision {
             Some(true) => {
-                self.close_session_group(root_uid);
+                if single {
+                    // 确认框开着时下标可能变过，按 uid 重新找
+                    if let Some(i) = self.session_idx_by_uid(uid) {
+                        self.close_session(i);
+                    }
+                } else {
+                    self.close_session_group(root_uid);
+                }
+                self.pending_close_one = None;
                 self.pending_close_tab = None;
             }
-            Some(false) => self.pending_close_tab = None,
+            Some(false) => {
+                self.pending_close_one = None;
+                self.pending_close_tab = None;
+            }
             None => {}
         }
     }

@@ -94,6 +94,9 @@ pub struct App {
     /// 待确认关闭的会话（记 uid 而不是下标：确认框开着时别的会话可能被关掉——比如 AI
     /// 关了它自己的会话——下标会指到另一个会话上，点「关闭」就关错了）
     pending_close_tab: Option<u64>,
+    /// 待确认关闭的**单个**窗口（标签菜单里点 AI 窗口的 ×）。与 `pending_close_tab` 不同，
+    /// 它只关这一个，不带上同一标签里的其它窗口。同样记 uid。
+    pending_close_one: Option<u64>,
     /// 已确认可以关闭
     allow_close: bool,
     /// 编辑器状态：放在 Arc<Mutex> 里，供 deferred viewport 回调（'static + Send + Sync，
@@ -243,6 +246,7 @@ impl App {
             toast: None,
             show_close_confirm: false,
             pending_close_tab: None,
+            pending_close_one: None,
             allow_close: false,
             editor_state: Arc::new(Mutex::new(EditorState::default())),
             image: ImageView::default(),

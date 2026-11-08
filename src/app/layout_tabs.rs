@@ -561,6 +561,22 @@ impl App {
         self.paint_tab_menu(root.ctx());
     }
 
+    /// 关掉标签里的单个 AI 窗口。需要确认（连着、AI 在用、或有未保存编辑）就挂起等确认框，
+    /// 否则直接关。
+    fn request_close_one(&mut self, uid: u64) {
+        let Some(idx) = self.session_idx_by_uid(uid) else {
+            return;
+        };
+        let dirty = super::util::lock_mutex(&self.editor_state).dirty_tabs_for_session(uid);
+        let s = &self.sessions[idx];
+        if super::session::session_close_needs_confirm(s.connected, s.ai_owned, dirty) {
+            self.pending_close_tab = None;
+            self.pending_close_one = Some(uid);
+        } else {
+            self.close_session(idx);
+        }
+    }
+
     /// 标签下拉里切换这个标签底下的 shell。打开它的那一帧不响应「点外面关掉」，
     /// 否则点圆点的同一下会把它立刻关掉。
     fn paint_tab_menu(&mut self, ctx: &egui::Context) {
@@ -577,6 +593,7 @@ impl App {
             return;
         }
         let mut picked = None;
+        let mut close_one: Option<u64> = None;
         let popup = egui::Area::new(egui::Id::new(("tab_group_menu", menu.root_uid)))
             .order(egui::Order::Foreground)
             .fixed_pos(menu.anchor)
@@ -596,18 +613,85 @@ impl App {
                         );
                         for &idx in &members {
                             let s = &self.sessions[idx];
+                            let is_root = s.uid == menu.root_uid;
                             let mut label = s.title.clone();
-                            if s.uid == menu.root_uid {
+                            if is_root {
                                 label =
                                     format!("{label} · {}", crate::i18n::tr("本窗口", "this tab"));
                             } else if let Some(origin) = s.ai_owner_label.as_deref() {
                                 label = format!("{label} · {origin}");
                             }
-                            if ui
-                                .selectable_label(self.active == Some(idx), label)
-                                .clicked()
-                            {
+                            // 一行：左边切换，AI 窗口的右边在鼠标移上来时露出 ×（关这一个窗口）。
+                            // 根窗口没有 ×：它的关闭在标签上，关它会带走整个标签。
+                            let (row, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 24.0),
+                                Sense::hover(),
+                            );
+                            let hovered = ui.rect_contains_pointer(row);
+                            let close_rect = egui::Rect::from_center_size(
+                                egui::pos2(row.right() - 12.0, row.center().y),
+                                egui::vec2(20.0, 20.0),
+                            );
+                            let label_rect = if is_root {
+                                row
+                            } else {
+                                egui::Rect::from_min_max(
+                                    row.min,
+                                    egui::pos2(close_rect.left() - 2.0, row.max.y),
+                                )
+                            };
+                            // 自己画这一行：内建按钮在 `put`/对齐布局里都会把标题居中，和原来左对齐的
+                            // 菜单不一样；整格可点、选中与悬停各有底色。
+                            let label_resp = ui.interact(
+                                label_rect,
+                                egui::Id::new(("tab_menu_row", s.uid)),
+                                Sense::click(),
+                            );
+                            let fill = if self.active == Some(idx) {
+                                Some(Palette::ACCENT_SOFT)
+                            } else if label_resp.hovered() {
+                                Some(Palette::PANEL_2)
+                            } else {
+                                None
+                            };
+                            if let Some(f) = fill {
+                                ui.painter().rect_filled(label_rect, 4, f);
+                            }
+                            ui.painter().text(
+                                egui::pos2(label_rect.left() + 8.0, label_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                &label,
+                                egui::TextStyle::Button.resolve(ui.style()),
+                                Palette::TEXT,
+                            );
+                            if label_resp.clicked() {
                                 picked = Some(idx);
+                            }
+                            if !is_root && hovered {
+                                let x = ui.interact(
+                                    close_rect,
+                                    egui::Id::new(("tab_menu_close", s.uid)),
+                                    Sense::click(),
+                                );
+                                let color = if x.hovered() {
+                                    Palette::DANGER
+                                } else {
+                                    Palette::TEXT_DIM
+                                };
+                                ui.painter().text(
+                                    close_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    egui_phosphor::regular::X,
+                                    egui::FontId::proportional(13.0),
+                                    color,
+                                );
+                                if x.clicked() {
+                                    close_one = Some(s.uid);
+                                }
+                                x.on_hover_text(crate::i18n::tr(
+                                    "关闭这个窗口",
+                                    "Close this window",
+                                ));
                             }
                         }
                     });
@@ -617,7 +701,10 @@ impl App {
             || (pass != menu.opened_pass
                 && ctx.input(|i| i.pointer.any_click())
                 && !popup.response.hovered());
-        if let Some(idx) = picked {
+        if let Some(uid) = close_one {
+            self.tab_menu = None;
+            self.request_close_one(uid);
+        } else if let Some(idx) = picked {
             self.active = Some(idx);
             self.tabbar.scroll_to_active = true;
             if let Some(s) = self.sessions.get_mut(idx) {
