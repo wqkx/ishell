@@ -2,7 +2,7 @@
 //!
 //! 点「分析」会把这棵树里每个文件、每个子目录的大小都留下。界面一次只铺当前目录的直接子项，
 //! 点进任意一层都用已经留下的数字，不再重算。不跟随符号链接，不跨进别的磁盘。
-//! 遍历超过 [`WALK_CAP`] 个目录项就停下，并标明数字不完整。
+//! 遍历不设条目数上限，想停就按「停止」；只有「记下深层条目名」有内存上限 [`NESTED_CAP`]。
 //!
 //! 本机用 Rust 自己遍历（可中途停下）。远端一条 GNU `du -a` 把整棵树的大小打出来，
 //! 输出按行流式解析（[`LevelParser`]），不占双份内存，超限降级为「不完整」而不是报错。
@@ -17,9 +17,13 @@ use crate::i18n::tr;
 const SHOW_CAP: usize = 2000;
 /// 按名称搜索时保留的最大命中数（按大小）。
 const SEARCH_CAP: usize = 500;
-/// 一次遍历最多看多少个目录项。超过就停下并标明数字不完整，避免百万级目录把机器拖死。
+/// 一次分析最多记下多少条深层条目（路径 + 大小），进子目录不重算全靠它。
+/// 这只限制内存：超过之后遍历照常走完、各层数字照常准确，只是更深的层进去后要再点「分析」。
 /// 界面侧按路径留下的大小也以此为总量上限（一棵大树足以装满）。
-pub(crate) const WALK_CAP: u64 = 1_500_000;
+pub(crate) const NESTED_CAP: u64 = 1_500_000;
+/// 远端 `du -a` 的输出最多读多少字节。输出是流式解析的、内存与它无关，这只是防失控的保险，
+/// 取得很大：以前的 64 MiB 在约 60 万个条目处就把输出掐断，整棵树的总数和最后几个目录都丢了。
+pub(crate) const LEVEL_STREAM_CAP: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub enum UsageKind {
@@ -40,6 +44,8 @@ pub struct UsageRow {
     pub path: String,
     pub size: u64,
     pub is_dir: bool,
+    /// 修改时间（UTC 纪元秒），0 = 不知道。目录是它自己的修改时间，不是里面最新文件的。
+    pub mtime: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -142,12 +148,23 @@ fn base_name(path: &str) -> &str {
 /// 处理 du 行时就要知道谁是目录）。
 pub fn remote_level_cmd(path: &str) -> String {
     let q = shell_quote(path);
+    // 修改时间：目录的取自 find（它自己的 mtime），文件的取自 du 的 `--time`（文件自己的 mtime）。
+    // 两个都是 GNU 扩展，各自拿 `/dev/null` 探一次（探测不遍历任何目录），不支持就退回没有时间的
+    // 老写法——分析本身不能因为少了一列时间就跑不起来。解析端两种格式都认。
     format!(
         "root={q}\n\
          echo ISHELL_TY\n\
+         if find /dev/null -maxdepth 0 -printf '' 2>/dev/null; then\n\
+         find \"$root\" -mindepth 1 -maxdepth 1 -xdev -type d -printf '%T@\\t%p\\n' 2>/dev/null\n\
+         else\n\
          find \"$root\" -mindepth 1 -maxdepth 1 -xdev -type d -print 2>/dev/null\n\
+         fi\n\
          echo ISHELL_DU\n\
+         if du -b --time --time-style=+%s /dev/null >/dev/null 2>&1; then\n\
+         du -x -a -b --time --time-style=+%s -- \"$root\"\n\
+         else\n\
          du -x -a -b -- \"$root\"\n\
+         fi\n\
          echo ISHELL_END\n"
     )
 }
@@ -164,7 +181,7 @@ pub fn remote_search_cmd(path: &str, needle: &str) -> String {
     format!(
         "root={root}\n\
          pat={pat}\n\
-         find \"$root\" -xdev {flag} \"$pat\" -type f -printf '%s\\t%p\\n' 2>/dev/null | sort -nr | head -n {n}\n"
+         find \"$root\" -xdev {flag} \"$pat\" -type f -printf '%s\\t%T@\\t%p\\n' 2>/dev/null | sort -nr | head -n {n}\n"
     )
 }
 
@@ -196,10 +213,16 @@ pub fn remote_mounts_cmd() -> &'static str {
 pub fn remote_names_cmd(path: &str) -> String {
     let q = shell_quote(path);
     let n = SHOW_CAP + 1;
+    // 先分清「不是目录 / 没权限读」：`find` 的错误被丢进 /dev/null，不先判断的话，读不了的目录
+    // 会静悄悄地列出零项，界面就显示成「这个目录是空的」。
     format!(
         "root={q}\n\
-         if find \"$root\" -mindepth 1 -maxdepth 1 -printf '' 2>/dev/null; then\n\
-         find \"$root\" -mindepth 1 -maxdepth 1 \\( -type d -o -type f -o -type l \\) -printf '%y\\t%s\\t%f\\n' 2>/dev/null | head -n {n}\n\
+         if [ ! -d \"$root\" ]; then\n\
+         echo ISHELL_NOTDIR\n\
+         elif [ ! -r \"$root\" ] || [ ! -x \"$root\" ]; then\n\
+         echo ISHELL_DENIED\n\
+         elif find \"$root\" -mindepth 1 -maxdepth 1 -printf '' 2>/dev/null; then\n\
+         find \"$root\" -mindepth 1 -maxdepth 1 \\( -type d -o -type f -o -type l \\) -printf '%y\\t%s\\t%T@\\t%f\\n' 2>/dev/null | head -n {n}\n\
          else\n\
          echo ISHELL_UNSUPPORTED\n\
          fi\n"
@@ -208,6 +231,28 @@ pub fn remote_names_cmd(path: &str) -> String {
 
 /// [`remote_names_cmd`] 在不支持 GNU `-printf` 的系统上打出的标记。
 pub const NAMES_UNSUPPORTED_MARK: &str = "ISHELL_UNSUPPORTED";
+/// 目录存在但当前用户读不了。
+pub const NAMES_DENIED_MARK: &str = "ISHELL_DENIED";
+/// 路径不存在，或者不是目录。
+pub const NAMES_NOTDIR_MARK: &str = "ISHELL_NOTDIR";
+
+/// 纪元秒。`find -printf %T@` 给的是 `1700000000.1234567890`，`du --time-style=+%s` 给整数。
+/// 不是纯数字（含小数点之外的字符、负数）一律当「不知道」：0。
+fn parse_epoch(s: &str) -> u64 {
+    let whole = s.split('.').next().unwrap_or("");
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    whole.parse().unwrap_or(0)
+}
+
+/// 看起来是一个时间字段：非空，只含数字和至多一个小数点。
+fn is_epoch_field(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && s.bytes().filter(|&b| b == b'.').count() <= 1
+        && !s.starts_with('.')
+}
 
 /// 解析 [`remote_names_cmd`] 的输出。
 pub fn parse_names(root: &str, text: &str) -> NameReport {
@@ -221,10 +266,15 @@ pub fn parse_names(root: &str, text: &str) -> NameReport {
         let Some((ty, rest)) = line.split_once('\t') else {
             continue;
         };
-        // `%y\t%s\t%f`。目录的 `%s` 只是目录项本身，不是里面的占用，留到分析再填。
-        let (size, name) = match rest.split_once('\t') {
-            Some((sz, name)) => (sz.parse::<u64>().unwrap_or(0), name),
+        // `%y\t%s\t%T@\t%f`（老格式没有 `%T@`）。目录的 `%s` 只是目录项本身，不是里面的占用，
+        // 留到分析再填。
+        let (size, rest) = match rest.split_once('\t') {
+            Some((sz, tail)) => (sz.parse::<u64>().unwrap_or(0), tail),
             None => (0, rest),
+        };
+        let (mtime, name) = match rest.split_once('\t') {
+            Some((t, n)) if is_epoch_field(t) => (parse_epoch(t), n),
+            _ => (0, rest),
         };
         if name.is_empty() || name == "." || name == ".." {
             continue;
@@ -244,6 +294,7 @@ pub fn parse_names(root: &str, text: &str) -> NameReport {
             path,
             size: if is_dir { 0 } else { size },
             is_dir,
+            mtime,
         });
     }
     sort_names(&mut rows);
@@ -290,7 +341,7 @@ pub fn parse_level(root: &str, text: &str) -> Result<UsageBody, String> {
 }
 
 /// `du -a` 输出的流式解析器。一行一行喂，不用把整份输出和中间名单都攒在内存里：
-/// 顶层行只留最大的 [`SHOW_CAP`] 条（堆），更深层的大小留到 [`WALK_CAP`] 为止。
+/// 顶层行只留最大的 [`SHOW_CAP`] 条（堆），更深层的大小留到 [`NESTED_CAP`] 为止。
 /// 内存占用与树大小无关，超大树的输出超限后由调用方标 `capped`，这里降级为 partial。
 pub struct LevelParser {
     root: String,
@@ -298,15 +349,14 @@ pub struct LevelParser {
     phase: u8, // 0 还没到标记，1 目录名，2 du，3 结束
     total: u64,
     saw_total: bool,
-    /// 顶层目录名单（ISHELL_TY 段，先于 du 输出到达）。
-    dirs: std::collections::HashSet<String>,
+    /// 顶层目录名单（ISHELL_TY 段，先于 du 输出到达），值是目录自己的修改时间（不知道为 0）。
+    dirs: std::collections::HashMap<String, u64>,
     /// du 真的统计过的顶层目录名。名单里有、du 里没有的，是异设备挂载点。
     seen_dirs: std::collections::HashSet<String>,
     heap: BinaryHeap<Smaller>,
     children: u64,
     children_bytes: u64,
     nested: Vec<(String, u64)>,
-    nested_full: bool,
 }
 
 impl LevelParser {
@@ -317,13 +367,12 @@ impl LevelParser {
             phase: 0,
             total: 0,
             saw_total: false,
-            dirs: std::collections::HashSet::new(),
+            dirs: std::collections::HashMap::new(),
             seen_dirs: std::collections::HashSet::new(),
             heap: BinaryHeap::new(),
             children: 0,
             children_bytes: 0,
             nested: Vec::new(),
-            nested_full: false,
         }
     }
 
@@ -348,14 +397,27 @@ impl LevelParser {
             _ => {}
         }
         if self.phase == 1 {
-            self.dirs.insert(base_name(line).to_string());
+            // `mtime \t path`（GNU find），老格式只有 `path`。
+            let (mtime, path) = match line.split_once('\t') {
+                Some((t, p)) if is_epoch_field(t) => (parse_epoch(t), p),
+                _ => (0, line),
+            };
+            self.dirs.insert(base_name(path).to_string(), mtime);
             return;
         }
         if self.phase != 2 {
             return;
         }
-        let Some((size, path)) = split_size_path(line) else {
+        let Some((size, rest)) = split_size_path(line) else {
             return;
+        };
+        // `du --time-style=+%s` 的行是 `size \t 纪元秒 \t path`；没有 `--time` 时是 `size \t path`。
+        // 路径是绝对路径、不会以数字开头，所以「第二段是纯数字且后面还有一段」只可能是时间。
+        let (du_time, path) = match rest.split_once('\t') {
+            Some((t, p)) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) => {
+                (parse_epoch(t), p)
+            }
+            _ => (0, rest),
         };
         match under_root(&self.root_trim, path) {
             Some(Under::Here) => {
@@ -365,10 +427,13 @@ impl LevelParser {
             Some(Under::Child(name)) => {
                 self.children += 1;
                 self.children_bytes = self.children_bytes.saturating_add(size);
-                let is_dir = self.dirs.contains(name);
+                let own = self.dirs.get(name).copied();
+                let is_dir = own.is_some();
                 if is_dir {
                     self.seen_dirs.insert(name.to_string());
                 }
+                // 目录取它自己的修改时间（find）；拿不到才退到 du 给的「里面最新的」。
+                let mtime = own.filter(|&t| t > 0).unwrap_or(du_time);
                 consider(
                     &mut self.heap,
                     UsageRow {
@@ -376,15 +441,15 @@ impl LevelParser {
                         name: name.to_string(),
                         size,
                         is_dir,
+                        mtime,
                     },
                     SHOW_CAP,
                 );
             }
             // 再往下的每一层。文件和目录都留下，进去任意深都不用重算。
             Some(Under::Deeper) => {
-                if self.nested.len() >= WALK_CAP as usize {
-                    self.nested_full = true;
-                } else {
+                // 记满之后不再留名字，也不算没算完：本层的数字不受影响。
+                if self.nested.len() < NESTED_CAP as usize {
                     self.nested.push((path.to_string(), size));
                 }
             }
@@ -395,6 +460,14 @@ impl LevelParser {
     /// `denied`：远端统计时数出来的无权限目录数（本机解析给 0）。
     /// `capped`：输出超限被提前掐断，数字不完整。
     pub fn finish(mut self, denied: u64, capped: bool) -> Result<LevelReport, String> {
+        if self.children == 0 && !self.saw_total && capped {
+            // 输出在读完任何一个子项之前就被掐断：不是没权限，别说成没权限。
+            return Err(tr(
+                "目录太大，统计在读完第一项之前就被中断了",
+                "This folder is too large: the scan was cut off before finishing its first item",
+            )
+            .into());
+        }
         if self.children == 0 && !self.saw_total {
             return Err(tr(
                 "无法统计这个目录（需要 GNU du，或没有权限）",
@@ -407,7 +480,7 @@ impl LevelParser {
         let kept_bytes = rows.iter().fold(0u64, |a, r| a.saturating_add(r.size));
         // 名单里有、du 没统计的顶层目录：`du -x` 跨不过设备，整行缺失。补占位行露出来，
         // 大小留 0；界面认得这是挂载点的话会回填磁盘用量。
-        for name in &self.dirs {
+        for (name, &mtime) in &self.dirs {
             if !self.seen_dirs.contains(name) {
                 let path = if self.root_trim.is_empty() {
                     format!("/{name}")
@@ -419,6 +492,7 @@ impl LevelParser {
                     path,
                     size: 0,
                     is_dir: true,
+                    mtime,
                 });
             }
         }
@@ -434,7 +508,8 @@ impl LevelParser {
             rows,
             omitted: self.children.saturating_sub(kept),
             omitted_bytes: self.children_bytes.saturating_sub(kept_bytes),
-            partial: capped || self.nested_full,
+            // 记不下的深层名字不算「没算完」：各层数字都是准的，只是进更深的目录要再点「分析」。
+            partial: capped,
             denied,
             nested: std::mem::take(&mut self.nested),
         })
@@ -608,10 +683,11 @@ pub fn parse_search(root: &str, needle: &str, text: &str) -> UsageBody {
             Some(v) => v,
             None => continue,
         };
-        let (kind, path) = if let Some((k, p)) = rest.split_once('\t') {
-            (k, p)
-        } else {
-            ("f", rest)
+        // 现在是 `size \t mtime \t path`；兼容老的 `size \t y \t path` 和 `size path`。
+        let (kind, mtime, path) = match rest.split_once('\t') {
+            Some((t, p)) if is_epoch_field(t) => ("f", parse_epoch(t), p),
+            Some((k, p)) => (k, 0, p),
+            None => ("f", 0, rest),
         };
         let path = path.trim();
         if path.is_empty() {
@@ -622,6 +698,7 @@ pub fn parse_search(root: &str, needle: &str, text: &str) -> UsageBody {
             path: path.to_string(),
             size,
             is_dir: kind.starts_with('d'),
+            mtime,
         });
     }
     // 远端命令多取了一条（SEARCH_CAP + 1）专门用来判断截断；这条不算进命中数。
@@ -719,6 +796,7 @@ fn list_names(root: &str) -> Result<NameReport, String> {
             // 文件大小就是目录项上的长度，不用等分析。目录要等这一层算完才有占用。
             size: if is_dir { 0 } else { meta.len() },
             is_dir,
+            mtime: mtime_of(&meta),
         });
     }
     sort_names(&mut rows);
@@ -727,6 +805,44 @@ fn list_names(root: &str) -> Result<NameReport, String> {
         rows,
         omitted,
     })
+}
+
+/// 本机遍历的共享状态：取消旗标、进度与无权限计数，以及已记下的深层条目数。
+///
+/// 遍历**不再有条目数上限**：分析没算完就停下，比慢一点更糟——数字不全，用户还不知道缺了什么。
+/// 想停就按界面上的「停止」（置 `cancel`）。只有「记下深层条目名」这一项有内存上限
+/// （[`NESTED_CAP`]），超过之后继续累加大小，只是不再留名字。
+struct Walk<'a> {
+    cancel: &'a AtomicBool,
+    visited: &'a AtomicU64,
+    denied: &'a AtomicU64,
+    recorded: &'a AtomicU64,
+}
+
+impl Walk<'_> {
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn bump(&self) {
+        self.visited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn deny(&self) {
+        self.denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 这条深层条目要不要记名字。记满 [`NESTED_CAP`] 之后返回 false。
+    fn keep(&self) -> bool {
+        self.recorded.fetch_add(1, Ordering::Relaxed) < NESTED_CAP
+    }
+}
+
+fn mtime_of(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
 }
 
 fn scan_level(
@@ -751,6 +867,7 @@ fn scan_level(
                 path: root.display().to_string(),
                 size: meta.len(),
                 is_dir: false,
+                mtime: mtime_of(&meta),
             }],
             omitted: 0,
             omitted_bytes: 0,
@@ -760,10 +877,15 @@ fn scan_level(
         });
     }
     let dev = dev_of(&meta);
-    let stop = AtomicBool::new(false);
-    // 遍历计数与界面共享：它一路涨，界面把它当进度显示。
-    let visited = progress;
     let denied = AtomicU64::new(0);
+    let recorded = AtomicU64::new(0);
+    // 遍历计数与界面共享：它一路涨，界面把它当进度显示。
+    let walk = Walk {
+        cancel,
+        visited: progress,
+        denied: &denied,
+        recorded: &recorded,
+    };
     let rd = std::fs::read_dir(root).map_err(|e| io_msg(root, &e))?;
     // 文件名只留最大的 SHOW_CAP 条。平铺目录里有几十万个文件时，不必把每个名字都留在内存里。
     let mut file_heap: BinaryHeap<Smaller> = BinaryHeap::new();
@@ -772,20 +894,21 @@ fn scan_level(
     let mut mounts_here = Vec::new();
     let mut dirs = Vec::new();
     for ent in rd.flatten() {
-        if stopped(cancel, &stop) {
+        if walk.stopped() {
             break;
         }
-        bump(visited, &stop);
+        walk.bump();
         let path = ent.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) => {
-                denied.fetch_add(1, Ordering::Relaxed);
+                walk.deny();
                 continue;
             }
         };
         let name = ent.file_name().to_string_lossy().into_owned();
         let shown = path.display().to_string();
+        let mtime = mtime_of(&meta);
         if meta.file_type().is_symlink() {
             remember_file(
                 &mut file_heap,
@@ -794,7 +917,7 @@ fn scan_level(
                 name,
                 shown,
                 meta.len(),
-                false,
+                mtime,
             );
         } else if meta.is_dir() {
             if other_device(&meta, dev) {
@@ -804,9 +927,15 @@ fn scan_level(
                     path: shown,
                     size: meta.len(),
                     is_dir: true,
+                    mtime,
                 });
             } else {
-                dirs.push((path, name, meta.len()));
+                dirs.push(TopDir {
+                    path,
+                    name,
+                    own: meta.len(),
+                    mtime,
+                });
             }
         } else {
             remember_file(
@@ -816,11 +945,11 @@ fn scan_level(
                 name,
                 shown,
                 meta.len(),
-                false,
+                mtime,
             );
         }
     }
-    let (dir_rows, nested) = size_dirs(dirs, dev, cancel, &stop, visited, &denied);
+    let (dir_rows, nested) = size_dirs(dirs, dev, &walk);
     let kept: Vec<UsageRow> = file_heap.into_iter().map(|s| s.0).collect();
     let kept_bytes = kept.iter().fold(0u64, |a, r| a.saturating_add(r.size));
     let dropped_n = file_n.saturating_sub(kept.len() as u64);
@@ -845,20 +974,25 @@ fn scan_level(
         rows,
         omitted,
         omitted_bytes,
-        partial: stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed),
+        // 只有被「停止」打断才算没算完；记不下的深层名字不影响这一层的数字。
+        partial: cancel.load(Ordering::Relaxed),
         denied: denied.load(Ordering::Relaxed),
         nested,
     })
 }
 
-fn size_dirs(
-    dirs: Vec<(PathBuf, String, u64)>,
-    dev: u64,
-    cancel: &AtomicBool,
-    stop: &AtomicBool,
-    visited: &AtomicU64,
-    denied: &AtomicU64,
-) -> (Vec<UsageRow>, Vec<(String, u64)>) {
+/// 这一层里要统计大小的子目录。
+struct TopDir {
+    path: PathBuf,
+    name: String,
+    /// 目录项自己的大小。
+    own: u64,
+    mtime: u64,
+}
+
+/// 子目录按「谁先空闲谁取下一个」分给几个线程：按序号轮流分的话，几个大目录碰巧落在
+/// 同一个线程上，其余线程早早闲下来，整体时间由最慢的那个线程决定。
+fn size_dirs(dirs: Vec<TopDir>, dev: u64, walk: &Walk) -> (Vec<UsageRow>, Vec<(String, u64)>) {
     if dirs.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -867,32 +1001,33 @@ fn size_dirs(
         .unwrap_or(4)
         .clamp(1, 8)
         .min(dirs.len());
-    let mut chunks: Vec<Vec<(PathBuf, String, u64)>> = (0..n).map(|_| Vec::new()).collect();
-    for (i, d) in dirs.into_iter().enumerate() {
-        chunks[i % n].push(d);
-    }
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(dirs));
+    let queue = &queue;
     let parts: Vec<(Vec<UsageRow>, Vec<(String, u64)>)> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in chunks {
-            handles.push(scope.spawn(move || {
-                let mut out = Vec::with_capacity(chunk.len());
-                let mut nested = Vec::new();
-                for (path, name, own) in chunk {
-                    if stopped(cancel, stop) {
-                        break;
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut nested = Vec::new();
+                    loop {
+                        if walk.stopped() {
+                            break;
+                        }
+                        let next = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                        let Some(d) = next else { break };
+                        let size = record_tree(&d.path, d.own, dev, walk, &mut nested);
+                        out.push(UsageRow {
+                            name: d.name,
+                            path: d.path.display().to_string(),
+                            size,
+                            is_dir: true,
+                            mtime: d.mtime,
+                        });
                     }
-                    let (size, kids) = measure_dir(&path, own, dev, cancel, stop, visited, denied);
-                    nested.extend(kids);
-                    out.push(UsageRow {
-                        name,
-                        path: path.display().to_string(),
-                        size,
-                        is_dir: true,
-                    });
-                }
-                (out, nested)
-            }));
-        }
+                    (out, nested)
+                })
+            })
+            .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
     let mut rows = Vec::new();
@@ -904,58 +1039,46 @@ fn size_dirs(
     (rows, nested)
 }
 
-/// 这个目录的总大小，以及它里面每一个文件、每一个子目录的大小。
-fn measure_dir(
-    path: &Path,
-    own: u64,
-    dev: u64,
-    cancel: &AtomicBool,
-    stop: &AtomicBool,
-    visited: &AtomicU64,
-    denied: &AtomicU64,
-) -> (u64, Vec<(String, u64)>) {
-    record_tree(path, own, dev, cancel, stop, visited, denied)
-}
-
-/// 走进 `path`。返回值是它自己的总大小（含目录项本身）。名单里是它下面的全部文件和目录。
+/// 走进 `path`，返回它自己的总大小（含目录项本身）。它下面的每个文件和目录追加进 `out`。
+/// 名单一路写进同一个 `Vec`：以前每层返回一个新 `Vec` 再往上 `extend`，一条路径要被
+/// 复制「它的深度」次。
 fn record_tree(
     path: &Path,
     own: u64,
     dev: u64,
-    cancel: &AtomicBool,
-    stop: &AtomicBool,
-    visited: &AtomicU64,
-    denied: &AtomicU64,
-) -> (u64, Vec<(String, u64)>) {
-    let mut saved = Vec::new();
-    if stopped(cancel, stop) {
-        return (own, saved);
+    walk: &Walk,
+    out: &mut Vec<(String, u64)>,
+) -> u64 {
+    if walk.stopped() {
+        return own;
     }
     let rd = match std::fs::read_dir(path) {
         Ok(rd) => rd,
         Err(_) => {
-            denied.fetch_add(1, Ordering::Relaxed);
-            return (own, saved);
+            walk.deny();
+            return own;
         }
     };
     let mut content = 0u64;
     for ent in rd.flatten() {
-        if bump(visited, stop) || stopped(cancel, stop) {
+        walk.bump();
+        if walk.stopped() {
             break;
         }
         let child = ent.path();
         let meta = match std::fs::symlink_metadata(&child) {
             Ok(m) => m,
             Err(_) => {
-                denied.fetch_add(1, Ordering::Relaxed);
+                walk.deny();
                 continue;
             }
         };
-        let shown = child.display().to_string();
         if meta.file_type().is_symlink() {
             let len = meta.len();
             content = content.saturating_add(len);
-            saved.push((shown, len));
+            if walk.keep() {
+                out.push((child.display().to_string(), len));
+            }
             continue;
         }
         if other_device(&meta, dev) {
@@ -963,31 +1086,24 @@ fn record_tree(
         }
         let len = meta.len();
         if meta.is_dir() {
-            let (sz, kids) = record_tree(&child, len, dev, cancel, stop, visited, denied);
+            // 目录行要等它里面算完才知道大小，但名单顺序无所谓：先占位再回填。
+            let slot = walk.keep().then(|| {
+                out.push((child.display().to_string(), 0));
+                out.len() - 1
+            });
+            let sz = record_tree(&child, len, dev, walk, out);
             content = content.saturating_add(sz);
-            saved.push((shown, sz));
-            saved.extend(kids);
+            if let Some(i) = slot {
+                out[i].1 = sz;
+            }
         } else {
             content = content.saturating_add(len);
-            saved.push((shown, len));
+            if walk.keep() {
+                out.push((child.display().to_string(), len));
+            }
         }
     }
-    (own.saturating_add(content), saved)
-}
-
-/// 返回 true 表示已经超过上限，调用方应停。
-fn bump(visited: &AtomicU64, stop: &AtomicBool) -> bool {
-    let n = visited.fetch_add(1, Ordering::Relaxed);
-    if n >= WALK_CAP {
-        stop.store(true, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
-}
-
-fn stopped(cancel: &AtomicBool, stop: &AtomicBool) -> bool {
-    cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed)
+    own.saturating_add(content)
 }
 
 fn scan_search(
@@ -1006,26 +1122,22 @@ fn scan_search(
         .map(|m| dev_of(&m))
         .unwrap_or(0);
     let matcher = matcher_for(needle);
-    let stop = AtomicBool::new(false);
-    let visited = progress;
-    let denied = AtomicU64::new(0);
     let mut stack = vec![root.to_path_buf()];
     let mut matched = 0u64;
     // 最小堆：堆顶是当前保留项里最小的，方便被更大的挤掉。
     let mut heap: BinaryHeap<Smaller> = BinaryHeap::new();
+    let cancelled = || cancel.load(Ordering::Relaxed);
     while let Some(dir) = stack.pop() {
-        if stopped(cancel, &stop) {
+        if cancelled() {
             break;
         }
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
-            Err(_) => {
-                denied.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            Err(_) => continue,
         };
         for ent in rd.flatten() {
-            if bump(visited, &stop) || stopped(cancel, &stop) {
+            progress.fetch_add(1, Ordering::Relaxed);
+            if cancelled() {
                 break;
             }
             let path = ent.path();
@@ -1050,6 +1162,7 @@ fn scan_search(
                         path: path.display().to_string(),
                         size: meta.len(),
                         is_dir: false,
+                        mtime: mtime_of(&meta),
                     },
                     SEARCH_CAP,
                 );
@@ -1066,7 +1179,7 @@ fn scan_search(
         needle: needle.to_string(),
         rows,
         matched,
-        truncated: stop.load(Ordering::Relaxed) || matched > SEARCH_CAP as u64,
+        truncated: cancelled() || matched > SEARCH_CAP as u64,
     })
 }
 
@@ -1214,7 +1327,7 @@ fn remember_file(
     name: String,
     path: String,
     size: u64,
-    is_dir: bool,
+    mtime: u64,
 ) {
     *n += 1;
     *bytes = bytes.saturating_add(size);
@@ -1224,7 +1337,8 @@ fn remember_file(
             name,
             path,
             size,
-            is_dir,
+            is_dir: false,
+            mtime,
         },
         SHOW_CAP,
     );
@@ -1514,18 +1628,19 @@ ISHELL_END
     }
 
     #[test]
-    fn parse_level_marks_partial_when_nested_overflows() {
+    fn parse_level_overflowing_nested_is_not_incomplete_but_truncation_is() {
         let mut p = LevelParser::new("/d");
         p.feed("ISHELL_DU");
-        for i in 0..(WALK_CAP + 10) {
+        for i in 0..(NESTED_CAP + 10) {
             p.feed(&format!("1\t/d/a/b/{i}"));
         }
         p.feed("10\t/d/a");
         p.feed("20\t/d");
         p.feed("ISHELL_END");
         let r = p.finish(0, false).unwrap();
-        assert!(r.partial);
-        assert_eq!(r.nested.len(), WALK_CAP as usize);
+        // 深层名字记满只是更深的层要再分析，这一层的数字是全的，不能标「未算完」。
+        assert!(!r.partial);
+        assert_eq!(r.nested.len(), NESTED_CAP as usize);
         assert_eq!(r.total, 20);
         // 提前掐断（输出超限）：没有总数行时退化为子项合计，也是 partial。
         let mut q = LevelParser::new("/d");
@@ -1860,5 +1975,244 @@ tmpfs tmpfs 100 1 90 1% /run
         assert_eq!(search.matched, 1);
         assert_eq!(search.rows[0].size, 4000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 当前用户读不了的子目录：统计要跳过它继续走完，只记一笔「无权限」。
+    /// root 不受权限位约束，这条测试对 root 没有意义。
+    #[cfg(unix)]
+    fn unreadable_tree(tag: &str) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("ishell-usage-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("locked").join("inner")).unwrap();
+        std::fs::create_dir_all(dir.join("open")).unwrap();
+        std::fs::write(dir.join("locked").join("inner").join("x.bin"), vec![0u8; 9000]).unwrap();
+        std::fs::write(dir.join("open").join("a.bin"), vec![1u8; 3000]).unwrap();
+        std::fs::write(dir.join("z.bin"), vec![2u8; 2000]).unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        Some(dir)
+    }
+
+    #[cfg(unix)]
+    fn restore_and_remove(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_scan_keeps_going_past_an_unreadable_directory() {
+        let Some(dir) = unreadable_tree("loc") else {
+            return;
+        };
+        let rep = scan_level(&dir, &AtomicBool::new(false), &AtomicU64::new(0)).unwrap();
+        restore_and_remove(&dir);
+        assert!(!rep.partial, "无权限不该让统计提前结束");
+        assert!(rep.denied >= 1, "{rep:?}");
+        assert!(rep.rows.iter().any(|r| r.name == "z.bin" && r.size == 2000));
+        assert!(rep.rows.iter().any(|r| r.name == "open" && r.size >= 3000));
+        assert!(rep.rows.iter().any(|r| r.name == "locked"));
+    }
+
+    /// 远端那条命令在本机的 sh 里原样跑一遍，输出喂给流式解析器：du 遇到读不了的目录
+    /// 往 stderr 报错、退出码非 0，但 stdout 仍要走完整棵树。
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_keeps_going_past_an_unreadable_directory() {
+        let Some(dir) = unreadable_tree("rem") else {
+            return;
+        };
+        let root = dir.display().to_string();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_level_cmd(&root))
+            .output()
+            .unwrap();
+        restore_and_remove(&dir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut p = LevelParser::new(&root);
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            p.feed(line);
+        }
+        let denied = stderr.lines().filter(|l| l.starts_with("du: ")).count() as u64;
+        let rep = p.finish(denied, false).unwrap();
+        assert!(!rep.partial);
+        assert!(rep.denied >= 1, "stderr={stderr:?}");
+        assert!(rep.rows.iter().any(|r| r.name == "z.bin" && r.size == 2000), "{rep:?}");
+        assert!(rep.rows.iter().any(|r| r.name == "open" && r.size >= 3000), "{rep:?}");
+    }
+
+    #[test]
+    fn parse_level_reads_mtimes_from_find_and_du() {
+        let text = "\
+ISHELL_TY
+1700000000.5000000000\t/d/sub
+ISHELL_DU
+5\t1600000000\t/d/sub/in.txt
+9\t1650000000\t/d/sub
+30\t1699999999\t/d/a.bin
+39\t1700000001\t/d
+ISHELL_END
+";
+        let UsageBody::Level(r) = parse_level("/d", text).unwrap() else {
+            panic!("level");
+        };
+        let sub = r.rows.iter().find(|x| x.name == "sub").unwrap();
+        let file = r.rows.iter().find(|x| x.name == "a.bin").unwrap();
+        // 目录取 find 给的它自己的时间，不是 du 给的「里面最新的」。
+        assert_eq!((sub.is_dir, sub.mtime), (true, 1_700_000_000));
+        assert_eq!((file.is_dir, file.mtime), (false, 1_699_999_999));
+        assert_eq!(r.total, 39);
+    }
+
+    #[test]
+    fn parse_level_still_reads_output_without_times() {
+        let text = "ISHELL_TY\n/d/sub\nISHELL_DU\n9\t/d/sub\n30\t/d/a.bin\n39\t/d\nISHELL_END\n";
+        let UsageBody::Level(r) = parse_level("/d", text).unwrap() else {
+            panic!("level");
+        };
+        assert!(r.rows.iter().all(|x| x.mtime == 0));
+        assert!(r.rows.iter().find(|x| x.name == "sub").unwrap().is_dir);
+        assert_eq!(r.total, 39);
+    }
+
+    #[test]
+    fn truncated_stream_with_nothing_read_does_not_blame_permissions() {
+        let mut p = LevelParser::new("/d");
+        p.feed("ISHELL_TY");
+        p.feed("0\t/d/big");
+        p.feed("ISHELL_DU");
+        // du 后序输出：/d/big 的子项还没出完整个输出就被掐断，一行顶层行都没到
+        p.feed("5\t1\t/d/big/x/y");
+        let err = p.finish(0, true).unwrap_err();
+        assert!(!err.contains("权限") && !err.contains("permission"), "{err}");
+    }
+
+    #[test]
+    fn names_and_search_parse_mtimes() {
+        let r = parse_names("/data", "f\t12\t1700000000.25\treadme.txt\nd\t4096\t1690000000.0\tsrc\n");
+        let f = r.rows.iter().find(|x| x.name == "readme.txt").unwrap();
+        let d = r.rows.iter().find(|x| x.name == "src").unwrap();
+        assert_eq!((f.size, f.mtime), (12, 1_700_000_000));
+        assert_eq!((d.is_dir, d.mtime), (true, 1_690_000_000));
+        // 老格式（没有时间）照常解析
+        let old = parse_names("/data", "f\t12\treadme.txt\n");
+        assert_eq!((old.rows[0].name.as_str(), old.rows[0].mtime), ("readme.txt", 0));
+        let UsageBody::Search(s) = parse_search("/data", "x", "300\t1700000000.5\t/data/a/x.bin\n20\t1600000000.0\t/data/x.txt\n") else {
+            panic!("search");
+        };
+        assert_eq!((s.rows[0].size, s.rows[0].mtime), (300, 1_700_000_000));
+        assert_eq!(s.rows[0].path, "/data/a/x.bin");
+        assert_eq!(s.rows[1].mtime, 1_600_000_000);
+    }
+
+    /// 远端命令在本机 sh 里原样跑：时间格式要能被解析器认出来（GNU 工具上），拿到真实的 mtime。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_command_output_carries_real_mtimes() {
+        let dir = std::env::temp_dir().join(format!("ishell-usage-mt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![1u8; 2000]).unwrap();
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::File::options().write(true).open(dir.join("a.bin")).unwrap().set_modified(t).unwrap();
+        let root = dir.display().to_string();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_level_cmd(&root))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let UsageBody::Level(r) = parse_level(&root, &text).unwrap() else {
+            panic!("level");
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = r.rows.iter().find(|x| x.name == "a.bin").unwrap();
+        assert_eq!(a.mtime, 1_600_000_000, "{text}");
+        assert!(r.rows.iter().find(|x| x.name == "sub").unwrap().mtime > 1_600_000_000, "{text}");
+    }
+
+    /// 深层条目名记满之后遍历照常走完：各层大小一分不少，只是不再往名单里放。
+    #[test]
+    fn local_walk_past_the_name_cap_still_sums_every_size() {
+        let dir = std::env::temp_dir().join(format!("ishell-usage-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a").join("b")).unwrap();
+        std::fs::write(dir.join("a").join("one.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.join("a").join("b").join("two.bin"), vec![0u8; 2000]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let visited = AtomicU64::new(0);
+        let denied = AtomicU64::new(0);
+        let recorded = AtomicU64::new(NESTED_CAP); // 名额已经用完
+        let walk = Walk {
+            cancel: &cancel,
+            visited: &visited,
+            denied: &denied,
+            recorded: &recorded,
+        };
+        let mut out = Vec::new();
+        let size = record_tree(&dir.join("a"), 0, dev_of(&std::fs::metadata(&dir).unwrap()), &walk, &mut out);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.is_empty(), "名额用完后不该再记名字: {out:?}");
+        assert!(size >= 3000, "大小必须照常累加: {size}");
+        assert!(visited.load(Ordering::Relaxed) >= 3);
+    }
+
+    /// 记名字的名额没满时，目录行的大小在它里面算完之后回填，顺序是「目录先、子项后」。
+    #[test]
+    fn nested_dir_size_is_backfilled_in_place() {
+        let dir = std::env::temp_dir().join(format!("ishell-usage-bf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a").join("b")).unwrap();
+        std::fs::write(dir.join("a").join("b").join("two.bin"), vec![0u8; 2000]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let (visited, denied, recorded) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let walk = Walk { cancel: &cancel, visited: &visited, denied: &denied, recorded: &recorded };
+        let mut out = Vec::new();
+        record_tree(&dir.join("a"), 0, dev_of(&std::fs::metadata(&dir).unwrap()), &walk, &mut out);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].0.ends_with("/b") && out[0].1 >= 2000, "{out:?}");
+        assert!(out[1].0.ends_with("two.bin") && out[1].1 == 2000, "{out:?}");
+    }
+
+    /// 取消之后遍历立刻停，并且标成没算完。
+    #[test]
+    fn cancelled_local_scan_is_marked_partial() {
+        let dir = std::env::temp_dir().join(format!("ishell-usage-cx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a").join("x.bin"), vec![0u8; 100]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let first = scan_level(&dir, &cancel, &progress).unwrap();
+        assert!(!first.partial);
+        // 扫描过程中被停：在目录之间的检查点上看到取消旗标
+        cancel.store(true, Ordering::Relaxed);
+        let cancelled = scan_level(&dir, &cancel, &progress);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(cancelled.is_err() || cancelled.unwrap().partial);
+    }
+
+    /// 本机列名字也要带修改时间（界面「修改时间」一栏的数据来源）。
+    #[test]
+    fn local_names_carry_mtime() {
+        let dir = std::env::temp_dir().join(format!("ishell-usage-nm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let f = dir.join("a.bin");
+        std::fs::write(&f, b"x").unwrap();
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(t).unwrap();
+        let rep = list_names(&dir.display().to_string()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = rep.rows.iter().find(|r| r.name == "a.bin").unwrap();
+        assert_eq!(a.mtime, 1_600_000_000);
+        assert!(rep.rows.iter().find(|r| r.name == "sub").unwrap().mtime > 1_600_000_000);
     }
 }

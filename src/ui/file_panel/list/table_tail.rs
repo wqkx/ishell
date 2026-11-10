@@ -32,9 +32,12 @@ pub(super) fn apply_table_tail_actions(
     }
 
     // 批量删除：工具栏删除按钮 或 Delete 键（重命名/路径编辑/已有对话框时不触发）
+    // 有别的控件持有焦点时（终端、占用分析的列表、各种输入框）Delete 是它们的，不能弹出文件删除确认。
+    // 与上面的 Ctrl+A 同一条规则：没有任何焦点才算文件列表的快捷键。
     let key_del = ui.input(|i| i.key_pressed(egui::Key::Delete))
         && state.renaming.is_none()
-        && state.path_edit.is_none();
+        && state.path_edit.is_none()
+        && ui.ctx().memory(|m| m.focused().is_none());
     if key_del && state.dialog.is_none() && !state.selected.is_empty() {
         let mut idxs: Vec<usize> = state.selected.iter().copied().collect();
         idxs.sort_unstable();

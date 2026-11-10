@@ -14,11 +14,13 @@ use crate::usage::{
     LevelReport, MountPoint, NameReport, SearchReport, UsageBody, UsageKind, UsageRow,
 };
 
-/// `known_size` 每帧最多入库多少条。一次分析最多带回 [`crate::usage::WALK_CAP`] 条
+/// `known_size` 每帧最多入库多少条。一次分析最多带回 [`crate::usage::NESTED_CAP`] 条
 /// 深层大小，一帧全插会让界面卡住几百毫秒；分批摊开，数字在约一秒内陆续到位。
-const KNOWN_DRAIN_PER_FRAME: usize = 30_000;
+const KNOWN_DRAIN_PER_FRAME: usize = 10_000;
+/// 修改时间一栏（`2026-11-10 09:30`，等宽小字）大约占多宽，用来决定窄窗口里画不画它。
+const MTIME_W: f32 = 112.0;
 /// 记下的大小总量上限。与一次遍历的上限对齐：装得下一整棵大树，又不至于无限增长。
-const KNOWN_CAP: usize = crate::usage::WALK_CAP as usize;
+const KNOWN_CAP: usize = crate::usage::NESTED_CAP as usize;
 
 use super::super::App;
 
@@ -71,8 +73,13 @@ pub(in crate::app) struct UsageWin {
     /// 进行中的 Level 扫描统计的是哪个目录。离开那一页扫描不停（转后台），
     /// 回来还能看到「分析中」。
     level_path: String,
-    /// 已扫描条目数。worker 侧随走随加，界面按帧读出来当进度。
-    progress: Arc<AtomicU64>,
+    /// 已扫描条目数。worker 侧随走随加，界面按帧读出来当进度。分析和搜索各一份：
+    /// 以前共用一个，进子目录列名字（也会换一份新计数）就把后台分析的进度清零冻住了，
+    /// 看上去像分析停了。
+    level_progress: Arc<AtomicU64>,
+    list_progress: Arc<AtomicU64>,
+    /// 下一帧把键盘焦点交给列表（刚打开时）。
+    want_focus: bool,
     /// 父目录还在统计时进了子目录，结果回来也要记下来。
     level_keep: HashSet<u64>,
     level_cancel: Option<Arc<AtomicBool>>,
@@ -118,7 +125,9 @@ impl UsageWin {
             mount_id: None,
             next_id: 1,
             level_path: String::new(),
-            progress: Arc::new(AtomicU64::new(0)),
+            level_progress: Arc::new(AtomicU64::new(0)),
+            list_progress: Arc::new(AtomicU64::new(0)),
+            want_focus: true,
             level_keep: HashSet::new(),
             level_cancel: None,
             list_cancel: None,
@@ -158,6 +167,17 @@ impl UsageWin {
 
     fn busy(&self) -> bool {
         self.search_id.is_some() || self.names_id.is_some() || self.scan_on_page()
+    }
+
+    /// 一次分析带回的深层大小排队等分帧入库。**先把哈希表一次撑到位**：边插边扩容的话，
+    /// 每次翻倍都要把已有的几十万条整表重排，实测会有一帧卡 200ms。
+    fn queue_known(&mut self, batch: Vec<(String, u64)>, overwrite: bool) {
+        if batch.is_empty() {
+            return;
+        }
+        let room = KNOWN_CAP.saturating_sub(self.known_size.len());
+        self.known_size.reserve(batch.len().min(room));
+        self.pending_known.push_back((batch, overwrite));
     }
 
     /// 把排队的大小入库一批。返回 true 表示还有剩余，调用方要接着要重绘。
@@ -261,6 +281,10 @@ impl App {
         if close {
             if let Some(w) = self.usage.take() {
                 w.stop();
+            }
+            // 键盘焦点原来在列表上，窗口没了就还给当前终端。
+            if let Some(s) = self.active.and_then(|i| self.sessions.get_mut(i)) {
+                s.terminal.request_focus();
             }
         } else if clear_query {
             if let Some(w) = self.usage.as_mut() {
@@ -427,6 +451,7 @@ impl App {
             kind
         };
         let heavy = !matches!(kind, UsageKind::Mounts);
+        let measuring_kind = matches!(kind, UsageKind::Level { .. });
         let (uid, id, cancel, progress) = {
             let Some(w) = self.usage.as_mut() else {
                 return;
@@ -445,7 +470,11 @@ impl App {
                     prev.store(true, Ordering::Relaxed);
                 }
                 // 每次重查询从零计。worker 侧随走随加，界面按帧读。
-                w.progress = Arc::new(AtomicU64::new(0));
+                if measuring {
+                    w.level_progress = Arc::new(AtomicU64::new(0));
+                } else {
+                    w.list_progress = Arc::new(AtomicU64::new(0));
+                }
                 w.error.clear();
                 match &kind {
                     UsageKind::Level { path } => {
@@ -481,7 +510,12 @@ impl App {
             } else {
                 w.mount_id = Some(id);
             }
-            (w.session_uid, id, cancel, w.progress.clone())
+            let progress = if measuring_kind {
+                w.level_progress.clone()
+            } else {
+                w.list_progress.clone()
+            };
+            (w.session_uid, id, cancel, progress)
         };
         let sent = self.sessions.iter().find(|s| s.uid == uid).map(|s| {
             s.cmd_tx
@@ -535,9 +569,7 @@ fn remember_level(w: &mut UsageWin, mut rep: LevelReport) -> LevelReport {
     }
     let overwrite = !rep.partial;
     let nested = std::mem::take(&mut rep.nested);
-    if !nested.is_empty() {
-        w.pending_known.push_back((nested, overwrite));
-    }
+    w.queue_known(nested, overwrite);
     w.analyzed.insert(path, rep.clone());
     rep
 }
@@ -684,6 +716,32 @@ fn paint_usage(
             };
             let (rows, analyzed, total, search) = shown_rows(w);
             let full_w = ui.available_width();
+            // 列表区域持有键盘焦点（点行、点空白处都算，刚打开时也先给它）：终端和文件列表只在
+            // 「自己有焦点」或「没有任何焦点」时才吃快捷键，列表拿着焦点它们就不会收到 Ctrl+A。
+            // 画在行的下面：行盖在上面，点行归行，点空白才落到这里。
+            let focus_id = list_focus_id();
+            let list_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(full_w, list_h));
+            let blank = ui.interact(list_rect, focus_id, egui::Sense::click());
+            if w.want_focus || blank.clicked() {
+                ui.memory_mut(|m| m.request_focus(focus_id));
+                w.want_focus = false;
+            }
+            if ui.memory(|m| m.has_focus(focus_id)) && w.confirm_delete.is_none() {
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+                    && !rows.is_empty()
+                {
+                    w.selected = (0..rows.len()).collect();
+                    w.select_anchor = Some(0);
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+                    && !w.selected.is_empty()
+                {
+                    let items = selected_items(&rows, &w.selected);
+                    if !items.is_empty() {
+                        w.confirm_delete = Some(items);
+                    }
+                }
+            }
             ui.allocate_ui(egui::vec2(full_w, list_h), |ui| {
                 if rows.is_empty() {
                     if let Some(msg) = list_message(w) {
@@ -1099,15 +1157,34 @@ fn summary_row(ui: &mut egui::Ui, w: &UsageWin, go: &mut Option<UsageKind>, stop
         }
         if busy {
             // 分析中的进度：worker 侧实时累加的条目数。
-            let n = fmt_count(w.progress.load(Ordering::Relaxed));
+            let n = fmt_count(w.level_progress.load(Ordering::Relaxed));
             let text = match crate::i18n::current() {
                 crate::i18n::Lang::Zh => format!("已统计 {n} 项"),
                 crate::i18n::Lang::En => format!("{n} items scanned"),
             };
             ui.label(RichText::new(text).size(FS_NOTE).color(Palette::TEXT_DIM));
+            // 分析可能要很久（大目录、慢盘）：必须有一个看得见的停止入口。停止 = 放弃这次
+            // 统计，回到分析前的样子；已经算完的其它目录的结果不受影响。
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("{}  {}", icon::STOP, tr("停止", "Stop")))
+                            .size(FS_BODY)
+                            .color(Palette::DANGER),
+                    )
+                    .fill(Palette::PANEL_2),
+                )
+                .on_hover_text(tr(
+                    "停止分析（放弃这次统计）",
+                    "Stop analyzing (discard this scan)",
+                ))
+                .clicked()
+            {
+                *stop_scan = true;
+            }
         } else if w.level_id.is_some() {
             // 后台还在分析别的目录：给个指示，点一下可以停。
-            let n = fmt_count(w.progress.load(Ordering::Relaxed));
+            let n = fmt_count(w.level_progress.load(Ordering::Relaxed));
             let name = leaf(&w.level_path);
             let text = match crate::i18n::current() {
                 crate::i18n::Lang::Zh => format!("后台分析 {name}（{n} 项）"),
@@ -1216,7 +1293,7 @@ fn headline(w: &UsageWin) -> (String, String) {
 fn summary_note(w: &UsageWin) -> (String, String, egui::Color32) {
     // 搜索也有进度：已检查的条目数实时涨。
     if w.search_id.is_some() {
-        let n = fmt_count(w.progress.load(Ordering::Relaxed));
+        let n = fmt_count(w.list_progress.load(Ordering::Relaxed));
         let text = match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!("已检查 {n} 项"),
             crate::i18n::Lang::En => format!("{n} items checked"),
@@ -1295,7 +1372,18 @@ fn list_message(w: &UsageWin) -> Option<String> {
         });
     }
     match w.mode {
-        Mode::Level => Some(tr("这个目录是空的", "This folder is empty").into()),
+        Mode::Level => {
+            // 读不了的目录不是「空的」：分析时统计到了无权限、又一项都没读到。
+            let unreadable = w
+                .level
+                .as_ref()
+                .is_some_and(|l| l.denied > 0 && l.rows.is_empty());
+            Some(if unreadable {
+                tr("没有权限读取这个目录", "Permission denied reading this folder").into()
+            } else {
+                tr("这个目录是空的", "This folder is empty").into()
+            })
+        }
         Mode::Search => Some(tr("没有匹配的文件", "No matching files").into()),
     }
 }
@@ -1320,12 +1408,15 @@ fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
     }
     if let Some(names) = w.names.as_ref().filter(|n| norm_path(&n.path) == w.path) {
         let mut rows = names.rows.clone();
+        // 每帧都会走到这里：挂载点的规范化路径只算一次，不要每行、每个挂载点各算一遍
+        // （2000 行 × 20 个挂载点 = 4 万次分配，占掉了一帧里的大头）。
+        let mounts = mount_used_map(w);
         for row in &mut rows {
             row.path = norm_path(&row.path);
             // 缓存只补目录的大小（名字列表里目录没有数字）。文件大小列目录时已经从
             // metadata 读到，不能用父目录扫描留下的旧值盖掉——文件可能刚变动过。
             if row.is_dir {
-                if let Some(sz) = saved_size(w, &row.path) {
+                if let Some(sz) = saved_size_in(w, &mounts, &row.path) {
                     row.size = sz;
                 }
             }
@@ -1350,9 +1441,20 @@ fn shown_rows(w: &UsageWin) -> (Vec<UsageRow>, bool, u64, bool) {
 }
 
 fn saved_size(w: &UsageWin, path: &str) -> Option<u64> {
-    let path = norm_path(path);
-    let saved = w.known_size.get(&path).copied();
-    match (saved, disk_used(w, &path)) {
+    saved_size_in(w, &mount_used_map(w), &norm_path(path))
+}
+
+/// 挂载点（规范化路径）→ 已用字节。
+fn mount_used_map(w: &UsageWin) -> HashMap<String, u64> {
+    w.mounts
+        .iter()
+        .map(|m| (norm_path(&m.path), m.used))
+        .collect()
+}
+
+/// `path` 已经规范化。缓存的大小与挂载点的整盘已用，取大的那个。
+fn saved_size_in(w: &UsageWin, mounts: &HashMap<String, u64>, path: &str) -> Option<u64> {
+    match (w.known_size.get(path).copied(), mounts.get(path).copied()) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (Some(a), None) => Some(a),
         (None, Some(b)) if b > 0 => Some(b),
@@ -1372,6 +1474,11 @@ fn green_bar(p: &egui::Painter, rect: egui::Rect, frac: f32) {
             egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 210),
         );
     }
+}
+
+/// 列表的键盘焦点 id。
+fn list_focus_id() -> egui::Id {
+    egui::Id::new("usage_list_focus")
 }
 
 fn paint_rows(
@@ -1496,7 +1603,9 @@ fn row_hit(
         egui::FontId::proportional(FS_STRONG),
         icon_color,
     );
-    let size_right = if show_size {
+    // 右侧从右往左依次是：占比、大小、修改时间。名字占剩下的。
+    let mut right = rect.right();
+    if show_size {
         let pct_rect = painter.text(
             egui::pos2(rect.right() - 8.0, text_y),
             egui::Align2::RIGHT_CENTER,
@@ -1504,7 +1613,7 @@ fn row_hit(
             egui::FontId::monospace(FS_NOTE),
             Palette::TEXT_DIM,
         );
-        painter
+        right = painter
             .text(
                 egui::pos2(pct_rect.left() - 10.0, text_y),
                 egui::Align2::RIGHT_CENTER,
@@ -1512,10 +1621,20 @@ fn row_hit(
                 egui::FontId::monospace(FS_BODY),
                 Palette::TEXT,
             )
-            .left()
-    } else {
-        rect.right()
-    };
+            .left();
+    }
+    // 窗口被拖窄时先让名字，时间让位：名字至少留 140px 才画时间。
+    if right - (rect.left() + 26.0) > 140.0 + MTIME_W {
+        let t = painter.text(
+            egui::pos2(right - 12.0, text_y),
+            egui::Align2::RIGHT_CENTER,
+            crate::ui::file_panel::fmt_mtime(row.mtime),
+            egui::FontId::monospace(FS_NOTE),
+            Palette::TEXT_DIM,
+        );
+        right = t.left();
+    }
+    let size_right = right;
     let name_rect = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 26.0, rect.top()),
         egui::pos2(size_right - 8.0, rect.bottom()),
@@ -1570,6 +1689,10 @@ fn row_hit(
         }
     } else if resp.clicked() {
         select_row(w, index, ui);
+    }
+    if resp.clicked() || resp.secondary_clicked() {
+        // 点了行就由列表持有键盘焦点：Ctrl+A、Delete 才归这个窗口，不再落到后面的终端或文件列表。
+        ui.memory_mut(|m| m.request_focus(list_focus_id()));
     }
     if resp.secondary_clicked() && !w.selected.contains(&index) {
         w.selected.clear();
@@ -1695,7 +1818,7 @@ fn nav_modal(ui: &mut egui::Ui, w: &mut UsageWin) -> Option<(String, bool)> {
                 .color(Palette::TEXT),
         );
         ui.add_space(6.0);
-        let n = fmt_count(w.progress.load(Ordering::Relaxed));
+        let n = fmt_count(w.level_progress.load(Ordering::Relaxed));
         let body = match crate::i18n::current() {
             crate::i18n::Lang::Zh => format!(
                 "{} 还在分析中（已统计 {n} 项）。\n离开后可以让它在后台继续分析，也可以停止分析。",
@@ -1921,6 +2044,7 @@ mod tests {
                 path: "/home/wangqi/snap/code/src".into(),
                 size: 400,
                 is_dir: true,
+                mtime: 0,
             }],
             omitted: 0,
             omitted_bytes: 0,
@@ -1996,6 +2120,7 @@ mod tests {
                     path: "/data/src".into(),
                     size: 40,
                     is_dir: true,
+                    mtime: 0,
                 }],
                 omitted: 0,
                 omitted_bytes: 0,
@@ -2028,6 +2153,7 @@ mod tests {
                     path: "/data/src".into(),
                     size: 40,
                     is_dir: true,
+                    mtime: 0,
                 }],
                 omitted: 0,
                 omitted_bytes: 0,
@@ -2061,6 +2187,7 @@ mod tests {
                     path: "/data/src".into(),
                     size: 40,
                     is_dir: true,
+                    mtime: 0,
                 }],
                 omitted: 0,
                 omitted_bytes: 0,
@@ -2079,6 +2206,7 @@ mod tests {
                     path: "/data/src".into(),
                     size: 1,
                     is_dir: true,
+                    mtime: 0,
                 }],
                 omitted: 0,
                 omitted_bytes: 0,
@@ -2139,6 +2267,7 @@ mod tests {
                     path: "/data/src".into(),
                     size: 40,
                     is_dir: true,
+                    mtime: 0,
                 }],
                 omitted: 0,
                 omitted_bytes: 0,
@@ -2248,12 +2377,14 @@ mod tests {
                     path: "/data/a".into(),
                     size: 30,
                     is_dir: false,
+                    mtime: 0,
                 },
                 UsageRow {
                     name: "b".into(),
                     path: "/data/deep/b".into(),
                     size: 10,
                     is_dir: false,
+                    mtime: 0,
                 },
             ],
             matched: 2,
@@ -2280,6 +2411,7 @@ mod tests {
                     path: "/data/leaf".into(),
                     size: 100,
                     is_dir: true,
+                    mtime: 0,
                 }],
                 omitted: 0,
                 omitted_bytes: 0,
@@ -2298,12 +2430,14 @@ mod tests {
                     path: "/data/leaf/small".into(),
                     size: 1,
                     is_dir: false,
+                    mtime: 0,
                 },
                 UsageRow {
                     name: "big".into(),
                     path: "/data/leaf/big".into(),
                     size: 90,
                     is_dir: false,
+                    mtime: 0,
                 },
             ],
             omitted: 0,
@@ -2324,17 +2458,64 @@ mod tests {
                     path: "/data/zdir".into(),
                     size: 0,
                     is_dir: true,
+                    mtime: 0,
                 },
                 UsageRow {
                     name: "big".into(),
                     path: "/data/big".into(),
                     size: 90,
                     is_dir: false,
+                    mtime: 0,
                 },
             ],
             omitted: 0,
         });
         let (rows, ..) = shown_rows(&w);
         assert_eq!(rows[0].name, "zdir", "没分析过的目录不能沉到文件底下");
+    }
+
+    /// 读不了的目录不能显示成「空目录」。
+    #[test]
+    fn unreadable_folder_is_not_called_empty() {
+        let mut w = UsageWin::new(1, "/root".into(), "/home/x".into());
+        w.level = Some(LevelReport {
+            path: "/root".into(),
+            total: 4096,
+            rows: Vec::new(),
+            omitted: 0,
+            omitted_bytes: 0,
+            partial: false,
+            denied: 1,
+            nested: Vec::new(),
+        });
+        let msg = list_message(&w).unwrap();
+        assert!(msg.contains("权限") || msg.contains("Permission"), "{msg}");
+        w.level.as_mut().unwrap().denied = 0;
+        let msg = list_message(&w).unwrap();
+        assert!(msg.contains("空") || msg.contains("empty"), "{msg}");
+    }
+
+    /// 进子目录列名字（会换一份新的进度计数）不能把后台分析的计数清零。
+    #[test]
+    fn listing_names_does_not_reset_the_scan_counter() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/x".into());
+        let before = w.level_progress.clone();
+        before.fetch_add(42, Ordering::Relaxed);
+        w.list_progress = Arc::new(AtomicU64::new(0));
+        assert_eq!(w.level_progress.load(Ordering::Relaxed), 42);
+        assert!(Arc::ptr_eq(&before, &w.level_progress));
+    }
+
+    /// 一次分析带回的深层大小要先把哈希表撑到位，否则入库时整表重排会卡出一帧长顿。
+    #[test]
+    fn queue_known_reserves_room_up_front() {
+        let mut w = UsageWin::new(1, "/data".into(), "/home/x".into());
+        let batch: Vec<(String, u64)> = (0..50_000u64).map(|i| (format!("/data/f{i}"), i)).collect();
+        w.queue_known(batch, true);
+        let cap = w.known_size.capacity();
+        assert!(cap >= 50_000, "{cap}");
+        w.flush_known();
+        assert_eq!(w.known_size.len(), 50_000);
+        assert_eq!(w.known_size.capacity(), cap, "入库过程中不该再扩容");
     }
 }

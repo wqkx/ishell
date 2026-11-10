@@ -28,7 +28,7 @@ use sysinfo::{SysSampler, PROBE_CMD};
 
 pub(super) use auth::ClientHandler;
 use auth::{
-    connect, exec_capture, exec_status, exec_stream, open_sftp, open_shell, EXEC_CAPTURE_LIMIT,
+    connect, exec_capture, exec_status, exec_stream, open_sftp, open_shell,
 };
 use sftp::{handle_fs_op, list_dir, read_file_chunked, read_image_file, remote_parent, tail_file};
 use xfer::{
@@ -1108,7 +1108,7 @@ async fn remote_usage(
         let end = exec_stream(
             handle,
             &cmd,
-            EXEC_CAPTURE_LIMIT,
+            crate::usage::LEVEL_STREAM_CAP,
             Some(cancel),
             Some("du: "),
             |line| {
@@ -1152,8 +1152,29 @@ async fn remote_usage(
                 .any(|l| l.trim() == crate::usage::NAMES_UNSUPPORTED_MARK)
             {
                 return Err(crate::i18n::tr(
-                    "无法列出这个目录（远端需要 GNU find，或没有权限）",
-                    "Could not list this directory (remote needs GNU find, or permission denied)",
+                    "无法列出这个目录（远端需要 GNU find）",
+                    "Could not list this directory (remote needs GNU find)",
+                )
+                .into());
+            }
+            // 读不了的目录不能显示成「空目录」：命令里单独判断过，这里照实说。
+            if text
+                .lines()
+                .any(|l| l.trim() == crate::usage::NAMES_DENIED_MARK)
+            {
+                return Err(crate::i18n::tr(
+                    "没有权限读取这个目录",
+                    "Permission denied reading this folder",
+                )
+                .into());
+            }
+            if text
+                .lines()
+                .any(|l| l.trim() == crate::usage::NAMES_NOTDIR_MARK)
+            {
+                return Err(crate::i18n::tr(
+                    "这个路径不存在，或者不是目录",
+                    "This path does not exist or is not a folder",
                 )
                 .into());
             }

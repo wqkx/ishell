@@ -1405,7 +1405,22 @@ pub(super) async fn exec_stream(
         cancelled: false,
         err_lines: 0,
     };
-    while let Some(msg) = channel.wait().await {
+    // 取消旗标只在「来了一条消息」时查的话，远端 `du` 卡在慢盘上一行也不吐，取消就要等到它
+    // 吐出下一行——可能是几分钟。所以另有一个定时器，没消息也每 200ms 看一眼。
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let msg = tokio::select! {
+            m = channel.wait() => m,
+            _ = tick.tick() => {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    end.cancelled = true;
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(msg) = msg else { break };
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             end.cancelled = true;
             break;
@@ -1712,5 +1727,125 @@ mod tests {
         assert!(super::rewrite_x11_client_prefix(&buf[..8], &fake, &real).is_err());
         buf[12] = b'X';
         assert!(super::rewrite_x11_client_prefix(&buf, &fake, &real).is_err());
+    }
+}
+
+/// 占用分析走的远端流式 exec 的 live 测试：连一台真实 sshd。
+///
+/// ```text
+/// ISHELL_TEST_SSH_HOST=127.0.0.1 ISHELL_TEST_SSH_USER=$USER ISHELL_TEST_SSH_KEY=~/.ssh/id_ed25519 \
+///   cargo test --locked live_usage -- --ignored --test-threads=1
+/// ```
+#[cfg(test)]
+mod live_usage_tests {
+    use super::*;
+    use crate::proto::{AuthMethod, ConnectConfig, Transport};
+
+    fn cfg_or_skip() -> Option<ConnectConfig> {
+        let host = std::env::var("ISHELL_TEST_SSH_HOST").ok()?;
+        let user = std::env::var("ISHELL_TEST_SSH_USER").ok()?;
+        let key = std::env::var("ISHELL_TEST_SSH_KEY").ok()?;
+        let port = std::env::var("ISHELL_TEST_SSH_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        Some(ConnectConfig {
+            host,
+            port,
+            username: user,
+            auth: AuthMethod::KeyFile {
+                path: key,
+                passphrase: None,
+            },
+            label: "live-usage-test".into(),
+            jump: None,
+            forward_agent: false,
+            forward_x11: false,
+            transport: Transport::default(),
+        })
+    }
+
+    async fn connect_live(cfg: &ConnectConfig) -> Handle<ClientHandler> {
+        let (evt_tx, _evt_rx) = std::sync::mpsc::sync_channel(64);
+        let (sysinfo_tx, _sysinfo_rx) = tokio::sync::watch::channel(None);
+        let sink = crate::ssh::UiSink::new(
+            evt_tx,
+            egui::Context::default(),
+            std::sync::Arc::new(sysinfo_tx),
+        );
+        let (hostkey_tx, hostkey_rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..4 {
+            let _ = hostkey_tx.send(true);
+        }
+        let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        connect(cfg, &sink, hostkey_rx, &mut cmd_rx, 0)
+            .await
+            .expect("连上测试服务器")
+            .0
+    }
+
+    /// 远端命令静默不出一行时，取消也要在一两秒内生效。
+    /// 旧写法只在「来了一条消息」时才看取消旗标，`du` 卡在慢盘上就要等到它下一次吐字。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_usage_cancel_returns_while_remote_is_silent() {
+        let Some(cfg) = cfg_or_skip() else { return };
+        let handle = connect_live(&cfg).await;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let end = exec_stream(&handle, "sleep 30", 1 << 20, Some(&cancel), None, |_| {})
+            .await
+            .expect("exec");
+        let took = started.elapsed();
+        assert!(end.cancelled, "应当被取消");
+        assert!(took < Duration::from_secs(3), "取消花了 {took:?}，远端一行没吐时不该等它");
+    }
+
+    /// 整条远端分析：造一棵带「读不了的子目录」的树，用产品自己的命令 + 流式解析跑一遍，
+    /// 要拿到完整的大小、真实的修改时间，并数出无权限目录数。
+    #[tokio::test]
+    #[ignore = "需要真实 sshd，见模块文档"]
+    async fn live_usage_level_over_ssh_with_times_and_denied() {
+        let Some(cfg) = cfg_or_skip() else { return };
+        let handle = connect_live(&cfg).await;
+        let root = format!("/tmp/ishell-usage-live-{}", std::process::id());
+        let setup = format!(
+            "rm -rf {root} && mkdir -p {root}/locked/inner {root}/open && \
+             head -c 3000 /dev/zero > {root}/open/a.bin && head -c 2000 /dev/zero > {root}/z.bin && \
+             head -c 9000 /dev/zero > {root}/locked/inner/x.bin && \
+             touch -d '2020-09-13 12:26:40 UTC' {root}/z.bin && chmod 000 {root}/locked"
+        );
+        let (code, err) = exec_status(&handle, &setup).await.expect("造测试树");
+        assert_eq!(code, 0, "{err}");
+
+        let mut parser = crate::usage::LevelParser::new(&root);
+        let end = exec_stream(
+            &handle,
+            &crate::usage::remote_level_cmd(&root),
+            crate::usage::LEVEL_STREAM_CAP,
+            None,
+            Some("du: "),
+            |line| parser.feed(line),
+        )
+        .await
+        .expect("exec");
+        let _ = exec_status(
+            &handle,
+            &format!("chmod 755 {root}/locked; rm -rf {root}"),
+        )
+        .await;
+        let rep = parser.finish(end.err_lines, end.capped).expect("解析");
+        assert!(!rep.partial && !end.capped);
+        assert!(rep.denied >= 1, "应当数到无权限目录：{rep:?}");
+        let z = rep.rows.iter().find(|r| r.name == "z.bin").expect("z.bin");
+        assert_eq!((z.size, z.mtime), (2000, 1_600_000_000), "{rep:?}");
+        let open = rep.rows.iter().find(|r| r.name == "open").expect("open");
+        assert!(open.is_dir && open.size >= 3000 && open.mtime > 1_600_000_000, "{rep:?}");
+        assert!(rep.rows.iter().any(|r| r.name == "locked" && r.is_dir), "{rep:?}");
     }
 }

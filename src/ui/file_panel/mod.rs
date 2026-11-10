@@ -567,7 +567,7 @@ pub(super) fn perm_string(perm: u32, is_dir: bool, is_link: bool) -> String {
 
 /// 时间格式化：把 SFTP 的 UTC 纪元秒 `secs` 按**该时刻实际生效**的本地时区/夏令时换算后展示。
 /// 逐时间戳换算（而非「取当前偏移套到所有文件」），故跨夏令时边界的历史文件也不会差 1 小时。
-pub(super) fn fmt_mtime(secs: u64) -> String {
+pub(crate) fn fmt_mtime(secs: u64) -> String {
     if secs == 0 {
         return "-".into();
     }

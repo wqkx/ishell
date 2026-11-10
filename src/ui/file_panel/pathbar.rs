@@ -166,6 +166,17 @@ pub fn show(ui: &mut egui::Ui, c: &mut Crumbs<'_>) -> Option<String> {
         let mut enter_edit = false;
         let mut nav_click: Option<String> = None;
         let ghost_col = egui::Color32::from_rgb(0xb8, 0xb3, 0xa6);
+        // 目录一变就把「当前目录的最后一段」滚进可视区。`stick_to_right` 只在「本来就贴在最右边」
+        // 时才跟随：用户滚过一次滚轮之后它就不跟了，切到很深的子目录时当前目录被挤出可视区。
+        let seen_id = egui::Id::new((c.id_salt, "crumbs_cwd"));
+        let cwd_changed = ui
+            .data(|d| d.get_temp::<String>(seen_id))
+            .as_deref()
+            != Some(c.cwd);
+        if cwd_changed {
+            let cwd = c.cwd.to_string();
+            ui.data_mut(|d| d.insert_temp(seen_id, cwd));
+        }
         let bc_resp = egui::ScrollArea::horizontal()
             .id_salt((c.id_salt, "crumbs"))
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -183,6 +194,10 @@ pub fn show(ui: &mut egui::Ui, c: &mut Crumbs<'_>) -> Option<String> {
                     } else if root.clicked() {
                         nav_click = Some("/".into());
                     }
+                    // 根目录没有段可滚：回到最左边。
+                    if cwd_changed && cwd_s.split('/').all(str::is_empty) {
+                        root.scroll_to_me(Some(egui::Align::LEFT));
+                    }
                     let mut combined = root;
                     let mut acc = String::new();
                     for seg in cwd_s.split('/').filter(|s| !s.is_empty()) {
@@ -199,6 +214,10 @@ pub fn show(ui: &mut egui::Ui, c: &mut Crumbs<'_>) -> Option<String> {
                         let r = ui.add(
                             egui::Label::new(RichText::new(seg).color(color)).sense(Sense::click()),
                         );
+                        if is_last && cwd_changed {
+                            // 滚到这一段（不是灰色的「幽灵」尾巴）靠右可见。
+                            r.scroll_to_me(Some(egui::Align::RIGHT));
+                        }
                         if r.double_clicked() {
                             enter_edit = true;
                         } else if r.clicked() {
